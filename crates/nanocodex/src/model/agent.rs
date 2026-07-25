@@ -1,4 +1,8 @@
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, RwLock},
+};
 
 use nanocodex_core::{
     AgentEventKind, EventSink, MODEL, ModelConfig, Prompt, ResponseItem, ResponsesTransport,
@@ -49,12 +53,15 @@ pub(crate) struct ModelRun<S> {
     server_reasoning_included: bool,
     session: Option<ModelSessionState>,
     active_tools: Option<ToolRuntimeControl>,
+    tool_control: ToolControlSlot,
     active_tool_call: Option<ActiveToolCall>,
     tool_call_indices: HashMap<Box<str>, u32>,
     tools: Tools,
     prompt_cache: ModelPromptCache,
     global_instructions: Option<Arc<str>>,
 }
+
+pub(crate) type ToolControlSlot = Arc<RwLock<Option<ToolRuntimeControl>>>;
 
 pub(crate) enum ModelTurnOutcome {
     Completed(CompletedModelTurn),
@@ -426,6 +433,7 @@ impl<S> ModelRun<S> {
             server_reasoning_included: false,
             session: None,
             active_tools: None,
+            tool_control: Arc::new(RwLock::new(None)),
             active_tool_call: None,
             tool_call_indices: HashMap::new(),
             tools,
@@ -457,6 +465,7 @@ impl<S> ModelRun<S> {
             events.clone(),
             Arc::clone(&transport_stats),
         );
+        let tool_control = Arc::new(RwLock::new(Some(active_tools.clone())));
         let thinking = config.thinking;
         let fast_mode = config.fast_mode;
         Self {
@@ -477,6 +486,7 @@ impl<S> ModelRun<S> {
                 preserve_inherited_delta: checkpoint.preserve_inherited_delta,
             }),
             active_tools: Some(active_tools),
+            tool_control,
             active_tool_call: None,
             tool_call_indices: HashMap::new(),
             tools,
@@ -499,6 +509,17 @@ impl<S> ModelRun<S> {
         match self.config.responses_transport {
             ResponsesTransport::WebSocket => &self.config.websocket_url,
             ResponsesTransport::Https => &self.config.api_base_url,
+        }
+    }
+
+    pub(crate) fn tool_control(&self) -> ToolControlSlot {
+        Arc::clone(&self.tool_control)
+    }
+
+    fn set_active_tools(&mut self, control: ToolRuntimeControl) {
+        self.active_tools = Some(control.clone());
+        if let Ok(mut slot) = self.tool_control.write() {
+            *slot = Some(control);
         }
     }
 
@@ -740,7 +761,7 @@ where
             let workspace = resolve_workspace(requested_workspace.as_deref())?;
             let project_instructions = self.load_agent_instructions(&workspace)?;
             let tools = tool_runtime(&workspace, &self.config, &self.tools);
-            self.active_tools = Some(tools.control());
+            self.set_active_tools(tools.control());
             let factory = self.attempt_factory(&tools);
             let user_content = prepare_user_input(&task.instruction).await;
             let history = task_input(

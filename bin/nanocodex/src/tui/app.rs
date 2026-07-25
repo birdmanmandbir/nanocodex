@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use nanocodex::{AgentEvent, AgentEventKind, Prompt, UserInput};
+use nanocodex::{AgentEvent, AgentEventKind, Prompt, TerminalId, TerminalSession, UserInput};
 use ratatui::{
     buffer::Buffer,
     layout::{Position, Rect},
@@ -1025,6 +1025,9 @@ pub(super) struct App {
     pub(super) btw: Option<BtwPane>,
     pub(super) focus: PaneId,
     pub(super) input: String,
+    terminal_attachment: Option<TerminalAttachment>,
+    terminal_listing_pending: bool,
+    suppressed_terminal: Option<(PaneId, TerminalId)>,
     local_images: Vec<AttachedImage>,
     pending_pastes: Vec<PendingPaste>,
     pub(super) cursor: usize,
@@ -1044,6 +1047,16 @@ pub(super) struct App {
 struct CancelConfirmation {
     target: PaneId,
     expires_at: Instant,
+}
+
+struct TerminalAttachment {
+    target: PaneId,
+    terminal: TerminalSession,
+    output: Vec<u8>,
+    refresh_pending: bool,
+    application_cursor: bool,
+    bracketed_paste: bool,
+    parser: vt100::Parser,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1073,6 +1086,9 @@ impl App {
             btw: None,
             focus: PaneId::Main,
             input: String::new(),
+            terminal_attachment: None,
+            terminal_listing_pending: false,
+            suppressed_terminal: None,
             local_images: Vec::new(),
             pending_pastes: Vec::new(),
             cursor: 0,
@@ -1411,6 +1427,137 @@ impl App {
         self.pending_pastes.clear();
         self.cursor = 0;
         self.preferred_column = None;
+    }
+
+    pub(super) fn terminal_input_active(&self) -> bool {
+        self.terminal_attachment.is_some()
+    }
+
+    pub(super) fn terminal_input_command(&self) -> Option<&str> {
+        self.terminal_attachment
+            .as_ref()
+            .map(|attachment| attachment.terminal.command.as_str())
+    }
+
+    pub(super) fn begin_terminal_input(&mut self, target: PaneId, terminal: TerminalSession) {
+        self.suppressed_terminal = None;
+        self.terminal_attachment = Some(TerminalAttachment {
+            target,
+            terminal,
+            output: Vec::new(),
+            refresh_pending: false,
+            application_cursor: false,
+            bracketed_paste: false,
+            parser: vt100::Parser::new(24, 80, 0),
+        });
+        self.set_status(target, "Attached to terminal");
+    }
+
+    pub(super) fn cancel_terminal_input(&mut self) {
+        let target = self
+            .terminal_attachment
+            .take()
+            .map_or(self.focus, |attachment| {
+                self.suppressed_terminal = Some((attachment.target, attachment.terminal.id));
+                attachment.target
+            });
+        self.set_status(target, "Detached from terminal");
+    }
+
+    pub(super) fn finish_terminal_input(&mut self) {
+        let target = self
+            .terminal_attachment
+            .take()
+            .map_or(self.focus, |attachment| attachment.target);
+        self.suppressed_terminal = None;
+        self.set_status(target, "Interactive terminal completed");
+    }
+
+    pub(super) fn begin_terminal_listing(&mut self) -> Option<PaneId> {
+        if self.terminal_listing_pending {
+            return None;
+        }
+        self.terminal_listing_pending = true;
+        Some(
+            self.terminal_attachment
+                .as_ref()
+                .map_or(self.focus, |attachment| attachment.target),
+        )
+    }
+
+    pub(super) fn terminal_listing_finished(&mut self) {
+        self.terminal_listing_pending = false;
+    }
+
+    pub(super) fn should_attach_terminal(&self, target: PaneId, terminal: TerminalId) -> bool {
+        self.terminal_attachment.is_none() && self.suppressed_terminal != Some((target, terminal))
+    }
+
+    pub(super) fn attached_terminal_is_listed(
+        &self,
+        target: PaneId,
+        terminals: &[TerminalSession],
+    ) -> bool {
+        self.terminal_attachment.as_ref().is_none_or(|attachment| {
+            attachment.target != target
+                || terminals
+                    .iter()
+                    .any(|terminal| terminal.id == attachment.terminal.id)
+        })
+    }
+
+    pub(super) fn attached_terminal(&self) -> Option<(PaneId, TerminalSession)> {
+        self.terminal_attachment
+            .as_ref()
+            .map(|attachment| (attachment.target, attachment.terminal.clone()))
+    }
+
+    pub(super) fn terminal_screen(&self) -> Option<&vt100::Screen> {
+        self.terminal_attachment
+            .as_ref()
+            .map(|attachment| attachment.parser.screen())
+    }
+
+    pub(super) fn terminal_modes(&self) -> (bool, bool) {
+        self.terminal_attachment
+            .as_ref()
+            .map_or((false, false), |attachment| {
+                (attachment.application_cursor, attachment.bracketed_paste)
+            })
+    }
+
+    pub(super) fn request_terminal_refresh(&mut self) -> Option<(PaneId, TerminalSession)> {
+        let attachment = self.terminal_attachment.as_mut()?;
+        if attachment.refresh_pending {
+            return None;
+        }
+        attachment.refresh_pending = true;
+        Some((attachment.target, attachment.terminal.clone()))
+    }
+
+    pub(super) fn update_terminal_output(
+        &mut self,
+        target: PaneId,
+        terminal: &TerminalSession,
+        output: Vec<u8>,
+    ) -> Vec<Vec<u8>> {
+        let Some(attachment) = self.terminal_attachment.as_mut() else {
+            return Vec::new();
+        };
+        if attachment.target == target && attachment.terminal.id == terminal.id {
+            let replies = if let Some(delta) = output.strip_prefix(attachment.output.as_slice()) {
+                process_terminal_delta(&mut attachment.parser, delta)
+            } else {
+                attachment.parser = vt100::Parser::new(24, 80, 0);
+                process_terminal_delta(&mut attachment.parser, &output)
+            };
+            attachment.application_cursor = attachment.parser.screen().application_cursor();
+            attachment.bracketed_paste = attachment.parser.screen().bracketed_paste();
+            attachment.output = output;
+            attachment.refresh_pending = false;
+            return replies;
+        }
+        Vec::new()
     }
 
     /// Interrupts immediately to resubmit pending steers, otherwise implements
@@ -2361,7 +2508,11 @@ impl App {
     }
 
     pub(super) fn set_active_status(&mut self, status: impl Into<String>) {
-        if let Some(conversation) = self.conversation_mut(self.focus) {
+        self.set_status(self.focus, status);
+    }
+
+    pub(super) fn set_status(&mut self, target: PaneId, status: impl Into<String>) {
+        if let Some(conversation) = self.conversation_mut(target) {
             conversation.status = status.into();
         }
     }
@@ -2510,6 +2661,23 @@ impl App {
             self.cancel_confirmation = None;
         }
     }
+}
+
+fn process_terminal_delta(parser: &mut vt100::Parser, mut bytes: &[u8]) -> Vec<Vec<u8>> {
+    const CURSOR_POSITION_QUERY: &[u8] = b"\x1b[6n";
+    let mut replies = Vec::new();
+    while let Some(index) = bytes
+        .windows(CURSOR_POSITION_QUERY.len())
+        .position(|window| window == CURSOR_POSITION_QUERY)
+    {
+        parser.process(&bytes[..index]);
+        let (row, column) = parser.screen().cursor_position();
+        replies.push(format!("\x1b[{};{}R", row + 1, column + 1).into_bytes());
+        parser.process(CURSOR_POSITION_QUERY);
+        bytes = &bytes[index + CURSOR_POSITION_QUERY.len()..];
+    }
+    parser.process(bytes);
+    replies
 }
 
 fn resolved_pending_pastes(input: &str, pastes: &[PendingPaste]) -> Vec<(usize, usize, usize)> {
@@ -2877,8 +3045,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        App, EscapeAction, PaneId, SubmittedPrompt, present_tool_name, smooth_scroll_drain,
-        summarize_tool_arguments,
+        App, EscapeAction, PaneId, SubmittedPrompt, present_tool_name, process_terminal_delta,
+        smooth_scroll_drain, summarize_tool_arguments,
     };
     use crate::tui::transcript::TranscriptItem;
 
@@ -2904,6 +3072,16 @@ mod tests {
             ),
             "cargo test \\\n  --workspace"
         );
+    }
+
+    #[test]
+    fn terminal_cursor_position_query_gets_an_immediate_one_based_reply() {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+
+        let replies = process_terminal_delta(&mut parser, b"picker\x1b[6n");
+
+        assert_eq!(replies, [b"\x1b[1;7R".to_vec()]);
+        assert_eq!(parser.screen().cursor_position(), (0, 6));
     }
 
     #[test]

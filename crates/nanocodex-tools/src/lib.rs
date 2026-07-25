@@ -33,9 +33,10 @@ pub use plan::UpdatePlanTool;
 #[cfg(not(target_family = "wasm"))]
 pub use runtime::{
     DEFAULT_TOOL_OUTPUT_TOKENS, DynamicToolProvider, ImageGenerationConfig, OwnedToolContext,
-    ProcessTraceWire, Tool, ToolContext, ToolError, ToolExecution, ToolExecutionWire, ToolInput,
-    ToolInputError, ToolOutputBody, ToolOutputContent, ToolResult, ToolRuntime, ToolRuntimeControl,
-    Tools, ToolsBuildError, ToolsBuilder, WebSearchConfig, schema_for,
+    ProcessTraceWire, TerminalInputError, TerminalSessionInfo, Tool, ToolContext, ToolError,
+    ToolExecution, ToolExecutionWire, ToolInput, ToolInputError, ToolOutputBody, ToolOutputContent,
+    ToolResult, ToolRuntime, ToolRuntimeControl, Tools, ToolsBuildError, ToolsBuilder,
+    WebSearchConfig, schema_for,
 };
 #[cfg(not(target_family = "wasm"))]
 pub use standard::StandardTool;

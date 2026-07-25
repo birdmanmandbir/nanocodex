@@ -25,7 +25,8 @@ use crossterm::event::{
 use eyre::{Result, WrapErr};
 use futures_util::StreamExt;
 use nanocodex::{
-    AgentEvent, AgentEvents, Nanocodex, NanocodexError, TimedAgentEvent, TurnControl, TurnResult,
+    AgentEvent, AgentEvents, Nanocodex, NanocodexError, TerminalId,
+    TerminalSession as AgentTerminalSession, TimedAgentEvent, TurnControl, TurnResult,
 };
 use tokio::{
     sync::mpsc,
@@ -56,6 +57,19 @@ const MOUSE_SCROLL_ROWS: usize = 3;
 const MAX_AGENT_EVENTS_PER_BATCH: usize = 256;
 
 enum WorkerCommand {
+    ListTerminals {
+        target: PaneId,
+        purpose: TerminalListPurpose,
+    },
+    WriteTerminal {
+        target: PaneId,
+        terminal: TerminalId,
+        input: Vec<u8>,
+    },
+    ReadTerminal {
+        target: PaneId,
+        terminal: AgentTerminalSession,
+    },
     Prompt {
         target: PaneId,
         prompt_id: u64,
@@ -94,6 +108,23 @@ enum WorkerCommand {
 }
 
 enum WorkerEvent {
+    TerminalsListed {
+        target: PaneId,
+        purpose: TerminalListPurpose,
+        terminals: Vec<AgentTerminalSession>,
+    },
+    TerminalInputSent {
+        target: PaneId,
+    },
+    TerminalOutput {
+        target: PaneId,
+        terminal: AgentTerminalSession,
+        output: Vec<u8>,
+    },
+    TerminalControlFailed {
+        target: PaneId,
+        error: String,
+    },
     TurnTraceStarted {
         target: PaneId,
         id: u64,
@@ -178,6 +209,12 @@ enum WorkerEvent {
     MainBranchEventStreamClosed {
         id: u64,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalListPurpose {
+    Automatic,
+    Liveness,
 }
 
 struct MainWorkerBranch {
@@ -423,6 +460,8 @@ impl UiModel {
             }
             UiAction::Tick => {
                 self.app.on_tick();
+                request_terminal_lifecycle(&mut self.app, commands)?;
+                request_terminal_refresh(&mut self.app, commands)?;
                 Ok(UiUpdate::Redraw(RedrawPriority::Streaming))
             }
         }
@@ -533,6 +572,7 @@ pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Re
             }
             _ = ticker.tick(), if ui.app.main.running
                 || ui.app.btw.as_ref().is_some_and(|btw| btw.conversation.running)
+                || ui.app.terminal_input_active()
                 || ui.app.mouse_selection_needs_redraw() => {
                 if apply_update(ui.update(UiAction::Tick, &worker_tx)?, &mut scheduler) {
                     return Ok(());
@@ -696,6 +736,27 @@ fn handle_worker_update(
     commands: &mpsc::UnboundedSender<WorkerCommand>,
 ) -> Result<()> {
     match update {
+        WorkerEvent::TerminalsListed {
+            target,
+            purpose,
+            terminals,
+        } => {
+            handle_terminals_listed(app, target, purpose, terminals, commands)?;
+        }
+        WorkerEvent::TerminalInputSent { target } => {
+            app.set_status(target, "Attached to terminal");
+            request_terminal_refresh(app, commands)?;
+        }
+        WorkerEvent::TerminalOutput {
+            target,
+            terminal,
+            output,
+        } => {
+            handle_terminal_output(app, target, &terminal, output, commands)?;
+        }
+        WorkerEvent::TerminalControlFailed { target, error } => {
+            handle_terminal_failure(app, target, &error);
+        }
         WorkerEvent::TurnFinished {
             target,
             main_branch_id,
@@ -774,6 +835,55 @@ fn handle_worker_update(
     Ok(())
 }
 
+fn handle_terminal_output(
+    app: &mut App,
+    target: PaneId,
+    terminal: &AgentTerminalSession,
+    output: Vec<u8>,
+    commands: &mpsc::UnboundedSender<WorkerCommand>,
+) -> Result<()> {
+    for reply in app.update_terminal_output(target, terminal, output) {
+        send_terminal_bytes(app, commands, reply)?;
+    }
+    Ok(())
+}
+
+fn handle_terminals_listed(
+    app: &mut App,
+    target: PaneId,
+    purpose: TerminalListPurpose,
+    terminals: Vec<AgentTerminalSession>,
+    commands: &mpsc::UnboundedSender<WorkerCommand>,
+) -> Result<()> {
+    app.terminal_listing_finished();
+    match purpose {
+        TerminalListPurpose::Automatic => {
+            if let Some(terminal) = terminals
+                .into_iter()
+                .rev()
+                .find(|terminal| app.should_attach_terminal(target, terminal.id))
+            {
+                app.begin_terminal_input(target, terminal);
+                request_terminal_refresh(app, commands)?;
+            }
+        }
+        TerminalListPurpose::Liveness => {
+            if !app.attached_terminal_is_listed(target, &terminals) {
+                app.finish_terminal_input();
+            }
+        }
+    }
+    Ok(())
+}
+
+fn handle_terminal_failure(app: &mut App, target: PaneId, error: &str) {
+    app.terminal_listing_finished();
+    if app.terminal_input_active() {
+        app.cancel_terminal_input();
+    }
+    app.set_status(target, format!("Terminal input failed: {error}"));
+}
+
 fn spawn_agent_worker(
     root: Nanocodex,
     root_session_id: Arc<str>,
@@ -825,6 +935,17 @@ struct AgentWorker {
 impl AgentWorker {
     async fn handle_command(&mut self, command: WorkerCommand) {
         match command {
+            WorkerCommand::ListTerminals { target, purpose } => {
+                self.list_terminals(target, purpose).await;
+            }
+            WorkerCommand::WriteTerminal {
+                target,
+                terminal,
+                input,
+            } => self.write_terminal(target, terminal, input).await,
+            WorkerCommand::ReadTerminal { target, terminal } => {
+                self.read_terminal(target, terminal).await;
+            }
             WorkerCommand::Prompt {
                 target,
                 prompt_id,
@@ -861,6 +982,76 @@ impl AgentWorker {
             }
             WorkerCommand::SwitchMainBranch { id } => self.switch_main_branch(id),
         }
+    }
+
+    fn agent(&self, target: PaneId) -> Option<&Nanocodex> {
+        match target {
+            PaneId::Main => Some(&self.main.agent),
+            PaneId::Btw(id) => self
+                .btw
+                .as_ref()
+                .filter(|branch| branch.id == id)
+                .map(|branch| &branch.agent),
+        }
+    }
+
+    async fn list_terminals(&self, target: PaneId, purpose: TerminalListPurpose) {
+        let event = match self.agent(target) {
+            Some(agent) => match agent.terminal_sessions().await {
+                Ok(terminals) => WorkerEvent::TerminalsListed {
+                    target,
+                    purpose,
+                    terminals,
+                },
+                Err(error) => WorkerEvent::TerminalControlFailed {
+                    target,
+                    error: error.to_string(),
+                },
+            },
+            None => WorkerEvent::TerminalControlFailed {
+                target,
+                error: "agent branch is not available".to_owned(),
+            },
+        };
+        drop(self.updates.send(event));
+    }
+
+    async fn write_terminal(&self, target: PaneId, terminal: TerminalId, input: Vec<u8>) {
+        let event = match self.agent(target) {
+            Some(agent) => match agent.write_terminal(terminal, input).await {
+                Ok(()) => WorkerEvent::TerminalInputSent { target },
+                Err(error) => WorkerEvent::TerminalControlFailed {
+                    target,
+                    error: error.to_string(),
+                },
+            },
+            None => WorkerEvent::TerminalControlFailed {
+                target,
+                error: "agent branch is not available".to_owned(),
+            },
+        };
+        drop(self.updates.send(event));
+    }
+
+    async fn read_terminal(&self, target: PaneId, terminal: AgentTerminalSession) {
+        let event = match self.agent(target) {
+            Some(agent) => match agent.terminal_output(terminal.id).await {
+                Ok(output) => WorkerEvent::TerminalOutput {
+                    target,
+                    terminal,
+                    output,
+                },
+                Err(error) => WorkerEvent::TerminalControlFailed {
+                    target,
+                    error: error.to_string(),
+                },
+            },
+            None => WorkerEvent::TerminalControlFailed {
+                target,
+                error: "agent branch is not available".to_owned(),
+            },
+        };
+        drop(self.updates.send(event));
     }
 
     async fn prompt(&mut self, target: PaneId, prompt_id: u64, prompt: SubmittedPrompt) {
@@ -1583,7 +1774,16 @@ fn handle_terminal_event(
         }
         Event::Paste(text) => {
             let _ = app.clear_mouse_selection();
-            app.handle_paste(&text);
+            if app.terminal_input_active() {
+                let mut input = text.into_bytes();
+                if app.terminal_modes().1 {
+                    input.splice(..0, b"\x1b[200~".iter().copied());
+                    input.extend_from_slice(b"\x1b[201~");
+                }
+                send_terminal_bytes(app, commands, input)?;
+            } else {
+                app.handle_paste(&text);
+            }
             Ok(TerminalAction::Redraw)
         }
         Event::Mouse(mouse) => match mouse.kind {
@@ -1631,19 +1831,170 @@ fn handle_terminal_event(
     }
 }
 
+fn handle_terminal_input_key(
+    key: KeyEvent,
+    app: &mut App,
+    commands: &mpsc::UnboundedSender<WorkerCommand>,
+) -> Result<Option<TerminalAction>> {
+    if !app.terminal_input_active() {
+        return Ok(None);
+    }
+    if key.kind == KeyEventKind::Release {
+        return Ok(Some(TerminalAction::Ignore));
+    }
+    if key.code == KeyCode::Char(']') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.cancel_terminal_input();
+        return Ok(Some(TerminalAction::Redraw));
+    }
+    if let Some(input) = terminal_key_bytes(key, app.terminal_modes().0) {
+        send_terminal_bytes(app, commands, input)?;
+    }
+    Ok(Some(TerminalAction::Redraw))
+}
+
+fn send_terminal_bytes(
+    app: &App,
+    commands: &mpsc::UnboundedSender<WorkerCommand>,
+    input: Vec<u8>,
+) -> Result<()> {
+    if let Some((target, terminal)) = app.attached_terminal() {
+        send_command(
+            commands,
+            WorkerCommand::WriteTerminal {
+                target,
+                terminal: terminal.id,
+                input,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn terminal_key_bytes(key: KeyEvent, application_cursor: bool) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    if alt {
+        bytes.push(0x1b);
+    }
+    match key.code {
+        KeyCode::Char(character) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let byte = if character == ' ' {
+                0
+            } else if character.is_ascii() {
+                (character.to_ascii_uppercase() as u8) & 0x1f
+            } else {
+                return None;
+            };
+            bytes.push(byte);
+        }
+        KeyCode::Char(character) => {
+            let mut encoded = [0_u8; 4];
+            bytes.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+        }
+        KeyCode::Enter => bytes.push(b'\r'),
+        KeyCode::Tab => bytes.push(b'\t'),
+        KeyCode::BackTab => bytes.extend_from_slice(b"\x1b[Z"),
+        KeyCode::Backspace => bytes.push(0x7f),
+        KeyCode::Esc => bytes.push(0x1b),
+        KeyCode::Left => bytes.extend_from_slice(cursor_key(b'D', application_cursor)),
+        KeyCode::Right => bytes.extend_from_slice(cursor_key(b'C', application_cursor)),
+        KeyCode::Up => bytes.extend_from_slice(cursor_key(b'A', application_cursor)),
+        KeyCode::Down => bytes.extend_from_slice(cursor_key(b'B', application_cursor)),
+        KeyCode::Home => bytes.extend_from_slice(cursor_key(b'H', application_cursor)),
+        KeyCode::End => bytes.extend_from_slice(cursor_key(b'F', application_cursor)),
+        KeyCode::PageUp => bytes.extend_from_slice(b"\x1b[5~"),
+        KeyCode::PageDown => bytes.extend_from_slice(b"\x1b[6~"),
+        KeyCode::Insert => bytes.extend_from_slice(b"\x1b[2~"),
+        KeyCode::Delete => bytes.extend_from_slice(b"\x1b[3~"),
+        KeyCode::F(number) => bytes.extend_from_slice(function_key_bytes(number)?),
+        KeyCode::Null => bytes.push(0),
+        _ => return None,
+    }
+    Some(bytes)
+}
+
+const fn cursor_key(key: u8, application_cursor: bool) -> &'static [u8] {
+    match (key, application_cursor) {
+        (b'A', false) => b"\x1b[A",
+        (b'B', false) => b"\x1b[B",
+        (b'C', false) => b"\x1b[C",
+        (b'D', false) => b"\x1b[D",
+        (b'H', false) => b"\x1b[H",
+        (b'F', false) => b"\x1b[F",
+        (b'A', true) => b"\x1bOA",
+        (b'B', true) => b"\x1bOB",
+        (b'C', true) => b"\x1bOC",
+        (b'D', true) => b"\x1bOD",
+        (b'H', true) => b"\x1bOH",
+        (b'F', true) => b"\x1bOF",
+        _ => b"",
+    }
+}
+
+fn function_key_bytes(number: u8) -> Option<&'static [u8]> {
+    Some(match number {
+        1 => b"\x1bOP",
+        2 => b"\x1bOQ",
+        3 => b"\x1bOR",
+        4 => b"\x1bOS",
+        5 => b"\x1b[15~",
+        6 => b"\x1b[17~",
+        7 => b"\x1b[18~",
+        8 => b"\x1b[19~",
+        9 => b"\x1b[20~",
+        10 => b"\x1b[21~",
+        11 => b"\x1b[23~",
+        12 => b"\x1b[24~",
+        _ => return None,
+    })
+}
+
+fn request_terminal_lifecycle(
+    app: &mut App,
+    commands: &mpsc::UnboundedSender<WorkerCommand>,
+) -> Result<()> {
+    let purpose = if app.terminal_input_active() {
+        TerminalListPurpose::Liveness
+    } else if app.is_running(app.focus) {
+        TerminalListPurpose::Automatic
+    } else {
+        return Ok(());
+    };
+    let Some(target) = app.begin_terminal_listing() else {
+        return Ok(());
+    };
+    send_command(commands, WorkerCommand::ListTerminals { target, purpose })?;
+    Ok(())
+}
+
+fn request_terminal_refresh(
+    app: &mut App,
+    commands: &mpsc::UnboundedSender<WorkerCommand>,
+) -> Result<()> {
+    if let Some((target, terminal)) = app.request_terminal_refresh() {
+        send_command(commands, WorkerCommand::ReadTerminal { target, terminal })?;
+    }
+    Ok(())
+}
+
 fn handle_key(
     key: KeyEvent,
     app: &mut App,
     root_session_id: &str,
     commands: &mpsc::UnboundedSender<WorkerCommand>,
 ) -> Result<TerminalAction> {
-    if matches!(key.code, KeyCode::Char('v' | 'V'))
+    if !app.terminal_input_active()
+        && matches!(key.code, KeyCode::Char('v' | 'V'))
         && key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
     {
         paste_clipboard_image(app, clipboard::paste_image_to_temp_png);
         return Ok(TerminalAction::Redraw);
+    }
+
+    if let Some(action) = handle_terminal_input_key(key, app, commands)? {
+        return Ok(action);
     }
 
     if let Some(action) = handle_inline_historical_editor_key(key, app, commands)? {
@@ -2179,10 +2530,11 @@ mod tests {
     use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
     use super::{
-        BTW_BOUNDARY, PaneId, RedrawPriority, Submission, TerminalAction, UiAction, UiModel,
-        UiUpdate, WorkerCommand, WorkerEvent, active_session_id, classify_submission, handle_key,
-        handle_worker_update, paste_clipboard_image, prepare_btw_prompt, session_trace_url,
-        spawn_agent_worker,
+        BTW_BOUNDARY, PaneId, RedrawPriority, Submission, TerminalAction, TerminalListPurpose,
+        UiAction, UiModel, UiUpdate, WorkerCommand, WorkerEvent, active_session_id,
+        classify_submission, handle_key, handle_worker_update, paste_clipboard_image,
+        prepare_btw_prompt, request_terminal_lifecycle, session_trace_url, spawn_agent_worker,
+        terminal_key_bytes,
     };
     use crate::tui::app::App;
 
@@ -2193,6 +2545,73 @@ mod tests {
             row: 0,
             modifiers: KeyModifiers::NONE,
         })
+    }
+
+    #[test]
+    fn raw_terminal_keys_encode_navigation_and_control_sequences() {
+        assert_eq!(
+            terminal_key_bytes(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), false),
+            Some(b"\x1b[B".to_vec())
+        );
+        assert_eq!(
+            terminal_key_bytes(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), true),
+            Some(b"\x1bOB".to_vec())
+        );
+        assert_eq!(
+            terminal_key_bytes(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), false),
+            Some(b"\r".to_vec())
+        );
+        assert_eq!(
+            terminal_key_bytes(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                false,
+            ),
+            Some(vec![3])
+        );
+        assert_eq!(
+            terminal_key_bytes(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT), false,),
+            Some(b"\x1bx".to_vec())
+        );
+    }
+
+    #[test]
+    fn running_turn_automatically_checks_for_interactive_terminals() {
+        let mut app = App::new("/workspace".into());
+        let (commands, mut command_rx) = mpsc::unbounded_channel();
+        app.main.running = true;
+
+        request_terminal_lifecycle(&mut app, &commands)
+            .expect("automatic terminal discovery should be requested");
+
+        assert!(matches!(
+            command_rx.try_recv(),
+            Ok(WorkerCommand::ListTerminals {
+                target: PaneId::Main,
+                purpose: TerminalListPurpose::Automatic,
+            })
+        ));
+        assert!(command_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn empty_automatic_terminal_listing_leaves_the_composer_untouched() {
+        let mut app = App::new("/workspace".into());
+        let (commands, _command_rx) = mpsc::unbounded_channel();
+        app.replace_input("keep this draft".to_owned());
+
+        handle_worker_update(
+            &mut app,
+            WorkerEvent::TerminalsListed {
+                target: PaneId::Main,
+                purpose: TerminalListPurpose::Automatic,
+                terminals: Vec::new(),
+            },
+            &commands,
+        )
+        .expect("empty terminal listing should be handled");
+
+        assert!(!app.terminal_input_active());
+        assert_eq!(app.input, "keep this draft");
     }
 
     #[test]

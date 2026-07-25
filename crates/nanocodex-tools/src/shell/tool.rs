@@ -41,7 +41,8 @@ impl Tool for ExecCommandHandler {
             arguments.tty,
             arguments.yield_time_ms,
             arguments.max_output_tokens,
-        );
+        )
+        .interactive(arguments.interactive);
         let result = self.sessions.execute(command, &self.workspace).await;
         Ok(shell_execution(&result))
     }
@@ -103,6 +104,8 @@ struct ExecCommandArguments {
     #[serde(default)]
     tty: bool,
     #[serde(default)]
+    interactive: bool,
+    #[serde(default)]
     yield_time_ms: Option<i64>,
     #[serde(default)]
     max_output_tokens: Option<i64>,
@@ -143,6 +146,11 @@ mod tests {
             spec.pointer("/parameters/properties/shell/type")
                 .and_then(serde_json::Value::as_str),
             Some("string")
+        );
+        assert_eq!(
+            spec.pointer("/parameters/properties/interactive/type")
+                .and_then(serde_json::Value::as_str),
+            Some("boolean")
         );
     }
 }

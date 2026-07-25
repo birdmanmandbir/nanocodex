@@ -47,6 +47,9 @@ pub enum NanocodexError {
     #[error("the agent stopped before the turn completed")]
     TurnStopped,
 
+    #[error("the agent has not initialized its terminal runtime")]
+    TerminalRuntimeUnavailable,
+
     #[error("the targeted turn is queued, completed, or otherwise not active for steering")]
     TurnNotSteerable,
 
@@ -97,6 +100,10 @@ pub enum NanocodexError {
     #[cfg(not(target_family = "wasm"))]
     #[error("failed to build tools for an agent driver: {0}")]
     Tools(#[from] nanocodex_tools::ToolsBuildError),
+
+    #[cfg(not(target_family = "wasm"))]
+    #[error(transparent)]
+    TerminalInput(#[from] nanocodex_tools::TerminalInputError),
 
     #[error("Responses service middleware failed: {0}")]
     ResponsesMiddleware(#[from] tower::BoxError),

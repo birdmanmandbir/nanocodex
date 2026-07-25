@@ -15,6 +15,8 @@ use crate::{
     shell::{self, ShellSessions},
     view_image,
 };
+
+pub use crate::shell::{TerminalInputError, TerminalSessionInfo};
 #[cfg(feature = "remote-tools")]
 use crate::{image_generation, web_search};
 
@@ -882,6 +884,25 @@ impl ToolRuntime {
 }
 
 impl ToolRuntimeControl {
+    #[doc(hidden)]
+    pub async fn terminal_sessions(&self) -> Vec<TerminalSessionInfo> {
+        self.sessions.terminal_sessions().await
+    }
+
+    #[doc(hidden)]
+    pub async fn write_terminal(
+        &self,
+        session_id: i64,
+        input: &[u8],
+    ) -> Result<(), TerminalInputError> {
+        self.sessions.write_terminal(session_id, input).await
+    }
+
+    #[doc(hidden)]
+    pub async fn terminal_output(&self, session_id: i64) -> Result<Vec<u8>, TerminalInputError> {
+        self.sessions.terminal_output(session_id).await
+    }
+
     #[doc(hidden)]
     pub async fn cancel(&self) {
         #[cfg(feature = "code-mode")]

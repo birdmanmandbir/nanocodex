@@ -15,7 +15,8 @@ use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
 use crate::{
     AgentHandle, Nanocodex, NanocodexError, OpenAiAuth, Prompt, Responses, ResponsesError,
-    ResponsesHistory, ResponsesTransport, RolloutConfig, SessionSnapshot, Thinking, Tools,
+    ResponsesHistory, ResponsesTransport, RolloutConfig, SessionSnapshot, TerminalId, Thinking,
+    Tools,
 };
 
 #[derive(Clone)]
@@ -1116,6 +1117,117 @@ async fn stored_response_local_code_mode_round_trip() -> Result<()> {
         .map_err(|_| eyre!("mock Responses server did not finish"))???;
     assert!(output.contains("\"tool\":\"exec\""));
     assert!(output.contains("\"tool\":\"exec_command\""));
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn wait_for_terminal_text(
+    agent: &Nanocodex,
+    terminal: TerminalId,
+    expected: &str,
+) -> Result<()> {
+    timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let output = agent
+                .terminal_output(terminal)
+                .await
+                .expect("terminal output should remain readable");
+            if String::from_utf8_lossy(&output).contains(expected) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| eyre!("terminal output did not contain {expected:?}"))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn agent_accepts_human_input_for_a_live_tool_terminal() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let (tool_finished, tool_finished_rx) = tokio::sync::oneshot::channel();
+    let (release_final, release_final_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut socket = accept_async(stream).await?;
+        assert_warmup(&next_json(&mut socket).await?);
+        send_warmup(&mut socket, "resp-warmup").await?;
+
+        let generation = next_json(&mut socket).await?;
+        assert_eq!(generation["previous_response_id"], "resp-warmup");
+        send_json(
+            &mut socket,
+            completed_response(
+                "resp-tool",
+                &[json!({
+                    "type": "custom_tool_call",
+                    "call_id": "call-exec",
+                    "name": "exec",
+                    "input": r#"const result = await tools.exec_command({cmd: "stty -echo; printf 'Secret: '; read value; printf '\r\naccepted\r\n'; printf '%s' \"$value\" > terminal-input", interactive: true}); text(result.output);"#
+                })],
+            ),
+        )
+        .await?;
+
+        let continuation = next_json(&mut socket).await?;
+        assert_eq!(continuation["input"][0]["type"], "custom_tool_call_output");
+        tool_finished
+            .send(())
+            .map_err(|()| eyre!("tool completion signal receiver dropped"))?;
+        release_final_rx
+            .await
+            .map_err(|_| eyre!("final response release sender dropped"))?;
+        send_final(&mut socket, "resp-final").await
+    });
+
+    let workspace = temporary_workspace("human-terminal-input")?;
+    let responses = Responses::builder().websocket_url(endpoint).build();
+    let (agent, _events) = Nanocodex::builder("test-key")
+        .thinking(Thinking::Low)
+        .workspace(&workspace)
+        .responses(responses)
+        .session_id("model-test")
+        .build()?;
+    let turn = agent.prompt("ask for a secret").await?;
+    timeout(std::time::Duration::from_secs(5), tool_finished_rx)
+        .await
+        .map_err(|_| eyre!("terminal tool did not yield"))??;
+
+    let terminals = agent.terminal_sessions().await?;
+    assert_eq!(terminals.len(), 1);
+    assert!(terminals[0].command.contains("read value"));
+    wait_for_terminal_text(&agent, terminals[0].id, "Secret: ").await?;
+    agent
+        .write_terminal(terminals[0].id, b"swordfish\n".to_vec())
+        .await?;
+    timeout(std::time::Duration::from_secs(2), async {
+        while !matches!(
+            std::fs::read_to_string(workspace.join("terminal-input")).as_deref(),
+            Ok("swordfish")
+        ) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| eyre!("terminal process did not consume human input"))?;
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("terminal-input"))?,
+        "swordfish"
+    );
+    wait_for_terminal_text(&agent, terminals[0].id, "accepted").await?;
+
+    release_final
+        .send(())
+        .map_err(|()| eyre!("mock server stopped before final response"))?;
+    assert_eq!(turn.result().await?.final_message, "done");
+    drop(agent);
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock Responses server did not finish"))???;
     std::fs::remove_dir_all(workspace)?;
     Ok(())
 }

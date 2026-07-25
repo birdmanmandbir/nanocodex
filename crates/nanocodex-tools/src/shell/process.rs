@@ -182,6 +182,7 @@ fn spawn_pty(
     for (name, value) in environment {
         command.env(name, value);
     }
+    command.env("TERM", "xterm-256color");
 
     let mut child = pair.slave.spawn_command(command).map_err(pty_error)?;
     let pid = child

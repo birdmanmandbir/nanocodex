@@ -18,12 +18,34 @@ use std::{
 use serde::Serialize;
 use tokio::{sync::Mutex, task::JoinHandle, time::timeout};
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalSessionInfo {
+    pub id: i64,
+    pub command: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum TerminalInputError {
+    #[error("unknown or completed terminal session {0}")]
+    UnknownSession(i64),
+    #[error("exec session {0} is not attached to a terminal")]
+    NotATerminal(i64),
+    #[error("failed to write to terminal session {session_id}: {source}")]
+    Write {
+        session_id: i64,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
 const DEFAULT_EXEC_YIELD_MS: u64 = 10_000;
 const DEFAULT_WRITE_YIELD_MS: u64 = 250;
 const DEFAULT_POLL_YIELD_MS: u64 = 5_000;
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
+const MAX_TERMINAL_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_LIVE_SESSIONS: usize = 64;
+const MAX_TERMINAL_ARCHIVES: usize = 16;
 
 pub(crate) struct ExecCommand {
     script: String,
@@ -31,6 +53,7 @@ pub(crate) struct ExecCommand {
     shell: Option<String>,
     login: Option<bool>,
     tty: bool,
+    interactive: bool,
     yield_time_ms: Option<i64>,
     max_output_tokens: Option<i64>,
 }
@@ -51,9 +74,15 @@ impl ExecCommand {
             shell,
             login,
             tty,
+            interactive: false,
             yield_time_ms,
             max_output_tokens,
         }
+    }
+
+    pub(crate) const fn interactive(mut self, interactive: bool) -> Self {
+        self.interactive = interactive;
+        self
     }
 }
 
@@ -131,7 +160,7 @@ impl ShellSessions {
             &workdir,
             &shell,
             command.login.unwrap_or(true),
-            command.tty,
+            command.tty || command.interactive,
             &environment,
         ) {
             Ok(spawned) => spawned,
@@ -142,21 +171,30 @@ impl ShellSessions {
                 );
             }
         };
-        let session = Session::new(session_id, spawned, secrets);
+        let session = Session::new(
+            session_id,
+            spawned,
+            secrets,
+            command.script,
+            command.interactive,
+        );
         let _interaction_guard = session.interaction.lock().await;
         let pruned = self.sessions.lock().await.insert(Arc::clone(&session));
         if let Some(pruned) = pruned {
             pruned.terminate().await;
         }
 
-        let yield_time = duration_ms(command.yield_time_ms, DEFAULT_EXEC_YIELD_MS, 250, 30_000);
+        let default_yield_ms = if command.interactive {
+            DEFAULT_WRITE_YIELD_MS
+        } else {
+            DEFAULT_EXEC_YIELD_MS
+        };
+        let yield_time = duration_ms(command.yield_time_ms, default_yield_ms, 250, 30_000);
         let _interaction = session.begin_interaction();
         let result = session
             .wait_for_output(yield_time, command.max_output_tokens, started_at)
             .await;
-        if result.exit_code.is_some() {
-            self.sessions.lock().await.remove(session_id);
-        }
+        self.retire_completed(&session, &result).await;
         result
     }
 
@@ -197,16 +235,86 @@ impl ShellSessions {
         let result = session
             .wait_for_output(yield_time, request.max_output_tokens, started_at)
             .await;
-        if result.exit_code.is_some() {
-            self.sessions.lock().await.remove(request.session_id);
-        }
+        self.retire_completed(&session, &result).await;
         result
+    }
+
+    async fn retire_completed(&self, session: &Session, result: &ExecCommandResult) {
+        if result.exit_code.is_none() {
+            return;
+        }
+        let archive = session.tty.then(|| session.terminal_output());
+        let archive = match archive {
+            Some(output) => Some(output.await),
+            None => None,
+        };
+        let mut store = self.sessions.lock().await;
+        if let Some(output) = archive {
+            store.archive_terminal(session.id, output);
+        }
+        store.remove(session.id);
+    }
+
+    pub(crate) async fn terminal_sessions(&self) -> Vec<TerminalSessionInfo> {
+        let store = self.sessions.lock().await;
+        let mut sessions = store
+            .sessions
+            .values()
+            .filter(|session| session.tty && session.interactive)
+            .map(|session| TerminalSessionInfo {
+                id: session.id,
+                command: session.command.clone(),
+            })
+            .collect::<Vec<_>>();
+        sessions.sort_unstable_by_key(|session| session.id);
+        sessions
+    }
+
+    pub(crate) async fn write_terminal(
+        &self,
+        session_id: i64,
+        input: &[u8],
+    ) -> Result<(), TerminalInputError> {
+        let session = self
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .ok_or(TerminalInputError::UnknownSession(session_id))?;
+        if !session.tty {
+            return Err(TerminalInputError::NotATerminal(session_id));
+        }
+        session
+            .write_bytes(input)
+            .await
+            .map_err(|source| TerminalInputError::Write { session_id, source })
+    }
+
+    pub(crate) async fn terminal_output(
+        &self,
+        session_id: i64,
+    ) -> Result<Vec<u8>, TerminalInputError> {
+        let session = {
+            let mut store = self.sessions.lock().await;
+            if let Some(session) = store.get(session_id) {
+                session
+            } else {
+                return store
+                    .archived_terminal(session_id)
+                    .ok_or(TerminalInputError::UnknownSession(session_id));
+            }
+        };
+        if !session.tty {
+            return Err(TerminalInputError::NotATerminal(session_id));
+        }
+        Ok(session.terminal_output().await)
     }
 
     pub(crate) async fn terminate_all(&self) {
         let sessions = {
             let mut store = self.sessions.lock().await;
             store.recency.clear();
+            store.terminal_archives.clear();
             store
                 .sessions
                 .drain()
@@ -223,6 +331,7 @@ impl ShellSessions {
 struct SessionStore {
     sessions: HashMap<i64, Arc<Session>>,
     recency: VecDeque<i64>,
+    terminal_archives: VecDeque<(i64, Vec<u8>)>,
 }
 
 impl SessionStore {
@@ -265,54 +374,84 @@ impl SessionStore {
         }
         self.recency.push_back(id);
     }
+
+    fn archive_terminal(&mut self, id: i64, output: Vec<u8>) {
+        self.terminal_archives.push_back((id, output));
+        while self.terminal_archives.len() > MAX_TERMINAL_ARCHIVES {
+            self.terminal_archives.pop_front();
+        }
+    }
+
+    fn archived_terminal(&self, id: i64) -> Option<Vec<u8>> {
+        self.terminal_archives
+            .iter()
+            .find(|(candidate, _)| *candidate == id)
+            .map(|(_, output)| output.clone())
+    }
 }
 
 struct Session {
     id: i64,
+    command: String,
     tty: bool,
+    interactive: bool,
     interaction: Mutex<()>,
     child: Mutex<process::ProcessChild>,
     stdin: Mutex<Option<process::ProcessStdin>>,
     process_group: Mutex<process::ProcessGroupGuard>,
     drains: Mutex<Option<Vec<JoinHandle<()>>>>,
     captured: Arc<Mutex<CapturedOutput>>,
+    terminal_output: Arc<Mutex<TerminalOutput>>,
     secrets: Vec<String>,
     next_chunk_id: AtomicU64,
     active_interactions: AtomicU64,
 }
 
 impl Session {
-    fn new(id: i64, spawned: process::SpawnedProcess, secrets: Vec<String>) -> Arc<Self> {
+    fn new(
+        id: i64,
+        spawned: process::SpawnedProcess,
+        secrets: Vec<String>,
+        command: String,
+        interactive: bool,
+    ) -> Arc<Self> {
         let tty = matches!(spawned.stdin.as_ref(), Some(process::ProcessStdin::Pty(_)));
         let captured = Arc::new(Mutex::new(CapturedOutput::default()));
+        let terminal_output = Arc::new(Mutex::new(TerminalOutput::default()));
         let drains = match spawned.output {
             process::ProcessOutput::Pipes { stdout, stderr } => vec![
                 tokio::spawn(output::drain(
                     stdout,
                     Arc::clone(&captured),
+                    None,
                     MAX_CAPTURE_BYTES,
                 )),
                 tokio::spawn(output::drain(
                     stderr,
                     Arc::clone(&captured),
+                    None,
                     MAX_CAPTURE_BYTES,
                 )),
             ],
             process::ProcessOutput::Pty(reader) => vec![output::drain_blocking(
                 reader,
                 Arc::clone(&captured),
+                Arc::clone(&terminal_output),
                 MAX_CAPTURE_BYTES,
             )],
         };
         Arc::new(Self {
             id,
+            command,
             tty,
+            interactive,
             interaction: Mutex::new(()),
             child: Mutex::new(spawned.child),
             stdin: Mutex::new(spawned.stdin),
             process_group: Mutex::new(spawned.process_group),
             drains: Mutex::new(Some(drains)),
             captured,
+            terminal_output,
             secrets,
             next_chunk_id: AtomicU64::new(1),
             active_interactions: AtomicU64::new(0),
@@ -337,11 +476,19 @@ impl Session {
     }
 
     async fn write(&self, chars: &str) -> std::io::Result<()> {
+        self.write_bytes(chars.as_bytes()).await
+    }
+
+    async fn write_bytes(&self, bytes: &[u8]) -> std::io::Result<()> {
         let mut stdin = self.stdin.lock().await;
         let stdin = stdin.as_mut().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdin is closed")
         })?;
-        stdin.write(chars.as_bytes()).await
+        stdin.write(bytes).await
+    }
+
+    async fn terminal_output(&self) -> Vec<u8> {
+        self.terminal_output.lock().await.snapshot()
     }
 
     async fn wait_for_output(
@@ -433,6 +580,23 @@ pub(super) struct CapturedOutput {
     head: Vec<u8>,
     tail: VecDeque<u8>,
     omitted_bytes: usize,
+}
+
+#[derive(Default)]
+pub(super) struct TerminalOutput {
+    bytes: VecDeque<u8>,
+}
+
+impl TerminalOutput {
+    fn push(&mut self, bytes: &[u8]) {
+        self.bytes.extend(bytes);
+        let overflow = self.bytes.len().saturating_sub(MAX_TERMINAL_OUTPUT_BYTES);
+        self.bytes.drain(..overflow);
+    }
+
+    fn snapshot(&self) -> Vec<u8> {
+        self.bytes.iter().copied().collect()
+    }
 }
 
 impl CapturedOutput {
@@ -545,11 +709,14 @@ fn duration_ms(requested: Option<i64>, default: u64, minimum: u64, maximum: u64)
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
-    use std::time::{Duration, SystemTime};
+    use std::{
+        sync::Arc,
+        time::{Duration, SystemTime},
+    };
 
-    #[cfg(unix)]
-    use super::WriteStdin;
     use super::{CapturedOutput, ExecCommand, ShellSessions};
+    #[cfg(unix)]
+    use super::{TerminalInputError, WriteStdin};
 
     #[test]
     fn bounded_capture_keeps_head_and_tail_then_accepts_the_next_poll() {
@@ -781,6 +948,202 @@ mod tests {
             format!("{}{}", first.output, second.output),
             "readygot:hello"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn human_terminal_input_is_not_blocked_by_a_model_poll() {
+        let sessions = Arc::new(ShellSessions::new());
+        let first = sessions
+            .execute(
+                ExecCommand::new(
+                    "stty -echo; read value; printf 'got:%s' \"$value\"".to_owned(),
+                    None,
+                    None,
+                    Some(false),
+                    true,
+                    Some(250),
+                    None,
+                ),
+                std::path::Path::new("/"),
+            )
+            .await;
+        assert_eq!(first.session_id, Some(1));
+
+        let polling_sessions = Arc::clone(&sessions);
+        let poll = tokio::spawn(async move {
+            polling_sessions
+                .write_stdin(WriteStdin::new(1, String::new(), Some(5_000), None))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            sessions.write_terminal(1, b"hello\n"),
+        )
+        .await
+        .expect("human input must not wait for the model's long poll")
+        .expect("PTY input should be accepted");
+
+        let result = poll.await.expect("poll task should complete");
+        assert_eq!(result.exit_code, Some(0));
+        assert!(result.output.contains("got:hello"), "{}", result.output);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_control_lists_only_ptys_and_rejects_other_sessions() {
+        let sessions = ShellSessions::new();
+        let plain = sessions
+            .execute(
+                ExecCommand::new(
+                    "sleep 30".to_owned(),
+                    None,
+                    None,
+                    Some(false),
+                    false,
+                    Some(250),
+                    None,
+                ),
+                std::path::Path::new("/"),
+            )
+            .await;
+        assert_eq!(plain.session_id, Some(1));
+        let decorative_terminal = sessions
+            .execute(
+                ExecCommand::new(
+                    "sleep 30".to_owned(),
+                    None,
+                    None,
+                    Some(false),
+                    true,
+                    Some(250),
+                    None,
+                ),
+                std::path::Path::new("/"),
+            )
+            .await;
+        assert_eq!(decorative_terminal.session_id, Some(2));
+        let terminal = sessions
+            .execute(
+                ExecCommand::new(
+                    "stty -echo; read value".to_owned(),
+                    None,
+                    None,
+                    Some(false),
+                    true,
+                    Some(250),
+                    None,
+                )
+                .interactive(true),
+                std::path::Path::new("/"),
+            )
+            .await;
+        assert_eq!(terminal.session_id, Some(3));
+
+        assert_eq!(
+            sessions.terminal_sessions().await,
+            vec![super::TerminalSessionInfo {
+                id: 3,
+                command: "stty -echo; read value".to_owned(),
+            }]
+        );
+        assert!(matches!(
+            sessions.write_terminal(1, b"nope\n").await,
+            Err(TerminalInputError::NotATerminal(1))
+        ));
+        assert!(matches!(
+            sessions.write_terminal(99, b"nope\n").await,
+            Err(TerminalInputError::UnknownSession(99))
+        ));
+
+        sessions.terminate_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_output_snapshot_does_not_consume_model_output() {
+        if !std::path::Path::new("/bin/bash").is_file() {
+            return;
+        }
+        let sessions = ShellSessions::new();
+        let first = sessions
+            .execute(
+                ExecCommand::new(
+                    r"stty -echo; printf '\033[2J\033[H> first\r\n  second'; IFS= read -r -s -n 3 key; [[ $key == $'\033[B' ]] && printf '\033[2J\033[H  first\r\n> second'; read done".to_owned(),
+                    None,
+                    Some("/bin/bash".to_owned()),
+                    Some(false),
+                    true,
+                    Some(250),
+                    None,
+                ),
+                std::path::Path::new("/"),
+            )
+            .await;
+        assert_eq!(
+            first.session_id,
+            Some(1),
+            "PTY exited early with {:?}: {}",
+            first.exit_code,
+            first.output
+        );
+        sessions
+            .write_terminal(1, b"\x1b[B")
+            .await
+            .expect("raw terminal input should be accepted");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let output = sessions
+                    .terminal_output(1)
+                    .await
+                    .expect("terminal snapshot should remain available");
+                if String::from_utf8_lossy(&output).contains("> second") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal output should reach the snapshot");
+
+        let polled = sessions
+            .write_stdin(WriteStdin::new(1, "done\n".to_owned(), Some(1_000), None))
+            .await;
+        assert!(polled.output.contains("> second"));
+        assert!(
+            String::from_utf8_lossy(
+                &sessions
+                    .terminal_output(1)
+                    .await
+                    .expect("completed terminal output should remain archived")
+            )
+            .contains("> second")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tty_commands_receive_an_interactive_term() {
+        let sessions = ShellSessions::new();
+        let result = sessions
+            .execute(
+                ExecCommand::new(
+                    "printf %s \"$TERM\"".to_owned(),
+                    None,
+                    None,
+                    Some(false),
+                    true,
+                    Some(1_000),
+                    None,
+                ),
+                std::path::Path::new("/"),
+            )
+            .await;
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.output, "xterm-256color");
     }
 
     #[cfg(unix)]

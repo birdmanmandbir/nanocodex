@@ -70,9 +70,13 @@ fn exec_command_definition(name: &'static str) -> ToolDefinition {
                     "type": "boolean",
                     "description": "True allocates a PTY for the command; false or omitted uses plain pipes."
                 },
+                "interactive": {
+                    "type": "boolean",
+                    "description": "True marks the command as requiring direct human terminal input and implies a PTY. In the TUI, keyboard input is routed to the command until it exits or the user detaches."
+                },
                 "yield_time_ms": {
                     "type": "integer",
-                    "description": "Wait before yielding output. Defaults to 10000 ms; effective range is 250-30000 ms."
+                    "description": "Wait before yielding output. Defaults to 10000 ms, or 250 ms for interactive commands; effective range is 250-30000 ms."
                 },
                 "max_output_tokens": {
                     "type": "integer",

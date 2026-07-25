@@ -5,7 +5,7 @@ use tokio::{
     sync::Mutex,
 };
 
-use super::CapturedOutput;
+use super::{CapturedOutput, TerminalOutput};
 
 const DEFAULT_MAX_OUTPUT_TOKENS: usize = 10_000;
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -25,6 +25,7 @@ pub(super) fn effective_token_limit(requested: Option<i64>) -> usize {
 pub(super) async fn drain(
     mut pipe: Option<impl AsyncRead + Unpin>,
     captured: Arc<Mutex<CapturedOutput>>,
+    terminal: Option<Arc<Mutex<TerminalOutput>>>,
     capture_limit: usize,
 ) {
     let Some(mut pipe) = pipe.take() else {
@@ -34,7 +35,12 @@ pub(super) async fn drain(
     loop {
         match pipe.read(&mut buffer).await {
             Ok(0) => return,
-            Ok(length) => captured.lock().await.push(&buffer[..length], capture_limit),
+            Ok(length) => {
+                captured.lock().await.push(&buffer[..length], capture_limit);
+                if let Some(terminal) = &terminal {
+                    terminal.lock().await.push(&buffer[..length]);
+                }
+            }
             Err(error) => {
                 captured.lock().await.push(
                     format!("failed to read command output: {error}").as_bytes(),
@@ -49,6 +55,7 @@ pub(super) async fn drain(
 pub(super) fn drain_blocking(
     mut pipe: Box<dyn Read + Send>,
     captured: Arc<Mutex<CapturedOutput>>,
+    terminal: Arc<Mutex<TerminalOutput>>,
     capture_limit: usize,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
@@ -56,9 +63,12 @@ pub(super) fn drain_blocking(
         loop {
             match pipe.read(&mut buffer) {
                 Ok(0) => return,
-                Ok(length) => captured
-                    .blocking_lock()
-                    .push(&buffer[..length], capture_limit),
+                Ok(length) => {
+                    captured
+                        .blocking_lock()
+                        .push(&buffer[..length], capture_limit);
+                    terminal.blocking_lock().push(&buffer[..length]);
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 // PTY masters commonly report EIO when their slave closes.
                 Err(_) => return,

@@ -219,6 +219,18 @@ enum Command {
         enabled: bool,
         result: oneshot::Sender<Result<()>>,
     },
+    ListTerminals {
+        result: oneshot::Sender<Result<Vec<TerminalSession>>>,
+    },
+    WriteTerminal {
+        terminal: TerminalId,
+        input: Vec<u8>,
+        result: oneshot::Sender<Result<()>>,
+    },
+    ReadTerminal {
+        terminal: TerminalId,
+        result: oneshot::Sender<Result<Vec<u8>>>,
+    },
 }
 
 enum QueuedTurn {
@@ -248,6 +260,17 @@ pub struct Nanocodex {
     session_id: Arc<str>,
     rollout: Option<RolloutInfo>,
     rollout_recorder: Option<RolloutRecorder>,
+}
+
+/// Opaque identifier for a live terminal owned by one agent driver.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct TerminalId(i64);
+
+/// Snapshot of a live interactive terminal owned by an agent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalSession {
+    pub id: TerminalId,
+    pub command: String,
 }
 
 /// Weak child-agent capability for the driver that owns one tool runtime.
@@ -392,6 +415,56 @@ impl Nanocodex {
             },
             result: receiver,
         })
+    }
+
+    /// Returns shell sessions explicitly marked for direct human interaction.
+    ///
+    /// Completed sessions and PTYs created only for terminal rendering are
+    /// omitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before the first turn initializes the tool runtime or
+    /// after the agent driver has stopped.
+    pub async fn terminal_sessions(&self) -> Result<Vec<TerminalSession>> {
+        request_command(&self.commands, |result| Command::ListTerminals { result }).await
+    }
+
+    /// Writes exact bytes directly to one retained PTY without adding them to
+    /// model history or routing them through a model tool call.
+    /// Input content is deliberately omitted from tracing because this path may
+    /// carry credentials entered by a human.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown or completed terminal, a non-TTY shell
+    /// session, an uninitialized runtime, or a stopped driver.
+    pub async fn write_terminal(
+        &self,
+        terminal: TerminalId,
+        input: impl Into<Vec<u8>>,
+    ) -> Result<()> {
+        let input = input.into();
+        request_command(&self.commands, |result| Command::WriteTerminal {
+            terminal,
+            input,
+            result,
+        })
+        .await
+    }
+
+    /// Returns a bounded, non-consuming snapshot of a retained PTY's output.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown terminal, an uninitialized runtime, or
+    /// a stopped driver.
+    pub async fn terminal_output(&self, terminal: TerminalId) -> Result<Vec<u8>> {
+        request_command(&self.commands, |result| Command::ReadTerminal {
+            terminal,
+            result,
+        })
+        .await
     }
 
     /// Changes the reasoning effort for subsequently accepted turns.
@@ -884,6 +957,7 @@ where
                 self.global_instructions.clone(),
             )
         };
+        let mut tool_control = model.tool_control();
         let mut turn_index = 0_u64;
         let mut latest_fork_checkpoint = inherited_checkpoint;
         let mut queued_turns = VecDeque::new();
@@ -988,15 +1062,33 @@ where
                     drop(result.send(Ok(())));
                     continue;
                 }
-                handle_idle_command(
-                    command,
-                    latest_fork_checkpoint.as_ref(),
-                    &self.spawner,
-                    default_thinking,
-                    default_fast_mode,
-                    session_id.as_str(),
-                    self.workspace.clone(),
-                );
+                match command {
+                    Command::ListTerminals { result } => {
+                        let outcome = terminal_sessions(&tool_control).await;
+                        drop(result.send(outcome));
+                    }
+                    Command::WriteTerminal {
+                        terminal,
+                        input,
+                        result,
+                    } => {
+                        let outcome = write_terminal(&tool_control, terminal, &input).await;
+                        drop(result.send(outcome));
+                    }
+                    Command::ReadTerminal { terminal, result } => {
+                        let outcome = terminal_output(&tool_control, terminal).await;
+                        drop(result.send(outcome));
+                    }
+                    command => handle_idle_command(
+                        command,
+                        latest_fork_checkpoint.as_ref(),
+                        &self.spawner,
+                        default_thinking,
+                        default_fast_mode,
+                        session_id.as_str(),
+                        self.workspace.clone(),
+                    ),
+                }
                 continue;
             };
             let thinking = thinking.unwrap_or(default_thinking);
@@ -1144,6 +1236,22 @@ where
                                 default_fast_mode = enabled;
                                 drop(result.send(Ok(())));
                             }
+                            Some(Command::ListTerminals { result }) => {
+                                let outcome = terminal_sessions(&tool_control).await;
+                                drop(result.send(outcome));
+                            }
+                            Some(Command::WriteTerminal {
+                                terminal,
+                                input,
+                                result,
+                            }) => {
+                                let outcome = write_terminal(&tool_control, terminal, &input).await;
+                                drop(result.send(outcome));
+                            }
+                            Some(Command::ReadTerminal { terminal, result }) => {
+                                let outcome = terminal_output(&tool_control, terminal).await;
+                                drop(result.send(outcome));
+                            }
                             None => commands_open = false,
                         }
                     }
@@ -1195,6 +1303,7 @@ where
                         prompt_cache.clone(),
                         prepared,
                     );
+                    tool_control = model.tool_control();
                     (Err(NanocodexError::TurnCancelled), true)
                 }
                 Err(error) => (Err(error), false),
@@ -1356,8 +1465,66 @@ fn handle_idle_command<S>(
         Command::SetThinking { result, .. } | Command::SetFastMode { result, .. } => {
             drop(result.send(Ok(())));
         }
-        Command::Prompt { .. } => {}
+        Command::ListTerminals { .. }
+        | Command::WriteTerminal { .. }
+        | Command::ReadTerminal { .. }
+        | Command::Prompt { .. } => {}
     }
+}
+
+fn current_tool_control(
+    slot: &crate::model::agent::ToolControlSlot,
+) -> Result<nanocodex_tools::ToolRuntimeControl> {
+    slot.read()
+        .ok()
+        .and_then(|control| control.clone())
+        .ok_or(NanocodexError::TerminalRuntimeUnavailable)
+}
+
+async fn terminal_sessions(
+    slot: &crate::model::agent::ToolControlSlot,
+) -> Result<Vec<TerminalSession>> {
+    let control = current_tool_control(slot)?;
+    Ok(control
+        .terminal_sessions()
+        .await
+        .into_iter()
+        .map(|session| TerminalSession {
+            id: TerminalId(session.id),
+            command: session.command,
+        })
+        .collect())
+}
+
+async fn write_terminal(
+    slot: &crate::model::agent::ToolControlSlot,
+    terminal: TerminalId,
+    input: &[u8],
+) -> Result<()> {
+    trace_private_terminal_write(terminal, input.len());
+    current_tool_control(slot)?
+        .write_terminal(terminal.0, input)
+        .await?;
+    Ok(())
+}
+
+// Accept metadata only so private input cannot accidentally enter this event.
+fn trace_private_terminal_write(terminal: TerminalId, input_bytes: usize) {
+    info!(
+        terminal.session_id = terminal.0,
+        input_bytes,
+        sensitive = true,
+        "writing private human input to tool terminal"
+    );
+}
+
+async fn terminal_output(
+    slot: &crate::model::agent::ToolControlSlot,
+    terminal: TerminalId,
+) -> Result<Vec<u8>> {
+    Ok(current_tool_control(slot)?
+        .terminal_output(terminal.0)
+        .await?)
 }
 
 impl<S> BranchSpawner<S>
@@ -1717,12 +1884,48 @@ fn rollout_workspace(workspace: Option<&str>) -> std::io::Result<PathBuf> {
 mod tests {
     use std::{
         future::{Pending, Ready, pending},
+        io::Write,
+        sync::Mutex,
         time::Duration,
     };
 
     use super::*;
     use tempfile::tempdir;
     use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer, timeout::TimeoutLayer};
+
+    struct TraceWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for TraceWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn private_terminal_trace_omits_input_content() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::clone(&captured);
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || TraceWriter(Arc::clone(&writer)))
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let secret = b"swordfish";
+
+        tracing::dispatcher::with_default(&dispatch, || {
+            trace_private_terminal_write(TerminalId(7), secret.len());
+        });
+
+        let output = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("input_bytes=9"));
+        assert!(!output.contains("swordfish"));
+    }
 
     #[derive(Clone)]
     struct NeverCalled;

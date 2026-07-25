@@ -81,6 +81,7 @@ tracing-opentelemetry = "0.32.0"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt", "json"] }
 unicode-segmentation = "1.13"
 unicode-width = "0.2"
+vt100 = "0.15.2"
 url = "2.5.7"
 uuid = { version = "1", features = ["v7"] }
 vergen = { version = "8", default-features = false }

@@ -1,15 +1,14 @@
+use super::{
+    app::{App, Conversation, PaneId},
+    composer::ComposerLayout,
+    transcript::InlineEdit,
+};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph},
-};
-
-use super::{
-    app::{App, Conversation, PaneId},
-    composer::ComposerLayout,
-    transcript::InlineEdit,
 };
 
 pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
@@ -21,17 +20,25 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
     };
     app.set_composer_width(composer_width);
     let composer_layout = ComposerLayout::new(&app.input, composer_width);
-    let composer_height = if app.historical_editor_active() || app.branch_navigator_active() {
+    let composer_height = if app.terminal_input_active() {
+        terminal_composer_height(
+            area.height,
+            pending_height(app),
+            terminal_occupied_rows(app.terminal_screen()),
+        )
+    } else if app.historical_editor_active() || app.branch_navigator_active() {
         3
     } else {
         composer_height(&composer_layout)
     };
-    let cursor = composer_layout.cursor_position(&app.input, app.cursor);
-    app.settle_composer_viewport(
-        cursor.row,
-        composer_layout.row_count(),
-        usize::from(composer_height.saturating_sub(2)),
-    );
+    if !app.terminal_input_active() {
+        let cursor = composer_layout.cursor_position(&app.input, app.cursor);
+        app.settle_composer_viewport(
+            cursor.row,
+            composer_layout.row_count(),
+            usize::from(composer_height.saturating_sub(2)),
+        );
+    }
     let pending_height = pending_height(app);
     let [
         header_area,
@@ -52,9 +59,127 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
     let mut selectable_areas = SelectableAreas::default();
     render_transcripts(frame, app, transcript_area, &mut selectable_areas);
     render_pending(frame, app, pending_area);
-    selectable_areas.push(render_composer(frame, app, composer_area, &composer_layout));
-    render_footer(frame, app, footer_area);
+    if app.terminal_input_active() {
+        render_attached_terminal(frame, app, composer_area);
+        render_terminal_footer(frame, footer_area);
+    } else {
+        selectable_areas.push(render_composer(frame, app, composer_area, &composer_layout));
+        render_footer(frame, app, footer_area);
+    }
     app.render_mouse_selection(frame.buffer_mut(), selectable_areas.as_slice());
+}
+
+fn render_attached_terminal(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let command = app.terminal_input_command().unwrap_or("terminal");
+    let block = Block::default()
+        .title(format!(" Terminal input · {command} "))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let rows = inner.height;
+    let cols = inner.width.min(80);
+    let Some(screen) = app.terminal_screen() else {
+        return;
+    };
+    let (cursor_row, cursor_column) = screen.cursor_position();
+    let first_row = cursor_row.saturating_add(1).saturating_sub(rows);
+    frame.render_widget(
+        Paragraph::new(terminal_screen_text(screen, first_row, rows, cols)),
+        inner,
+    );
+    let visible_cursor_row = cursor_row.saturating_sub(first_row);
+    if visible_cursor_row < inner.height && cursor_column < inner.width {
+        frame.set_cursor_position(Position::new(
+            inner.x + cursor_column,
+            inner.y + visible_cursor_row,
+        ));
+    }
+}
+
+fn render_terminal_footer(frame: &mut Frame<'_>, area: Rect) {
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            " Composer routed to terminal · Ctrl+] detach · input content is not traced ",
+            Style::default().fg(Color::DarkGray),
+        )),
+        area,
+    );
+}
+
+fn terminal_screen_text(
+    screen: &vt100::Screen,
+    first_row: u16,
+    rows: u16,
+    cols: u16,
+) -> Text<'static> {
+    let lines = (first_row..first_row.saturating_add(rows))
+        .map(|row| {
+            let spans = (0..cols)
+                .filter_map(|column| screen.cell(row, column))
+                .filter(|cell| !cell.is_wide_continuation())
+                .map(|cell| {
+                    let contents = if cell.has_contents() {
+                        cell.contents()
+                    } else {
+                        " ".to_owned()
+                    };
+                    Span::styled(contents, terminal_cell_style(cell))
+                })
+                .collect::<Vec<_>>();
+            Line::from(spans)
+        })
+        .collect::<Vec<_>>();
+    Text::from(lines)
+}
+
+fn terminal_composer_height(screen_height: u16, pending_height: u16, occupied_rows: u16) -> u16 {
+    let available = screen_height
+        .saturating_sub(pending_height)
+        .saturating_sub(6);
+    occupied_rows.saturating_add(2).clamp(3, available.max(3))
+}
+
+fn terminal_occupied_rows(screen: Option<&vt100::Screen>) -> u16 {
+    let Some(screen) = screen else {
+        return 1;
+    };
+    let content_rows = (0..24)
+        .rev()
+        .find(|row| {
+            (0..80).any(|column| {
+                screen
+                    .cell(*row, column)
+                    .is_some_and(vt100::Cell::has_contents)
+            })
+        })
+        .map_or(0, |row| row + 1);
+    content_rows.max(screen.cursor_position().0.saturating_add(1))
+}
+
+fn terminal_cell_style(cell: &vt100::Cell) -> Style {
+    let mut foreground = terminal_color(cell.fgcolor());
+    let mut background = terminal_color(cell.bgcolor());
+    if cell.inverse() {
+        std::mem::swap(&mut foreground, &mut background);
+    }
+    let mut modifiers = Modifier::empty();
+    modifiers.set(Modifier::BOLD, cell.bold());
+    modifiers.set(Modifier::ITALIC, cell.italic());
+    modifiers.set(Modifier::UNDERLINED, cell.underline());
+    Style::default()
+        .fg(foreground)
+        .bg(background)
+        .add_modifier(modifiers)
+}
+
+const fn terminal_color(color: vt100::Color) -> Color {
+    match color {
+        vt100::Color::Default => Color::Reset,
+        vt100::Color::Idx(index) => Color::Indexed(index),
+        vt100::Color::Rgb(red, green, blue) => Color::Rgb(red, green, blue),
+    }
 }
 
 #[derive(Default)]
@@ -351,7 +476,10 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect, layout: &Compos
     let visible_end = vertical_scroll.saturating_add(usize::from(inner.height));
     let lines = (vertical_scroll..visible_end)
         .filter_map(|row| layout.row(row))
-        .map(|range| Line::raw(&app.input[range.clone()]))
+        .map(|range| {
+            let line = &app.input[range.clone()];
+            Line::raw(line)
+        })
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 
@@ -554,8 +682,57 @@ mod tests {
         style::{Color, Modifier},
     };
 
-    use super::render;
+    use super::{
+        render, terminal_cell_style, terminal_composer_height, terminal_occupied_rows,
+        terminal_screen_text,
+    };
     use crate::tui::{app::App, transcript::TranscriptItem};
+
+    #[test]
+    fn attached_terminal_preserves_inverse_selection_style() {
+        let mut parser = vt100::Parser::new(2, 20, 0);
+        parser.process(b"\x1b[31;44;7mselected");
+        let style = terminal_cell_style(parser.screen().cell(0, 0).unwrap());
+
+        assert_eq!(style.fg, Some(Color::Indexed(4)));
+        assert_eq!(style.bg, Some(Color::Indexed(1)));
+    }
+
+    #[test]
+    fn attached_terminal_uses_only_the_composer_region() {
+        assert_eq!(terminal_composer_height(40, 0, 4), 6);
+        assert_eq!(terminal_composer_height(12, 0, 20), 6);
+        assert_eq!(terminal_composer_height(12, 3, 20), 3);
+    }
+
+    #[test]
+    fn attached_terminal_grows_to_its_occupied_rows() {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(b"one\r\ntwo\r\nthree\r\nfour");
+
+        assert_eq!(terminal_occupied_rows(Some(parser.screen())), 4);
+        assert_eq!(terminal_composer_height(40, 0, 4), 6);
+    }
+
+    #[test]
+    fn compact_terminal_viewport_follows_the_child_cursor() {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        for line in 0..12 {
+            parser.process(format!("line {line}\r\n").as_bytes());
+        }
+        let (cursor_row, _) = parser.screen().cursor_position();
+        let rows = 4;
+        let first_row = cursor_row.saturating_add(1).saturating_sub(rows);
+        let rendered = terminal_screen_text(parser.screen(), first_row, rows, 20)
+            .lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("line 11"), "{rendered:?}");
+        assert!(!rendered.contains("line 0"), "{rendered:?}");
+    }
 
     #[test]
     fn btw_renders_as_a_side_by_side_focused_pane() {

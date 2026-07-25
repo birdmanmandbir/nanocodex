@@ -629,7 +629,12 @@ Use `nanocodex --rollouts false ...` (or `NANOCODEX_ROLLOUTS=false`) when a CLI
 consumer does not want local session recording.
 
 The TUI retains one session across prompts. Enter submits, Tab explicitly queues
-a follow-up while work is active, and `/cancel` stops the focused turn. At any
+a follow-up while work is active, and `/cancel` stops the focused turn. An
+`exec_command` call with `interactive: true` automatically routes the composer
+to its PTY for passwords, prompts, and raw keyboard navigation; `interactive`
+implies `tty`. The draft is preserved, normal composer input returns when the
+process exits, and Ctrl+] detaches early. Attached keystroke content is
+deliberately omitted from tracing because it may contain credentials. At any
 safe model/tool boundary, `/btw <question>` opens a fast fork in a vertical pane
 while the mainline continues. The fork inherits the last completed response ID
 plus complete tool results and applied steers after that response; partial model
