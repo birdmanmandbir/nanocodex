@@ -505,7 +505,7 @@ let responses = Responses::builder()
 let (agent, events) = Nanocodex::builder(api_key)
     .codex_home("/home/me/.codex")
     .instructions("You are a concise repository maintenance agent.")
-    .thinking(Thinking::Medium)
+    .thinking(Thinking::High)
     .workspace("/work/project")
     .tools(tools)
     .responses(responses)
@@ -534,6 +534,12 @@ Recording appends Codex's model-context response items and its legacy turn and
 message events after each completed or cancelled turn, so both resumed model
 context and the visible Codex transcript are restored. Compaction uses explicit
 replacement-history records, and failed partial output is excluded.
+`nanocodex resume <thread-id>` discovers the same rollout beneath
+`$CODEX_HOME/sessions` (or `archived_sessions`) that `codex resume` uses and
+materializes its latest replacement-history boundary plus subsequent response
+items. No Nanocodex-specific sidecar is required, so Codex-created threads can
+be continued directly. Pass `--prompt "..."` to submit a follow-on prompt as
+soon as the TUI opens.
 The rollout writer projects the same committed session boundary exposed by
 `TurnResult::snapshot()` rather than maintaining a second conversation state.
 `flush_rollout()` retries pending writes and provides a durability barrier.
@@ -616,6 +622,27 @@ nanocodex auth login
 nanocodex --auth-file "${CODEX_HOME:-$HOME/.codex}/auth.json"
 ```
 
+The CLI merges enabled MCP servers from
+`${CODEX_HOME:-$HOME/.codex}/config.toml` with its deferred
+`openaiDeveloperDocs`, `tempo`, and `cloudflare` defaults. Explicit `--mcp` and
+`--mcp-stdio` entries take precedence over Codex config, and Codex entries take
+precedence over same-named defaults. Their catalogs stay out of the stable
+model prompt until Code Mode calls `tool_search`. Disable the built-in set with
+`--mcp-defaults false` and Codex config loading with
+`--mcp-codex-config false`; the environment equivalents are
+`NANOCODEX_MCP_DEFAULTS=false` and `NANOCODEX_MCP_CODEX_CONFIG=false`.
+Streamable HTTP servers also reuse Codex's file-backed MCP OAuth credentials.
+Expired access tokens refresh through the server's OAuth metadata and rotated
+credentials are persisted back to `.credentials.json` under the same
+cross-process lock as Codex.
+
+Provider prewarming is scheduled before agent construction returns, so the TUI
+does not wait for HTTP client setup, DNS/TLS, MCP handshakes, `tools/list`, or
+BM25 indexing. Discovery and index construction run in parallel in the
+background while the terminal is idle. Activating a deferred tool changes only
+the nested Code Mode runtime; the model-visible `exec`/`tool_search` prefix stays
+byte-stable for prompt-cache reuse.
+
 The CLI records Codex-compatible rollouts beneath
 `${CODEX_HOME:-$HOME/.codex}/sessions` by default. The `request_id` in headless
 JSONL is the resumable UUID, so a completed handoff is:
@@ -640,7 +667,10 @@ while the mainline continues. The fork inherits the last completed response ID
 plus complete tool results and applied steers after that response; partial model
 output and unmatched tool calls remain excluded. With local telemetry running,
 `/trace` opens Jaeger filtered to every turn in the focused main or `/btw`
-session. The complete keybinding reference, retained Amp and Codex research, and
+session. `/mcp login <server>` opens browser OAuth and hot-reloads that server's
+tools into the running session after the callback; `/mcp reload <server>` retries
+discovery without restarting the TUI. The complete keybinding reference,
+retained Amp and Codex research, and
 prioritized Ratatui backlog live in
 [`docs/TUI_NOTES.md`](docs/TUI_NOTES.md). The headless `nanocodex run` adapter
 emits flushed JSONL for scripts and Harbor.
@@ -701,6 +731,33 @@ The smaller boundary is the feature. A caller builds an agent, receives
 `(Nanocodex, AgentEvents)`, sends prompts through a cheap cloneable handle, and
 awaits independently owned `TurnResult`s. The CLI, Harbor adapter, Python
 binding, and Rust/WASM binding all consume that same API.
+
+### Codex request parity
+
+The deterministic differential drives stock Codex and Nanocodex through basic
+tools, continued PTY shells, bounded output, failures, images, WebSocket
+reconnect/replay, automatic compaction, and SIGINT cleanup:
+
+```bash
+cargo build -p nanocodex-bin
+python3 benchmarks/codex_request_parity.py \
+  --codex-bin ~/github/openai/codex/codex-rs/target/debug/codex \
+  --nanocodex-bin target/debug/nanocodex \
+  --output /tmp/nanocodex-request-parity.json
+```
+
+The default command succeeds when both implementations complete every scenario,
+preserve stable request identity, replay or compact complete history, and clean
+up cancelled descendants. Add `--check` when exact normalized request and
+transport equality is required; it currently reports the documented
+WebSocket-to-HTTPS fallback. App-owned internal turn metadata is an explicit
+normalization exclusion. Use repeated `--scenario <name>` flags to run only
+selected cases.
+
+Nanocodex deliberately defaults to `Thinking::High`; stock Codex currently
+defaults the bundled Sol model to `low`. The differential passes the same
+explicit effort to both binaries so it tests harness behavior rather than that
+product-policy choice.
 
 ### How Fast?
 

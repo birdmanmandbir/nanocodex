@@ -1,7 +1,7 @@
 use std::io;
 
 use clap::{Args, builder::NonEmptyStringValueParser};
-use eyre::Result;
+use eyre::{Result, eyre};
 
 use crate::config::AgentArgs;
 
@@ -18,23 +18,44 @@ pub(crate) struct Run {
 
 impl Run {
     pub(crate) async fn run(self, config: AgentArgs) -> Result<()> {
-        let configured = config.build()?;
+        let configured = config.build().await?;
         let handle = configured.handle;
         let mut events = configured.events;
-        let result = async {
+        let run_result: Result<()> = async {
             for _ in 0..self.repeat {
                 let turn = handle.prompt(self.prompt.clone()).await?;
-                events.write_turn_jsonl(io::stdout()).await?;
-                turn.result().await?;
+                let control = turn.control();
+                let completion = async {
+                    events.write_turn_jsonl(io::stdout()).await?;
+                    turn.result().await?;
+                    Ok::<(), eyre::Report>(())
+                };
+                tokio::pin!(completion);
+                tokio::select! {
+                    result = &mut completion => result?,
+                    signal = tokio::signal::ctrl_c() => {
+                        signal?;
+                        control.cancel().await?;
+                        let _ = completion.await;
+                        return Err(eyre!("interrupted"));
+                    }
+                }
                 handle.flush_rollout().await?;
             }
             Ok(())
         }
         .await;
         drop(handle);
+        drop(events);
         if let Some(child_agents) = configured.child_agents {
             child_agents.shutdown().await;
         }
-        result
+        let shutdown_result = if let Some(adapter) = configured.mpp_adapter {
+            adapter.shutdown().await
+        } else {
+            Ok(())
+        };
+        run_result?;
+        shutdown_result
     }
 }

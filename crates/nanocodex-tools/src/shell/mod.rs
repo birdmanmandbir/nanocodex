@@ -7,6 +7,7 @@ pub(crate) use tool::{ExecCommandHandler, WriteStdinHandler};
 
 use std::{
     collections::{HashMap, VecDeque},
+    ffi::OsString,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -15,6 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use rand::{Rng, rng};
 use serde::Serialize;
 use tokio::{sync::Mutex, task::JoinHandle, time::timeout};
 
@@ -54,8 +56,8 @@ pub(crate) struct ExecCommand {
     login: Option<bool>,
     tty: bool,
     interactive: bool,
-    yield_time_ms: Option<i64>,
-    max_output_tokens: Option<i64>,
+    yield_time_ms: Option<u64>,
+    max_output_tokens: Option<usize>,
 }
 
 impl ExecCommand {
@@ -65,8 +67,8 @@ impl ExecCommand {
         shell: Option<String>,
         login: Option<bool>,
         tty: bool,
-        yield_time_ms: Option<i64>,
-        max_output_tokens: Option<i64>,
+        yield_time_ms: Option<u64>,
+        max_output_tokens: Option<usize>,
     ) -> Self {
         Self {
             script,
@@ -87,18 +89,18 @@ impl ExecCommand {
 }
 
 pub(crate) struct WriteStdin {
-    session_id: i64,
+    session_id: i32,
     chars: String,
-    yield_time_ms: Option<i64>,
-    max_output_tokens: Option<i64>,
+    yield_time_ms: Option<u64>,
+    max_output_tokens: Option<usize>,
 }
 
 impl WriteStdin {
     pub(crate) const fn new(
-        session_id: i64,
+        session_id: i32,
         chars: String,
-        yield_time_ms: Option<i64>,
-        max_output_tokens: Option<i64>,
+        yield_time_ms: Option<u64>,
+        max_output_tokens: Option<usize>,
     ) -> Self {
         Self {
             session_id,
@@ -127,14 +129,21 @@ pub(crate) struct ShellSessions {
     sessions: Mutex<SessionStore>,
     next_session_id: AtomicI64,
     default_shell: selection::Shell,
+    environment: Arc<Vec<(OsString, OsString)>>,
 }
 
 impl ShellSessions {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
+        Self::with_environment(Arc::new(Vec::new()))
+    }
+
+    pub(crate) fn with_environment(environment: Arc<Vec<(OsString, OsString)>>) -> Self {
         Self {
             sessions: Mutex::new(SessionStore::default()),
             next_session_id: AtomicI64::new(1),
             default_shell: selection::default_user_shell(),
+            environment,
         }
     }
 
@@ -154,7 +163,7 @@ impl ShellSessions {
             || self.default_shell.clone(),
             selection::get_shell_by_model_provided_path,
         );
-        let (environment, secrets) = process::sanitized_environment();
+        let (environment, secrets) = process::sanitized_environment(&self.environment);
         let spawned = match process::spawn(
             &command.script,
             &workdir,
@@ -200,7 +209,8 @@ impl ShellSessions {
 
     pub(crate) async fn write_stdin(&self, request: WriteStdin) -> ExecCommandResult {
         let started_at = Instant::now();
-        let session = self.sessions.lock().await.get(request.session_id);
+        let session_id = i64::from(request.session_id);
+        let session = self.sessions.lock().await.get(session_id);
         let Some(session) = session else {
             return ExecCommandResult::failed(
                 started_at.elapsed(),
@@ -403,7 +413,6 @@ struct Session {
     captured: Arc<Mutex<CapturedOutput>>,
     terminal_output: Arc<Mutex<TerminalOutput>>,
     secrets: Vec<String>,
-    next_chunk_id: AtomicU64,
     active_interactions: AtomicU64,
 }
 
@@ -453,7 +462,6 @@ impl Session {
             captured,
             terminal_output,
             secrets,
-            next_chunk_id: AtomicU64::new(1),
             active_interactions: AtomicU64::new(0),
         })
     }
@@ -494,7 +502,7 @@ impl Session {
     async fn wait_for_output(
         &self,
         yield_time: Duration,
-        max_output_tokens: Option<i64>,
+        max_output_tokens: Option<usize>,
         started_at: Instant,
     ) -> ExecCommandResult {
         let status = {
@@ -520,11 +528,7 @@ impl Session {
         };
         let (output, original_token_count) = self.take_output(max_output_tokens).await;
         ExecCommandResult {
-            chunk_id: Some(format!(
-                "{}-{}",
-                self.id,
-                self.next_chunk_id.fetch_add(1, Ordering::Relaxed)
-            )),
+            chunk_id: Some(generate_chunk_id()),
             wall_time_seconds: started_at.elapsed().as_secs_f64(),
             exit_code,
             session_id: exit_code.is_none().then_some(self.id),
@@ -550,7 +554,7 @@ impl Session {
         }
     }
 
-    async fn take_output(&self, max_output_tokens: Option<i64>) -> (String, Option<usize>) {
+    async fn take_output(&self, max_output_tokens: Option<usize>) -> (String, Option<usize>) {
         let captured = self.captured.lock().await.take();
         let raw = String::from_utf8_lossy(&captured.with_omission_marker()).into_owned();
         let limit = output::effective_token_limit(max_output_tokens);
@@ -699,24 +703,42 @@ fn resolve_workdir(workspace: &Path, requested: Option<&str>) -> PathBuf {
     }
 }
 
-fn duration_ms(requested: Option<i64>, default: u64, minimum: u64, maximum: u64) -> Duration {
-    let requested = requested
-        .and_then(|value| u64::try_from(value).ok())
-        .unwrap_or(default);
+fn duration_ms(requested: Option<u64>, default: u64, minimum: u64, maximum: u64) -> Duration {
+    let requested = requested.unwrap_or(default);
     Duration::from_millis(requested.clamp(minimum, maximum))
+}
+
+fn generate_chunk_id() -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut rng = rng();
+    (0..6)
+        .map(|_| char::from(HEX[rng.random_range(0..HEX.len())]))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
     use std::{
+        ffi::OsString,
         sync::Arc,
         time::{Duration, SystemTime},
     };
 
-    use super::{CapturedOutput, ExecCommand, ShellSessions};
+    use super::{CapturedOutput, ExecCommand, ShellSessions, generate_chunk_id};
     #[cfg(unix)]
     use super::{TerminalInputError, WriteStdin};
+
+    #[test]
+    fn chunk_ids_match_codex_shape() {
+        let chunk_id = generate_chunk_id();
+        assert_eq!(chunk_id.len(), 6);
+        assert!(
+            chunk_id
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+        );
+    }
 
     #[test]
     fn bounded_capture_keeps_head_and_tail_then_accepts_the_next_poll() {
@@ -730,6 +752,46 @@ mod tests {
         captured.push(b"next", 4);
         let second = captured.take();
         assert_eq!(second.with_omission_marker(), b"next");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_process_receives_explicit_environment_overrides() {
+        let sessions = ShellSessions::with_environment(Arc::new(vec![
+            (
+                OsString::from("NANOCODEX_EGRESS_TEST"),
+                OsString::from("injected"),
+            ),
+            (
+                OsString::from("HTTPS_PROXY"),
+                OsString::from("http://nanocodex:proxy-secret-value@127.0.0.1:1234"),
+            ),
+            (
+                OsString::from("NANOCODEX_MPP_EGRESS_PASSWORD"),
+                OsString::from("proxy-secret-value"),
+            ),
+        ]));
+
+        let result = sessions
+            .execute(
+                ExecCommand::new(
+                    "printf '%s|%s' \"$NANOCODEX_EGRESS_TEST\" \"$HTTPS_PROXY\"".to_owned(),
+                    None,
+                    Some("/bin/sh".to_owned()),
+                    Some(false),
+                    false,
+                    Some(1_000),
+                    None,
+                ),
+                std::path::Path::new("/"),
+            )
+            .await;
+
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(
+            result.output,
+            "injected|http://nanocodex:[REDACTED]@127.0.0.1:1234"
+        );
     }
 
     #[cfg(unix)]
@@ -753,7 +815,7 @@ mod tests {
         assert_eq!(first.session_id, Some(1));
 
         let second = sessions
-            .write_stdin(WriteStdin::new(1, "hello\n".to_owned(), Some(1_000), None))
+            .write_stdin(WriteStdin::new(1, "hello\n".to_owned(), Some(5_000), None))
             .await;
         assert_eq!(second.exit_code, Some(0));
         assert_eq!(second.output, "got:hello");
@@ -813,7 +875,7 @@ mod tests {
                     None,
                     Some(false),
                     false,
-                    Some(1_000),
+                    Some(5_000),
                     None,
                 ),
                 std::path::Path::new("/"),

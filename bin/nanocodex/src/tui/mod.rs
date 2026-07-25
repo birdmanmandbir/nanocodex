@@ -14,6 +14,7 @@ mod view;
 
 use std::{
     collections::VecDeque,
+    path::PathBuf,
     process::{Command, Stdio},
     sync::Arc,
     time::{Duration, Instant},
@@ -25,8 +26,8 @@ use crossterm::event::{
 use eyre::{Result, WrapErr};
 use futures_util::StreamExt;
 use nanocodex::{
-    AgentEvent, AgentEvents, Nanocodex, NanocodexError, TerminalId,
-    TerminalSession as AgentTerminalSession, TimedAgentEvent, TurnControl, TurnResult,
+    AgentEvent, AgentEvents, DurableSession, McpHandle, Nanocodex, NanocodexError, TerminalId,
+    TerminalSession as AgentTerminalSession, Thinking, TimedAgentEvent, TurnControl, TurnResult,
 };
 use tokio::{
     sync::mpsc,
@@ -35,7 +36,7 @@ use tokio::{
 use tracing::{Instrument, info_span};
 
 use self::{
-    app::{App, EscapeAction, PaneId, SubmittedPrompt},
+    app::{App, EscapeAction, PaneId, ReasoningPickerAction, SubmittedPrompt},
     notification::Notifier,
     scheduler::{RenderScheduler, STREAM_FRAME_INTERVAL},
     telemetry::{StreamTelemetry, ViewTelemetry},
@@ -104,6 +105,18 @@ enum WorkerCommand {
     },
     SwitchMainBranch {
         id: u64,
+    },
+    SetFastMode {
+        enabled: bool,
+    },
+    SetThinking {
+        thinking: Thinking,
+    },
+    McpLogin {
+        name: String,
+    },
+    McpReload {
+        name: String,
     },
 }
 
@@ -208,6 +221,30 @@ enum WorkerEvent {
     },
     MainBranchEventStreamClosed {
         id: u64,
+    },
+    FastModeChanged {
+        enabled: bool,
+    },
+    FastModeChangeFailed {
+        error: String,
+    },
+    ThinkingChanged {
+        thinking: Thinking,
+    },
+    ThinkingChangeFailed {
+        error: String,
+    },
+    McpLoginStarted {
+        name: String,
+    },
+    McpReady {
+        name: String,
+        tool_count: usize,
+        authenticated: bool,
+    },
+    McpFailed {
+        name: String,
+        error: String,
     },
 }
 
@@ -481,26 +518,58 @@ enum Submission {
     CloseBtw,
     Cancel,
     Trace,
+    Fast(Option<bool>),
+    ReasoningPicker,
+    McpLogin(String),
+    McpReload(String),
+    InvalidCommand(String),
 }
 
-pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Result<()> {
-    let cwd = config
-        .cwd()
-        .canonicalize()
-        .wrap_err("failed to resolve the working directory")?;
-    let configured = config.build()?;
+#[allow(
+    clippy::too_many_lines,
+    reason = "the ordered terminal, agent, worker, and render event loop is intentionally cohesive"
+)]
+pub(crate) async fn run(
+    config: AgentArgs,
+    initial_prompt: Option<String>,
+    resume: Option<DurableSession>,
+) -> Result<()> {
+    let initial_thinking = config.thinking();
+    let restored_transcript = resume
+        .as_ref()
+        .map(|session| session.transcript().to_vec())
+        .unwrap_or_default();
+    let cwd = resume
+        .as_ref()
+        .map(|session| PathBuf::from(session.workspace()))
+        .unwrap_or(resolve_cwd(&config)?);
+    let configured = if let Some(session) = resume {
+        config.build_resumed(session).await?
+    } else {
+        config.build().await?
+    };
     let agent = configured.handle;
     let mut agent_events = configured.events;
     let root_session_id = Arc::<str>::from(agent_events.request_id());
-    let _child_agents = configured.child_agents;
+    let child_agents = configured.child_agents;
+    let mpp_adapter = configured.mpp_adapter;
+    let mcp = configured.mcp;
     let (worker_tx, worker_rx) = mpsc::unbounded_channel();
     let (update_tx, mut update_rx) = mpsc::unbounded_channel();
-    spawn_agent_worker(agent, Arc::clone(&root_session_id), worker_rx, update_tx);
+    let worker = spawn_agent_worker(
+        agent,
+        Arc::clone(&root_session_id),
+        mcp,
+        worker_rx,
+        update_tx,
+    );
 
     let mut terminal = TerminalSession::enter().wrap_err("failed to initialize the terminal")?;
     let mut input_events = EventStream::new();
     let mut ticker = ui_ticker();
-    let mut ui = UiModel::new(App::new(cwd), Arc::clone(&root_session_id));
+    let mut app = App::new(cwd).with_thinking(initial_thinking);
+    app.restore_transcript(restored_transcript);
+    let mut ui = UiModel::new(app, Arc::clone(&root_session_id));
     let mut scheduler = RenderScheduler::new(STREAM_FRAME_INTERVAL, Instant::now());
     let mut stream_telemetry = StreamTelemetry::default();
     let mut view_telemetry = ViewTelemetry::new(Arc::clone(&root_session_id));
@@ -508,18 +577,19 @@ pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Re
 
     submit_initial_prompt(&mut ui.app, &root_session_id, &worker_tx, initial_prompt)?;
 
-    loop {
-        view_telemetry.observe(&ui.app);
-        render_due_frame(
-            &mut ui,
-            &mut terminal,
-            &mut scheduler,
-            &mut stream_telemetry,
-            &mut notifier,
-        )?;
+    let loop_result: Result<()> = async {
+        loop {
+            view_telemetry.observe(&ui.app);
+            render_due_frame(
+                &mut ui,
+                &mut terminal,
+                &mut scheduler,
+                &mut stream_telemetry,
+                &mut notifier,
+            )?;
 
-        let render_deadline = scheduler.deadline();
-        tokio::select! {
+            let render_deadline = scheduler.deadline();
+            tokio::select! {
             () = async {
                 if let Some(deadline) = render_deadline {
                     sleep_until(deadline.into()).await;
@@ -534,7 +604,7 @@ pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Re
                     input_events = run_external_editor(input_events, &mut terminal, &mut ui.app).await?;
                     scheduler.request_immediate(Instant::now());
                 } else if apply_update(update, &mut scheduler) {
-                    return Ok(());
+                    break Ok(());
                 }
             }
             event = agent_events.recv_timed(), if ui.agent_events_open => {
@@ -567,7 +637,7 @@ pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Re
                     );
                 }
                 if apply_update(update, &mut scheduler) {
-                    return Ok(());
+                    break Ok(());
                 }
             }
             _ = ticker.tick(), if ui.app.main.running
@@ -575,11 +645,49 @@ pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Re
                 || ui.app.terminal_input_active()
                 || ui.app.mouse_selection_needs_redraw() => {
                 if apply_update(ui.update(UiAction::Tick, &worker_tx)?, &mut scheduler) {
-                    return Ok(());
+                    break Ok(());
                 }
+            }
             }
         }
     }
+    .await;
+
+    // Restore the terminal before disconnecting the paid WebSocket session.
+    drop((terminal, worker_tx, agent_events));
+    let shutdown_result = shutdown_runtime(worker, child_agents, mpp_adapter).await;
+    loop_result?;
+    shutdown_result
+}
+
+fn resolve_cwd(config: &AgentArgs) -> Result<PathBuf> {
+    config
+        .cwd()
+        .canonicalize()
+        .wrap_err("failed to resolve the working directory")
+}
+
+async fn shutdown_runtime(
+    worker: tokio::task::JoinHandle<()>,
+    child_agents: Option<std::sync::Arc<crate::subagents::ChildAgents>>,
+    mpp_adapter: Option<crate::mpp::MppAdapter>,
+) -> Result<()> {
+    worker.abort();
+    let worker_result = worker.await;
+    if let Some(child_agents) = child_agents {
+        child_agents.shutdown().await;
+    }
+    let shutdown_result = if let Some(adapter) = mpp_adapter {
+        adapter.shutdown().await
+    } else {
+        Ok(())
+    };
+    match worker_result {
+        Ok(()) => {}
+        Err(error) if error.is_cancelled() => {}
+        Err(error) => return Err(error).wrap_err("TUI agent worker failed"),
+    }
+    shutdown_result
 }
 
 fn apply_main_agent_event_batch(
@@ -736,26 +844,11 @@ fn handle_worker_update(
     commands: &mpsc::UnboundedSender<WorkerCommand>,
 ) -> Result<()> {
     match update {
-        WorkerEvent::TerminalsListed {
-            target,
-            purpose,
-            terminals,
-        } => {
-            handle_terminals_listed(app, target, purpose, terminals, commands)?;
-        }
-        WorkerEvent::TerminalInputSent { target } => {
-            app.set_status(target, "Attached to terminal");
-            request_terminal_refresh(app, commands)?;
-        }
-        WorkerEvent::TerminalOutput {
-            target,
-            terminal,
-            output,
-        } => {
-            handle_terminal_output(app, target, &terminal, output, commands)?;
-        }
-        WorkerEvent::TerminalControlFailed { target, error } => {
-            handle_terminal_failure(app, target, &error);
+        event @ (WorkerEvent::TerminalsListed { .. }
+        | WorkerEvent::TerminalInputSent { .. }
+        | WorkerEvent::TerminalOutput { .. }
+        | WorkerEvent::TerminalControlFailed { .. }) => {
+            handle_terminal_worker_update(app, event, commands)?;
         }
         WorkerEvent::TurnFinished {
             target,
@@ -831,6 +924,72 @@ fn handle_worker_update(
         WorkerEvent::MainBranchEventStreamClosed { id } => {
             app.main_branch_event_stream_closed(id);
         }
+        WorkerEvent::FastModeChanged { enabled } => app.fast_mode_changed(enabled),
+        WorkerEvent::FastModeChangeFailed { error } => app.fast_mode_change_failed(&error),
+        WorkerEvent::ThinkingChanged { thinking } => app.thinking_changed(thinking),
+        WorkerEvent::ThinkingChangeFailed { error } => app.thinking_change_failed(&error),
+        event @ (WorkerEvent::McpLoginStarted { .. }
+        | WorkerEvent::McpReady { .. }
+        | WorkerEvent::McpFailed { .. }) => {
+            handle_mcp_worker_update(app, event)?;
+        }
+    }
+    Ok(())
+}
+
+fn handle_mcp_worker_update(app: &mut App, update: WorkerEvent) -> Result<()> {
+    match update {
+        WorkerEvent::McpLoginStarted { name } => {
+            app.set_active_status(format!("Authorizing MCP server {name} in browser"));
+        }
+        WorkerEvent::McpReady {
+            name,
+            tool_count,
+            authenticated,
+        } => {
+            let action = if authenticated {
+                "Authenticated and reloaded"
+            } else {
+                "Reloaded"
+            };
+            app.set_active_status(format!("{action} MCP server {name} ({tool_count} tools)"));
+        }
+        WorkerEvent::McpFailed { name, error } => {
+            app.push_active_error(format!("MCP server {name}: {error}"));
+        }
+        _ => return Err(eyre::eyre!("MCP dispatcher received a non-MCP update")),
+    }
+    Ok(())
+}
+
+fn handle_terminal_worker_update(
+    app: &mut App,
+    update: WorkerEvent,
+    commands: &mpsc::UnboundedSender<WorkerCommand>,
+) -> Result<()> {
+    match update {
+        WorkerEvent::TerminalsListed {
+            target,
+            purpose,
+            terminals,
+        } => handle_terminals_listed(app, target, purpose, terminals, commands)?,
+        WorkerEvent::TerminalInputSent { target } => {
+            app.set_status(target, "Attached to terminal");
+            request_terminal_refresh(app, commands)?;
+        }
+        WorkerEvent::TerminalOutput {
+            target,
+            terminal,
+            output,
+        } => handle_terminal_output(app, target, &terminal, output, commands)?,
+        WorkerEvent::TerminalControlFailed { target, error } => {
+            handle_terminal_failure(app, target, &error);
+        }
+        _ => {
+            return Err(eyre::eyre!(
+                "terminal dispatcher received a non-terminal update"
+            ));
+        }
     }
     Ok(())
 }
@@ -887,9 +1046,10 @@ fn handle_terminal_failure(app: &mut App, target: PaneId, error: &str) {
 fn spawn_agent_worker(
     root: Nanocodex,
     root_session_id: Arc<str>,
+    mcp: Option<McpHandle>,
     mut commands: mpsc::UnboundedReceiver<WorkerCommand>,
     updates: mpsc::UnboundedSender<WorkerEvent>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let (finished_tx, mut finished_rx) = mpsc::unbounded_channel::<FinishedTurn>();
         let mut worker = AgentWorker {
@@ -906,6 +1066,7 @@ fn spawn_agent_worker(
             btw: None,
             finished: finished_tx,
             updates,
+            mcp,
         };
         loop {
             tokio::select! {
@@ -920,7 +1081,7 @@ fn spawn_agent_worker(
                 }
             }
         }
-    });
+    })
 }
 
 struct AgentWorker {
@@ -930,6 +1091,7 @@ struct AgentWorker {
     btw: Option<BtwWorker>,
     finished: mpsc::UnboundedSender<FinishedTurn>,
     updates: mpsc::UnboundedSender<WorkerEvent>,
+    mcp: Option<McpHandle>,
 }
 
 impl AgentWorker {
@@ -981,6 +1143,10 @@ impl AgentWorker {
                     .await;
             }
             WorkerCommand::SwitchMainBranch { id } => self.switch_main_branch(id),
+            WorkerCommand::SetFastMode { enabled } => self.set_fast_mode(enabled).await,
+            WorkerCommand::SetThinking { thinking } => self.set_thinking(thinking).await,
+            WorkerCommand::McpLogin { name } => self.mcp_login(name),
+            WorkerCommand::McpReload { name } => self.mcp_reload(name),
         }
     }
 
@@ -1052,6 +1218,127 @@ impl AgentWorker {
             },
         };
         drop(self.updates.send(event));
+    }
+
+    fn mcp_login(&self, name: String) {
+        let Some(mcp) = self.mcp.clone() else {
+            drop(self.updates.send(WorkerEvent::McpFailed {
+                name,
+                error: "MCP is not configured".to_owned(),
+            }));
+            return;
+        };
+        let updates = self.updates.clone();
+        drop(tokio::spawn(async move {
+            let login = match mcp.login(&name).await {
+                Ok(login) => login,
+                Err(error) => {
+                    drop(updates.send(WorkerEvent::McpFailed {
+                        name,
+                        error: error.to_string(),
+                    }));
+                    return;
+                }
+            };
+            let authorization_url = login.authorization_url().to_owned();
+            if let Err(error) = open_browser(&authorization_url) {
+                drop(updates.send(WorkerEvent::McpFailed {
+                    name,
+                    error: format!(
+                        "failed to open OAuth page: {error}; open {authorization_url} manually"
+                    ),
+                }));
+                return;
+            }
+            drop(updates.send(WorkerEvent::McpLoginStarted { name: name.clone() }));
+            match login.wait().await {
+                Ok(tool_count) => {
+                    drop(updates.send(WorkerEvent::McpReady {
+                        name,
+                        tool_count,
+                        authenticated: true,
+                    }));
+                }
+                Err(error) => {
+                    drop(updates.send(WorkerEvent::McpFailed {
+                        name,
+                        error: error.to_string(),
+                    }));
+                }
+            }
+        }));
+    }
+
+    fn mcp_reload(&self, name: String) {
+        let Some(mcp) = self.mcp.clone() else {
+            drop(self.updates.send(WorkerEvent::McpFailed {
+                name,
+                error: "MCP is not configured".to_owned(),
+            }));
+            return;
+        };
+        let updates = self.updates.clone();
+        drop(tokio::spawn(async move {
+            match mcp.reload(&name).await {
+                Ok(tool_count) => {
+                    drop(updates.send(WorkerEvent::McpReady {
+                        name,
+                        tool_count,
+                        authenticated: false,
+                    }));
+                }
+                Err(error) => {
+                    drop(updates.send(WorkerEvent::McpFailed {
+                        name,
+                        error: error.to_string(),
+                    }));
+                }
+            }
+        }));
+    }
+
+    async fn set_fast_mode(&mut self, enabled: bool) {
+        let mut result = self.main.agent.set_fast_mode(enabled).await;
+        for branch in &self.archived_main {
+            if result.is_ok() {
+                result = branch.agent.set_fast_mode(enabled).await;
+            }
+        }
+        if let Some(branch) = &self.btw
+            && result.is_ok()
+        {
+            result = branch.agent.set_fast_mode(enabled).await;
+        }
+
+        let update = match result {
+            Ok(()) => WorkerEvent::FastModeChanged { enabled },
+            Err(error) => WorkerEvent::FastModeChangeFailed {
+                error: error.to_string(),
+            },
+        };
+        drop(self.updates.send(update));
+    }
+
+    async fn set_thinking(&mut self, thinking: Thinking) {
+        let mut result = self.main.agent.set_thinking(thinking).await;
+        for branch in &self.archived_main {
+            if result.is_ok() {
+                result = branch.agent.set_thinking(thinking).await;
+            }
+        }
+        if let Some(branch) = &self.btw
+            && result.is_ok()
+        {
+            result = branch.agent.set_thinking(thinking).await;
+        }
+
+        let update = match result {
+            Ok(()) => WorkerEvent::ThinkingChanged { thinking },
+            Err(error) => WorkerEvent::ThinkingChangeFailed {
+                error: error.to_string(),
+            },
+        };
+        drop(self.updates.send(update));
     }
 
     async fn prompt(&mut self, target: PaneId, prompt_id: u64, prompt: SubmittedPrompt) {
@@ -1983,17 +2270,15 @@ fn handle_key(
     root_session_id: &str,
     commands: &mpsc::UnboundedSender<WorkerCommand>,
 ) -> Result<TerminalAction> {
-    if !app.terminal_input_active()
-        && matches!(key.code, KeyCode::Char('v' | 'V'))
-        && key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-    {
-        paste_clipboard_image(app, clipboard::paste_image_to_temp_png);
+    if handle_clipboard_image_key(key, app) {
         return Ok(TerminalAction::Redraw);
     }
 
     if let Some(action) = handle_terminal_input_key(key, app, commands)? {
+        return Ok(action);
+    }
+
+    if let Some(action) = handle_reasoning_picker_key(key, app, commands)? {
         return Ok(action);
     }
 
@@ -2090,6 +2375,48 @@ fn handle_key(
         | KeyCode::Modifier(_) => {}
     }
     Ok(TerminalAction::Redraw)
+}
+
+fn handle_clipboard_image_key(key: KeyEvent, app: &mut App) -> bool {
+    if app.terminal_input_active()
+        || !matches!(key.code, KeyCode::Char('v' | 'V'))
+        || !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return false;
+    }
+    paste_clipboard_image(app, clipboard::paste_image_to_temp_png);
+    true
+}
+
+fn handle_reasoning_picker_key(
+    key: KeyEvent,
+    app: &mut App,
+    commands: &mpsc::UnboundedSender<WorkerCommand>,
+) -> Result<Option<TerminalAction>> {
+    if app.reasoning_picker().is_none() {
+        return Ok(None);
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
+        return Ok(Some(TerminalAction::Quit));
+    }
+    if key.modifiers.is_empty() {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => app.move_reasoning_picker(-1),
+            KeyCode::Down | KeyCode::Char('j') => app.move_reasoning_picker(1),
+            KeyCode::Enter => {
+                if let Some(ReasoningPickerAction::Selected(thinking)) =
+                    app.confirm_reasoning_picker()
+                {
+                    send_command(commands, WorkerCommand::SetThinking { thinking })?;
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('q') => app.back_reasoning_picker(),
+            _ => {}
+        }
+    }
+    Ok(Some(TerminalAction::Redraw))
 }
 
 fn handle_escape_key(app: &mut App, commands: &mpsc::UnboundedSender<WorkerCommand>) -> Result<()> {
@@ -2421,6 +2748,18 @@ fn submit(
                 Err(error) => app.push_active_error(format!("failed to open Jaeger: {error}")),
             }
         }
+        Submission::Fast(enabled) => {
+            let enabled = enabled.unwrap_or(!app.fast_mode());
+            send_command(commands, WorkerCommand::SetFastMode { enabled })?;
+        }
+        Submission::ReasoningPicker => app.open_reasoning_picker(),
+        Submission::McpLogin(name) => {
+            send_command(commands, WorkerCommand::McpLogin { name })?;
+        }
+        Submission::McpReload(name) => {
+            send_command(commands, WorkerCommand::McpReload { name })?;
+        }
+        Submission::InvalidCommand(error) => app.push_active_error(error),
     }
     Ok(())
 }
@@ -2457,6 +2796,43 @@ fn classify_submission(input: impl Into<SubmittedPrompt>) -> Submission {
     if trimmed == "/trace" {
         return Submission::Trace;
     }
+    if trimmed == "/fast" {
+        return Submission::Fast(None);
+    }
+    if let Some(argument) = trimmed.strip_prefix("/fast ") {
+        return match argument.trim() {
+            "on" => Submission::Fast(Some(true)),
+            "off" => Submission::Fast(Some(false)),
+            _ => Submission::InvalidCommand("Usage: /fast [on|off]".to_owned()),
+        };
+    }
+    if matches!(trimmed, "/model" | "/thinking") {
+        return Submission::ReasoningPicker;
+    }
+    if trimmed.starts_with("/model ") || trimmed.starts_with("/thinking ") {
+        return Submission::InvalidCommand("Usage: /model or /thinking".to_owned());
+    }
+    if let Some(name) = trimmed.strip_prefix("/mcp login ") {
+        let name = name.trim();
+        return if name.is_empty() || name.split_whitespace().count() != 1 {
+            Submission::InvalidCommand("Usage: /mcp login <server>".to_owned())
+        } else {
+            Submission::McpLogin(name.to_owned())
+        };
+    }
+    if let Some(name) = trimmed.strip_prefix("/mcp reload ") {
+        let name = name.trim();
+        return if name.is_empty() || name.split_whitespace().count() != 1 {
+            Submission::InvalidCommand("Usage: /mcp reload <server>".to_owned())
+        } else {
+            Submission::McpReload(name.to_owned())
+        };
+    }
+    if trimmed == "/mcp" || trimmed.starts_with("/mcp ") {
+        return Submission::InvalidCommand(
+            "Usage: /mcp login <server> or /mcp reload <server>".to_owned(),
+        );
+    }
     Submission::Prompt(input)
 }
 
@@ -2487,7 +2863,11 @@ fn open_session_traces(session_id: &str) -> Result<()> {
     let base_url =
         std::env::var(JAEGER_UI_URL_ENV).unwrap_or_else(|_| DEFAULT_JAEGER_UI_URL.to_owned());
     let url = session_trace_url(&base_url, session_id)?;
-    let mut command = browser_command(url.as_str());
+    open_browser(url.as_str())
+}
+
+fn open_browser(url: &str) -> Result<()> {
+    let mut command = browser_command(url);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -2636,6 +3016,42 @@ mod tests {
             classify_submission(" /trace ".to_owned()),
             Submission::Trace
         );
+        assert_eq!(classify_submission("/fast"), Submission::Fast(None));
+        assert_eq!(
+            classify_submission(" /fast on "),
+            Submission::Fast(Some(true))
+        );
+        assert_eq!(
+            classify_submission("/fast off"),
+            Submission::Fast(Some(false))
+        );
+        assert_eq!(
+            classify_submission("/fast turbo"),
+            Submission::InvalidCommand("Usage: /fast [on|off]".to_owned())
+        );
+        assert_eq!(classify_submission("/model"), Submission::ReasoningPicker);
+        assert_eq!(
+            classify_submission(" /thinking "),
+            Submission::ReasoningPicker
+        );
+        assert_eq!(
+            classify_submission("/thinking high"),
+            Submission::InvalidCommand("Usage: /model or /thinking".to_owned())
+        );
+        assert_eq!(
+            classify_submission(" /mcp login centaur-tempo "),
+            Submission::McpLogin("centaur-tempo".to_owned())
+        );
+        assert_eq!(
+            classify_submission("/mcp reload centaur-paradigm"),
+            Submission::McpReload("centaur-paradigm".to_owned())
+        );
+        assert_eq!(
+            classify_submission("/mcp login"),
+            Submission::InvalidCommand(
+                "Usage: /mcp login <server> or /mcp reload <server>".to_owned()
+            )
+        );
         assert_eq!(
             classify_submission("/btw-not-a-command".to_owned()),
             Submission::Prompt("/btw-not-a-command".into())
@@ -2644,6 +3060,55 @@ mod tests {
             classify_submission("/trace-this".to_owned()),
             Submission::Prompt("/trace-this".into())
         );
+        assert_eq!(
+            classify_submission("/fastest"),
+            Submission::Prompt("/fastest".into())
+        );
+        assert_eq!(
+            classify_submission("/modeling"),
+            Submission::Prompt("/modeling".into())
+        );
+    }
+
+    #[test]
+    fn reasoning_picker_changes_subsequent_turn_effort() {
+        let (commands, mut worker) = mpsc::unbounded_channel();
+        let mut app = App::new("/workspace".into());
+        app.open_reasoning_picker();
+
+        handle_key(
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            &mut app,
+            "main-session",
+            &commands,
+        )
+        .unwrap();
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app,
+            "main-session",
+            &commands,
+        )
+        .unwrap();
+
+        assert!(app.reasoning_picker().is_none());
+        assert!(matches!(
+            worker.try_recv(),
+            Ok(WorkerCommand::SetThinking {
+                thinking: Thinking::Medium
+            })
+        ));
+        assert_eq!(app.thinking(), Thinking::High);
+
+        handle_worker_update(
+            &mut app,
+            WorkerEvent::ThinkingChanged {
+                thinking: Thinking::Medium,
+            },
+            &commands,
+        )
+        .unwrap();
+        assert_eq!(app.thinking(), Thinking::Medium);
     }
 
     #[test]
@@ -2904,6 +3369,7 @@ mod tests {
         spawn_agent_worker(
             agent,
             std::sync::Arc::from("tui-steer-test"),
+            None,
             worker_rx,
             updates,
         );
@@ -3017,6 +3483,7 @@ mod tests {
         spawn_agent_worker(
             agent,
             std::sync::Arc::from("tui-historical-edit-test"),
+            None,
             worker_rx,
             updates,
         );

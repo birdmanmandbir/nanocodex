@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM rust:1.88-alpine3.21 AS build
+FROM rust:1.97-alpine3.22 AS build
 
 ARG TARGETARCH
 ARG CARGO_PROFILE=dev
@@ -9,13 +9,15 @@ ARG VERGEN_GIT_SHA=unknown
 ENV TAG_NAME=${TAG_NAME} \
     VERGEN_GIT_SHA=${VERGEN_GIT_SHA}
 WORKDIR /build
-RUN apk add --no-cache musl-dev
+RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconf
 
 COPY Cargo.toml Cargo.lock ./
 COPY bin/nanocodex/Cargo.toml bin/nanocodex/Cargo.toml
 COPY bin/nanocodex/build.rs bin/nanocodex/build.rs
+COPY bin/nanousd-api/Cargo.toml bin/nanousd-api/Cargo.toml
 COPY js/bindings/Cargo.toml js/bindings/Cargo.toml
 COPY py/bindings/Cargo.toml py/bindings/Cargo.toml
+COPY crates/mpp-egress/Cargo.toml crates/mpp-egress/Cargo.toml
 COPY crates/nanocodex/Cargo.toml crates/nanocodex/Cargo.toml
 COPY crates/nanocodex-core/Cargo.toml crates/nanocodex-core/Cargo.toml
 COPY crates/nanocodex-macros/Cargo.toml crates/nanocodex-macros/Cargo.toml
@@ -23,13 +25,16 @@ COPY crates/nanocodex-mcp/Cargo.toml crates/nanocodex-mcp/Cargo.toml
 COPY crates/nanocodex-observability/Cargo.toml crates/nanocodex-observability/Cargo.toml
 COPY crates/nanocodex-service/Cargo.toml crates/nanocodex-service/Cargo.toml
 COPY crates/nanocodex-tools/Cargo.toml crates/nanocodex-tools/Cargo.toml
+COPY crates/nanousd/Cargo.toml crates/nanousd/Cargo.toml
 COPY examples/Cargo.toml examples/Cargo.toml
 # Keep dependency compilation in a manifest-only layer. Source-only edits reuse
 # this layer, while the cache mounts retain Cargo downloads and target outputs.
 RUN mkdir bin/nanocodex/src \
         bin/nanocodex/benches \
+        bin/nanousd-api/src \
         js/bindings/src \
         py/bindings/src \
+        crates/mpp-egress/src \
         crates/nanocodex/src \
         crates/nanocodex-core/src \
         crates/nanocodex-core/benches \
@@ -38,11 +43,14 @@ RUN mkdir bin/nanocodex/src \
         crates/nanocodex-observability/src \
         crates/nanocodex-service/src \
         crates/nanocodex-service/benches \
-        crates/nanocodex-tools/src && \
+        crates/nanocodex-tools/src \
+        crates/nanousd/src && \
     printf 'fn main() {}\n' > bin/nanocodex/src/main.rs && \
     printf 'fn main() {}\n' > bin/nanocodex/benches/tui_render.rs && \
+    printf 'fn main() {}\n' > bin/nanousd-api/src/main.rs && \
     printf '\n' > js/bindings/src/lib.rs && \
     printf '\n' > py/bindings/src/lib.rs && \
+    printf '\n' > crates/mpp-egress/src/lib.rs && \
     printf '\n' > crates/nanocodex/src/lib.rs && \
     printf '\n' > crates/nanocodex-core/src/lib.rs && \
     printf 'fn main() {}\n' > crates/nanocodex-core/benches/fork_history.rs && \
@@ -52,6 +60,7 @@ RUN mkdir bin/nanocodex/src \
     printf '\n' > crates/nanocodex-service/src/lib.rs && \
     printf 'fn main() {}\n' > crates/nanocodex-service/benches/tower_responses.rs && \
     printf '\n' > crates/nanocodex-tools/src/lib.rs && \
+    printf '\n' > crates/nanousd/src/lib.rs && \
     printf 'fn main() {}\n' > examples/minimal.rs && \
     printf 'fn main() {}\n' > examples/follow_on.rs && \
     printf 'fn main() {}\n' > examples/custom_tool.rs && \
@@ -68,13 +77,16 @@ COPY crates ./crates
 RUN --mount=type=cache,id=nanocodex-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=nanocodex-target-${TARGETARCH},target=/build/target \
     touch bin/nanocodex/src/main.rs \
+        bin/nanousd-api/src/main.rs \
+        crates/mpp-egress/src/lib.rs \
         crates/nanocodex/src/lib.rs \
         crates/nanocodex-core/src/lib.rs \
         crates/nanocodex-macros/src/lib.rs \
         crates/nanocodex-mcp/src/lib.rs \
         crates/nanocodex-observability/src/lib.rs \
         crates/nanocodex-service/src/lib.rs \
-        crates/nanocodex-tools/src/lib.rs && \
+        crates/nanocodex-tools/src/lib.rs \
+        crates/nanousd/src/lib.rs && \
     cargo build --locked --profile "${CARGO_PROFILE}" && \
     mkdir /out && \
     case "${CARGO_PROFILE}" in \
@@ -86,7 +98,7 @@ RUN --mount=type=cache,id=nanocodex-cargo-registry,target=/usr/local/cargo/regis
 FROM scratch AS artifact
 COPY --from=build /out/nanocodex /nanocodex
 
-FROM alpine:3.21 AS runtime
+FROM alpine:3.22 AS runtime
 RUN apk add --no-cache ca-certificates git
 COPY --from=build /out/nanocodex /usr/local/bin/nanocodex
 ENTRYPOINT ["/usr/local/bin/nanocodex"]

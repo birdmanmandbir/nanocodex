@@ -1,15 +1,16 @@
 use super::{
-    app::{App, Conversation, PaneId},
+    app::{App, Conversation, PaneId, ReasoningPicker, STANDARD_THINKING_OPTIONS},
     composer::ComposerLayout,
     transcript::InlineEdit,
 };
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout, Position, Rect},
+    layout::{Alignment, Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph},
 };
+use std::time::Instant;
 
 pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
@@ -67,6 +68,107 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
         render_footer(frame, app, footer_area);
     }
     app.render_mouse_selection(frame.buffer_mut(), selectable_areas.as_slice());
+    render_reasoning_picker(frame, app);
+}
+
+fn render_reasoning_picker(frame: &mut Frame<'_>, app: &App) {
+    let Some(picker) = app.reasoning_picker() else {
+        return;
+    };
+    let area = frame.area();
+    let popup_height = match picker {
+        ReasoningPicker::Standard { .. } => 9,
+        ReasoningPicker::Advanced => 7,
+    }
+    .min(area.height);
+    let popup_width = area.width.min(80);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(popup_width) / 2,
+        area.y + area.height.saturating_sub(popup_height),
+        popup_width,
+        popup_height,
+    );
+    frame.render_widget(Clear, popup);
+
+    let mut lines = Vec::new();
+    match picker {
+        ReasoningPicker::Standard { selected } => {
+            lines.push(Line::styled(
+                format!("  Select Reasoning Level for {}", nanocodex::MODEL),
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            lines.push(Line::default());
+            for (index, (thinking, label, description)) in
+                STANDARD_THINKING_OPTIONS.iter().enumerate()
+            {
+                let mut label = (*label).to_owned();
+                if *thinking == nanocodex::Thinking::default() {
+                    label.push_str(" (default)");
+                }
+                if *thinking == app.thinking() {
+                    label.push_str(" (current)");
+                }
+                lines.push(reasoning_option_line(
+                    index == selected,
+                    index + 1,
+                    &label,
+                    description,
+                ));
+            }
+            lines.push(reasoning_option_line(
+                selected == STANDARD_THINKING_OPTIONS.len(),
+                STANDARD_THINKING_OPTIONS.len() + 1,
+                "More reasoning…",
+                "Max consumes usage limits faster",
+            ));
+        }
+        ReasoningPicker::Advanced => {
+            lines.push(Line::styled(
+                "  Advanced Reasoning",
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            lines.push(Line::styled(
+                "  ⚠ Consumes usage limits faster",
+                Style::default().fg(Color::Cyan),
+            ));
+            lines.push(Line::default());
+            let label = if app.thinking() == nanocodex::Thinking::Max {
+                "Max (current)"
+            } else {
+                "Max"
+            };
+            lines.push(reasoning_option_line(
+                true,
+                1,
+                label,
+                "For difficult problems when quality matters more than speed · higher usage",
+            ));
+        }
+    }
+    lines.push(Line::default());
+    lines.push(Line::styled(
+        "  Press enter to confirm or esc to go back",
+        Style::default().fg(Color::DarkGray),
+    ));
+    frame.render_widget(Paragraph::new(lines), popup);
+}
+
+fn reasoning_option_line(
+    selected: bool,
+    number: usize,
+    label: &str,
+    description: &str,
+) -> Line<'static> {
+    let marker = if selected { "›" } else { " " };
+    let style = if selected {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default()
+    };
+    Line::styled(
+        format!("{marker} {number}. {label:<19} {description}"),
+        style,
+    )
 }
 
 fn render_attached_terminal(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -514,11 +616,15 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
             )
         }
     } else if app.transcript_selection_active() {
-        "History — ↑/↓ navigate · e fork-edit · Esc return".to_owned()
+        "History — ↑/↓ select · e edit/fork · Esc return".to_owned()
     } else if app.cancel_confirmation_active() {
         "Stop Agent Turn — Esc again to confirm".to_owned()
     } else if conversation.running {
-        format!("{} Thinking...", spinner[app.frame % spinner.len()])
+        format!(
+            "{} Working ({})",
+            spinner[app.frame % spinner.len()],
+            format_elapsed(conversation.run_elapsed(Instant::now()))
+        )
     } else {
         conversation.status.clone()
     };
@@ -556,6 +662,10 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
             "  /btw <question> side fork · {tool_help} · Ctrl+V image · Enter send/steer · Tab queue · {escape_help} · Ctrl+C quit"
         )
     };
+    let model_width = nanocodex::MODEL.len() + 3 + "default".len() + 7 + 1;
+    let model_width = saturating_u16(model_width).min(area.width);
+    let [left, right] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(model_width)]).areas(area);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -564,8 +674,48 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
             ),
             Span::styled(help, Style::default().fg(Color::DarkGray)),
         ])),
-        area,
+        left,
     );
+    let mut model = vec![Span::styled(
+        nanocodex::MODEL,
+        Style::default().fg(Color::Cyan),
+    )];
+    let thinking = if app.thinking() == nanocodex::Thinking::None {
+        "default"
+    } else {
+        app.thinking().as_str()
+    };
+    model.push(Span::styled(
+        format!(" · {thinking}"),
+        Style::default().fg(Color::DarkGray),
+    ));
+    if app.fast_mode() {
+        model.push(Span::styled(
+            " · fast",
+            Style::default().fg(Color::LightYellow),
+        ));
+    }
+    model.push(Span::raw(" "));
+    frame.render_widget(
+        Paragraph::new(Line::from(model)).alignment(Alignment::Right),
+        right,
+    );
+}
+
+fn format_elapsed(elapsed: std::time::Duration) -> String {
+    let seconds = elapsed.as_secs();
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    if seconds < 3_600 {
+        return format!("{}m {:02}s", seconds / 60, seconds % 60);
+    }
+    format!(
+        "{}h {:02}m {:02}s",
+        seconds / 3_600,
+        (seconds % 3_600) / 60,
+        seconds % 60
+    )
 }
 
 fn conversation_pending_count(conversation: &Conversation) -> usize {
@@ -673,6 +823,7 @@ fn saturating_u16(value: usize) -> u16 {
 #[cfg(test)]
 mod tests {
     use std::io;
+    use std::time::Instant;
 
     use ratatui::{
         Terminal,
@@ -778,16 +929,71 @@ mod tests {
     }
 
     #[test]
-    fn running_footer_uses_one_fixed_thinking_label() {
+    fn running_footer_uses_one_elapsed_working_indicator() {
         let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
         let mut app = App::new("/workspace".into());
         app.main.running = true;
+        let now = Instant::now();
+        app.main.set_run_started_at(
+            now.checked_sub(std::time::Duration::from_secs(65))
+                .unwrap_or(now),
+        );
         app.main.status = "Running exec_command".to_owned();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let rendered = terminal.backend().to_string();
-        assert!(rendered.contains("Thinking..."));
+        assert!(rendered.contains("Working (1m 05s)"));
         assert!(!rendered.contains("Running exec_command"));
+    }
+
+    #[test]
+    fn footer_keeps_model_on_the_bottom_right_and_marks_fast_mode() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        let mut app = App::new("/workspace".into());
+        app.fast_mode_changed(true);
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let footer = terminal.backend().buffer().content[15 * 80..16 * 80]
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(footer.ends_with("gpt-5.6-sol · high · fast "));
+    }
+
+    #[test]
+    fn reasoning_picker_matches_codex_labels_and_advanced_flow() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        let mut app = App::new("/workspace".into());
+        app.open_reasoning_picker();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("Select Reasoning Level for gpt-5.6-sol"));
+        assert!(rendered.contains("Low"));
+        assert!(rendered.contains("High (default) (current)"));
+        assert!(rendered.contains("Extra high"));
+        assert!(rendered.contains("More reasoning…"));
+        assert!(!rendered.contains("Maximum reasoning depth"));
+
+        app.move_reasoning_picker(3);
+        assert!(matches!(
+            app.confirm_reasoning_picker(),
+            Some(crate::tui::app::ReasoningPickerAction::OpenedAdvanced)
+        ));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("Advanced Reasoning"));
+        assert!(rendered.contains("For difficult problems when quality"));
+    }
+
+    #[test]
+    fn narrow_footer_preserves_the_model_before_help() {
+        let mut terminal = Terminal::new(TestBackend::new(24, 10)).unwrap();
+        let mut app = App::new("/workspace".into());
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("gpt-5.6-sol"));
     }
 
     #[test]
@@ -1088,7 +1294,7 @@ mod tests {
                 "\"┌ Message → Main ──────────────────────────────┐\"\n",
                 "\"│                                              │\"\n",
                 "\"└──────────────────────────────────────────────┘\"\n",
-                "\" Ready  /btw <question> side fork · Ctrl+O fold \"\n",
+                "\" Ready  /btw <quest          gpt-5.6-sol · high \"\n",
             )
         );
     }

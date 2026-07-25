@@ -1,15 +1,21 @@
 mod auth;
 mod config;
+mod credits;
 mod mcp;
+mod mpp;
 mod observability;
+mod resource;
 mod run;
 mod subagents;
 mod tui;
 mod update;
 mod version;
 
+use std::path::PathBuf;
+
 use clap::{Args, Parser, Subcommand, builder::NonEmptyStringValueParser};
-use eyre::Result;
+use eyre::{Result, WrapErr};
+use nanocodex::RolloutConfig;
 
 use config::AgentArgs;
 use observability::ObservabilityArgs;
@@ -41,8 +47,12 @@ struct Cli {
 enum Command {
     /// Manage `ChatGPT` subscription login.
     Auth(auth::Auth),
+    /// Inspect or purchase Nanocodex NANOUSD credits.
+    Credits(credits::Credits),
     /// Run one prompt and stream JSONL events to stdout.
     Run(Box<RunCommand>),
+    /// Resume a Codex or Nanocodex thread in the interactive TUI.
+    Resume(Box<ResumeCommand>),
     /// Update this executable from a GitHub release channel.
     Update(update::Update),
 }
@@ -59,6 +69,23 @@ struct RunCommand {
     observability: ObservabilityArgs,
 }
 
+#[derive(Args)]
+struct ResumeCommand {
+    /// Codex thread UUID to resume.
+    #[arg(value_parser = NonEmptyStringValueParser::new())]
+    thread_id: String,
+
+    #[command(flatten)]
+    agent: AgentArgs,
+
+    #[command(flatten)]
+    observability: ObservabilityArgs,
+
+    /// Submit an initial follow-on prompt immediately after the TUI opens.
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    prompt: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Keep direct `cargo run` behavior consistent with the Justfile without
@@ -66,16 +93,109 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
 
     let cli = Cli::parse();
+    let uses_tempo = match &cli.command {
+        Some(Command::Run(command)) => command.agent.uses_tempo(),
+        Some(Command::Resume(command)) => command.agent.uses_tempo(),
+        None => cli.agent.uses_tempo(),
+        Some(Command::Auth(_) | Command::Credits(_) | Command::Update(_)) => false,
+    };
+    if uses_tempo {
+        resource::ensure_mpp_file_descriptor_capacity()?;
+    }
     match cli.command {
         Some(Command::Auth(command)) => command.run().await,
+        Some(Command::Credits(command)) => command.run().await,
         Some(Command::Run(command)) => {
             let _observability = command.observability.install(false, command.agent.cwd())?;
             command.run.run(command.agent).await
         }
+        Some(Command::Resume(command)) => {
+            let codex_home = config::default_codex_home()?;
+            let session = RolloutConfig::new(&codex_home)
+                .load_session(&command.thread_id)
+                .wrap_err_with(|| format!("failed to load Codex thread {}", command.thread_id))?;
+            let workspace = PathBuf::from(session.workspace());
+            let _observability = command.observability.install(true, &workspace)?;
+            tui::run(command.agent, command.prompt, Some(session)).await
+        }
         Some(Command::Update(command)) => command.run().await,
         None => {
             let _observability = cli.observability.install(true, cli.agent.cwd())?;
-            tui::run(cli.agent, cli.prompt).await
+            tui::run(cli.agent, cli.prompt, None).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tempo_flag_selects_the_tui_transport() {
+        let cli = Cli::try_parse_from([
+            "nanocodex",
+            "--provider.tempo",
+            "--provider.tempo.wallet-store",
+            "/tmp/tempo-wallet.json",
+        ])
+        .unwrap();
+
+        assert!(cli.command.is_none());
+        assert!(cli.agent.uses_tempo());
+    }
+
+    #[test]
+    fn tempo_flag_selects_the_one_shot_transport() {
+        let cli = Cli::try_parse_from([
+            "nanocodex",
+            "run",
+            "reply with ok",
+            "--provider.tempo",
+            "--provider.tempo.wallet-store",
+            "/tmp/tempo-wallet.json",
+        ])
+        .unwrap();
+
+        assert!(matches!(cli.command, Some(Command::Run(_))));
+        assert!(cli.agent.uses_tempo());
+    }
+
+    #[test]
+    fn openai_provider_is_explicitly_selectable() {
+        let cli = Cli::try_parse_from(["nanocodex", "--provider.openai", "--api-key", "test-key"])
+            .unwrap();
+
+        assert!(!cli.agent.uses_tempo());
+    }
+
+    #[test]
+    fn provider_selection_is_exclusive() {
+        let error = Cli::try_parse_from(["nanocodex", "--provider.openai", "--provider.tempo"])
+            .err()
+            .unwrap();
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn resume_accepts_a_thread_id_and_agent_configuration() {
+        let cli = Cli::try_parse_from([
+            "nanocodex",
+            "resume",
+            "019c0d31-c308-7d91-bff4-5dca82d15ac6",
+            "--provider.openai",
+            "--api-key",
+            "test-key",
+            "--prompt",
+            "continue",
+        ])
+        .unwrap();
+
+        let Some(Command::Resume(command)) = cli.command else {
+            panic!("resume command was not parsed");
+        };
+        assert_eq!(command.thread_id, "019c0d31-c308-7d91-bff4-5dca82d15ac6");
+        assert_eq!(command.prompt.as_deref(), Some("continue"));
+        assert!(!command.agent.uses_tempo());
     }
 }

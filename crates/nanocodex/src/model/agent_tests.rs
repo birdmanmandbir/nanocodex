@@ -14,9 +14,9 @@ use tokio::{
 use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
 use crate::{
-    AgentHandle, Nanocodex, NanocodexError, OpenAiAuth, Prompt, Responses, ResponsesError,
-    ResponsesHistory, ResponsesTransport, RolloutConfig, SessionSnapshot, TerminalId, Thinking,
-    Tools,
+    AgentHandle, Nanocodex, NanocodexError, OpenAiAuth, Prompt, ResponseItem, ResponseItemId,
+    Responses, ResponsesError, ResponsesHistory, ResponsesTransport, RolloutConfig,
+    SessionSnapshot, TerminalId, Thinking, Tools,
 };
 
 #[derive(Clone)]
@@ -57,6 +57,16 @@ impl nanocodex_core::OpenAiAuthSource for StaticChatGptAuth {
 
 fn chatgpt_auth() -> OpenAiAuth {
     OpenAiAuth::managed_chatgpt(Arc::new(StaticChatGptAuth))
+}
+
+#[test]
+fn additional_tools_never_carry_client_defined_ids() {
+    let mut prefix = [ResponseItem::additional_tools(Vec::new())];
+    prefix[0].set_id(Some(ResponseItemId::with_suffix("at", "legacy")));
+
+    super::assign_request_prefix_ids(&mut prefix);
+
+    assert!(prefix[0].id().is_none());
 }
 
 #[tokio::test]
@@ -661,7 +671,7 @@ async fn steering_is_bounded_fifo_and_joins_at_the_next_model_boundary() -> Resu
 
         let first = next_json(&mut socket).await?;
         assert_eq!(first["previous_response_id"], "resp-warmup");
-        assert_eq!(first["input"][1]["content"][0]["text"], "initial task");
+        assert_eq!(first["input"][2]["content"][0]["text"], "initial task");
         first_seen
             .send(())
             .map_err(|()| eyre!("first-request signal receiver dropped"))?;
@@ -920,20 +930,21 @@ async fn cancellation_retains_interrupted_prompt_and_resumes_from_the_abort_boun
 
 fn assert_interrupted_replay(request: &Value) {
     assert!(request.get("previous_response_id").is_none());
-    assert_eq!(request["input"].as_array().map(Vec::len), Some(8));
+    assert_eq!(request["input"].as_array().map(Vec::len), Some(9));
     assert_eq!(request["input"][0]["type"], "additional_tools");
     assert_eq!(request["input"][1]["role"], "developer");
-    assert_eq!(request["input"][2]["role"], "user");
-    assert_eq!(request["input"][3]["content"][0]["text"], "first prompt");
-    assert_eq!(request["input"][4]["content"][0]["text"], "done");
-    assert_eq!(request["input"][5]["content"][0]["text"], "cancel me");
+    assert_eq!(request["input"][2]["role"], "developer");
+    assert_eq!(request["input"][3]["role"], "user");
+    assert_eq!(request["input"][4]["content"][0]["text"], "first prompt");
+    assert_eq!(request["input"][5]["content"][0]["text"], "done");
+    assert_eq!(request["input"][6]["content"][0]["text"], "cancel me");
     assert!(
-        request["input"][6]["content"][0]["text"]
+        request["input"][7]["content"][0]["text"]
             .as_str()
             .is_some_and(|text| text.contains("<turn_aborted>"))
     );
     assert_eq!(
-        request["input"][7]["content"][0]["text"],
+        request["input"][8]["content"][0]["text"],
         "run after cancellations"
     );
     assert!(
@@ -973,19 +984,19 @@ async fn cancellation_pairs_an_active_tool_call_before_resuming() -> Result<()> 
         let mut replacement = accept_async(stream).await?;
         let resumed = next_json(&mut replacement).await?;
         assert!(resumed.get("previous_response_id").is_none());
-        assert_eq!(resumed["input"].as_array().map(Vec::len), Some(8));
-        assert_eq!(resumed["input"][3]["content"][0]["text"], "run a long tool");
-        assert_eq!(resumed["input"][4]["type"], "custom_tool_call");
-        assert_eq!(resumed["input"][4]["call_id"], "call-exec");
-        assert_eq!(resumed["input"][5]["type"], "custom_tool_call_output");
+        assert_eq!(resumed["input"].as_array().map(Vec::len), Some(9));
+        assert_eq!(resumed["input"][4]["content"][0]["text"], "run a long tool");
+        assert_eq!(resumed["input"][5]["type"], "custom_tool_call");
         assert_eq!(resumed["input"][5]["call_id"], "call-exec");
-        assert!(resumed["input"][5].to_string().contains("aborted by user"));
+        assert_eq!(resumed["input"][6]["type"], "custom_tool_call_output");
+        assert_eq!(resumed["input"][6]["call_id"], "call-exec");
+        assert!(resumed["input"][6].to_string().contains("aborted by user"));
         assert!(
-            resumed["input"][6]["content"][0]["text"]
+            resumed["input"][7]["content"][0]["text"]
                 .as_str()
                 .is_some_and(|text| text.contains("<turn_aborted>"))
         );
-        assert_eq!(resumed["input"][7]["content"][0]["text"], "continue");
+        assert_eq!(resumed["input"][8]["content"][0]["text"], "continue");
         send_final(&mut replacement, "resp-follow-up").await
     });
 
@@ -1072,7 +1083,10 @@ async fn stored_response_local_code_mode_round_trip() -> Result<()> {
         assert_eq!(generation["previous_response_id"], "resp-warmup");
         assert_eq!(generation["store"], true);
         assert!(generation.get("generate").is_none());
-        assert_eq!(generation["input"].as_array().map(Vec::len), Some(2));
+        assert_eq!(generation["input"].as_array().map(Vec::len), Some(3));
+        assert_eq!(generation["input"][0]["role"], "developer");
+        assert_eq!(generation["input"][1]["role"], "user");
+        assert_eq!(generation["input"][2]["role"], "user");
         assert_eq!(
             generation["client_metadata"]["x-codex-turn-state"],
             "sticky-test"
@@ -1272,20 +1286,27 @@ async fn unsupported_direct_tools_return_failed_results_to_the_model() -> Result
         let input = continuation["input"]
             .as_array()
             .ok_or_else(|| eyre!("continuation input was not an array"))?;
+        assert_eq!(input[0]["type"], "custom_tool_call_output");
+        assert_eq!(input[0]["call_id"], "call-custom");
         assert_eq!(
-            input,
-            &[
-                json!({
-                    "type": "custom_tool_call_output",
-                    "call_id": "call-custom",
-                    "output": "unsupported custom tool call: missing_custom"
-                }),
-                json!({
-                    "type": "function_call_output",
-                    "call_id": "call-function",
-                    "output": "unsupported call: example::missing_function"
-                }),
-            ]
+            input[0]["output"],
+            "unsupported custom tool call: missing_custom"
+        );
+        assert!(
+            input[0]["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("ctco_"))
+        );
+        assert_eq!(input[1]["type"], "function_call_output");
+        assert_eq!(input[1]["call_id"], "call-function");
+        assert_eq!(
+            input[1]["output"],
+            "unsupported call: example::missing_function"
+        );
+        assert!(
+            input[1]["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("fco_"))
         );
         send_final(&mut socket, "resp-final").await
     });
@@ -1480,7 +1501,7 @@ async fn yielded_exec_cell_continues_through_direct_wait_tool() -> Result<()> {
                     "type": "function_call",
                     "call_id": "call-wait",
                     "name": "wait",
-                    "arguments": "{\"cell_id\":\"1\",\"yield_time_ms\":1000}"
+                    "arguments": "{\"cell_id\":\"1\",\"yield_time_ms\":30000}"
                 })],
             ),
         )
@@ -1535,11 +1556,12 @@ async fn warmup_failure_falls_back_to_a_full_first_request() -> Result<()> {
         let generation = next_json(&mut second).await?;
         assert!(generation.get("previous_response_id").is_none());
         assert!(generation.get("generate").is_none());
-        assert_eq!(generation["input"].as_array().map(Vec::len), Some(4));
+        assert_eq!(generation["input"].as_array().map(Vec::len), Some(5));
         assert_eq!(generation["input"][0]["type"], "additional_tools");
         assert_eq!(generation["input"][1]["role"], "developer");
-        assert_eq!(generation["input"][2]["role"], "user");
+        assert_eq!(generation["input"][2]["role"], "developer");
         assert_eq!(generation["input"][3]["role"], "user");
+        assert_eq!(generation["input"][4]["role"], "user");
         send_final(&mut second, "resp-final").await
     });
 
@@ -1570,11 +1592,12 @@ async fn warmup_connection_failure_falls_back_to_a_full_first_request() -> Resul
         let generation = next_json(&mut socket).await?;
         assert!(generation.get("previous_response_id").is_none());
         assert!(generation.get("generate").is_none());
-        assert_eq!(generation["input"].as_array().map(Vec::len), Some(4));
+        assert_eq!(generation["input"].as_array().map(Vec::len), Some(5));
         assert_eq!(generation["input"][0]["type"], "additional_tools");
         assert_eq!(generation["input"][1]["role"], "developer");
-        assert_eq!(generation["input"][2]["role"], "user");
+        assert_eq!(generation["input"][2]["role"], "developer");
         assert_eq!(generation["input"][3]["role"], "user");
+        assert_eq!(generation["input"][4]["role"], "user");
         send_final(&mut socket, "resp-final").await
     });
 
@@ -1791,13 +1814,19 @@ async fn reconnect_drops_previous_response_id_and_replays_full_history() -> Resu
         let replay = next_json(&mut second).await?;
         assert!(replay.get("previous_response_id").is_none());
         assert_eq!(replay["store"], true);
-        assert_eq!(replay["input"].as_array().map(Vec::len), Some(6));
+        assert_eq!(replay["input"].as_array().map(Vec::len), Some(7));
         assert_eq!(replay["input"][0]["type"], "additional_tools");
         assert_eq!(replay["input"][1]["role"], "developer");
-        assert_eq!(replay["input"][2]["role"], "user");
-        assert_eq!(replay["input"][4]["type"], "custom_tool_call");
-        assert!(replay["input"][4].get("id").is_none());
-        assert_eq!(replay["input"][5]["type"], "custom_tool_call_output");
+        assert_eq!(replay["input"][2]["role"], "developer");
+        assert_eq!(replay["input"][3]["role"], "user");
+        assert_eq!(replay["input"][5]["type"], "custom_tool_call");
+        assert!(replay["input"][5].get("id").is_none());
+        assert_eq!(replay["input"][6]["type"], "custom_tool_call_output");
+        assert!(
+            replay["input"][6]["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("ctco_"))
+        );
         send_final(&mut second, "resp-final").await
     });
 
@@ -1872,10 +1901,10 @@ async fn receive_reset_reconnects_without_replaying_completed_tools() -> Result<
         let mut second = accept_async(stream).await?;
         let replay = next_json(&mut second).await?;
         assert!(replay.get("previous_response_id").is_none());
-        assert_eq!(replay["input"].as_array().map(Vec::len), Some(6));
-        assert_eq!(replay["input"][4]["type"], "custom_tool_call");
-        assert_eq!(replay["input"][4]["call_id"], "call-exec");
-        assert_eq!(replay["input"][5], tool_output);
+        assert_eq!(replay["input"].as_array().map(Vec::len), Some(7));
+        assert_eq!(replay["input"][5]["type"], "custom_tool_call");
+        assert_eq!(replay["input"][5]["call_id"], "call-exec");
+        assert_eq!(replay["input"][6], tool_output);
         send_final(&mut second, "resp-final").await
     });
 
@@ -1929,9 +1958,10 @@ async fn sol_compacts_with_a_trigger_and_installs_the_returned_context() -> Resu
         assert_eq!(compact["previous_response_id"], "resp-tool");
         assert_eq!(compact["input"].as_array().map(Vec::len), Some(2));
         assert_eq!(compact["input"][0]["type"], "custom_tool_call_output");
-        assert_eq!(
-            compact["input"][0]["output"],
-            "Output exceeded the available model context and was truncated"
+        assert!(
+            compact["input"][0]["output"]
+                .to_string()
+                .contains("tool completed")
         );
         assert_eq!(compact["input"][1], json!({ "type": "compaction_trigger" }));
         send_json(
@@ -1954,17 +1984,18 @@ async fn sol_compacts_with_a_trigger_and_installs_the_returned_context() -> Resu
 
         let continuation = next_json(&mut socket).await?;
         assert!(continuation.get("previous_response_id").is_none());
-        assert_eq!(continuation["input"].as_array().map(Vec::len), Some(5));
+        assert_eq!(continuation["input"].as_array().map(Vec::len), Some(6));
         assert_eq!(continuation["input"][0]["type"], "additional_tools");
         assert_eq!(continuation["input"][1]["role"], "developer");
-        assert_eq!(continuation["input"][2]["role"], "user");
+        assert_eq!(continuation["input"][2]["role"], "developer");
         assert_eq!(continuation["input"][3]["role"], "user");
-        assert_eq!(continuation["input"][4]["type"], "compaction");
+        assert_eq!(continuation["input"][4]["role"], "user");
+        assert_eq!(continuation["input"][5]["type"], "compaction");
         assert_eq!(
-            continuation["input"][4]["encrypted_content"],
+            continuation["input"][5]["encrypted_content"],
             "opaque-summary"
         );
-        assert!(continuation["input"][4].get("id").is_none());
+        assert!(continuation["input"][5].get("id").is_none());
         assert!(continuation.to_string().contains("exercise compaction"));
         assert!(
             continuation
@@ -1983,6 +2014,109 @@ async fn sol_compacts_with_a_trigger_and_installs_the_returned_context() -> Resu
     assert!(output.contains("\"model.compaction.started\""));
     assert!(output.contains("\"model.compaction.completed\""));
     assert!(output.contains("\"compactions\":1"));
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn sol_compacts_before_sampling_a_follow_on_turn() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut socket = accept_async(stream).await?;
+        assert_warmup(&next_json(&mut socket).await?);
+        send_warmup(&mut socket, "resp-warmup").await?;
+
+        let first = next_json(&mut socket).await?;
+        assert!(first.to_string().contains("first prompt"));
+        send_json(
+            &mut socket,
+            completed_response_with_usage(
+                "resp-first",
+                &[json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "done" }]
+                })],
+                244_800,
+            ),
+        )
+        .await?;
+
+        let compact = next_json(&mut socket).await?;
+        assert_eq!(compact["previous_response_id"], "resp-first");
+        assert_eq!(compact["input"], json!([{ "type": "compaction_trigger" }]));
+        assert!(!compact.to_string().contains("second prompt"));
+        send_json(
+            &mut socket,
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "id": "cmp-server-id",
+                    "type": "compaction",
+                    "encrypted_content": "opaque-summary"
+                }
+            }),
+        )
+        .await?;
+        send_json(
+            &mut socket,
+            completed_response_with_usage("resp-compact", &[], 120),
+        )
+        .await?;
+
+        let second = next_json(&mut socket).await?;
+        assert!(second.get("previous_response_id").is_none());
+        assert!(second.to_string().contains("second prompt"));
+        let second_input = second["input"]
+            .as_array()
+            .ok_or_else(|| eyre!("follow-on request input was not an array"))?;
+        assert_eq!(
+            second_input.get(second_input.len().saturating_sub(2)),
+            Some(&json!({
+                "type": "compaction",
+                "encrypted_content": "opaque-summary"
+            }))
+        );
+        assert!(
+            second_input
+                .last()
+                .is_some_and(|item| item.to_string().contains("second prompt"))
+        );
+        send_final(&mut socket, "resp-second").await
+    });
+
+    let workspace = temporary_workspace("pre-turn-compaction")?;
+    let responses = Responses::builder().websocket_url(endpoint).build();
+    let (agent, events) = Nanocodex::builder("test-key")
+        .thinking(Thinking::Low)
+        .workspace(&workspace)
+        .responses(responses)
+        .session_id("model-test")
+        .build()?;
+    assert_eq!(
+        agent
+            .prompt("first prompt")
+            .await?
+            .result()
+            .await?
+            .final_message,
+        "done"
+    );
+    assert_eq!(
+        agent
+            .prompt("second prompt")
+            .await?
+            .result()
+            .await?
+            .final_message,
+        "done"
+    );
+    drop((agent, events));
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock Responses server did not finish"))???;
     std::fs::remove_dir_all(workspace)?;
     Ok(())
 }
@@ -2088,6 +2222,10 @@ async fn active_boundary_fork_sends_tool_and_steer_delta_then_replays_on_checkpo
         assert_eq!(continuation["input"].as_array().map(Vec::len), Some(2));
         assert_eq!(continuation["input"][0]["type"], "custom_tool_call_output");
         assert!(continuation["input"][0].to_string().contains("shit"));
+        let tool_output_id = continuation["input"][0]["id"]
+            .as_str()
+            .ok_or_else(|| eyre!("root continuation omitted the tool output ID"))?
+            .to_owned();
         assert_eq!(
             continuation["input"][1]["content"][0]["text"],
             "print shat instead"
@@ -2103,6 +2241,7 @@ async fn active_boundary_fork_sends_tool_and_steer_delta_then_replays_on_checkpo
         assert_eq!(incremental["input"].as_array().map(Vec::len), Some(3));
         assert_eq!(incremental["input"][0]["type"], "custom_tool_call_output");
         assert!(incremental["input"][0].to_string().contains("shit"));
+        assert_eq!(incremental["input"][0]["id"], tool_output_id);
         assert_eq!(
             incremental["input"][1]["content"][0]["text"],
             "print shat instead"
@@ -2125,6 +2264,15 @@ async fn active_boundary_fork_sends_tool_and_steer_delta_then_replays_on_checkpo
 
         let replay = next_json(&mut branch).await?;
         assert!(replay.get("previous_response_id").is_none());
+        let replay_tool_output = replay["input"]
+            .as_array()
+            .and_then(|items| {
+                items.iter().find(|item| {
+                    item["type"] == "custom_tool_call_output" && item["call_id"] == "call-exec"
+                })
+            })
+            .ok_or_else(|| eyre!("full replay omitted the inherited tool output"))?;
+        assert_eq!(replay_tool_output["id"], tool_output_id);
         let replay_text = replay.to_string();
         assert!(replay_text.contains("active root prompt"));
         assert!(replay_text.contains("call-exec"));
@@ -2577,7 +2725,7 @@ async fn cloned_builders_singleflight_one_shared_prefix_warmup() -> Result<()> {
         assert_eq!(second_turn["prompt_cache_key"], "shared-prefix");
         assert!(second_turn.get("previous_response_id").is_none());
         assert_ne!(second_turn["client_metadata"]["session_id"], first_session);
-        assert_eq!(second_turn["input"].as_array().map(Vec::len), Some(4));
+        assert_eq!(second_turn["input"].as_array().map(Vec::len), Some(5));
         assert!(second_turn.get("generate").is_none());
         send_final(&mut second, "resp-second").await
     });
@@ -2727,6 +2875,7 @@ async fn serialized_session_and_codex_rollout_share_committed_history() -> Resul
         assert!(replay.get("previous_response_id").is_none());
         assert_eq!(replay["prompt_cache_key"], "durable-cache");
         assert_eq!(replay["input"][0]["type"], "additional_tools");
+        assert!(replay["input"][0].get("id").is_none());
         assert_eq!(replay["input"][1]["role"], "developer");
         assert_eq!(
             replay["input"][1]["content"][0]["text"],
@@ -2760,6 +2909,19 @@ async fn serialized_session_and_codex_rollout_share_committed_history() -> Resul
     let encoded = serde_json::to_vec(&first.snapshot())?;
     agent.flush_rollout().await?;
     let snapshot_json = serde_json::from_slice::<Value>(&encoded)?;
+    let request_prefix = snapshot_json["request_prefix"]
+        .as_array()
+        .ok_or_else(|| eyre!("snapshot request prefix was not an array"))?;
+    assert_eq!(request_prefix[0]["type"], "additional_tools");
+    assert!(request_prefix[0].get("id").is_none());
+    assert!(request_prefix[1]["id"].is_string());
+    assert!(
+        snapshot_json["history"]
+            .as_array()
+            .is_some_and(|items| items.iter().all(|item| {
+                item.get("id").is_some_and(Value::is_string) || item["type"] == "compaction_trigger"
+            }))
+    );
     let rollout_history = std::fs::read_to_string(rollout_path)?
         .lines()
         .map(serde_json::from_str::<Value>)
@@ -2929,6 +3091,7 @@ fn assert_warmup(warmup: &Value) {
     assert_eq!(warmup["prompt_cache_key"], "model-test");
     assert_eq!(warmup["input"].as_array().map(Vec::len), Some(2));
     assert_eq!(warmup["input"][0]["type"], "additional_tools");
+    assert!(warmup["input"][0].get("id").is_none());
     assert_eq!(warmup["input"][0]["role"], "developer");
     assert_eq!(warmup["input"][0]["tools"][0]["type"], "custom");
     assert_eq!(warmup["input"][0]["tools"][0]["name"], "exec");

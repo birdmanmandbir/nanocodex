@@ -1,14 +1,128 @@
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use eyre::{Result, eyre};
-use nanocodex_core::ResponseItem;
+use nanocodex_core::{ResponseItem, ToolDefinition};
 use serde_json::Value;
+use tokio::sync::Semaphore;
 
 use super::{
     CellUpdate, CodeModeExecution, CodeModeObserver, CodeModeUpdate, LiveCell, NestedToolCall,
-    nested_tool_yield_after, observe_cell, observer_yield_timeout, parse_exec_source,
+    ObservationMode, nested_tool_yield_after, observe_cell, observer_yield_timeout,
+    parse_exec_source,
 };
-use crate::{ToolContext, ToolOutputBody, ToolOutputContent, ToolRuntime, WebSearchConfig};
+use crate::{
+    Tool, ToolContext, ToolExecution, ToolInput, ToolOutputBody, ToolOutputContent, ToolResult,
+    ToolRuntime, Tools, WebSearchConfig,
+};
+
+struct ConcurrencyProbe {
+    state: Arc<ConcurrencyProbeState>,
+}
+
+struct ConcurrencyProbeState {
+    active: AtomicUsize,
+    maximum: AtomicUsize,
+    release: Semaphore,
+}
+
+#[async_trait::async_trait]
+impl Tool for ConcurrencyProbe {
+    fn name(&self) -> &'static str {
+        "concurrency_probe"
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::function(
+            self.name(),
+            "Waits until released by the test.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        )
+    }
+
+    async fn execute(&self, _input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
+        let active = self.state.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.state.maximum.fetch_max(active, Ordering::SeqCst);
+        let permit = self
+            .state
+            .release
+            .acquire()
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        permit.forget();
+        self.state.active.fetch_sub(1, Ordering::SeqCst);
+        Ok(ToolExecution::text("released"))
+    }
+}
+
+#[tokio::test]
+async fn nested_tool_calls_are_bounded_at_128() -> Result<()> {
+    const CALLS: usize = super::MAX_CONCURRENT_NESTED_CALLS + 1;
+
+    let workspace = temporary_workspace("bounded-nested-tools")?;
+    let state = Arc::new(ConcurrencyProbeState {
+        active: AtomicUsize::new(0),
+        maximum: AtomicUsize::new(0),
+        release: Semaphore::new(0),
+    });
+    let tools = Tools::builder()
+        .without_defaults()
+        .tool(ConcurrencyProbe {
+            state: Arc::clone(&state),
+        })
+        .build()?;
+    let runtime = ToolRuntime::new_with_tools(&workspace, None, None, &tools);
+    let execution = tokio::spawn(async move {
+        let history = Vec::new();
+        runtime
+            .execute_code(
+                &format!(
+                    "await Promise.all(Array.from({{ length: {CALLS} }}, () => \
+                     tools.concurrency_probe({{}})));"
+                ),
+                test_context(&history),
+            )
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state.active.load(Ordering::SeqCst) < super::MAX_CONCURRENT_NESTED_CALLS {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(
+        state.active.load(Ordering::SeqCst),
+        super::MAX_CONCURRENT_NESTED_CALLS
+    );
+    assert_eq!(
+        state.maximum.load(Ordering::SeqCst),
+        super::MAX_CONCURRENT_NESTED_CALLS
+    );
+
+    state.release.add_permits(CALLS);
+    let execution = execution.await?;
+    assert!(execution.success, "{}", execution_output(&execution));
+    assert_eq!(execution.nested_calls.len(), CALLS);
+    assert_eq!(
+        state.maximum.load(Ordering::SeqCst),
+        super::MAX_CONCURRENT_NESTED_CALLS
+    );
+
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
 
 #[test]
 fn long_observer_yields_include_completion_grace() {
@@ -116,13 +230,17 @@ async fn embedded_quickjs_does_not_expose_node_or_host_callback_globals() -> Res
     let history = Vec::new();
     let execution = tools
         .execute_code(
-            r"
+            r#"
 text({
   process: typeof process,
   require: typeof require,
   hostCallback: typeof __nanocodexTool,
+  console: Object.hasOwn(globalThis, "console"),
+  atomics: Object.hasOwn(globalThis, "Atomics"),
+  sharedArrayBuffer: Object.hasOwn(globalThis, "SharedArrayBuffer"),
+  webAssembly: Object.hasOwn(globalThis, "WebAssembly"),
 });
-",
+"#,
             test_context(&history),
         )
         .await;
@@ -130,8 +248,83 @@ text({
     assert!(execution.success, "{}", execution_output(&execution));
     assert_eq!(
         emitted_text(&execution)?,
-        r#"{"process":"undefined","require":"undefined","hostCallback":"undefined"}"#
+        r#"{"process":"undefined","require":"undefined","hostCallback":"undefined","console":false,"atomics":false,"sharedArrayBuffer":false,"webAssembly":false}"#
     );
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn all_tools_exposes_only_codex_metadata_fields() -> Result<()> {
+    let workspace = temporary_workspace("all-tools-metadata")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            r"
+text(ALL_TOOLS.map((tool) => ({
+  keys: Object.keys(tool).sort(),
+  frozen: Object.isFrozen(tool),
+})));
+",
+            test_context(&history),
+        )
+        .await;
+
+    assert!(execution.success, "{}", execution_output(&execution));
+    let metadata = serde_json::from_str::<Value>(emitted_text(&execution)?)?;
+    let tools = metadata
+        .as_array()
+        .ok_or_else(|| eyre!("ALL_TOOLS output was not an array"))?;
+    assert!(!tools.is_empty());
+    assert!(tools.iter().all(|tool| {
+        tool["keys"] == serde_json::json!(["description", "name"]) && tool["frozen"] == true
+    }));
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn function_tools_receive_an_empty_object_when_called_without_arguments() -> Result<()> {
+    let workspace = temporary_workspace("empty-function-arguments")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            r"
+try {
+  await tools.update_plan();
+} catch (_) {}
+",
+            test_context(&history),
+        )
+        .await;
+
+    assert!(execution.success, "{}", execution_output(&execution));
+    assert_eq!(execution.nested_calls.len(), 1);
+    assert_eq!(execution.nested_calls[0].input, serde_json::json!({}));
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn text_propagates_json_stringification_errors() -> Result<()> {
+    let workspace = temporary_workspace("text-stringification-error")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            r"
+const value = {};
+value.self = value;
+text(value);
+",
+            test_context(&history),
+        )
+        .await;
+
+    assert!(!execution.success);
+    assert!(execution_output(&execution).contains("Script error:"));
     std::fs::remove_dir_all(workspace)?;
     Ok(())
 }
@@ -168,22 +361,30 @@ text(result.output);
 
     let second = tools
         .wait_for_code(
-            r#"{"cell_id":"2","yield_time_ms":1000}"#,
+            r#"{"cell_id":"2","yield_time_ms":5000}"#,
             test_context_with_call(&history, "call-wait-second"),
         )
         .await;
     let first = tools
         .wait_for_code(
-            r#"{"cell_id":"1","yield_time_ms":1000}"#,
+            r#"{"cell_id":"1","yield_time_ms":5000}"#,
             test_context_with_call(&history, "call-wait-first"),
         )
         .await;
 
     assert!(second.success, "{}", execution_output(&second));
-    assert!(execution_output(&second).contains("second done"));
+    assert!(
+        execution_output(&second).contains("second done"),
+        "{}",
+        execution_output(&second)
+    );
     assert_eq!(second.nested_calls.len(), 1);
     assert!(first.success, "{}", execution_output(&first));
-    assert!(execution_output(&first).contains("first done"));
+    assert!(
+        execution_output(&first).contains("first done"),
+        "{}",
+        execution_output(&first)
+    );
     assert_eq!(first.nested_calls.len(), 1);
     std::fs::remove_dir_all(workspace)?;
     Ok(())
@@ -252,8 +453,11 @@ async fn nested_call_updates_stream_in_start_and_resolution_order() -> Result<()
         .execute_code_with_updates(
             r#"
 await Promise.all([
-  tools.exec_command({ cmd: "sleep 0.08", login: false }),
-  tools.exec_command({ cmd: "sleep 0.01", login: false }),
+  tools.exec_command({
+    cmd: "i=0; while [ \"$i\" -lt 500 ]; do [ -f second.done ] && exit 0; i=$((i + 1)); sleep 0.01; done; exit 91",
+    login: false,
+  }),
+  tools.exec_command({ cmd: "touch second.done", login: false }),
 ]);
 "#,
             test_context(&history),
@@ -400,6 +604,76 @@ async fn image_helper_normalizes_detail_and_honors_override() -> Result<()> {
         }) if image_url == "data:image/png;base64,a"
     ));
 
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn view_image_rejects_unsupported_detail_with_codex_diagnostics() -> Result<()> {
+    let workspace = temporary_workspace("view-image-detail-error")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            r#"
+try {
+  await tools.view_image({ path: "missing.png", detail: "low" });
+} catch (error) {
+  text(error);
+}
+"#,
+            test_context(&history),
+        )
+        .await;
+
+    assert!(execution.success, "{}", execution_output(&execution));
+    assert_eq!(
+        emitted_text(&execution)?,
+        "view_image.detail only supports `high` or `original`; omit `detail` for default high resized behavior, got `low`"
+    );
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn output_helpers_accept_raw_mcp_image_and_audio_blocks() -> Result<()> {
+    let workspace = temporary_workspace("code-mode-mcp-media")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            r#"
+const returnsUndefined = [
+  image({
+    type: "image",
+    data: "a",
+    mimeType: "image/png",
+    _meta: { "codex/imageDetail": "original" },
+  }),
+  audio({
+    type: "audio",
+    data: "YXVkaW8=",
+    mimeType: "audio/wav",
+  }),
+].map((value) => value === undefined);
+text(returnsUndefined);
+"#,
+            test_context(&history),
+        )
+        .await;
+
+    assert!(execution.success, "{}", execution_output(&execution));
+    let ToolOutputBody::Content(content) = &execution.output else {
+        return Err(eyre!("code-mode execution did not emit content"));
+    };
+    assert!(matches!(
+        content.get(1),
+        Some(ToolOutputContent::InputImage {
+            image_url,
+            detail: crate::ImageDetail::Original,
+        }) if image_url == "data:image/png;base64,a"
+    ));
+    assert_eq!(emitted_text(&execution)?, "[true,true]");
     std::fs::remove_dir_all(workspace)?;
     Ok(())
 }
@@ -566,13 +840,144 @@ text("after");
 
     let completed = tools
         .wait_for_code(
-            r#"{"cell_id":"1","yield_time_ms":1000}"#,
+            r#"{"cell_id":"1","yield_time_ms":5000}"#,
             test_context(&history),
         )
         .await;
     assert!(completed.success);
     assert!(execution_output(&completed).contains("Script completed"));
     assert!(execution_output(&completed).contains("after"));
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn yield_control_does_not_require_pending_tools_to_finish() -> Result<()> {
+    let workspace = temporary_workspace("yield-with-pending-tool")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            r#"
+const pending = tools.exec_command({
+  cmd: "sleep 0.05; printf 'finished'",
+  login: false,
+});
+text("before");
+yield_control();
+const result = await pending;
+text(result.output);
+"#,
+            test_context(&history),
+        )
+        .await;
+
+    assert!(execution.success, "{}", execution_output(&execution));
+    assert!(execution_output(&execution).contains("Script running with cell ID 1"));
+    assert!(execution_output(&execution).contains("before"));
+    let completed = tools
+        .wait_for_code(
+            r#"{"cell_id":"1","yield_time_ms":5000}"#,
+            test_context(&history),
+        )
+        .await;
+    assert!(completed.success, "{}", execution_output(&completed));
+    assert!(execution_output(&completed).contains("finished"));
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pending_timeouts_do_not_keep_a_cell_alive() -> Result<()> {
+    let workspace = temporary_workspace("unawaited-timeout")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let completed = tokio::time::timeout(
+        Duration::from_secs(2),
+        tools.execute_code(
+            r#"
+setTimeout(() => text("late"), 60_000);
+text("done");
+"#,
+            test_context(&history),
+        ),
+    )
+    .await?;
+
+    assert!(completed.success, "{}", execution_output(&completed));
+    assert_eq!(emitted_text(&completed)?, "done");
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn termination_returns_unobserved_output_since_the_last_yield() -> Result<()> {
+    let workspace = temporary_workspace("terminated-cell-output")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let after_ready = workspace.join("after-ready");
+    let yielded = tools
+        .execute_code(
+            r#"
+text("before");
+yield_control();
+text("after");
+await tools.exec_command({cmd: "touch after-ready", login: false});
+await new Promise(() => {});
+"#,
+            test_context(&history),
+        )
+        .await;
+
+    assert!(yielded.success, "{}", execution_output(&yielded));
+    assert!(execution_output(&yielded).contains("before"));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !after_ready.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    let terminated = tools
+        .wait_for_code(
+            r#"{"cell_id":"1","terminate":true}"#,
+            test_context(&history),
+        )
+        .await;
+    assert!(terminated.success, "{}", execution_output(&terminated));
+    assert!(execution_output(&terminated).contains("Script terminated"));
+    assert!(execution_output(&terminated).contains("after"));
+    assert!(!execution_output(&terminated).contains("was terminated"));
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn natural_completion_wins_over_a_late_termination_request() -> Result<()> {
+    let workspace = temporary_workspace("completion-before-termination")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let yielded = tools
+        .execute_code(
+            r#"
+yield_control();
+text("done");
+"#,
+            test_context(&history),
+        )
+        .await;
+    assert!(yielded.success, "{}", execution_output(&yielded));
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let completed = tools
+        .wait_for_code(
+            r#"{"cell_id":"1","terminate":true}"#,
+            test_context(&history),
+        )
+        .await;
+    assert!(completed.success, "{}", execution_output(&completed));
+    assert!(execution_output(&completed).contains("Script completed"));
+    assert!(execution_output(&completed).contains("done"));
     std::fs::remove_dir_all(workspace)?;
     Ok(())
 }
@@ -627,6 +1032,39 @@ text(result);
 }
 
 #[tokio::test]
+async fn completed_shell_session_is_not_reported_as_running() -> Result<()> {
+    let workspace = temporary_workspace("completed-shell-session")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            r#"
+const command = await tools.exec_command({
+  cmd: "read value; printf 'received:%s' \"$value\"",
+  login: false,
+  tty: true,
+  yield_time_ms: 250,
+});
+const completed = await tools.write_stdin({
+  session_id: command.session_id,
+  chars: "parity\n",
+  yield_time_ms: 5000,
+});
+text(completed.output);
+"#,
+            test_context(&history),
+        )
+        .await;
+
+    assert!(execution.success, "{}", execution_output(&execution));
+    let output = execution_output(&execution);
+    assert!(output.contains("received:parity"));
+    assert!(!output.contains("Nested shell process is still running"));
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn cancellation_terminates_yielded_code_cells() -> Result<()> {
     let workspace = temporary_workspace("cancelled-cell")?;
     let tools = test_tools(&workspace);
@@ -648,7 +1086,7 @@ await new Promise(() => {});
         .wait_for_code(r#"{"cell_id":"1"}"#, test_context(&history))
         .await;
     assert!(!missing.success);
-    assert!(execution_output(&missing).contains("exec cell 1 was not found"));
+    assert!(execution_output(&missing).contains("exec cell 1 not found"));
 
     std::fs::remove_dir_all(workspace)?;
     Ok(())
@@ -761,10 +1199,7 @@ text(result);
         .await;
 
     assert!(execution.success, "{}", execution_output(&execution));
-    assert!(
-        execution_output(&execution)
-            .contains("Success. Updated the following files:\nA created.txt")
-    );
+    assert_eq!(emitted_text(&execution)?, "{}");
     assert_eq!(execution.nested_calls.len(), 1);
     assert_eq!(
         execution.nested_calls[0].input,
@@ -777,6 +1212,61 @@ text(result);
         std::fs::read_to_string(workspace.join("created.txt"))?,
         "created by patch\n"
     );
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn freeform_apply_patch_rejects_with_codex_diagnostics() -> Result<()> {
+    let workspace = temporary_workspace("freeform-apply-patch-error")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            r#"
+try {
+  await tools.apply_patch("*** Begin Patch\n*** Update File: missing.txt\n@@\n-before\n+after\n*** End Patch");
+} catch (error) {
+  text(error);
+}
+"#,
+            test_context(&history),
+        )
+        .await;
+
+    assert!(execution.success, "{}", execution_output(&execution));
+    assert!(
+        emitted_text(&execution)?
+            .starts_with("apply_patch verification failed: Failed to read file to update "),
+        "{}",
+        execution_output(&execution)
+    );
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn update_plan_matches_codex_handler_acceptance() -> Result<()> {
+    let workspace = temporary_workspace("update-plan-acceptance")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            r#"
+const result = await tools.update_plan({
+  plan: [
+    { step: "", status: "in_progress" },
+    { step: "also active", status: "in_progress" },
+  ],
+});
+text(result);
+"#,
+            test_context(&history),
+        )
+        .await;
+
+    assert!(execution.success, "{}", execution_output(&execution));
+    assert_eq!(emitted_text(&execution)?, "{}");
     std::fs::remove_dir_all(workspace)?;
     Ok(())
 }
@@ -854,7 +1344,7 @@ fn nested_shell_yields_follow_the_handlers_bounds() {
             "write_stdin",
             &serde_json::json!({ "session_id": 1, "yield_time_ms": 120_000 }),
         ),
-        Some(Duration::from_secs(120))
+        Some(Duration::from_mins(2))
     );
     assert_eq!(
         nested_tool_yield_after(
@@ -877,6 +1367,35 @@ fn nested_shell_yields_follow_the_handlers_bounds() {
 }
 
 #[tokio::test]
+async fn negative_shell_limits_fail_during_codex_compatible_argument_parsing() -> Result<()> {
+    let workspace = temporary_workspace("negative-shell-limits")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            r#"
+try {
+  await tools.exec_command({ cmd: "true", yield_time_ms: -1 });
+} catch (error) {
+  text(error);
+}
+"#,
+            test_context(&history),
+        )
+        .await;
+
+    assert!(execution.success, "{}", execution_output(&execution));
+    assert!(
+        emitted_text(&execution)?
+            .starts_with("failed to parse function arguments: invalid value: integer `-1`"),
+        "{}",
+        execution_output(&execution)
+    );
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn default_cell_yield_extends_for_a_longer_nested_shell_wait() {
     let (updates_tx, updates) = tokio::sync::mpsc::unbounded_channel();
     let (terminate, _terminate_rx) = tokio::sync::oneshot::channel();
@@ -891,9 +1410,7 @@ async fn default_cell_yield_extends_for_a_longer_nested_shell_wait() {
             .expect("observer should receive the nested call");
         tokio::time::sleep(Duration::from_millis(15)).await;
         updates_tx
-            .send(CellUpdate::Completed {
-                content: Vec::new(),
-            })
+            .send(CellUpdate::Completed)
             .expect("observer should receive cell completion");
     });
     let mut cell = LiveCell {
@@ -907,7 +1424,7 @@ async fn default_cell_yield_extends_for_a_longer_nested_shell_wait() {
     let (execution, running) = observe_cell(
         &mut cell,
         std::time::Instant::now(),
-        Duration::from_millis(5),
+        ObservationMode::YieldAfter(Duration::from_millis(5)),
         None,
         true,
         &mut super::IgnoreCodeModeUpdates,
@@ -934,9 +1451,7 @@ async fn explicit_cell_yield_is_not_extended_by_a_nested_shell_wait() {
             })
             .expect("observer should receive the nested call");
         tokio::time::sleep(Duration::from_millis(15)).await;
-        let _ = updates_tx.send(CellUpdate::Completed {
-            content: Vec::new(),
-        });
+        let _ = updates_tx.send(CellUpdate::Completed);
     });
     let mut cell = LiveCell {
         id: 1,
@@ -949,7 +1464,7 @@ async fn explicit_cell_yield_is_not_extended_by_a_nested_shell_wait() {
     let (execution, running) = observe_cell(
         &mut cell,
         std::time::Instant::now(),
-        Duration::from_millis(5),
+        ObservationMode::YieldAfter(Duration::from_millis(5)),
         None,
         false,
         &mut super::IgnoreCodeModeUpdates,
@@ -976,7 +1491,7 @@ fn model_description_uses_codex_style_declarations() {
         .as_str()
         .expect("exec should have a description");
     assert!(description.contains("// @exec:"));
-    assert!(description.contains("must be a base64-encoded `data:` URL"));
+    assert!(description.contains("should be a base64-encoded `data:` URL"));
     assert!(description.contains("apply_patch(input: string): Promise<unknown>"));
     assert!(description.contains("exec_command(args: {"));
     assert!(!description.contains("Input schema:"));
@@ -996,7 +1511,7 @@ fn emitted_text(execution: &CodeModeExecution) -> Result<&str> {
         .rev()
         .find_map(|item| match item {
             ToolOutputContent::InputText { text } => Some(text.as_str()),
-            ToolOutputContent::InputImage { .. } => None,
+            ToolOutputContent::InputImage { .. } | ToolOutputContent::InputAudio { .. } => None,
         })
         .ok_or_else(|| eyre!("code-mode execution did not emit text"))
 }
@@ -1008,7 +1523,7 @@ fn execution_output(execution: &CodeModeExecution) -> String {
             .iter()
             .filter_map(|item| match item {
                 ToolOutputContent::InputText { text } => Some(text.as_str()),
-                ToolOutputContent::InputImage { .. } => None,
+                ToolOutputContent::InputImage { .. } | ToolOutputContent::InputAudio { .. } => None,
             })
             .collect::<Vec<_>>()
             .join("\n"),

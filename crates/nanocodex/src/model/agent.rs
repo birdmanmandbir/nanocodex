@@ -5,8 +5,8 @@ use std::{
 };
 
 use nanocodex_core::{
-    AgentEventKind, EventSink, MODEL, ModelConfig, Prompt, ResponseItem, ResponsesTransport,
-    Thinking, ToolDefinition, Usage, responses::RequestProfile,
+    AgentEventKind, EventSink, MODEL, ModelConfig, Prompt, ResponseItem, ResponseItemId,
+    ResponsesTransport, Thinking, ToolDefinition, Usage, responses::RequestProfile,
 };
 use nanocodex_service::{
     CodeCall, CodeCallKind, ResponsesAttempt, ResponsesAttemptFactory, ResponsesClient,
@@ -19,7 +19,9 @@ use tower::Service;
 use tracing::{Instrument, info, info_span};
 use web_time::Instant;
 
-use super::context_manager::has_well_formed_tool_calls;
+use super::context_manager::{
+    assign_missing_response_item_id, assign_missing_response_item_ids, has_well_formed_tool_calls,
+};
 use super::{
     CompactionCompleted, CompactionFailed, CompactionStarted, ModelCallCompleted, ModelCallFailed,
     ModelCallStarted, RunError, RunStarted, RunStats, RunSteered, ToolCallArguments, ToolCallEvent,
@@ -29,8 +31,8 @@ use super::{
     context_manager::ContextManager,
     display_endpoint, elapsed_ns,
     input::{
-        custom_tool_notification, custom_tool_output, function_tool_output, task_context,
-        task_input, turn_aborted,
+        custom_tool_notification, custom_tool_output, developer_context, function_tool_output,
+        task_context, task_input, turn_aborted,
     },
     resolve_workspace, terminal_payload,
 };
@@ -120,15 +122,16 @@ impl ModelCheckpoint {
 
     pub(crate) fn resume(
         workspace: String,
-        request_prefix: Arc<[ResponseItem]>,
+        mut request_prefix: Vec<ResponseItem>,
         prompt_cache_key: Arc<str>,
         canonical_context: ResponseItem,
         history: Vec<ResponseItem>,
     ) -> Result<Self> {
+        assign_request_prefix_ids(&mut request_prefix);
         Ok(Self {
             workspace,
             conversation: ConversationState::resume(canonical_context, history)?,
-            request_prefix,
+            request_prefix: Arc::from(request_prefix),
             prompt_cache_key,
             preserve_inherited_delta: false,
             global_instructions: None,
@@ -152,6 +155,22 @@ struct ModelSessionState {
     factory: ResponsesAttemptFactory,
     conversation: ConversationState,
     preserve_inherited_delta: bool,
+}
+
+impl ModelSessionState {
+    fn validate_workspace(&self, requested: Option<&str>) -> Result<()> {
+        let Some(requested) = requested else {
+            return Ok(());
+        };
+        let requested = resolve_workspace(Some(requested))?;
+        if requested != self.workspace {
+            return Err(NanocodexError::WorkspaceChanged {
+                current: self.workspace.clone(),
+                requested,
+            });
+        }
+        Ok(())
+    }
 }
 
 struct ActiveToolCall {
@@ -292,14 +311,15 @@ struct ConversationState {
 }
 
 impl ConversationState {
-    fn new(history: Vec<ResponseItem>) -> Result<Self> {
-        let canonical_context =
-            history
-                .first()
-                .cloned()
-                .ok_or(NanocodexError::MalformedResponse {
-                    detail: "task input did not include initial context",
-                })?;
+    fn new(mut history: Vec<ResponseItem>) -> Result<Self> {
+        assign_missing_response_item_ids(&mut history);
+        let canonical_context = history
+            .iter()
+            .find(|item| item.is_user_message())
+            .cloned()
+            .ok_or(NanocodexError::MalformedResponse {
+                detail: "task input did not include initial context",
+            })?;
         Ok(Self {
             canonical_context: Arc::new(canonical_context),
             context: ContextManager::new(history),
@@ -309,7 +329,7 @@ impl ConversationState {
         })
     }
 
-    fn resume(canonical_context: ResponseItem, history: Vec<ResponseItem>) -> Result<Self> {
+    fn resume(mut canonical_context: ResponseItem, mut history: Vec<ResponseItem>) -> Result<Self> {
         if history.is_empty() {
             return Err(NanocodexError::InvalidSessionSnapshot(
                 "conversation history must not be empty".to_owned(),
@@ -320,6 +340,8 @@ impl ConversationState {
                 "canonical context must be a user message".to_owned(),
             ));
         }
+        assign_missing_response_item_id(&mut canonical_context);
+        assign_missing_response_item_ids(&mut history);
         if !has_well_formed_tool_calls(&history) {
             return Err(NanocodexError::InvalidSessionSnapshot(
                 "conversation history contains an unmatched or misordered tool call".to_owned(),
@@ -375,11 +397,13 @@ impl ConversationState {
     fn install_compaction(
         &mut self,
         item: ResponseItem,
+        canonical_developer_context: ResponseItem,
         canonical_context: ResponseItem,
         request_prefix: &[ResponseItem],
     ) {
+        let initial_context = [canonical_developer_context, canonical_context.clone()];
         let history =
-            compaction::install_history(&self.context.flattened_items(), &canonical_context, item);
+            compaction::install_history(&self.context.flattened_items(), &initial_context, item);
         self.canonical_context = Arc::new(canonical_context);
         self.context.replace_and_recompute(history, request_prefix);
         self.delta_start = 0;
@@ -560,12 +584,16 @@ pub(crate) fn prepare_resumed_checkpoint(
         tool_specs,
         config.system_prompt(),
     );
-    let expected = serde_json::to_vec(expected.prefix()).map_err(|error| {
-        NanocodexError::InvalidSessionSnapshot(format!(
-            "failed to validate the request prefix: {error}"
-        ))
-    })?;
-    let stored = serde_json::to_vec(prepared.checkpoint.request_prefix()).map_err(|error| {
+    let expected =
+        serde_json::to_vec(&without_response_item_ids(expected.prefix())).map_err(|error| {
+            NanocodexError::InvalidSessionSnapshot(format!(
+                "failed to validate the request prefix: {error}"
+            ))
+        })?;
+    let stored = serde_json::to_vec(&without_response_item_ids(
+        prepared.checkpoint.request_prefix(),
+    ))
+    .map_err(|error| {
         NanocodexError::InvalidSessionSnapshot(format!(
             "failed to validate the stored request prefix: {error}"
         ))
@@ -576,6 +604,55 @@ pub(crate) fn prepare_resumed_checkpoint(
         ));
     }
     Ok(prepared)
+}
+
+pub(crate) fn prepare_rollout_checkpoint(
+    workspace: String,
+    canonical_context: ResponseItem,
+    history: Vec<ResponseItem>,
+    prompt_cache_key: Arc<str>,
+    config: &ModelConfig,
+    tools: &Tools,
+    session_id: &str,
+) -> Result<PreparedCheckpoint> {
+    let runtime = tool_runtime(&workspace, config, tools);
+    #[cfg(not(target_family = "wasm"))]
+    let tool_specs = {
+        let _ = session_id;
+        runtime.model_specs()
+    };
+    #[cfg(target_family = "wasm")]
+    let tool_specs = runtime.model_specs(session_id);
+    let request_prefix = request_profile(
+        "rollout-resume",
+        "rollout-resume",
+        tool_specs,
+        config.system_prompt(),
+    )
+    .prefix()
+    .to_vec();
+    let checkpoint = ModelCheckpoint::resume(
+        workspace,
+        request_prefix,
+        prompt_cache_key,
+        canonical_context,
+        history,
+    )?;
+    Ok(PreparedCheckpoint {
+        checkpoint,
+        runtime,
+    })
+}
+
+fn without_response_item_ids(items: &[ResponseItem]) -> Vec<ResponseItem> {
+    items
+        .iter()
+        .cloned()
+        .map(|mut item| {
+            item.strip_id();
+            item
+        })
+        .collect()
 }
 
 impl<S> ModelRun<S>
@@ -720,6 +797,41 @@ where
         }
     }
 
+    async fn prepare_follow_on_turn(
+        &mut self,
+        session: &mut ModelSessionState,
+        task: &Prompt,
+        cancel: &mut tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<bool> {
+        let compacted = {
+            let compaction = self.maybe_compact(
+                self.stats.model_calls,
+                &mut session.conversation,
+                &session.factory,
+                &session.workspace,
+                session.tools.working_directory(),
+                session.tools.default_shell_name(),
+            );
+            tokio::pin!(compaction);
+            tokio::select! {
+                biased;
+                _ = &mut *cancel => return Ok(false),
+                outcome = &mut compaction => outcome?,
+            }
+        };
+        if compacted || session.preserve_inherited_delta {
+            session.preserve_inherited_delta = false;
+        } else {
+            session.conversation.clear_delta();
+        }
+        let user_content = prepare_user_input(&task.instruction).await;
+        session.conversation.append([ResponseItem::message(
+            nanocodex_core::MessageRole::User,
+            user_content,
+        )]);
+        Ok(true)
+    }
+
     async fn execute_task(
         &mut self,
         task: Prompt,
@@ -729,33 +841,24 @@ where
         fork_snapshots: &watch::Sender<Option<ModelCheckpoint>>,
     ) -> Result<ModelTaskOutcome> {
         let mut session = if let Some(mut session) = self.session.take() {
-            if let Some(requested) = requested_workspace.as_deref() {
-                let resolved = match resolve_workspace(Some(requested)) {
-                    Ok(resolved) => resolved,
-                    Err(error) => {
-                        self.session = Some(session);
-                        return Err(error);
-                    }
-                };
-                if resolved != session.workspace {
-                    let current = session.workspace.clone();
+            if let Err(error) = session.validate_workspace(requested_workspace.as_deref()) {
+                self.session = Some(session);
+                return Err(error);
+            }
+            match self
+                .prepare_follow_on_turn(&mut session, &task, cancel)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
                     self.session = Some(session);
-                    return Err(NanocodexError::WorkspaceChanged {
-                        current,
-                        requested: resolved,
-                    });
+                    return Ok(ModelTaskOutcome::Cancelled);
+                }
+                Err(error) => {
+                    self.session = Some(session);
+                    return Err(error);
                 }
             }
-            let user_content = prepare_user_input(&task.instruction).await;
-            if session.preserve_inherited_delta {
-                session.preserve_inherited_delta = false;
-            } else {
-                session.conversation.clear_delta();
-            }
-            session.conversation.append([ResponseItem::message(
-                nanocodex_core::MessageRole::User,
-                user_content,
-            )]);
             session
         } else {
             let workspace = resolve_workspace(requested_workspace.as_deref())?;
@@ -935,9 +1038,7 @@ where
             let end_turn = response.end_turn;
             let final_message = response.final_message;
             let code_calls = response.code_calls;
-            session
-                .conversation
-                .append(response.output_items.into_iter().map(strip_item_id));
+            session.conversation.append(response.output_items);
             can_drain_steers = true;
 
             if code_calls.is_empty() {
@@ -958,6 +1059,15 @@ where
                     // The completed response is retained by previous_response_id;
                     // the next delta contains only newly drained steer messages.
                     session.conversation.clear_delta();
+                    self.maybe_compact(
+                        call_index,
+                        &mut session.conversation,
+                        &session.factory,
+                        &session.workspace,
+                        session.tools.working_directory(),
+                        session.tools.default_shell_name(),
+                    )
+                    .await?;
                     continue;
                 }
                 if let Some(message) = final_message {
@@ -1153,20 +1263,16 @@ where
         project_workspace: &str,
         working_directory: &str,
         shell: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let Some(auto_compact_token_limit) = compaction::auto_compact_token_limit(MODEL) else {
-            return Ok(());
+            return Ok(false);
         };
         let active_context_tokens =
             conversation.active_context_tokens(self.server_reasoning_included);
         if active_context_tokens < auto_compact_token_limit {
-            return Ok(());
+            return Ok(false);
         }
-        let previous_response_id = conversation.previous_response_id.as_deref().ok_or(
-            NanocodexError::MalformedResponse {
-                detail: "compaction did not have a previous response ID",
-            },
-        )?;
+        let previous_response_id = conversation.previous_response_id.as_deref();
         let (item, _usage) = self
             .perform_compaction(
                 after_model_call_index,
@@ -1181,8 +1287,13 @@ where
         let project_instructions = self.load_agent_instructions(project_workspace)?;
         let canonical_context =
             task_context(working_directory, shell, project_instructions.as_deref());
-        conversation.install_compaction(item, canonical_context, factory.profile().prefix());
-        Ok(())
+        conversation.install_compaction(
+            item,
+            developer_context(),
+            canonical_context,
+            factory.profile().prefix(),
+        );
+        Ok(true)
     }
 
     async fn perform_warmup(
@@ -1428,15 +1539,17 @@ where
         after_model_call_index: u32,
         history: nanocodex_core::responses::ResponseHistory,
         incremental_start: usize,
-        previous_response_id: &str,
+        previous_response_id: Option<&str>,
         active_context_tokens: u64,
         auto_compact_token_limit: u64,
         factory: &ResponsesAttemptFactory,
     ) -> Result<(ResponseItem, Option<Usage>)> {
         let trigger = compaction::trigger();
-        let mut history: Vec<_> = history.iter().cloned().collect();
-        compaction::trim_tool_outputs_to_fit_context_window(&mut history, active_context_tokens);
-        let history = nanocodex_core::responses::ResponseHistory::new(history);
+        let mut history = history;
+        compaction::trim_tool_outputs_to_fit_context_window(
+            &mut history,
+            factory.profile().prefix(),
+        );
         let started_at = Instant::now();
         self.stats.compactions += 1;
         self.events.emit(
@@ -1756,30 +1869,48 @@ fn record_model_response(span: &tracing::Span, response: &TurnResult) {
     );
 }
 
-fn strip_item_id(mut item: ResponseItem) -> ResponseItem {
-    item.strip_id();
-    item
-}
-
 fn request_profile(
     session_id: &str,
     prompt_cache_key: &str,
     tool_specs: Vec<ToolDefinition>,
     system_prompt: &str,
 ) -> RequestProfile {
-    RequestProfile::new(
-        session_id,
-        prompt_cache_key,
-        Arc::from([
-            ResponseItem::additional_tools(tool_specs),
-            ResponseItem::message(
-                nanocodex_core::MessageRole::Developer,
-                [nanocodex_core::ContentItem::InputText {
-                    text: system_prompt.into(),
-                }],
-            ),
-        ]),
-    )
+    let mut prefix = [
+        ResponseItem::additional_tools(tool_specs),
+        ResponseItem::message(
+            nanocodex_core::MessageRole::Developer,
+            [nanocodex_core::ContentItem::InputText {
+                text: system_prompt.into(),
+            }],
+        ),
+    ];
+    assign_request_prefix_ids(&mut prefix);
+    RequestProfile::new(session_id, prompt_cache_key, Arc::from(prefix))
+}
+
+fn assign_request_prefix_ids(prefix: &mut [ResponseItem]) {
+    for item in prefix {
+        // Responses Lite rejects client-defined IDs on `additional_tools` even
+        // though ordinary client-authored messages retain stable IDs.
+        if matches!(item, ResponseItem::AdditionalTools { .. }) {
+            item.strip_id();
+            continue;
+        }
+        if item.id().is_some_and(|id| !id.is_empty()) {
+            continue;
+        }
+        let Some((item_prefix, suffix)) = (match item {
+            ResponseItem::Message {
+                role: nanocodex_core::MessageRole::Developer,
+                ..
+            } => Some(("msg", "nanocodex-instructions")),
+            _ => None,
+        }) else {
+            assign_missing_response_item_id(item);
+            continue;
+        };
+        item.set_id(Some(ResponseItemId::with_suffix(item_prefix, suffix)));
+    }
 }
 
 fn attempt_factory(

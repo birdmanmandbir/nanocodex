@@ -5,7 +5,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use nanocodex::{AgentEvent, AgentEventKind, Prompt, TerminalId, TerminalSession, UserInput};
+use nanocodex::{
+    AgentEvent, AgentEventKind, Prompt, RolloutTranscriptItem, TerminalId, TerminalSession,
+    Thinking, UserInput,
+};
 use ratatui::{
     buffer::Buffer,
     layout::{Position, Rect},
@@ -28,6 +31,41 @@ const LARGE_PASTE_CHAR_THRESHOLD: usize = 1_000;
 const CANCEL_CONFIRMATION_WINDOW: Duration = Duration::from_secs(1);
 const SMOOTH_SCROLL_BACKLOG_ROWS: usize = 8;
 const MAX_SMOOTH_SCROLL_CATCH_UP_ROWS: usize = 32;
+
+pub(super) const STANDARD_THINKING_OPTIONS: [(Thinking, &str, &str); 4] = [
+    (
+        Thinking::Low,
+        "Low",
+        "Fast responses with lighter reasoning",
+    ),
+    (
+        Thinking::Medium,
+        "Medium",
+        "Balances speed and reasoning depth for everyday tasks",
+    ),
+    (
+        Thinking::High,
+        "High",
+        "Greater reasoning depth for complex problems",
+    ),
+    (
+        Thinking::Xhigh,
+        "Extra high",
+        "Extra high reasoning depth for complex problems",
+    ),
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ReasoningPicker {
+    Standard { selected: usize },
+    Advanced,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ReasoningPickerAction {
+    OpenedAdvanced,
+    Selected(Thinking),
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AttachedImage {
@@ -164,6 +202,10 @@ impl PendingSteer {
     }
 }
 
+struct PendingCodeExec {
+    arguments: String,
+}
+
 pub(super) struct Conversation {
     pub(super) transcript: Transcript,
     pub(super) selected_user: Option<usize>,
@@ -178,6 +220,8 @@ pub(super) struct Conversation {
     pending_scroll_anchor: Option<PendingScrollAnchor>,
     streamed_this_turn: bool,
     pending_run_error: Option<String>,
+    run_started_at: Option<Instant>,
+    pending_code_execs: HashMap<String, PendingCodeExec>,
     hidden_terminal_calls: HashMap<String, i64>,
     running_shell_sessions: HashMap<i64, ContinuedTool>,
     hidden_cell_waits: HashMap<String, String>,
@@ -208,6 +252,8 @@ impl Conversation {
             pending_scroll_anchor: None,
             streamed_this_turn: false,
             pending_run_error: None,
+            run_started_at: None,
+            pending_code_execs: HashMap::new(),
             hidden_terminal_calls: HashMap::new(),
             running_shell_sessions: HashMap::new(),
             hidden_cell_waits: HashMap::new(),
@@ -227,6 +273,17 @@ impl Conversation {
         let mut branch = Self::new("Ready");
         branch.transcript = self.transcript.prefix_before(transcript_index);
         branch
+    }
+
+    pub(super) fn run_elapsed(&self, now: Instant) -> Duration {
+        self.run_started_at
+            .map(|started_at| now.saturating_duration_since(started_at))
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_run_started_at(&mut self, started_at: Instant) {
+        self.run_started_at = Some(started_at);
     }
 
     fn queue_prompt(&mut self, id: u64, prompt: String) {
@@ -312,6 +369,8 @@ impl Conversation {
                 self.run_generation = self.run_generation.saturating_add(1);
                 self.streamed_this_turn = false;
                 self.pending_run_error = None;
+                self.run_started_at = Some(Instant::now());
+                self.pending_code_execs.clear();
                 self.hidden_terminal_calls.clear();
                 self.hidden_cell_waits.clear();
                 self.hidden_plan_calls.clear();
@@ -360,6 +419,8 @@ impl Conversation {
                     self.push_output(TranscriptItem::Error(error));
                 }
                 self.running = false;
+                self.run_started_at = None;
+                self.pending_code_execs.clear();
                 self.reconcile_applied_steers();
                 "Ready".clone_into(&mut self.status);
             }
@@ -418,10 +479,18 @@ impl Conversation {
             self.hidden_cell_waits.insert(payload.call_id, cell_id);
             return false;
         }
+        if payload.tool == "exec" {
+            let arguments = summarize_tool_arguments(&payload.tool, &payload.arguments);
+            "Running exec".clone_into(&mut self.status);
+            self.pending_code_execs
+                .insert(payload.call_id.clone(), PendingCodeExec { arguments });
+            return true;
+        }
+        self.materialize_code_parent(&payload.call_id);
         let arguments = summarize_tool_arguments(&payload.tool, &payload.arguments);
-        self.status = format!("Running {}", payload.tool);
+        let name = present_tool_name(&payload.tool, &payload.arguments);
+        self.status = format!("Running {name}");
         let call_id = payload.call_id;
-        let name = present_tool_name(&payload.tool, &payload.arguments).to_owned();
         let status = ToolStatus::Running;
         if self.transcript.has_tool_parent(&call_id) {
             self.note_tail_will_change();
@@ -457,6 +526,7 @@ impl Conversation {
         if let Some(cell_id) = self.hidden_cell_waits.remove(&payload.call_id) {
             return self.on_cell_transport_result(&cell_id, &payload, status);
         }
+        let pending_code_exec = self.pending_code_execs.contains_key(&payload.call_id);
         if payload.tool.as_deref() == Some("exec_command")
             && status == ToolStatus::Completed
             && let Some(session_id) = payload.result.as_ref().and_then(result_session_id)
@@ -471,10 +541,11 @@ impl Conversation {
             );
             return true;
         }
-        if payload.tool.as_deref() == Some("exec")
+        if (payload.tool.as_deref() == Some("exec") || pending_code_exec)
             && status == ToolStatus::Completed
             && let Some(cell_id) = payload.result.as_ref().and_then(running_cell_id)
         {
+            let visible = self.pending_code_execs.remove(&payload.call_id).is_none();
             self.running_cells.insert(
                 cell_id,
                 ContinuedTool::new(
@@ -483,7 +554,10 @@ impl Conversation {
                     payload.duration_ns,
                 ),
             );
-            return true;
+            return visible;
+        }
+        if self.pending_code_execs.remove(&payload.call_id).is_some() {
+            return false;
         }
         let result = payload
             .result
@@ -505,6 +579,21 @@ impl Conversation {
         self.note_unseen_output();
         "Working".clone_into(&mut self.status);
         true
+    }
+
+    fn materialize_code_parent(&mut self, child_call_id: &str) {
+        let Some(parent_call_id) = code_parent_call_id(child_call_id) else {
+            return;
+        };
+        let Some(parent) = self.pending_code_execs.remove(parent_call_id) else {
+            return;
+        };
+        self.push_output(TranscriptItem::Tool {
+            call_id: parent_call_id.to_owned(),
+            name: "exec".to_owned(),
+            arguments: parent.arguments,
+            status: ToolStatus::Running,
+        });
     }
 
     fn on_terminal_transport_result(
@@ -579,6 +668,8 @@ impl Conversation {
 
     fn run_failed(&mut self, event: &AgentEvent) {
         self.running = false;
+        self.run_started_at = None;
+        self.pending_code_execs.clear();
         self.reconcile_applied_steers();
         let cancelled = event
             .decode_payload::<TerminalPayload>()
@@ -1041,6 +1132,9 @@ pub(super) struct App {
     cancel_confirmation: Option<CancelConfirmation>,
     screen_selection: ScreenSelection,
     tool_details_expanded: bool,
+    fast_mode: bool,
+    thinking: Thinking,
+    reasoning_picker: Option<ReasoningPicker>,
 }
 
 #[derive(Clone, Copy)]
@@ -1102,7 +1196,39 @@ impl App {
             cancel_confirmation: None,
             screen_selection: ScreenSelection::default(),
             tool_details_expanded: true,
+            fast_mode: false,
+            thinking: Thinking::default(),
+            reasoning_picker: None,
         }
+    }
+
+    pub(super) fn restore_transcript(
+        &mut self,
+        transcript: impl IntoIterator<Item = RolloutTranscriptItem>,
+    ) {
+        for activity in transcript {
+            let item = match activity {
+                RolloutTranscriptItem::User(message) => TranscriptItem::User(message),
+                RolloutTranscriptItem::Reasoning(message) => TranscriptItem::Reasoning(message),
+                RolloutTranscriptItem::Assistant(message) => TranscriptItem::Assistant(message),
+                RolloutTranscriptItem::Tool {
+                    call_id,
+                    name,
+                    arguments,
+                } => TranscriptItem::Tool {
+                    call_id,
+                    name,
+                    arguments,
+                    status: ToolStatus::Completed,
+                },
+            };
+            self.main.push_output(item);
+        }
+    }
+
+    pub(super) const fn with_thinking(mut self, thinking: Thinking) -> Self {
+        self.thinking = thinking;
+        self
     }
 
     pub(super) fn insert_char(&mut self, character: char) {
@@ -2517,6 +2643,83 @@ impl App {
         }
     }
 
+    pub(super) const fn fast_mode(&self) -> bool {
+        self.fast_mode
+    }
+
+    pub(super) fn fast_mode_changed(&mut self, enabled: bool) {
+        self.fast_mode = enabled;
+    }
+
+    pub(super) fn fast_mode_change_failed(&mut self, error: &str) {
+        self.push_active_error(format!("Could not change fast mode: {error}"));
+        self.set_active_status("Fast mode unchanged");
+    }
+
+    pub(super) const fn thinking(&self) -> Thinking {
+        self.thinking
+    }
+
+    pub(super) const fn reasoning_picker(&self) -> Option<ReasoningPicker> {
+        self.reasoning_picker
+    }
+
+    pub(super) fn open_reasoning_picker(&mut self) {
+        let selected = STANDARD_THINKING_OPTIONS
+            .iter()
+            .position(|(thinking, _, _)| *thinking == self.thinking)
+            .unwrap_or(STANDARD_THINKING_OPTIONS.len());
+        self.reasoning_picker = Some(ReasoningPicker::Standard { selected });
+    }
+
+    pub(super) fn move_reasoning_picker(&mut self, direction: isize) {
+        let Some(ReasoningPicker::Standard { selected }) = &mut self.reasoning_picker else {
+            return;
+        };
+        let count = STANDARD_THINKING_OPTIONS.len() + 1;
+        *selected = selected
+            .saturating_add_signed(direction)
+            .min(count.saturating_sub(1));
+    }
+
+    pub(super) fn confirm_reasoning_picker(&mut self) -> Option<ReasoningPickerAction> {
+        match self.reasoning_picker? {
+            ReasoningPicker::Standard { selected }
+                if selected == STANDARD_THINKING_OPTIONS.len() =>
+            {
+                self.reasoning_picker = Some(ReasoningPicker::Advanced);
+                Some(ReasoningPickerAction::OpenedAdvanced)
+            }
+            ReasoningPicker::Standard { selected } => {
+                let (thinking, _, _) = STANDARD_THINKING_OPTIONS[selected];
+                self.reasoning_picker = None;
+                Some(ReasoningPickerAction::Selected(thinking))
+            }
+            ReasoningPicker::Advanced => {
+                self.reasoning_picker = None;
+                Some(ReasoningPickerAction::Selected(Thinking::Max))
+            }
+        }
+    }
+
+    pub(super) fn back_reasoning_picker(&mut self) {
+        self.reasoning_picker = match self.reasoning_picker {
+            Some(ReasoningPicker::Advanced) => Some(ReasoningPicker::Standard {
+                selected: STANDARD_THINKING_OPTIONS.len(),
+            }),
+            Some(ReasoningPicker::Standard { .. }) | None => None,
+        };
+    }
+
+    pub(super) fn thinking_changed(&mut self, thinking: Thinking) {
+        self.thinking = thinking;
+    }
+
+    pub(super) fn thinking_change_failed(&mut self, error: &str) {
+        self.push_active_error(format!("Could not change reasoning: {error}"));
+        self.set_active_status("Reasoning unchanged");
+    }
+
     pub(super) fn push_active_error(&mut self, error: impl Into<String>) {
         if let Some(conversation) = self.conversation_mut(self.focus) {
             conversation.push_output(TranscriptItem::Error(error.into()));
@@ -2849,6 +3052,9 @@ fn summarize_tool_arguments(tool: &str, arguments: &Value) -> String {
         {
             return summary;
         }
+        if let Some(summary) = summarize_mcp_arguments(tool, object) {
+            return summary;
+        }
         let preferred = match tool {
             "view_image" => object.get("path").and_then(Value::as_str),
             "read_file" => object
@@ -2870,14 +3076,21 @@ fn summarize_tool_arguments(tool: &str, arguments: &Value) -> String {
     compact_arguments(arguments)
 }
 
-fn present_tool_name<'a>(tool: &'a str, arguments: &Value) -> &'a str {
+fn present_tool_name(tool: &str, arguments: &Value) -> String {
+    if tool == "tool_search" {
+        return "MCP discovery".to_owned();
+    }
+    if let Some((server, operation)) = mcp_tool_parts(tool) {
+        let operation = mcp_wrapper_target(operation, arguments).unwrap_or(operation);
+        return format!("{server} › {}", present_mcp_operation(operation));
+    }
     if tool != "web__run" {
-        return tool;
+        return tool.to_owned();
     }
     let Some(object) = arguments.as_object() else {
-        return "Web";
+        return "Web".to_owned();
     };
-    if object.contains_key("search_query") {
+    let name = if object.contains_key("search_query") {
         "Web search"
     } else if object.contains_key("image_query") {
         "Image search"
@@ -2891,6 +3104,57 @@ fn present_tool_name<'a>(tool: &'a str, arguments: &Value) -> &'a str {
         "Sports"
     } else {
         "Web"
+    };
+    name.to_owned()
+}
+
+fn summarize_mcp_arguments(tool: &str, object: &serde_json::Map<String, Value>) -> Option<String> {
+    if tool == "tool_search" {
+        return object
+            .get("query")
+            .and_then(Value::as_str)
+            .map(compact_tool_text);
+    }
+    let (_, operation) = mcp_tool_parts(tool)?;
+    if operation == "get_tool_details" {
+        return object
+            .get("name")
+            .and_then(Value::as_str)
+            .map(|name| compact_tool_text(name.trim_start_matches('_')));
+    }
+    let target = matches!(operation, "call_read_tool" | "call_write_tool")
+        .then(|| object.get("name").and_then(Value::as_str))
+        .flatten();
+    let effective = if matches!(operation, "call_read_tool" | "call_write_tool") {
+        object.get("arguments").and_then(Value::as_object)
+    } else {
+        Some(object)
+    };
+    if let Some(effective) = effective {
+        for field in ["query", "q", "name", "path", "url", "ref_id"] {
+            if let Some(value) = effective.get(field).and_then(Value::as_str) {
+                return Some(compact_tool_text(value));
+            }
+        }
+    }
+    target.map(|target| compact_tool_text(target.trim_start_matches('_')))
+}
+
+fn mcp_tool_parts(tool: &str) -> Option<(&str, &str)> {
+    tool.strip_prefix("mcp__")?.split_once("__")
+}
+
+fn mcp_wrapper_target<'a>(operation: &str, arguments: &'a Value) -> Option<&'a str> {
+    matches!(operation, "call_read_tool" | "call_write_tool")
+        .then(|| arguments.get("name").and_then(Value::as_str))
+        .flatten()
+}
+
+fn present_mcp_operation(operation: &str) -> &str {
+    match operation.trim_start_matches('_') {
+        "search_tools" => "Search tools",
+        "get_tool_details" => "Tool details",
+        operation => operation,
     }
 }
 
@@ -2928,6 +3192,10 @@ fn tool_string_argument(arguments: &Value, name: &str) -> Option<String> {
         .get(name)?
         .as_str()
         .map(str::to_owned)
+}
+
+fn code_parent_call_id(call_id: &str) -> Option<&str> {
+    call_id.split_once("/code-").map(|(parent, _)| parent)
 }
 
 fn result_session_id(result: &Value) -> Option<i64> {
@@ -3040,7 +3308,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use nanocodex::{AgentEvent, AgentEventKind, PromptInput, UserInput};
+    use nanocodex::{AgentEvent, AgentEventKind, PromptInput, RolloutTranscriptItem, UserInput};
     use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
     use serde_json::{Value, json};
 
@@ -3059,6 +3327,27 @@ mod tests {
             "payload": payload,
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn restored_rollout_activity_seeds_the_visible_transcript() {
+        let mut app = App::new(std::path::PathBuf::from("/worktree"));
+        app.restore_transcript([
+            RolloutTranscriptItem::User("visible prompt".to_owned()),
+            RolloutTranscriptItem::Reasoning("thinking".to_owned()),
+            RolloutTranscriptItem::Tool {
+                call_id: "call-1".to_owned(),
+                name: "exec".to_owned(),
+                arguments: "pwd".to_owned(),
+            },
+            RolloutTranscriptItem::Assistant("visible answer".to_owned()),
+        ]);
+
+        assert_eq!(app.main.transcript.len(), 4);
+        assert_eq!(
+            app.main.transcript.latest_user_message(),
+            Some("visible prompt")
+        );
     }
 
     #[test]
@@ -3108,6 +3397,115 @@ mod tests {
             summarize_tool_arguments("web__run", &arguments),
             "Rust async cancellation · Tokio process groups"
         );
+    }
+
+    #[test]
+    fn mcp_discovery_and_gateway_calls_present_the_semantic_operation() {
+        let discovery = json!({ "query": "centaur domain ownership" });
+        assert_eq!(
+            present_tool_name("tool_search", &discovery),
+            "MCP discovery"
+        );
+        assert_eq!(
+            summarize_tool_arguments("tool_search", &discovery),
+            "centaur domain ownership"
+        );
+
+        let search = json!({
+            "name": "_search_tools",
+            "arguments": { "query": "innovationreception.org" }
+        });
+        assert_eq!(
+            present_tool_name("mcp__centaur-paradigm__call_read_tool", &search),
+            "centaur-paradigm › Search tools"
+        );
+        assert_eq!(
+            summarize_tool_arguments("mcp__centaur-paradigm__call_read_tool", &search),
+            "innovationreception.org"
+        );
+
+        let details = json!({ "name": "_search_tools" });
+        assert_eq!(
+            present_tool_name("mcp__centaur-paradigm__get_tool_details", &details),
+            "centaur-paradigm › Tool details"
+        );
+        assert_eq!(
+            summarize_tool_arguments("mcp__centaur-paradigm__get_tool_details", &details),
+            "search_tools"
+        );
+    }
+
+    #[test]
+    fn mcp_activity_renders_without_gateway_plumbing() {
+        let mut app = App::new(".".into());
+        app.main.on_agent_event(&event(
+            AgentEventKind::ToolCall,
+            &json!({
+                "call_id": "call-exec",
+                "tool": "exec",
+                "arguments": "await discover();"
+            }),
+        ));
+        app.main.on_agent_event(&event(
+            AgentEventKind::ToolCall,
+            &json!({
+                "call_id": "call-exec/code-1",
+                "tool": "tool_search",
+                "arguments": { "query": "centaur domain ownership" }
+            }),
+        ));
+        app.main.on_agent_event(&event(
+            AgentEventKind::ToolResult,
+            &json!({
+                "call_id": "call-exec/code-1",
+                "tool": "tool_search",
+                "status": "completed",
+                "result": { "tools": [{ "name": "mcp__centaur-paradigm__call_read_tool" }] }
+            }),
+        ));
+        app.main.on_agent_event(&event(
+            AgentEventKind::ToolCall,
+            &json!({
+                "call_id": "call-exec/code-2",
+                "tool": "mcp__centaur-paradigm__call_read_tool",
+                "arguments": {
+                    "name": "_search_tools",
+                    "arguments": { "query": "innovationreception.org" }
+                }
+            }),
+        ));
+        app.main.on_agent_event(&event(
+            AgentEventKind::ToolResult,
+            &json!({
+                "call_id": "call-exec/code-2",
+                "tool": "mcp__centaur-paradigm__call_read_tool",
+                "status": "completed",
+                "result": { "content": [] }
+            }),
+        ));
+
+        let area = Rect::new(0, 0, 100, 12);
+        let mut buffer = Buffer::empty(area);
+        app.main
+            .transcript
+            .widget(0, None, None, "empty")
+            .render(area, &mut buffer);
+        let rendered = buffer
+            .content
+            .chunks(usize::from(area.width))
+            .map(|row| {
+                row.iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("MCP discovery  centaur domain ownership"));
+        assert!(rendered.contains("centaur-paradigm › Search tools  innovationreception.org"));
+        assert!(!rendered.contains("call_read_tool"));
+        assert!(!rendered.contains("_search_tools"));
+        assert!(!rendered.contains("{\"query\""));
     }
 
     #[test]
@@ -3406,7 +3804,11 @@ mod tests {
             PaneId::Btw(btw_id),
             &event(
                 AgentEventKind::ToolCall,
-                &json!({ "call_id": "side-1", "tool": "exec", "arguments": "pwd" }),
+                &json!({
+                    "call_id": "side-1",
+                    "tool": "exec_command",
+                    "arguments": { "cmd": "pwd" }
+                }),
             ),
         );
         app.btw
@@ -3999,7 +4401,7 @@ mod tests {
 
         assert!(!app.main.running);
         assert_eq!(app.main.status, "Cancelled");
-        assert_eq!(app.main.transcript.len(), 2);
+        assert_eq!(app.main.transcript.len(), 1);
     }
 
     #[test]
@@ -4052,6 +4454,14 @@ mod tests {
             &json!({ "call_id": "call-1", "tool": "exec", "arguments": "pwd" }),
         ));
         app.main.on_agent_event(&event(
+            AgentEventKind::ToolCall,
+            &json!({
+                "call_id": "call-1/code-1",
+                "tool": "exec_command",
+                "arguments": { "cmd": "pwd" }
+            }),
+        ));
+        app.main.on_agent_event(&event(
             AgentEventKind::ReasoningSummaryDelta,
             &json!({ "model_call_index": 1, "text": "Second thought" }),
         ));
@@ -4076,9 +4486,38 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let first = rendered.find("• First thought").unwrap();
-        let tool = rendered.find("◌ Working").unwrap();
+        let tool = rendered.find("◌ Tools").unwrap();
         let second = rendered.find("• Second thought").unwrap();
         assert!(first < tool && tool < second);
+    }
+
+    #[test]
+    fn sequential_empty_code_execs_do_not_leave_working_rows() {
+        let mut app = App::new(".".into());
+        for index in 1..=2 {
+            let call_id = format!("call-{index}");
+            app.main.on_agent_event(&event(
+                AgentEventKind::ToolCall,
+                &json!({
+                    "call_id": call_id,
+                    "tool": "exec",
+                    "arguments": "text('done');"
+                }),
+            ));
+            app.main.on_agent_event(&event(
+                AgentEventKind::ToolResult,
+                &json!({
+                    "call_id": call_id,
+                    "tool": "exec",
+                    "status": "completed",
+                    "duration_ns": 10_000_000_000_u64,
+                    "result": "Script completed\nWall time 10 seconds\nOutput:\ndone"
+                }),
+            ));
+        }
+
+        assert!(app.main.transcript.is_empty());
+        assert!(app.main.pending_code_execs.is_empty());
     }
 
     #[test]
@@ -4222,26 +4661,7 @@ mod tests {
             }),
         ));
 
-        assert_eq!(app.main.transcript.len(), 1);
-        let area = Rect::new(0, 0, 80, 8);
-        let mut buffer = Buffer::empty(area);
-        app.main
-            .transcript
-            .widget(0, None, None, "empty")
-            .render(area, &mut buffer);
-        let rendered = buffer
-            .content
-            .chunks(usize::from(area.width))
-            .map(|row| {
-                row.iter()
-                    .map(ratatui::buffer::Cell::symbol)
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(!rendered.contains("wait"));
-        assert!(!rendered.contains("cell ID"));
-        assert!(rendered.contains("12ms"));
+        assert!(app.main.transcript.is_empty());
         assert!(!app.main.running_cells.contains_key("3"));
     }
 

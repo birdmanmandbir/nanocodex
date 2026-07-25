@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shlex
-import sys
 import tempfile
 import time
 from pathlib import Path
@@ -46,16 +46,34 @@ def _cli_tools_install_command(*, install_node: bool) -> str:
     """Build a portable installer for the stock Codex task-side CLI toolset."""
     packages = ["ca-certificates", "curl", "bash", "ripgrep"]
     checks = ["curl", "bash", "rg"]
+    node_modules_cleanup = ""
     if install_node:
         packages.extend(("nodejs", "npm"))
         checks.extend(("node", "npm"))
+        # FastDockerEnvironment exposes missing system Node modules through
+        # read-only symlinks into its shared toolbox. Remove only those links
+        # before the task package manager installs its writable Node tree.
+        node_modules_cleanup = (
+            "if [ -L /usr/share/nodejs ] && "
+            '[ "$(readlink /usr/share/nodejs)" = '
+            '"/opt/nanocodex-toolbox/usr/share/nodejs" ]; then '
+            "rm /usr/share/nodejs && mkdir -p /usr/share/nodejs; "
+            "elif [ -d /usr/share/nodejs ]; then "
+            "for node_module_entry in /usr/share/nodejs/*; do "
+            '[ -L "$node_module_entry" ] || continue; '
+            'case "$(readlink "$node_module_entry")" in '
+            "/opt/nanocodex-toolbox/usr/share/nodejs/*) "
+            'rm "$node_module_entry" ;; '
+            "esac; done; fi; "
+        )
 
     package_list = " ".join(packages)
     command_checks = "; ".join(
         f"command -v {command} >/dev/null 2>&1" for command in checks
     )
     return (
-        "if ldd --version 2>&1 | grep -qi musl || "
+        node_modules_cleanup
+        + "if ldd --version 2>&1 | grep -qi musl || "
         "[ -f /etc/alpine-release ]; then "
         f"apk add --no-cache {package_list}; "
         "elif command -v apt-get >/dev/null 2>&1; then "
@@ -68,6 +86,26 @@ def _cli_tools_install_command(*, install_node: bool) -> str:
         "echo 'No supported package manager found; checking preinstalled tools' >&2; "
         "fi; "
         f"{command_checks}"
+    )
+
+
+def _remote_binary_install_command(
+    *, binary_url: str, binary_sha256: str, destination: str
+) -> str:
+    """Download one immutable binary inside the Harbor environment."""
+    return (
+        "temporary=$(mktemp); "
+        'trap \'rm -f "$temporary"\' EXIT; '
+        "curl --fail --location --retry 5 --retry-all-errors "
+        f'--output "$temporary" {shlex.quote(binary_url)}; '
+        "if command -v sha256sum >/dev/null 2>&1; then "
+        'actual=$(sha256sum "$temporary" | awk \'{ print $1 }\'); '
+        "elif command -v shasum >/dev/null 2>&1; then "
+        'actual=$(shasum -a 256 "$temporary" | awk \'{ print $1 }\'); '
+        "else echo 'no SHA-256 implementation found' >&2; exit 1; fi; "
+        f"test \"$actual\" = {shlex.quote(binary_sha256)}; "
+        f'cp "$temporary" {shlex.quote(destination)}; '
+        f"chmod 0755 {shlex.quote(destination)}"
     )
 
 
@@ -86,6 +124,8 @@ class NanocodexAgent(BaseInstalledAgent):
         self,
         logs_dir: Path,
         binary_path: str | Path = ".nanocodex/installed/nanocodex",
+        binary_url: str | None = None,
+        binary_sha256: str | None = None,
         model_name: str | None = None,
         effort: str = "low",
         web_search: bool = True,
@@ -107,6 +147,18 @@ class NanocodexAgent(BaseInstalledAgent):
             **kwargs,
         )
         self._binary_path = Path(binary_path).resolve()
+        if (binary_url is None) != (binary_sha256 is None):
+            raise ValueError("binary_url and binary_sha256 must be configured together")
+        if binary_url is not None and not binary_url.startswith("https://"):
+            raise ValueError("binary_url must use HTTPS")
+        if binary_sha256 is not None and not re.fullmatch(
+            r"[0-9a-fA-F]{64}", binary_sha256
+        ):
+            raise ValueError("binary_sha256 must contain 64 hexadecimal characters")
+        self._binary_url = binary_url
+        self._binary_sha256 = (
+            binary_sha256.lower() if binary_sha256 is not None else None
+        )
         self._model = self._api_model_name(model_name)
         if self._model != MODEL:
             raise ValueError(f"nanocodex supports only {MODEL}, got {self._model}")
@@ -120,6 +172,7 @@ class NanocodexAgent(BaseInstalledAgent):
         self._agents_md_path = self._resolve_context_file(agents_md_path, "AGENTS.md")
         self._run_interrupted = False
         self._run_failed = False
+        self._post_run_validation_failed = False
 
     @staticmethod
     def name() -> str:
@@ -129,7 +182,9 @@ class NanocodexAgent(BaseInstalledAgent):
         return f"{self._BINARY} --version"
 
     async def install(self, environment: BaseEnvironment) -> None:
-        if not self._binary_path.is_file():
+        binary_url = getattr(self, "_binary_url", None)
+        binary_sha256 = getattr(self, "_binary_sha256", None)
+        if binary_url is None and not self._binary_path.is_file():
             raise RuntimeError(
                 f"missing nanocodex binary at {self._binary_path}; run `just build-agent`"
             )
@@ -138,8 +193,18 @@ class NanocodexAgent(BaseInstalledAgent):
             _cli_tools_install_command(install_node=self._install_node),
             env={"DEBIAN_FRONTEND": "noninteractive"},
         )
-        await environment.upload_file(self._binary_path, self._BINARY)
-        await self.exec_as_root(environment, f"chmod 0755 {self._BINARY}")
+        if binary_url is not None and binary_sha256 is not None:
+            await self.exec_as_root(
+                environment,
+                _remote_binary_install_command(
+                    binary_url=binary_url,
+                    binary_sha256=binary_sha256,
+                    destination=self._BINARY,
+                ),
+            )
+        else:
+            await environment.upload_file(self._binary_path, self._BINARY)
+            await self.exec_as_root(environment, f"chmod 0755 {self._BINARY}")
 
     async def _stage_api_key(self, environment: BaseEnvironment) -> None:
         identity = await self.exec_as_agent(environment, "id -u")
@@ -187,6 +252,7 @@ class NanocodexAgent(BaseInstalledAgent):
     ) -> None:
         self._run_interrupted = False
         self._run_failed = False
+        self._post_run_validation_failed = False
         try:
             await self._run_to_completion(instruction, environment, context)
         except asyncio.CancelledError:
@@ -233,10 +299,6 @@ class NanocodexAgent(BaseInstalledAgent):
         finally:
             await self._remove_staged_api_key(environment)
         self._publish_events(result.stdout)
-        if result.stdout:
-            print(result.stdout, end="", flush=True)
-        if result.stderr:
-            print(result.stderr, end="", file=sys.stderr, flush=True)
 
     def _run_arguments(self, prompt: str) -> list[str]:
         return [
@@ -266,8 +328,14 @@ class NanocodexAgent(BaseInstalledAgent):
         temporary = events.with_name(f"{events.name}.host.tmp")
         temporary.write_text(stdout, encoding="utf-8")
         temporary.replace(events)
+        (self.logs_dir / Path(self._EVENTS_TMP).name).unlink(missing_ok=True)
 
     def populate_context_post_run(self, context: AgentContext) -> None:
+        if getattr(self, "_post_run_validation_failed", False):
+            self.logger.debug(
+                "skipping repeated nanocodex trajectory validation during recovery"
+            )
+            return
         try:
             self._populate_context_post_run_strict(context)
         except Exception:
@@ -275,6 +343,11 @@ class NanocodexAgent(BaseInstalledAgent):
                 getattr(self, "_run_interrupted", False)
                 or getattr(self, "_run_failed", False)
             ):
+                # Harbor records the first validation failure on the trial, then
+                # calls this hook again while recovering outputs. Preserve the
+                # original strict failure but do not let the recovery pass raise
+                # a second time and cancel the entire concurrent job.
+                self._post_run_validation_failed = True
                 raise
             self.logger.debug(
                 "skipping strict nanocodex trajectory validation after an incomplete run",

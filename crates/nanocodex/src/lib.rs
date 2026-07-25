@@ -36,13 +36,16 @@ pub use nanocodex_core::{
     LocalShellExecAction, LocalShellStatus, MODEL, MessagePhase, MessageRole, OpenAiAuth,
     OpenAiAuthError, OpenAiAuthMode, OutputTextAnnotation, OutputTextLogprob, OutputTextTopLogprob,
     Prompt, PromptInput, ReasoningContent, ReasoningMode, ReasoningSummary, ResponseItem,
-    ResponsesHistory, ResponsesTransport, Thinking, TimedAgentEvent, ToolCaller, ToolDefinition,
-    Usage, UserInput, WebSearchAction, monotonic_now_ns,
+    ResponseItemId, ResponsesHistory, ResponsesTransport, Thinking, TimedAgentEvent, ToolCaller,
+    ToolDefinition, Usage, UserInput, WebSearchAction, monotonic_now_ns,
 };
 #[cfg(not(target_family = "wasm"))]
 pub use nanocodex_macros::tool;
 #[cfg(not(target_family = "wasm"))]
-pub use nanocodex_mcp::{Mcp, McpBuildError, McpBuilder, McpServer};
+pub use nanocodex_mcp::{
+    Mcp, McpBuildError, McpBuilder, McpControlError, McpHandle, McpLogin, McpOAuthCredentials,
+    McpOAuthStore, McpServer,
+};
 pub use nanocodex_service::{
     DefaultResponsesService, ResponsesAttempt, ResponsesAttemptKind, ResponsesClient,
     ResponsesRetryPolicy, ResponsesService, ResponsesServiceError, ResponsesServiceResponse,
@@ -59,7 +62,7 @@ pub use responses::{FactoryResponses, LayeredResponses, StandardResponses};
 #[cfg(not(target_family = "wasm"))]
 pub use responses::{Responses, ResponsesBuilder};
 #[cfg(not(target_family = "wasm"))]
-pub use rollout::{RolloutConfig, RolloutInfo};
+pub use rollout::{DurableSession, RolloutConfig, RolloutInfo, RolloutTranscriptItem};
 #[cfg(not(target_family = "wasm"))]
 pub use schemars::JsonSchema as ToolSchema;
 pub use session::SessionSnapshot;

@@ -19,7 +19,7 @@ pub use responses::{
     InternalMessageMetadata, ItemStatus, JsonSchema, JsonValue, LocalShellAction,
     LocalShellExecAction, LocalShellStatus, MessagePhase, MessageRole, OutputTextAnnotation,
     OutputTextLogprob, OutputTextTopLogprob, ReasoningContent, ReasoningSummary, ResponseItem,
-    ToolCaller, ToolDefinition, Usage, WebSearchAction,
+    ResponseItemId, ToolCaller, ToolDefinition, Usage, WebSearchAction,
 };
 
 const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
@@ -358,8 +358,8 @@ impl FromStr for ReasoningMode {
 pub enum Thinking {
     None,
     Low,
-    #[default]
     Medium,
+    #[default]
     High,
     Xhigh,
     Max,

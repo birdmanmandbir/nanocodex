@@ -8,6 +8,7 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use nanocodex_core::{
     ContentItem, FunctionOutputBody, FunctionOutputContent, ImageDetail, ResponseItem,
+    responses::ResponseHistory,
 };
 #[cfg(not(target_family = "wasm"))]
 use sha1::{Digest as _, Sha1};
@@ -72,43 +73,86 @@ pub(super) const fn trigger() -> ResponseItem {
 }
 
 pub(super) fn trim_tool_outputs_to_fit_context_window(
-    history: &mut [ResponseItem],
-    active_context_tokens: u64,
+    history: &mut ResponseHistory,
+    request_prefix: &[ResponseItem],
 ) -> usize {
-    let mut estimated_tokens = active_context_tokens;
-    let mut rewritten_outputs = 0;
-    for item in history.iter_mut().rev() {
+    let mut estimated_tokens = request_prefix
+        .iter()
+        .chain(history.iter())
+        .map(estimate_item_tokens)
+        .fold(0_u64, u64::saturating_add);
+    let mut rewritten_outputs = Vec::new();
+    for item in history.iter_rev() {
         if estimated_tokens <= SOL_CONTEXT_WINDOW {
             break;
         }
         let tokens_before = estimate_item_tokens(item);
-        if !rewrite_tool_output(item) {
+        let Some(rewritten) = rewritten_tool_output(item) else {
             break;
-        }
-        let tokens_after = estimate_item_tokens(item);
+        };
+        let tokens_after = estimate_item_tokens(&rewritten);
         estimated_tokens =
             estimated_tokens.saturating_sub(tokens_before.saturating_sub(tokens_after));
-        rewritten_outputs += 1;
+        rewritten_outputs.push(rewritten);
     }
-    rewritten_outputs
+    let rewritten_count = rewritten_outputs.len();
+    if rewritten_count > 0 {
+        rewritten_outputs.reverse();
+        history.replace_suffix(history.len() - rewritten_count, rewritten_outputs);
+    }
+    rewritten_count
 }
 
-fn rewrite_tool_output(item: &mut ResponseItem) -> bool {
-    let (ResponseItem::FunctionCallOutput { output, .. }
-    | ResponseItem::CustomToolCallOutput { output, .. }) = item
-    else {
-        return false;
-    };
-    *output = FunctionOutputBody::Text(CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE.into());
-    true
+fn rewritten_tool_output(item: &ResponseItem) -> Option<ResponseItem> {
+    let output = FunctionOutputBody::Text(CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE.into());
+    match item {
+        ResponseItem::FunctionCallOutput {
+            id,
+            call_id,
+            caller,
+            status,
+            created_by,
+            internal_chat_message_metadata_passthrough,
+            ..
+        } => Some(ResponseItem::FunctionCallOutput {
+            id: id.clone(),
+            call_id: call_id.clone(),
+            output,
+            caller: caller.clone(),
+            status: *status,
+            created_by: created_by.clone(),
+            internal_chat_message_metadata_passthrough: internal_chat_message_metadata_passthrough
+                .clone(),
+        }),
+        ResponseItem::CustomToolCallOutput {
+            id,
+            call_id,
+            name,
+            caller,
+            status,
+            created_by,
+            internal_chat_message_metadata_passthrough,
+            ..
+        } => Some(ResponseItem::CustomToolCallOutput {
+            id: id.clone(),
+            call_id: call_id.clone(),
+            name: name.clone(),
+            output,
+            caller: caller.clone(),
+            status: *status,
+            created_by: created_by.clone(),
+            internal_chat_message_metadata_passthrough: internal_chat_message_metadata_passthrough
+                .clone(),
+        }),
+        _ => None,
+    }
 }
 
 pub(super) fn install_history(
     history: &[ResponseItem],
-    canonical_context: &ResponseItem,
-    mut compaction: ResponseItem,
+    initial_context: &[ResponseItem],
+    compaction: ResponseItem,
 ) -> Vec<ResponseItem> {
-    compaction.strip_id();
     let retained = history
         .iter()
         .filter(|item| item.is_user_message() && !is_contextual_user_message(item))
@@ -116,7 +160,10 @@ pub(super) fn install_history(
         .collect();
     let mut installed = truncate_retained_messages(retained, RETAINED_MESSAGE_TOKEN_BUDGET);
     let insertion_index = installed.len().saturating_sub(1);
-    installed.insert(insertion_index, canonical_context.clone());
+    installed.splice(
+        insertion_index..insertion_index,
+        initial_context.iter().cloned(),
+    );
     installed.push(compaction);
     installed
 }
@@ -397,6 +444,12 @@ mod tests {
 
     #[test]
     fn installed_history_retains_user_inputs_and_reinjects_context() {
+        let permissions = ResponseItem::message(
+            nanocodex_core::MessageRole::Developer,
+            [ContentItem::InputText {
+                text: "<permissions instructions>...</permissions instructions>".into(),
+            }],
+        );
         let initial =
             message("<environment_context>\n<cwd>/workspace</cwd>\n</environment_context>");
         let first = message("do the task");
@@ -418,44 +471,71 @@ mod tests {
             r#"{"id":"cmp-id","type":"compaction","encrypted_content":"opaque"}"#,
         )
         .unwrap();
-        let installed = install_history(&history, &initial, compaction);
-        assert_eq!(installed.len(), 4);
+        let installed = install_history(
+            &history,
+            &[permissions.clone(), initial.clone()],
+            compaction,
+        );
+        assert_eq!(installed.len(), 5);
         assert_eq!(
             serde_json::to_value(&installed[0]).unwrap(),
             serde_json::to_value(first).unwrap()
         );
         assert_eq!(
             serde_json::to_value(&installed[1]).unwrap(),
-            serde_json::to_value(initial).unwrap()
+            serde_json::to_value(permissions).unwrap()
         );
         assert_eq!(
             serde_json::to_value(&installed[2]).unwrap(),
+            serde_json::to_value(initial).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&installed[3]).unwrap(),
             serde_json::to_value(latest).unwrap()
         );
         assert!(matches!(
-            installed[3],
-            ResponseItem::Compaction { id: None, .. }
+            &installed[4],
+            ResponseItem::Compaction { id: Some(id), .. } if id.as_str() == "cmp-id"
         ));
     }
 
     #[test]
     fn over_window_history_rewrites_trailing_tool_outputs() {
-        let mut history = vec![ResponseItem::custom_tool_output(
+        let mut history = ResponseHistory::new(vec![ResponseItem::custom_tool_output(
             "call".to_owned(),
             None,
-            FunctionOutputBody::Text("x".repeat(200_000).into_boxed_str()),
-        )];
+            FunctionOutputBody::Text(
+                "x".repeat(272_001 * APPROX_BYTES_PER_TOKEN)
+                    .into_boxed_str(),
+            ),
+        )]);
         assert_eq!(
-            trim_tool_outputs_to_fit_context_window(&mut history, SOL_CONTEXT_WINDOW + 50_000),
+            trim_tool_outputs_to_fit_context_window(&mut history, &[]),
             1
         );
         assert!(matches!(
-            &history[0],
+            history.iter().next().unwrap(),
             ResponseItem::CustomToolCallOutput {
                 output: FunctionOutputBody::Text(text),
                 ..
             } if text.as_ref() == CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE
         ));
+    }
+
+    #[test]
+    fn under_window_history_keeps_its_shared_storage() {
+        let mut history = ResponseHistory::new(vec![ResponseItem::custom_tool_output(
+            "call".to_owned(),
+            None,
+            FunctionOutputBody::Text("output".into()),
+        )]);
+        let shared_tail = history.shared_tail();
+
+        assert_eq!(
+            trim_tool_outputs_to_fit_context_window(&mut history, &[]),
+            0
+        );
+        assert!(std::sync::Arc::ptr_eq(&history.shared_tail(), &shared_tail));
     }
 
     fn message(text: &str) -> ResponseItem {

@@ -27,21 +27,50 @@ use crate::{
     model::{
         agent::{
             CompletedModelTurn, ModelCheckpoint, ModelRun, ModelTurnOutcome, PreparedCheckpoint,
-            prepare_checkpoint, prepare_resumed_checkpoint,
+            prepare_checkpoint, prepare_resumed_checkpoint, prepare_rollout_checkpoint,
         },
         load_global_instructions,
     },
     responses::{FactoryResponses, LayeredResponses, Responses, StandardResponses},
     rollout::{RolloutConfig, RolloutInfo, RolloutOrigin, RolloutRecorder, RolloutTurn},
-    session::{CommittedSession, SessionSnapshot},
+    session::{CommittedSession, SessionResume, SessionSnapshot},
 };
 
 const COMMAND_CAPACITY: usize = 8;
 const STEER_CAPACITY: usize = 8;
+const CODEX_THREAD_ID_ENV_VAR: &str = "CODEX_THREAD_ID";
 
 type ServiceFactory<S> = Arc<dyn Fn() -> S + Send + Sync>;
 type ToolsFactory =
     Arc<dyn Fn(AgentHandle) -> std::result::Result<Tools, ToolsBuildError> + Send + Sync>;
+
+enum InitialResume {
+    Exact(Box<ModelCheckpoint>),
+    Rollout(Box<RolloutResume>),
+}
+
+struct RolloutResume {
+    workspace: String,
+    canonical_context: nanocodex_core::ResponseItem,
+    history: Vec<nanocodex_core::ResponseItem>,
+    prompt_cache_key: Arc<str>,
+}
+
+impl InitialResume {
+    fn workspace(&self) -> &str {
+        match self {
+            Self::Exact(checkpoint) => checkpoint.workspace(),
+            Self::Rollout(resume) => &resume.workspace,
+        }
+    }
+
+    fn history_len(&self) -> usize {
+        match self {
+            Self::Exact(checkpoint) => checkpoint.history().len(),
+            Self::Rollout(resume) => resume.history.len(),
+        }
+    }
+}
 
 #[derive(Clone)]
 enum ToolsConfiguration {
@@ -56,6 +85,14 @@ impl ToolsConfiguration {
             Self::PerAgent(factory) => factory(agent_handle).map_err(Into::into),
         }
     }
+}
+
+fn bind_agent_environment(tools: Tools, session_id: &str) -> Result<Tools> {
+    tools
+        .into_builder()
+        .process_environment([(CODEX_THREAD_ID_ENV_VAR, session_id)])
+        .build()
+        .map_err(Into::into)
 }
 
 /// Completion handle for an accepted turn.
@@ -606,7 +643,7 @@ impl<S> NanocodexBuilder<S> {
         self
     }
 
-    /// Sets the model thinking level. The default is [`Thinking::Medium`].
+    /// Sets the model thinking level. The default is [`Thinking::High`].
     #[must_use]
     pub const fn thinking(mut self, thinking: Thinking) -> Self {
         self.config.thinking = thinking;
@@ -918,7 +955,6 @@ where
     /// Returns an infrastructure error while receiving or starting a command.
     #[allow(clippy::too_many_lines)]
     async fn run(mut self) -> Result<()> {
-        self.tools.start_providers();
         let session_id = self.events.request_id().to_owned();
         let rollout = self.rollout.take();
         let mut default_thinking = self.spawner.config.thinking;
@@ -1553,7 +1589,7 @@ where
             session_id,
             workspace,
             (self.service_factory)(),
-            Some(checkpoint.model().clone()),
+            Some(InitialResume::Exact(Box::new(checkpoint.model().clone()))),
             None,
             AgentOrigin {
                 kind: "fork",
@@ -1623,8 +1659,15 @@ where
     let session_id = session_id.unwrap_or_else(new_session_id);
     let PromptCacheConfig { key, shared } = prompt_cache;
     let is_resume = resume.is_some();
-    let (lineage_id, prompt_cache_key, initial_checkpoint) = if let Some(snapshot) = resume {
-        let (lineage_id, restored_cache_key, checkpoint) = snapshot.into_checkpoint()?;
+    let (lineage_id, prompt_cache_key, initial_resume) = if let Some(snapshot) = resume {
+        let SessionResume {
+            lineage_id,
+            prompt_cache_key: restored_cache_key,
+            workspace,
+            canonical_context,
+            history,
+            checkpoint,
+        } = snapshot.into_resume()?;
         if key
             .as_deref()
             .is_some_and(|key| key != restored_cache_key.as_ref())
@@ -1633,7 +1676,18 @@ where
                 "configured prompt cache key does not match the resumed session".to_owned(),
             ));
         }
-        (lineage_id, Some(restored_cache_key), Some(checkpoint))
+        let initial = checkpoint.map_or_else(
+            || {
+                InitialResume::Rollout(Box::new(RolloutResume {
+                    workspace,
+                    canonical_context,
+                    history,
+                    prompt_cache_key: Arc::clone(&restored_cache_key),
+                }))
+            },
+            |checkpoint| InitialResume::Exact(Box::new(checkpoint)),
+        );
+        (lineage_id, Some(restored_cache_key), Some(initial))
     } else {
         (
             Arc::<str>::from(session_id.as_str()),
@@ -1651,9 +1705,9 @@ where
                 })
         })
         .transpose()?;
-    let workspace = if let Some(checkpoint) = initial_checkpoint.as_ref() {
-        let restored = crate::model::resolve_workspace(Some(checkpoint.workspace()))?;
-        if restored != checkpoint.workspace() {
+    let workspace = if let Some(initial) = initial_resume.as_ref() {
+        let restored = crate::model::resolve_workspace(Some(initial.workspace()))?;
+        if restored != initial.workspace() {
             return Err(NanocodexError::InvalidSessionSnapshot(
                 "workspace no longer resolves to the stored location".to_owned(),
             ));
@@ -1688,7 +1742,7 @@ where
         session_id,
         workspace,
         service,
-        initial_checkpoint,
+        initial_resume,
         global_instructions,
         AgentOrigin {
             kind: if is_resume { "resume" } else { "root" },
@@ -1703,7 +1757,7 @@ fn spawn_agent_driver<S>(
     session_id: String,
     workspace: Option<Arc<str>>,
     service: S,
-    initial_checkpoint: Option<ModelCheckpoint>,
+    initial_resume: Option<InitialResume>,
     global_instructions: Option<Arc<str>>,
     origin: AgentOrigin,
 ) -> Result<(Nanocodex, AgentEvents)>
@@ -1715,9 +1769,12 @@ where
     let runtime = tokio::runtime::Handle::try_current()
         .map_err(|_| NanocodexError::TokioRuntimeUnavailable)?;
     let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
-    let tools = spawner.tools.materialize(AgentHandle {
-        commands: commands.downgrade(),
-    })?;
+    let tools = bind_agent_environment(
+        spawner.tools.materialize(AgentHandle {
+            commands: commands.downgrade(),
+        })?,
+        &session_id,
+    )?;
     let rollout = spawner
         .rollout
         .as_ref()
@@ -1738,6 +1795,7 @@ where
                     kind: origin.kind,
                     parent_thread_id: origin.parent_session_id.as_deref(),
                 },
+                initial_resume.as_ref().map(InitialResume::history_len),
             )
             .map_err(|source| NanocodexError::InitializeRollout {
                 codex_home: config.codex_home().to_path_buf(),
@@ -1748,9 +1806,28 @@ where
     let rollout_info = rollout.as_ref().map(|recorder| recorder.info().clone());
     let session_id: Arc<str> = Arc::from(session_id);
     let (events, event_stream) = EventSink::channel(session_id.to_string());
-    let initial_model = initial_checkpoint
-        .map(|checkpoint| {
-            prepare_resumed_checkpoint(checkpoint, &spawner.config, &tools, &session_id)
+    let initial_model = initial_resume
+        .map(|initial| match initial {
+            InitialResume::Exact(checkpoint) => {
+                prepare_resumed_checkpoint(*checkpoint, &spawner.config, &tools, &session_id)
+            }
+            InitialResume::Rollout(resume) => {
+                let RolloutResume {
+                    workspace,
+                    canonical_context,
+                    history,
+                    prompt_cache_key,
+                } = *resume;
+                prepare_rollout_checkpoint(
+                    workspace,
+                    canonical_context,
+                    history,
+                    prompt_cache_key,
+                    &spawner.config,
+                    &tools,
+                    &session_id,
+                )
+            }
         })
         .transpose()?;
     let transport_stats = Arc::new(TransportStats::default());
@@ -1762,6 +1839,9 @@ where
         rollout: rollout_info,
         rollout_recorder: rollout.clone(),
     };
+    // Start discovery before returning the handle so an idle CLI or TUI immediately
+    // contributes its human think time to provider prewarming.
+    tools.start_providers();
     drop(
         runtime.spawn(
             AgentDriver {
@@ -1885,11 +1965,17 @@ mod tests {
     use std::{
         future::{Pending, Ready, pending},
         io::Write,
-        sync::Mutex,
+        sync::{Mutex, atomic::AtomicBool},
         time::Duration,
     };
 
     use super::*;
+    use async_trait::async_trait;
+    use nanocodex_tools::{
+        DynamicToolProvider, ToolContext, ToolDefinition, ToolExecution, ToolInput, ToolOutputBody,
+        ToolRuntime,
+    };
+    use serde_json::Value;
     use tempfile::tempdir;
     use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer, timeout::TimeoutLayer};
 
@@ -1950,6 +2036,32 @@ mod tests {
     #[derive(Clone)]
     struct PendingService;
 
+    struct StartProbe(Arc<AtomicBool>);
+
+    #[async_trait]
+    impl DynamicToolProvider for StartProbe {
+        fn start(&self) {
+            self.0.store(true, Ordering::Release);
+        }
+
+        fn direct_tools(&self) -> Vec<Arc<dyn nanocodex_tools::Tool>> {
+            Vec::new()
+        }
+
+        fn available_definitions(&self) -> Vec<ToolDefinition> {
+            Vec::new()
+        }
+
+        async fn execute(
+            &self,
+            _name: &str,
+            _input: Value,
+            _context: ToolContext<'_>,
+        ) -> Option<ToolExecution> {
+            None
+        }
+    }
+
     impl Service<ResponsesAttempt> for PendingService {
         type Response = ResponsesServiceResponse;
         type Error = NanocodexError;
@@ -1982,6 +2094,25 @@ mod tests {
             .responses(responses)
             .build()
             .unwrap();
+        drop(events);
+    }
+
+    #[tokio::test]
+    async fn starts_dynamic_providers_before_build_returns() {
+        let started = Arc::new(AtomicBool::new(false));
+        let tools = Tools::builder()
+            .provider(StartProbe(Arc::clone(&started)))
+            .build()
+            .unwrap();
+        let responses = Responses::builder().service(|| NeverCalled).build();
+
+        let (_agent, events) = Nanocodex::builder("test")
+            .tools(tools)
+            .responses(responses)
+            .build()
+            .unwrap();
+
+        assert!(started.load(Ordering::Acquire));
         drop(events);
     }
 
@@ -2056,6 +2187,43 @@ mod tests {
         assert!(rollout.path().is_file());
         agent.flush_rollout().await.unwrap();
         drop((agent, events));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_session_id_is_authoritative_in_shell_environment() {
+        let workspace = tempdir().unwrap();
+        let tools = Tools::builder()
+            .process_environment([(CODEX_THREAD_ID_ENV_VAR, "caller-spoof")])
+            .build()
+            .unwrap();
+        let tools = bind_agent_environment(tools, "agent-thread").unwrap();
+        let runtime = ToolRuntime::new_with_tools(workspace.path(), None, None, &tools);
+        let input = serde_json::value::RawValue::from_string(
+            r#"{"cmd":"printf '%s' \"$CODEX_THREAD_ID\"","login":false}"#.to_owned(),
+        )
+        .unwrap();
+
+        let execution = runtime
+            .execute_tool(
+                "exec_command",
+                ToolInput::Function(input),
+                ToolContext {
+                    model: "test",
+                    session_id: "agent-thread",
+                    call_id: "call-1",
+                    history: &[],
+                    output_token_budget: 1_000,
+                },
+            )
+            .await;
+
+        assert!(execution.success);
+        let ToolOutputBody::Text(output) = execution.output else {
+            panic!("shell returned non-text output");
+        };
+        let output: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(output["output"], "agent-thread");
     }
 
     #[test]

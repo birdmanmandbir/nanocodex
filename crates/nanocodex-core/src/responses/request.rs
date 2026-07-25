@@ -123,6 +123,36 @@ impl ResponseHistory {
         self.tail = Arc::new(items);
     }
 
+    /// Replaces every item from `start` onward while sharing complete prefix
+    /// segments.
+    ///
+    /// This is an internal COW primitive used when a transport operation needs
+    /// to rewrite a trailing portion of retained history.
+    #[doc(hidden)]
+    pub fn replace_suffix(&mut self, start: usize, replacement: Vec<ResponseItem>) {
+        let start = start.min(self.len());
+        let committed_len = self.head.as_ref().map_or(0, |segment| segment.len);
+        if start >= committed_len {
+            let tail_prefix_len = start - committed_len;
+            let mut tail = Vec::with_capacity(tail_prefix_len + replacement.len());
+            tail.extend(self.tail[..tail_prefix_len].iter().cloned());
+            tail.extend(replacement);
+            self.tail = Arc::new(tail);
+            return;
+        }
+        let mut current = self.head.clone();
+        while let Some(segment) = current.take() {
+            let previous_len = segment.previous.as_ref().map_or(0, |previous| previous.len);
+            if start >= previous_len {
+                self.head.clone_from(&segment.previous);
+                self.tail = Arc::new(segment.items[..start - previous_len].to_vec());
+                break;
+            }
+            current.clone_from(&segment.previous);
+        }
+        Arc::make_mut(&mut self.tail).extend(replacement);
+    }
+
     #[must_use]
     pub fn iter(&self) -> ResponseHistoryIter<'_> {
         ResponseHistoryIter::new(self, 0)
@@ -131,6 +161,16 @@ impl ResponseHistory {
     #[must_use]
     pub fn iter_from(&self, start: usize) -> ResponseHistoryIter<'_> {
         ResponseHistoryIter::new(self, start)
+    }
+
+    #[must_use]
+    pub fn iter_rev(&self) -> ResponseHistoryRevIter<'_> {
+        ResponseHistoryRevIter {
+            tail: self.tail.iter().rev(),
+            segment: self.head.as_deref(),
+            segment_items: None,
+            remaining: self.len(),
+        }
     }
 
     #[cfg(test)]
@@ -219,6 +259,39 @@ impl<'a> Iterator for ResponseHistoryIter<'a> {
 }
 
 impl ExactSizeIterator for ResponseHistoryIter<'_> {}
+
+pub struct ResponseHistoryRevIter<'a> {
+    tail: std::iter::Rev<std::slice::Iter<'a, ResponseItem>>,
+    segment: Option<&'a HistorySegment>,
+    segment_items: Option<std::iter::Rev<std::slice::Iter<'a, ResponseItem>>>,
+    remaining: usize,
+}
+
+impl<'a> Iterator for ResponseHistoryRevIter<'a> {
+    type Item = &'a ResponseItem;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(item) = self.tail.next() {
+            self.remaining -= 1;
+            return Some(item);
+        }
+        loop {
+            if let Some(item) = self.segment_items.as_mut().and_then(Iterator::next) {
+                self.remaining -= 1;
+                return Some(item);
+            }
+            let segment = self.segment.take()?;
+            self.segment = segment.previous.as_deref();
+            self.segment_items = Some(segment.items.iter().rev());
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for ResponseHistoryRevIter<'_> {}
 
 #[derive(Clone, Copy)]
 pub struct ResponsesInput<'a> {
@@ -330,9 +403,58 @@ impl Serialize for ResponsesInput<'_> {
     {
         let mut sequence = serializer.serialize_seq(Some(self.len()))?;
         for item in self.iter() {
-            sequence.serialize_element(item)?;
+            sequence.serialize_element(&RequestResponseItem {
+                item,
+                retain_ids: true,
+            })?;
         }
         sequence.end()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RequestInput<'a> {
+    input: ResponsesInput<'a>,
+    retain_ids: bool,
+}
+
+impl Serialize for RequestInput<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.input.len()))?;
+        for item in self.input.iter() {
+            sequence.serialize_element(&RequestResponseItem {
+                item,
+                retain_ids: self.retain_ids,
+            })?;
+        }
+        sequence.end()
+    }
+}
+
+struct RequestResponseItem<'a> {
+    item: &'a ResponseItem,
+    retain_ids: bool,
+}
+
+impl Serialize for RequestResponseItem<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if self
+            .item
+            .id()
+            .is_some_and(|id| !id.is_prefixed() || !self.retain_ids)
+        {
+            let mut item = self.item.clone();
+            item.set_id(None);
+            item.serialize(serializer)
+        } else {
+            self.item.serialize(serializer)
+        }
     }
 }
 
@@ -343,7 +465,7 @@ pub struct ResponseCreate<'a> {
     model: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     previous_response_id: Option<&'a str>,
-    input: ResponsesInput<'a>,
+    input: RequestInput<'a>,
     tool_choice: &'static str,
     parallel_tool_calls: bool,
     reasoning: ReasoningControls,
@@ -423,13 +545,16 @@ impl<'a> ResponseCreate<'a> {
             kind: websocket.then_some("response.create"),
             model: crate::MODEL,
             previous_response_id,
-            input,
+            input: RequestInput {
+                input,
+                retain_ids: config.store_responses,
+            },
             tool_choice: "auto",
             parallel_tool_calls: false,
             reasoning: ReasoningControls {
                 mode: config.reasoning_mode.request_value(),
                 effort: policy.thinking.as_str(),
-                summary: "detailed",
+                summary: Some("auto"),
                 context: "all_turns",
             },
             store: config.store_responses,
@@ -460,7 +585,8 @@ struct ReasoningControls {
     #[serde(skip_serializing_if = "Option::is_none")]
     mode: Option<&'static str>,
     effort: &'static str,
-    summary: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<&'static str>,
     context: &'static str,
 }
 
@@ -511,14 +637,82 @@ mod tests {
         assert_eq!(request["generate"], false);
         assert!(request.get("tools").is_none());
         assert!(request.get("instructions").is_none());
-        assert_eq!(request["reasoning"]["summary"], json!("detailed"));
+        assert_eq!(request["reasoning"]["summary"], json!("auto"));
         assert!(request["reasoning"].get("mode").is_none());
         assert!(request.get("context_management").is_none());
     }
 
     #[test]
-    fn thinking_defaults_to_medium() {
-        assert_eq!(ModelConfig::default().thinking, Thinking::Medium);
+    fn request_serialization_matches_codex_item_id_policy_without_mutating_history() {
+        let mut client_item = ResponseItem::message(
+            MessageRole::User,
+            [ContentItem::InputText {
+                text: "client".into(),
+            }],
+        );
+        client_item.set_id(Some(super::super::ResponseItemId::with_suffix(
+            "msg", "stable",
+        )));
+        let mut server_item = ResponseItem::message(
+            MessageRole::Assistant,
+            [ContentItem::OutputText {
+                text: "server".into(),
+                annotations: None,
+                logprobs: None,
+            }],
+        );
+        server_item.set_id(Some(super::super::ResponseItemId::from_server(
+            "server-item-id",
+        )));
+        let history = ResponseHistory::new(vec![client_item, server_item]);
+        let stored_config = ModelConfig::default();
+        let profile = RequestProfile::new("agent", "lineage", Arc::from([]));
+
+        let stored_request = serde_json::to_value(ResponseCreate::generation(
+            &stored_config,
+            Thinking::Medium,
+            false,
+            ResponsesInput::history(&[], &history, None),
+            None,
+            &profile,
+            None,
+        ))
+        .expect("request should serialize");
+
+        assert_eq!(stored_request["input"][0]["id"], "msg_stable");
+        assert!(stored_request["input"][1].get("id").is_none());
+
+        let ephemeral_config = ModelConfig {
+            store_responses: false,
+            ..ModelConfig::default()
+        };
+        let ephemeral_request = serde_json::to_value(ResponseCreate::generation(
+            &ephemeral_config,
+            Thinking::Medium,
+            false,
+            ResponsesInput::history(&[], &history, None),
+            None,
+            &profile,
+            None,
+        ))
+        .expect("request should serialize");
+
+        assert!(ephemeral_request["input"][0].get("id").is_none());
+        assert!(ephemeral_request["input"][1].get("id").is_none());
+        assert_eq!(
+            history
+                .iter()
+                .nth(1)
+                .and_then(ResponseItem::id)
+                .map(super::super::ResponseItemId::as_str),
+            Some("server-item-id"),
+            "outbound preparation must not mutate authoritative history"
+        );
+    }
+
+    #[test]
+    fn thinking_defaults_to_high() {
+        assert_eq!(ModelConfig::default().thinking, Thinking::High);
     }
 
     #[test]
@@ -643,5 +837,54 @@ mod tests {
             serde_json::to_value(vec![item("one"), item("two"), item("three")]).unwrap(),
         );
         assert_eq!(history.iter_from(99).count(), 0);
+    }
+
+    #[test]
+    fn reverse_iteration_crosses_tail_and_segments_newest_first() {
+        let item = |text: &'static str| {
+            ResponseItem::message(
+                MessageRole::User,
+                [ContentItem::InputText { text: text.into() }],
+            )
+        };
+        let mut history = ResponseHistory::new(vec![item("zero"), item("one")]);
+        history.commit_tail();
+        history.push(item("two"));
+        history.commit_tail();
+        history.push(item("three"));
+
+        let reversed: Vec<_> = history.iter_rev().cloned().collect();
+        assert_eq!(
+            serde_json::to_value(reversed).unwrap(),
+            serde_json::to_value(vec![item("three"), item("two"), item("one"), item("zero")])
+                .unwrap(),
+        );
+    }
+
+    #[test]
+    fn replacing_a_suffix_shares_complete_prefix_segments() {
+        let item = |text: &'static str| {
+            ResponseItem::message(
+                MessageRole::User,
+                [ContentItem::InputText { text: text.into() }],
+            )
+        };
+        let mut history = ResponseHistory::new(vec![item("zero"), item("one")]);
+        history.commit_tail();
+        let shared_prefix = Arc::clone(history.committed_head().unwrap());
+        history.push(item("two"));
+        history.commit_tail();
+        history.push(item("three"));
+
+        history.replace_suffix(2, vec![item("replacement")]);
+
+        assert!(Arc::ptr_eq(
+            history.committed_head().unwrap(),
+            &shared_prefix
+        ));
+        assert_eq!(
+            serde_json::to_value(history.iter().cloned().collect::<Vec<_>>()).unwrap(),
+            serde_json::to_value(vec![item("zero"), item("one"), item("replacement")]).unwrap(),
+        );
     }
 }

@@ -106,21 +106,21 @@ struct ExecCommandArguments {
     #[serde(default)]
     interactive: bool,
     #[serde(default)]
-    yield_time_ms: Option<i64>,
+    yield_time_ms: Option<u64>,
     #[serde(default)]
-    max_output_tokens: Option<i64>,
+    max_output_tokens: Option<usize>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WriteStdinArguments {
-    session_id: i64,
+    session_id: i32,
     #[serde(default)]
     chars: String,
     #[serde(default)]
-    yield_time_ms: Option<i64>,
+    yield_time_ms: Option<u64>,
     #[serde(default)]
-    max_output_tokens: Option<i64>,
+    max_output_tokens: Option<usize>,
 }
 
 #[cfg(test)]
@@ -131,7 +131,7 @@ mod tests {
     use crate::shell::ShellSessions;
 
     #[test]
-    fn exec_command_exposes_shell_parameter_and_session_lifecycle() {
+    fn exec_command_exposes_codex_description_and_shell_parameter() {
         let handler = ExecCommandHandler::new(PathBuf::from("/"), Arc::new(ShellSessions::new()));
         let spec = serde_json::to_value(handler.definition()).unwrap();
 
@@ -139,7 +139,7 @@ mod tests {
             spec.pointer("/description")
                 .and_then(serde_json::Value::as_str),
             Some(
-                "Runs a shell command, returning output or a session ID for ongoing interaction. Live sessions are terminated when the agent ends; detach services that must remain running afterward."
+                "Runs a command in a PTY, returning output or a session ID for ongoing interaction."
             )
         );
         assert_eq!(

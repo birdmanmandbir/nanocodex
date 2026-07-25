@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
@@ -26,12 +26,13 @@ pub(crate) struct ToolEntry {
     pub timeout: Duration,
 }
 
-#[derive(Default)]
 struct Catalog {
     entries: BTreeMap<String, Arc<ToolEntry>>,
-    active: HashSet<String>,
+    active: BTreeSet<String>,
     failures: BTreeMap<String, String>,
-    search_index: Option<SearchIndex>,
+    search_index: Option<Arc<SearchIndex>>,
+    pending_servers: BTreeSet<String>,
+    generations: BTreeMap<String, u64>,
 }
 
 struct SearchIndex {
@@ -52,6 +53,16 @@ pub(crate) struct SearchResponse {
     failed_servers: BTreeMap<String, String>,
 }
 
+impl SearchResponse {
+    pub(crate) fn tool_count(&self) -> usize {
+        self.tools.len()
+    }
+
+    pub(crate) const fn pending_server_count(&self) -> usize {
+        self.pending_servers
+    }
+}
+
 #[derive(Serialize)]
 struct SearchTool {
     name: String,
@@ -62,10 +73,26 @@ struct SearchTool {
 }
 
 impl ProviderState {
-    pub(crate) fn new(server_count: usize, discovery_timeout: Duration) -> Self {
-        let (remaining, _) = watch::channel(server_count);
+    pub(crate) fn new(
+        server_names: impl IntoIterator<Item = String>,
+        discovery_timeout: Duration,
+    ) -> Self {
+        let pending_servers = server_names.into_iter().collect::<BTreeSet<_>>();
+        let generations = pending_servers
+            .iter()
+            .cloned()
+            .map(|name| (name, 0))
+            .collect();
+        let (remaining, _) = watch::channel(pending_servers.len());
         Self {
-            catalog: Mutex::new(Catalog::default()),
+            catalog: Mutex::new(Catalog {
+                entries: BTreeMap::new(),
+                active: BTreeSet::new(),
+                failures: BTreeMap::new(),
+                search_index: None,
+                pending_servers,
+                generations,
+            }),
             remaining,
             discovery_timeout,
         }
@@ -74,11 +101,25 @@ impl ProviderState {
     pub(crate) fn complete_server(
         &self,
         server_name: &str,
+        generation: u64,
         result: Result<Vec<ToolEntry>, String>,
     ) {
         let mut catalog = self.catalog();
+        if catalog.generations.get(server_name).copied() != Some(generation) {
+            return;
+        }
         match result {
             Ok(entries) => {
+                let removed = catalog
+                    .entries
+                    .iter()
+                    .filter_map(|(name, entry)| {
+                        (entry.server_name == server_name).then_some(name.clone())
+                    })
+                    .collect::<Vec<_>>();
+                for name in removed {
+                    catalog.entries.remove(&name);
+                }
                 for entry in entries {
                     if catalog.entries.contains_key(&entry.canonical_name) {
                         catalog.failures.insert(
@@ -94,16 +135,45 @@ impl ProviderState {
                         .entries
                         .insert(entry.canonical_name.clone(), Arc::new(entry));
                 }
+                let available = catalog.entries.keys().cloned().collect::<BTreeSet<_>>();
+                catalog.active.retain(|name| available.contains(name));
             }
             Err(error) => {
                 catalog.failures.insert(server_name.to_owned(), error);
             }
         }
-        catalog.search_index = None;
+        catalog.pending_servers.remove(server_name);
+        if catalog.pending_servers.is_empty() {
+            tracing::info!(
+                target: "nanocodex_mcp",
+                tool_count = catalog.entries.len(),
+                "prewarming MCP tool search index"
+            );
+            catalog.search_index = Some(Arc::new(SearchIndex::new(
+                catalog.entries.values().cloned(),
+            )));
+        } else {
+            catalog.search_index = None;
+        }
+        let pending_servers = catalog.pending_servers.len();
         drop(catalog);
-        self.remaining.send_modify(|remaining| {
-            *remaining = remaining.saturating_sub(1);
-        });
+        self.remaining.send_replace(pending_servers);
+    }
+
+    pub(crate) fn begin_server(&self, server_name: &str) -> u64 {
+        let mut catalog = self.catalog();
+        let generation = catalog
+            .generations
+            .entry(server_name.to_owned())
+            .and_modify(|generation| *generation = generation.saturating_add(1))
+            .or_insert(0);
+        let generation = *generation;
+        catalog.failures.remove(server_name);
+        catalog.pending_servers.insert(server_name.to_owned());
+        let pending_servers = catalog.pending_servers.len();
+        drop(catalog);
+        self.remaining.send_replace(pending_servers);
+        generation
     }
 
     pub(crate) async fn search(
@@ -127,14 +197,21 @@ impl ProviderState {
                 tool_count = catalog.entries.len(),
                 "building MCP tool search index"
             );
-            catalog.search_index = Some(SearchIndex::new(catalog.entries.values().cloned()));
+            catalog.search_index = Some(Arc::new(SearchIndex::new(
+                catalog.entries.values().cloned(),
+            )));
         }
-        let selected = catalog
+        let index = catalog
             .search_index
-            .as_ref()
-            .map_or_else(Vec::new, |index| {
-                index.search(query, limit.min(MAX_SEARCH_LIMIT))
-            });
+            .clone()
+            .ok_or_else(|| "MCP search index was not initialized".to_owned())?;
+        let pending_servers = catalog.pending_servers.len();
+        let failed_servers = catalog.failures.clone();
+        drop(catalog);
+
+        let selected = index.search(query, limit.min(MAX_SEARCH_LIMIT));
+        let tools = selected.iter().map(|entry| entry.summary()).collect();
+        let mut catalog = self.catalog();
         for entry in &selected {
             catalog.active.insert(entry.canonical_name.clone());
         }
@@ -144,11 +221,10 @@ impl ProviderState {
             active_count = catalog.active.len(),
             "searched MCP tool catalog"
         );
-        let tools = selected.iter().map(|entry| entry.summary()).collect();
         Ok(SearchResponse {
             tools,
-            pending_servers: *self.remaining.borrow(),
-            failed_servers: catalog.failures.clone(),
+            pending_servers,
+            failed_servers,
         })
     }
 
@@ -172,6 +248,9 @@ impl ProviderState {
     }
 
     async fn wait_for_startup(&self) {
+        if self.catalog().search_index.is_some() {
+            return;
+        }
         let mut remaining = self.remaining.subscribe();
         if *remaining.borrow() == 0 {
             return;

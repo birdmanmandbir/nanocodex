@@ -6,17 +6,28 @@ use std::{
 use clap::{ArgAction, Args, builder::NonEmptyStringValueParser};
 use eyre::{Result, WrapErr, eyre};
 use nanocodex::{
-    AgentEvents, Nanocodex, OpenAiAuth, ReasoningMode, Responses, ResponsesHistory,
-    ResponsesTransport, RolloutConfig, Thinking, Tools,
+    AgentEvents, DurableSession, McpHandle, Nanocodex, OpenAiAuth, OpenAiAuthMode, ReasoningMode,
+    Responses, ResponsesHistory, ResponsesTransport, RolloutConfig, SessionSnapshot, Thinking,
+    Tools,
 };
 
-use crate::mcp::McpArgs;
+use crate::mcp::{ConfiguredMcp, McpArgs};
+use crate::mpp::{MppAdapter, MppArgs};
 use crate::subagents::{self, ChildAgents};
 
 pub(crate) struct ConfiguredAgent {
     pub(crate) handle: Nanocodex,
     pub(crate) events: AgentEvents,
     pub(crate) child_agents: Option<Arc<ChildAgents>>,
+    pub(crate) mpp_adapter: Option<MppAdapter>,
+    pub(crate) mcp: Option<McpHandle>,
+}
+
+struct SessionBuild {
+    workspace: PathBuf,
+    session_id: Option<String>,
+    snapshot: Option<SessionSnapshot>,
+    rollout: Option<RolloutConfig>,
 }
 
 #[derive(Args)]
@@ -34,8 +45,8 @@ pub(crate) struct AgentArgs {
     auth_file: Option<PathBuf>,
 
     /// Working directory exposed to the coding tools.
-    #[arg(long, default_value = ".")]
-    cwd: PathBuf,
+    #[arg(long)]
+    cwd: Option<PathBuf>,
 
     /// Reasoning effort: none, low, medium, high, xhigh, or max.
     #[arg(long, env = "OPENAI_REASONING_EFFORT", default_value_t)]
@@ -105,56 +116,97 @@ pub(crate) struct AgentArgs {
     #[arg(long, env = "NANOCODEX_STORE_RESPONSES", action = ArgAction::Set)]
     store_responses: Option<bool>,
 
-    /// `OpenAI` HTTP API base used by HTTPS Responses and standalone web search.
+    /// `OpenAI` HTTP API base used by HTTPS Responses and in-process remote tools.
     #[arg(long, env = "OPENAI_API_BASE_URL")]
     api_base_url: Option<String>,
 
     #[command(flatten)]
     mcp: McpArgs,
+
+    #[command(flatten)]
+    mpp: MppArgs,
 }
 
 impl AgentArgs {
     pub(crate) fn cwd(&self) -> &Path {
-        &self.cwd
+        self.cwd.as_deref().unwrap_or_else(|| Path::new("."))
     }
 
-    pub(crate) fn build(self) -> Result<ConfiguredAgent> {
+    pub(crate) const fn uses_tempo(&self) -> bool {
+        self.mpp.is_enabled()
+    }
+
+    pub(crate) const fn thinking(&self) -> Thinking {
+        self.thinking
+    }
+
+    pub(crate) async fn build(self) -> Result<ConfiguredAgent> {
+        self.build_inner(None).await
+    }
+
+    pub(crate) async fn build_resumed(self, session: DurableSession) -> Result<ConfiguredAgent> {
+        self.build_inner(Some(session)).await
+    }
+
+    async fn build_inner(self, durable: Option<DurableSession>) -> Result<ConfiguredAgent> {
         let codex_home = default_codex_home()?;
-        let rollout = self.rollouts.then(|| codex_home.clone());
-        let auth = select_auth(self.api_key, self.auth_file, environment_api_key()?)?;
-        let mut responses = Responses::builder().transport(self.responses_transport);
+        let session = prepare_session_build(self.cwd, self.rollouts, &codex_home, durable)?;
+        let mpp_enabled = self.mpp.is_enabled();
+        let auth = if mpp_enabled {
+            OpenAiAuth::api_key("tempo-proxy")
+        } else {
+            select_auth(self.api_key, self.auth_file, environment_api_key()?)?
+        };
+        let direct_websocket_url = direct_websocket_url(self.websocket_url, auth.mode());
+        let (websocket_url, mpp_adapter) = self.mpp.start(direct_websocket_url).await?;
+        let mut responses = Responses::builder()
+            .transport(self.responses_transport)
+            .websocket_url(websocket_url);
         if let Some(history) = self.responses_history {
             responses = responses.history(history);
         }
         if let Some(store) = self.store_responses {
             responses = responses.store(store);
         }
-        if let Some(websocket_url) = self.websocket_url {
-            responses = responses.websocket_url(websocket_url);
-        }
-        if let Some(api_base_url) = self.api_base_url {
+        let api_base_url = self.api_base_url.or_else(|| {
+            mpp_adapter
+                .as_ref()
+                .map(|adapter| adapter.api_base_url().to_owned())
+        });
+        if let Some(api_base_url) = api_base_url {
             responses = responses.api_base_url(api_base_url);
         }
         let responses = responses.build();
         let mut tools = Tools::builder()
             .web_search(self.web_search)
             .image_generation(self.image_generation);
-        if let Some(mcp) = self.mcp.build()? {
-            tools = tools.provider(mcp);
+        let mcp = self.mcp.build(&codex_home)?;
+        let mcp_handle = mcp.as_ref().map(|mcp| mcp.handle.clone());
+        if let Some(ConfiguredMcp { provider, .. }) = mcp {
+            tools = tools.provider(provider);
+        }
+        if let Some(mpp_adapter) = &mpp_adapter {
+            tools = tools
+                .process_environment(mpp_adapter.tool_environment())
+                .remote_http_client(mpp_adapter.tool_http_client()?);
         }
         let tools = tools.build()?;
         let child_agents = self.subagents.then(|| Arc::new(ChildAgents::default()));
-        let builder = Nanocodex::builder(auth)
+        let mut builder = Nanocodex::builder(auth)
             .reasoning_mode(self.reasoning_mode)
             .thinking(self.thinking)
-            .workspace(self.cwd)
+            .workspace(session.workspace)
             .codex_home(codex_home)
             .responses(responses);
-        let builder = if let Some(codex_home) = rollout {
-            builder.rollout(RolloutConfig::new(codex_home))
-        } else {
-            builder
-        };
+        if let Some(session_id) = session.session_id {
+            builder = builder.session_id(session_id);
+        }
+        if let Some(snapshot) = session.snapshot {
+            builder = builder.resume(snapshot);
+        }
+        if let Some(rollout) = session.rollout {
+            builder = builder.rollout(rollout);
+        }
         let builder = if let Some(child_agents) = &child_agents {
             let tools = tools.clone();
             let child_agents = Arc::downgrade(child_agents);
@@ -174,8 +226,52 @@ impl AgentArgs {
             handle,
             events,
             child_agents,
+            mpp_adapter,
+            mcp: mcp_handle,
         })
     }
+}
+
+fn prepare_session_build(
+    requested_workspace: Option<PathBuf>,
+    rollouts: bool,
+    codex_home: &Path,
+    durable: Option<DurableSession>,
+) -> Result<SessionBuild> {
+    let Some(session) = durable else {
+        return Ok(SessionBuild {
+            workspace: requested_workspace.unwrap_or_else(|| PathBuf::from(".")),
+            session_id: None,
+            snapshot: None,
+            rollout: rollouts.then(|| RolloutConfig::new(codex_home)),
+        });
+    };
+    let restored = Path::new(session.workspace())
+        .canonicalize()
+        .wrap_err("failed to resolve the resumed workspace")?;
+    if let Some(requested) = requested_workspace {
+        let requested = requested
+            .canonicalize()
+            .wrap_err("failed to resolve the requested workspace")?;
+        if requested != restored {
+            return Err(eyre!(
+                "resumed thread workspace is {}; --cwd requested {}",
+                restored.display(),
+                requested.display()
+            ));
+        }
+    }
+    let (session_id, snapshot, rollout) = session.into_parts();
+    Ok(SessionBuild {
+        workspace: restored,
+        session_id: Some(session_id),
+        snapshot: Some(snapshot),
+        rollout: rollouts.then_some(rollout),
+    })
+}
+
+fn direct_websocket_url(explicit: Option<String>, auth_mode: OpenAiAuthMode) -> String {
+    explicit.unwrap_or_else(|| auth_mode.default_websocket_url().to_owned())
 }
 
 fn select_auth(
@@ -273,7 +369,26 @@ mod tests {
     use clap::CommandFactory;
     use nanocodex::OpenAiAuthMode;
 
-    use super::{select_auth, select_auth_with_default};
+    use super::{direct_websocket_url, select_auth, select_auth_with_default};
+
+    #[test]
+    fn default_websocket_url_follows_the_selected_auth_mode() {
+        assert_eq!(
+            direct_websocket_url(None, OpenAiAuthMode::ApiKey),
+            "wss://api.openai.com/v1/responses"
+        );
+        assert_eq!(
+            direct_websocket_url(None, OpenAiAuthMode::ChatGpt),
+            "wss://chatgpt.com/backend-api/codex/responses"
+        );
+        assert_eq!(
+            direct_websocket_url(
+                Some("ws://127.0.0.1:1234/responses".to_owned()),
+                OpenAiAuthMode::ChatGpt,
+            ),
+            "ws://127.0.0.1:1234/responses"
+        );
+    }
 
     static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
 
@@ -321,6 +436,23 @@ mod tests {
             .expect("the CLI should expose the rollouts argument");
 
         assert_eq!(rollouts.get_default_values(), ["true"]);
+    }
+
+    #[test]
+    fn standard_and_codex_config_mcp_servers_are_enabled_by_default() {
+        let command = crate::Cli::command();
+        let mcp_defaults = command
+            .get_arguments()
+            .find(|argument| argument.get_id() == "mcp_defaults")
+            .expect("the CLI should expose the MCP defaults argument");
+
+        assert_eq!(mcp_defaults.get_default_values(), ["true"]);
+
+        let codex_config = command
+            .get_arguments()
+            .find(|argument| argument.get_id() == "mcp_codex_config")
+            .expect("the CLI should expose the Codex MCP config argument");
+        assert_eq!(codex_config.get_default_values(), ["true"]);
     }
 
     #[test]

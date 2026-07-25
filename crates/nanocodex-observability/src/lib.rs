@@ -72,9 +72,7 @@ pub enum ObservabilityError {
 impl ObservabilityBuilder {
     #[must_use]
     pub fn new(service_name: impl Into<String>, service_version: impl Into<String>) -> Self {
-        let filter =
-            "warn,nanocodex=info,nanocodex_service=info,nanocodex_tools=info,nanocodex_mcp=info"
-                .to_owned();
+        let filter = "warn,nanocodex=info,nanocodex_service=info,nanocodex_tools=info,nanocodex_mcp=info,mpp_egress=info".to_owned();
         Self {
             otel_filter: filter.clone(),
             filter,
@@ -197,6 +195,7 @@ impl ObservabilityBuilder {
         let Some(endpoint) = self.otlp_endpoint.as_deref() else {
             return Ok(None);
         };
+        drop(rustls::crypto::ring::default_provider().install_default());
         let resource = self.resource();
         if current_tokio_runtime_is_multi_thread() {
             let exporter = SpanExporter::builder()
