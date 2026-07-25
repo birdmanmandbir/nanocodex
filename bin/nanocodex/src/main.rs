@@ -335,6 +335,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn turbo_is_explicitly_selectable_for_one_shot_runs() {
+        let cli = Cli::try_parse_from(["nanocodex", "run", "--turbo", "reply with ok"]).unwrap();
+
+        let Some(Command::Run(command)) = cli.command else {
+            panic!("expected one-shot run command");
+        };
+        assert!(command.agent.turbo);
+    }
+
     #[cfg(feature = "tempo")]
     #[test]
     fn provider_selection_is_exclusive() {

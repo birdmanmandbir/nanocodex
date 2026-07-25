@@ -162,6 +162,7 @@ class NanocodexAgent(BaseInstalledAgent):
         fast_mode: bool = False,
         web_search: bool = True,
         subagents: bool = False,
+        turbo: bool = False,
         install_node: bool = False,
         system_prompt_path: str | Path | None = None,
         agents_md_path: str | Path | None = None,
@@ -199,6 +200,7 @@ class NanocodexAgent(BaseInstalledAgent):
         self._fast_mode = fast_mode
         self._web_search = web_search
         self._subagents = subagents
+        self._turbo = turbo
         self._install_node = install_node
         self._system_prompt_path = self._resolve_context_file(
             system_prompt_path, "system prompt"
@@ -343,7 +345,7 @@ class NanocodexAgent(BaseInstalledAgent):
         self._publish_events(result.stdout)
 
     def _run_arguments(self, prompt: str) -> list[str]:
-        return [
+        arguments = [
             self._BINARY,
             "run",
             "--model",
@@ -358,9 +360,11 @@ class NanocodexAgent(BaseInstalledAgent):
             str(self._web_search).lower(),
             "--subagents",
             str(getattr(self, "_subagents", False)).lower(),
-            "--",
-            prompt,
         ]
+        if getattr(self, "_turbo", False):
+            arguments.append("--turbo")
+        arguments.extend(["--", prompt])
+        return arguments
 
     def _classify_exec_error(self, command: str, result: Any) -> Exception:
         # BaseInstalledAgent classifies and raises before returning a nonzero

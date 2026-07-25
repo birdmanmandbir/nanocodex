@@ -159,6 +159,10 @@ pub(crate) struct AgentArgs {
     )]
     subagents: bool,
 
+    /// Enable recursive structured task tools for this session.
+    #[arg(long, env = "NANOCODEX_TURBO", action = ArgAction::SetTrue)]
+    pub(crate) turbo: bool,
+
     /// Write Codex-compatible resumable threads beneath `CODEX_HOME`.
     #[arg(
         long,
@@ -248,7 +252,8 @@ impl AgentArgs {
     }
 
     pub(crate) async fn build(self, vm: VmArgs) -> Result<ConfiguredAgent> {
-        self.build_inner(None, vm, false).await
+        let turbo = self.turbo;
+        self.build_inner(None, vm, turbo, turbo).await
     }
 
     pub(crate) async fn build_resumed(
@@ -256,11 +261,13 @@ impl AgentArgs {
         session: DurableSession,
         vm: VmArgs,
     ) -> Result<ConfiguredAgent> {
-        self.build_inner(Some(session), vm, true).await
+        let turbo = self.turbo;
+        self.build_inner(Some(session), vm, true, turbo).await
     }
 
     pub(crate) async fn build_for_tui(self, vm: VmArgs) -> Result<ConfiguredAgent> {
-        self.build_inner(None, vm, true).await
+        let turbo = self.turbo;
+        self.build_inner(None, vm, true, turbo).await
     }
 
     async fn build_inner(
@@ -268,6 +275,7 @@ impl AgentArgs {
         durable: Option<DurableSession>,
         vm: VmArgs,
         with_task_tools: bool,
+        task_tools_enabled: bool,
     ) -> Result<ConfiguredAgent> {
         let thinking = self.thinking();
         let web_search = self.web_search();
@@ -345,7 +353,7 @@ impl AgentArgs {
         let tools = tools.build()?;
         let task_runtime = with_task_tools.then(|| {
             let runtime = TaskRuntime::new();
-            runtime.set_enabled(false);
+            runtime.set_enabled(task_tools_enabled);
             runtime
         });
         let child_agents = self.subagents.then(|| Arc::new(ChildAgents::default()));

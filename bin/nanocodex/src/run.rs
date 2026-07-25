@@ -6,6 +6,11 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use crate::config::AgentArgs;
 use crate::vm::VmArgs;
 
+const TURBO_ENABLED_MARKER: &str = r#"<nanocodex_turbo enabled="true" parallel_agents="4">
+Recursive structured task tools are available. Use four parallel child workstreams when useful,
+then synthesize and verify their results before completing the task.
+</nanocodex_turbo>"#;
+
 #[derive(Args)]
 pub(crate) struct Run {
     /// Prompt submitted to the agent.
@@ -20,12 +25,21 @@ pub(crate) struct Run {
 impl Run {
     pub(crate) async fn run(self, config: AgentArgs, vm: VmArgs) -> Result<()> {
         let configured = config.build(vm).await?;
+        let turbo = configured
+            .task_runtime
+            .as_ref()
+            .is_some_and(nanocodex_rlm::TaskRuntime::is_enabled);
         let handle = configured.handle;
         let mut events = configured.events;
         let mut stdout = tokio::io::stdout();
         let run_result: Result<()> = async {
             for _ in 0..self.repeat {
-                let turn = handle.prompt(self.prompt.clone()).await?;
+                let prompt = if turbo {
+                    format!("{TURBO_ENABLED_MARKER}\n\n{}", self.prompt)
+                } else {
+                    self.prompt.clone()
+                };
+                let turn = handle.prompt(prompt).await?;
                 let control = turn.control();
                 let completion = async {
                     write_turn_jsonl(&mut events, &mut stdout).await?;
