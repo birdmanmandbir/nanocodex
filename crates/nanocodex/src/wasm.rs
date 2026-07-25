@@ -19,9 +19,12 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::{
     NanocodexError, SessionSnapshot,
-    model::agent::{
-        CompletedModelTurn, ModelCheckpoint, ModelRun, ModelTurnOutcome, PreparedCheckpoint,
-        prepare_checkpoint, prepare_resumed_checkpoint, prepare_rollout_checkpoint,
+    model::{
+        ModelCallMiddlewareConfig,
+        agent::{
+            CompletedModelTurn, ModelCheckpoint, ModelRun, ModelTurnOutcome, PreparedCheckpoint,
+            prepare_checkpoint, prepare_resumed_checkpoint, prepare_rollout_checkpoint,
+        },
     },
     prompt_cache::ModelPromptCache,
     session::{CommittedSession, SessionResume},
@@ -556,6 +559,7 @@ fn spawn_agent(
             factory.tools.clone(),
             factory.prompt_cache.clone(),
             None,
+            ModelCallMiddlewareConfig::default(),
         ),
         Some(prepared) => ModelRun::from_checkpoint(
             events.clone(),
@@ -564,6 +568,7 @@ fn spawn_agent(
             Arc::clone(&transport_stats),
             factory.tools.clone(),
             factory.prompt_cache.clone(),
+            ModelCallMiddlewareConfig::default(),
             prepared,
         ),
     };
@@ -819,6 +824,7 @@ async fn run_driver(
                     Arc::clone(&transport_stats),
                     factory.tools.clone(),
                     factory.prompt_cache.clone(),
+                    ModelCallMiddlewareConfig::default(),
                     prepared,
                 );
                 (Err(NanocodexError::TurnCancelled.to_string()), true)

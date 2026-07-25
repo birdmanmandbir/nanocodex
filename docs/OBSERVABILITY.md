@@ -64,6 +64,14 @@ agent.turn
     └── responses.attempt
 ```
 
+When the explicit Kimi refusal fallback is enabled, a structured
+`cyber_policy` failure closes the primary `model.call`, emits
+`model.route.changed`, and opens a sibling `model.call` whose `model` field is
+`kimi-k3`. Its ordered span events retain the complete `kimi.request` and
+`kimi.response` bodies, including API-visible `reasoning_content`; authorization
+headers and API keys are not attached. Kimi tool work remains the same
+`tool.call`/`tool.execute` branch used by primary-model calls.
+
 To inspect every turn in one conversation, enter `/trace` in the TUI. It opens
 Jaeger's search page filtered to the focused main or `/btw` session. The local
 Jaeger configuration also turns `session.id` and `parent.session.id` tags into

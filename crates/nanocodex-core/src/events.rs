@@ -101,6 +101,8 @@ pub enum AgentEventKind {
     ModelCallCompleted,
     #[serde(rename = "model.call.failed")]
     ModelCallFailed,
+    #[serde(rename = "model.route.changed")]
+    ModelRouteChanged,
     #[serde(rename = "model.compaction.started")]
     ModelCompactionStarted,
     #[serde(rename = "model.compaction.completed")]

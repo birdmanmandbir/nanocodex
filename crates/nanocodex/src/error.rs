@@ -98,8 +98,24 @@ pub enum NanocodexError {
     #[error("failed to build tools for an agent driver: {0}")]
     Tools(#[from] nanocodex_tools::ToolsBuildError),
 
+    #[cfg(not(target_family = "wasm"))]
+    #[error("Kimi refusal fallback failed: {source}")]
+    KimiFallback {
+        #[source]
+        source: Box<dyn Error + Send + Sync>,
+    },
+
     #[error("Responses service middleware failed: {0}")]
     ResponsesMiddleware(#[from] tower::BoxError),
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl From<crate::kimi::KimiError> for NanocodexError {
+    fn from(source: crate::kimi::KimiError) -> Self {
+        Self::KimiFallback {
+            source: Box::new(source),
+        }
+    }
 }
 
 impl NanocodexError {

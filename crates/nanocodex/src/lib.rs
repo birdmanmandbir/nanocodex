@@ -5,6 +5,8 @@ mod agent;
 #[cfg(not(target_family = "wasm"))]
 mod auth;
 mod error;
+#[cfg(not(target_family = "wasm"))]
+mod kimi;
 mod model;
 mod prompt_cache;
 #[cfg(not(target_family = "wasm"))]
@@ -25,6 +27,11 @@ pub use auth::{
     logout_chatgpt,
 };
 pub use error::{NanocodexError, ResponsesError, Result};
+#[cfg(not(target_family = "wasm"))]
+pub use kimi::{
+    KIMI_FALLBACK_API_BASE_URL, KIMI_FALLBACK_MAX_LEASE_GENERATIONS, KIMI_FALLBACK_MODEL,
+    KimiRefusalFallback,
+};
 pub use nanocodex_core::responses::RequestProfile;
 pub use nanocodex_core::{
     AgentEvent, AgentEventKind, AgentEventTiming, AgentEvents, AgentMessageContent, ContentItem,

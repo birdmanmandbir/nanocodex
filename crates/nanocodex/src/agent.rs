@@ -23,8 +23,9 @@ use tracing::{Instrument, error, info, info_span};
 
 use crate::prompt_cache::{ModelPromptCache, SharedPromptCache};
 use crate::{
-    NanocodexError, Result,
+    KimiRefusalFallback, NanocodexError, Result,
     model::{
+        ModelCallMiddlewareConfig,
         agent::{
             CompletedModelTurn, ModelCheckpoint, ModelRun, ModelTurnOutcome, PreparedCheckpoint,
             prepare_checkpoint, prepare_resumed_checkpoint, prepare_rollout_checkpoint,
@@ -354,6 +355,7 @@ impl Nanocodex {
             prompt_cache: PromptCacheConfig::default(),
             codex: CodexCompatibility::default(),
             resume: None,
+            model_call_middleware: ModelCallMiddlewareConfig::default(),
             responses: Responses::default(),
         }
     }
@@ -547,6 +549,7 @@ pub struct NanocodexBuilder<S = StandardResponses> {
     prompt_cache: PromptCacheConfig,
     codex: CodexCompatibility,
     resume: Option<SessionSnapshot>,
+    model_call_middleware: ModelCallMiddlewareConfig,
     responses: Responses<S>,
 }
 
@@ -685,6 +688,19 @@ impl<S> NanocodexBuilder<S> {
         self
     }
 
+    /// Temporarily routes structured `cyber_policy` refusals to Kimi while
+    /// retaining the primary Responses conversation as authoritative.
+    ///
+    /// Kimi receives exponentially growing leases of `1, 2, 4, ...`
+    /// generations, capped by the supplied policy. The next model boundary
+    /// after a lease expires probes the primary model again. This fallback is
+    /// disabled unless explicitly configured.
+    #[must_use]
+    pub fn kimi_refusal_fallback(mut self, fallback: KimiRefusalFallback) -> Self {
+        self.model_call_middleware = self.model_call_middleware.with_kimi_refusal(fallback);
+        self
+    }
+
     /// Replaces the default Responses configuration or service stack.
     #[must_use]
     pub fn responses<T>(self, responses: Responses<T>) -> NanocodexBuilder<T> {
@@ -696,6 +712,7 @@ impl<S> NanocodexBuilder<S> {
             prompt_cache: self.prompt_cache,
             codex: self.codex,
             resume: self.resume,
+            model_call_middleware: self.model_call_middleware,
             responses,
         }
     }
@@ -716,6 +733,7 @@ impl NanocodexBuilder<StandardResponses> {
             self.session_id.as_deref(),
             self.prompt_cache.key.as_deref(),
             self.codex.rollout.as_ref(),
+            &self.model_call_middleware,
         )?;
         let config = Arc::new(self.config);
         #[cfg(not(target_family = "wasm"))]
@@ -747,6 +765,7 @@ impl NanocodexBuilder<StandardResponses> {
             self.prompt_cache,
             self.codex,
             self.resume,
+            self.model_call_middleware,
             service_factory,
         )
     }
@@ -774,6 +793,7 @@ where
             self.session_id.as_deref(),
             self.prompt_cache.key.as_deref(),
             self.codex.rollout.as_ref(),
+            &self.model_call_middleware,
         )?;
         let config = Arc::new(self.config);
         let layers = self.responses.service.0;
@@ -805,6 +825,7 @@ where
             self.prompt_cache,
             self.codex,
             self.resume,
+            self.model_call_middleware,
             service_factory,
         )
     }
@@ -832,6 +853,7 @@ where
             self.session_id.as_deref(),
             self.prompt_cache.key.as_deref(),
             self.codex.rollout.as_ref(),
+            &self.model_call_middleware,
         )?;
         let config = Arc::new(self.config);
         let service_factory: ServiceFactory<S> = Arc::new(self.responses.service.0);
@@ -843,6 +865,7 @@ where
             self.prompt_cache,
             self.codex,
             self.resume,
+            self.model_call_middleware,
             service_factory,
         )
     }
@@ -872,6 +895,7 @@ struct BranchSpawner<S> {
     codex_home: Option<PathBuf>,
     depth: u32,
     rollout: Option<RolloutConfig>,
+    model_call_middleware: ModelCallMiddlewareConfig,
     service_factory: ServiceFactory<S>,
 }
 
@@ -893,6 +917,7 @@ impl<S> Clone for BranchSpawner<S> {
             codex_home: self.codex_home.clone(),
             depth: self.depth,
             rollout: self.rollout.clone(),
+            model_call_middleware: self.model_call_middleware.clone(),
             service_factory: Arc::clone(&self.service_factory),
         }
     }
@@ -936,6 +961,7 @@ where
                 Arc::clone(&self.transport_stats),
                 self.tools.clone(),
                 prompt_cache.clone(),
+                self.spawner.model_call_middleware.clone(),
                 initial,
             )
         } else {
@@ -947,6 +973,7 @@ where
                 self.tools.clone(),
                 prompt_cache.clone(),
                 self.global_instructions.clone(),
+                self.spawner.model_call_middleware.clone(),
             )
         };
         let mut turn_index = 0_u64;
@@ -1258,6 +1285,7 @@ where
                         Arc::clone(&self.transport_stats),
                         self.tools.clone(),
                         prompt_cache.clone(),
+                        self.spawner.model_call_middleware.clone(),
                         prepared,
                     );
                     (Err(NanocodexError::TurnCancelled), true)
@@ -1482,6 +1510,7 @@ where
             codex_home: self.codex_home.clone(),
             depth,
             rollout: self.rollout.clone(),
+            model_call_middleware: self.model_call_middleware.clone(),
             service_factory: Arc::clone(&self.service_factory),
         };
         let service = (self.service_factory)();
@@ -1511,6 +1540,7 @@ fn build_agent<S>(
     prompt_cache: PromptCacheConfig,
     codex: CodexCompatibility,
     resume: Option<SessionSnapshot>,
+    model_call_middleware: ModelCallMiddlewareConfig,
     service_factory: ServiceFactory<S>,
 ) -> Result<(Nanocodex, AgentEvents)>
 where
@@ -1599,6 +1629,7 @@ where
             codex_home: codex.home,
             depth: 0,
             rollout: codex.rollout,
+            model_call_middleware,
             service_factory,
         },
         session_id,
@@ -1753,6 +1784,7 @@ fn validate(
     session_id: Option<&str>,
     prompt_cache_key: Option<&str>,
     rollout: Option<&RolloutConfig>,
+    model_call_middleware: &ModelCallMiddlewareConfig,
 ) -> Result<()> {
     config
         .auth
@@ -1802,6 +1834,7 @@ fn validate(
             "session_id must be a UUID when Codex rollout recording is enabled".to_owned(),
         ));
     }
+    model_call_middleware.validate()?;
     Ok(())
 }
 
@@ -2103,6 +2136,22 @@ mod tests {
             panic!("empty prompt cache key unexpectedly built");
         };
         assert!(error.to_string().contains("prompt_cache_key"));
+    }
+
+    #[tokio::test]
+    async fn rejects_an_invalid_kimi_refusal_fallback() {
+        let responses = Responses::builder().service(|| NeverCalled).build();
+        let outcome = Nanocodex::builder("test")
+            .kimi_refusal_fallback(
+                KimiRefusalFallback::new("test-kimi-key").max_lease_generations(0),
+            )
+            .responses(responses)
+            .build();
+
+        let Err(error) = outcome else {
+            panic!("zero-length Kimi lease unexpectedly built");
+        };
+        assert!(error.to_string().contains("at least one generation"));
     }
 
     #[tokio::test]

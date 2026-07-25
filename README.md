@@ -235,6 +235,51 @@ complete generation with the shared provider cache key. The cache key is
 inherited by forks and clean spawned agents. Without an explicit key, every
 clean root or spawned agent retains its own cache identity.
 
+### Structured refusal fallback
+
+Applications may explicitly configure Kimi K3 as a narrow escape hatch for a
+primary Responses generation rejected with the structured error code
+`cyber_policy`:
+
+```rust
+use nanocodex::{KimiRefusalFallback, Nanocodex};
+
+let fallback = KimiRefusalFallback::new(kimi_api_key)
+    .reasoning_effort("high")
+    .max_lease_generations(16);
+
+let (agent, _events) = Nanocodex::builder(openai_auth)
+    .kimi_refusal_fallback(fallback)
+    .build()?;
+```
+
+The fallback is disabled by default and does not create a provider abstraction.
+It is isolated behind the internal model-call middleware, so the agent
+lifecycle only observes whether a generation retained a primary checkpoint.
+After each refusal, Kimi receives an exponentially growing lease of `1, 2, 4,
+...` successful generations. Nanocodex probes the primary model only when that
+lease expires, rather than after every tool generation. Kimi tool calls use the
+same owned Code Mode runtime, and Kimi may complete the turn; a following turn
+always starts on the primary model. The last valid primary response checkpoint
+is retained while Kimi works, Kimi response IDs are never sent to the Responses
+API, and a Kimi final answer makes the next primary request replay complete
+typed history.
+
+The bundled CLI enables this policy when `KIMI_API_KEY` is present, including
+when loaded from `.env`. `--kimi-api-base-url` and
+`--kimi-max-lease-generations` expose the corresponding explicit overrides.
+Every provider attempt emits its actual model in `model.call.*` events, and
+route transitions emit `model.route.changed`.
+
+The ignored paid E2E gate exercises a production Sol `cyber_policy` rejection
+through a production Kimi K3 completion. It requires a working Codex login in
+`NANOCODEX_AUTH_FILE`, `$CODEX_HOME/auth.json`, or `~/.codex/auth.json`, plus an
+exported `KIMI_API_KEY`:
+
+```bash
+cargo test -p nanocodex --test kimi_refusal_e2e -- --ignored
+```
+
 ### Lifecycle and dataflow
 
 ```text

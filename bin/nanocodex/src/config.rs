@@ -6,9 +6,9 @@ use std::{
 use clap::{ArgAction, Args, builder::NonEmptyStringValueParser};
 use eyre::{Result, WrapErr, eyre};
 use nanocodex::{
-    AgentEvents, DurableSession, McpHandle, Nanocodex, OpenAiAuth, OpenAiAuthMode, ReasoningMode,
-    Responses, ResponsesHistory, ResponsesTransport, RolloutConfig, SessionSnapshot, Thinking,
-    Tools,
+    AgentEvents, DurableSession, KIMI_FALLBACK_MAX_LEASE_GENERATIONS, KimiRefusalFallback,
+    McpHandle, Nanocodex, OpenAiAuth, OpenAiAuthMode, ReasoningMode, Responses, ResponsesHistory,
+    ResponsesTransport, RolloutConfig, SessionSnapshot, Thinking, Tools,
 };
 
 use crate::mcp::{ConfiguredMcp, McpArgs};
@@ -39,6 +39,30 @@ pub(crate) struct AgentArgs {
     /// Explicit `OpenAI` API key override.
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
     api_key: Option<String>,
+
+    /// Enable structured `cyber_policy` fallback with this Kimi API key.
+    #[arg(
+        long,
+        env = "KIMI_API_KEY",
+        value_parser = NonEmptyStringValueParser::new()
+    )]
+    kimi_api_key: Option<String>,
+
+    /// Override the Kimi API base URL.
+    #[arg(
+        long,
+        env = "KIMI_API_BASE_URL",
+        value_parser = NonEmptyStringValueParser::new()
+    )]
+    kimi_api_base_url: Option<String>,
+
+    /// Cap the exponentially growing Kimi generation lease.
+    #[arg(
+        long,
+        env = "NANOCODEX_KIMI_MAX_LEASE_GENERATIONS",
+        default_value_t = KIMI_FALLBACK_MAX_LEASE_GENERATIONS
+    )]
+    kimi_max_lease_generations: u32,
 
     /// Explicitly use `ChatGPT` authorization from this credential file.
     #[arg(long, env = "NANOCODEX_AUTH_FILE")]
@@ -159,6 +183,14 @@ impl AgentArgs {
     async fn build_inner(self, durable: Option<DurableSession>) -> Result<ConfiguredAgent> {
         let codex_home = default_codex_home()?;
         let responses_transport = self.responses_transport();
+        let kimi_refusal_fallback = self.kimi_api_key.map(|api_key| {
+            let mut fallback = KimiRefusalFallback::new(api_key)
+                .max_lease_generations(self.kimi_max_lease_generations);
+            if let Some(api_base_url) = self.kimi_api_base_url {
+                fallback = fallback.api_base_url(api_base_url);
+            }
+            fallback
+        });
         let session = prepare_session_build(self.cwd, self.rollouts, &codex_home, durable)?;
         let mpp_enabled = self.mpp.is_enabled();
         if mpp_enabled && !matches!(responses_transport, ResponsesTransport::Https) {
@@ -217,6 +249,9 @@ impl AgentArgs {
             .workspace(session.workspace)
             .codex_home(codex_home)
             .responses(responses);
+        if let Some(fallback) = kimi_refusal_fallback {
+            builder = builder.kimi_refusal_fallback(fallback);
+        }
         if let Some(session_id) = session.session_id {
             builder = builder.session_id(session_id);
         }
@@ -388,7 +423,10 @@ mod tests {
     use clap::CommandFactory;
     use nanocodex::OpenAiAuthMode;
 
-    use super::{direct_websocket_url, select_auth, select_auth_with_default};
+    use super::{
+        KIMI_FALLBACK_MAX_LEASE_GENERATIONS, direct_websocket_url, select_auth,
+        select_auth_with_default,
+    };
 
     #[test]
     fn default_websocket_url_follows_the_selected_auth_mode() {
@@ -455,6 +493,23 @@ mod tests {
             .expect("the CLI should expose the rollouts argument");
 
         assert_eq!(rollouts.get_default_values(), ["true"]);
+    }
+
+    #[test]
+    fn kimi_refusal_fallback_is_key_gated_and_bounded() {
+        let command = crate::Cli::command();
+        let api_key = command
+            .get_arguments()
+            .find(|argument| argument.get_id() == "kimi_api_key")
+            .expect("the CLI should expose the Kimi API key argument");
+        assert!(api_key.get_default_values().is_empty());
+
+        let maximum = command
+            .get_arguments()
+            .find(|argument| argument.get_id() == "kimi_max_lease_generations")
+            .expect("the CLI should expose the Kimi lease cap");
+        assert_eq!(KIMI_FALLBACK_MAX_LEASE_GENERATIONS, 16);
+        assert_eq!(maximum.get_default_values(), ["16"]);
     }
 
     #[test]

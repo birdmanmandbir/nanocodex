@@ -431,6 +431,7 @@ impl Conversation {
             | AgentEventKind::ModelCallStarted
             | AgentEventKind::ModelCallCompleted
             | AgentEventKind::ModelCallFailed
+            | AgentEventKind::ModelRouteChanged
             | AgentEventKind::ModelCompactionStarted
             | AgentEventKind::ModelCompactionCompleted
             | AgentEventKind::ModelCompactionFailed

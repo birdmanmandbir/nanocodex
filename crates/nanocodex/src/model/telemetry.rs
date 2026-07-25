@@ -11,8 +11,9 @@ use web_time::Instant;
 #[cfg(not(target_family = "wasm"))]
 use crate::NanocodexError;
 use crate::Result;
-use nanocodex_service::TransportStatsDelta;
+use nanocodex_service::{ResponsesAttempt, TransportStatsDelta};
 use nanocodex_tools::ToolOutputBody;
+use tracing::info;
 
 const COST_STATUS: &str = "not_reported_by_responses_api";
 
@@ -20,8 +21,8 @@ const COST_STATUS: &str = "not_reported_by_responses_api";
 pub(super) struct ModelCallStarted<'a> {
     pub(super) call_index: u32,
     pub(super) model: &'a str,
-    pub(super) reasoning_mode: &'static str,
-    pub(super) effort: &'static str,
+    pub(super) reasoning_mode: &'a str,
+    pub(super) effort: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) previous_response_id: Option<&'a str>,
 }
@@ -72,6 +73,16 @@ pub(super) struct ModelCallFailed<'a> {
     pub(super) model: &'a str,
     pub(super) duration_ns: u64,
     pub(super) error: &'a str,
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[derive(Serialize)]
+pub(super) struct ModelRouteChanged<'a> {
+    pub(super) after_model_call_index: u32,
+    pub(super) from_model: &'a str,
+    pub(super) to_model: &'a str,
+    pub(super) reason: &'static str,
+    pub(super) lease_generations: u32,
 }
 
 #[derive(Serialize)]
@@ -164,6 +175,8 @@ impl UsageTotals {
 #[derive(Default, Serialize)]
 pub(super) struct RunStats {
     pub(super) model_calls: u32,
+    pub(super) safety_refusals: u32,
+    pub(super) fallback_model_calls: u32,
     pub(super) steers: u32,
     pub(super) compactions: u32,
     pub(super) tool_calls: u32,
@@ -178,8 +191,10 @@ pub(super) struct RunStats {
     pub(super) tool_work_duration_ns: u64,
     pub(super) tool_wall_duration_ns: u64,
     pub(super) usage: UsageTotals,
+    pub(super) fallback_usage: UsageTotals,
     pub(super) warmup_usage: UsageTotals,
     pub(super) last_response_id: Option<String>,
+    pub(super) last_fallback_response_id: Option<String>,
 }
 
 impl RunStats {
@@ -297,4 +312,53 @@ fn duration_ns(duration: Duration) -> u64 {
 
 pub(super) fn display_endpoint(endpoint: &str) -> &str {
     endpoint.split_once('?').map_or(endpoint, |(base, _)| base)
+}
+
+pub(super) fn trace_model_input(request: &ResponsesAttempt) -> (usize, usize, Option<String>) {
+    let item_count = request.input_item_count();
+    if !trace_content_enabled() {
+        return (item_count, 0, None);
+    }
+    let items = request.input_items().collect::<Vec<_>>();
+    let content = serde_json::to_string(&items).ok();
+    let bytes = content.as_ref().map_or(0, String::len);
+    (item_count, bytes, content)
+}
+
+pub(super) fn trace_content_enabled() -> bool {
+    tracing::enabled!(target: "nanocodex", tracing::Level::INFO)
+}
+
+pub(super) fn serialize_trace_content<T: Serialize + ?Sized>(value: &T) -> Option<String> {
+    trace_content_enabled()
+        .then(|| serde_json::to_string(value).ok())
+        .flatten()
+}
+
+pub(super) fn record_span_content(span: &tracing::Span, kind: &'static str, content: &str) {
+    span.in_scope(|| {
+        info!(
+            target: "nanocodex",
+            content_kind = kind,
+            content,
+            "trace content"
+        );
+    });
+}
+
+pub(super) fn record_indexed_span_content(
+    span: &tracing::Span,
+    kind: &'static str,
+    index: usize,
+    content: &str,
+) {
+    span.in_scope(|| {
+        info!(
+            target: "nanocodex",
+            content_kind = kind,
+            output.index = index,
+            content,
+            "trace content"
+        );
+    });
 }

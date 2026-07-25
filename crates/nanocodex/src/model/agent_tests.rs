@@ -14,8 +14,8 @@ use tokio::{
 use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
 use crate::{
-    AgentHandle, Nanocodex, NanocodexError, OpenAiAuth, Prompt, ResponseItem, ResponseItemId,
-    Responses, ResponsesError, ResponsesHistory, ResponsesTransport, RolloutConfig,
+    AgentHandle, KimiRefusalFallback, Nanocodex, NanocodexError, OpenAiAuth, Prompt, ResponseItem,
+    ResponseItemId, Responses, ResponsesError, ResponsesHistory, ResponsesTransport, RolloutConfig,
     SessionSnapshot, Thinking, Tools,
 };
 
@@ -126,6 +126,349 @@ async fn https_ephemeral_replays_complete_follow_on_history() -> Result<()> {
     timeout(std::time::Duration::from_secs(5), server)
         .await
         .map_err(|_| eyre!("mock HTTPS Responses server did not finish"))???;
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn cyber_policy_uses_one_kimi_generation_then_probes_the_primary_checkpoint() -> Result<()> {
+    let primary_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let primary_endpoint = format!("http://{}", primary_listener.local_addr()?);
+    let kimi_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let kimi_endpoint = format!("http://{}", kimi_listener.local_addr()?);
+
+    let primary_server = tokio::spawn(async move {
+        let first = next_http_json(&primary_listener).await?;
+        assert!(first.body.get("previous_response_id").is_none());
+        assert!(first.body.to_string().contains("establish checkpoint"));
+        send_http_final(first.stream, "resp-primary-1").await?;
+
+        let refused = next_http_json(&primary_listener).await?;
+        assert_eq!(refused.body["previous_response_id"], "resp-primary-1");
+        assert!(refused.body.to_string().contains("trigger fallback"));
+        send_http_cyber_policy_rejection(refused.stream).await?;
+
+        let probe = next_http_json(&primary_listener).await?;
+        assert_eq!(probe.body["previous_response_id"], "resp-primary-1");
+        let probe_body = probe.body.to_string();
+        assert!(probe_body.contains("trigger fallback"));
+        assert!(probe_body.contains("exec_0"));
+        assert!(probe_body.contains("kimi-ok"));
+        send_http_final(probe.stream, "resp-primary-2").await
+    });
+
+    let kimi_server = tokio::spawn(async move {
+        let request = next_http_json(&kimi_listener).await?;
+        assert!(request.headers.starts_with("post /chat/completions "));
+        assert!(
+            request
+                .headers
+                .contains("authorization: bearer test-kimi-key")
+        );
+        assert_eq!(request.body["model"], "kimi-k3");
+        assert_eq!(request.body["reasoning_effort"], "low");
+        assert!(request.body["prompt_cache_key"].is_string());
+        let exec = request.body["tools"]
+            .as_array()
+            .and_then(|tools| tools.iter().find(|tool| tool["function"]["name"] == "exec"))
+            .ok_or_else(|| eyre!("Kimi request omitted the exec function"))?;
+        assert_eq!(exec["function"]["parameters"]["required"][0], "source");
+        let messages = request.body["messages"].to_string();
+        assert!(messages.contains("establish checkpoint"));
+        assert!(messages.contains("trigger fallback"));
+        send_http_json(
+            request.stream,
+            json!({
+                "id": "chatcmpl-kimi-tool",
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "use the existing code-mode runtime",
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "exec_0",
+                            "type": "function",
+                            "function": {
+                                "name": "exec",
+                                "arguments": "{\"source\":\"text(\\\"kimi-ok\\\");\"}"
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {
+                    "prompt_tokens": 20,
+                    "completion_tokens": 5,
+                    "total_tokens": 25,
+                    "cached_tokens": 3,
+                    "completion_tokens_details": {"reasoning_tokens": 2}
+                }
+            }),
+        )
+        .await
+    });
+
+    let workspace = temporary_workspace("kimi-primary-probe")?;
+    let responses = Responses::builder()
+        .transport(ResponsesTransport::Https)
+        .store(true)
+        .api_base_url(primary_endpoint)
+        .build();
+    let fallback = KimiRefusalFallback::new("test-kimi-key")
+        .api_base_url(kimi_endpoint)
+        .reasoning_effort("low");
+    let (agent, events) = Nanocodex::builder("test-openai-key")
+        .thinking(Thinking::Low)
+        .workspace(&workspace)
+        .responses(responses)
+        .kimi_refusal_fallback(fallback)
+        .session_id("kimi-primary-probe")
+        .build()?;
+    let event_task = tokio::spawn(async move {
+        let mut output = Vec::new();
+        events.write_jsonl(&mut output).await?;
+        Ok::<_, eyre::Report>(output)
+    });
+
+    assert_eq!(
+        agent
+            .prompt("establish checkpoint")
+            .await?
+            .result()
+            .await?
+            .final_message,
+        "done"
+    );
+    assert_eq!(
+        agent
+            .prompt("trigger fallback")
+            .await?
+            .result()
+            .await?
+            .final_message,
+        "done"
+    );
+    drop(agent);
+    let output = String::from_utf8(event_task.await??)?;
+    assert!(output.contains("\"type\":\"model.route.changed\""));
+    assert!(output.contains("\"reason\":\"cyber_policy\""));
+    assert!(output.contains("\"lease_generations\":1"));
+    assert!(output.contains("\"reason\":\"lease_expired\""));
+    assert!(output.contains("\"safety_refusals\":1"));
+    assert!(output.contains("\"fallback_model_calls\":1"));
+
+    timeout(std::time::Duration::from_secs(5), primary_server)
+        .await
+        .map_err(|_| eyre!("mock primary Responses server did not finish"))???;
+    timeout(std::time::Duration::from_secs(5), kimi_server)
+        .await
+        .map_err(|_| eyre!("mock Kimi server did not finish"))???;
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn repeated_refusals_back_off_and_a_kimi_final_forces_next_turn_full_replay() -> Result<()> {
+    let primary_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let primary_endpoint = format!("http://{}", primary_listener.local_addr()?);
+    let kimi_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let kimi_endpoint = format!("http://{}", kimi_listener.local_addr()?);
+
+    let primary_server = tokio::spawn(async move {
+        let first_refusal = next_http_json(&primary_listener).await?;
+        assert!(first_refusal.body.get("previous_response_id").is_none());
+        send_http_cyber_policy(first_refusal.stream).await?;
+
+        let second_refusal = next_http_json(&primary_listener).await?;
+        assert!(second_refusal.body.get("previous_response_id").is_none());
+        assert!(second_refusal.body.to_string().contains("lease-one"));
+        send_http_cyber_policy(second_refusal.stream).await?;
+
+        // The second lease is two Kimi generations, so no primary request may
+        // occur between the next Kimi tool call and Kimi's final answer.
+        let follow_on = next_http_json(&primary_listener).await?;
+        assert!(follow_on.body.get("previous_response_id").is_none());
+        let replay = follow_on.body.to_string();
+        assert!(replay.contains("back off twice"));
+        assert!(replay.contains("lease-one"));
+        assert!(replay.contains("lease-two"));
+        assert!(replay.contains("Kimi got us over the hump."));
+        assert!(replay.contains("follow on with Sol"));
+        send_http_final(follow_on.stream, "resp-follow-on").await
+    });
+
+    let kimi_server = tokio::spawn(async move {
+        let lease_one = next_http_json(&kimi_listener).await?;
+        send_http_json(
+            lease_one.stream,
+            kimi_tool_response(
+                "chatcmpl-lease-one",
+                "exec_lease_one",
+                "lease one reasoning",
+                "text(\"lease-one\");",
+            ),
+        )
+        .await?;
+
+        let lease_two_first = next_http_json(&kimi_listener).await?;
+        let messages = lease_two_first.body["messages"].to_string();
+        assert!(messages.contains("lease one reasoning"));
+        assert!(messages.contains("lease-one"));
+        send_http_json(
+            lease_two_first.stream,
+            kimi_tool_response(
+                "chatcmpl-lease-two-tool",
+                "exec_lease_two",
+                "lease two reasoning",
+                "text(\"lease-two\");",
+            ),
+        )
+        .await?;
+
+        let lease_two_second = next_http_json(&kimi_listener).await?;
+        let messages = lease_two_second.body["messages"].to_string();
+        assert!(messages.contains("lease one reasoning"));
+        assert!(messages.contains("lease two reasoning"));
+        assert!(messages.contains("lease-two"));
+        send_http_json(
+            lease_two_second.stream,
+            json!({
+                "id": "chatcmpl-kimi-final",
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "Kimi got us over the hump.",
+                        "reasoning_content": "the work is complete",
+                        "tool_calls": []
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 24,
+                    "completion_tokens": 6,
+                    "total_tokens": 30
+                }
+            }),
+        )
+        .await
+    });
+
+    let workspace = temporary_workspace("kimi-backoff-final")?;
+    let responses = Responses::builder()
+        .transport(ResponsesTransport::Https)
+        .store(true)
+        .api_base_url(primary_endpoint)
+        .build();
+    let fallback = KimiRefusalFallback::new("test-kimi-key")
+        .api_base_url(kimi_endpoint)
+        .reasoning_effort("low")
+        .max_lease_generations(4);
+    let (agent, events) = Nanocodex::builder("test-openai-key")
+        .thinking(Thinking::Low)
+        .workspace(&workspace)
+        .responses(responses)
+        .kimi_refusal_fallback(fallback)
+        .session_id("kimi-backoff-final")
+        .build()?;
+    let event_task = tokio::spawn(async move {
+        let mut output = Vec::new();
+        events.write_jsonl(&mut output).await?;
+        Ok::<_, eyre::Report>(output)
+    });
+
+    assert_eq!(
+        agent
+            .prompt("back off twice")
+            .await?
+            .result()
+            .await?
+            .final_message,
+        "Kimi got us over the hump."
+    );
+    assert_eq!(
+        agent
+            .prompt("follow on with Sol")
+            .await?
+            .result()
+            .await?
+            .final_message,
+        "done"
+    );
+    drop(agent);
+    let output = String::from_utf8(event_task.await??)?;
+    assert!(output.contains("\"lease_generations\":1"));
+    assert!(output.contains("\"lease_generations\":2"));
+    assert!(output.contains("\"fallback_model_calls\":3"));
+    assert!(output.contains("\"safety_refusals\":2"));
+
+    timeout(std::time::Duration::from_secs(5), primary_server)
+        .await
+        .map_err(|_| eyre!("mock primary Responses server did not finish"))???;
+    timeout(std::time::Duration::from_secs(5), kimi_server)
+        .await
+        .map_err(|_| eyre!("mock Kimi server did not finish"))???;
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires KIMI_API_KEY and paid Kimi K3 access"]
+async fn live_kimi_k3_refusal_fallback_smoke() -> Result<()> {
+    let kimi_api_key =
+        std::env::var("KIMI_API_KEY").map_err(|_| eyre!("KIMI_API_KEY is not configured"))?;
+    let primary_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let primary_endpoint = format!("http://{}", primary_listener.local_addr()?);
+    let primary_server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let refused = next_http_json(&primary_listener).await?;
+            send_http_cyber_policy(refused.stream).await?;
+        }
+        Ok::<_, eyre::Report>(())
+    });
+    let workspace = temporary_workspace("live-kimi-k3")?;
+    let responses = Responses::builder()
+        .transport(ResponsesTransport::Https)
+        .store(false)
+        .api_base_url(primary_endpoint)
+        .build();
+    let fallback = KimiRefusalFallback::new(kimi_api_key)
+        .reasoning_effort("low")
+        .max_lease_generations(2)
+        .request_timeout(std::time::Duration::from_mins(1));
+    let (agent, events) = Nanocodex::builder("test-openai-key")
+        .thinking(Thinking::Low)
+        .workspace(&workspace)
+        .responses(responses)
+        .kimi_refusal_fallback(fallback)
+        .session_id("live-kimi-k3")
+        .build()?;
+    let event_task = tokio::spawn(async move {
+        let mut output = Vec::new();
+        events.write_jsonl(&mut output).await?;
+        Ok::<_, eyre::Report>(output)
+    });
+
+    let result = agent
+        .prompt(
+            "Call exec exactly once with source `text(\"KIMI_TOOL_OK\");`. \
+             After its result, reply with exactly KIMI_FALLBACK_OK and no other text.",
+        )
+        .await?
+        .result()
+        .await?;
+    assert_eq!(result.final_message.trim(), "KIMI_FALLBACK_OK");
+    drop(agent);
+    let output = String::from_utf8(event_task.await??)?;
+    assert!(output.contains("\"model\":\"kimi-k3\""));
+    assert!(output.contains("\"type\":\"model.route.changed\""));
+    assert!(output.contains("KIMI_TOOL_OK"));
+    assert!(output.contains("\"lease_generations\":2"));
+    timeout(std::time::Duration::from_secs(5), primary_server)
+        .await
+        .map_err(|_| eyre!("mock primary Responses server did not finish"))???;
     std::fs::remove_dir_all(workspace)?;
     Ok(())
 }
@@ -3233,6 +3576,82 @@ async fn send_http_final(mut stream: TcpStream, response_id: &str) -> Result<()>
     stream.write_all(response.as_bytes()).await?;
     stream.shutdown().await?;
     Ok(())
+}
+
+async fn send_http_cyber_policy(mut stream: TcpStream) -> Result<()> {
+    let event = json!({
+        "type": "error",
+        "error": {
+            "code": "cyber_policy",
+            "message": "request blocked by cyber safety policy"
+        }
+    });
+    let body = format!("data: {event}\n\n");
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.shutdown().await?;
+    Ok(())
+}
+
+async fn send_http_cyber_policy_rejection(mut stream: TcpStream) -> Result<()> {
+    let body = json!({
+        "error": {
+            "type": "invalid_request_error",
+            "code": "cyber_policy",
+            "message": "request blocked by cyber safety policy"
+        }
+    })
+    .to_string();
+    let response = format!(
+        "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.shutdown().await?;
+    Ok(())
+}
+
+async fn send_http_json(mut stream: TcpStream, body: Value) -> Result<()> {
+    let body = body.to_string();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.shutdown().await?;
+    Ok(())
+}
+
+fn kimi_tool_response(response_id: &str, call_id: &str, reasoning: &str, source: &str) -> Value {
+    json!({
+        "id": response_id,
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": reasoning,
+                "tool_calls": [{
+                    "index": 0,
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "exec",
+                        "arguments": json!({"source": source}).to_string()
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": {
+            "prompt_tokens": 20,
+            "completion_tokens": 5,
+            "total_tokens": 25,
+            "completion_tokens_details": {"reasoning_tokens": 2}
+        }
+    })
 }
 
 async fn next_json<S>(socket: &mut WebSocketStream<S>) -> Result<Value>

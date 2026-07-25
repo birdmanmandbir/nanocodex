@@ -6,22 +6,25 @@ use nanocodex_core::{
 };
 use nanocodex_service::{
     CodeCall, CodeCallKind, ResponsesAttempt, ResponsesAttemptFactory, ResponsesClient,
-    ResponsesOutput, ResponsesServiceResponse, TransportStats, TurnResult,
+    ResponsesOutput, ResponsesServiceResponse, TransportStats,
 };
-use serde::Serialize;
 use serde_json::value::RawValue;
 use tokio::sync::watch;
 use tower::Service;
 use tracing::{Instrument, info, info_span};
 use web_time::Instant;
 
+use super::call_middleware::{
+    ModelCallContext, ModelCallMiddleware, ModelCallMiddlewareConfig, ModelCallOutput,
+};
 use super::context_manager::{
     assign_missing_response_item_id, assign_missing_response_item_ids, has_well_formed_tool_calls,
 };
+use super::{AgentSend, record_span_content};
 use super::{
-    CompactionCompleted, CompactionFailed, CompactionStarted, ModelCallCompleted, ModelCallFailed,
-    ModelCallStarted, RunError, RunStarted, RunStats, RunSteered, ToolCallArguments, ToolCallEvent,
-    ToolResultEvent, WarmupCompleted, WarmupFailed, WarmupStarted,
+    CompactionCompleted, CompactionFailed, CompactionStarted, RunError, RunStarted, RunStats,
+    RunSteered, ToolCallArguments, ToolCallEvent, ToolResultEvent, WarmupCompleted, WarmupFailed,
+    WarmupStarted,
     agents_md::load_instructions,
     compaction,
     context_manager::ContextManager,
@@ -30,7 +33,8 @@ use super::{
         custom_tool_notification, custom_tool_output, developer_context, function_tool_output,
         task_context, task_input, turn_aborted,
     },
-    resolve_workspace, terminal_payload,
+    resolve_workspace, serialize_trace_content, terminal_payload, trace_content_enabled,
+    trace_model_input,
 };
 use crate::{NanocodexError, Result, prompt_cache::ModelPromptCache};
 use nanocodex_tools::{
@@ -44,11 +48,10 @@ pub(crate) struct ModelRun<S> {
     config: Arc<ModelConfig>,
     thinking: Thinking,
     fast_mode: bool,
-    client: ResponsesClient<S>,
+    model_calls: ModelCallMiddleware<S>,
     transport_stats: Arc<TransportStats>,
     started_at: Instant,
     stats: RunStats,
-    server_reasoning_included: bool,
     session: Option<ModelSessionState>,
     active_tools: Option<ToolRuntimeControl>,
     active_tool_call: Option<ActiveToolCall>,
@@ -132,22 +135,13 @@ impl ModelCheckpoint {
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
-pub(crate) trait AgentSend: Send {}
-#[cfg(not(target_family = "wasm"))]
-impl<T: Send> AgentSend for T {}
-
-#[cfg(target_family = "wasm")]
-pub(crate) trait AgentSend {}
-#[cfg(target_family = "wasm")]
-impl<T> AgentSend for T {}
-
 struct ModelSessionState {
     workspace: String,
     tools: ToolRuntime,
     factory: ResponsesAttemptFactory,
     conversation: ConversationState,
     preserve_inherited_delta: bool,
+    completed_without_primary_checkpoint: bool,
 }
 
 impl ModelSessionState {
@@ -295,7 +289,7 @@ enum ModelTaskOutcome {
 }
 
 #[derive(Clone)]
-struct ConversationState {
+pub(super) struct ConversationState {
     canonical_context: Arc<ResponseItem>,
     context: ContextManager,
     delta_start: usize,
@@ -383,6 +377,7 @@ impl ConversationState {
         self.context.prompt_items()
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn shared_history(&self) -> nanocodex_core::responses::ResponseHistory {
         self.context.shared_items()
     }
@@ -424,9 +419,43 @@ impl ConversationState {
         self.reset_for_full_request();
         self.context.commit_tail();
     }
+
+    fn commit_without_primary_checkpoint(&mut self) {
+        self.reset_for_full_request();
+        self.context.commit_tail();
+    }
+}
+
+impl ModelCallContext for ConversationState {
+    fn previous_response_id(&self) -> Option<&str> {
+        self.previous_response_id.as_deref()
+    }
+
+    fn prompt_history(&self) -> nanocodex_core::responses::ResponseHistory {
+        self.context.prompt_items()
+    }
+
+    fn shared_history(&self) -> nanocodex_core::responses::ResponseHistory {
+        self.context.shared_items()
+    }
+
+    fn delta_start(&self) -> usize {
+        self.delta_start
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn flattened_history(&self) -> Vec<ResponseItem> {
+        self.context.flattened_items()
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn history_revision(&self) -> u64 {
+        self.history_revision
+    }
 }
 
 impl<S> ModelRun<S> {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         events: EventSink,
         config: Arc<ModelConfig>,
@@ -435,19 +464,25 @@ impl<S> ModelRun<S> {
         tools: Tools,
         prompt_cache: ModelPromptCache,
         global_instructions: Option<Arc<str>>,
+        model_call_middleware: ModelCallMiddlewareConfig,
     ) -> Self {
         let thinking = config.thinking;
         let fast_mode = config.fast_mode;
+        let model_calls = ModelCallMiddleware::new(
+            events.clone(),
+            Arc::clone(&config),
+            client,
+            model_call_middleware,
+        );
         Self {
             events,
             config,
             thinking,
             fast_mode,
-            client,
+            model_calls,
             transport_stats,
             started_at: Instant::now(),
             stats: RunStats::default(),
-            server_reasoning_included: false,
             session: None,
             active_tools: None,
             active_tool_call: None,
@@ -458,6 +493,7 @@ impl<S> ModelRun<S> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_checkpoint(
         events: EventSink,
         config: Arc<ModelConfig>,
@@ -465,6 +501,7 @@ impl<S> ModelRun<S> {
         transport_stats: Arc<TransportStats>,
         tools: Tools,
         prompt_cache: ModelPromptCache,
+        model_call_middleware: ModelCallMiddlewareConfig,
         prepared: PreparedCheckpoint,
     ) -> Self {
         let PreparedCheckpoint {
@@ -483,22 +520,28 @@ impl<S> ModelRun<S> {
         );
         let thinking = config.thinking;
         let fast_mode = config.fast_mode;
+        let model_calls = ModelCallMiddleware::new(
+            events.clone(),
+            Arc::clone(&config),
+            client,
+            model_call_middleware,
+        );
         Self {
             events,
             config,
             thinking,
             fast_mode,
-            client,
+            model_calls,
             transport_stats,
             started_at: Instant::now(),
             stats: RunStats::default(),
-            server_reasoning_included: false,
             session: Some(ModelSessionState {
                 workspace: checkpoint.workspace,
                 tools: runtime,
                 factory,
                 conversation: checkpoint.conversation,
                 preserve_inherited_delta: checkpoint.preserve_inherited_delta,
+                completed_without_primary_checkpoint: false,
             }),
             active_tools: Some(active_tools),
             active_tool_call: None,
@@ -859,6 +902,7 @@ where
                 factory,
                 conversation,
                 preserve_inherited_delta: false,
+                completed_without_primary_checkpoint: false,
             };
             Self::publish_fork_snapshot(
                 &mut session,
@@ -918,7 +962,12 @@ where
             .ok_or(NanocodexError::InvalidAttemptState {
                 detail: "completed turn did not have a model session",
             })?;
-        session.conversation.commit()?;
+        if session.completed_without_primary_checkpoint {
+            session.conversation.commit_without_primary_checkpoint();
+            session.completed_without_primary_checkpoint = false;
+        } else {
+            session.conversation.commit()?;
+        }
         Ok(ModelCheckpoint {
             workspace: session.workspace.clone(),
             conversation: session.conversation.clone(),
@@ -965,6 +1014,7 @@ where
         session.conversation.append(aborted_output);
         session.conversation.append([turn_aborted()]);
         session.conversation.commit_interrupted();
+        session.completed_without_primary_checkpoint = false;
         Ok(ModelCheckpoint {
             workspace: session.workspace.clone(),
             conversation: session.conversation.clone(),
@@ -991,6 +1041,7 @@ where
         }));
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn drive_session(
         &mut self,
         session: &mut ModelSessionState,
@@ -1000,20 +1051,36 @@ where
         // Match Codex's ordering: always sample the turn's initial prompt once
         // before injecting input that arrived while that first request ran.
         let mut can_drain_steers = false;
+        let mut model_call_turn = self.model_calls.begin_turn();
         loop {
             if can_drain_steers {
                 self.drain_steers(&mut session.conversation, &mut steers)
                     .await?;
             }
             Self::publish_fork_snapshot(session, fork_snapshots, self.global_instructions.as_ref());
-            let call_index = self.stats.model_calls + 1;
-            let response = self
-                .perform_model_call(call_index, &session.conversation, &session.factory)
+            let model_call = self
+                .model_calls
+                .generate(
+                    &session.conversation,
+                    &session.factory,
+                    self.thinking,
+                    self.fast_mode,
+                    &mut self.stats,
+                    &mut model_call_turn,
+                )
                 .await?;
+            let has_primary_checkpoint = model_call.has_primary_checkpoint();
+            let ModelCallOutput {
+                call_index,
+                response,
+                ..
+            } = model_call;
             session
                 .conversation
                 .update_token_info(response.usage.as_ref());
-            session.conversation.previous_response_id = Some(response.id.clone());
+            if has_primary_checkpoint {
+                session.conversation.previous_response_id = Some(response.id.clone());
+            }
             let end_turn = response.end_turn;
             let final_message = response.final_message;
             let code_calls = response.code_calls;
@@ -1022,7 +1089,9 @@ where
 
             if code_calls.is_empty() {
                 if end_turn == Some(false) {
-                    session.conversation.clear_delta();
+                    if has_primary_checkpoint {
+                        session.conversation.clear_delta();
+                    }
                     self.maybe_compact(
                         call_index,
                         &mut session.conversation,
@@ -1037,7 +1106,9 @@ where
                 if !steers.is_empty() {
                     // The completed response is retained by previous_response_id;
                     // the next delta contains only newly drained steer messages.
-                    session.conversation.clear_delta();
+                    if has_primary_checkpoint {
+                        session.conversation.clear_delta();
+                    }
                     self.maybe_compact(
                         call_index,
                         &mut session.conversation,
@@ -1050,6 +1121,14 @@ where
                     continue;
                 }
                 if let Some(message) = final_message {
+                    if self.model_calls.finish_turn(
+                        call_index,
+                        has_primary_checkpoint,
+                        &model_call_turn,
+                    )? {
+                        session.conversation.reset_for_full_request();
+                        session.completed_without_primary_checkpoint = true;
+                    }
                     return Ok(if message.trim().is_empty() {
                         "The model completed without emitting assistant text.".to_owned()
                     } else {
@@ -1061,7 +1140,9 @@ where
                 });
             }
 
-            session.conversation.clear_delta();
+            if has_primary_checkpoint {
+                session.conversation.clear_delta();
+            }
             for call in code_calls {
                 let history = (call.name == "exec")
                     .then(|| Arc::new(session.conversation.flattened_history()));
@@ -1247,7 +1328,7 @@ where
             return Ok(false);
         };
         let active_context_tokens =
-            conversation.active_context_tokens(self.server_reasoning_included);
+            conversation.active_context_tokens(self.model_calls.server_reasoning_included());
         if active_context_tokens < auto_compact_token_limit {
             return Ok(false);
         }
@@ -1335,7 +1416,8 @@ where
         let duration_ns = elapsed_ns(started_at);
         let (response_id, source, attempt, connection_generation, usage) =
             if let Some(execution) = execution {
-                self.server_reasoning_included |= execution.server_reasoning_included;
+                self.model_calls
+                    .include_server_reasoning(execution.server_reasoning_included);
                 if let Some(usage) = &execution.usage {
                     self.stats.warmup_usage.add(usage);
                 }
@@ -1375,8 +1457,8 @@ where
         span: &tracing::Span,
     ) -> Result<WarmupExecution> {
         let success = self
-            .client
-            .execute(factory.warmup(self.thinking, self.fast_mode))
+            .model_calls
+            .execute_primary(factory.warmup(self.thinking, self.fast_mode))
             .instrument(span.clone())
             .await
             .map_err(Into::into)?;
@@ -1411,105 +1493,6 @@ where
             },
         )?;
         Err(error)
-    }
-
-    async fn perform_model_call(
-        &mut self,
-        call_index: u32,
-        conversation: &ConversationState,
-        factory: &ResponsesAttemptFactory,
-    ) -> Result<TurnResult> {
-        let previous_response_id = conversation.previous_response_id.as_deref();
-        let started_at = Instant::now();
-        self.stats.model_calls += 1;
-        self.events.emit(
-            AgentEventKind::ModelCallStarted,
-            ModelCallStarted {
-                call_index,
-                model: MODEL,
-                reasoning_mode: self.config.reasoning_mode.as_str(),
-                effort: self.thinking.as_str(),
-                previous_response_id,
-            },
-        )?;
-        let request = factory.generation(
-            call_index,
-            conversation.prompt_history(),
-            conversation.shared_history(),
-            conversation.delta_start,
-            previous_response_id,
-            self.thinking,
-            self.fast_mode,
-        );
-        let (input_item_count, input_bytes, input_content) = trace_model_input(&request);
-        let span = model_call_span(
-            call_index,
-            self.config.reasoning_mode.as_str(),
-            self.thinking.as_str(),
-            previous_response_id.is_some(),
-            input_item_count,
-            input_bytes,
-        );
-        if let Some(input_content) = &input_content {
-            record_span_content(&span, "model.input", input_content);
-        }
-        let success = match self.client.execute(request).instrument(span.clone()).await {
-            Ok(success) => success,
-            Err(error) => {
-                span.record("status", "failed");
-                span.record("otel.status_code", "ERROR");
-                span.record("duration_ns", elapsed_ns(started_at));
-                return self.model_call_failed(call_index, started_at, error.into());
-            }
-        };
-        let attempt = success.attempt();
-        let connection_generation = success.connection_generation();
-        self.server_reasoning_included |= success.server_reasoning_included();
-        let ResponsesOutput::Generation(response) = success.into_output() else {
-            span.record("status", "failed");
-            span.record("otel.status_code", "ERROR");
-            return Err(NanocodexError::InvalidAttemptState {
-                detail: "generation returned a non-generation response",
-            });
-        };
-        let duration_ns = elapsed_ns(started_at);
-        record_model_response(&span, &response);
-        span.record("status", "completed");
-        span.record("otel.status_code", "OK");
-        span.record("duration_ns", duration_ns);
-        if let Some(usage) = &response.usage {
-            span.record("input_tokens", usage.input_tokens);
-            span.record(
-                "cached_input_tokens",
-                usage
-                    .input_tokens_details
-                    .as_ref()
-                    .map_or(0, |details| details.cached_tokens),
-            );
-            span.record("output_tokens", usage.output_tokens);
-        }
-        self.stats.model_duration_ns += duration_ns;
-        if let Some(usage) = &response.usage {
-            self.stats.usage.add(usage);
-        }
-        self.stats.last_response_id = Some(response.id.clone());
-        self.events.emit(
-            AgentEventKind::ModelCallCompleted,
-            ModelCallCompleted {
-                call_index,
-                model: MODEL,
-                response_id: &response.id,
-                attempt,
-                connection_generation,
-                status: &response.status,
-                duration_ns,
-                time_to_first_event_ns: response.time_to_first_event_ns,
-                time_to_first_output_ns: response.time_to_first_output_ns,
-                tool_calls: response.code_calls.len(),
-                usage: response.usage.as_ref(),
-            },
-        )?;
-        Ok(response)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1566,7 +1549,12 @@ where
         if let Some(input_content) = &input_content {
             record_span_content(&span, "model.input", input_content);
         }
-        let success = match self.client.execute(request).instrument(span.clone()).await {
+        let success = match self
+            .model_calls
+            .execute_primary(request)
+            .instrument(span.clone())
+            .await
+        {
             Ok(success) => success,
             Err(error) => {
                 span.record("status", "failed");
@@ -1577,7 +1565,8 @@ where
         };
         let attempt = success.attempt();
         let connection_generation = success.connection_generation();
-        self.server_reasoning_included |= success.server_reasoning_included();
+        self.model_calls
+            .include_server_reasoning(success.server_reasoning_included());
         let ResponsesOutput::Compaction(response) = success.into_output() else {
             span.record("status", "failed");
             span.record("otel.status_code", "ERROR");
@@ -1634,27 +1623,6 @@ where
         )?;
         Err(error)
     }
-
-    fn model_call_failed<T>(
-        &mut self,
-        call_index: u32,
-        started_at: Instant,
-        error: crate::NanocodexError,
-    ) -> Result<T> {
-        let duration_ns = elapsed_ns(started_at);
-        self.stats.model_duration_ns += duration_ns;
-        let message = error.to_string();
-        self.events.emit(
-            AgentEventKind::ModelCallFailed,
-            ModelCallFailed {
-                call_index,
-                model: MODEL,
-                duration_ns,
-                error: &message,
-            },
-        )?;
-        Err(error)
-    }
 }
 
 fn unsupported_tool_message(call: &CodeCall) -> Option<String> {
@@ -1666,27 +1634,6 @@ fn unsupported_tool_message(call: &CodeCall) -> Option<String> {
         CodeCallKind::Custom => format!("unsupported custom tool call: {qualified_name}"),
         CodeCallKind::Function => format!("unsupported call: {qualified_name}"),
     })
-}
-
-fn trace_model_input(request: &ResponsesAttempt) -> (usize, usize, Option<String>) {
-    let item_count = request.input_item_count();
-    if !trace_content_enabled() {
-        return (item_count, 0, None);
-    }
-    let items = request.input_items().collect::<Vec<_>>();
-    let content = serde_json::to_string(&items).ok();
-    let bytes = content.as_ref().map_or(0, String::len);
-    (item_count, bytes, content)
-}
-
-fn trace_content_enabled() -> bool {
-    tracing::enabled!(target: "nanocodex", tracing::Level::INFO)
-}
-
-fn serialize_trace_content<T: Serialize + ?Sized>(value: &T) -> Option<String> {
-    trace_content_enabled()
-        .then(|| serde_json::to_string(value).ok())
-        .flatten()
 }
 
 fn model_tool_span(call: &CodeCall, call_index: u32) -> tracing::Span {
@@ -1722,130 +1669,6 @@ fn owned_code_context(
         history,
         nanocodex_tools::DEFAULT_TOOL_OUTPUT_TOKENS,
     )))
-}
-
-fn record_span_content(span: &tracing::Span, kind: &'static str, content: &str) {
-    span.in_scope(|| {
-        info!(
-            target: "nanocodex",
-            content_kind = kind,
-            content,
-            "trace content"
-        );
-    });
-}
-
-fn record_indexed_span_content(
-    span: &tracing::Span,
-    kind: &'static str,
-    index: usize,
-    content: &str,
-) {
-    span.in_scope(|| {
-        info!(
-            target: "nanocodex",
-            content_kind = kind,
-            output.index = index,
-            content,
-            "trace content"
-        );
-    });
-}
-
-fn model_call_span(
-    call_index: u32,
-    reasoning_mode: &str,
-    reasoning_effort: &str,
-    previous_response: bool,
-    input_item_count: usize,
-    input_bytes: usize,
-) -> tracing::Span {
-    info_span!(
-        target: "nanocodex",
-        "model.call",
-        otel.kind = "internal",
-        otel.status_code = tracing::field::Empty,
-        model = MODEL,
-        reasoning.mode = reasoning_mode,
-        reasoning.effort = reasoning_effort,
-        model.call_index = call_index,
-        previous_response,
-        model.input.item_count = input_item_count,
-        model.input.bytes = input_bytes,
-        model.response.id = tracing::field::Empty,
-        model.response.status = tracing::field::Empty,
-        model.response.end_turn = tracing::field::Empty,
-        model.output.item_count = tracing::field::Empty,
-        model.output.bytes = tracing::field::Empty,
-        model.tool_call_count = tracing::field::Empty,
-        assistant.output.bytes = tracing::field::Empty,
-        status = tracing::field::Empty,
-        duration_ns = tracing::field::Empty,
-        input_tokens = tracing::field::Empty,
-        cached_input_tokens = tracing::field::Empty,
-        output_tokens = tracing::field::Empty,
-        reasoning.summary_count = tracing::field::Empty,
-        time_to_first_event_ns = tracing::field::Empty,
-        time_to_first_output_ns = tracing::field::Empty,
-        stream.display_delta.count = tracing::field::Empty,
-        stream.display_delta.bytes = tracing::field::Empty,
-        stream.inter_delta_gap.max_ns = tracing::field::Empty,
-        stream.inter_delta_stall_100ms.count = tracing::field::Empty,
-    )
-}
-
-fn record_model_response(span: &tracing::Span, response: &TurnResult) {
-    span.record("model.response.id", response.id.as_str());
-    span.record("model.response.status", response.status.as_str());
-    if let Some(end_turn) = response.end_turn {
-        span.record("model.response.end_turn", end_turn);
-    }
-    span.record("model.output.item_count", response.output_items.len());
-    span.record("model.tool_call_count", response.code_calls.len());
-    let trace_content = trace_content_enabled();
-    let mut output_bytes = usize::from(trace_content).saturating_mul(2);
-    let mut serialized_items = 0_usize;
-    let mut summary_count = 0_usize;
-    for (index, item) in response.output_items.iter().enumerate() {
-        let kind = if let ResponseItem::Reasoning { summary, .. } = item {
-            summary_count = summary_count.saturating_add(summary.len());
-            "reasoning"
-        } else {
-            "model.output_item"
-        };
-        if trace_content && let Ok(content) = serde_json::to_string(item) {
-            output_bytes = output_bytes
-                .saturating_add(usize::from(serialized_items != 0))
-                .saturating_add(content.len());
-            serialized_items = serialized_items.saturating_add(1);
-            record_indexed_span_content(span, kind, index, &content);
-        }
-    }
-    span.record("model.output.bytes", output_bytes);
-    if let Some(message) = &response.final_message {
-        span.record("assistant.output.bytes", message.len());
-    }
-    span.record("reasoning.summary_count", summary_count);
-    span.record("time_to_first_event_ns", response.time_to_first_event_ns);
-    if let Some(time_to_first_output_ns) = response.time_to_first_output_ns {
-        span.record("time_to_first_output_ns", time_to_first_output_ns);
-    }
-    span.record(
-        "stream.display_delta.count",
-        response.pipeline_stats.display_delta_count,
-    );
-    span.record(
-        "stream.display_delta.bytes",
-        response.pipeline_stats.display_delta_bytes,
-    );
-    span.record(
-        "stream.inter_delta_gap.max_ns",
-        response.pipeline_stats.inter_delta_gap_max_ns,
-    );
-    span.record(
-        "stream.inter_delta_stall_100ms.count",
-        response.pipeline_stats.inter_delta_stall_100ms_count,
-    );
 }
 
 fn request_profile(

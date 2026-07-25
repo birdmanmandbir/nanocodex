@@ -91,6 +91,11 @@ impl ResponsesError {
     pub fn is_checkpoint_missing(&self) -> bool {
         matches!(self, Self::Api { event } if api_error_has_code(event, "previous_response_not_found"))
     }
+
+    #[must_use]
+    pub fn is_cyber_policy(&self) -> bool {
+        matches!(self, Self::Api { event } if api_error_has_code(event, "cyber_policy"))
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

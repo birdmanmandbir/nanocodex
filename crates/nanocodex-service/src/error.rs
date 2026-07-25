@@ -151,6 +151,15 @@ impl ResponsesError {
     pub fn is_checkpoint_missing(&self) -> bool {
         matches!(self, Self::Api { event } if api_error_has_code(event, "previous_response_not_found"))
     }
+
+    #[must_use]
+    pub fn is_cyber_policy(&self) -> bool {
+        match self {
+            Self::Api { event } => api_error_has_code(event, "cyber_policy"),
+            Self::HttpRejected { body, .. } => api_error_has_code(body, "cyber_policy"),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -265,7 +274,53 @@ impl RetryAfterValue {
 
 #[cfg(test)]
 mod tests {
-    use super::retryable_api_error;
+    use super::{ResponsesError, retryable_api_error};
+
+    #[test]
+    fn classifies_structured_cyber_policy_errors() {
+        let error = ResponsesError::Api {
+            event: r#"{
+                "type":"error",
+                "error":{
+                    "type":"invalid_request_error",
+                    "code":"cyber_policy",
+                    "message":"request blocked"
+                }
+            }"#
+            .to_owned(),
+        };
+
+        assert!(error.is_cyber_policy());
+        assert!(!error.is_checkpoint_missing());
+        assert!(error.retry_advice().is_none());
+
+        let message_only = ResponsesError::Api {
+            event: r#"{
+                "type":"error",
+                "error":{
+                    "code":"invalid_prompt",
+                    "message":"the phrase cyber_policy is diagnostic text only"
+                }
+            }"#
+            .to_owned(),
+        };
+        assert!(!message_only.is_cyber_policy());
+        assert!(!ResponsesError::UnexpectedEnd.is_cyber_policy());
+
+        let https_rejection = ResponsesError::HttpRejected {
+            status: 400,
+            body: r#"{
+                "error":{
+                    "type":"invalid_request_error",
+                    "code":"cyber_policy",
+                    "message":"request blocked"
+                }
+            }"#
+            .to_owned(),
+            retry_after: None,
+        };
+        assert!(https_rejection.is_cyber_policy());
+    }
 
     #[test]
     fn retries_server_error_reported_as_error_type() {

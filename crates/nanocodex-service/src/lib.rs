@@ -33,5 +33,5 @@ pub use nanocodex_core::responses::{
 pub use service::ResponsesService;
 pub use service_error::ResponsesServiceError;
 pub use socket::EncodedRequest;
-pub use stream::{CodeCall, CodeCallKind, CompactionResult, TurnResult};
+pub use stream::{CodeCall, CodeCallKind, CompactionResult, ResponsePipelineStats, TurnResult};
 pub use telemetry::TRANSPORT;
