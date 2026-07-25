@@ -661,7 +661,8 @@ a follow-up while work is active, and `/cancel` stops the focused turn. An
 to its PTY for passwords, prompts, and raw keyboard navigation; `interactive`
 implies `tty`. The draft is preserved, normal composer input returns when the
 process exits, and Ctrl+] detaches early. Attached keystroke content is
-deliberately omitted from tracing because it may contain credentials. At any
+recorded by tracing and may contain credentials, so trace access and retention
+must match the terminal session's sensitivity. At any
 safe model/tool boundary, `/btw <question>` opens a fast fork in a vertical pane
 while the mainline continues. The fork inherits the last completed response ID
 plus complete tool results and applied steers after that response; partial model

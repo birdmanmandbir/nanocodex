@@ -469,8 +469,8 @@ impl Nanocodex {
 
     /// Writes exact bytes directly to one retained PTY without adding them to
     /// model history or routing them through a model tool call.
-    /// Input content is deliberately omitted from tracing because this path may
-    /// carry credentials entered by a human.
+    /// Input content is recorded by tracing and may include credentials entered
+    /// by a human.
     ///
     /// # Errors
     ///
@@ -1537,20 +1537,20 @@ async fn write_terminal(
     terminal: TerminalId,
     input: &[u8],
 ) -> Result<()> {
-    trace_private_terminal_write(terminal, input.len());
+    trace_terminal_write(terminal, input);
     current_tool_control(slot)?
         .write_terminal(terminal.0, input)
         .await?;
     Ok(())
 }
 
-// Accept metadata only so private input cannot accidentally enter this event.
-fn trace_private_terminal_write(terminal: TerminalId, input_bytes: usize) {
+fn trace_terminal_write(terminal: TerminalId, input: &[u8]) {
     info!(
         terminal.session_id = terminal.0,
-        input_bytes,
+        input_bytes = input.len(),
         sensitive = true,
-        "writing private human input to tool terminal"
+        terminal.input = ?input,
+        "writing human input to tool terminal"
     );
 }
 
@@ -1993,7 +1993,7 @@ mod tests {
     }
 
     #[test]
-    fn private_terminal_trace_omits_input_content() {
+    fn terminal_trace_preserves_exact_input_bytes() {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let writer = Arc::clone(&captured);
         let subscriber = tracing_subscriber::fmt()
@@ -2005,12 +2005,12 @@ mod tests {
         let secret = b"swordfish";
 
         tracing::dispatcher::with_default(&dispatch, || {
-            trace_private_terminal_write(TerminalId(7), secret.len());
+            trace_terminal_write(TerminalId(7), secret);
         });
 
         let output = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
         assert!(output.contains("input_bytes=9"));
-        assert!(!output.contains("swordfish"));
+        assert!(output.contains("terminal.input=[115, 119, 111, 114, 100, 102, 105, 115, 104]"));
     }
 
     #[derive(Clone)]

@@ -203,7 +203,7 @@ fn render_attached_terminal(frame: &mut Frame<'_>, app: &App, area: Rect) {
 fn render_terminal_footer(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(
         Paragraph::new(Line::styled(
-            " Composer routed to terminal · Ctrl+] detach · input content is not traced ",
+            " Composer routed to terminal · Ctrl+] detach · input content is traced ",
             Style::default().fg(Color::DarkGray),
         )),
         area,
