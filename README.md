@@ -271,10 +271,11 @@ when loaded from `.env`. `--kimi-api-base-url` and
 Every provider attempt emits its actual model in `model.call.*` events, and
 route transitions emit `model.route.changed`.
 
-The ignored paid E2E gate exercises a production Sol `cyber_policy` rejection
-through a production Kimi K3 completion. It requires a working Codex login in
-`NANOCODEX_AUTH_FILE`, `$CODEX_HOME/auth.json`, or `~/.codex/auth.json`, plus an
-exported `KIMI_API_KEY`:
+The ignored paid E2E gate requires a production Sol `cyber_policy` rejection
+followed by a production Kimi K3 response containing the exact requested
+success marker; a non-empty refusal does not pass. It requires a working Codex
+login in `NANOCODEX_AUTH_FILE`, `$CODEX_HOME/auth.json`, or
+`~/.codex/auth.json`, plus an exported `KIMI_API_KEY`:
 
 ```bash
 cargo test -p nanocodex --test kimi_refusal_e2e -- --ignored
