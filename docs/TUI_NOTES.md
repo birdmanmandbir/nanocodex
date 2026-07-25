@@ -26,6 +26,7 @@ The implementation in `bin/nanocodex/src/tui/mod.rs` is the source of truth.
 | `Esc`, then `Esc` within one second while running | Cancel the focused turn. The first press arms target-scoped confirmation and preserves the draft. Repeated key events do not confirm cancellation. |
 | `Ctrl+C` | Quit. |
 | `Ctrl+D` with an empty draft | Quit. |
+| `/` with an empty draft | Open the searchable action palette without changing the draft. Type to filter, use `Enter` or `Tab` to open an action, or use `Ctrl+Enter` to send the search as a literal slash-prefixed prompt. |
 
 `Enter` and `Tab` deliberately differ while work is active: `Enter` is a steer
 that may affect the current run, while `Tab` creates a later queued turn.
@@ -68,6 +69,11 @@ that may affect the current run, while `Tab` creates a later queued turn.
 | `/trace` | Open Jaeger filtered to the focused session. A `/btw` trace becomes available after its fork has produced a session ID. |
 
 Unknown slash-prefixed input is sent to the model as an ordinary prompt.
+
+The action palette also exposes non-command presentation controls such as the
+branch browser, tool-detail density, and the keyboard-shortcut reference. Actions
+that are not valid in the current pane remain visible with a concise reason and
+cannot be triggered.
 
 ## Current design and retained practices
 
@@ -190,6 +196,7 @@ The Criterion suite in `bin/nanocodex/benches/tui_render.rs` measures:
 - a 128-row follow-bottom burst, one smooth viewport step, and draining the
   bounded animation backlog at `120x40`;
 - repeated rendering of a 100 KiB multiline composer draft at `120x40`; and
+- an animated empty-state branding frame at `120x40`;
 - 100 KiB large-paste ingestion, placeholder rendering, and submission expansion;
 - first-frame rendering of a 16-file patch activity; and
 - selection of every retained user prompt and the first selected-history frame
@@ -351,6 +358,28 @@ Do not import Codex's app server, approval flow, generic history manager, or
 multi-agent scheduler. Nanocodex should copy useful invariants and operational
 behavior while retaining its much smaller consumer surface.
 
+## Tact findings retained
+
+The Tact comparison used `clabby/tact@7291a4085e303b37b9f92406937a7cbbae47e5a7`
+on 2026-07-25. Its strongest compatible presentation ideas were opening a
+searchable action menu from `/` only when the composer draft is empty and giving
+the untouched transcript a restrained animated identity. Nanocodex adopts the
+discoverability pattern while routing selected commands through its existing
+submission classifier and worker boundary. The palette therefore does not
+create a second command implementation, and an unmatched search still preserves
+the existing literal slash-prompt behavior.
+
+Tact's centered rounded modal chrome, dynamic unavailable-action labels, and
+dedicated shortcut reference also informed this slice. Its empty-state plasma
+field was adapted into a responsive Nanocodex ASCII wordmark with compact and
+plain-text fallbacks; its status motion became a stable-width wordmark that
+types and erases during active work. Animation is scheduled only while work or
+the unobscured empty state needs it, and disappears as soon as transcript
+content exists. Tact's broader component tree, session management, subagent
+inspector, theme configuration, and file finder were not copied: those either
+duplicate Nanocodex's existing measured consumer or require separate product
+and performance evidence.
+
 ## Candidate backlog
 
 Candidate IDs are stable handles for later filtering. `Now` means the idea fits
@@ -369,6 +398,8 @@ choice; `Defer` is intentionally outside the next slice.
 | `TUI-RENDER-01` | Done | Render assistant Markdown and useful tables. | Streaming snapshots heal incomplete constructs before parsing; completed source is exact and width-cached. Wide tables align columns, narrow tables become lossless labeled row cards, and fenced blocks receive native syntax highlighting with a plain fallback. Deterministic healing/reflow/highlighting tests and finalized/streaming frame benchmarks cover the boundary without changing the transcript event contract. |
 | `TUI-TOOL-01` | Done | Improve tool-call presentation. | Code Mode parent and `/code-N` child events form one timed activity tree with multiline highlighted JavaScript, multiline child continuation rows, compact results, explicit status, failure detail, and evidence-based sequence/overlap labels. Patch calls add operation-aware paths, moves, `+/-` counts, and styled hunks. A 16-child update/frame benchmark and 16-file patch frame cover the cached representation. |
 | `TUI-NOTIFY-01` | Done | Notify on completion while unfocused. | Focus reporting gates exactly one terminal-safe completion notification per turn. Known terminals receive OSC 9, tmux receives an escaped passthrough sequence, unknown terminals use BEL, and a backend write failure disables later attempts. |
+| `TUI-ACTIONS-01` | Done | Make the TUI's existing command and control vocabulary discoverable. | An empty-draft `/` opens a searchable, rounded action palette with context-aware availability, direct access to the shortcut reference, and a literal-submit escape hatch. Selected commands reuse the normal submission path; a compact footer keeps only immediate send/queue/cancel guidance visible. Deterministic interaction and frame tests cover search, disabled actions, command dispatch, unknown slash prompts, and both overlays. Its cached `80x24` frame measured 81.04 µs in the release-profile quick gate on 2026-07-25. |
+| `TUI-BRAND-01` | Done | Give idle and active waiting states a distinctive Nanocodex identity. | The empty main transcript renders a reasoning-colored animated signal field behind responsive full/compact ASCII branding, with a plain fallback for tiny panes. Split views remain quiet, content removes the mark immediately, and obscuring overlays pause its demand-driven ticker. Active work uses a fixed-width typing/erasing `nanocodex` loader. Deterministic tests cover responsive rendering, motion, scheduling, snapshots, and a changed-cell ceiling; the changed `120x40` frame measured 143.00 µs in the release-profile quick gate on 2026-07-25. |
 | `TUI-SEARCH-01` | Evaluate | Add transcript search and copy-oriented navigation. | First define how matches interact with semantic entries, wrapped rows, two panes, and streaming updates. |
 | `TUI-BTW-01` | Defer | Support multiple named `/btw` panes. | Product candidate already recorded in `docs/ORCHESTRATION_DECISION_CONTEXT.md`; preserve fresh driver/tool runtime ownership and explicit cleanup. This is broader than a rendering slice. |
 | `TUI-BTW-02` | Evaluate | Make branch cancellation and close cleanup explicit. | Cancellation exists, but busy `/close` is rejected. Decide whether close should offer cancel-and-close while guaranteeing subprocess and driver cleanup. |
@@ -394,6 +425,7 @@ choice; `Defer` is intentionally outside the next slice.
 ## Source map
 
 - Current input behavior: `bin/nanocodex/src/tui/mod.rs`
+- Empty-state identity: `bin/nanocodex/src/tui/branding.rs`
 - Composer display rows: `bin/nanocodex/src/tui/composer.rs`
 - External editor round trip: `bin/nanocodex/src/tui/external_editor.rs`
 - TUI state and Amp Escape invariant: `bin/nanocodex/src/tui/app.rs`

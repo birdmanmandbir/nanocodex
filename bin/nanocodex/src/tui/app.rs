@@ -13,6 +13,7 @@ use ratatui::{
 use serde::Deserialize;
 use serde_json::Value;
 
+use super::actions::{ActionContext, ActionMenu};
 use super::composer::ComposerLayout;
 use super::selection::{
     ScreenSelection, SelectionClick, SelectionScrollDirection, SelectionScrollRequest,
@@ -1129,6 +1130,8 @@ pub(super) struct App {
     fast_mode: bool,
     thinking: Thinking,
     reasoning_picker: Option<ReasoningPicker>,
+    action_menu: Option<ActionMenu>,
+    keybindings_visible: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1180,6 +1183,8 @@ impl App {
             fast_mode: false,
             thinking: Thinking::default(),
             reasoning_picker: None,
+            action_menu: None,
+            keybindings_visible: false,
         }
     }
 
@@ -2215,6 +2220,56 @@ impl App {
         !self.input.chars().all(char::is_whitespace)
     }
 
+    pub(super) fn open_action_menu(&mut self) {
+        self.action_menu = Some(ActionMenu::default());
+    }
+
+    pub(super) fn action_menu(&self) -> Option<&ActionMenu> {
+        self.action_menu.as_ref()
+    }
+
+    pub(super) fn action_menu_mut(&mut self) -> Option<&mut ActionMenu> {
+        self.action_menu.as_mut()
+    }
+
+    pub(super) fn close_action_menu(&mut self) {
+        self.action_menu = None;
+    }
+
+    pub(super) fn action_context(&self) -> ActionContext {
+        let conversation = self.active_conversation();
+        ActionContext {
+            fast_mode: self.fast_mode,
+            btw_open: self.btw.is_some(),
+            btw_busy: self.btw_busy(),
+            can_browse_branches: self.focus == PaneId::Main
+                && self.btw.is_none()
+                && self.historical_editor.is_none()
+                && self.pending_historical_edit.is_none()
+                && !self.main_branches.is_empty(),
+            can_cancel: conversation.running || conversation.pending_turns > 0,
+            trace_available: matches!(self.focus, PaneId::Main)
+                || self
+                    .btw
+                    .as_ref()
+                    .is_some_and(|btw| btw.request_id.is_some()),
+            tool_details_expanded: self.tool_details_expanded(),
+        }
+    }
+
+    pub(super) fn open_keybindings(&mut self) {
+        self.action_menu = None;
+        self.keybindings_visible = true;
+    }
+
+    pub(super) const fn keybindings_visible(&self) -> bool {
+        self.keybindings_visible
+    }
+
+    pub(super) fn close_keybindings(&mut self) {
+        self.keybindings_visible = false;
+    }
+
     pub(super) fn turn_finished(
         &mut self,
         target: PaneId,
@@ -2374,6 +2429,15 @@ impl App {
 
     pub(super) fn mouse_selection_needs_redraw(&self) -> bool {
         self.screen_selection.needs_tick()
+    }
+
+    pub(super) fn brand_animation_active(&self) -> bool {
+        self.btw.is_none()
+            && self.main.transcript.is_empty()
+            && self.branch_navigator.is_none()
+            && self.action_menu.is_none()
+            && !self.keybindings_visible
+            && self.reasoning_picker.is_none()
     }
 
     fn place_composer_cursor(&mut self, click: SelectionClick) -> bool {
@@ -3177,6 +3241,22 @@ mod tests {
             app.main.transcript.latest_user_message(),
             Some("visible prompt")
         );
+    }
+
+    #[test]
+    fn brand_animation_runs_only_for_the_unobscured_empty_main_transcript() {
+        let mut app = App::new("/worktree".into());
+        assert!(app.brand_animation_active());
+
+        app.open_action_menu();
+        assert!(!app.brand_animation_active());
+        app.close_action_menu();
+        assert!(app.brand_animation_active());
+
+        app.main
+            .transcript
+            .push(TranscriptItem::User("start working".to_owned()));
+        assert!(!app.brand_animation_active());
     }
 
     #[test]

@@ -40,6 +40,16 @@ mod tui {
     }
 
     #[allow(dead_code, unused_imports)]
+    mod branding {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/tui/branding.rs"));
+    }
+
+    #[allow(dead_code, unused_imports)]
+    mod actions {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/tui/actions.rs"));
+    }
+
+    #[allow(dead_code, unused_imports)]
     mod app {
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/tui/app.rs"));
     }
@@ -862,6 +872,40 @@ mod tui {
         });
     }
 
+    pub(super) fn action_palette_benchmark(criterion: &mut Criterion) {
+        criterion.bench_function("tui_action_palette/cached_frame/80x24", |bencher| {
+            let mut app = App::new("/workspace/nanocodex".into());
+            app.open_action_menu();
+            let mut terminal = Terminal::new(TestBackend::new(80, 24))
+                .expect("action palette benchmark terminal should initialize");
+            terminal
+                .draw(|frame| view::render(frame, &mut app))
+                .expect("initial action palette frame should render");
+            bencher.iter(|| {
+                terminal
+                    .draw(|frame| view::render(frame, &mut app))
+                    .expect("action palette benchmark frame should render");
+            });
+        });
+    }
+
+    pub(super) fn branding_benchmark(criterion: &mut Criterion) {
+        criterion.bench_function("tui_branding/animated_empty_frame/120x40", |bencher| {
+            let mut app = App::new("/workspace/nanocodex".into());
+            let mut terminal = Terminal::new(TestBackend::new(120, 40))
+                .expect("branding benchmark terminal should initialize");
+            terminal
+                .draw(|frame| view::render(frame, &mut app))
+                .expect("initial branding frame should render");
+            bencher.iter(|| {
+                app.on_tick();
+                terminal
+                    .draw(|frame| view::render(frame, &mut app))
+                    .expect("animated branding frame should render");
+            });
+        });
+    }
+
     pub(super) fn large_paste_benchmarks(criterion: &mut Criterion) {
         let pasted = sized_text(100 * 1_024, 5);
         let mut group = criterion.benchmark_group("tui_large_paste");
@@ -1577,6 +1621,8 @@ criterion_group!(
     tui::stream_telemetry_benchmark,
     tui::first_frame_benchmarks,
     tui::composer_benchmarks,
+    tui::action_palette_benchmark,
+    tui::branding_benchmark,
     tui::large_paste_benchmarks,
     tui::history_navigation_benchmarks,
     tui::branch_state_benchmarks,

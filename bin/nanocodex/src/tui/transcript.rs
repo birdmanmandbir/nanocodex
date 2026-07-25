@@ -19,6 +19,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::app::PlanStepStatus;
+use super::branding;
 use super::composer::ComposerLayout;
 use super::diff::{PatchPresentation, present_apply_patch};
 use super::markdown::{
@@ -88,7 +89,6 @@ impl Clone for Transcript {
 }
 
 impl Transcript {
-    #[cfg(test)]
     pub(super) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -400,6 +400,7 @@ impl Transcript {
             selected,
             inline_edit,
             empty_message,
+            branding: None,
         }
     }
 
@@ -459,6 +460,14 @@ pub(super) struct TranscriptWidget<'a> {
     selected: Option<usize>,
     inline_edit: Option<InlineEdit<'a>>,
     empty_message: &'static str,
+    branding: Option<(usize, Color)>,
+}
+
+impl TranscriptWidget<'_> {
+    pub(super) const fn branded_empty(mut self, frame: usize, accent: Color) -> Self {
+        self.branding = Some((frame, accent));
+        self
+    }
 }
 
 impl Widget for TranscriptWidget<'_> {
@@ -467,6 +476,10 @@ impl Widget for TranscriptWidget<'_> {
             return;
         }
         if self.transcript.entries.is_empty() {
+            if let Some((frame, accent)) = self.branding {
+                branding::render_empty(area, buffer, frame, accent, self.empty_message);
+                return;
+            }
             Paragraph::new(Text::from(vec![
                 Line::raw(""),
                 Line::styled(

@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 use std::time::Instant;
 
@@ -12,6 +12,22 @@ use super::{
     composer::ComposerLayout,
     transcript::InlineEdit,
 };
+
+const KEYBINDINGS: [(&str, &str); 13] = [
+    ("Enter", "send; steer while the focused turn is running"),
+    ("Tab", "queue input; switch pane when the draft is empty"),
+    ("Shift+Enter", "insert a newline"),
+    ("↑ / ↓", "move by visual row; then select prior prompts"),
+    ("PageUp / PageDown", "scroll the focused transcript"),
+    ("Ctrl+End", "jump to the newest output"),
+    ("Ctrl+O", "expand or collapse tool details"),
+    ("Ctrl+G", "edit the draft in $VISUAL or $EDITOR"),
+    ("Ctrl+Alt+B", "browse the branch tree"),
+    ("Ctrl+Alt+↑ / ↓", "cycle retained branches"),
+    ("Ctrl+V / Alt+V", "attach an image from the clipboard"),
+    ("Esc Esc", "stop the focused running turn"),
+    ("Ctrl+C", "quit"),
+];
 
 pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
@@ -57,6 +73,130 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
     render_footer(frame, app, footer_area);
     app.render_mouse_selection(frame.buffer_mut(), selectable_areas.as_slice());
     render_reasoning_picker(frame, app);
+    render_action_menu(frame, app);
+    render_keybindings(frame, app);
+}
+
+fn render_action_menu(frame: &mut Frame<'_>, app: &App) {
+    let Some(menu) = app.action_menu() else {
+        return;
+    };
+    let area = centered(frame.area(), 64, 16);
+    let inner = render_popup(frame, area, "Actions");
+    if inner.is_empty() {
+        return;
+    }
+    let [search_area, actions_area, help_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  Search: /", Style::default().fg(Color::DarkGray)),
+            Span::raw(menu.query()),
+        ])),
+        search_area,
+    );
+
+    let context = app.action_context();
+    let items = menu.visible_actions().map(|action| {
+        let enabled = action.enabled(context);
+        let label = action.label(context);
+        let color = if enabled {
+            Color::Reset
+        } else {
+            Color::DarkGray
+        };
+        let mut spans = vec![Span::styled(label, Style::default().fg(color))];
+        if let Some(command) = action.command() {
+            spans.push(Span::styled(
+                format!("  {command}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        ListItem::new(Line::from(spans))
+    });
+    let mut state = ListState::default().with_selected(menu.selected());
+    frame.render_stateful_widget(
+        List::new(items).highlight_symbol("› ").highlight_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        actions_area,
+        &mut state,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "↑↓ move · enter/tab open · ctrl+enter send literal · esc close",
+            Style::default().fg(Color::DarkGray),
+        ))
+        .alignment(Alignment::Center),
+        help_area,
+    );
+}
+
+fn render_keybindings(frame: &mut Frame<'_>, app: &App) {
+    if !app.keybindings_visible() {
+        return;
+    }
+    let area = centered(frame.area(), 74, 17);
+    let inner = render_popup(frame, area, "Keyboard shortcuts");
+    let [body, help] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    let lines = KEYBINDINGS
+        .map(|(key, description)| {
+            Line::from(vec![
+                Span::styled(
+                    format!("  {key:<18}"),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(description),
+            ])
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), body);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "esc close",
+            Style::default().fg(Color::DarkGray),
+        ))
+        .alignment(Alignment::Center),
+        help,
+    );
+}
+
+fn render_popup(frame: &mut Frame<'_>, area: Rect, title: &str) -> Rect {
+    let block = Block::default()
+        .title(format!(" {title} "))
+        .title_alignment(Alignment::Center)
+        .title_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    inner
+}
+
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
 }
 
 fn render_reasoning_picker(frame: &mut Frame<'_>, app: &App) {
@@ -185,6 +325,7 @@ fn render_transcripts(
     selectable_areas: &mut SelectableAreas,
 ) {
     let historical_editor_index = app.historical_editor_index();
+    let branding = Some((app.frame, thinking_color(app.thinking())));
     let inline_edit = historical_editor_index.map(|index| InlineEdit {
         index,
         input: app.input.as_str(),
@@ -208,6 +349,7 @@ fn render_transcripts(
                     empty_message:
                         "Ask Nanocodex to inspect, edit, run, or explain this workspace.",
                     preserve_view: preserve_main,
+                    branding: None,
                 },
             ));
             selectable_areas.push(render_transcript(
@@ -220,6 +362,7 @@ fn render_transcripts(
                     inline_edit: None,
                     empty_message: "Ask a quick side question without interrupting the main thread.",
                     preserve_view: preserve_btw,
+                    branding: None,
                 },
             ));
         }
@@ -242,6 +385,7 @@ fn render_transcripts(
                     empty_message:
                         "Ask Nanocodex to inspect, edit, run, or explain this workspace.",
                     preserve_view: false,
+                    branding: None,
                 },
             ));
         }
@@ -258,6 +402,7 @@ fn render_transcripts(
                 inline_edit,
                 empty_message: "Ask Nanocodex to inspect, edit, run, or explain this workspace.",
                 preserve_view: preserve_main,
+                branding,
             },
         ));
     }
@@ -355,6 +500,7 @@ struct TranscriptRenderOptions<'a> {
     inline_edit: Option<InlineEdit<'a>>,
     empty_message: &'static str,
     preserve_view: bool,
+    branding: Option<(usize, Color)>,
 }
 
 fn render_transcript(
@@ -369,6 +515,7 @@ fn render_transcript(
         inline_edit,
         empty_message,
         preserve_view,
+        branding,
     } = options;
     let title = if conversation.has_unseen_output {
         format!("{title}↓ New output · Ctrl+End ")
@@ -388,15 +535,17 @@ fn render_transcript(
     let scroll_from_bottom = conversation.display_scroll_from_bottom();
     frame.render_widget(block, area);
 
-    frame.render_widget(
-        conversation.transcript.widget(
-            scroll_from_bottom,
-            conversation.selected_user,
-            inline_edit,
-            empty_message,
-        ),
-        inner,
+    let widget = conversation.transcript.widget(
+        scroll_from_bottom,
+        conversation.selected_user,
+        inline_edit,
+        empty_message,
     );
+    let widget = match branding {
+        Some((frame, accent)) => widget.branded_empty(frame, accent),
+        None => widget,
+    };
+    frame.render_widget(widget, inner);
     if let Some(edit) = inline_edit
         && let Some(position) = conversation.transcript.inline_edit_cursor(
             inner,
@@ -473,7 +622,6 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect, layout: &Compos
 
 fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let conversation = app.active_conversation();
-    let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let state = if app.branch_navigator_active() {
         "Branches — ↑/↓ or j/k switch + preview · Esc close".to_owned()
     } else if app.historical_editor_active() {
@@ -493,8 +641,8 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         "Stop Agent Turn — Esc again to confirm".to_owned()
     } else if conversation.running {
         format!(
-            "{} Working ({})",
-            spinner[app.frame % spinner.len()],
+            "[{}] Working ({})",
+            loader_frame(app.frame),
             format_elapsed(conversation.run_elapsed(Instant::now()))
         )
     } else {
@@ -515,24 +663,17 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
             (steers, queued) => format!(" · {steers} steers · {queued} queued"),
         }
     };
-    let escape_help = if steers == 0 {
-        "Esc Esc stop"
+    let help = if conversation.running {
+        let escape = if steers == 0 {
+            "Esc Esc stop"
+        } else {
+            "Esc interrupt/send"
+        };
+        format!("  / actions · Enter steer · Tab queue · {escape}")
+    } else if app.btw.is_some() {
+        "  / actions · BackTab switch · Enter send · Tab queue".to_owned()
     } else {
-        "Esc interrupt/send"
-    };
-    let tool_help = if app.tool_details_expanded() {
-        "Ctrl+O fold tools"
-    } else {
-        "Ctrl+O expand tools"
-    };
-    let help = if app.btw.is_some() {
-        format!(
-            "  BackTab switch · {tool_help} · Ctrl+V image · /close dismiss · Enter send/steer · Tab queue · {escape_help} · Ctrl+C quit"
-        )
-    } else {
-        format!(
-            "  /btw <question> side fork · {tool_help} · Ctrl+V image · Enter send/steer · Tab queue · {escape_help} · Ctrl+C quit"
-        )
+        "  / actions · Enter send · Tab queue".to_owned()
     };
     let model_width = nanocodex::MODEL.len() + 3 + "default".len() + 7 + 1;
     let model_width = saturating_u16(model_width).min(area.width);
@@ -572,6 +713,34 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Paragraph::new(Line::from(model)).alignment(Alignment::Right),
         right,
     );
+}
+
+fn thinking_color(thinking: nanocodex::Thinking) -> Color {
+    match thinking {
+        nanocodex::Thinking::None | nanocodex::Thinking::Low => Color::Gray,
+        nanocodex::Thinking::Medium => Color::Cyan,
+        nanocodex::Thinking::High => Color::Yellow,
+        nanocodex::Thinking::Xhigh => Color::Red,
+        nanocodex::Thinking::Max => Color::Magenta,
+    }
+}
+
+fn loader_frame(frame: usize) -> String {
+    const WORDMARK: &str = "nanocodex";
+    let length = WORDMARK.len();
+    let phase = frame % (length * 2);
+    WORDMARK
+        .chars()
+        .enumerate()
+        .map(|(index, character)| {
+            let visible = if phase < length {
+                index <= phase
+            } else {
+                index > phase - length
+            };
+            if visible { character } else { '·' }
+        })
+        .collect()
 }
 
 fn format_elapsed(elapsed: std::time::Duration) -> String {
@@ -705,7 +874,7 @@ mod tests {
         style::{Color, Modifier},
     };
 
-    use super::render;
+    use super::{loader_frame, render};
     use crate::tui::{app::App, transcript::TranscriptItem};
 
     #[test]
@@ -770,6 +939,15 @@ mod tests {
     }
 
     #[test]
+    fn running_loader_types_and_erases_a_stable_width_wordmark() {
+        assert_eq!(loader_frame(0), "n········");
+        assert_eq!(loader_frame(8), "nanocodex");
+        assert_eq!(loader_frame(9), "·anocodex");
+        assert_eq!(loader_frame(17), "·········");
+        assert!((0..36).all(|frame| loader_frame(frame).chars().count() == 9));
+    }
+
+    #[test]
     fn footer_keeps_model_on_the_bottom_right_and_marks_fast_mode() {
         let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
         let mut app = App::new("/workspace".into());
@@ -807,6 +985,36 @@ mod tests {
         let rendered = terminal.backend().to_string();
         assert!(rendered.contains("Advanced Reasoning"));
         assert!(rendered.contains("For difficult problems when quality"));
+    }
+
+    #[test]
+    fn slash_action_menu_is_searchable_and_keeps_unavailable_actions_visible() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut app = App::new("/workspace".into());
+        app.open_action_menu();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("Actions"));
+        assert!(rendered.contains("Search: /"));
+        assert!(rendered.contains("Change reasoning"));
+        assert!(rendered.contains("Browse branches · no alternate branches"));
+        assert!(rendered.contains("ctrl+enter send literal"));
+        assert_eq!(terminal.backend().buffer()[(8, 4)].symbol(), "╭");
+    }
+
+    #[test]
+    fn shortcut_reference_keeps_the_daily_driver_bindings_in_one_overlay() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut app = App::new("/workspace".into());
+        app.open_keybindings();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("Keyboard shortcuts"));
+        assert!(rendered.contains("send; steer while the focused turn is running"));
+        assert!(rendered.contains("browse the branch tree"));
+        assert!(rendered.contains("edit the draft in $VISUAL or $EDITOR"));
     }
 
     #[test]
@@ -1109,15 +1317,15 @@ mod tests {
                 "\" nanocodex   /workspace                         \"\n",
                 "\"┌ Main ────────────────────────────────────────┐\"\n",
                 "\"│                                              │\"\n",
-                "\"│  Ask Nanocodex to inspect, edit, run, or     │\"\n",
-                "\"│explain this workspace.                       │\"\n",
-                "\"│                                              │\"\n",
+                "\"│     ##            nanocodex           *+     │\"\n",
+                "\"│   ****    small agent · sharp tools   *++=   │\"\n",
+                "\"│     **                                ++     │\"\n",
                 "\"│                                              │\"\n",
                 "\"└──────────────────────────────────────────────┘\"\n",
                 "\"┌ Message → Main ──────────────────────────────┐\"\n",
                 "\"│                                              │\"\n",
                 "\"└──────────────────────────────────────────────┘\"\n",
-                "\" Ready  /btw <quest          gpt-5.6-sol · high \"\n",
+                "\" Ready  / actions ·          gpt-5.6-sol · high \"\n",
             )
         );
     }
@@ -1209,6 +1417,21 @@ mod tests {
         app.cursor = app.input.len();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert_eq!(terminal.backend().draw_counts[2], 1);
+    }
+
+    #[test]
+    fn animated_branding_limits_terminal_changes_to_its_signal_mask() {
+        let backend = CountingBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("/workspace".into());
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        app.on_tick();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let changed_cells = terminal.backend().draw_counts[1];
+        assert!(changed_cells > 0);
+        assert!(changed_cells <= 64 * 11);
     }
 
     struct CountingBackend {

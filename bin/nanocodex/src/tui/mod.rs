@@ -1,4 +1,6 @@
+mod actions;
 mod app;
+mod branding;
 mod clipboard;
 mod composer;
 mod diff;
@@ -36,6 +38,7 @@ use tokio::{
 use tracing::{Instrument, info_span};
 
 use self::{
+    actions::{Action, ActionMenuResult},
     app::{App, EscapeAction, PaneId, ReasoningPickerAction, SubmittedPrompt},
     notification::Notifier,
     scheduler::{RenderScheduler, STREAM_FRAME_INTERVAL},
@@ -604,7 +607,8 @@ pub(crate) async fn run(
             }
             _ = ticker.tick(), if ui.app.main.running
                 || ui.app.btw.as_ref().is_some_and(|btw| btw.conversation.running)
-                || ui.app.mouse_selection_needs_redraw() => {
+                || ui.app.mouse_selection_needs_redraw()
+                || ui.app.brand_animation_active() => {
                 if apply_update(ui.update(UiAction::Tick, &worker_tx)?, &mut scheduler) {
                     break Ok(());
                 }
@@ -1842,7 +1846,11 @@ fn handle_terminal_event(
         }
         Event::Paste(text) => {
             let _ = app.clear_mouse_selection();
-            app.handle_paste(&text);
+            if let Some(menu) = app.action_menu_mut() {
+                menu.handle_paste(&text);
+            } else if !app.keybindings_visible() {
+                app.handle_paste(&text);
+            }
             Ok(TerminalAction::Redraw)
         }
         Event::Mouse(mouse) => match mouse.kind {
@@ -1896,6 +1904,10 @@ fn handle_key(
     root_session_id: &str,
     commands: &mpsc::UnboundedSender<WorkerCommand>,
 ) -> Result<TerminalAction> {
+    if let Some(action) = handle_overlay_key(key, app, root_session_id, commands)? {
+        return Ok(action);
+    }
+
     if matches!(key.code, KeyCode::Char('v' | 'V'))
         && key
             .modifiers
@@ -1903,10 +1915,6 @@ fn handle_key(
     {
         paste_clipboard_image(app, clipboard::paste_image_to_temp_png);
         return Ok(TerminalAction::Redraw);
-    }
-
-    if let Some(action) = handle_reasoning_picker_key(key, app, commands)? {
-        return Ok(action);
     }
 
     if let Some(action) = handle_inline_historical_editor_key(key, app, commands)? {
@@ -1971,6 +1979,7 @@ fn handle_key(
             app.insert_char('\n');
         }
         KeyCode::Enter => submit(app, root_session_id, commands, SubmitIntent::Immediate)?,
+        KeyCode::Char('/') if app.input.is_empty() => app.open_action_menu(),
         KeyCode::Char(character) => app.insert_char(character),
         KeyCode::Backspace => app.backspace(),
         KeyCode::Delete => app.delete(),
@@ -2002,6 +2011,93 @@ fn handle_key(
         | KeyCode::Modifier(_) => {}
     }
     Ok(TerminalAction::Redraw)
+}
+
+fn handle_overlay_key(
+    key: KeyEvent,
+    app: &mut App,
+    root_session_id: &str,
+    commands: &mpsc::UnboundedSender<WorkerCommand>,
+) -> Result<Option<TerminalAction>> {
+    if let Some(action) = handle_keybindings_key(key, app) {
+        return Ok(Some(action));
+    }
+    if let Some(action) = handle_action_menu_key(key, app, root_session_id, commands)? {
+        return Ok(Some(action));
+    }
+    handle_reasoning_picker_key(key, app, commands)
+}
+
+fn handle_keybindings_key(key: KeyEvent, app: &mut App) -> Option<TerminalAction> {
+    if !app.keybindings_visible() {
+        return None;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        return Some(TerminalAction::Quit);
+    }
+    if key.modifiers.is_empty() && matches!(key.code, KeyCode::Esc | KeyCode::Char('q' | '?')) {
+        app.close_keybindings();
+    }
+    Some(TerminalAction::Redraw)
+}
+
+fn handle_action_menu_key(
+    key: KeyEvent,
+    app: &mut App,
+    root_session_id: &str,
+    commands: &mpsc::UnboundedSender<WorkerCommand>,
+) -> Result<Option<TerminalAction>> {
+    if app.action_menu().is_none() {
+        return Ok(None);
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        return Ok(Some(TerminalAction::Quit));
+    }
+    let context = app.action_context();
+    let Some(result) = app
+        .action_menu_mut()
+        .map(|menu| menu.handle_key(key, context))
+    else {
+        return Ok(None);
+    };
+    match result {
+        ActionMenuResult::Handled => {}
+        ActionMenuResult::Dismiss => app.close_action_menu(),
+        ActionMenuResult::SubmitLiteral(input) => {
+            app.close_action_menu();
+            app.replace_input(input);
+            submit(app, root_session_id, commands, SubmitIntent::Immediate)?;
+        }
+        ActionMenuResult::Trigger(action) => {
+            app.close_action_menu();
+            match action {
+                Action::Branches => {
+                    let _ = app.toggle_branch_navigator();
+                }
+                Action::ToolDetails => {
+                    let _ = app.toggle_tool_details();
+                }
+                Action::Keybindings => app.open_keybindings(),
+                Action::McpLogin | Action::McpReload => {
+                    if let Some(command) = action.command() {
+                        app.replace_input(command.to_owned());
+                    }
+                }
+                Action::Reasoning
+                | Action::FastMode
+                | Action::Btw
+                | Action::Cancel
+                | Action::Trace
+                | Action::CloseBtw => {
+                    if let Some(command) = action.command() {
+                        app.replace_input(command.to_owned());
+                        submit(app, root_session_id, commands, SubmitIntent::Immediate)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(Some(TerminalAction::Redraw))
 }
 
 fn handle_reasoning_picker_key(
@@ -2614,6 +2710,72 @@ mod tests {
             classify_submission("/modeling"),
             Submission::Prompt("/modeling".into())
         );
+    }
+
+    #[test]
+    fn leading_slash_opens_searchable_actions_and_can_open_reasoning() {
+        let (commands, mut worker) = mpsc::unbounded_channel();
+        let mut app = App::new("/workspace".into());
+
+        handle_key(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            &mut app,
+            "main-session",
+            &commands,
+        )
+        .unwrap();
+        assert!(app.action_menu().is_some());
+        assert!(app.input.is_empty());
+
+        for character in "thinking".chars() {
+            handle_key(
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                &mut app,
+                "main-session",
+                &commands,
+            )
+            .unwrap();
+        }
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app,
+            "main-session",
+            &commands,
+        )
+        .unwrap();
+
+        assert!(app.action_menu().is_none());
+        assert!(app.reasoning_picker().is_some());
+        assert!(worker.try_recv().is_err());
+    }
+
+    #[test]
+    fn unmatched_action_search_preserves_unknown_slash_prompt_behavior() {
+        let (commands, mut worker) = mpsc::unbounded_channel();
+        let mut app = App::new("/workspace".into());
+        app.open_action_menu();
+        for character in "review-pr".chars() {
+            handle_key(
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                &mut app,
+                "main-session",
+                &commands,
+            )
+            .unwrap();
+        }
+
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app,
+            "main-session",
+            &commands,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            worker.try_recv(),
+            Ok(WorkerCommand::Prompt { prompt, .. }) if prompt == "/review-pr"
+        ));
     }
 
     #[test]
