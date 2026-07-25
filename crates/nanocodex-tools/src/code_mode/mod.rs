@@ -1,5 +1,6 @@
 //! Code Mode execution results, notifications, and nested-tool observation.
 
+mod context;
 pub(crate) mod description;
 mod embedded;
 mod output;
@@ -30,6 +31,7 @@ pub use crate::hosted::{
     CodeModeExecution, CodeModeNotification, CodeModeObserver, CodeModeUpdate, NestedToolCall,
 };
 use crate::runtime::{OwnedToolContext, ToolRegistry};
+pub use context::{ContextContent, ContextItem};
 use embedded::EmbeddedHost;
 pub(crate) use spec::{exec_spec, wait_spec};
 
@@ -1217,8 +1219,14 @@ async fn run_cell_actor(
     record_elapsed("host.wait_ns", host_wait_started_at);
     tracing::Span::current().record("host.reused", reused);
     let run = async {
-        host.start_cell(cell_id, &source, stored, tools.nested_tool_metadata())
-            .map_err(HostFailure::new)?;
+        host.start_cell(
+            cell_id,
+            &source,
+            stored,
+            tools.nested_tool_metadata(),
+            context::project(&context.history),
+        )
+        .map_err(HostFailure::new)?;
         host.drive_cell(
             cell_id,
             &context.call_id,
