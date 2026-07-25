@@ -56,6 +56,9 @@ impl Run {
         if let Some(child_agents) = configured.child_agents {
             child_agents.shutdown().await;
         }
+        if let Some(task_runtime) = configured.task_runtime {
+            task_runtime.shutdown().await;
+        }
         let browser_shutdown_result = if let Some(browser) = configured.browser {
             browser.shutdown().await
         } else {

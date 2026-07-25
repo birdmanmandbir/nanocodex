@@ -561,10 +561,15 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         )
     } else {
         format!(
-            "  /btw <question> side fork · /voice [voice] · {tool_help} · Ctrl+V image · Enter send/steer · Tab queue · {escape_help} · Ctrl+C quit"
+            "  /turbo · /btw <question> side fork · /voice [voice] · {tool_help} · Ctrl+V image · Enter send/steer · Tab queue · {escape_help} · Ctrl+C quit"
         )
     };
-    let model_width = app.model().as_str().len() + 3 + "default".len() + 7 + 1;
+    let model_width = app.model().as_str().len()
+        + 3
+        + "default".len()
+        + 7
+        + usize::from(app.turbo_mode()) * " · turbo".len()
+        + 1;
     let model_width = saturating_u16(model_width).min(area.width);
     let [left, right] =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(model_width)]).areas(area);
@@ -578,6 +583,14 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ])),
         left,
     );
+    let model = footer_model(app);
+    frame.render_widget(
+        Paragraph::new(Line::from(model)).alignment(Alignment::Right),
+        right,
+    );
+}
+
+fn footer_model(app: &App) -> Vec<Span<'static>> {
     let mut model = vec![Span::styled(
         app.model().as_str(),
         Style::default().fg(Color::Cyan),
@@ -597,11 +610,14 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Style::default().fg(Color::LightYellow),
         ));
     }
+    if app.turbo_mode() {
+        model.push(Span::styled(
+            " · turbo",
+            Style::default().fg(Color::LightMagenta),
+        ));
+    }
     model.push(Span::raw(" "));
-    frame.render_widget(
-        Paragraph::new(Line::from(model)).alignment(Alignment::Right),
-        right,
-    );
+    model
 }
 
 fn footer_queue(steers: usize, queued: usize) -> String {
@@ -840,17 +856,18 @@ mod tests {
     }
 
     #[test]
-    fn footer_keeps_model_on_the_bottom_right_and_marks_fast_mode() {
+    fn footer_keeps_model_on_the_bottom_right_and_marks_runtime_modes() {
         let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
         let mut app = App::new("/workspace".into());
         app.fast_mode_changed(true);
+        app.turbo_mode_changed(true);
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let footer = terminal.backend().buffer().content[15 * 80..16 * 80]
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
-        assert!(footer.ends_with("gpt-5.6-sol · high · fast "));
+        assert!(footer.ends_with("gpt-5.6-sol · high · fast · turbo "));
     }
 
     #[test]
@@ -1379,7 +1396,7 @@ mod tests {
                 "\"┌ Message → Main ──────────────────────────────┐\"\n",
                 "\"│                                              │\"\n",
                 "\"└──────────────────────────────────────────────┘\"\n",
-                "\" Ready  /btw <quest          gpt-5.6-sol · high \"\n",
+                "\" Ready  /turbo · /           gpt-5.6-sol · high \"\n",
             )
         );
     }

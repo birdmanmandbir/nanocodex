@@ -23,6 +23,7 @@ use nanocodex::{
     },
     tools::mcp::McpHandle,
 };
+use nanocodex_rlm::TaskRuntime;
 
 use crate::browser::{BrowserArgs, ConfiguredBrowser};
 use crate::mcp::{ConfiguredMcp, McpArgs};
@@ -35,6 +36,7 @@ pub(crate) struct ConfiguredAgent {
     pub(crate) events: AgentEvents,
     pub(crate) realtime: Option<OpenAi>,
     pub(crate) child_agents: Option<Arc<ChildAgents>>,
+    pub(crate) task_runtime: Option<TaskRuntime>,
     pub(crate) mpp_adapter: Option<MppAdapter>,
     pub(crate) mcp: Option<McpHandle>,
     pub(crate) browser: Option<ConfiguredBrowser>,
@@ -246,7 +248,7 @@ impl AgentArgs {
     }
 
     pub(crate) async fn build(self, vm: VmArgs) -> Result<ConfiguredAgent> {
-        self.build_inner(None, vm).await
+        self.build_inner(None, vm, false).await
     }
 
     pub(crate) async fn build_resumed(
@@ -254,13 +256,18 @@ impl AgentArgs {
         session: DurableSession,
         vm: VmArgs,
     ) -> Result<ConfiguredAgent> {
-        self.build_inner(Some(session), vm).await
+        self.build_inner(Some(session), vm, true).await
+    }
+
+    pub(crate) async fn build_for_tui(self, vm: VmArgs) -> Result<ConfiguredAgent> {
+        self.build_inner(None, vm, true).await
     }
 
     async fn build_inner(
         self,
         durable: Option<DurableSession>,
         vm: VmArgs,
+        with_task_tools: bool,
     ) -> Result<ConfiguredAgent> {
         let thinking = self.thinking();
         let web_search = self.web_search();
@@ -336,6 +343,11 @@ impl AgentArgs {
             tools = tools.provider(browser.tool());
         }
         let tools = tools.build()?;
+        let task_runtime = with_task_tools.then(|| {
+            let runtime = TaskRuntime::new();
+            runtime.set_enabled(false);
+            runtime
+        });
         let child_agents = self.subagents.then(|| Arc::new(ChildAgents::default()));
         let mut builder = Nanocodex::builder(openai)
             .model(self.model)
@@ -353,11 +365,20 @@ impl AgentArgs {
         if let Some(rollout) = session.rollout {
             builder = builder.rollout(rollout);
         }
-        let builder = if let Some(child_agents) = &child_agents {
+        let builder = if child_agents.is_some() || task_runtime.is_some() {
             let tools = tools;
-            let child_agents = Arc::downgrade(child_agents);
+            let child_agents = child_agents.as_ref().map(Arc::downgrade);
+            let task_tools = task_runtime.as_ref().map(TaskRuntime::tools);
             builder.tools_factory(move |agent| {
-                subagents::with_subagents(tools.clone(), agent, child_agents.clone())
+                let mut installed = tools.clone();
+                if let Some(child_agents) = &child_agents {
+                    installed =
+                        subagents::with_subagents(installed, agent.clone(), child_agents.clone())?;
+                }
+                if let Some(task_tools) = &task_tools {
+                    installed = task_tools.install(installed, agent)?;
+                }
+                Ok(installed)
             })
         } else {
             builder.tools(tools)
@@ -373,6 +394,7 @@ impl AgentArgs {
             events,
             realtime,
             child_agents,
+            task_runtime,
             mpp_adapter,
             mcp: mcp_handle,
             browser: configured_browser,

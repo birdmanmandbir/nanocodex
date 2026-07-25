@@ -12,6 +12,7 @@ members = [
     "crates/experimental/nanocodex-vm",
     "crates/nanocodex-oai-api",
     "crates/nanocodex-observability",
+    "crates/nanocodex-rlm",
     "crates/nanocodex-tools",
     "crates/nanocodex-tools/macros",
     "examples",
@@ -77,6 +78,7 @@ nanocodex-eval = { version = "0.3.0", path = "crates/experimental/nanocodex-eval
 nanocodex-vm = { version = "0.3.0", path = "crates/experimental/nanocodex-vm" }
 nanocodex-oai-api = { version = "0.3.0", path = "crates/nanocodex-oai-api" }
 nanocodex-observability = { version = "0.3.0", path = "crates/nanocodex-observability" }
+nanocodex-rlm = { version = "0.3.0", path = "crates/nanocodex-rlm" }
 nanocodex-tools = { version = "0.3.0", path = "crates/nanocodex-tools" }
 nanocodex-tools-macros = { version = "0.3.0", path = "crates/nanocodex-tools/macros" }
 nanousd = { version = "0.3.0", path = "bin/nanousd" }
@@ -86,6 +88,7 @@ reflink-copy = "0.1.30"
 image = { version = "0.25.9", default-features = false, features = ["bmp", "gif", "jpeg", "png", "pnm", "webp"] }
 iana-time-zone = "0.1.64"
 js-sys = "0.3.82"
+jsonschema = { version = "0.48.5", default-features = false }
 nix = { version = "0.31.3", default-features = false, features = ["process", "resource", "signal", "user"] }
 portable-pty = "0.9.0"
 pulldown-cmark = { version = "0.10", default-features = false }

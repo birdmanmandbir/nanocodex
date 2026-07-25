@@ -34,6 +34,7 @@ use nanocodex::{
     },
     tools::mcp::McpHandle,
 };
+use nanocodex_rlm::TaskRuntime;
 use nanocodex_voice::{
     CHATGPT_REALTIME_VOICES, PLATFORM_REALTIME_VOICES, RealtimeVoice, VoiceAgentControl,
     VoiceEvent, VoiceEvents, VoiceSession, VoiceSessionBuilder, VoiceSpeaker,
@@ -68,6 +69,10 @@ const DEFAULT_JAEGER_UI_URL: &str = "http://127.0.0.1:16686";
 const JAEGER_UI_URL_ENV: &str = "NANOCODEX_JAEGER_UI_URL";
 const MOUSE_SCROLL_ROWS: usize = 3;
 const MAX_AGENT_EVENTS_PER_BATCH: usize = 256;
+const TURBO_ENABLED_MARKER: &str =
+    "<nanocodex_turbo enabled=\"true\">Recursive task tools are available.</nanocodex_turbo>";
+const TURBO_DISABLED_MARKER: &str =
+    "<nanocodex_turbo enabled=\"false\">Recursive task tools are unavailable.</nanocodex_turbo>";
 
 enum WorkerCommand {
     Prompt {
@@ -106,6 +111,9 @@ enum WorkerCommand {
         id: u64,
     },
     SetFastMode {
+        enabled: bool,
+    },
+    SetTurboMode {
         enabled: bool,
     },
     SetThinking {
@@ -540,6 +548,7 @@ enum Submission {
     Cancel,
     Trace,
     Fast(Option<bool>),
+    Turbo(Option<bool>),
     ReasoningPicker,
     Voice(VoiceControl),
     McpLogin(String),
@@ -581,13 +590,17 @@ pub(crate) async fn run(
     let configured = if let Some(session) = resume {
         config.build_resumed(session, vm).await?
     } else {
-        config.build(vm).await?
+        config.build_for_tui(vm).await?
     };
     let agent = configured.handle;
     let mut agent_events = configured.events;
     let realtime = configured.realtime;
-    let root_session_id = Arc::<str>::from(agent_events.request_id());
     let child_agents = configured.child_agents;
+    let root_session_id = Arc::<str>::from(agent_events.request_id());
+    let task_runtime = configured
+        .task_runtime
+        .ok_or_else(|| eyre::eyre!("TUI task runtime was not configured"))?;
+    let initial_turbo_mode = task_runtime.is_enabled();
     let mpp_adapter = configured.mpp_adapter;
     let mcp = configured.mcp;
     let browser = configured.browser;
@@ -599,6 +612,7 @@ pub(crate) async fn run(
         Arc::clone(&root_session_id),
         realtime,
         mcp,
+        task_runtime.clone(),
         worker_rx,
         update_tx,
     );
@@ -624,7 +638,8 @@ pub(crate) async fn run(
     let mut app = App::new(cwd)
         .with_model(initial_model)
         .with_thinking(initial_thinking)
-        .with_fast_mode(initial_fast_mode);
+        .with_fast_mode(initial_fast_mode)
+        .with_turbo_mode(initial_turbo_mode);
     app.set_math_renderer(math_renderer.clone());
     app.restore_transcript(restored_transcript);
     let mut ui = UiModel::new(app, Arc::clone(&root_session_id));
@@ -723,7 +738,8 @@ pub(crate) async fn run(
     // Restore the terminal before disconnecting the paid WebSocket session.
     drop((terminal, worker_tx, agent_events));
     math_renderer.shutdown();
-    let shutdown_result = shutdown_runtime(worker, child_agents, mpp_adapter, browser, vm).await;
+    let shutdown_result =
+        shutdown_runtime(worker, child_agents, task_runtime, mpp_adapter, browser, vm).await;
     loop_result?;
     shutdown_result
 }
@@ -737,7 +753,8 @@ fn resolve_cwd(config: &AgentArgs) -> Result<PathBuf> {
 
 async fn shutdown_runtime(
     worker: tokio::task::JoinHandle<()>,
-    child_agents: Option<std::sync::Arc<crate::subagents::ChildAgents>>,
+    child_agents: Option<Arc<crate::subagents::ChildAgents>>,
+    task_runtime: TaskRuntime,
     mpp_adapter: Option<crate::mpp::MppAdapter>,
     browser: Option<crate::browser::ConfiguredBrowser>,
     vm: Option<crate::vm::ConfiguredVm>,
@@ -757,6 +774,7 @@ async fn shutdown_runtime(
     } else {
         Ok(())
     };
+    task_runtime.shutdown().await;
     let shutdown_result = if let Some(adapter) = mpp_adapter {
         adapter.shutdown().await
     } else {
@@ -992,7 +1010,8 @@ fn handle_worker_update(
             request_id,
         } => {
             if let Some(prompt) = app.main_branch_opened(id, parent_id, prompt_id, request_id) {
-                let prompt = SubmittedPrompt::text(prompt);
+                let mut prompt = SubmittedPrompt::text(prompt);
+                mark_turbo_mode(&mut prompt, app.turbo_mode());
                 let prompt_id = app
                     .queue_prompt(PaneId::Main, prompt.display().to_owned())
                     .ok_or_else(|| {
@@ -1077,6 +1096,7 @@ fn spawn_agent_worker(
     root_session_id: Arc<str>,
     realtime: Option<OpenAi>,
     mcp: Option<McpHandle>,
+    task_runtime: TaskRuntime,
     mut commands: mpsc::UnboundedReceiver<WorkerCommand>,
     updates: mpsc::UnboundedSender<WorkerEvent>,
 ) -> tokio::task::JoinHandle<()> {
@@ -1094,6 +1114,7 @@ fn spawn_agent_worker(
             archived_main: Vec::new(),
             next_turn_id: 1,
             btw: None,
+            task_runtime,
             finished: finished_tx,
             updates,
             mcp,
@@ -1152,6 +1173,7 @@ struct AgentWorker {
     archived_main: Vec<MainWorkerBranch>,
     next_turn_id: u64,
     btw: Option<BtwWorker>,
+    task_runtime: TaskRuntime,
     finished: mpsc::UnboundedSender<FinishedTurn>,
     updates: mpsc::UnboundedSender<WorkerEvent>,
     mcp: Option<McpHandle>,
@@ -1199,6 +1221,7 @@ impl AgentWorker {
             }
             WorkerCommand::SwitchMainBranch { id } => self.switch_main_branch(id),
             WorkerCommand::SetFastMode { enabled } => self.set_fast_mode(enabled).await,
+            WorkerCommand::SetTurboMode { enabled } => self.task_runtime.set_enabled(enabled),
             WorkerCommand::SetThinking { thinking } => self.set_thinking(thinking).await,
             WorkerCommand::McpLogin { name } => self.mcp_login(name),
             WorkerCommand::McpReload { name } => self.mcp_reload(name),
@@ -2613,6 +2636,8 @@ fn submit(
     };
     match classify_submission(input) {
         Submission::Prompt(prompt) => {
+            let mut prompt = prompt;
+            mark_turbo_mode(&mut prompt, app.turbo_mode());
             let target = app.focus;
             if matches!(intent, SubmitIntent::Immediate) && app.is_running(target) {
                 if let Some(id) = app.queue_steer(target, prompt.clone()) {
@@ -2630,6 +2655,10 @@ fn submit(
             }
         }
         Submission::Btw(prompt) => {
+            let prompt = prompt.map(|mut prompt| {
+                mark_turbo_mode(&mut prompt, app.turbo_mode());
+                prompt
+            });
             if let Some(id) = app.btw_id() {
                 app.focus_btw();
                 if let Some(prompt) = prompt {
@@ -2688,6 +2717,15 @@ fn submit(
         Submission::Fast(enabled) => {
             let enabled = enabled.unwrap_or(!app.fast_mode());
             send_command(commands, WorkerCommand::SetFastMode { enabled })?;
+        }
+        Submission::Turbo(enabled) => {
+            if app.has_pending_agent_work() {
+                app.push_active_error("Finish active and queued turns before changing turbo mode");
+            } else {
+                let enabled = enabled.unwrap_or(!app.turbo_mode());
+                app.turbo_mode_changed(enabled);
+                send_command(commands, WorkerCommand::SetTurboMode { enabled })?;
+            }
         }
         Submission::ReasoningPicker => app.open_reasoning_picker(),
         Submission::Voice(control) => {
@@ -2757,6 +2795,16 @@ fn classify_submission(input: impl Into<SubmittedPrompt>) -> Submission {
     if trimmed == "/fast" {
         return Submission::Fast(None);
     }
+    if trimmed == "/turbo" {
+        return Submission::Turbo(None);
+    }
+    if let Some(argument) = trimmed.strip_prefix("/turbo ") {
+        return match argument.trim() {
+            "on" => Submission::Turbo(Some(true)),
+            "off" => Submission::Turbo(Some(false)),
+            _ => Submission::InvalidCommand("Usage: /turbo [on|off]".to_owned()),
+        };
+    }
     if let Some(argument) = trimmed.strip_prefix("/fast ") {
         return match argument.trim() {
             "on" => Submission::Fast(Some(true)),
@@ -2792,6 +2840,17 @@ fn classify_submission(input: impl Into<SubmittedPrompt>) -> Submission {
         );
     }
     Submission::Prompt(input)
+}
+
+fn mark_turbo_mode(prompt: &mut SubmittedPrompt, enabled: bool) {
+    prompt.set_model_prefix(
+        if enabled {
+            TURBO_ENABLED_MARKER
+        } else {
+            TURBO_DISABLED_MARKER
+        }
+        .to_owned(),
+    );
 }
 
 fn active_session_id<'a>(app: &'a App, root_session_id: &'a str) -> Option<&'a str> {
@@ -2867,8 +2926,11 @@ mod tests {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use futures_util::{SinkExt, StreamExt};
     use nanocodex::{
-        Nanocodex, OpenAi, Thinking, agent::events::AgentEventKind, oai::__private::EventSink,
+        Nanocodex, OpenAi, Thinking,
+        agent::{events::AgentEventKind, input::PromptInput},
+        oai::__private::EventSink,
     };
+    use nanocodex_rlm::TaskRuntime;
     use nanocodex_voice::RealtimeVoice;
     use serde_json::{Value, json};
     use tokio::{net::TcpListener, sync::mpsc, time::timeout};
@@ -2878,8 +2940,8 @@ mod tests {
         BTW_BOUNDARY, PaneId, RedrawPriority, Submission, TerminalAction, UiAction, UiModel,
         UiUpdate, VoiceControl, WorkerCommand, WorkerEvent, active_session_id,
         apply_main_agent_event_batch, classify_submission, handle_key, handle_worker_update,
-        paste_clipboard_image, prepare_btw_prompt, report_cancel_outcome, session_trace_url,
-        spawn_agent_worker,
+        mark_turbo_mode, paste_clipboard_image, prepare_btw_prompt, report_cancel_outcome,
+        session_trace_url, spawn_agent_worker,
     };
     use crate::tui::{
         app::App,
@@ -2953,6 +3015,19 @@ mod tests {
             classify_submission("/fast turbo"),
             Submission::InvalidCommand("Usage: /fast [on|off]".to_owned())
         );
+        assert_eq!(classify_submission("/turbo"), Submission::Turbo(None));
+        assert_eq!(
+            classify_submission(" /turbo on "),
+            Submission::Turbo(Some(true))
+        );
+        assert_eq!(
+            classify_submission("/turbo off"),
+            Submission::Turbo(Some(false))
+        );
+        assert_eq!(
+            classify_submission("/turbo maybe"),
+            Submission::InvalidCommand("Usage: /turbo [on|off]".to_owned())
+        );
         assert_eq!(classify_submission("/model"), Submission::ReasoningPicker);
         assert_eq!(
             classify_submission(" /thinking "),
@@ -2992,6 +3067,19 @@ mod tests {
             classify_submission("/modeling"),
             Submission::Prompt("/modeling".into())
         );
+    }
+
+    #[test]
+    fn turbo_mode_marker_is_model_visible_but_not_displayed() {
+        let mut prompt = crate::tui::app::SubmittedPrompt::text("inspect the crate".to_owned());
+        mark_turbo_mode(&mut prompt, true);
+        assert_eq!(prompt.display(), "inspect the crate");
+        let prompt = prompt.into_prompt();
+        let PromptInput::Text(input) = prompt.instruction else {
+            panic!("text-only submission should remain a text prompt");
+        };
+        assert!(input.contains("<nanocodex_turbo enabled=\"true\">"));
+        assert!(input.ends_with("inspect the crate"));
     }
 
     #[test]
@@ -3371,6 +3459,7 @@ mod tests {
             Arc::from(session_id.to_string()),
             None,
             None,
+            TaskRuntime::new(),
             worker_rx,
             updates,
         );
@@ -3467,6 +3556,7 @@ mod tests {
             std::sync::Arc::from(session_id.to_string()),
             None,
             None,
+            TaskRuntime::new(),
             worker_rx,
             updates,
         );
@@ -3586,6 +3676,7 @@ mod tests {
             std::sync::Arc::from(session_id.to_string()),
             None,
             None,
+            TaskRuntime::new(),
             worker_rx,
             updates,
         );

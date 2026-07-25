@@ -1,4 +1,4 @@
-use nanocodex_core::{
+use nanocodex_oai_api::responses::{
     AgentMessageContent, ContentItem, FunctionOutputBody, FunctionOutputContent, MessagePhase,
     MessageRole, ReasoningContent, ReasoningSummary, ResponseItem,
 };
@@ -8,34 +8,54 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContextItem {
+    /// One developer, user, or assistant message.
     Message {
+        /// Message author role.
         role: MessageRole,
+        /// Ordered message content.
         content: Vec<ContextContent>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Optional assistant presentation phase.
         phase: Option<MessagePhase>,
     },
+    /// One agent-to-agent message.
     AgentMessage {
+        /// Sending agent identity.
         author: Box<str>,
+        /// Receiving agent identity.
         recipient: Box<str>,
+        /// Ordered visible content.
         content: Vec<ContextContent>,
     },
+    /// API-visible reasoning summaries and content.
     Reasoning {
+        /// Ordered reasoning summaries.
         summary: Vec<Box<str>>,
+        /// Ordered API-visible reasoning content.
         content: Vec<Box<str>>,
     },
+    /// One model-issued tool call.
     ToolCall {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Tool-call identity when available.
         call_id: Option<Box<str>>,
+        /// Model-visible tool name.
         name: Box<str>,
+        /// Serialized tool input.
         input: Box<str>,
     },
+    /// One tool result.
     ToolResult {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Tool-call identity when available.
         call_id: Option<Box<str>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Tool name when available.
         name: Option<Box<str>>,
+        /// Ordered result content.
         output: Vec<ContextContent>,
     },
+    /// One transcript compaction boundary.
     Compaction,
 }
 
@@ -43,9 +63,21 @@ pub enum ContextItem {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContextContent {
-    Text { text: Box<str> },
-    Image { image_url: Box<str> },
-    Audio { audio_url: Box<str> },
+    /// Plain text content.
+    Text {
+        /// Complete text.
+        text: Box<str>,
+    },
+    /// Image content.
+    Image {
+        /// Data URL or remote image URL.
+        image_url: Box<str>,
+    },
+    /// Audio content.
+    Audio {
+        /// Data URL or remote audio URL.
+        audio_url: Box<str>,
+    },
 }
 
 pub(super) fn project(history: &[ResponseItem]) -> Vec<ContextItem> {
@@ -250,7 +282,9 @@ fn serialize_typed(value: &impl Serialize) -> Box<str> {
 
 #[cfg(test)]
 mod tests {
-    use nanocodex_core::{ContentItem, FunctionOutputBody, MessageRole, ResponseItem};
+    use nanocodex_oai_api::responses::{
+        ContentItem, FunctionOutputBody, MessageRole, ResponseItem,
+    };
 
     use super::{ContextContent, ContextItem, project};
 
