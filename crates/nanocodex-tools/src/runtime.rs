@@ -1007,6 +1007,40 @@ mod tests {
         started: AtomicBool,
     }
 
+    #[test]
+    fn json_media_can_keep_the_event_compact_and_code_mode_value_rich() {
+        let compact = json!({ "path": "/tmp/screenshot.png" });
+        let rich = json!({
+            "path": "/tmp/screenshot.png",
+            "modelImage": { "image_url": "data:image/png;base64,a" }
+        });
+        let execution = ToolExecution::json_content_with_value(
+            &compact,
+            &rich,
+            vec![ToolOutputContent::InputImage {
+                image_url: "data:image/png;base64,a".to_owned(),
+                detail: ImageDetail::High,
+            }],
+        );
+
+        assert_eq!(execution.value(), rich);
+        let ToolOutputBody::Content(content) = execution.output else {
+            panic!("expected multimodal content");
+        };
+        assert!(matches!(
+            &content[0],
+            ToolOutputContent::InputText { text }
+                if text == r#"{"path":"/tmp/screenshot.png"}"#
+        ));
+        assert!(matches!(
+            &content[1],
+            ToolOutputContent::InputImage {
+                image_url,
+                detail: ImageDetail::High,
+            } if image_url == "data:image/png;base64,a"
+        ));
+    }
+
     #[derive(Deserialize)]
     struct DoubleInput {
         value: i64,

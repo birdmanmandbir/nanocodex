@@ -23,7 +23,9 @@ eyre.workspace = true
 futures-util.workspace = true
 image.workspace = true
 nanocodex.workspace = true
+nanocodex-browser.workspace = true
 nanocodex-observability.workspace = true
+nanocodex-react.workspace = true
 nix.workspace = true
 nanousd.workspace = true
 pulldown-cmark.workspace = true
@@ -48,6 +50,7 @@ tempo-alloy.workspace = true
 tracing.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
+url.workspace = true
 
 [build-dependencies]
 chrono.workspace = true

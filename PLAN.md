@@ -355,6 +355,95 @@ stable cache/session headers, custom JavaScript tools, unified events, and the
 browser host contract. Native cancellation remains owned by the Phase 2 turn
 lifecycle rather than a binding-specific alternate runtime.
 
+### Phase 4: browser tool (active)
+
+Browser control is an optional application-owned tool, not a new agent runtime:
+
+1. [x] Define one strict Code Mode action/result protocol with compact
+   accessibility snapshots, stable element references, targeted DOM reads,
+   screenshots, browser diagnostics, and explicit JavaScript evaluation.
+2. [x] Prove the protocol with a recording backend and then a real managed
+   headless Chromium session through an in-process typed CDP client.
+3. [x] Give every tool an isolated session, serialize its actions, ignore ambient
+   browser configuration, keep Chrome warm across calls, and close it on
+   drop.
+4. [x] Benchmark startup, warm action latency, screenshot/DOM latency, cleanup,
+   and concurrent independent sessions on representative local frontend tasks.
+   The typed `browser-bench` consumer covers isolated local sessions and one
+   dedicated CDP endpoint per remote VM browser without multiplexing ownership.
+   `browser-debug-bench` covers a real Vite application with open shadow roots,
+   repeated DOM/style/geometry reads, screenshots, and bounded diagnostic
+   floods. The CLI overlaps explicit browser startup with its first model call.
+5. [x] Add explicit authenticated-state policy only after the managed path is
+   stable. Importing a profile or attaching to a running browser must never
+   happen implicitly. Allowlisted Brave cookies enter a private local profile
+   or a dedicated remote browser through an invisible host broker; full site
+   data remains local-only, and visible authentication is an explicit
+   harness-owned handoff absent from the model-facing schema.
+6. [x] Cover complete frontend debugging state without making raw JavaScript the
+   normal path. Typed atomic DOM snapshots include closed and user-agent shadow
+   trees, layout, and requested styles. Cursor-based network capture follows the
+   page and recursively attached worker targets from their first import, with
+   on-demand bodies and WebSocket messages. `browser-inspect` verifies the
+   Code Mode binding against the real Vite app and its Performance Resource
+   Timing ground truth. Caller-enabled, pre-document React Scan Lite
+   instrumentation adds a bounded typed cursor stream for renderer capability,
+   commit/Fiber timing, source, and render-cause data without modifying the
+   inspected app. The same pinned bootstrap exposes a strict bounded
+   `element_context` action backed by one shared Bippy runtime and a React
+   Grab-derived context primitive, mapping snapshot references or selectors to
+   component/source/owner metadata without exposing DOM or Fiber objects.
+   A separate `nanocodex-react` crate provides a bounded Oxc-based Rust source
+   analyzer and ordinary Code Mode tool; it never injects a linter into the
+   inspected application. The CLI opts browser sessions in by default while
+   direct library consumers retain explicit policy.
+7. [x] Close the high-frequency interaction gaps with typed scroll, native
+   select/check, drag/drop, and file-upload actions. Keep upload roots and
+   download destinations harness-owned, and retain typed tab, frame, dialog,
+   and download state in the library session.
+8. [x] Make rendered evidence genuinely model-visible without changing the
+   direct Rust artifact contract. Screenshots, visual baselines, pixel diffs,
+   and classified flash frames remain private file-backed artifacts; the
+   `BrowserTool` supplies a transient typed Code Mode image handle and the
+   outer cell deliberately emits it with `image(...)`.
+9. [x] Add bounded frontend quality diagnostics: pre-document Web Vitals,
+   Chromium performance traces with typed summaries, deterministic visual
+   traces, and an embedded frame-aware accessibility audit. Prove the complete
+   path against a real local Chromium session.
+10. [x] Add harness-owned network control before first navigation. Explicit
+    egress policy covers pages, frames, workers, and WebSockets; deterministic
+    routes, offline emulation, and HAR export stay ordinary typed browser
+    actions. Prove deny-by-default containment with a routed fixture and a
+    blocked undeclared request.
+11. [x] Close the remaining high-value Playwright and DevTools debugging gaps.
+    Native pointer actions now wait for actionable, stable, unobscured targets
+    across shadow roots and same-origin frames, and return action-scoped page,
+    network, console, error, dialog, download, and optional post-action snapshot
+    state. Add bounded snapshot search, explicit selector/text/URL/load/function
+    waits, history navigation, source-mapped console and page-error stacks, and
+    source-mapped performance findings. File-backed CPU profiles, precise
+    JavaScript coverage, comparable V8 heap snapshots with bounded retaining
+    graphs, typed trace insights, and optional ffmpeg WebM capture remain
+    explicit library actions. Prove the complete contract with real local
+    Chrome fixtures and a model-driven Nanocodex CLI Code Mode run.
+12. [x] Finish the deterministic browser-diagnostics milestone with one shared
+    typed target contract for role/name, text, labels, placeholders, test IDs,
+    CSS, and snapshot references; harness-owned viewport/device, locale,
+    timezone, media, geolocation/permission, header/auth, initialization, CPU,
+    and network policy; native raw mouse/touch/keyboard input; persistable and
+    replayable JSONL session traces; authored CSS, listener, debugger,
+    service-worker/cache/IndexedDB, and deep heap inspection; and direct typed
+    cookie/origin-storage capture and restore outside the model schema. Add
+    embedded axe-core and Chromium PDF evidence, an explicitly configured exact
+    Lighthouse attachment, and explicit configured CrUX field data whose API
+    key is absent from tool inputs, `Debug`, and request errors. Prove the slice
+    with deterministic tests, a real local-Chrome vertical gate, an exact
+    Lighthouse run, and the broader browser fixture matrix.
+
+The gates are real Code Mode programs that open a local page, receive stable
+refs, mutate and read the DOM, capture complete DOM and network state, evaluate
+JavaScript, capture a screenshot, and leave no managed browser session behind.
+
 ## Performance policy
 
 - Optimize representative retained API/JSONL traces and real turns, not type
@@ -470,8 +559,7 @@ advancing this checkpoint.
 - Provider/model abstraction and backwards compatibility.
 - A Nanocodex-owned app server, JSON-RPC protocol, or daemon.
 - Additional language bindings without a concrete embedded consumer.
-- Browser/computer-use runtimes until a deterministic eval and consumer justify
-  the capability.
+- Computer-use runtimes without a deterministic eval and consumer.
 - Skills/plugins, approval machinery, alternate runtime modes, or duplicate
   shell implementations.
 - JJ provenance, graders, human-review state, durable replay journals, and local
