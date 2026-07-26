@@ -26,6 +26,8 @@ use mpp::{
 };
 use mpp_egress::{EgressPolicy, MppEgress};
 use nanocodex::{Tool, ToolContext, ToolExecution, ToolInput, ToolOutputBody, ToolOutputContent};
+use nanocodex_browser::{Browser, BrowserTool};
+use nanocodex_tools::ToolRuntime;
 use nanocodex_vm::{VmToolSession, mpp_egress_layer};
 use nanovm::{
     BlockDevice, EgressLease, EgressMount, GUEST_EGRESS_ROOT, GuestCommand, VmConfig,
@@ -39,6 +41,30 @@ const GUEST_RUNTIME: &str = "/usr/local/bin/nanocodex-vm-guest";
 const RUNTIME_BLOCK_DEVICE: &str = "/dev/vdb";
 const RUNTIME_MOUNT: &str = "/run/nanocodex";
 const RUNTIME_DISK_BYTES: u64 = 128 * 1024 * 1024;
+const VM_BROWSER_PROOF: &str = r#"
+const [shell, opened] = await Promise.all([
+  tools.exec_command({
+    cmd: "printf vm-workspace",
+    workdir: "/workspace",
+    login: false
+  }),
+  tools.browser({
+    action: "open",
+    url: "data:text/html,<main>host-browser</main>"
+  })
+]);
+const page = await tools.browser({
+  action: "get_text",
+  target: { by: "css", selector: "main" }
+});
+if (shell.exit_code !== 0 || !shell.output.includes("vm-workspace")) {
+  throw new Error("exec_command did not execute in the VM");
+}
+if (opened.result !== "action" || page.text !== "host-browser") {
+  throw new Error("browser did not execute in the shared host session");
+}
+text({ vm: shell.output, browser: page.text });
+"#;
 type AnyError = Box<dyn Error + Send + Sync>;
 
 #[derive(Deserialize)]
@@ -59,26 +85,27 @@ fn main() -> Result<(), AnyError> {
         VmProcessConfig::read(config)?.run()?;
         return Ok(());
     }
-    let prove_mpp = arguments.last().is_some_and(|value| value == "--prove-mpp");
-    if prove_mpp {
-        arguments.pop();
-    }
+    let prove_mpp = take_flag(&mut arguments, "--prove-mpp");
+    let prove_browser = take_flag(&mut arguments, "--prove-browser");
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(run_host(arguments, prove_mpp))
+        .block_on(run_host(arguments, prove_mpp, prove_browser))
 }
 
 #[allow(
     clippy::too_many_lines,
     reason = "the executable intentionally presents one linear end-to-end VM tool proof"
 )]
-async fn run_host(arguments: Vec<std::ffi::OsString>, prove_mpp: bool) -> Result<(), AnyError> {
-    let root = arguments
-        .first()
-        .cloned()
-        .map(PathBuf::from)
-        .ok_or("usage: vm-tools ROOTFS [GUEST_RUNTIME_BINARY_OR_EXT4] [--prove-mpp]")?;
+async fn run_host(
+    arguments: Vec<std::ffi::OsString>,
+    prove_mpp: bool,
+    prove_browser: bool,
+) -> Result<(), AnyError> {
+    let root = arguments.first().cloned().map(PathBuf::from).ok_or(
+        "usage: vm-tools ROOTFS [GUEST_RUNTIME_BINARY_OR_EXT4] \
+             [--prove-mpp] [--prove-browser]",
+    )?;
     let (_private_root, root) = if root.is_file() {
         let directory = tempfile::tempdir()?;
         let private = directory.path().join("rootfs.ext4");
@@ -141,11 +168,15 @@ async fn run_host(arguments: Vec<std::ffi::OsString>, prove_mpp: bool) -> Result
     vmm.arg("--vmm");
     let session = VmToolSession::spawn_configured(vmm, config, guest, egress).await?;
     let vm = session.tools();
-    let agent_tools = vm
+    let browser = prove_browser.then(Browser::new).transpose()?;
+    let mut agent_tools = vm
         .tools_builder()
         .working_directory("/workspace")
-        .default_shell("sh")
-        .build()?;
+        .default_shell("sh");
+    if let Some(browser) = &browser {
+        agent_tools = agent_tools.tool(BrowserTool::from_browser(browser.clone()));
+    }
+    let agent_tools = agent_tools.build()?;
     let context = ToolContext {
         model: "vm-proof",
         session_id: "session-1",
@@ -315,6 +346,15 @@ async fn run_host(arguments: Vec<std::ffi::OsString>, prove_mpp: bool) -> Result
         }
         println!("mpp egress: guest curl paid and replayed exactly once");
     }
+    if let Some(browser) = browser {
+        let runtime = ToolRuntime::new_with_tools(".", None, None, &agent_tools);
+        let execution = runtime.execute_code(VM_BROWSER_PROOF, context).await;
+        if !execution.success {
+            return Err("combined VM and browser Code Mode proof failed".into());
+        }
+        browser.close().await?;
+        println!("browser: host browser and VM tools composed in one Code Mode cell");
+    }
     println!("all VM-owned tools executed through one retained libkrun VM");
     drop(agent_tools);
     drop(vm);
@@ -398,6 +438,19 @@ fn remove_partial_copy(path: &Path) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+fn take_flag(arguments: &mut Vec<std::ffi::OsString>, flag: &str) -> bool {
+    let mut found = false;
+    arguments.retain(|argument| {
+        if argument == flag {
+            found = true;
+            false
+        } else {
+            true
+        }
+    });
+    found
 }
 
 struct MppProof {
