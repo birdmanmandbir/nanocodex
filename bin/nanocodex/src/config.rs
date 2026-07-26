@@ -183,21 +183,14 @@ impl AgentArgs {
     async fn build_inner(self, durable: Option<DurableSession>) -> Result<ConfiguredAgent> {
         let codex_home = default_codex_home()?;
         let responses_transport = self.responses_transport();
-        let kimi_refusal_fallback = self.kimi_api_key.map(|api_key| {
-            let mut fallback = KimiRefusalFallback::new(api_key)
-                .max_lease_generations(self.kimi_max_lease_generations);
-            if let Some(api_base_url) = self.kimi_api_base_url {
-                fallback = fallback.api_base_url(api_base_url);
-            }
-            fallback
-        });
+        let kimi_refusal_fallback = build_kimi_refusal_fallback(
+            self.kimi_api_key,
+            self.kimi_api_base_url,
+            self.kimi_max_lease_generations,
+        );
         let session = prepare_session_build(self.cwd, self.rollouts, &codex_home, durable)?;
         let mpp_enabled = self.mpp.is_enabled();
-        if mpp_enabled && !matches!(responses_transport, ResponsesTransport::Https) {
-            return Err(eyre!(
-                "the Tempo provider currently supports HTTPS Responses with Charge only"
-            ));
-        }
+        validate_mpp_transport(mpp_enabled, responses_transport)?;
         let auth = if mpp_enabled {
             OpenAiAuth::api_key("tempo-proxy")
         } else {
@@ -284,6 +277,30 @@ impl AgentArgs {
             mcp: mcp_handle,
         })
     }
+}
+
+fn build_kimi_refusal_fallback(
+    api_key: Option<String>,
+    api_base_url: Option<String>,
+    max_lease_generations: u32,
+) -> Option<KimiRefusalFallback> {
+    api_key.map(|api_key| {
+        let mut fallback =
+            KimiRefusalFallback::new(api_key).max_lease_generations(max_lease_generations);
+        if let Some(api_base_url) = api_base_url {
+            fallback = fallback.api_base_url(api_base_url);
+        }
+        fallback
+    })
+}
+
+fn validate_mpp_transport(enabled: bool, transport: ResponsesTransport) -> Result<()> {
+    if enabled && !matches!(transport, ResponsesTransport::Https) {
+        return Err(eyre!(
+            "the Tempo provider currently supports HTTPS Responses with Charge only"
+        ));
+    }
+    Ok(())
 }
 
 fn prepare_session_build(
