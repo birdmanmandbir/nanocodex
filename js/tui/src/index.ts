@@ -185,6 +185,26 @@ export function turnRejected(state: TerminalState, error: string): TerminalState
   }, error);
 }
 
+/** Remove a queued prompt that was cancelled before its run could start. */
+export function cancelQueuedPrompt(
+  state: TerminalState,
+  id: number,
+): TerminalState {
+  const index = state.queuedPrompts.findIndex((prompt) => prompt.id === id);
+  if (index < 0) return state;
+  const queuedPrompts = state.queuedPrompts.filter((prompt) => prompt.id !== id);
+  return {
+    ...state,
+    pendingTurns: Math.max(0, state.pendingTurns - 1),
+    queuedPrompts,
+    displayedQueuedPrompt:
+      state.displayedQueuedPrompt === id
+        ? undefined
+        : state.displayedQueuedPrompt,
+    status: state.running ? state.status : "Cancelled",
+  };
+}
+
 export function appendError(state: TerminalState, text: string): TerminalState {
   const syntheticId = state.syntheticId + 1;
   return {

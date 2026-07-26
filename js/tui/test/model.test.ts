@@ -4,6 +4,7 @@ import { test } from "node:test";
 
 import {
   applyAgentEvents,
+  cancelQueuedPrompt,
   groupAgentEventsByTarget,
   initialTerminalState,
   queuePrompt,
@@ -26,6 +27,26 @@ test("a prompt rejected before run start leaves no phantom queued work", () => {
   assert.equal(rejected.displayedQueuedPrompt, undefined);
   assert.equal(rejected.entries.at(-1)?.kind, "error");
   assert.equal(rejected.pendingSteers.length + rejected.queuedPrompts.length, 0);
+});
+
+test("a prewarmed prompt can be cancelled before an agent exists", () => {
+  let state = queuePrompt(initialTerminalState("Prewarming"), 1, "first");
+  state = queuePrompt(state, 2, "second");
+  const cancelled = cancelQueuedPrompt(state, 1);
+
+  assert.equal(cancelled.pendingTurns, 1);
+  assert.deepEqual(cancelled.queuedPrompts, [{ id: 2, text: "second" }]);
+  assert.equal(cancelled.displayedQueuedPrompt, undefined);
+  assert.equal(cancelled.status, "Cancelled");
+
+  const started = applyAgentEvents(cancelled, [event(1, "run.started", {})]);
+  assert.equal(started.entries.at(-1)?.kind, "user");
+  assert.equal(
+    started.entries.at(-1) && "text" in started.entries.at(-1)!
+      ? started.entries.at(-1)!.text
+      : "",
+    "second",
+  );
 });
 
 test("a streaming burst remains one semantic transcript entry", () => {

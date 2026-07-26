@@ -1,0 +1,67 @@
+{
+  "name": "ask-nanocodex",
+  "type": "module",
+  "title": "Ask Nanocodex",
+  "description": "Ask the Nanocodex agent through an MPP-paid Responses session.",
+  "author": "gakonst",
+  "icon": "icon.png",
+  "platforms": [
+    "macOS"
+  ],
+  "categories": [
+    "Developer Tools"
+  ],
+  "license": "MIT",
+  "commands": [
+    {
+      "name": "ask-nanocodex",
+      "title": "Ask Nanocodex",
+      "subtitle": "Paid with MPP",
+      "description": "Ask Nanocodex from Root Search or as a fallback command",
+      "mode": "view",
+      "arguments": [
+        {
+          "name": "prompt",
+          "placeholder": "Ask anything",
+          "type": "text",
+          "required": false
+        }
+      ]
+    },
+    {
+      "name": "run-nanocodex-job",
+      "title": "Run Nanocodex Background Job",
+      "subtitle": "Internal Worker",
+      "description": "Runs queued Nanocodex prompts after the chat view closes",
+      "mode": "no-view"
+    }
+  ],
+  "scripts": {
+    "build": "ray build -e dist --output dist",
+    "dev": "ray develop",
+    "fix-lint": "eslint src --fix && prettier --write package.json tsconfig.json eslint.config.js src README.md",
+    "lint": "eslint src --max-warnings 0 && prettier --check package.json tsconfig.json eslint.config.js src README.md",
+    "prebuild": "npm run prepare:assets",
+    "predev": "npm run prepare:assets",
+    "prepare:assets": "node scripts/prepare-assets.mjs",
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@raycast/api": "1.104.23",
+    "accounts": "^0.15.5",
+    "mppx": "^0.8.14",
+    "nanocodex": "file:../../js/bindings",
+    "nanocodex-tui": "file:../../js/tui",
+    "react": "19.0.0",
+    "viem": "^2.55.8",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@raycast/eslint-config": "2.0.4",
+    "@types/ws": "^8.18.1",
+    "eslint": "9.39.5",
+    "prettier": "3.7.4",
+    "typescript": "5.9.3"
+  }
+}
