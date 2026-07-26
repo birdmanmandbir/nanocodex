@@ -8,7 +8,9 @@ use nanocodex_tools::{
     UpdatePlanTool,
 };
 
-pub use session::{VmCommand, VmCommandOutput, VmToolSession, VmToolSessionError};
+pub use session::{
+    VmCommand, VmCommandOutput, VmToolSession, VmToolSessionError, VmToolSessionHandle,
+};
 
 /// One VM-aware execution capability shared by all proxied workspace tools.
 ///

@@ -1,4 +1,10 @@
-use std::{any::Any, collections::BTreeMap, fmt, path::PathBuf, sync::Arc};
+use std::{
+    any::Any,
+    collections::BTreeMap,
+    fmt,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use thiserror::Error;
 
@@ -26,6 +32,7 @@ pub struct EgressLease {
     network: Network,
     guest_environment: BTreeMap<String, String>,
     guest_mounts: BTreeMap<String, EgressMount>,
+    guest_files: BTreeMap<PathBuf, EgressFile>,
     guards: Vec<Arc<dyn Any + Send + Sync>>,
 }
 
@@ -37,6 +44,40 @@ pub struct EgressMount {
     pub guest_path: PathBuf,
 }
 
+/// One provider-owned public file provisioned before agent tools are exposed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EgressFile {
+    guest_path: PathBuf,
+    contents: Vec<u8>,
+    mode: u32,
+}
+
+impl EgressFile {
+    #[must_use]
+    pub fn new(guest_path: impl Into<PathBuf>, contents: impl Into<Vec<u8>>, mode: u32) -> Self {
+        Self {
+            guest_path: guest_path.into(),
+            contents: contents.into(),
+            mode,
+        }
+    }
+
+    #[must_use]
+    pub fn guest_path(&self) -> &Path {
+        &self.guest_path
+    }
+
+    #[must_use]
+    pub fn contents(&self) -> &[u8] {
+        &self.contents
+    }
+
+    #[must_use]
+    pub const fn mode(&self) -> u32 {
+        self.mode
+    }
+}
+
 impl EgressLease {
     #[must_use]
     pub fn new(network: Network) -> Self {
@@ -44,6 +85,7 @@ impl EgressLease {
             network,
             guest_environment: BTreeMap::new(),
             guest_mounts: BTreeMap::new(),
+            guest_files: BTreeMap::new(),
             guards: Vec::new(),
         }
     }
@@ -113,6 +155,27 @@ impl EgressLease {
         Ok(())
     }
 
+    /// Adds one public CA or provider configuration file to provision in the guest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the guest path is not absolute or conflicts with
+    /// a different provider file.
+    pub fn insert_file(&mut self, file: EgressFile) -> Result<(), EgressError> {
+        if !file.guest_path.is_absolute() {
+            return Err(EgressError::GuestFilePathNotAbsolute(file.guest_path));
+        }
+        if self
+            .guest_files
+            .get(&file.guest_path)
+            .is_some_and(|current| current != &file)
+        {
+            return Err(EgressError::GuestFileConflict(file.guest_path));
+        }
+        self.guest_files.insert(file.guest_path.clone(), file);
+        Ok(())
+    }
+
     /// Retains provider state, such as a revocable proxy lease, until the guest
     /// is dropped.
     pub fn retain<T>(&mut self, guard: Arc<T>)
@@ -124,13 +187,14 @@ impl EgressLease {
 
     /// Combines independently provisioned egress fragments.
     ///
-    /// Identical network, environment, and mount configuration is idempotent.
+    /// Identical network, environment, mount, and guest-file configuration is
+    /// idempotent.
     /// Conflicting configuration fails closed.
     ///
     /// # Errors
     ///
     /// Returns an error when the fragments select different network modes or
-    /// assign incompatible environment or mount values.
+    /// assign incompatible environment, mount, or guest-file values.
     pub fn merge(&mut self, other: Self) -> Result<(), EgressError> {
         if self.network != other.network {
             return Err(EgressError::NetworkConflict);
@@ -141,6 +205,9 @@ impl EgressLease {
         }
         for mount in other.guest_mounts.into_values() {
             merged.insert_mount(mount)?;
+        }
+        for file in other.guest_files.into_values() {
+            merged.insert_file(file)?;
         }
         merged.guards.extend(other.guards);
         *self = merged;
@@ -171,18 +238,23 @@ impl EgressLease {
     #[must_use]
     pub fn configure(&self, mut vm: VmConfig, command: &GuestCommand) -> (VmConfig, GuestCommand) {
         vm = vm.network(self.network.clone());
-        let mut configured =
-            GuestCommand::new("/bin/sh").args(["-c", MOUNT_AND_EXEC, "nanovm-egress"]);
-        configured = configured.arg(command.current_directory().as_os_str());
-        for mount in self.guest_mounts() {
-            vm = vm.shared_directory(SharedDirectory::read_only(&mount.tag, &mount.host_path));
-            configured = configured.arg(&mount.tag).arg(mount.guest_path.as_os_str());
-        }
-        configured = configured.arg("--").arg(command.program().as_os_str());
-        configured = configured.args(command.arguments().iter().cloned());
-        for (name, value) in command.environment() {
-            configured = configured.env(name, value);
-        }
+        let mut configured = if self.guest_mounts.is_empty() {
+            command.clone()
+        } else {
+            let mut configured =
+                GuestCommand::new("/bin/sh").args(["-c", MOUNT_AND_EXEC, "nanovm-egress"]);
+            configured = configured.arg(command.current_directory().as_os_str());
+            for mount in self.guest_mounts() {
+                vm = vm.shared_directory(SharedDirectory::read_only(&mount.tag, &mount.host_path));
+                configured = configured.arg(&mount.tag).arg(mount.guest_path.as_os_str());
+            }
+            configured = configured.arg("--").arg(command.program().as_os_str());
+            configured = configured.args(command.arguments().iter().cloned());
+            for (name, value) in command.environment() {
+                configured = configured.env(name, value);
+            }
+            configured
+        };
         for (name, value) in self.guest_environment() {
             configured = configured.env(name, value);
         }
@@ -202,6 +274,10 @@ impl EgressLease {
     pub fn guest_mounts(&self) -> impl Iterator<Item = &EgressMount> {
         self.guest_mounts.values()
     }
+
+    pub fn guest_files(&self) -> impl Iterator<Item = &EgressFile> {
+        self.guest_files.values()
+    }
 }
 
 impl fmt::Debug for EgressLease {
@@ -216,6 +292,10 @@ impl fmt::Debug for EgressLease {
             .field(
                 "guest_mounts",
                 &self.guest_mounts.values().collect::<Vec<_>>(),
+            )
+            .field(
+                "guest_file_paths",
+                &self.guest_files.keys().collect::<Vec<_>>(),
             )
             .field("guards", &self.guards.len())
             .finish()
@@ -236,6 +316,10 @@ pub enum EgressError {
     MountTagConflict(String),
     #[error("guest egress mount path `{0}` has conflicting providers")]
     GuestMountConflict(PathBuf),
+    #[error("guest egress file path must be absolute: {0}")]
+    GuestFilePathNotAbsolute(PathBuf),
+    #[error("guest egress file path `{0}` has conflicting providers")]
+    GuestFileConflict(PathBuf),
 }
 
 fn valid_environment_name(name: &str) -> bool {
@@ -303,6 +387,38 @@ mod tests {
     }
 
     #[test]
+    fn provider_files_compose_idempotently_and_conflicts_fail_closed() {
+        let path = "/tmp/nanovm/ca.pem";
+        let file = EgressFile::new(path, b"public ca".to_vec(), 0o444);
+        let mut first = EgressLease::internet();
+        first.insert_file(file.clone()).unwrap();
+        let mut identical = EgressLease::internet();
+        identical.insert_file(file).unwrap();
+        first.merge(identical).unwrap();
+        assert_eq!(first.guest_files().count(), 1);
+
+        let mut conflicting = EgressLease::internet();
+        conflicting
+            .insert_file(EgressFile::new(path, b"different ca".to_vec(), 0o444))
+            .unwrap();
+        assert_eq!(
+            first.merge(conflicting),
+            Err(EgressError::GuestFileConflict(PathBuf::from(path)))
+        );
+    }
+
+    #[test]
+    fn provider_file_paths_must_be_absolute() {
+        let mut lease = EgressLease::internet();
+        assert_eq!(
+            lease.insert_file(EgressFile::new("relative/ca.pem", Vec::new(), 0o444)),
+            Err(EgressError::GuestFilePathNotAbsolute(PathBuf::from(
+                "relative/ca.pem"
+            )))
+        );
+    }
+
+    #[test]
     fn lease_configures_network_mounts_and_proxy_environment() {
         let mut lease = EgressLease::internet();
         lease
@@ -342,5 +458,18 @@ mod tests {
                 .arguments()
                 .contains(&std::ffi::OsString::from("/run/egress/mpp"))
         );
+    }
+
+    #[test]
+    fn mount_free_lease_preserves_the_direct_guest_command() {
+        let command = GuestCommand::new("/usr/local/bin/nanocodex-vm-guest")
+            .arg("/workspace")
+            .current_dir("/workspace");
+
+        let (vm, configured) =
+            EgressLease::disabled().configure(VmConfig::new("/rootfs"), &command);
+
+        assert_eq!(vm.network_value(), &Network::Disabled);
+        assert_eq!(configured, command);
     }
 }
