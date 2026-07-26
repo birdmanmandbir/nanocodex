@@ -199,6 +199,24 @@ mod tests {
     }
 
     #[test]
+    fn remote_browser_accepts_brave_cookie_origins() {
+        let cli = Cli::try_parse_from([
+            "nanocodex",
+            "run",
+            "inspect the deployment",
+            "--browser-cdp",
+            "ws://127.0.0.1:9222",
+            "--browser-brave",
+            "https://console.example.com",
+            "--browser-brave",
+            "https://company.okta.example",
+        ])
+        .unwrap();
+
+        assert!(matches!(cli.command, Some(Command::Run(_))));
+    }
+
+    #[test]
     fn provider_selection_is_exclusive() {
         let error = Cli::try_parse_from(["nanocodex", "--provider.openai", "--provider.tempo"])
             .err()

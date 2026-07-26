@@ -12,6 +12,8 @@ crates=(
   nanocodex-service
   nanocodex-tools
   nanocodex-mcp
+  nanocodex-browser
+  nanocodex-react
   nanocodex
 )
 temporary_dir="$(mktemp -d 2>/dev/null)" || {

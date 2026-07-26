@@ -1,0 +1,56 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Nanocodex passkey fixture</title>
+<main>
+  <button id="create">Create account</button>
+  <button id="disconnect" hidden>Disconnect</button>
+  <button id="signin">Sign in</button>
+  <output id="status">ready</output>
+</main>
+<script>
+  const challenge = new Uint8Array(32).fill(7);
+  const userId = new Uint8Array(16).fill(9);
+  let credentialId;
+
+  document.querySelector("#create").onclick = async () => {
+    const credential = await navigator.credentials.create({
+      publicKey: {
+        challenge,
+        rp: { name: "Nanocodex passkey fixture" },
+        user: {
+          id: userId,
+          name: "browser@example.com",
+          displayName: "Nanocodex Browser",
+        },
+        pubKeyCredParams: [{ alg: -7, type: "public-key" }],
+        authenticatorSelection: {
+          authenticatorAttachment: "platform",
+          residentKey: "required",
+          userVerification: "required",
+        },
+      },
+    });
+    credentialId = credential.rawId;
+    document.querySelector("#status").value = "registered";
+    document.querySelector("#create").hidden = true;
+    document.querySelector("#disconnect").hidden = false;
+  };
+
+  document.querySelector("#disconnect").onclick = () => {
+    document.querySelector("#status").value = "disconnected";
+    document.querySelector("#disconnect").hidden = true;
+  };
+
+  document.querySelector("#signin").onclick = async () => {
+    await navigator.credentials.get({
+      publicKey: {
+        challenge,
+        allowCredentials: credentialId
+          ? [{ id: credentialId, type: "public-key" }]
+          : [],
+        userVerification: "required",
+      },
+    });
+    document.querySelector("#status").value = "authenticated";
+  };
+</script>

@@ -576,6 +576,69 @@ schema. `Tools::builder()` accepts generated or manual `Tool` implementations;
 normally sees only Code Mode and its wait operation, then composes nested tools
 with generated JavaScript, including loops, conditionals, and `Promise.all`.
 
+`nanocodex-browser` is an optional ordinary tool that gives Code Mode one
+isolated Chromium session: locally managed and headless by default, or headed
+behind a private CDP endpoint in a VM. It uses compact semantic snapshots and
+stable element references plus strict role/name, text, label, placeholder,
+alt/title, test-ID, and CSS targets while retaining typed DOM reads, screenshots,
+console and page errors, network requests, and JavaScript evaluation. Semantic
+snapshots and selectors cross open shadow roots; a separate typed atomic DOM
+snapshot includes closed and user-agent shadow trees, layout, and requested
+styles. Cursor-based request capture includes recursively attached workers,
+on-demand bodies, and WebSocket messages. Failed requests retain their
+DevTools reason, and bounded diagnostic buffers remain cheap during long
+debugging sessions. File-backed screenshots, visual diffs, and detected flash
+frames can be emitted as real model-visible Code Mode images without putting a
+duplicate base64 payload in the retained Rust result. Typed web vitals,
+bounded Chrome performance traces and insights, source-mapped console/error
+stacks, V8 CPU profiles, precise JavaScript coverage, heap snapshots and
+dominator/retainer inspection, optional WebM recordings, embedded axe-core,
+file-backed PDF, opt-in exact Lighthouse, configured CrUX field data, frames, tabs,
+dialogs, downloads, network fixtures, offline emulation, and HAR export cover
+the rest of the frontend-debugging loop. Pointer and form actions use strict
+Playwright-style actionability checks and return typed post-action page,
+network, diagnostic, dialog, download, and optionally refreshed snapshot
+state. Snapshot search and typed selector/text/URL/load/function waits keep
+large-page loops compact. Builder-owned egress policy can deny
+undeclared page, frame, worker, and WebSocket traffic before the first
+navigation; upload roots and download destinations are also harness-owned.
+Deterministic context policy fixes viewport/input device, locale/timezone,
+media, geolocation/permissions, headers, initialization, and CPU/network
+conditions before navigation. Harness-only typed storage state can move
+cookies and origin storage between isolated sessions without exposing values
+to the model. Replayable JSONL session traces optionally retain per-action PNG
+and flattened-DOM evidence and can be persisted beyond the private browser
+runtime directory.
+Optional pre-document React diagnostics add typed renderer capabilities,
+commit/Fiber timings, source locations, render causes, and a typed
+`element_context` mapping from a rendered element to its component, owner
+stack, source, stable selector, markup, and styles without modifying the
+inspected app. The pinned bootstrap contains React Scan Lite plus one shared
+Bippy runtime and a small React Grab-derived context primitive, not either
+toolbar. `nanocodex-react` independently analyzes JSX/TSX with Oxc and exposes
+the typed `react_doctor` Code Mode tool; pass `--react-doctor`, or enable any
+browser configuration to install it automatically. The CLI enables runtime
+React diagnostics automatically with any browser configuration; direct library
+consumers opt in with `.react_diagnostics(ReactDiagnostics::default())`, and
+`--browser-react=false` disables it. The Rust library owns Chrome and its typed
+DevTools connection directly; no browser CLI or daemon is involved. Register
+`BrowserTool::new()?`, or pass `--browser` to the CLI. Cross-origin frame
+contents participate in snapshots and ordinary element references. Pass
+`--browser-passkeys` to add an isolated CTAP2 virtual platform authenticator
+for unattended registration and authentication. Pass one or more
+`--browser-brave <ORIGIN>` values to seed a private headless Brave session with
+cookies from the standard profile; the visible Brave process is never attached
+or mutated. `--browser-cdp` composes with those origins: a short-lived invisible
+host Brave broker decrypts the filtered cookies and installs typed records into
+the dedicated VM browser without copying the profile, keychain, or cookie
+database into the guest. When a human passkey or enterprise auth gate is
+unavoidable, the typed `Browser::auth_handoff` API opens only an allowlisted
+protected URL in ordinary Brave, then refreshes the dedicated browser after the
+caller confirms completion. This harness operation is absent from the
+model-facing browser action schema. See
+[`docs/browser-tool.md`](docs/browser-tool.md) and the runnable `browser-tool`
+example.
+
 Code Mode prewarms one persistent Node host alongside the first model call and
 reuses it for the session. Cells receive one shared owned history snapshot;
 resumed waits do not copy history they cannot read. A nested shell request can
@@ -612,6 +675,27 @@ cargo run -p nanocodex-examples --bin fork-conversations
 cargo run -p nanocodex-examples --bin subagents
 just build-vm-example
 target/debug/vm-tools ROOTFS [GUEST_RUNTIME_BINARY_OR_EXT4] [--prove-mpp]
+cargo run -p nanocodex-examples --bin browser-tool
+cargo run -p nanocodex-examples --bin browser-tool -- \
+  --cdp-endpoint ws://127.0.0.1:9222/devtools/browser/SESSION
+cargo run -p nanocodex-examples --bin browser-bench -- \
+  --sessions 4 --warm-reads 25
+cargo run -p nanocodex-examples --bin browser-debug-bench -- \
+  https://127.0.0.1:5173/ \
+  --react \
+  --activate Code \
+  --settle-selector .code-workspace \
+  --probe-selector "[role='treeitem']" \
+  --cycles 50
+cargo run -p nanocodex-examples --bin browser-inspect -- \
+  https://127.0.0.1:5173/ \
+  --element-context main \
+  --activate Code
+cargo run -p nanocodex-examples --bin browser-element-context -- \
+  https://127.0.0.1:5173/ main
+cargo run -p nanocodex-examples --bin react-doctor -- ./web --path src
+cargo run -p nanocodex-examples --bin browser-passkey -- \
+  https://tempo.xyz/developers/docs/guide/payments/send-a-payment
 ```
 
 ## CLI and repository

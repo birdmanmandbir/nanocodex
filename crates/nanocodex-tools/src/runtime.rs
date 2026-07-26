@@ -184,6 +184,51 @@ impl ToolExecution {
         }
     }
 
+    /// Returns typed JSON to Code Mode and appends model-visible media.
+    ///
+    /// The JSON text remains the first content item so non-Code-Mode tool
+    /// consumers receive the complete structured result. Code Mode receives
+    /// the same value directly without having to infer it from multimodal
+    /// content.
+    #[must_use]
+    pub fn json_content(output: &impl Serialize, content: Vec<ToolOutputContent>) -> Self {
+        Self::json_content_with_value(output, output, content)
+    }
+
+    /// Returns compact JSON plus media while providing a richer typed value to
+    /// Code Mode.
+    ///
+    /// This is useful for file-backed library artifacts: the ordinary tool
+    /// output and event record can remain compact while Code Mode receives an
+    /// additional data URL that it may deliberately emit with `image(...)`.
+    #[must_use]
+    pub fn json_content_with_value(
+        output: &impl Serialize,
+        code_mode_value: &impl Serialize,
+        mut content: Vec<ToolOutputContent>,
+    ) -> Self {
+        let value = match serde_json::to_value(code_mode_value) {
+            Ok(value) => value,
+            Err(error) => {
+                return Self::error(format!("failed to encode tool result: {error}"));
+            }
+        };
+        let encoded = match serde_json::to_string(output) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                return Self::error(format!("failed to encode tool result: {error}"));
+            }
+        };
+        content.insert(0, ToolOutputContent::InputText { text: encoded });
+        Self {
+            output: ToolOutputBody::Content(content),
+            success: true,
+            code_mode_value: Some(value),
+            metadata: None,
+            process_trace: None,
+        }
+    }
+
     /// Returns a JSON value to Code Mode while retaining a serialized form for
     /// the model-visible tool result and event stream.
     #[must_use]
@@ -1277,13 +1322,14 @@ mod tests {
         atomic::{AtomicBool, Ordering},
     };
 
-    use nanocodex_core::{OpenAiAuth, ToolDefinition};
+    use nanocodex_core::{ImageDetail, OpenAiAuth, ToolDefinition};
     use serde::Deserialize;
     use serde_json::json;
 
     use super::{
         DEFAULT_TOOL_OUTPUT_TOKENS, DynamicToolProvider, ImageGenerationConfig, Tool, ToolContext,
-        ToolExecution, ToolInput, ToolOutputBody, ToolResult, ToolRuntime, Tools, WebSearchConfig,
+        ToolExecution, ToolInput, ToolOutputBody, ToolOutputContent, ToolResult, ToolRuntime,
+        Tools, WebSearchConfig,
     };
 
     struct Double;
@@ -1299,6 +1345,40 @@ mod tests {
     struct DeferredProvider {
         activated: Arc<AtomicBool>,
         started: AtomicBool,
+    }
+
+    #[test]
+    fn json_media_can_keep_the_event_compact_and_code_mode_value_rich() {
+        let compact = json!({ "path": "/tmp/screenshot.png" });
+        let rich = json!({
+            "path": "/tmp/screenshot.png",
+            "modelImage": { "image_url": "data:image/png;base64,a" }
+        });
+        let execution = ToolExecution::json_content_with_value(
+            &compact,
+            &rich,
+            vec![ToolOutputContent::InputImage {
+                image_url: "data:image/png;base64,a".to_owned(),
+                detail: ImageDetail::High,
+            }],
+        );
+
+        assert_eq!(execution.value(), rich);
+        let ToolOutputBody::Content(content) = execution.output else {
+            panic!("expected multimodal content");
+        };
+        assert!(matches!(
+            &content[0],
+            ToolOutputContent::InputText { text }
+                if text == r#"{"path":"/tmp/screenshot.png"}"#
+        ));
+        assert!(matches!(
+            &content[1],
+            ToolOutputContent::InputImage {
+                image_url,
+                detail: ImageDetail::High,
+            } if image_url == "data:image/png;base64,a"
+        ));
     }
 
     #[derive(Deserialize)]

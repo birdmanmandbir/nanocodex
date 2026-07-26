@@ -1,5 +1,5 @@
 [workspace]
-members = ["bin/nanocodex", "bin/nanousd-api", "crates/mpp-egress", "crates/nanocodex", "crates/nanocodex-core", "crates/nanocodex-macros", "crates/nanocodex-mcp", "crates/nanocodex-observability", "crates/nanocodex-service", "crates/nanocodex-tools", "crates/nanocodex-vm", "crates/nanousd", "crates/nanovm", "examples", "js/bindings", "py/bindings"]
+members = ["bin/nanocodex", "bin/nanousd-api", "crates/mpp-egress", "crates/nanocodex", "crates/nanocodex-browser", "crates/nanocodex-core", "crates/nanocodex-macros", "crates/nanocodex-mcp", "crates/nanocodex-observability", "crates/nanocodex-react", "crates/nanocodex-service", "crates/nanocodex-tools", "crates/nanocodex-vm", "crates/nanousd", "crates/nanovm", "examples", "js/bindings", "py/bindings"]
 default-members = ["bin/nanocodex"]
 resolver = "2"
 
@@ -26,6 +26,7 @@ arcbox-ext4 = "0.1.2"
 axum = "0.8.9"
 bm25 = "2.3.2"
 chrono = "0.4.43"
+chromiumoxide = "0.9.1"
 clap = { version = "4.5.54", features = ["derive", "env"] }
 crossterm = { version = "0.28.1", features = ["bracketed-paste", "event-stream"] }
 criterion = { version = "0.7.0", features = ["async_tokio"] }
@@ -36,16 +37,19 @@ getrandom = "0.3.4"
 http = "1.3.1"
 http-body-util = "0.1.3"
 hmac = "0.13.0"
+ignore = "0.4.25"
 hudsucker = { version = "0.25.0", git = "https://github.com/gakonst/hudsucker", rev = "0c7da328e446518036b9420db3e75451fca522e9", default-features = false, features = ["rcgen-ca", "rustls-client"] }
 imago = "=0.2.3"
 krun = { package = "libkrun", version = "=2.0.0-dev", git = "https://github.com/containers/libkrun", rev = "df85b8b75f55e8ef1b06b5bc18f08dc6d7b5aeb0", features = ["blk", "net"] }
 mpp = { version = "=0.11.0", git = "https://github.com/tempoxyz/mpp-rs", rev = "5caad442edeab796821b7f3bb009ab6945106e35", default-features = false }
 mpp-egress = { version = "0.2.0", path = "crates/mpp-egress" }
 nanocodex = { version = "0.2.0", path = "crates/nanocodex" }
+nanocodex-browser = { version = "0.2.0", path = "crates/nanocodex-browser" }
 nanocodex-core = { version = "0.2.0", path = "crates/nanocodex-core" }
 nanocodex-macros = { version = "0.2.0", path = "crates/nanocodex-macros" }
 nanocodex-mcp = { version = "0.2.0", path = "crates/nanocodex-mcp" }
 nanocodex-observability = { version = "0.2.0", path = "crates/nanocodex-observability" }
+nanocodex-react = { version = "0.2.0", path = "crates/nanocodex-react" }
 nanocodex-service = { version = "0.2.0", path = "crates/nanocodex-service" }
 nanocodex-tools = { version = "0.2.0", path = "crates/nanocodex-tools" }
 nanocodex-vm = { version = "0.2.0", path = "crates/nanocodex-vm" }
@@ -65,13 +69,18 @@ opentelemetry = { version = "0.32", features = ["trace"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-client", "trace"] }
 opentelemetry-semantic-conventions = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["experimental_trace_batch_span_processor_with_async_runtime", "rt-tokio", "trace"] }
+oxc_allocator = "=0.141.0"
+oxc_ast = "=0.141.0"
+oxc_ast_visit = "=0.141.0"
+oxc_parser = "=0.141.0"
+oxc_span = "=0.141.0"
 pyo3 = "0.29.0"
 proc-macro-crate = "3"
 proc-macro2 = "1.0.106"
 quote = "1.0.46"
 ratatui = { version = "0.29.0", features = ["unstable-rendered-line-info"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "query", "rustls"] }
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.38", features = ["backup", "bundled"] }
 rquickjs = "0.12.1"
 rmcp = { version = "1.8.0", default-features = false, features = ["auth", "client", "reqwest-tls-no-provider", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 oauth2 = { version = "5.0", default-features = false }
@@ -87,6 +96,7 @@ shlex = "2.0.1"
 simd-json = "=0.15.1"
 smallvec = { version = "1.15.1", features = ["serde"] }
 sonic-rs = "0.5.8"
+sourcemap = "9.3.2"
 syn = { version = "2.0.119", features = ["full"] }
 thiserror = "2.0.17"
 tempfile = "3.27.0"
@@ -103,6 +113,7 @@ unicode-segmentation = "1.13"
 unicode-width = "0.2"
 url = "2.5.7"
 uuid = { version = "1", features = ["v7"] }
+v8-heap-parser = "1.1.0"
 vergen = { version = "8", default-features = false }
 vm-memory = "=0.17.1"
 wasm-bindgen = "0.2.105"
