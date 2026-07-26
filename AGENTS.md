@@ -59,8 +59,8 @@
 - `nanovm` owns typed libkrun configuration, the audited FFI boundary,
   provider-neutral egress leases, and VMM process configuration.
 - `nanocodex-vm` owns the persistent host/guest tool protocol and the standard
-  workspace-tool adapters. Applications decide whether each agent driver uses
-  host tools or a fresh VM tool session.
+  workspace-tool adapters. Applications decide whether a root agent tree uses
+  host tools or one shared VM tool session.
 - `nanocodex-mcp` owns MCP transports, background handshake/discovery,
   authenticated connection inputs, deferred tool search, and remote dispatch.
 - `nanocodex` composes those crates into the owned agent lifecycle and exports

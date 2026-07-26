@@ -610,7 +610,8 @@ cargo run -p nanocodex-examples --bin custom-tool
 cargo run -p nanocodex-examples --bin mcp
 cargo run -p nanocodex-examples --bin fork-conversations
 cargo run -p nanocodex-examples --bin subagents
-cargo run -p nanocodex-examples --bin vm-tools -- ROOTFS
+just build-vm-example
+target/debug/vm-tools ROOTFS [GUEST_RUNTIME_EXT4] [--prove-mpp]
 ```
 
 ## CLI and repository

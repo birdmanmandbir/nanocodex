@@ -15,13 +15,13 @@ description = "VM-owned standard workspace tools for Nanocodex"
 
 [features]
 default = []
-mpp = ["dep:mpp-egress", "dep:nanovm"]
+mpp = ["dep:mpp-egress"]
 
 [dependencies]
 async-trait = "0.1.89"
 mpp-egress = { workspace = true, optional = true }
 nanocodex-tools.workspace = true
-nanovm = { workspace = true, optional = true }
+nanovm.workspace = true
 nix.workspace = true
 serde.workspace = true
 serde_json.workspace = true

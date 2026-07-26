@@ -12,7 +12,9 @@ use nanocodex_tools::{
 
 #[cfg(feature = "mpp")]
 pub use mpp::{MppVmEgressError, mpp_egress_layer};
-pub use session::{VmCommand, VmCommandOutput, VmToolSession, VmToolSessionError};
+pub use session::{
+    VmCommand, VmCommandOutput, VmToolSession, VmToolSessionError, VmToolSessionHandle,
+};
 
 /// One VM-aware execution capability shared by all proxied workspace tools.
 ///
