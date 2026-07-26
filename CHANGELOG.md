@@ -5,6 +5,13 @@ All notable changes to Nanocodex are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Features
+
+- [vm] Add persistent VM-backed workspace tools, composable egress leases, and
+  an MPP proxy layer.
+
 ## [0.2.0](https://github.com/gakonst/nanocodex/releases/tag/v0.2.0) - 2026-07-26
 
 ### Bug Fixes
@@ -140,7 +147,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add stock Codex parity differential
 - Stress parallel MPP egress replay ([#24](https://github.com/gakonst/nanocodex/issues/24))
 - Synchronize code cell termination output ([#23](https://github.com/gakonst/nanocodex/issues/23))
-
 ## [0.1.1](https://github.com/gakonst/nanocodex/releases/tag/v0.1.1) - 2026-07-23
 
 ### Bug Fixes
