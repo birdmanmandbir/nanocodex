@@ -58,7 +58,8 @@ export async function createTempoMppSession() {
     bootstrap: true,
     channelStore,
     client: provider.getClient(),
-    maxDeposit: "0.05",
+    // maxDeposit caps cumulative vouchers, not an individual top-up.
+    maxDeposit: "1",
     topUpAmount: "0.05",
   });
   return {

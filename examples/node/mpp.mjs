@@ -82,7 +82,8 @@ const mpp = tempo.session.manager({
   channelStore: persistentChannelStore(),
   client: provider.getClient(),
   webSocket: ObservedWebSocket,
-  maxDeposit: "0.05",
+  // maxDeposit caps cumulative vouchers, not an individual top-up.
+  maxDeposit: "1",
   topUpAmount: "0.05",
 });
 let agent;
