@@ -234,6 +234,93 @@ test("Node can load an application-owned web module and resume Codex rollout his
   await server.close();
 });
 
+test("Codex rollout imports repair interrupted tools and tolerate legacy output records", async () => {
+  const server = await startServer();
+  const wasm = await readFile(new URL("../pkg-web/nanocodex_bg.wasm", import.meta.url));
+  const canonicalContext = {
+    type: "message",
+    role: "user",
+    content: [{ type: "input_text", text: "inspect the old run" }],
+  };
+  const snapshot = {
+    version: 1,
+    model: "gpt-5.6-sol",
+    lineage_id: "legacy-codex-rollout",
+    prompt_cache_key: "legacy-codex-rollout",
+    workspace: process.cwd(),
+    canonical_context: canonicalContext,
+    history: [
+      canonicalContext,
+      {
+        type: "custom_tool_call",
+        call_id: "legacy-exec",
+        name: "exec",
+        input: "text('done')",
+      },
+      {
+        type: "custom_tool_call_output",
+        call_id: "legacy-exec",
+        output: "done",
+      },
+      {
+        type: "custom_tool_call_output",
+        call_id: "legacy-exec",
+        name: "text",
+        output: "done",
+      },
+      {
+        type: "function_call",
+        call_id: "interrupted",
+        name: "shell",
+        arguments: "{}",
+      },
+      {
+        type: "ghost_snapshot",
+        ghost_commit: { id: "unsupported-rollout-record" },
+      },
+    ],
+  };
+  const agent = await Agent.create({
+    apiKey: "test-key",
+    module: wasm,
+    websocketUrl: server.url,
+    thinking: "none",
+    sessionId: "raycast-legacy-runtime",
+    resume: snapshot,
+  });
+  const scenario = (async () => {
+    const socket = await server.connection;
+    const request = await messageReader(socket).next();
+    const input = request.input;
+    assert.equal(
+      input.filter(
+        (item) =>
+          item.type === "custom_tool_call_output" &&
+          item.call_id === "legacy-exec",
+      ).length,
+      2,
+    );
+    const interrupted = input.findIndex(
+      (item) =>
+        item.type === "function_call" && item.call_id === "interrupted",
+    );
+    assert.notEqual(interrupted, -1);
+    assert.equal(input[interrupted + 1].type, "function_call_output");
+    assert.equal(input[interrupted + 1].call_id, "interrupted");
+    assert.match(JSON.stringify(input[interrupted + 1]), /aborted/);
+    assert.doesNotMatch(JSON.stringify(input), /ghost_snapshot/);
+    sendFinal(socket, "resp-legacy-resumed", "recovered");
+  })();
+
+  assert.equal(
+    await agent.turn.prompt({ input: "continue safely" }).result(),
+    "recovered",
+  );
+  await scenario;
+  agent.dispose();
+  await server.close();
+});
+
 test("independent agents keep their host connections isolated", async () => {
   const leftServer = await startServer();
   const rightServer = await startServer();

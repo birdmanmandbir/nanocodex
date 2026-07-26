@@ -16,7 +16,8 @@ use tracing::{Instrument, info, info_span};
 use web_time::Instant;
 
 use super::context_manager::{
-    assign_missing_response_item_id, assign_missing_response_item_ids, has_well_formed_tool_calls,
+    assign_missing_response_item_id, assign_missing_response_item_ids, has_recoverable_tool_calls,
+    has_well_formed_tool_calls,
 };
 use super::{
     CompactionCompleted, CompactionFailed, CompactionStarted, ModelCallCompleted, ModelCallFailed,
@@ -124,6 +125,24 @@ impl ModelCheckpoint {
         Ok(Self {
             workspace,
             conversation: ConversationState::resume(canonical_context, history)?,
+            request_prefix: Arc::from(request_prefix),
+            prompt_cache_key,
+            preserve_inherited_delta: false,
+            global_instructions: None,
+        })
+    }
+
+    fn resume_rollout(
+        workspace: String,
+        mut request_prefix: Vec<ResponseItem>,
+        prompt_cache_key: Arc<str>,
+        canonical_context: ResponseItem,
+        history: Vec<ResponseItem>,
+    ) -> Result<Self> {
+        assign_request_prefix_ids(&mut request_prefix);
+        Ok(Self {
+            workspace,
+            conversation: ConversationState::resume_rollout(canonical_context, history)?,
             request_prefix: Arc::from(request_prefix),
             prompt_cache_key,
             preserve_inherited_delta: false,
@@ -323,6 +342,21 @@ impl ConversationState {
     }
 
     fn resume(mut canonical_context: ResponseItem, mut history: Vec<ResponseItem>) -> Result<Self> {
+        Self::resume_with_policy(&mut canonical_context, &mut history, true)
+    }
+
+    fn resume_rollout(
+        mut canonical_context: ResponseItem,
+        mut history: Vec<ResponseItem>,
+    ) -> Result<Self> {
+        Self::resume_with_policy(&mut canonical_context, &mut history, false)
+    }
+
+    fn resume_with_policy(
+        canonical_context: &mut ResponseItem,
+        history: &mut Vec<ResponseItem>,
+        strict: bool,
+    ) -> Result<Self> {
         if history.is_empty() {
             return Err(NanocodexError::InvalidSessionSnapshot(
                 "conversation history must not be empty".to_owned(),
@@ -333,16 +367,21 @@ impl ConversationState {
                 "canonical context must be a user message".to_owned(),
             ));
         }
-        assign_missing_response_item_id(&mut canonical_context);
-        assign_missing_response_item_ids(&mut history);
-        if !has_well_formed_tool_calls(&history) {
+        assign_missing_response_item_id(canonical_context);
+        assign_missing_response_item_ids(history);
+        let calls_are_valid = if strict {
+            has_well_formed_tool_calls(history)
+        } else {
+            has_recoverable_tool_calls(history)
+        };
+        if !calls_are_valid {
             return Err(NanocodexError::InvalidSessionSnapshot(
                 "conversation history contains an unmatched or misordered tool call".to_owned(),
             ));
         }
         let history_len = history.len();
-        let mut context = ContextManager::new(history);
-        if context.len() != history_len {
+        let mut context = ContextManager::new(std::mem::take(history));
+        if strict && context.len() != history_len {
             return Err(NanocodexError::InvalidSessionSnapshot(
                 "conversation history contains an unsupported item".to_owned(),
             ));
@@ -350,7 +389,7 @@ impl ConversationState {
         context.commit_tail();
         let delta_start = context.len();
         Ok(Self {
-            canonical_context: Arc::new(canonical_context),
+            canonical_context: Arc::new(canonical_context.clone()),
             context,
             delta_start,
             previous_response_id: None,
@@ -610,7 +649,7 @@ pub(crate) fn prepare_rollout_checkpoint(
     )
     .prefix()
     .to_vec();
-    let checkpoint = ModelCheckpoint::resume(
+    let checkpoint = ModelCheckpoint::resume_rollout(
         workspace,
         request_prefix,
         prompt_cache_key,

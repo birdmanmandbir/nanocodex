@@ -294,6 +294,18 @@ fn new_response_item_id(prefix: &str) -> ResponseItemId {
 }
 
 pub(super) fn has_well_formed_tool_calls(items: &[ResponseItem]) -> bool {
+    tool_calls_are_ordered(items, true, false)
+}
+
+pub(super) fn has_recoverable_tool_calls(items: &[ResponseItem]) -> bool {
+    tool_calls_are_ordered(items, false, true)
+}
+
+fn tool_calls_are_ordered(
+    items: &[ResponseItem],
+    require_complete: bool,
+    allow_repeated_or_orphan_outputs: bool,
+) -> bool {
     let mut function_calls = HashSet::new();
     let mut function_outputs = HashSet::new();
     let mut custom_calls = HashSet::new();
@@ -308,12 +320,15 @@ pub(super) fn has_well_formed_tool_calls(items: &[ResponseItem]) -> bool {
                 ..
             } => function_calls.insert(call_id.as_ref()),
             ResponseItem::FunctionCallOutput { call_id, .. } => {
-                function_calls.contains(call_id.as_ref())
-                    && function_outputs.insert(call_id.as_ref())
+                let inserted = function_outputs.insert(call_id.as_ref());
+                allow_repeated_or_orphan_outputs
+                    || (inserted && function_calls.contains(call_id.as_ref()))
             }
             ResponseItem::CustomToolCall { call_id, .. } => custom_calls.insert(call_id.as_ref()),
             ResponseItem::CustomToolCallOutput { call_id, .. } => {
-                custom_calls.contains(call_id.as_ref()) && custom_outputs.insert(call_id.as_ref())
+                let inserted = custom_outputs.insert(call_id.as_ref());
+                allow_repeated_or_orphan_outputs
+                    || (inserted && custom_calls.contains(call_id.as_ref()))
             }
             ResponseItem::ToolSearchCall {
                 call_id: Some(call_id),
@@ -322,16 +337,21 @@ pub(super) fn has_well_formed_tool_calls(items: &[ResponseItem]) -> bool {
             ResponseItem::ToolSearchOutput {
                 call_id: Some(call_id),
                 ..
-            } => search_calls.contains(call_id.as_ref()) && search_outputs.insert(call_id.as_ref()),
+            } => {
+                let inserted = search_outputs.insert(call_id.as_ref());
+                allow_repeated_or_orphan_outputs
+                    || (inserted && search_calls.contains(call_id.as_ref()))
+            }
             _ => true,
         };
         if !valid {
             return false;
         }
     }
-    function_calls == function_outputs
-        && custom_calls == custom_outputs
-        && search_calls == search_outputs
+    !require_complete
+        || (function_calls == function_outputs
+            && custom_calls == custom_outputs
+            && search_calls == search_outputs)
 }
 
 fn is_model_generated_item(item: &ResponseItem) -> bool {
@@ -500,6 +520,40 @@ mod tests {
             ResponseItem::CustomToolCallOutput { call_id, output: FunctionOutputBody::Text(text), .. }
                 if call_id.as_ref() == "missing" && text.as_ref() == "aborted"
         ));
+    }
+
+    #[test]
+    fn rollout_tool_history_accepts_codex_recovery_shapes_without_weakening_snapshots() {
+        let call: ResponseItem = serde_json::from_str(
+            r#"{"type":"custom_tool_call","call_id":"call","name":"exec","input":"code"}"#,
+        )
+        .unwrap();
+        let output = ResponseItem::custom_tool_output(
+            "call".to_owned(),
+            None,
+            FunctionOutputBody::Text("done".into()),
+        );
+        let orphan = ResponseItem::custom_tool_output(
+            "orphan".to_owned(),
+            None,
+            FunctionOutputBody::Text("unused".into()),
+        );
+
+        assert!(!has_well_formed_tool_calls(std::slice::from_ref(&call)));
+        assert!(has_recoverable_tool_calls(std::slice::from_ref(&call)));
+        assert!(!has_well_formed_tool_calls(&[
+            call.clone(),
+            output.clone(),
+            output.clone(),
+        ]));
+        assert!(has_recoverable_tool_calls(&[
+            call.clone(),
+            output.clone(),
+            output,
+        ]));
+        assert!(!has_well_formed_tool_calls(std::slice::from_ref(&orphan)));
+        assert!(has_recoverable_tool_calls(&[orphan]));
+        assert!(!has_recoverable_tool_calls(&[call.clone(), call]));
     }
 
     #[test]
