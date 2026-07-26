@@ -5,11 +5,10 @@ use std::{
 };
 
 use mpp_egress::MppEgress;
-use nanovm::{EgressError, EgressLease, EgressMount};
+use nanovm::{EgressError, EgressFile, EgressLease};
 use thiserror::Error;
 
-const MPP_MOUNT_TAG: &str = "nanocodex-mpp-egress";
-const GUEST_DIRECTORY: &str = "/run/nanocodex/egress/mpp";
+const GUEST_DIRECTORY: &str = "/tmp/nanocodex/egress/mpp";
 const CA_FILENAME: &str = "mpp-egress-ca.pem";
 const CA_ENVIRONMENT: [&str; 4] = [
     "CURL_CA_BUNDLE",
@@ -46,9 +45,6 @@ where
             certificate.to_path_buf(),
         ));
     }
-    let host_directory = certificate
-        .parent()
-        .ok_or_else(|| MppVmEgressError::CertificateWithoutParent(certificate.to_path_buf()))?;
     let guest_directory = PathBuf::from(GUEST_DIRECTORY);
     let guest_certificate = guest_directory.join(CA_FILENAME);
     let guest_certificate = guest_certificate
@@ -57,11 +53,11 @@ where
         .to_owned();
 
     let mut lease = EgressLease::internet();
-    lease.insert_mount(EgressMount {
-        tag: MPP_MOUNT_TAG.to_owned(),
-        host_path: host_directory.to_path_buf(),
-        guest_path: guest_directory,
-    })?;
+    lease.insert_file(EgressFile::new(
+        &guest_certificate,
+        std::fs::read(certificate).map_err(MppVmEgressError::ReadCertificate)?,
+        0o444,
+    ))?;
     for (name, value) in environment {
         let name = name
             .into_string()
@@ -83,8 +79,8 @@ where
 pub enum MppVmEgressError {
     #[error("MPP egress CA is not a regular file: {0}")]
     CertificateNotFile(PathBuf),
-    #[error("MPP egress CA path has no parent directory: {0}")]
-    CertificateWithoutParent(PathBuf),
+    #[error("failed to read the MPP egress CA: {0}")]
+    ReadCertificate(#[source] std::io::Error),
     #[error("MPP guest CA path is not valid UTF-8")]
     GuestCertificatePath,
     #[error("MPP egress produced a non-UTF-8 environment name")]
@@ -100,7 +96,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mpp_layer_routes_curl_through_proxy_and_mounts_public_ca() {
+    fn mpp_layer_routes_curl_through_proxy_and_provisions_public_ca() {
         let directory = tempfile::tempdir().unwrap();
         let certificate = directory.path().join(CA_FILENAME);
         std::fs::write(&certificate, "public ca").unwrap();
@@ -126,7 +122,8 @@ mod tests {
             lease.guest_environment().get("CURL_CA_BUNDLE"),
             Some(&format!("{GUEST_DIRECTORY}/{CA_FILENAME}"))
         );
-        assert_eq!(lease.guest_mounts().count(), 1);
+        assert_eq!(lease.guest_mounts().count(), 0);
+        assert_eq!(lease.guest_files().count(), 1);
         assert_eq!(Arc::strong_count(&guard), 2);
         assert!(!format!("{lease:?}").contains("secret"));
     }
