@@ -145,6 +145,33 @@ capturing `VmTools` in a driver factory is sufficient for the complete agent
 tree. Graceful shutdown fails while sibling capabilities remain; drop the
 agents, tool registries, and cloned handles before calling it.
 
+Host-owned tools compose on top of that boundary. For example, one `Browser`
+can be cloned into the same factory while every workspace tool continues to
+target the shared VM:
+
+```rust,no_run
+# use nanocodex::{Nanocodex, OpenAiAuth};
+# use nanocodex_browser::{Browser, BrowserTool};
+# use nanocodex_vm::VmToolSession;
+# fn build(auth: OpenAiAuth, session: VmToolSession, browser: Browser) -> nanocodex::Result<()> {
+let vm = session.tools();
+let (agent, events) = Nanocodex::builder(auth)
+    .tools_factory(move |_agent| {
+        vm.tools_builder()
+            .working_directory("/workspace")
+            .tool(BrowserTool::from_browser(browser.clone()))
+            .build()
+    })
+    .build()?;
+# drop((agent, events));
+# Ok(())
+# }
+```
+
+This keeps browser lifecycle, authentication state, and CDP policy on the host
+while `exec_command`, `write_stdin`, `apply_patch`, and `view_image` share one
+guest runtime across the root agent and its subagents.
+
 ## Configurable egress
 
 `EgressLease` is the VM-facing output of application policy. A layer may

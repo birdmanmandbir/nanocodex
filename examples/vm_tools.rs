@@ -54,26 +54,27 @@ fn main() -> Result<(), AnyError> {
         VmProcessConfig::read(config)?.run()?;
         return Ok(());
     }
-    let prove_mpp = arguments.last().is_some_and(|value| value == "--prove-mpp");
-    if prove_mpp {
-        arguments.pop();
-    }
+    let prove_mpp = take_flag(&mut arguments, "--prove-mpp");
+    let prove_browser = take_flag(&mut arguments, "--prove-browser");
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(run_host(arguments, prove_mpp))
+        .block_on(run_host(arguments, prove_mpp, prove_browser))
 }
 
 #[allow(
     clippy::too_many_lines,
     reason = "the executable intentionally presents one linear end-to-end VM tool proof"
 )]
-async fn run_host(arguments: Vec<std::ffi::OsString>, prove_mpp: bool) -> Result<(), AnyError> {
-    let root = arguments
-        .first()
-        .cloned()
-        .map(PathBuf::from)
-        .ok_or("usage: vm-tools ROOTFS [GUEST_RUNTIME_BINARY_OR_EXT4] [--prove-mpp]")?;
+async fn run_host(
+    arguments: Vec<std::ffi::OsString>,
+    prove_mpp: bool,
+    prove_browser: bool,
+) -> Result<(), AnyError> {
+    let root = arguments.first().cloned().map(PathBuf::from).ok_or(
+        "usage: vm-tools ROOTFS [GUEST_RUNTIME_BINARY_OR_EXT4] \
+             [--prove-mpp] [--prove-browser]",
+    )?;
     let (_private_root, root) = if root.is_file() {
         let directory = tempfile::tempdir()?;
         let private = directory.path().join("rootfs.ext4");
@@ -137,7 +138,8 @@ async fn run_host(arguments: Vec<std::ffi::OsString>, prove_mpp: bool) -> Result
     vmm.arg("--vmm");
     let session = VmToolSession::spawn_configured(vmm, config, guest, egress).await?;
     let vm = session.tools();
-    let agent_tools = vm
+    let browser = prove_browser.then(Browser::new).transpose()?;
+    let mut agent_tools = vm
         .tools_builder()
         .working_directory("/workspace")
         .default_shell("sh")
@@ -305,6 +307,15 @@ async fn run_host(arguments: Vec<std::ffi::OsString>, prove_mpp: bool) -> Result
         }
         println!("mpp egress: guest curl paid and replayed exactly once");
     }
+    if let Some(browser) = browser {
+        let runtime = ToolRuntime::new_with_tools(".", None, None, &agent_tools);
+        let execution = runtime.execute_code(VM_BROWSER_PROOF, context).await;
+        if !execution.success {
+            return Err("combined VM and browser Code Mode proof failed".into());
+        }
+        browser.close().await?;
+        println!("browser: host browser and VM tools composed in one Code Mode cell");
+    }
     println!("all VM-owned tools executed through one retained libkrun VM");
     drop(agent_tools);
     drop(vm);
@@ -374,6 +385,19 @@ fn remove_partial_copy(path: &Path) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+fn take_flag(arguments: &mut Vec<std::ffi::OsString>, flag: &str) -> bool {
+    let mut found = false;
+    arguments.retain(|argument| {
+        if argument == flag {
+            found = true;
+            false
+        } else {
+            true
+        }
+    });
+    found
 }
 
 struct MppProof {

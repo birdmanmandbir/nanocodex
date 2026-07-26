@@ -29,7 +29,7 @@ cargo run -p nanocodex-examples --bin subagents -- \
 NANOCODEX_SUBAGENT_JSONL=1 cargo run -p nanocodex-examples --bin subagents
 cargo run -p nanocodex-examples --bin mcp
 just build-vm-example
-target/debug/vm-tools ROOTFS [GUEST_RUNTIME_BINARY_OR_EXT4] [--prove-mpp]
+target/debug/vm-tools ROOTFS [GUEST_RUNTIME_BINARY_OR_EXT4] [--prove-mpp] [--prove-browser]
 cargo run -p nanocodex-examples --bin browser-tool
 cargo run -p nanocodex-examples --bin browser-tool -- \
   --cdp-endpoint ws://127.0.0.1:9222/devtools/browser/SESSION
@@ -88,6 +88,9 @@ disk before boot. On macOS, `just build-vm-example` also applies the required
 Hypervisor entitlement.
 Pass `--prove-mpp` to additionally run a real guest `curl` through the
 host-owned MPP proxy and verify one payment and one exact replay.
+Pass `--prove-browser` to additionally compose the cloneable VM tools and one
+host-owned browser in the same `Tools` value, then exercise both concurrently
+from one Code Mode cell.
 
 The Rust `browser-tool` example does not call the model and needs no API key. It
 exercises the real browser through the same Code Mode nested-tool path used by
