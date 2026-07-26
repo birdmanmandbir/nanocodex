@@ -36,9 +36,9 @@ through the normal tool-selection API:
 
 ```rust,no_run
 # use nanocodex::{Nanocodex, OpenAiAuth};
-# use nanocodex_vm::{VmToolSession, VmTools};
+# use nanocodex_vm::VmToolSession;
 # fn build(auth: OpenAiAuth, session: VmToolSession) -> nanocodex::Result<()> {
-let vm = VmTools::new(session);
+let vm = session.tools();
 let tools = vm
     .tools_builder()
     .working_directory("/workspace")
@@ -57,9 +57,34 @@ let (agent, events) = Nanocodex::builder(auth)
 image generation, and `update_plan` retain their existing host-side behavior.
 Callers can disable or replace those independently.
 
-Use `NanocodexBuilder::tools_factory` when an agent can spawn or fork. The
-factory must create a fresh root disk, VMM process, and `VmToolSession` for each
-driver; a child must not share its parent's mutable guest or shell sessions.
+Use `NanocodexBuilder::tools_factory` when an agent can spawn or fork. Start one
+`VmToolSession` for the root agent tree and capture its clone-cheap `VmTools` in
+the factory. Nanocodex invokes the factory once per driver, so agent-relative
+tools are freshly bound to that driver while every driver deliberately shares
+the same VM, filesystem, and retained guest shell sessions:
+
+```rust,no_run
+# use nanocodex::{Nanocodex, OpenAiAuth};
+# use nanocodex_vm::VmToolSession;
+# fn build(auth: OpenAiAuth, session: VmToolSession) -> nanocodex::Result<()> {
+let vm = session.tools();
+let (agent, events) = Nanocodex::builder(auth)
+    .workspace("/workspace")
+    .tools_factory(move |_agent| {
+        vm.tools_builder()
+            .working_directory("/workspace")
+            .default_shell("sh")
+            .build()
+    })
+    .build()?;
+# drop((agent, events));
+# Ok(())
+# }
+```
+
+The `VmToolSession` is the non-cloneable owner. Only it can shut the VM down.
+`VmTools` and `VmToolSessionHandle` are cloneable capabilities and cannot stop
+the shared VM out from under sibling drivers.
 
 ## Configurable egress
 
@@ -68,13 +93,13 @@ contribute:
 
 - a network mode;
 - guest environment such as an authenticated `HTTP_PROXY`/`HTTPS_PROXY`;
-- read-only CA or configuration mounts; and
+- read-only provider directories and public guest configuration files; and
 - lifecycle guards that keep revocable host services alive for the VM.
 
 Independent provider layers compose transactionally:
 
 ```rust,no_run
-use nanovm::{EgressLease, EgressMount};
+use nanovm::{EgressFile, EgressLease, EgressMount};
 use std::{path::PathBuf, sync::Arc};
 
 # fn configure() -> Result<EgressLease, nanovm::EgressError> {
@@ -83,6 +108,11 @@ mpp.insert_environment(
     "HTTPS_PROXY",
     "http://mpp-lease:credential@host.internal:8080",
 )?;
+mpp.insert_file(EgressFile::new(
+    "/tmp/nanocodex/egress/mpp/ca.pem",
+    b"public CA bytes".to_vec(),
+    0o444,
+))?;
 
 let mut secrets = EgressLease::internet();
 secrets.insert_environment(
@@ -104,17 +134,22 @@ EgressLease::internet()
 
 Applying the result to a `VmConfig` and `GuestCommand` selects the network,
 attaches provider directories read-only, mounts them before the guest runtime
-starts, and injects only the resolved guest environment:
+starts, and injects only the resolved guest environment. After spawning, give
+the same lease to the session so it provisions public files and retains all
+provider guards:
 
 ```rust,no_run
+# use nanocodex_vm::VmToolSession;
 # use nanovm::{EgressLease, GuestCommand, VmConfig};
-# fn configure(egress: EgressLease) {
+# async fn configure(egress: EgressLease, mut session: VmToolSession) -> Result<(), Box<dyn std::error::Error>> {
 let guest = GuestCommand::new("/usr/local/bin/nanocodex-vm-guest").arg("/workspace");
 let (vm, command) = egress.configure(
     VmConfig::ext4("rootfs.ext4"),
     &guest,
 );
-# drop((vm, command));
+# drop((vm, command)); // spawn the configured VMM here
+session.provision_egress(egress).await?;
+# Ok(())
 # }
 ```
 
@@ -125,15 +160,17 @@ secret-route placeholders out of the VMM command line.
 ### MPP and secret proxy layers
 
 The MPP provider remains a host-owned HTTP(S) proxy. Its layer points the guest
-at that proxy, mounts its public interception CA, and retains the wallet/proxy
-guard. Ordinary guest commands such as `curl` therefore receive a `402` through
-the proxy; the host pays and replays the exact bounded request without exposing
-the wallet to the VM. Enable `nanocodex-vm`'s `mpp` feature and pass an
-`Arc<MppEgress>` to `mpp_egress_layer` to produce that configuration.
+at that proxy, provisions its public interception CA, and retains the
+wallet/proxy guard. Ordinary guest commands such as `curl` therefore receive a
+`402` through the proxy; the host pays and replays the exact bounded request
+without exposing the wallet to the VM. Enable `nanocodex-vm`'s `mpp` feature
+and pass an `Arc<MppEgress>` to `mpp_egress_layer` to produce that
+configuration.
 
 NanoCentaur's Iron/secret egress follows the same contract: its layer carries
-the scoped proxy or gateway route, public CA mount, placeholders, and revocable
-lease guard. Resolved secrets remain host-side.
+the scoped proxy or gateway route, public CA/configuration files, placeholders,
+and revocable lease guard. Resolved secrets remain host-side and must never be
+placed in an `EgressFile`.
 
 A guest process can have only one value for `HTTPS_PROXY`. If two independently
 started providers both claim the front-proxy variables, lease composition
@@ -144,10 +181,15 @@ provider's credentials.
 
 ## Lifecycle and security
 
-- One VM tool session retains interactive guest processes across sequential
-  turns.
+- One VM tool session is shared by the complete root-agent tree and retains
+  interactive guest processes across sequential turns and subagent calls.
+- Concurrent drivers are multiplexed by request ID; one slow guest command
+  does not block unrelated subagent calls.
 - Dropping the session kills its VMM child. Explicit shutdown asks the guest to
   stop and bounds the wait for process exit.
+- On macOS, the dedicated VMM executable must carry the
+  `com.apple.security.hypervisor` entitlement. `just build-vm-example` builds
+  and ad-hoc signs the public proof binary with `nanovm.entitlements`.
 - Failed partial protocol responses are not converted into successful tool
   results.
 - Egress values are omitted from `Debug`; only environment names, mount

@@ -92,6 +92,14 @@ dev-react-example:
 smoke-mcp:
     cargo run --quiet -p nanocodex-examples --bin mcp
 
+# Build the end-to-end VM tool example. macOS VMM executables need the
+# Hypervisor entitlement; signing the built artifact keeps Cargo inputs clean.
+build-vm-example:
+    cargo build -p nanocodex-examples --bin vm-tools --all-features
+    @if [ "$(uname -s)" = "Darwin" ]; then \
+        codesign --entitlements nanovm.entitlements --force --sign - target/debug/vm-tools; \
+    fi
+
 # Start the ephemeral localhost Jaeger backend used by the OTLP trace demo.
 otel-up:
     @docker compose -f docker-compose.otel.yml up --detach

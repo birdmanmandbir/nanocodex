@@ -14,7 +14,7 @@ mod process;
 pub use capabilities::{Capabilities, KrunFeature};
 pub use command::GuestCommand;
 pub use config::{BlockDevice, Network, RootFilesystem, SharedDirectory, VmConfig};
-pub use egress::{EgressError, EgressLease, EgressMount};
+pub use egress::{EgressError, EgressFile, EgressLease, EgressMount};
 pub use gvproxy::{Gvproxy, GvproxyError};
 pub use krun::{KrunVm, KrunVmControl, VmError};
 pub use process::{PrivateVmProcessConfig, VmProcessConfig, VmProcessError};

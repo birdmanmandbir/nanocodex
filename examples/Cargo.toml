@@ -21,9 +21,10 @@ nanovm.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-tungstenite.workspace = true
 tower.workspace = true
+axum.workspace = true
 
 [[bin]]
 name = "minimal"
