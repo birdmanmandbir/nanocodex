@@ -583,6 +583,12 @@ extend the default outer-cell yield deadline while an explicit `@exec` deadline
 still wins. Live shell session IDs remain visible for later `write_stdin`
 calls, and stdout/stderr drains share one bounded completion deadline.
 
+Native applications can keep those workspace tools on the host or replace them
+with one persistent libkrun VM through `nanocodex-vm`. The model-visible
+contracts stay identical; MPP and secret gateways resolve into composable,
+conflict-checked `nanovm::EgressLease` layers. See
+[`docs/VM.md`](docs/VM.md) for the ownership boundary and end-to-end example.
+
 `AgentEvents` is an optional ordered stream independent of `TurnResult`. A TUI,
 server, notebook, or binding can consume all events, select a subset, or drop
 the receiver without changing prompt/result behavior. Libraries emit diagnostic
@@ -604,6 +610,7 @@ cargo run -p nanocodex-examples --bin custom-tool
 cargo run -p nanocodex-examples --bin mcp
 cargo run -p nanocodex-examples --bin fork-conversations
 cargo run -p nanocodex-examples --bin subagents
+cargo run -p nanocodex-examples --bin vm-tools -- ROOTFS
 ```
 
 ## CLI and repository
@@ -817,8 +824,9 @@ methodology, cache observations, raw trials, and reproduction commands.
 Nanocodex currently supports one model family (`gpt-5.6-sol`), one Responses
 WebSocket transport, and caller-defined tools. Sessions and branches live only
 as long as your process. Your application owns sandboxing, permissions,
-durability, and recursive cancellation policy for application-defined child
-agents. Code Mode requires Node.js 12.22 or newer on `PATH`.
+durability, selecting and provisioning optional VM-backed tools, and recursive
+cancellation policy for application-defined child agents. Code Mode requires
+Node.js 12.22 or newer on `PATH`.
 
 That is substantially less product than Codex. It is also much less machinery
 between your code and an agent turn.

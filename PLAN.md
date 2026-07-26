@@ -67,6 +67,10 @@ Crate ownership is fixed:
   transport telemetry.
 - `nanocodex-tools`: code mode, local tools, custom-tool registry, process
   lifecycle, and bounded tool output.
+- `nanovm`: typed libkrun configuration, the audited FFI boundary,
+  provider-neutral egress leases, and private VMM process configuration.
+- `nanocodex-vm`: persistent host/guest tool sessions and standard
+  workspace-tool adapters.
 - `nanocodex-mcp`: stdio/Streamable HTTP clients, background handshake and tool
   discovery, authenticated transports, BM25 search, and deferred Code Mode
   dispatch.

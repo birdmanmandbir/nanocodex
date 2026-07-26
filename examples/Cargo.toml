@@ -16,6 +16,8 @@ eyre.workspace = true
 futures-util.workspace = true
 http.workspace = true
 nanocodex.workspace = true
+nanocodex-vm.workspace = true
+nanovm.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
 serde.workspace = true
@@ -71,6 +73,10 @@ path = "codex_parity_bench.rs"
 [[bin]]
 name = "rollout-resume-bench"
 path = "rollout_resume_bench.rs"
+
+[[bin]]
+name = "vm-tools"
+path = "vm_tools.rs"
 
 [lints]
 workspace = true
