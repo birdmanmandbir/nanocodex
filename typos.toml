@@ -1,6 +1,8 @@
 [files]
 extend-exclude = [
     ".nanocodex/",
+    "crates/nanocodex-browser/assets/axe.js",
+    "crates/nanocodex-browser/assets/react_diagnostics.js",
     "web/public/data/",
     "web/src/data/harness-repository.json",
     "web/worker-configuration.d.ts",
