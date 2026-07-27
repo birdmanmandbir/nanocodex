@@ -193,12 +193,16 @@ provider's credentials.
 - One VM tool session is shared by the complete root-agent tree and retains
   interactive guest processes across sequential turns and subagent calls.
 - Concurrent drivers are multiplexed by request ID; one slow guest command
-  does not block unrelated subagent calls.
+  does not block unrelated subagent calls. Dropping an individual host request
+  sends a targeted cancellation frame, and the guest aborts that request's
+  process group without disturbing sibling work.
 - The last session/tool capability kills its VMM child and releases egress.
   Explicit shutdown first rejects live sibling capabilities, asks the guest to
   cancel in-flight work and sync filesystems, then bounds the wait for exit.
-- Protocol frames are limited to 64 MiB, harness file reads to 32 MiB, and
-  trusted command output to 8 MiB by default. Command timeouts, output-limit
+- Protocol frames are limited to 64 MiB and carry binary fields as base64
+  strings rather than allocation-heavy JSON byte arrays. Harness file reads
+  accept only regular files and are limited to 32 MiB; trusted command output
+  defaults to 8 MiB. Command timeouts, request cancellation, output-limit
   cancellation, guest shutdown, and capability drop terminate process groups,
   including descendants.
 - Egress files are limited to 4 MiB. Mounts and files must be non-overlapping

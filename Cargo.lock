@@ -4538,6 +4538,7 @@ name = "nanocodex-vm"
 version = "0.2.0"
 dependencies = [
  "async-trait",
+ "base64",
  "mpp-egress",
  "nanocodex-tools",
  "nanovm",
