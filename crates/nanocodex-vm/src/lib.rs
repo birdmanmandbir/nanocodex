@@ -1,13 +1,23 @@
+#[cfg(feature = "guest")]
+mod guest;
 mod protocol;
+#[cfg(feature = "host")]
 mod session;
 
-use std::{path::Path, sync::Arc};
+#[cfg(feature = "guest")]
+use std::path::Path;
+#[cfg(feature = "host")]
+use std::sync::Arc;
 
+#[cfg(feature = "host")]
 use nanocodex_tools::{
     StandardTool, Tool, ToolContext, ToolDefinition, ToolInput, ToolResult, Tools, ToolsBuilder,
     UpdatePlanTool,
 };
 
+#[cfg(feature = "guest")]
+pub use guest::VmGuestError;
+#[cfg(feature = "host")]
 pub use session::{
     VmCommand, VmCommandOutput, VmToolSession, VmToolSessionError, VmToolSessionHandle,
 };
@@ -17,6 +27,7 @@ pub use session::{
 /// The concrete client owns transport, guest session routing, cancellation,
 /// and conversion of the guest's typed result into Nanocodex's `ToolResult`.
 #[async_trait::async_trait]
+#[cfg(feature = "host")]
 pub trait VmToolClient: Send + Sync {
     async fn execute(
         &self,
@@ -28,10 +39,12 @@ pub trait VmToolClient: Send + Sync {
 
 /// Clone-cheap factory for the standard tools whose effects belong in a VM.
 #[derive(Clone)]
+#[cfg(feature = "host")]
 pub struct VmTools {
     client: Arc<dyn VmToolClient>,
 }
 
+#[cfg(feature = "host")]
 impl VmTools {
     #[must_use]
     pub fn new(client: impl VmToolClient + 'static) -> Self {
@@ -88,11 +101,13 @@ impl VmTools {
 
 /// One standard Nanocodex tool whose execution is forwarded into a VM.
 #[derive(Clone)]
+#[cfg(feature = "host")]
 pub struct VmTool {
     standard: StandardTool,
     client: Arc<dyn VmToolClient>,
 }
 
+#[cfg(feature = "host")]
 impl VmTool {
     #[must_use]
     pub const fn standard(&self) -> StandardTool {
@@ -101,6 +116,7 @@ impl VmTool {
 }
 
 #[async_trait::async_trait]
+#[cfg(feature = "host")]
 impl Tool for VmTool {
     fn name(&self) -> &'static str {
         self.standard.name()
@@ -123,11 +139,12 @@ impl Tool for VmTool {
 /// # Errors
 ///
 /// Returns an error for malformed protocol messages or guest console I/O.
-pub async fn serve_guest(workspace: impl AsRef<Path>) -> Result<(), VmToolSessionError> {
-    session::serve_guest(workspace.as_ref()).await
+#[cfg(feature = "guest")]
+pub async fn serve_guest(workspace: impl AsRef<Path>) -> Result<(), VmGuestError> {
+    guest::serve(workspace.as_ref()).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "host"))]
 mod tests {
     use std::sync::Mutex;
 

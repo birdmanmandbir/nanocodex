@@ -24,5 +24,6 @@ tempfile.workspace = true
 thiserror.workspace = true
 vm-memory.workspace = true
 
-[lints]
-workspace = true
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
