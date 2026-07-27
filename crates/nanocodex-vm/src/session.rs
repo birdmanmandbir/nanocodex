@@ -24,9 +24,9 @@ use tracing::{Instrument, Span, info, info_span};
 use crate::{
     VmToolClient,
     protocol::{
-        ControlResponse, ExecuteRequest, ExecuteResponse, ReadFileRequest, ReadFileResponse,
-        SessionRequest, SessionResponse, ShutdownRequest, ToolRequest, WireToolContext,
-        WireToolInput, WriteFileRequest,
+        CancelRequest, ControlResponse, ExecuteRequest, ExecuteResponse, ReadFileRequest,
+        ReadFileResponse, SessionRequest, SessionResponse, ShutdownRequest, ToolRequest,
+        WireToolContext, WireToolInput, WriteFileRequest,
     },
 };
 
@@ -759,6 +759,30 @@ impl Drop for PendingRequestGuard {
             && let Some(inner) = self.inner.upgrade()
         {
             lock_unpoisoned(&inner.pending).requests.remove(&self.id);
+            queue_cancel(&inner, self.id);
+        }
+    }
+}
+
+fn queue_cancel(inner: &Arc<VmToolSessionInner>, target_id: u64) {
+    if inner.closing.load(Ordering::Acquire) {
+        return;
+    }
+    let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
+    let request = SessionRequest::Cancel(CancelRequest { id, target_id });
+    let Ok(mut frame) = serde_json::to_vec(&request) else {
+        return;
+    };
+    frame.push(b'\n');
+    match inner.input.try_send(frame) {
+        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+        Err(mpsc::error::TrySendError::Full(frame)) => {
+            let input = inner.input.clone();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    let _ = input.send(frame).await;
+                });
+            }
         }
     }
 }
@@ -871,6 +895,7 @@ fn set_request_id(request: &mut SessionRequest, id: u64) {
         SessionRequest::WriteFile(request) => request.id = id,
         SessionRequest::ReadFile(request) => request.id = id,
         SessionRequest::Execute(request) => request.id = id,
+        SessionRequest::Cancel(request) => request.id = id,
         SessionRequest::Shutdown(request) => request.id = id,
     }
 }
@@ -1115,12 +1140,12 @@ mod tracing_tests {
     }
 
     #[test]
-    fn next_request_discards_a_cancelled_requests_late_response() {
+    fn cancelled_request_sends_targeted_guest_cancellation() {
         let _test_guard = TRACE_TEST_LOCK.lock().unwrap();
-        let first = r#"{"kind":"write_file","payload":{"id":0,"error":null}}"#;
-        let second = r#"{"kind":"write_file","payload":{"id":1,"error":null}}"#;
+        let cancel = r#"{"kind":"cancel","payload":{"id":1,"error":null}}"#;
+        let second = r#"{"kind":"write_file","payload":{"id":2,"error":null}}"#;
         let script = format!(
-            "IFS= read -r first\nsleep 0.05\nprintf '%s\\n' '{first}'\nIFS= read -r second\nprintf '%s\\n' '{second}'"
+            "IFS= read -r first\nIFS= read -r cancel\nprintf '%s\\n' '{cancel}'\nIFS= read -r second\nprintf '%s\\n' '{second}'"
         );
         let mut command = tokio::process::Command::new("/bin/sh");
         command.arg("-c").arg(script);
@@ -1177,10 +1202,10 @@ mod tracing_tests {
     #[test]
     fn cancelled_partial_write_cannot_corrupt_the_next_request() {
         let _test_guard = TRACE_TEST_LOCK.lock().unwrap();
-        let first = r#"{"kind":"write_file","payload":{"id":0,"error":null}}"#;
-        let second = r#"{"kind":"write_file","payload":{"id":1,"error":null}}"#;
+        let cancel = r#"{"kind":"cancel","payload":{"id":1,"error":null}}"#;
+        let second = r#"{"kind":"write_file","payload":{"id":2,"error":null}}"#;
         let script = format!(
-            "sleep 0.05\nIFS= read -r first\nprintf '%s\\n' '{first}'\nIFS= read -r second\nprintf '%s\\n' '{second}'"
+            "sleep 0.05\nIFS= read -r first\nIFS= read -r cancel\nprintf '%s\\n' '{cancel}'\nIFS= read -r second\nprintf '%s\\n' '{second}'"
         );
         let mut command = tokio::process::Command::new("/bin/sh");
         command.arg("-c").arg(script);
