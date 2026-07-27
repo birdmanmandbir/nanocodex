@@ -10,11 +10,15 @@ use std::{
 };
 
 use serde::Serialize;
+#[cfg(target_os = "macos")]
+use std::os::unix::ffi::OsStrExt;
 use thiserror::Error;
 
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
 const API_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_API_RESPONSE_BYTES: usize = 64 * 1024;
+#[cfg(target_os = "macos")]
+const MAX_UNIX_SOCKET_PATH_BYTES: usize = 103;
 
 /// Failure to launch, configure, or communicate with gvproxy.
 #[derive(Debug, Error)]
@@ -39,6 +43,19 @@ pub enum GvproxyError {
     /// Port zero cannot identify a listener created outside gvproxy.
     #[error("host port zero cannot identify the resulting gvproxy listener")]
     UnspecifiedHostPort,
+
+    /// The canonical vfkit socket path cannot fit in `sockaddr_un`.
+    #[error(
+        "canonical gvproxy socket path is {length} bytes, exceeding the {limit}-byte platform limit: {path}"
+    )]
+    NetworkSocketPathTooLong {
+        /// Canonical socket path rejected before starting the VMM.
+        path: PathBuf,
+        /// Path length in bytes.
+        length: usize,
+        /// Maximum path length supported by this platform.
+        limit: usize,
+    },
 
     /// The gvproxy services API returned a non-success response.
     #[error("gvproxy services API returned {status}: {body}")]
@@ -128,9 +145,26 @@ impl Gvproxy {
             thread::sleep(Duration::from_millis(10));
         }
 
+        let canonical_network_socket = match network_socket.canonicalize() {
+            Ok(path) => path,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(GvproxyError::Io(error));
+            }
+        };
+        #[cfg(target_os = "macos")]
+        {
+            if let Err(error) = validate_network_socket_path(&canonical_network_socket) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        }
+
         Ok(Self {
             child,
-            network_socket,
+            network_socket: canonical_network_socket,
             services_socket,
         })
     }
@@ -209,6 +243,19 @@ fn remove_stale_socket(path: &Path) -> Result<(), io::Error> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn validate_network_socket_path(path: &Path) -> Result<(), GvproxyError> {
+    let length = path.as_os_str().as_bytes().len();
+    if length > MAX_UNIX_SOCKET_PATH_BYTES {
+        return Err(GvproxyError::NetworkSocketPathTooLong {
+            path: path.to_owned(),
+            length,
+            limit: MAX_UNIX_SOCKET_PATH_BYTES,
+        });
+    }
+    Ok(())
 }
 
 fn services_request(socket: &Path, path: &str, body: &[u8]) -> Result<(), GvproxyError> {
@@ -299,5 +346,19 @@ mod tests {
             Err(GvproxyError::ApiResponseTooLarge)
         ));
         server.join().unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rejects_network_socket_paths_libkrun_cannot_represent() {
+        let path = PathBuf::from(format!("/{}", "x".repeat(MAX_UNIX_SOCKET_PATH_BYTES)));
+        assert!(matches!(
+            validate_network_socket_path(&path),
+            Err(GvproxyError::NetworkSocketPathTooLong {
+                length,
+                limit: MAX_UNIX_SOCKET_PATH_BYTES,
+                ..
+            }) if length == MAX_UNIX_SOCKET_PATH_BYTES + 1
+        ));
     }
 }

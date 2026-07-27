@@ -1,0 +1,39 @@
+[package]
+name = "nanocodex-browser-vm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Nanocodex browser controller hosted in an isolated libkrun microVM"
+
+[dependencies]
+base64.workspace = true
+nanocodex-browser.workspace = true
+nanovm.workspace = true
+percent-encoding.workspace = true
+reflink-copy.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "browser_vm"
+harness = false
+
+[lints]
+workspace = true

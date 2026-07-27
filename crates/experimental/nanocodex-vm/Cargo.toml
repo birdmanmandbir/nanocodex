@@ -23,15 +23,15 @@ host = [
     "dep:sha2",
     "dep:tempfile",
 ]
-mpp = ["host", "dep:mpp-egress"]
+mpp = ["host", "dep:nanocodex-vm-egress"]
 
 [dependencies]
 arcbox-ext4 = { workspace = true, optional = true }
 async-trait = "0.1.89"
 base64.workspace = true
 fs2 = { workspace = true, optional = true }
-mpp-egress = { workspace = true, optional = true }
-nanocodex-tools = { path = "../../nanocodex-tools", version = "0.2.0", default-features = false }
+nanocodex-tools = { path = "../../nanocodex-tools", version = "0.3.0", default-features = false }
+nanocodex-vm-egress = { workspace = true, optional = true }
 nanovm = { workspace = true, optional = true }
 nix = { workspace = true, optional = true }
 serde.workspace = true

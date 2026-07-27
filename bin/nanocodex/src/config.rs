@@ -9,8 +9,14 @@ use eyre::{Result, WrapErr, eyre};
 use nanocodex::{
     AgentEvents, DurableSession, McpHandle, Nanocodex, OpenAiAuth, OpenAiAuthMode, PricingSnapshot,
     ReasoningMode, Responses, ResponsesHistory, ResponsesTransport, RolloutConfig, SessionId,
-    SessionSnapshot, Thinking, Tools,
+    SessionSnapshot, Thinking, Tools, ToolsBuilder,
 };
+use nanocodex_browser::{
+    BraveSession, Browser, BrowserTool, ReactDiagnostics, VirtualAuthenticator,
+};
+use nanocodex_react::{ReactDoctor, ReactDoctorTool};
+use tracing::warn;
+use url::Url;
 
 use crate::mcp::{ConfiguredMcp, McpArgs};
 use crate::mpp::{MppAdapter, MppArgs};
@@ -92,6 +98,47 @@ pub(crate) struct AgentArgs {
     )]
     subagents: bool,
 
+    /// Expose a managed headless browser in Code Mode.
+    #[arg(long, action = ArgAction::SetTrue)]
+    browser: bool,
+
+    /// Connect the browser tool to a dedicated Chrome `DevTools` endpoint.
+    #[arg(long, value_name = "URL")]
+    browser_cdp: Option<Url>,
+
+    /// Instrument React before app code and expose typed render diagnostics.
+    #[arg(
+        long,
+        env = "NANOCODEX_BROWSER_REACT",
+        default_value_t = true,
+        action = ArgAction::Set
+    )]
+    browser_react: bool,
+
+    /// Expose the Rust-native React source analyzer in Code Mode.
+    #[arg(long, action = ArgAction::SetTrue)]
+    react_doctor: bool,
+
+    /// Expose a managed browser with unattended virtual passkeys in Code Mode.
+    #[arg(long, action = ArgAction::SetTrue)]
+    browser_passkeys: bool,
+
+    /// Seed the managed headless browser with Brave cookies for this origin.
+    #[arg(long = "browser-brave", value_name = "ORIGIN")]
+    browser_brave_origins: Vec<Url>,
+
+    /// Brave profile directory used by `--browser-brave`.
+    #[arg(long, default_value = "Default")]
+    browser_brave_profile: String,
+
+    /// Also clone Brave `localStorage` and `IndexedDB`; requires Brave to be closed.
+    #[arg(
+        long,
+        requires = "browser_brave_origins",
+        action = ArgAction::SetTrue
+    )]
+    browser_brave_site_data: bool,
+
     /// Write Codex-compatible resumable threads beneath `CODEX_HOME`.
     #[arg(
         long,
@@ -164,6 +211,7 @@ impl AgentArgs {
     async fn build_inner(self, durable: Option<DurableSession>) -> Result<ConfiguredAgent> {
         let codex_home = default_codex_home()?;
         let pricing = load_pricing(self.pricing_file.as_deref())?;
+        let mut tools = self.tools_builder()?;
         let responses_transport = self.responses_transport();
         let session = prepare_session_build(self.cwd, self.rollouts, &codex_home, durable)?;
         let mpp_enabled = self.mpp.is_enabled();
@@ -204,9 +252,6 @@ impl AgentArgs {
             responses = responses.http_client(mpp_adapter.responses_http_client()?);
         }
         let responses = responses.build();
-        let mut tools = Tools::builder()
-            .web_search(self.web_search)
-            .image_generation(self.image_generation);
         let mcp = self.mcp.build(&codex_home)?;
         let mcp_handle = mcp.as_ref().map(|mcp| mcp.handle.clone());
         if let Some(ConfiguredMcp { provider, .. }) = mcp {
@@ -259,6 +304,71 @@ impl AgentArgs {
             mpp_adapter,
             mcp: mcp_handle,
         })
+    }
+
+    fn configure_browser_tools(&self, mut tools: ToolsBuilder) -> Result<ToolsBuilder> {
+        let browser = self.build_browser()?;
+        let react_doctor = (self.react_doctor || browser.is_some())
+            .then(|| ReactDoctor::builder(self.cwd()).build())
+            .transpose()?;
+        if let Some(browser) = browser {
+            let prewarming_browser = browser.clone();
+            tokio::spawn(async move {
+                if let Err(error) = prewarming_browser.start().await {
+                    warn!(
+                        target: "nanocodex_browser",
+                        %error,
+                        "background browser startup failed; the first browser action will retry"
+                    );
+                }
+            });
+            tools = tools.tool(BrowserTool::from_browser(browser));
+        }
+        if let Some(react_doctor) = react_doctor {
+            tools = tools.tool(ReactDoctorTool::new(react_doctor));
+        }
+        Ok(tools)
+    }
+
+    fn tools_builder(&self) -> Result<ToolsBuilder> {
+        self.configure_browser_tools(
+            Tools::builder()
+                .web_search(self.web_search)
+                .image_generation(self.image_generation),
+        )
+    }
+
+    fn build_browser(&self) -> Result<Option<Browser>> {
+        let enabled = self.browser
+            || self.browser_cdp.is_some()
+            || self.browser_passkeys
+            || !self.browser_brave_origins.is_empty();
+        if !enabled {
+            return Ok(None);
+        }
+
+        let mut browser = Browser::builder();
+        if let Some(endpoint) = &self.browser_cdp {
+            browser = browser.cdp_endpoint(endpoint.clone());
+        }
+        if self.browser_react {
+            browser = browser.react_diagnostics(ReactDiagnostics::default());
+        }
+        if self.browser_passkeys {
+            browser = browser.virtual_authenticator(VirtualAuthenticator::platform_passkey());
+        }
+        if !self.browser_brave_origins.is_empty() {
+            let mut session =
+                BraveSession::standard()?.profile_directory(&self.browser_brave_profile);
+            for origin in &self.browser_brave_origins {
+                session = session.allow_origin(origin.clone());
+            }
+            if self.browser_brave_site_data {
+                session = session.include_site_data();
+            }
+            browser = browser.brave_session(session);
+        }
+        Ok(Some(browser.build()?))
     }
 }
 
@@ -415,7 +525,7 @@ pub(crate) fn default_codex_home() -> Result<PathBuf> {
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use clap::CommandFactory;
+    use clap::{ArgAction, CommandFactory};
     use nanocodex::OpenAiAuthMode;
 
     use super::{
@@ -520,6 +630,49 @@ mod tests {
             .expect("the CLI should expose the subagents argument");
 
         assert_eq!(subagents.get_default_values(), ["false"]);
+    }
+
+    #[test]
+    fn managed_browser_is_opt_in() {
+        let command = crate::Cli::command();
+        let browser = command
+            .get_arguments()
+            .find(|argument| argument.get_id() == "browser")
+            .expect("the CLI should expose the browser argument");
+
+        assert!(matches!(browser.get_action(), ArgAction::SetTrue));
+        assert!(browser.get_default_values().is_empty());
+
+        let browser_react = command
+            .get_arguments()
+            .find(|argument| argument.get_id() == "browser_react")
+            .expect("the CLI should expose React browser diagnostics");
+        assert!(matches!(browser_react.get_action(), ArgAction::Set));
+        assert_eq!(browser_react.get_default_values(), ["true"]);
+
+        let react_doctor = command
+            .get_arguments()
+            .find(|argument| argument.get_id() == "react_doctor")
+            .expect("the CLI should expose the Rust-native React analyzer");
+        assert!(matches!(react_doctor.get_action(), ArgAction::SetTrue));
+        assert!(react_doctor.get_default_values().is_empty());
+
+        let browser_passkeys = command
+            .get_arguments()
+            .find(|argument| argument.get_id() == "browser_passkeys")
+            .expect("the CLI should expose the browser passkeys argument");
+        assert!(matches!(browser_passkeys.get_action(), ArgAction::SetTrue));
+        assert!(browser_passkeys.get_default_values().is_empty());
+
+        let browser_brave_origins = command
+            .get_arguments()
+            .find(|argument| argument.get_id() == "browser_brave_origins")
+            .expect("the CLI should expose Brave session origins");
+        assert!(matches!(
+            browser_brave_origins.get_action(),
+            ArgAction::Append
+        ));
+        assert!(browser_brave_origins.get_default_values().is_empty());
     }
 
     #[test]

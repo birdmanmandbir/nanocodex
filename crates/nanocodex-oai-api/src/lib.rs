@@ -91,7 +91,7 @@
 //! doing so does not link a network or TLS implementation:
 //!
 //! ```toml
-//! nanocodex-oai-api = { version = "0.2", default-features = false }
+//! nanocodex-oai-api = { version = "0.3", default-features = false }
 //! ```
 
 #![deny(missing_docs, rustdoc::broken_intra_doc_links)]

@@ -246,6 +246,88 @@ Tool schemas, inputs, outputs, errors, and call context are typed; workspace,
 agent-driver, MCP-connection, and process-manager state stay in higher
 implementations.
 
+## Experimental browser and browser VM
+
+`nanocodex-browser` is a standalone deterministic CDP controller. Its typed
+actions cover semantic targeting, actionability, DOM and network inspection,
+screenshots, traces, audits, React diagnostics, passkeys, and replayable
+evidence. The same cloneable `Browser` can be driven directly or wrapped as an
+ordinary tool. The browser and VM crates currently live under
+[`crates/experimental/`](crates/experimental/README.md), where their APIs may
+change while they are exercised against real agents:
+
+```rust,ignore
+use nanocodex_browser::{Browser, BrowserAction, BrowserTool};
+
+let browser = Browser::new()?;
+browser
+    .execute(BrowserAction::Open {
+        url: "https://example.com/".to_owned(),
+    })
+    .await?;
+let browser_tool = BrowserTool::from_browser(browser.clone());
+```
+
+`nanocodex-browser-vm` composes that controller with a headed Chromium process
+inside a libkrun VM. The browser image is prepared once from
+[`crates/experimental/nanocodex-browser-vm/image/Dockerfile`](crates/experimental/nanocodex-browser-vm/image/Dockerfile);
+each session receives a disposable reflink, private gvproxy network, and random
+host-loopback CDP endpoint:
+
+```sh
+just prepare-browser-vm-image .cache/libkrunfw/libkrunfw
+```
+
+The command prints the content-addressed ext4 path. Supposing it printed the
+path from the retained baseline:
+
+```rust,ignore
+use nanocodex_browser::{Browser, ReactDiagnostics};
+use nanocodex_browser_vm::BrowserVm;
+
+let browser = BrowserVm::builder(
+    ".cache/browser-vm/builds/3f3f66dc5c70b2da77323f1ee1f0789b2bd61213c0d7eace6ef6bb2197af1f2d.ext4",
+    "target/release/vm-tools",
+    ".cache/gvproxy/v0.8.9/gvproxy",
+)
+.vmm_arg("--vmm")
+.firmware_directory(".cache/libkrunfw/libkrunfw")
+.browser(
+    Browser::builder()
+        .react_diagnostics(ReactDiagnostics::default()),
+)
+.spawn()
+.await?;
+
+let tools = nanocodex::Tools::builder()
+    .tool(browser.tool())
+    .build()?;
+let _ = tools;
+browser.shutdown().await?;
+```
+
+Authentication state and egress policy remain host configuration rather than
+model inputs. When `nanocodex_browser=info` is enabled, tracing records the
+complete harness configuration, credential-bearing storage, raw DevTools
+messages, actions, and results in order. Operators must protect that backend as
+a copy of the browser session.
+
+## Host-owned VM egress
+
+`nanocodex-vm-egress` turns application payment and secret policy into one
+cloneable `EgressLease`. The VM receives an authenticated proxy capability,
+public CA, and public route configuration. MPP wallets, signing state, secret
+providers, dynamic policy, and revocation stay in the host; resolved values are
+injected only into authorized host-side origin requests.
+
+Secret policy is checked on every request before resolution, so rotation and
+revocation are immediate. MPP `402` handling and secret injection share one
+front proxy; callers never have to choose an unsafe `HTTPS_PROXY` ordering.
+The same lease works with retained workspace VMs and headed browser VMs.
+See [VM-backed tools and egress](docs/VM.md) for the complete API and
+[the retained egress baseline](benchmarks/refactor_egress_baseline_2026-07-26.md)
+for latency, stress, non-disclosure, and live proof evidence.
+
 ## Evaluations
 
 `nanocodex-eval` runs immutable tasks through fresh agent sessions and
@@ -312,16 +394,22 @@ nanocodex                       thin facade, modules, and prelude
 nanocodex-tools-macros          #[tool] implementation
 ```
 
-The monorepo also contains independently useful systems components. VM
-components live under [`crates/experimental/`](crates/experimental/README.md):
+The monorepo also contains independently useful systems components. Components
+marked experimental remain full workspace members with the same test and lint
+gates, but are not part of the stable crates.io release:
 
 | Component | Responsibility |
 | --- | --- |
 | `nanovm` *(experimental)* | Typed libkrun lifecycle, disks, networking, egress capabilities, and shutdown |
 | `nanocodex-vm` *(experimental)* | Bounded retained host/guest RPC and agent tools backed by one VM session tree |
 | `nanovm-image` *(experimental)* | OCI/Dockerfile inputs to content-addressed immutable ext4 disks and attempt reflinks |
+| `nanocodex-browser` *(experimental)* | Deterministic typed CDP controller and ordinary browser tool |
+| `nanocodex-react` | Bounded Rust-native React source diagnostics and tool |
+| `nanocodex-browser-vm` *(experimental)* | A headed browser inside an isolated VM with a private CDP endpoint |
+| `nanocodex-vm-egress` *(experimental)* | One host-owned VM proxy for MPP payment and scoped secret injection |
 | `nanocodex-eval` | Typed tasks, attempts, scheduling, results, and sweeps |
-| `nanocodex-eval-harbor` | Canonical Harbor/ATIF import and export |
+| `nanocodex-eval-harbor` | Canonical Harbor/ATIF projection and published-result reader |
+| `nanocentaur` *(experimental)* | A durable managed-agent service built from the same libraries |
 
 The CLI is a consumer of these libraries. Evaluation is exposed as
 `nanocodex eval ...`; it does not install Nanocodex into every task image or
@@ -377,9 +465,14 @@ Lower-level consumers can depend only on the component they need:
 cargo add nanocodex-oai-api
 cargo add nanocodex-tools
 cargo add nanocodex-agent
+cargo add nanocodex-react
 cargo add nanocodex-eval
 cargo add nanocodex-eval-harbor
 ```
+
+Existing 0.2 consumers can migrate incrementally with the
+[0.3 migration guide](docs/migration-0.3.md). It maps every package move,
+durable-state guarantee, and compatibility surface.
 
 `nanocodex-oai-api` enables its Tower transports and managed session client by
 default. Low-level process components can select its dependency-light contract
@@ -388,14 +481,16 @@ Responses/tool types without linking HTTP, WebSocket, or TLS code. Normal
 native `nanocodex-tools` builds retain MCP, `tool_search`, Code Mode, image
 processing, and remote tools by default.
 
-The experimental VM crates currently track a reviewed libkrun Git checkpoint
-and are not published on crates.io, so Git/path consumers select them
-explicitly:
+Experimental crates are not published on crates.io. Git/path consumers select
+them explicitly while their APIs are being exercised and revised:
 
 ```sh
 cargo add nanovm --git https://github.com/gakonst/nanocodex
 cargo add nanocodex-vm --git https://github.com/gakonst/nanocodex
 cargo add nanovm-image --git https://github.com/gakonst/nanocodex
+cargo add nanocodex-browser --git https://github.com/gakonst/nanocodex
+cargo add nanocodex-browser-vm --git https://github.com/gakonst/nanocodex
+cargo add nanocodex-vm-egress --git https://github.com/gakonst/nanocodex
 ```
 
 The daily-driver CLI is available on macOS and Linux:

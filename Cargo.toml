@@ -10,11 +10,17 @@ members = [
     "crates/nanocodex-eval-harbor",
     "crates/nanocodex-oai-api",
     "crates/nanocodex-observability",
+    "crates/nanocodex-react",
     "crates/nanocodex-service",
     "crates/nanocodex-tools",
     "crates/nanocodex-tools-macros",
     "crates/nanousd",
+    "crates/experimental/nanocentaur",
+    "crates/experimental/nanocentaur-server",
+    "crates/experimental/nanocodex-browser",
+    "crates/experimental/nanocodex-browser-vm",
     "crates/experimental/nanocodex-vm",
+    "crates/experimental/nanocodex-vm-egress",
     "crates/experimental/nanovm",
     "crates/experimental/nanovm-image",
     "examples",
@@ -25,7 +31,7 @@ default-members = ["bin/nanocodex"]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.97"
 authors = ["Nanocodex Contributors"]
@@ -41,17 +47,20 @@ publish = true
 alloy = { version = "2.1.0", default-features = false, features = ["contract", "provider-http", "reqwest", "reqwest-rustls-tls", "rpc-types", "sol-types", "std"] }
 arboard = "3"
 base64 = "0.22.1"
+percent-encoding = "2.3.2"
 async-trait = "0.1.89"
 alloy-primitives = "1.6.1"
 arcbox-ext4 = "0.1.2"
 axum = "0.8.9"
 bm25 = "2.3.2"
 chrono = "0.4.43"
+chromiumoxide = "0.9.1"
 clap = { version = "4.5.54", features = ["derive", "env"] }
 crossterm = { version = "0.28.1", features = ["bracketed-paste", "event-stream"] }
 criterion = { version = "0.7.0", features = ["async_tokio"] }
 dotenvy = "0.15.7"
 eyre = "0.6.12"
+extism = "1.30.0"
 flate2 = "1.1"
 fs2 = "0.4"
 futures-util = "0.3.31"
@@ -63,21 +72,26 @@ hudsucker = { version = "0.25.0", git = "https://github.com/gakonst/hudsucker", 
 ignore = "0.4.31"
 krun = { package = "libkrun", version = "=2.0.0-dev", git = "https://github.com/containers/libkrun", rev = "df85b8b75f55e8ef1b06b5bc18f08dc6d7b5aeb0", features = ["blk", "net"] }
 mpp = { version = "=0.11.0", git = "https://github.com/tempoxyz/mpp-rs", rev = "5caad442edeab796821b7f3bb009ab6945106e35", default-features = false }
-mpp-egress = { version = "0.2.0", path = "crates/mpp-egress" }
-nanocodex = { version = "0.2.0", path = "crates/nanocodex" }
-nanocodex-agent = { version = "0.2.0", path = "crates/nanocodex-agent" }
-nanocodex-core = { version = "0.2.0", path = "crates/nanocodex-core" }
-nanocodex-eval = { version = "0.2.0", path = "crates/nanocodex-eval" }
-nanocodex-eval-harbor = { version = "0.2.0", path = "crates/nanocodex-eval-harbor" }
-nanocodex-oai-api = { version = "0.2.0", path = "crates/nanocodex-oai-api", default-features = false }
-nanocodex-observability = { version = "0.2.0", path = "crates/nanocodex-observability" }
-nanocodex-service = { version = "0.2.0", path = "crates/nanocodex-service" }
-nanocodex-tools = { version = "0.2.0", path = "crates/nanocodex-tools" }
-nanocodex-tools-macros = { version = "0.2.0", path = "crates/nanocodex-tools-macros" }
-nanocodex-vm = { version = "0.2.0", path = "crates/experimental/nanocodex-vm" }
-nanousd = { version = "0.2.0", path = "crates/nanousd" }
-nanovm = { version = "0.2.0", path = "crates/experimental/nanovm" }
-nanovm-image = { version = "0.2.0", path = "crates/experimental/nanovm-image" }
+mpp-egress = { version = "0.3.0", path = "crates/mpp-egress" }
+nanocentaur = { version = "0.3.0", path = "crates/experimental/nanocentaur", default-features = false }
+nanocodex = { version = "0.3.0", path = "crates/nanocodex" }
+nanocodex-agent = { version = "0.3.0", path = "crates/nanocodex-agent" }
+nanocodex-browser = { version = "0.3.0", path = "crates/experimental/nanocodex-browser" }
+nanocodex-browser-vm = { version = "0.3.0", path = "crates/experimental/nanocodex-browser-vm" }
+nanocodex-core = { version = "0.3.0", path = "crates/nanocodex-core" }
+nanocodex-eval = { version = "0.3.0", path = "crates/nanocodex-eval" }
+nanocodex-eval-harbor = { version = "0.3.0", path = "crates/nanocodex-eval-harbor" }
+nanocodex-oai-api = { version = "0.3.0", path = "crates/nanocodex-oai-api", default-features = false }
+nanocodex-observability = { version = "0.3.0", path = "crates/nanocodex-observability" }
+nanocodex-react = { version = "0.3.0", path = "crates/nanocodex-react" }
+nanocodex-service = { version = "0.3.0", path = "crates/nanocodex-service" }
+nanocodex-tools = { version = "0.3.0", path = "crates/nanocodex-tools" }
+nanocodex-tools-macros = { version = "0.3.0", path = "crates/nanocodex-tools-macros" }
+nanocodex-vm = { version = "0.3.0", path = "crates/experimental/nanocodex-vm" }
+nanocodex-vm-egress = { version = "0.3.0", path = "crates/experimental/nanocodex-vm-egress", default-features = false }
+nanousd = { version = "0.3.0", path = "crates/nanousd" }
+nanovm = { version = "0.3.0", path = "crates/experimental/nanovm" }
+nanovm-image = { version = "0.3.0", path = "crates/experimental/nanovm-image" }
 oci-client = { version = "0.17.0", default-features = false, features = ["rustls-tls"] }
 rand = "0.9.2"
 regex = "1"
@@ -94,13 +108,18 @@ opentelemetry = { version = "0.32", features = ["trace"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-client", "trace"] }
 opentelemetry-semantic-conventions = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["experimental_trace_batch_span_processor_with_async_runtime", "rt-tokio", "trace"] }
+oxc_allocator = "=0.141.0"
+oxc_ast = "=0.141.0"
+oxc_ast_visit = "=0.141.0"
+oxc_parser = "=0.141.0"
+oxc_span = "=0.141.0"
 pyo3 = "0.29.0"
 proc-macro-crate = "3"
 proc-macro2 = "1.0.106"
 quote = "1.0.46"
 ratatui = { version = "0.29.0", features = ["unstable-rendered-line-info"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "query", "rustls"] }
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.38", features = ["backup", "bundled"] }
 rquickjs = "0.12.1"
 rmcp = { version = "1.8.0", default-features = false, features = ["auth", "client", "reqwest-tls-no-provider", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 oauth2 = { version = "5.0", default-features = false }
@@ -116,6 +135,7 @@ shlex = "2.0.1"
 simd-json = "=0.15.1"
 smallvec = { version = "1.15.1", features = ["serde"] }
 sonic-rs = "0.5.8"
+sourcemap = "9.3.2"
 sysinfo = { version = "0.37.2", default-features = false, features = ["system"] }
 syn = { version = "2.0.119", features = ["full"] }
 thiserror = "2.0.17"
@@ -134,6 +154,7 @@ unicode-segmentation = "1.13"
 unicode-width = "0.2"
 url = "2.5.7"
 uuid = { version = "1", features = ["js", "serde", "v7"] }
+v8-heap-parser = "1.1.0"
 vergen = { version = "8", default-features = false }
 wasm-bindgen = "0.2.105"
 wasm-bindgen-futures = "0.4.55"

@@ -7,10 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-### Features
+## [0.3.0](https://github.com/gakonst/nanocodex/releases/tag/v0.3.0) - 2026-07-26
 
-- [vm] Add persistent VM-backed workspace tools, composable egress leases, and
-  an MPP proxy layer.
+### Changed
+
+- Split the runtime into reusable OpenAI, tools, agent, VM, browser, egress,
+  evaluation, and managed-service components behind a thin `nanocodex` facade.
+- Consolidate Nanoeval and Nanocentaur into the monorepo without removing their
+  supported workflows.
+- Add complete init4-style tracing, exact token usage, versioned USD estimates,
+  and recorded performance budgets across the stack.
+- Publish `nanocodex-eval` and `nanocodex-eval-harbor` in dependency order.
+
+See the [0.3 migration guide](docs/migration-0.3.md) for crate and API moves.
 
 ## [0.2.0](https://github.com/gakonst/nanocodex/releases/tag/v0.2.0) - 2026-07-26
 

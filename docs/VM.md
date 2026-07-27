@@ -6,7 +6,7 @@ execute. The default `Tools` selection runs `exec_command`, `write_stdin`,
 replace those handlers with one persistent libkrun VM without changing their
 model-visible names or schemas.
 
-Three packages own the boundary:
+Four packages own the boundary:
 
 - `nanovm` owns typed libkrun configuration, the small audited FFI boundary,
   private VMM process configuration, gvproxy lifecycle, and provider-neutral
@@ -17,9 +17,12 @@ Three packages own the boundary:
 - `nanocodex-vm` owns the typed host/guest tool protocol, retained guest shell
   sessions, bounded VMM process ownership, and adapters for
   Nanocodex's standard workspace tools.
+- `nanocodex-vm-egress` owns the standalone host proxy that composes MPP
+  payment with policy-scoped secret injection and projects it as one neutral
+  `EgressLease`.
 
-These packages do not own application policy, agent identity, payment limits,
-secret resolution, or the choice to enable VM tools.
+Applications still choose agent identity, route policy, payment limits, secret
+providers, and whether to enable VM tools.
 
 ## Preparing immutable images
 
@@ -145,57 +148,123 @@ capturing `VmTools` in a driver factory is sufficient for the complete agent
 tree. Graceful shutdown fails while sibling capabilities remain; drop the
 agents, tool registries, and cloned handles before calling it.
 
+Host-owned tools compose on top of that boundary. For example, one `Browser`
+can be cloned into the same factory while every workspace tool continues to
+target the shared VM:
+
+```rust,no_run
+# use nanocodex::{Nanocodex, OpenAiAuth};
+# use nanocodex_browser::{Browser, BrowserTool};
+# use nanocodex_vm::VmToolSession;
+# fn build(auth: OpenAiAuth, session: VmToolSession, browser: Browser) -> nanocodex::Result<()> {
+let vm = session.tools();
+let (agent, events) = Nanocodex::builder(auth)
+    .tools_factory(move |_agent| {
+        vm.tools_builder()
+            .working_directory("/workspace")
+            .tool(BrowserTool::from_browser(browser.clone()))
+            .build()
+    })
+    .build()?;
+# drop((agent, events));
+# Ok(())
+# }
+```
+
+This keeps browser lifecycle, authentication state, and CDP policy on the host
+while `exec_command`, `write_stdin`, `apply_patch`, and `view_image` share one
+guest runtime across the root agent and its subagents.
+
 ## Configurable egress
 
-`EgressLease` is the VM-facing output of application policy. A layer may
-contribute:
+`EgressLease` is a provider-neutral VM capability. It can carry:
 
 - a network mode;
 - guest environment such as an authenticated `HTTP_PROXY`/`HTTPS_PROXY`;
-- read-only provider directories and public guest configuration files; and
+- read-only mounts and public configuration such as a proxy CA; and
 - lifecycle guards that keep revocable host services alive for the VM.
 
-Independent provider layers compose transactionally:
+Compatible leases compose transactionally and conflicting environment, mount,
+file, or network claims fail closed. Application code normally receives a
+complete lease from `nanocodex-vm-egress` rather than assembling proxy values
+itself.
+
+### One host proxy for MPP and secrets
+
+`VmEgress` owns one authenticated HTTP(S) front proxy. Requests with no secret
+route use its ordinary MPP path: a `402` is paid and the exact bounded request
+is replayed by the host. A configured route first authorizes identity, origin,
+method, and path, then resolves and injects its secret on the host. The guest
+receives the route's public base URL, proxy capability, and public CA. The
+egress layer never puts the resolved value or payment provider in that
+configuration.
 
 ```rust,no_run
-use nanovm::{EgressFile, EgressLease, EgressMount};
 use std::sync::Arc;
 
-# fn configure() -> Result<EgressLease, nanovm::EgressError> {
-let mut mpp = EgressLease::internet();
-mpp.insert_environment(
-    "HTTPS_PROXY",
-    "http://mpp-lease:credential@host.internal:8080",
-)?;
-mpp.insert_file(EgressFile::new(
-    "/tmp/nanocodex/egress/mpp/ca.pem",
-    b"public CA bytes".to_vec(),
-    0o444,
-))?;
+use mpp::client::MultiProvider;
+use nanocodex_vm_egress::{
+    CompositeSecretManager, EgressContext, EnvironmentSecretManager,
+    SecretDelivery, SecretGuestConfig, SecretHttpMethod, SecretRef,
+    SecretRequestRule, SecretSpec, StaticSecretPolicy, VmEgress,
+};
 
-let mut secrets = EgressLease::internet();
-secrets.insert_environment(
-    "NANOCENTAUR_SECRET_BASE_URL",
-    "https://secret-gateway.internal/v1",
-)?;
-secrets.insert_mount(EgressMount::read_only(
-    "secret-ca",
-    "/host/secret-ca",
-    "/tmp/nanocodex/egress/secrets/ca",
-))?;
-secrets.retain(Arc::new(())); // the real layer retains its proxy lease
+# async fn configure() -> Result<(), Box<dyn std::error::Error>> {
+// The host variable is NANOCODEX_SECRET_OPENAI_API_KEY. It is read again for
+// every authorized request, so rotation needs no guest restart.
+let manager = CompositeSecretManager::new().provider(
+    "environment",
+    Arc::new(EnvironmentSecretManager::new("NANOCODEX_SECRET_")),
+);
+let openai = SecretSpec::builder(
+    "openai-responses",
+    SecretRef::new("environment", "OPENAI_API_KEY"),
+    "https://api.openai.com",
+    SecretDelivery::inject_header("authorization", "Bearer "),
+    SecretGuestConfig::new("OPENAI_BASE_URL"),
+)
+.rule(
+    SecretRequestRule::new()
+        .method(SecretHttpMethod::Post)
+        .path_prefix("/v1/responses"),
+)
+.build()?;
 
-EgressLease::internet()
-    .with_layer(mpp)?
-    .with_layer(secrets)
+// The empty provider rejects 402 challenges. Add a concrete provider with
+// `MultiProvider::with` when this VM may spend through MPP.
+let egress = VmEgress::builder(MultiProvider::new())
+    .secrets(
+        EgressContext::new(
+            "agent-019c-0000-7000-8000-000000000001",
+            "service:nanocodex-local",
+        ),
+        Arc::new(StaticSecretPolicy::new([openai])),
+        Arc::new(manager),
+    )
+    .spawn()
+    .await?;
+let lease = egress.lease();
+
+assert_eq!(
+    lease.guest_environment().get("OPENAI_BASE_URL"),
+    Some(&"https://api.openai.com".to_owned()),
+);
+assert!(
+    !lease
+        .guest_environment()
+        .contains_key("NANOCODEX_SECRET_OPENAI_API_KEY"),
+);
+
+drop(lease);
+egress.shutdown().await?;
+# Ok(())
 # }
 ```
 
 `VmToolSession::spawn_configured` consumes the complete lease and applies it to
 both launch configuration and retained session state. This selects the network,
 attaches provider directories read-only, mounts them before the guest runtime
-starts, injects only the resolved guest environment, provisions public files,
-and retains every provider guard:
+starts, installs public files, and retains every provider guard:
 
 ```rust,no_run
 # use nanocodex_vm::VmToolSession;
@@ -222,27 +291,24 @@ a process-start race. Lower-level `configure`, `write_private`, `spawn`, and
 `provision_egress` operations remain available for specialized launchers, but
 the application must then preserve the same ownership ordering itself.
 
-### MPP and secret proxy layers
+`StaticSecretPolicy` is the standalone immutable implementation. Managed
+applications implement `SecretPolicy`; it is queried for every request, so
+route revocation is immediate. `SecretManager` has file, environment,
+heterogeneous composite, 1Password Connect, and optional 1Password SDK
+implementations. Header injection and placeholder replacement are the only
+credential-delivery modes. Redirects are disabled, ambiguous routes and
+transport-owned headers are rejected, and configured-origin method or path
+misses fail even when unrelated MPP traffic is allowed.
 
-The MPP provider remains a host-owned HTTP(S) proxy. Its layer points the guest
-at that proxy, provisions its public interception CA, and retains the
-wallet/proxy guard. Ordinary guest commands such as `curl` therefore receive a
-`402` through the proxy; the host pays and replays the exact bounded request
-without exposing the wallet to the VM. Enable `nanocodex-vm`'s `mpp` feature
-and pass an `Arc<MppEgress>` to `mpp_egress_layer` to produce that
-configuration.
+Existing direct MPP consumers remain supported: `MppEgress::start` and
+`mpp_egress_layer(Arc<MppEgress>)` still produce the same lease without secret
+policy. New code that needs both capabilities uses `VmEgress` so the guest has
+one unambiguous `HTTPS_PROXY`.
 
-NanoCentaur's Iron/secret egress follows the same contract: its layer carries
-the scoped proxy or gateway route, public CA/configuration files, placeholders,
-and revocable lease guard. Resolved secrets remain host-side and must never be
-placed in an `EgressFile`.
-
-A guest process can have only one value for `HTTPS_PROXY`. If two independently
-started providers both claim the front-proxy variables, lease composition
-fails closed. An application that needs both proxies on one request path must
-chain or route them host-side and expose one front proxy to the guest. The VM
-package deliberately does not guess proxy order or silently overwrite one
-provider's credentials.
+`BrowserVm` consumes the same lease. It rewrites the host-loopback proxy
+through gvproxy, installs the public CA into Chromium's system and NSS trust,
+and uses a VM-owned extension that answers only proxy authentication
+challenges. Origin authentication prompts never receive the proxy capability.
 
 ## Lifecycle and security
 

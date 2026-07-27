@@ -1,0 +1,1056 @@
+use std::{
+    convert::Infallible,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use axum::{
+    Json, Router,
+    body::{Body, to_bytes},
+    extract::{Path, Query, Request, State},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
+    middleware::{self, Next},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
+    routing::{any, get, post},
+};
+use futures_util::stream;
+use serde::{Deserialize, Serialize};
+use tracing::Instrument;
+
+use crate::{
+    AdminAuthorizer, AgentManager, AuthorizationError, CreateAgent, CreateAgentResponse,
+    CreateTurn, MAX_SECRET_GATEWAY_REQUEST_BYTES, ManagerError, PaymentError, PaymentGate,
+    PaymentOutcome, PolicyError, PolicyStore, SecretGateway, SecretGatewayError, TurnAction,
+    TurnView, require,
+};
+
+/// Application-owned components shared by the REST and SSE handlers.
+///
+/// Fields remain private so queueing, policy, payment, and secret mechanics
+/// cannot be replaced after the router starts.
+pub struct ApiState {
+    pub(crate) manager: Arc<AgentManager>,
+    pub(crate) policy: Arc<PolicyStore>,
+    pub(crate) admin: Arc<AdminAuthorizer>,
+    pub(crate) payments: Arc<dyn PaymentGate>,
+    pub(crate) secrets: Arc<SecretGateway>,
+}
+
+impl ApiState {
+    /// Creates the complete managed HTTP boundary from application-owned
+    /// lifecycle, policy, authorization, payment, and secret components.
+    #[must_use]
+    pub fn new(
+        manager: Arc<AgentManager>,
+        policy: Arc<PolicyStore>,
+        admin: Arc<AdminAuthorizer>,
+        payments: Arc<dyn PaymentGate>,
+        secrets: Arc<SecretGateway>,
+    ) -> Self {
+        Self {
+            manager,
+            policy,
+            admin,
+            payments,
+            secrets,
+        }
+    }
+
+    /// Builds the REST/SSE router owned by this state.
+    pub fn router(self) -> Router {
+        app(Arc::new(self))
+    }
+}
+
+/// Builds the Nanocentaur REST/SSE router around shared application state.
+pub fn app(state: Arc<ApiState>) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/v1/agent/new", post(create_agent))
+        .route("/v1/agent/{agent_id}", get(get_agent).delete(delete_agent))
+        .route("/v1/agent/{agent_id}/turn", post(create_turn))
+        .route("/v1/agent/{agent_id}/turn/{turn_id}", get(get_turn))
+        .route(
+            "/v1/agent/{agent_id}/turn/{turn_id}/cancel",
+            post(cancel_turn),
+        )
+        .route("/v1/agent/{agent_id}/events", get(agent_events))
+        .route("/v1/agent/{agent_id}/fork", post(fork_latest))
+        .route(
+            "/v1/agent/{agent_id}/turn/{turn_id}/fork",
+            post(fork_from_turn),
+        )
+        .route("/v1/agent/{agent_id}/evict", post(evict_agent))
+        .route("/v1/payment-sessions", post(payment_session))
+        .route(
+            "/internal/v1/secret-egress/{lease_token}/{secret_id}",
+            any(secret_gateway_root),
+        )
+        .route(
+            "/internal/v1/secret-egress/{lease_token}/{secret_id}/{*path}",
+            any(secret_gateway_path),
+        )
+        .merge(crate::admin::routes())
+        .layer(middleware::from_fn(trace_request))
+        .with_state(state)
+}
+
+async fn trace_request(request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+    let headers = request.headers().clone();
+    let span = tracing::info_span!(
+        parent: None,
+        "nanocentaur.http.request",
+        otel.kind = "server",
+        http.request.method = %method,
+        url.path = %uri.path(),
+        http.response.status_code = tracing::field::Empty,
+        duration_ns = tracing::field::Empty,
+    );
+    async move {
+        tracing::info!(
+            target: "nanocentaur::observed",
+            http_request_uri = %uri,
+            http_request_headers = ?headers,
+            "http request observed"
+        );
+        let started = Instant::now();
+        let response = next.run(request).await;
+        tracing::Span::current().record("http.response.status_code", response.status().as_u16());
+        tracing::Span::current().record(
+            "duration_ns",
+            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
+        response
+    }
+    .instrument(span)
+    .await
+}
+
+#[derive(Serialize)]
+struct HealthResponse {
+    status: HealthStatus,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum HealthStatus {
+    Ok,
+}
+
+async fn health() -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: HealthStatus::Ok,
+    })
+}
+
+async fn secret_gateway_root(
+    State(state): State<Arc<ApiState>>,
+    Path((lease_token, secret_id)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    secret_gateway_request(state, lease_token, secret_id, String::new(), request).await
+}
+
+async fn secret_gateway_path(
+    State(state): State<Arc<ApiState>>,
+    Path((lease_token, secret_id, path)): Path<(String, String, String)>,
+    request: Request,
+) -> Response {
+    secret_gateway_request(state, lease_token, secret_id, path, request).await
+}
+
+async fn secret_gateway_request(
+    state: Arc<ApiState>,
+    lease_token: String,
+    secret_id: String,
+    path: String,
+    request: Request,
+) -> Response {
+    let (parts, body) = request.into_parts();
+    let body = match to_bytes(body, MAX_SECRET_GATEWAY_REQUEST_BYTES).await {
+        Ok(body) => body.to_vec(),
+        Err(_) => return secret_gateway_error(&SecretGatewayError::RequestTooLarge),
+    };
+    tracing::info!(
+        target: "nanocentaur::observed",
+        secret_gateway_lease_token = %lease_token,
+        secret_gateway_secret_id = %secret_id,
+        secret_gateway_path = %path,
+        http_request_body = ?body,
+        "scoped secret gateway request observed"
+    );
+    match state
+        .secrets
+        .forward(
+            &lease_token,
+            &secret_id,
+            &path,
+            axum::http::Request::from_parts(parts, body),
+        )
+        .await
+    {
+        Ok(response) => {
+            let (parts, body) = response.into_parts();
+            Response::from_parts(parts, Body::from(body))
+        }
+        Err(error) => secret_gateway_error(&error),
+    }
+}
+
+fn secret_gateway_error(error: &SecretGatewayError) -> Response {
+    tracing::warn!(
+        status = error.status_code().as_u16(),
+        kind = error.kind(),
+        "secret gateway request rejected"
+    );
+    (
+        error.status_code(),
+        Json(SecretGatewayErrorBody {
+            error: SecretGatewayErrorCode::SecretGatewayRequestFailed,
+        }),
+    )
+        .into_response()
+}
+
+#[derive(Serialize)]
+struct SecretGatewayErrorBody {
+    error: SecretGatewayErrorCode,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SecretGatewayErrorCode {
+    SecretGatewayRequestFailed,
+}
+
+async fn create_agent(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    Json(request): Json<CreateAgent>,
+) -> Result<Response, ApiError> {
+    tracing::info!(
+        target: "nanocentaur::observed",
+        request = ?request,
+        "create agent request observed"
+    );
+    let client = state.policy.authenticate(&headers)?;
+    let (identity, created) = state
+        .policy
+        .create_or_resolve_agent(&client, request.context_key.as_deref())?;
+    let view = state.manager.register(identity).await?;
+    let response = CreateAgentResponse {
+        agent_id: view.agent_id,
+        created,
+        state: view.state,
+    };
+    Ok((
+        if created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(response),
+    )
+        .into_response())
+}
+
+async fn get_agent(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    Path(agent_id): Path<String>,
+) -> Result<Json<crate::AgentView>, ApiError> {
+    let (identity, _) = authorize_agent(&state, &headers, &agent_id, "agent.read")?;
+    Ok(Json(state.manager.get(identity).await?))
+}
+
+async fn delete_agent(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    Path(agent_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let (identity, client) = authorize_agent(&state, &headers, &agent_id, "agent.delete")?;
+    if state.manager.get(identity).await?.state == crate::AgentStatus::Running {
+        return Err(ManagerError::AgentBusy.into());
+    }
+    state.manager.delete(&agent_id).await?;
+    state.policy.delete_agent(&client, &agent_id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn create_turn(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    Path(agent_id): Path<String>,
+    Json(request): Json<CreateTurn>,
+) -> Result<Response, ApiError> {
+    tracing::info!(
+        target: "nanocentaur::observed",
+        agent_id = %agent_id,
+        request = ?request,
+        "create turn request observed"
+    );
+    let (identity, _) = authorize_agent(&state, &headers, &agent_id, "agent.turn")?;
+    let idempotency_key = idempotency_key(&headers)?;
+    if let Some(key) = idempotency_key.as_deref()
+        && let Some(response) = state
+            .manager
+            .find_turn_by_idempotency_key(identity.clone(), key)
+            .await?
+    {
+        return Ok(Json(response).into_response());
+    }
+
+    let receipt = match state.payments.authorize(&headers).await? {
+        PaymentOutcome::Authorized(receipt) => receipt,
+        outcome => return payment_response(outcome),
+    };
+    let response = state
+        .manager
+        .create_turn(identity, request, idempotency_key)
+        .await?;
+    let status = match response.action {
+        TurnAction::Steered => StatusCode::OK,
+        TurnAction::Started | TurnAction::Queued => StatusCode::ACCEPTED,
+    };
+    let mut response = (status, Json(response)).into_response();
+    insert_receipt(&mut response, &receipt.header_value)?;
+    Ok(response)
+}
+
+async fn get_turn(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    Path((agent_id, turn_id)): Path<(String, String)>,
+) -> Result<Json<TurnView>, ApiError> {
+    let (identity, _) = authorize_agent(&state, &headers, &agent_id, "agent.read")?;
+    Ok(Json(state.manager.get_turn(identity, &turn_id).await?))
+}
+
+#[derive(Default, Deserialize)]
+struct EventsQuery {
+    after_event_id: Option<u64>,
+}
+
+async fn agent_events(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    Path(agent_id): Path<String>,
+    Query(query): Query<EventsQuery>,
+) -> Result<Response, ApiError> {
+    let (identity, _) = authorize_agent(&state, &headers, &agent_id, "agent.read")?;
+    let after_event_id = last_event_id(&headers)?
+        .or(query.after_event_id)
+        .unwrap_or(0);
+    let cursor = state.manager.events(identity, after_event_id).await?;
+    let output = stream::unfold(Some(cursor), |cursor| async move {
+        let mut cursor = cursor?;
+        let event = cursor.next().await?;
+        let sse = Event::default()
+            .id(event.id.to_string())
+            .event(event.payload.event_name())
+            .json_data(&event)
+            .unwrap_or_else(|_| Event::default().event("stream.error").data("{}"));
+        Some((Ok::<Event, Infallible>(sse), Some(cursor)))
+    });
+    Ok(Sse::new(output)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keepalive"),
+        )
+        .into_response())
+}
+
+#[derive(Serialize)]
+struct CancelTurnResponse {
+    cancel_requested: bool,
+}
+
+async fn cancel_turn(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    Path((agent_id, turn_id)): Path<(String, String)>,
+) -> Result<Json<CancelTurnResponse>, ApiError> {
+    let (identity, _) = authorize_agent(&state, &headers, &agent_id, "agent.cancel")?;
+    let cancelled = state.manager.cancel_turn(identity, &turn_id).await?;
+    Ok(Json(CancelTurnResponse {
+        cancel_requested: cancelled,
+    }))
+}
+
+#[derive(Serialize)]
+struct EvictAgentResponse {
+    evicted: bool,
+}
+
+async fn evict_agent(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    Path(agent_id): Path<String>,
+) -> Result<Json<EvictAgentResponse>, ApiError> {
+    let (identity, _) = authorize_agent(&state, &headers, &agent_id, "agent.evict")?;
+    let evicted = state.manager.evict(identity).await?;
+    Ok(Json(EvictAgentResponse { evicted }))
+}
+
+async fn fork_latest(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    Path(agent_id): Path<String>,
+) -> Result<Response, ApiError> {
+    fork_agent(&state, &headers, &agent_id, None).await
+}
+
+async fn fork_from_turn(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    Path((agent_id, turn_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    fork_agent(&state, &headers, &agent_id, Some(&turn_id)).await
+}
+
+async fn fork_agent(
+    state: &ApiState,
+    headers: &HeaderMap,
+    agent_id: &str,
+    turn_id: Option<&str>,
+) -> Result<Response, ApiError> {
+    let (source, client) = authorize_agent(state, headers, agent_id, "agent.fork")?;
+    let target = state.policy.fork_agent(&client, agent_id)?;
+    match state.manager.fork(source, target.clone(), turn_id).await {
+        Ok(response) => Ok((StatusCode::CREATED, Json(response)).into_response()),
+        Err(error) => {
+            if let Err(cleanup_error) = state.policy.delete_agent(&client, &target.id) {
+                tracing::warn!(%cleanup_error, "failed to clean up fork registry record");
+            }
+            Err(error.into())
+        }
+    }
+}
+
+async fn payment_session(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let _ = state.policy.authenticate(&headers)?;
+    payment_response(state.payments.authorize(&headers).await?)
+}
+
+fn authorize_agent(
+    state: &ApiState,
+    headers: &HeaderMap,
+    agent_id: &str,
+    permission: &str,
+) -> Result<(crate::AgentIdentity, crate::AuthenticatedClient), ApiError> {
+    let client = state.policy.authenticate(headers)?;
+    let identity = state.policy.agent(&client, agent_id)?;
+    require(&identity.principal, permission)?;
+    Ok((identity, client))
+}
+
+fn payment_response(outcome: PaymentOutcome) -> Result<Response, ApiError> {
+    match outcome {
+        PaymentOutcome::Challenge { www_authenticate } => {
+            let mut response = (
+                StatusCode::PAYMENT_REQUIRED,
+                Json(ErrorResponse::new(
+                    "payment_required",
+                    "payment authorization required",
+                )),
+            )
+                .into_response();
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                HeaderValue::from_str(&www_authenticate).map_err(|_| ApiError::Internal)?,
+            );
+            Ok(response)
+        }
+        PaymentOutcome::Management { body, receipt } => {
+            let mut response = Json(body).into_response();
+            insert_receipt(&mut response, &receipt.header_value)?;
+            Ok(response)
+        }
+        PaymentOutcome::Authorized(receipt) => {
+            let mut response = StatusCode::NO_CONTENT.into_response();
+            insert_receipt(&mut response, &receipt.header_value)?;
+            Ok(response)
+        }
+    }
+}
+
+fn insert_receipt(response: &mut Response, value: &str) -> Result<(), ApiError> {
+    response.headers_mut().insert(
+        HeaderName::from_static("payment-receipt"),
+        HeaderValue::from_str(value).map_err(|_| ApiError::Internal)?,
+    );
+    Ok(())
+}
+
+fn idempotency_key(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    optional_header(headers, "idempotency-key", "Idempotency-Key")
+}
+
+fn last_event_id(headers: &HeaderMap) -> Result<Option<u64>, ApiError> {
+    optional_header(headers, "last-event-id", "Last-Event-ID")?
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|_| ApiError::BadHeader("Last-Event-ID"))
+        })
+        .transpose()
+}
+
+fn optional_header(
+    headers: &HeaderMap,
+    header_name: &'static str,
+    display_name: &'static str,
+) -> Result<Option<String>, ApiError> {
+    headers
+        .get(header_name)
+        .map(|value| {
+            value
+                .to_str()
+                .map(str::to_owned)
+                .map_err(|_| ApiError::BadHeader(display_name))
+        })
+        .transpose()
+}
+
+pub(crate) enum ApiError {
+    Authorization(AuthorizationError),
+    Policy(PolicyError),
+    Manager(ManagerError),
+    Payment(PaymentError),
+    BadHeader(&'static str),
+    Internal,
+}
+
+impl From<AuthorizationError> for ApiError {
+    fn from(error: AuthorizationError) -> Self {
+        Self::Authorization(error)
+    }
+}
+
+impl From<PolicyError> for ApiError {
+    fn from(error: PolicyError) -> Self {
+        Self::Policy(error)
+    }
+}
+
+impl From<ManagerError> for ApiError {
+    fn from(error: ManagerError) -> Self {
+        Self::Manager(error)
+    }
+}
+
+impl From<PaymentError> for ApiError {
+    fn from(error: PaymentError) -> Self {
+        Self::Payment(error)
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, code, message) = match self {
+            Self::Authorization(AuthorizationError::Unauthenticated)
+            | Self::Policy(PolicyError::Unauthenticated) => (
+                StatusCode::UNAUTHORIZED,
+                "unauthenticated",
+                "authentication required",
+            ),
+            Self::Policy(PolicyError::Forbidden) => (
+                StatusCode::FORBIDDEN,
+                "permission_denied",
+                "permission denied",
+            ),
+            Self::Policy(PolicyError::NotFound) | Self::Manager(ManagerError::NotFound) => {
+                (StatusCode::NOT_FOUND, "not_found", "resource not found")
+            }
+            Self::Manager(ManagerError::SteerQueueFull) => (
+                StatusCode::CONFLICT,
+                "steer_queue_full",
+                "active turn steering queue is full",
+            ),
+            Self::Manager(ManagerError::AgentBusy) => (
+                StatusCode::CONFLICT,
+                "agent_busy",
+                "agent must be idle for this operation",
+            ),
+            Self::Manager(ManagerError::ForkBoundaryNotFound) => (
+                StatusCode::CONFLICT,
+                "fork_boundary_not_found",
+                "completed fork boundary was not found",
+            ),
+            Self::Manager(ManagerError::Invalid(message))
+            | Self::Policy(PolicyError::Invalid(message)) => {
+                (StatusCode::BAD_REQUEST, "invalid_request", message)
+            }
+            Self::Payment(PaymentError::InvalidCredential) => (
+                StatusCode::PAYMENT_REQUIRED,
+                "invalid_payment",
+                "invalid payment credential",
+            ),
+            Self::Payment(PaymentError::Configuration(_) | PaymentError::Verification(_))
+            | Self::Policy(
+                PolicyError::Poisoned
+                | PolicyError::Database(_)
+                | PolicyError::Json(_)
+                | PolicyError::Io(_),
+            )
+            | Self::Manager(
+                ManagerError::ActorStopped
+                | ManagerError::Durability(_)
+                | ManagerError::Agent(_)
+                | ManagerError::Io(_),
+            )
+            | Self::Authorization(AuthorizationError::InvalidConfiguration(_))
+            | Self::Internal => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "internal server error",
+            ),
+            Self::BadHeader(name) => (StatusCode::BAD_REQUEST, "invalid_header", name),
+        };
+        (status, Json(ErrorResponse::new(code, message))).into_response()
+    }
+}
+
+#[derive(Serialize)]
+struct ErrorResponse {
+    error: ErrorBody,
+}
+
+#[derive(Serialize)]
+struct ErrorBody {
+    code: &'static str,
+    message: &'static str,
+}
+
+impl ErrorResponse {
+    const fn new(code: &'static str, message: &'static str) -> Self {
+        Self {
+            error: ErrorBody { code, message },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeSet,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+
+    use async_trait::async_trait;
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+        routing::get,
+    };
+    use serde::de::DeserializeOwned;
+    use tower::ServiceExt;
+    use url::Url;
+
+    use super::*;
+    use crate::{
+        AdminAuthorizer, CapabilityEgress, CreateSecret, EgressContext, EgressProvider,
+        FreePaymentGate, ManagedAgentFactory, ManagedEgress, MockAgentFactory, PolicyStore,
+        SecretDelivery, SecretError, SecretGateway, SecretGuestConfig, SecretHttpMethod,
+        SecretManager, SecretRef, SecretRequestRule,
+    };
+
+    struct ConstantSecret;
+
+    #[async_trait]
+    impl SecretManager for ConstantSecret {
+        async fn resolve(&self, _reference: &SecretRef) -> Result<String, SecretError> {
+            Ok("host-only".to_owned())
+        }
+    }
+
+    async fn response_json<T: DeserializeOwned>(response: Response) -> T {
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap()).unwrap()
+    }
+
+    fn test_api_key_headers() -> HeaderMap {
+        HeaderMap::from_iter([(
+            HeaderName::from_static("x-api-key"),
+            HeaderValue::from_static("test-key"),
+        )])
+    }
+
+    fn test_app(delay: Duration) -> Router {
+        let factory: Arc<dyn ManagedAgentFactory> = Arc::new(MockAgentFactory::new(delay));
+        let directory = tempfile::tempdir().unwrap().keep();
+        let policy = Arc::new(PolicyStore::in_memory().unwrap());
+        policy
+            .bootstrap("test", "Test", "test-key", "test", [])
+            .unwrap();
+        let state = Arc::new(ApiState::new(
+            Arc::new(AgentManager::new(factory, directory).unwrap()),
+            policy,
+            Arc::new(AdminAuthorizer::new("admin-key").unwrap()),
+            Arc::new(FreePaymentGate),
+            Arc::new(SecretGateway::new("http://127.0.0.1:3000").unwrap()),
+        ));
+        app(state)
+    }
+
+    async fn create_test_agent(app: &Router, context_key: &str) -> String {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/agent/new")
+                    .header("x-api-key", "test-key")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(r#"{{"context_key":"{context_key}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        response_json::<CreateAgentResponse>(response)
+            .await
+            .agent_id
+    }
+
+    async fn wait_for_test_turn(app: &Router, agent_id: &str, turn_id: &str) -> TurnView {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::get(format!("/v1/agent/{agent_id}/turn/{turn_id}"))
+                            .header("x-api-key", "test-key")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let turn = response_json::<TurnView>(response).await;
+                if turn.state.is_terminal() {
+                    return turn;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn context_key_creates_or_returns_the_same_agent() {
+        let app = test_app(Duration::from_millis(5));
+        let first = create_test_agent(&app, "context:1").await;
+        let response = app
+            .oneshot(
+                Request::post("/v1/agent/new")
+                    .header("x-api-key", "test-key")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"context_key":"context:1"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json::<CreateAgentResponse>(response).await;
+        assert_eq!(body.agent_id, first);
+        assert!(!body.created);
+    }
+
+    #[tokio::test]
+    async fn follow_on_messages_steer_unless_enqueue_is_explicit() {
+        let app = test_app(Duration::from_millis(100));
+        let agent_id = create_test_agent(&app, "context:steer").await;
+        let send = |body: &'static str| {
+            Request::post(format!("/v1/agent/{agent_id}/turn"))
+                .header("x-api-key", "test-key")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let started = app
+            .clone()
+            .oneshot(send(r#"{"content":[{"type":"text","text":"one"}]}"#))
+            .await
+            .unwrap();
+        let started = response_json::<crate::TurnActionResponse>(started).await;
+        assert_eq!(started.action, TurnAction::Started);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let steered = app
+            .clone()
+            .oneshot(send(r#"{"content":[{"type":"text","text":"two"}]}"#))
+            .await
+            .unwrap();
+        let steered = response_json::<crate::TurnActionResponse>(steered).await;
+        assert_eq!(steered.action, TurnAction::Steered);
+        assert_eq!(steered.turn_id, started.turn_id);
+
+        let queued = app
+            .oneshot(send(
+                r#"{"delivery":"enqueue","content":[{"type":"text","text":"three"}]}"#,
+            ))
+            .await
+            .unwrap();
+        let queued = response_json::<crate::TurnActionResponse>(queued).await;
+        assert_eq!(queued.action, TurnAction::Queued);
+        assert_ne!(queued.turn_id, started.turn_id);
+    }
+
+    #[tokio::test]
+    async fn nested_turn_result_route_returns_content_blocks() {
+        let app = test_app(Duration::from_millis(5));
+        let agent_id = create_test_agent(&app, "context:result").await;
+        let created = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/v1/agent/{agent_id}/turn"))
+                    .header("x-api-key", "test-key")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"content":[{"type":"text","text":"hello"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let turn_id = response_json::<crate::TurnActionResponse>(created)
+            .await
+            .turn_id;
+        wait_for_test_turn(&app, &agent_id, &turn_id).await;
+        let result = app
+            .oneshot(
+                Request::get(format!("/v1/agent/{agent_id}/turn/{turn_id}"))
+                    .header("x-api-key", "test-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let result = response_json::<TurnView>(result).await;
+        assert_eq!(result.state, crate::TurnStatus::Completed);
+        assert!(matches!(
+            result.output.first(),
+            Some(crate::ContentBlock::Text { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn completed_agent_can_fork_through_the_nested_route() {
+        let app = test_app(Duration::from_millis(5));
+        let agent_id = create_test_agent(&app, "context:fork").await;
+        let created = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/v1/agent/{agent_id}/turn"))
+                    .header("x-api-key", "test-key")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"content":[{"type":"text","text":"establish a boundary"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let turn_id = response_json::<crate::TurnActionResponse>(created)
+            .await
+            .turn_id;
+        wait_for_test_turn(&app, &agent_id, &turn_id).await;
+
+        let forked = app
+            .oneshot(
+                Request::post(format!("/v1/agent/{agent_id}/turn/{turn_id}/fork"))
+                    .header("x-api-key", "test-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forked.status(), StatusCode::CREATED);
+        let forked = response_json::<crate::ForkResponse>(forked).await;
+        assert_ne!(forked.agent_id, agent_id);
+        assert_eq!(
+            forked.forked_from.turn_id.as_deref(),
+            Some(turn_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_routes_reject_agent_credentials() {
+        let app = test_app(Duration::from_millis(5));
+        let response = app
+            .oneshot(
+                Request::get("/admin/v1/principals")
+                    .header("x-api-key", "test-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_can_create_and_grant_a_typed_secret() {
+        let app = test_app(Duration::from_millis(5));
+        let create = app
+            .clone()
+            .oneshot(
+                Request::post("/admin/v1/secrets")
+                    .header("authorization", "Bearer admin-key")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "id":"openai",
+                            "name":"OpenAI",
+                            "source":{"provider":"environment","key":"OPENAI"},
+                            "upstream":"https://api.openai.com",
+                            "rules":[{"methods":["POST"],"path_prefixes":["/v1/"]}],
+                            "delivery":{"type":"inject_header","header":"authorization","prefix":"Bearer "},
+                            "guest":{"base_url_env":"OPENAI_BASE_URL"}
+                        }"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let created = response_json::<crate::SecretView>(create).await;
+        assert_eq!(created.id, "openai");
+
+        let grant = app
+            .clone()
+            .oneshot(
+                Request::put("/admin/v1/principals/test/secrets/openai")
+                    .header("authorization", "Bearer admin-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(grant.status(), StatusCode::NO_CONTENT);
+        let effective = app
+            .oneshot(
+                Request::get("/admin/v1/principals/test/effective-secrets")
+                    .header("authorization", "Bearer admin-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let effective = response_json::<Vec<crate::SecretView>>(effective).await;
+        assert_eq!(effective.len(), 1);
+        assert_eq!(effective[0].source.key(), "OPENAI");
+    }
+
+    #[tokio::test]
+    async fn scoped_secret_route_preserves_non_proxy_sdk_clients() {
+        let observed = Arc::new(Mutex::new(Vec::<String>::new()));
+        let upstream_observed = Arc::clone(&observed);
+        let upstream = Router::new().route(
+            "/v1/models",
+            get(move |headers: HeaderMap| {
+                let observed = Arc::clone(&upstream_observed);
+                async move {
+                    observed.lock().unwrap().push(
+                        headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_owned(),
+                    );
+                    "ok"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = listener.local_addr().unwrap();
+        let upstream_server =
+            tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let directory = tempfile::tempdir().unwrap();
+        let policy = Arc::new(PolicyStore::in_memory().unwrap());
+        policy
+            .bootstrap("test", "Test", "test-key", "test", [])
+            .unwrap();
+        policy
+            .create_secret(CreateSecret {
+                id: Some("openai".to_owned()),
+                name: "OpenAI".to_owned(),
+                source: SecretRef::new("test", "openai"),
+                upstream: format!("http://{upstream_address}"),
+                rules: vec![
+                    SecretRequestRule::new()
+                        .method(SecretHttpMethod::Get)
+                        .path_prefix("/v1/"),
+                ],
+                delivery: SecretDelivery::inject_header("authorization", "Bearer "),
+                guest: SecretGuestConfig::new("OPENAI_BASE_URL"),
+            })
+            .unwrap();
+        policy.set_principal_secret("test", "openai", true).unwrap();
+        let client = policy.authenticate(&test_api_key_headers()).unwrap();
+        let (identity, _) = policy
+            .create_or_resolve_agent(&client, Some("secret-route"))
+            .unwrap();
+        let gateway = Arc::new(SecretGateway::new("http://managed.internal").unwrap());
+        let egress = ManagedEgress::new(
+            Arc::clone(&policy),
+            Arc::new(ConstantSecret),
+            CapabilityEgress::new(),
+        )
+        .secret_gateway(Arc::clone(&gateway));
+        let lease = egress
+            .acquire(&EgressContext::new(identity.id, "test"), &BTreeSet::new())
+            .await
+            .unwrap();
+        let route = Url::parse(lease.guest_environment().get("OPENAI_BASE_URL").unwrap()).unwrap();
+
+        let factory: Arc<dyn ManagedAgentFactory> = Arc::new(MockAgentFactory::new(Duration::ZERO));
+        let state = Arc::new(ApiState::new(
+            Arc::new(AgentManager::new(factory, directory.path()).unwrap()),
+            Arc::clone(&policy),
+            Arc::new(AdminAuthorizer::new("admin-key").unwrap()),
+            Arc::new(FreePaymentGate),
+            Arc::clone(&gateway),
+        ));
+        let app = app(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("{}/v1/models", route.path().trim_end_matches('/')))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), 16).await.unwrap(),
+            "ok".as_bytes()
+        );
+        assert_eq!(observed.lock().unwrap().as_slice(), ["Bearer host-only"]);
+
+        policy
+            .set_principal_secret("test", "openai", false)
+            .unwrap();
+        let denied = app
+            .oneshot(
+                Request::get(format!("{}/v1/models", route.path().trim_end_matches('/')))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        drop(lease);
+        upstream_server.abort();
+    }
+}

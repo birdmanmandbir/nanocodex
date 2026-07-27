@@ -1,0 +1,2 @@
+rollout_rejects_a_non_uuid_explicit_session_id
+stress_repeated_tool_search

@@ -1,0 +1,11 @@
+nanocodex-oai-api
+nanocodex-core
+nanocodex-tools-macros
+nanocodex-observability
+nanocodex-service
+nanocodex-tools
+nanocodex-agent
+nanocodex-eval
+nanocodex-eval-harbor
+nanocodex-react
+nanocodex

@@ -122,6 +122,29 @@ impl SessionSnapshot {
         &self.workspace
     }
 
+    /// Rebinds this completed model boundary to a freshly provisioned workspace.
+    ///
+    /// This is intended for durable managed runtimes that keep model history
+    /// while replacing an ephemeral sandbox. It changes only the runtime
+    /// workspace location; lineage, cache identity, instructions, tool
+    /// definitions, and typed history remain unchanged. The caller must ensure
+    /// the new workspace contains any files the resumed model is expected to
+    /// observe.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the supplied workspace is empty.
+    pub fn rebase_workspace(mut self, workspace: impl Into<String>) -> Result<Self> {
+        let workspace = workspace.into();
+        if workspace.trim().is_empty() {
+            return Err(NanocodexError::InvalidSessionSnapshot(
+                "workspace must not be empty".to_owned(),
+            ));
+        }
+        self.workspace = workspace;
+        Ok(self)
+    }
+
     pub(crate) fn into_resume(self) -> Result<SessionResume> {
         if self.version != SESSION_SNAPSHOT_VERSION {
             return Err(NanocodexError::InvalidSessionSnapshot(format!(

@@ -118,16 +118,18 @@ nanocodex-tools-macros
 └── proc-macro implementation; no agent dependency
 ```
 
-Systems and evaluation crates remain below the agent. VM packages live under
-`crates/experimental/`; they remain workspace members but are outside the
-stable publication and dependency surface:
+Systems and evaluation crates remain below the agent. The VM, browser, and
+managed-service packages live under `crates/experimental/`; they remain
+workspace members but are outside the stable publication and dependency
+surface:
 
 ```text
-nanovm-image ──> nanocodex-vm ──> nanovm
+nanovm-image ────────────────> nanovm
+nanocodex-vm ────────────────> nanovm
 
 nanocodex-browser-vm
 ├── nanocodex-browser
-└── nanocodex-vm ──> nanovm
+└── nanovm
 
 nanocodex-vm-egress
 ├── neutral EgressLease composition
@@ -146,8 +148,8 @@ nanocentaur
 └── nanocodex-vm-egress
 ```
 
-The exact names of the VM image and egress crates remain subject to the
-standalone-API review. Their ownership boundaries do not.
+The standalone-API review fixed the systems names as `nanovm-image` for image
+preparation and `nanocodex-vm-egress` for composed host egress.
 
 ## Agreed core APIs
 
@@ -523,13 +525,18 @@ Secret egress adopts the Nanocentaur/Iron design:
 
 - policy authorizes principal, origin, method, and path before resolution;
 - a host gateway resolves secrets only for an authorized request;
-- credentials are injected into the upstream request and never returned to the
-  guest;
+- credentials are injected into the upstream request and are not returned by
+  the gateway itself;
 - providers sit behind an async `SecretManager` boundary;
-- resolved values never enter model context, VMM arguments, guest environment,
-  snapshots, logs, or durable session state;
-- redirects, bodies, concurrency, and response sizes are bounded; and
-- revocation terminates the lease.
+- the egress layer never places resolved values in model context, VMM
+  arguments, guest environment, snapshots, logs, or durable session state;
+- redirects, request bodies, concurrency, and response streaming are bounded;
+  and
+- revocation denies subsequent requests immediately.
+
+An upstream can still echo a credential in its response. That response is then
+ordinary agent-observed data and follows the full-fidelity tracing contract; the
+egress layer does not redact it.
 
 MPP and secret gateways compose behind one VM-facing front proxy when both
 need `HTTPS_PROXY`.
@@ -665,8 +672,8 @@ through a real consumer. Unmapped behavior blocks the deletion.
 - Move authoritative context, compaction mechanics, continuation, and replay
   into the session.
 - Move and extend request, parser, history, and Tower benchmarks.
-- Delete superseded `nanocodex-core` and `nanocodex-service` surfaces when all
-  consumers migrate.
+- Reduce `nanocodex-core` and `nanocodex-service` to documented compatibility
+  reexports while consumers migrate.
 
 ### 3. Tools
 
@@ -744,28 +751,57 @@ resolution is bounded-parallel, and init4-style bounded spans preserve the
 complete Dockerfile. Build CPU, memory, egress, and instruction timeouts are
 explicit builder policy rather than hidden constants.
 
-The three VM crates deliberately remain `publish = false` while `nanovm`
-targets the reviewed libkrun `2.0.0-dev` Git checkpoint, which is not available
-on crates.io. Their public APIs and Rustdoc are complete for path/Git consumers;
-Stack 10 owns publication once that exact dependency can be packaged without
-substituting an older hypervisor API.
+The VM packages deliberately remain `publish = false` under
+`crates/experimental/` while `nanovm` targets the reviewed libkrun
+`2.0.0-dev` Git checkpoint, which is not available on crates.io. Their public
+APIs and Rustdoc are complete for path/Git consumers. Promotion requires both a
+proven API and dependencies that can be packaged without substituting an older
+hypervisor API.
 
 ### 7. Browser on VM
 
-- Land the deterministic browser controller as its own component.
-- Compose it with the headed browser-in-VM lifecycle.
-- Keep authentication, policy, and secrets host-owned.
-- Benchmark warm boot, first action, semantic snapshot, screenshot, and
+- [x] Land the deterministic browser controller as its own component.
+- [x] Compose it with the headed browser-in-VM lifecycle.
+- [x] Keep authentication, policy, and secrets host-owned.
+- [x] Benchmark warm boot, first action, semantic snapshot, screenshot, and
   teardown with retained browser fixtures.
+
+Evidence:
+[`benchmarks/refactor_browser_baseline_2026-07-26.md`](benchmarks/refactor_browser_baseline_2026-07-26.md)
+records deterministic typed-protocol and real headed-browser VM baselines. The
+live proof prepares the browser image through public image APIs, boots
+Chromium/Xvfb behind a private gvproxy network, drives the same typed
+`Browser`/`BrowserTool` contract used by host and remote-CDP consumers,
+captures a semantic snapshot and PNG, and reaps the complete runtime. The
+composition depends directly on `nanovm`; it does not route through
+`nanocodex-vm`, whose narrower job is retained agent tool RPC.
 
 ### 8. MPP and secret egress
 
-- Consolidate the existing MPP proxy behind the VM egress lease.
-- Extract Nanocentaur's policy-aware secret gateway and provider boundary.
-- Compose payment and secret routing behind one guest-visible front proxy.
-- Prove by test that wallet and secret material never enter guest-visible or
+- [x] Consolidate the existing MPP proxy behind the VM egress lease.
+- [x] Extract Nanocentaur's policy-aware secret gateway and provider boundary.
+- [x] Compose payment and secret routing behind one guest-visible front proxy.
+- [x] Prove by test that wallet and secret material never enter guest-visible or
   persisted state.
-- Stress concurrency, backpressure, cancellation, replay, and revocation.
+- [x] Stress concurrency, backpressure, cancellation, replay, and revocation.
+
+Evidence:
+[`benchmarks/refactor_egress_baseline_2026-07-26.md`](benchmarks/refactor_egress_baseline_2026-07-26.md)
+records direct, authenticated MPP, and dynamic secret-policy round trips. The
+new `nanocodex-vm-egress` crate owns one proxy, cloneable neutral lease,
+dynamic `SecretPolicy`, standalone `SecretManager` implementations, scoped
+delivery, and typed shutdown. The existing direct `MppEgress` API and
+`nanocodex_vm::mpp_egress_layer` path remain available.
+
+Deterministic gates include byte-identical exact-once replay across 10,000
+bounded-parallel paid requests, connection and origin backpressure, client
+cancellation with bounded shutdown, live rotation and revocation, ambiguous
+route rejection, and non-disclosure by the egress layer itself. The retained
+libkrun proof uses one proxy for both a host-injected secret and an MPP `402`.
+The headed
+browser proof uses that lease through gvproxy, answers only proxy auth
+challenges, trusts the ephemeral CA for real HTTPS, and never receives the
+origin secret.
 
 ### 9. Evaluations
 
@@ -798,12 +834,44 @@ evidence with no harness error; the stronger stochastic agent solution passed
 
 ### 10. Managed API and release cleanup
 
-- Rebase Nanocentaur on the refactored libraries without leaking durability
+- [x] Rebase Nanocentaur on the refactored libraries without leaking durability
   into lower crates.
-- Finalize package metadata, changelogs, release ordering, docs.rs, and
+- [x] Finalize package metadata, changelogs, release ordering, docs.rs, and
   semver-facing migration notes.
-- Archive the temporary Nanoeval product boundary after parity evidence is
-  retained.
+- [x] Mark the temporary Nanoeval product boundary as superseded after parity
+  evidence is retained; repository archival remains an explicit administrative
+  action outside this code stack.
+
+Evidence:
+[`benchmarks/refactor_managed_baseline_2026-07-26.md`](benchmarks/refactor_managed_baseline_2026-07-26.md)
+records the real authenticated Axum, policy/session SQLite, actor, durable event,
+and zero-delay agent boundary. Authorized reads remain below 57 µs, idempotent
+replay below 48 µs, and accepted turn to durable terminal event below 2.9 ms on
+the baseline host. Completion atomically retains typed output, exact usage,
+optional versioned USD cost, snapshot, and terminal event; restart, replay,
+latest/exact-turn fork, cancellation, payment, and secret-gateway behavior are
+regression-tested.
+
+HTTP, agent-command, and SQLite work use bounded spans with explicit parent and
+subscriber propagation rather than a long-lived service root. The unified
+`nanocodex-vm-egress` policy and secret manager power both VM proxy injection
+and Nanocentaur's scoped reverse gateway, including exact-path rejection,
+rotation, revocation, expiry, and response limits.
+
+The synchronized breaking release is 0.3.0. One canonical
+[`scripts/release-crates.txt`](scripts/release-crates.txt) drives packaging,
+docs, changelogs, and publication, and is checked against every Cargo package
+whose manifest is publishable. It includes the consolidated
+`nanocodex-eval` and `nanocodex-eval-harbor` crates. VM composition and the
+managed service remain Git/path packages because their hypervisor and
+deployment inputs are not crates.io artifacts. The
+[`0.3 migration guide`](docs/migration-0.3.md) records all package and API
+moves.
+
+The stack-wide master ledger is
+[`benchmarks/refactor_master_parity_2026-07-26.md`](benchmarks/refactor_master_parity_2026-07-26.md).
+Its executable inventory guard compares 774 current Rust tests with 497 on the
+pinned pre-refactor master and rejects an unclassified deletion.
 
 ## Stack-wide completion gates
 
@@ -824,20 +892,21 @@ evidence with no harness error; the stronger stochastic agent solution passed
 - every accepted prompt still emits exactly one terminal event
 - no benchmark task or verifier is changed to improve agent results
 
-## Open decisions
+## Resolved decisions
 
-These are intentionally not hidden behind provisional APIs:
-
-- final construction spelling for `ToolDefinition` and heterogeneous tool
-  registration;
-- exact stable normalized `ResponseEvent` variants versus explicitly raw
-  OpenAI events;
-- final crate names for reusable VM image preparation and composed egress;
-- which observability conveniences belong in the facade prelude;
-- final feature policy for heavyweight VM, browser, eval, and managed-service
-  crates; and
-- the semver transition strategy for published `nanocodex-core`,
-  `nanocodex-service`, `nanocodex-mcp`, and `nanocodex-macros`.
-
-Each is resolved in the first implementation slice that needs it, with a
-complete consumer example and benchmark where performance-sensitive.
+- `ToolDefinition::function(...)` and `ToolDefinition::custom(...)` construct
+  the lower contract. `Tools::builder().tool(...)` and `.provider(...)` own
+  heterogeneous registration; `#[tool]` is the normal application path.
+- `ResponseEvent` is the typed single-operation stream.
+  `AgentEvent::data()` is the stable normalized lifecycle projection, while the
+  raw event envelope remains available for lossless OpenAI and JSONL consumers.
+- The facade prelude contains golden-path agent, event, pricing, and tool
+  contracts. Observability setup remains under the named
+  `nanocodex::observability` module instead of becoming ambient prelude policy.
+- React and eval libraries are synchronized crates.io packages. Browser, VM,
+  browser-VM, VM-egress, and Nanocentaur remain experimental Git/path
+  components while their APIs and deployment boundaries are exercised.
+- The breaking crate split is version 0.3. `nanocodex-core` and
+  `nanocodex-service` publish compatibility reexports.
+  `nanocodex-mcp` and `nanocodex-macros` stop at 0.2; their 0.3 owners are
+  `nanocodex-tools::mcp` and `nanocodex-tools-macros`.

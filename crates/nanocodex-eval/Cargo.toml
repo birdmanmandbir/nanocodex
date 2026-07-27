@@ -13,6 +13,10 @@ keywords.workspace = true
 categories.workspace = true
 description = "Typed, durable evaluation for Nanocodex agents"
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["-D", "warnings"]
+
 [dependencies]
 chrono.workspace = true
 futures-util.workspace = true

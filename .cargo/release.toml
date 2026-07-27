@@ -5,8 +5,11 @@
 nanocodex = { path = "crates/nanocodex" }
 nanocodex-agent = { path = "crates/nanocodex-agent" }
 nanocodex-core = { path = "crates/nanocodex-core" }
+nanocodex-eval = { path = "crates/nanocodex-eval" }
+nanocodex-eval-harbor = { path = "crates/nanocodex-eval-harbor" }
 nanocodex-oai-api = { path = "crates/nanocodex-oai-api" }
 nanocodex-observability = { path = "crates/nanocodex-observability" }
+nanocodex-react = { path = "crates/nanocodex-react" }
 nanocodex-service = { path = "crates/nanocodex-service" }
 nanocodex-tools = { path = "crates/nanocodex-tools" }
 nanocodex-tools-macros = { path = "crates/nanocodex-tools-macros" }

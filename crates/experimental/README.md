@@ -3,8 +3,13 @@
 This directory contains complete Nanocodex components whose APIs are still
 being exercised and revised:
 
-- `nanovm` and `nanovm-image`: embedded VM lifecycle and image preparation; and
-- `nanocodex-vm`: agent tools backed by retained VM sessions.
+- `nanovm` and `nanovm-image`: embedded VM lifecycle and image preparation;
+- `nanocodex-vm` and `nanocodex-vm-egress`: agent tools and capability-scoped
+  VM egress;
+- `nanocodex-browser` and `nanocodex-browser-vm`: deterministic browser control
+  locally and inside a headed VM; and
+- `nanocentaur` and `nanocentaur-server`: durable managed agents composed from
+  those components.
 
 Experimental means API stability, not reduced engineering standards. These
 packages remain workspace members and must pass the normal formatting, Clippy,

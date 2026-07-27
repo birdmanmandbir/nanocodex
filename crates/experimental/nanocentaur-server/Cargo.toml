@@ -1,0 +1,47 @@
+[package]
+name = "nanocentaur-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "REST server for host-managed Nanocodex agents"
+
+[features]
+default = ["onepassword-sdk"]
+mpp = ["dep:mpp"]
+onepassword-sdk = ["nanocentaur/onepassword-sdk"]
+
+[[bin]]
+name = "nanocentaur"
+path = "src/main.rs"
+doc = false
+
+[dependencies]
+async-trait.workspace = true
+axum.workspace = true
+clap.workspace = true
+eyre.workspace = true
+futures-util.workspace = true
+mpp = { workspace = true, features = ["server", "tempo"], optional = true }
+nanocentaur.workspace = true
+nanocodex-agent.workspace = true
+nanocodex-vm.workspace = true
+nanocodex-vm-egress.workspace = true
+nanovm.workspace = true
+reqwest = { workspace = true, features = ["json", "stream"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+url.workspace = true
+
+[lints]
+workspace = true

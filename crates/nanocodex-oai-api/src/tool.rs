@@ -153,6 +153,49 @@ impl ToolOutput {
         }
     }
 
+    /// Returns typed JSON to Code Mode and appends model-visible media.
+    ///
+    /// The serialized JSON remains the first content item so ordinary tool
+    /// consumers receive the complete structured result. Code Mode receives
+    /// the same value directly without inferring it from multimodal content.
+    #[must_use]
+    pub fn json_content(output: &impl Serialize, content: Vec<ToolOutputContent>) -> Self {
+        Self::json_content_with_value(output, output, content)
+    }
+
+    /// Returns compact JSON plus media with a richer typed Code Mode value.
+    ///
+    /// File-backed tools can keep their provider-visible output and event
+    /// record compact while exposing a transient data URL or another richer
+    /// value to the generated Code Mode program.
+    #[must_use]
+    pub fn json_content_with_value(
+        output: &impl Serialize,
+        code_mode_value: &impl Serialize,
+        mut content: Vec<ToolOutputContent>,
+    ) -> Self {
+        let value = match serde_json::to_value(code_mode_value) {
+            Ok(value) => value,
+            Err(error) => {
+                return Self::error(format!("failed to encode tool result: {error}"));
+            }
+        };
+        let encoded = match serde_json::to_string(output) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                return Self::error(format!("failed to encode tool result: {error}"));
+            }
+        };
+        content.insert(0, ToolOutputContent::InputText { text: encoded });
+        Self {
+            output: ToolOutputBody::Content(content),
+            success: true,
+            metadata: None,
+            code_mode_value: Some(value),
+            process_trace: None,
+        }
+    }
+
     /// Creates a JSON result with an explicit success state.
     ///
     /// Code Mode receives the typed JSON value while the Responses API
