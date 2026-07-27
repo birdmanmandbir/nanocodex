@@ -153,12 +153,15 @@ mod tests {
 
     #[test]
     fn execution_response_round_trips_opaque_values() {
-        let response = ToolResponse::completed(
-            8,
-            ToolExecution::from_json(json!({"output": "ok"}), true)
-                .into_wire()
-                .unwrap(),
-        );
+        let response = ToolResponse {
+            id: 8,
+            execution: Some(
+                ToolExecution::from_json(json!({"output": "ok"}), true)
+                    .into_wire()
+                    .unwrap(),
+            ),
+            error: None,
+        };
         let encoded = serde_json::to_string(&response).unwrap();
         let decoded = serde_json::from_str::<ToolResponse>(&encoded).unwrap();
         assert_eq!(decoded.id, 8);
