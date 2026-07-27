@@ -41,6 +41,10 @@ use crate::{
 
 use super::{BrowserError, ElementTarget, element_script, evaluate_typed, source_maps::SourceMaps};
 
+const MAX_STYLE_SHEETS: usize = 4_096;
+const MAX_DEBUGGER_FRAMES: usize = 128;
+const MAX_STYLE_SHEET_URL_CHARS: usize = 4_096;
+
 #[derive(Clone, Default)]
 pub(super) struct DevtoolsDiagnostics {
     style_sheets: Arc<StdMutex<HashMap<String, String>>>,
@@ -72,10 +76,18 @@ pub(super) async fn start(
             let Ok(mut style_sheets) = style_sheets.lock() else {
                 break;
             };
-            style_sheets.insert(
-                event.header.style_sheet_id.as_ref().to_owned(),
-                event.header.source_url.clone(),
-            );
+            let style_sheet_id = event.header.style_sheet_id.as_ref();
+            if style_sheets.len() < MAX_STYLE_SHEETS || style_sheets.contains_key(style_sheet_id) {
+                style_sheets.insert(
+                    style_sheet_id.to_owned(),
+                    event
+                        .header
+                        .source_url
+                        .chars()
+                        .take(MAX_STYLE_SHEET_URL_CHARS)
+                        .collect(),
+                );
+            }
         }
     });
 
@@ -85,6 +97,7 @@ pub(super) async fn start(
             let frames = event
                 .call_frames
                 .iter()
+                .take(MAX_DEBUGGER_FRAMES)
                 .map(|frame| debugger_frame(frame, &source_maps))
                 .collect::<Vec<_>>();
             let Ok(mut pause_state) = pause_state.lock() else {

@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io::Read,
     path::Path,
     process::Stdio,
     time::Duration,
@@ -9,6 +10,7 @@ use chromiumoxide::{
     Page,
     cdp::{browser_protocol::page::PrintToPdfParams, js_protocol::runtime::ExecutionContextId},
 };
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::{process::Command, time::timeout};
 use url::Url;
@@ -27,6 +29,9 @@ const AXE_BUNDLE: &str = include_str!("../../assets/axe.js");
 const MAX_AXE_FINDINGS: usize = 200;
 const MAX_AXE_NODES_PER_FINDING: usize = 50;
 const MAX_LIGHTHOUSE_FINDINGS: usize = 100;
+const MAX_PDF_BYTES: usize = 64 * 1024 * 1024;
+const MAX_LIGHTHOUSE_REPORT_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_CRUX_RESPONSE_BYTES: usize = 1024 * 1024;
 const LIGHTHOUSE_TIMEOUT: Duration = Duration::from_mins(2);
 const DEFAULT_CRUX_ENDPOINT: &str = "https://chromeuxreport.googleapis.com/v1/records:queryRecord";
 
@@ -47,6 +52,12 @@ pub(super) async fn pdf(
             ..PrintToPdfParams::default()
         })
         .await?;
+    if bytes.len() > MAX_PDF_BYTES {
+        return Err(BrowserError::PdfTooLarge {
+            bytes: bytes.len(),
+            maximum: MAX_PDF_BYTES,
+        });
+    }
     tokio::fs::write(&path, &bytes).await?;
     Ok(BrowserPdfArtifact {
         path,
@@ -209,7 +220,29 @@ pub(super) async fn lighthouse(
         });
     }
 
-    let encoded = tokio::fs::read(&path).await?;
+    let report_bytes = tokio::fs::metadata(&path).await?.len();
+    if report_bytes > MAX_LIGHTHOUSE_REPORT_BYTES {
+        return Err(BrowserError::LighthouseReportTooLarge {
+            bytes: report_bytes,
+            maximum: MAX_LIGHTHOUSE_REPORT_BYTES,
+        });
+    }
+    let report_path = path.clone();
+    let encoded = tokio::task::spawn_blocking(move || {
+        let mut encoded = Vec::new();
+        std::fs::File::open(report_path)?
+            .take(MAX_LIGHTHOUSE_REPORT_BYTES.saturating_add(1))
+            .read_to_end(&mut encoded)?;
+        Ok::<_, std::io::Error>(encoded)
+    })
+    .await
+    .map_err(BrowserError::LighthouseReadTask)??;
+    if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > MAX_LIGHTHOUSE_REPORT_BYTES {
+        return Err(BrowserError::LighthouseReportTooLarge {
+            bytes: u64::try_from(encoded.len()).unwrap_or(u64::MAX),
+            maximum: MAX_LIGHTHOUSE_REPORT_BYTES,
+        });
+    }
     let wire: LighthouseWire = serde_json::from_slice(&encoded)?;
     let categories = selected
         .into_iter()
@@ -301,10 +334,19 @@ pub(super) async fn crux(
         .await
         .map_err(crux_request_error)?
         .error_for_status()
-        .map_err(crux_request_error)?
-        .json::<CruxWire>()
-        .await
         .map_err(crux_request_error)?;
+    let mut encoded = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(crux_request_error)?;
+        if encoded.len().saturating_add(chunk.len()) > MAX_CRUX_RESPONSE_BYTES {
+            return Err(BrowserError::CruxResponseTooLarge {
+                maximum: MAX_CRUX_RESPONSE_BYTES,
+            });
+        }
+        encoded.extend_from_slice(&chunk);
+    }
+    let response: CruxWire = serde_json::from_slice(&encoded)?;
     let metrics = response
         .record
         .metrics

@@ -8,9 +8,8 @@ use chromiumoxide::{
     Connection, Method,
     cdp::{
         browser_protocol::{
-            fetch::{ContinueRequestParams, EnableParams as FetchEnableParams, FailRequestParams},
             network::{
-                EnableParams as NetworkEnableParams, ErrorReason, GetRequestPostDataParams,
+                EnableParams as NetworkEnableParams, GetRequestPostDataParams,
                 GetRequestPostDataReturns, GetResponseBodyParams, GetResponseBodyReturns,
             },
             target::{
@@ -21,6 +20,7 @@ use chromiumoxide::{
         events::{CdpEvent, CdpEventMessage},
         js_protocol::runtime::RunIfWaitingForDebuggerParams,
     },
+    error::CdpError,
     types::{CallId, Message},
 };
 use futures_util::StreamExt;
@@ -34,7 +34,6 @@ use tracing::warn;
 use super::{
     BrowserError, BrowserNetworkBodyKind, BrowserNetworkContext, BrowserNetworkRequest,
     BrowserWebSocketDirection, Diagnostics, NetworkSource, apply_response, finish_request,
-    network_control::{NetworkControls, RequestDecision, fulfill_params},
     network_headers, network_initiator, seconds_to_milliseconds,
 };
 
@@ -51,6 +50,10 @@ pub(super) struct NetworkBody {
 }
 
 enum ObserverCommand {
+    Activate {
+        target_id: String,
+        response: oneshot::Sender<()>,
+    },
     Body {
         session_id: String,
         request_id: String,
@@ -64,7 +67,38 @@ struct PendingBody {
     response: oneshot::Sender<Result<NetworkBody, String>>,
 }
 
+#[derive(Default)]
+struct AttachedTargets {
+    root_session: Option<String>,
+    child_sessions: HashSet<String>,
+    configured_targets: HashSet<String>,
+    session_targets: HashMap<String, String>,
+    session_roots: HashMap<String, String>,
+    activation_waiters: HashMap<String, Vec<oneshot::Sender<()>>>,
+}
+
 impl NetworkObserver {
+    pub(super) async fn activate(&self, target_id: String) -> Result<(), BrowserError> {
+        let (response, activated) = oneshot::channel();
+        self.commands
+            .send(ObserverCommand::Activate {
+                target_id,
+                response,
+            })
+            .await
+            .map_err(|_| BrowserError::NetworkObserver {
+                message: "the observer task stopped".to_owned(),
+            })?;
+        timeout(INITIALIZATION_TIMEOUT, activated)
+            .await
+            .map_err(|_| BrowserError::NetworkObserver {
+                message: "target activation timed out".to_owned(),
+            })?
+            .map_err(|_| BrowserError::NetworkObserver {
+                message: "the observer dropped an activation response".to_owned(),
+            })
+    }
+
     pub(super) async fn body(
         &self,
         session_id: String,
@@ -95,7 +129,6 @@ pub(super) async fn start(
     websocket_address: &str,
     target_id: TargetId,
     diagnostics: Arc<StdMutex<Diagnostics>>,
-    network_controls: NetworkControls,
 ) -> Result<(NetworkObserver, JoinHandle<()>), BrowserError> {
     let mut connection = Connection::<CdpEventMessage>::connect(websocket_address).await?;
     let filter = TargetFilter::new(vec![
@@ -119,7 +152,6 @@ pub(super) async fn start(
         command_rx,
         ready,
         diagnostics,
-        network_controls,
     ));
     match timeout(INITIALIZATION_TIMEOUT, ready_rx).await {
         Ok(Ok(Ok(()))) => Ok((NetworkObserver { commands }, task)),
@@ -142,6 +174,10 @@ pub(super) async fn start(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one select loop owns CDP ordering, activation handshakes, body routing, and shutdown"
+)]
 async fn run(
     mut connection: Connection<CdpEventMessage>,
     attach_call: CallId,
@@ -149,14 +185,15 @@ async fn run(
     mut commands: mpsc::Receiver<ObserverCommand>,
     ready: oneshot::Sender<Result<(), String>>,
     diagnostics: Arc<StdMutex<Diagnostics>>,
-    network_controls: NetworkControls,
 ) {
     let mut ready = Some(ready);
     let mut pending_bodies = HashMap::<CallId, PendingBody>::new();
-    let mut root_session = None;
-    let mut child_sessions = HashSet::new();
+    let mut targets = AttachedTargets::default();
+    let mut active_target_id = root_target_id.as_ref().to_owned();
+    let mut auto_attach_ready = false;
 
     loop {
+        pending_bodies.retain(|_, pending| !pending.response.is_closed());
         tokio::select! {
             message = connection.next() => {
                 let Some(message) = message else {
@@ -165,6 +202,14 @@ async fn run(
                 };
                 let message = match message {
                     Ok(message) => message,
+                    Err(CdpError::InvalidMessage(_, error)) => {
+                        warn!(
+                            target: "nanocodex_browser",
+                            %error,
+                            "network observer skipped an unsupported DevTools message"
+                        );
+                        continue;
+                    }
                     Err(error) => {
                         fail_ready(&mut ready, &error.to_string());
                         warn!(target: "nanocodex_browser", %error, "network observer stopped");
@@ -178,9 +223,8 @@ async fn run(
                                 fail_ready(&mut ready, &message);
                                 break;
                             }
-                            if let Some(ready) = ready.take() {
-                                let _ = ready.send(Ok(()));
-                            }
+                            auto_attach_ready = true;
+                            complete_ready(&mut ready, auto_attach_ready, &targets);
                         } else if let Some(pending) = pending_bodies.remove(&response.id) {
                             let result = decode_body_response(response, pending.kind);
                             let _ = pending.response.send(result);
@@ -196,12 +240,12 @@ async fn run(
                         handle_event(
                             event,
                             &root_target_id,
-                            &mut root_session,
-                            &mut child_sessions,
+                            &active_target_id,
+                            &mut targets,
                             &mut connection,
                             &diagnostics,
-                            &network_controls,
                         );
+                        complete_ready(&mut ready, auto_attach_ready, &targets);
                     }
                 }
             }
@@ -209,23 +253,41 @@ async fn run(
                 let Some(command) = command else {
                     break;
                 };
-                let ObserverCommand::Body {
-                    session_id,
-                    request_id,
-                    kind,
-                    response,
-                } = command;
-                match submit_body(
-                    &mut connection,
-                    SessionId::new(session_id),
-                    request_id,
-                    kind,
-                ) {
-                    Ok(call_id) => {
-                        pending_bodies.insert(call_id, PendingBody { kind, response });
+                match command {
+                    ObserverCommand::Activate {
+                        target_id,
+                        response,
+                    } => {
+                        active_target_id.clone_from(&target_id);
+                        if targets.configured_targets.contains(&target_id) {
+                            let _ = response.send(());
+                        } else {
+                            targets
+                                .activation_waiters
+                                .entry(target_id)
+                                .or_default()
+                                .push(response);
+                        }
                     }
-                    Err(message) => {
-                        let _ = response.send(Err(message));
+                    ObserverCommand::Body {
+                        session_id,
+                        request_id,
+                        kind,
+                        response,
+                    } => {
+                        match submit_body(
+                            &mut connection,
+                            SessionId::new(session_id),
+                            request_id,
+                            kind,
+                        ) {
+                            Ok(call_id) => {
+                                pending_bodies.insert(call_id, PendingBody { kind, response });
+                            }
+                            Err(message) => {
+                                let _ = response.send(Err(message));
+                            }
+                        }
                     }
                 }
             }
@@ -239,23 +301,17 @@ async fn run(
     }
 }
 
-fn configure_child(
+fn configure_page(
     connection: &mut Connection<CdpEventMessage>,
     session_id: SessionId,
 ) -> Result<(), String> {
+    enable_child_auto_attach(connection, session_id.clone())?;
     submit(
         connection,
         Some(session_id.clone()),
         NetworkEnableParams::default(),
     )
     .map_err(|error| error.to_string())?;
-    submit(
-        connection,
-        Some(session_id.clone()),
-        FetchEnableParams::default(),
-    )
-    .map_err(|error| error.to_string())?;
-    enable_child_auto_attach(connection, session_id.clone())?;
     submit(
         connection,
         Some(session_id),
@@ -270,6 +326,20 @@ fn configure_root(
     session_id: SessionId,
 ) -> Result<(), String> {
     enable_child_auto_attach(connection, session_id.clone())?;
+    resume_target(connection, session_id)
+}
+
+fn configure_worker(
+    connection: &mut Connection<CdpEventMessage>,
+    session_id: SessionId,
+) -> Result<(), String> {
+    enable_child_auto_attach(connection, session_id.clone())?;
+    submit(
+        connection,
+        Some(session_id.clone()),
+        NetworkEnableParams::default(),
+    )
+    .map_err(|error| error.to_string())?;
     resume_target(connection, session_id)
 }
 
@@ -375,6 +445,19 @@ fn fail_ready(ready: &mut Option<oneshot::Sender<Result<(), String>>>, message: 
     }
 }
 
+fn complete_ready(
+    ready: &mut Option<oneshot::Sender<Result<(), String>>>,
+    auto_attach_ready: bool,
+    targets: &AttachedTargets,
+) {
+    if auto_attach_ready
+        && targets.root_session.is_some()
+        && let Some(ready) = ready.take()
+    {
+        let _ = ready.send(Ok(()));
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "one exhaustive typed dispatch preserves child-target network event ordering"
@@ -382,34 +465,84 @@ fn fail_ready(ready: &mut Option<oneshot::Sender<Result<(), String>>>, message: 
 fn handle_event(
     event: CdpEventMessage,
     root_target_id: &TargetId,
-    root_session: &mut Option<String>,
-    child_sessions: &mut HashSet<String>,
+    active_target_id: &str,
+    targets: &mut AttachedTargets,
     connection: &mut Connection<CdpEventMessage>,
     diagnostics: &Arc<StdMutex<Diagnostics>>,
-    network_controls: &NetworkControls,
 ) {
     let parent_session = event.session_id.clone();
     if let CdpEvent::TargetAttachedToTarget(attached) = &event.params {
+        let session_id = attached.session_id.as_ref().to_owned();
+        let target_id = attached.target_info.target_id.as_ref().to_owned();
+        if targets.configured_targets.contains(&target_id) {
+            if let Err(message) = resume_target(connection, attached.session_id.clone()) {
+                warn!(
+                    target: "nanocodex_browser",
+                    target_type = %attached.target_info.r#type,
+                    %message,
+                    "failed to resume duplicate child-target attachment"
+                );
+            }
+            return;
+        }
         let is_root = attached.target_info.target_id == *root_target_id;
         let is_child = parent_session.as_ref().is_some_and(|parent| {
-            root_session.as_ref() == Some(parent) || child_sessions.contains(parent)
+            targets.root_session.as_ref() == Some(parent) || targets.child_sessions.contains(parent)
         });
         let setup = if is_root {
-            root_session.replace(attached.session_id.as_ref().to_owned());
             configure_root(connection, attached.session_id.clone())
+        } else if attached.target_info.r#type == "page" {
+            configure_page(connection, attached.session_id.clone())
         } else if is_child {
-            child_sessions.insert(attached.session_id.as_ref().to_owned());
-            configure_child(connection, attached.session_id.clone())
+            configure_worker(connection, attached.session_id.clone())
         } else {
             resume_target(connection, attached.session_id.clone())
         };
-        if let Err(message) = setup {
-            warn!(
-                target: "nanocodex_browser",
-                target_type = %attached.target_info.r#type,
-                %message,
-                "failed to configure child target"
-            );
+        match setup {
+            Ok(()) if is_root => {
+                targets.root_session.replace(session_id.clone());
+                targets.configured_targets.insert(target_id.clone());
+                targets
+                    .session_roots
+                    .insert(session_id.clone(), target_id.clone());
+                targets.session_targets.insert(session_id, target_id);
+                complete_activation(targets, attached.target_info.target_id.as_ref());
+            }
+            Ok(()) if is_child || attached.target_info.r#type == "page" => {
+                targets.child_sessions.insert(session_id.clone());
+                targets.configured_targets.insert(target_id.clone());
+                let root_target = parent_session
+                    .as_ref()
+                    .and_then(|parent| targets.session_roots.get(parent))
+                    .cloned()
+                    .unwrap_or_else(|| target_id.clone());
+                targets
+                    .session_roots
+                    .insert(session_id.clone(), root_target);
+                targets.session_targets.insert(session_id, target_id);
+                complete_activation(targets, attached.target_info.target_id.as_ref());
+            }
+            Ok(()) => {}
+            Err(message) => {
+                warn!(
+                    target: "nanocodex_browser",
+                    target_type = %attached.target_info.r#type,
+                    %message,
+                    "failed to configure child target"
+                );
+            }
+        }
+        return;
+    }
+    if let CdpEvent::TargetDetachedFromTarget(detached) = &event.params {
+        let detached = detached.session_id.as_ref();
+        targets.child_sessions.remove(detached);
+        targets.session_roots.remove(detached);
+        if let Some(target_id) = targets.session_targets.remove(detached) {
+            targets.configured_targets.remove(&target_id);
+        }
+        if targets.root_session.as_deref() == Some(detached) {
+            targets.root_session = None;
         }
         return;
     }
@@ -417,34 +550,16 @@ fn handle_event(
     let Some(session_id) = event.session_id else {
         return;
     };
-    if !child_sessions.contains(&session_id) {
-        return;
-    }
-    if let CdpEvent::FetchRequestPaused(event) = &event.params {
-        let command = match network_controls.decide(&event.request.url) {
-            RequestDecision::Continue => submit(
-                connection,
-                Some(SessionId::new(session_id.clone())),
-                ContinueRequestParams::new(event.request_id.clone()),
-            ),
-            RequestDecision::Block => submit(
-                connection,
-                Some(SessionId::new(session_id.clone())),
-                FailRequestParams::new(event.request_id.clone(), ErrorReason::BlockedByClient),
-            ),
-            RequestDecision::Fulfill(response) => submit(
-                connection,
-                Some(SessionId::new(session_id.clone())),
-                fulfill_params(event, response),
-            ),
-        };
-        if let Err(error) = command {
-            warn!(
-                target: "nanocodex_browser",
-                %error,
-                "failed to resolve a child-target intercepted request"
-            );
-        }
+    if targets
+        .session_targets
+        .get(&session_id)
+        .is_some_and(|target_id| target_id == active_target_id)
+        || targets
+            .session_roots
+            .get(&session_id)
+            .is_none_or(|target_id| target_id != active_target_id)
+        || !targets.child_sessions.contains(&session_id)
+    {
         return;
     }
     let request_key = |request_id: &str| child_request_key(&session_id, request_id);
@@ -619,6 +734,14 @@ fn handle_event(
             }
         }
         _ => {}
+    }
+}
+
+fn complete_activation(targets: &mut AttachedTargets, target_id: &str) {
+    if let Some(waiters) = targets.activation_waiters.remove(target_id) {
+        for waiter in waiters {
+            let _ = waiter.send(());
+        }
     }
 }
 

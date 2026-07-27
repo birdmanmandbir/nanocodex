@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
+    io::{self, Write},
     path::Path,
     sync::{
         Arc, Mutex as StdMutex,
@@ -28,14 +29,17 @@ use crate::{
 use super::{BrowserError, evaluate_typed, source_maps::SourceMaps};
 
 const MAX_TRACE_EVENTS: usize = 250_000;
+const MAX_TRACE_BYTES: u64 = 128 * 1024 * 1024;
 const TRACE_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(super) struct PerformanceTraceState {
+    page: Page,
     events: Arc<StdMutex<Vec<Value>>>,
     dropped: Arc<AtomicU64>,
     complete: oneshot::Receiver<bool>,
     task: Option<JoinHandle<()>>,
     request_after: u64,
+    ended: bool,
 }
 
 impl Drop for PerformanceTraceState {
@@ -43,6 +47,16 @@ impl Drop for PerformanceTraceState {
         if let Some(task) = &self.task {
             task.abort();
         }
+        if self.ended {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let page = self.page.clone();
+        runtime.spawn(async move {
+            let _ = page.execute(EndParams::default()).await;
+        });
     }
 }
 
@@ -56,6 +70,8 @@ pub(super) async fn start(
     let task_events = Arc::clone(&events);
     let dropped = Arc::new(AtomicU64::new(0));
     let task_dropped = Arc::clone(&dropped);
+    let retained_bytes = Arc::new(AtomicU64::new(0));
+    let task_retained_bytes = Arc::clone(&retained_bytes);
     let (complete_tx, complete) = oneshot::channel();
     let task = tokio::spawn(async move {
         let data_loss = loop {
@@ -64,7 +80,12 @@ pub(super) async fn start(
                     let Some(event) = event else {
                         break true;
                     };
-                    if !retain_events(&task_events, &task_dropped, &event.value) {
+                    if !retain_events(
+                        &task_events,
+                        &task_dropped,
+                        &task_retained_bytes,
+                        &event.value,
+                    ) {
                         break true;
                     }
                 }
@@ -73,7 +94,12 @@ pub(super) async fn start(
                     while let Ok(Some(event)) =
                         timeout(Duration::from_millis(50), data.next()).await
                     {
-                        if !retain_events(&task_events, &task_dropped, &event.value) {
+                        if !retain_events(
+                            &task_events,
+                            &task_dropped,
+                            &task_retained_bytes,
+                            &event.value,
+                        ) {
                             break;
                         }
                     }
@@ -111,27 +137,112 @@ pub(super) async fn start(
     )
     .await?;
     Ok(PerformanceTraceState {
+        page: page.clone(),
         events,
         dropped,
         complete,
         task: Some(task),
         request_after,
+        ended: false,
     })
 }
 
-fn retain_events(events: &StdMutex<Vec<Value>>, dropped: &AtomicU64, incoming: &[Value]) -> bool {
+fn retain_events(
+    events: &StdMutex<Vec<Value>>,
+    dropped: &AtomicU64,
+    retained_bytes: &AtomicU64,
+    incoming: &[Value],
+) -> bool {
+    retain_events_with_limits(
+        events,
+        dropped,
+        retained_bytes,
+        incoming,
+        MAX_TRACE_EVENTS,
+        MAX_TRACE_BYTES,
+    )
+}
+
+fn retain_events_with_limits(
+    events: &StdMutex<Vec<Value>>,
+    dropped: &AtomicU64,
+    retained_bytes: &AtomicU64,
+    incoming: &[Value],
+    max_events: usize,
+    max_bytes: u64,
+) -> bool {
     let Ok(mut retained) = events.lock() else {
         return false;
     };
-    let available = MAX_TRACE_EVENTS.saturating_sub(retained.len());
-    retained.extend(incoming.iter().take(available).cloned());
-    if incoming.len() > available {
-        dropped.fetch_add(
-            u64::try_from(incoming.len() - available).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
+    let mut bytes = retained_bytes.load(Ordering::Relaxed);
+    for event in incoming {
+        let mut counter = ByteCounter::default();
+        let event_bytes =
+            serde_json::to_writer(&mut counter, event).map_or(u64::MAX, |()| counter.bytes);
+        if retained.len() == max_events || bytes.saturating_add(event_bytes) > max_bytes {
+            dropped.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        bytes = bytes.saturating_add(event_bytes);
+        retained.push(event.clone());
     }
+    retained_bytes.store(bytes, Ordering::Relaxed);
     true
+}
+
+#[derive(Default)]
+struct ByteCounter {
+    bytes: u64,
+}
+
+impl Write for ByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .saturating_add(u64::try_from(buffer.len()).unwrap_or(u64::MAX));
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    use serde_json::json;
+
+    use super::retain_events_with_limits;
+
+    #[test]
+    fn trace_retention_enforces_count_and_encoded_byte_budgets() {
+        let retained = Mutex::new(Vec::new());
+        let dropped = AtomicU64::new(0);
+        let bytes = AtomicU64::new(0);
+        let incoming = [json!({"name": "first"}), json!({"name": "second"})];
+
+        assert!(retain_events_with_limits(
+            &retained, &dropped, &bytes, &incoming, 10, 17,
+        ));
+        assert_eq!(retained.lock().expect("retained trace").len(), 1);
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+
+        assert!(retain_events_with_limits(
+            &retained,
+            &dropped,
+            &bytes,
+            &[json!({"name": "third"})],
+            1,
+            u64::MAX,
+        ));
+        assert_eq!(retained.lock().expect("retained trace").len(), 1);
+        assert_eq!(dropped.load(Ordering::Relaxed), 2);
+    }
 }
 
 pub(super) async fn stop(
@@ -143,6 +254,7 @@ pub(super) async fn stop(
     source_maps: &SourceMaps,
 ) -> Result<BrowserPerformanceTrace, BrowserError> {
     page.execute(EndParams::default()).await?;
+    state.ended = true;
     let data_loss = timeout(TRACE_STOP_TIMEOUT, &mut state.complete)
         .await
         .map_err(|_| BrowserError::PerformanceTraceTimeout)?

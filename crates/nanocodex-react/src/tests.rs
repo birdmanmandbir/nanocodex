@@ -6,7 +6,10 @@ use nanocodex_tools::{
 };
 use serde_json::value::to_raw_value;
 
-use crate::{ReactDoctor, ReactDoctorError, ReactDoctorTool, ReactReport, ReactRule};
+use crate::{
+    ReactAnalysisFailureKind, ReactDoctor, ReactDoctorError, ReactDoctorTool, ReactReport,
+    ReactRule,
+};
 
 const FINDINGS: &str = r#"
 import React, { useEffect } from "react";
@@ -124,6 +127,22 @@ fn file_limit_counts_every_candidate_even_when_parsing_fails() {
         error,
         ReactDoctorError::FileLimit { maximum: 1, .. }
     ));
+}
+
+#[test]
+fn file_size_limit_is_enforced_before_parsing() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(directory.path().join("large.tsx"), "x".repeat(17)).unwrap();
+    let doctor = ReactDoctor::builder(directory.path())
+        .max_file_bytes(16)
+        .build()
+        .unwrap();
+
+    let report = doctor.analyze().unwrap();
+
+    assert_eq!(report.analyzed_files, 0);
+    assert_eq!(report.failures.len(), 1);
+    assert_eq!(report.failures[0].kind, ReactAnalysisFailureKind::TooLarge);
 }
 
 #[tokio::test]

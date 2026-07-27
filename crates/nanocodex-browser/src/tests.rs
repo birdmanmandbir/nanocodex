@@ -1185,6 +1185,10 @@ globalThis.retainedFixture = Array.from(
 
 #[tokio::test]
 #[ignore = "requires a local Chrome or Chromium installation"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one live scenario covers routes, blocked foreground and background egress, diagnostics, and HAR"
+)]
 async fn restricted_browser_routes_without_network_egress() -> Result<()> {
     let browser = Browser::builder()
         .egress_policy(BrowserEgressPolicy::deny_by_default())
@@ -1250,6 +1254,57 @@ async fn restricted_browser_routes_without_network_egress() -> Result<()> {
     assert!(har.path.is_file());
     let exported: Value = serde_json::from_slice(&std::fs::read(&har.path)?)?;
     assert_eq!(exported["log"]["version"], "1.2");
+    let tabs = browser.execute(BrowserAction::ListTabs).await?;
+    let BrowserActionResult::Tabs { tabs, .. } = tabs else {
+        return Err(eyre!("expected tabs"));
+    };
+    let original_tab = tabs
+        .iter()
+        .find(|tab| tab.active)
+        .ok_or_else(|| eyre!("missing original active tab"))?
+        .tab_id
+        .clone();
+    browser
+        .execute(BrowserAction::Evaluate {
+            expression: r#"
+window.__nanocodexBackgroundEgress = "pending";
+setTimeout(() => {
+  fetch("https://background-blocked.invalid/")
+    .then(
+      () => { window.__nanocodexBackgroundEgress = "escaped"; },
+      () => { window.__nanocodexBackgroundEgress = "blocked"; },
+    );
+}, 100);
+true
+"#
+            .to_owned(),
+        })
+        .await?;
+    browser
+        .execute(BrowserAction::NewTab {
+            url: Some("data:text/html,<title>foreground</title>".to_owned()),
+        })
+        .await?;
+    browser
+        .execute(BrowserAction::WaitForTimeout { milliseconds: 500 })
+        .await?;
+    browser
+        .execute(BrowserAction::SelectTab {
+            tab_id: original_tab,
+        })
+        .await?;
+    let background = browser
+        .execute(BrowserAction::Evaluate {
+            expression: "window.__nanocodexBackgroundEgress".to_owned(),
+        })
+        .await?;
+    assert!(matches!(
+        background,
+        BrowserActionResult::Evaluation {
+            value: Value::String(value),
+            ..
+        } if value == "blocked"
+    ));
     browser
         .execute(BrowserAction::SetOffline { offline: true })
         .await?;
@@ -1601,7 +1656,23 @@ async fn worker_network_is_captured_before_module_execution() -> Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(serve_worker_fixture(listener));
-    let browser = Browser::new()?;
+    let browser = Browser::builder()
+        .egress_policy(BrowserEgressPolicy::deny_by_default().allow_loopback(true))
+        .build()?;
+    browser
+        .execute(BrowserAction::NetworkRoute {
+            route_id: "worker-dependency".to_owned(),
+            url_contains: "/dep.js".to_owned(),
+            response: BrowserRouteResponse {
+                status: 200,
+                headers: vec![BrowserRouteHeader {
+                    name: "content-type".to_owned(),
+                    value: "text/javascript".to_owned(),
+                }],
+                body: "export const value = 'worker-routed';".to_owned(),
+            },
+        })
+        .await?;
     browser
         .execute(BrowserAction::Open {
             url: format!("http://{address}/"),
@@ -1615,7 +1686,7 @@ async fn worker_network_is_captured_before_module_execution() -> Result<()> {
                 target: BrowserTarget::css("#state"),
             })
             .await?;
-        if matches!(state, BrowserActionResult::Text { text, .. } if text == "worker-ready") {
+        if matches!(state, BrowserActionResult::Text { text, .. } if text == "worker-routed") {
             worker_ready = true;
             break;
         }
@@ -1642,7 +1713,7 @@ async fn worker_network_is_captured_before_module_execution() -> Result<()> {
                 && request.url.ends_with("/dep.js")
                 && request.completed
         })
-        .ok_or_else(|| eyre!("missing completed worker dependency request"))?;
+        .ok_or_else(|| eyre!("missing completed worker dependency request: {requests:#?}"))?;
     let body = browser
         .execute(BrowserAction::NetworkBody {
             request_id: dependency.request_id.clone(),
@@ -1655,7 +1726,7 @@ async fn worker_network_is_captured_before_module_execution() -> Result<()> {
             body,
             base64_encoded: false,
             ..
-        } if body.contains("worker-ready")
+        } if body.contains("worker-routed")
     ));
 
     browser.close().await?;

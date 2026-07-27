@@ -1,6 +1,6 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
-    io,
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
@@ -29,9 +29,9 @@ use chromiumoxide::{
     cdp::{
         browser_protocol::{
             browser::{
-                DownloadProgressState, EventDownloadProgress, EventDownloadWillBegin,
-                PermissionDescriptor, PermissionSetting, SetDownloadBehaviorBehavior,
-                SetDownloadBehaviorParams, SetPermissionParams,
+                CancelDownloadParams, DownloadProgressState, EventDownloadProgress,
+                EventDownloadWillBegin, PermissionDescriptor, PermissionSetting,
+                SetDownloadBehaviorBehavior, SetDownloadBehaviorParams, SetPermissionParams,
             },
             dom::SetFileInputFilesParams,
             dom_snapshot::{
@@ -105,10 +105,31 @@ const DEFAULT_NAVIGATION_TIMEOUT: Duration = Duration::from_secs(5);
 const MAIN_CONTEXT_RETRY_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_EXPLICIT_WAIT: Duration = Duration::from_secs(30);
 const MAX_SCRIPT_EVALUATION: Duration = Duration::from_secs(30);
+const MAX_NETWORK_BODY_WAIT: Duration = Duration::from_secs(30);
+const MAX_NETWORK_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ACTION_INPUT_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_ACTION_VALUE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SNAPSHOT_REFS: usize = 20_000;
+const MAX_DOM_SNAPSHOT_NODES: usize = 250_000;
+const MAX_DOM_SNAPSHOT_STRING_BYTES: usize = 64 * 1024 * 1024;
+const MAX_DOM_COMPUTED_STYLES: usize = 128;
 const MAX_CONSOLE_ENTRIES: usize = 1_000;
 const MAX_PAGE_ERRORS: usize = 1_000;
 const MAX_NETWORK_REQUESTS: usize = 4_000;
 const MAX_WEB_SOCKET_MESSAGES: usize = 4_000;
+const MAX_DIAGNOSTIC_TEXT_BYTES: usize = 16 * 1024;
+const MAX_WEB_SOCKET_PAYLOAD_BYTES: usize = 32 * 1024;
+const MAX_NETWORK_HEADERS: usize = 128;
+const MAX_NETWORK_HEADER_BYTES: usize = 32 * 1024;
+const MAX_NETWORK_STACK_FRAMES: usize = 32;
+const MAX_NETWORK_FIELD_BYTES: usize = 4 * 1024;
+const MAX_VISUAL_ARTIFACTS: usize = 128;
+const MAX_HEAP_SNAPSHOTS: usize = 4;
+const MAX_DOWNLOADS: usize = 128;
+const MAX_DOWNLOAD_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_UPLOAD_FILES: usize = 64;
+const MAX_UPLOAD_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_DIAGNOSTIC_RESULTS: usize = 200;
 const MAX_DIAGNOSTIC_RESULTS: usize = 1_000;
 const REACT_DIAGNOSTICS_PROTOCOL_VERSION: u32 = 1;
@@ -161,6 +182,7 @@ struct Session {
     authenticators: HashMap<String, InstalledAuthenticator>,
     allowed_origins: Vec<Url>,
     network_controls: network_control::NetworkControls,
+    egress_targets: HashSet<String>,
     file_root: Option<PathBuf>,
     visual_artifacts: HashMap<String, BrowserImageArtifact>,
     visual_trace: Option<artifacts::VisualTraceState>,
@@ -255,8 +277,13 @@ impl Diagnostics {
     }
 
     fn push_console(&mut self, mut entry: BrowserConsoleEntry) {
+        truncate_utf8(&mut entry.level, MAX_NETWORK_FIELD_BYTES);
         self.next_console_sequence = self.next_console_sequence.saturating_add(1);
         entry.sequence = self.next_console_sequence;
+        if entry.text.len() > MAX_DIAGNOSTIC_TEXT_BYTES {
+            self.dropped_console = self.dropped_console.saturating_add(1);
+            return;
+        }
         if self.console.len() == MAX_CONSOLE_ENTRIES {
             self.console.pop_front();
             self.dropped_console = self.dropped_console.saturating_add(1);
@@ -265,8 +292,15 @@ impl Diagnostics {
     }
 
     fn push_error(&mut self, mut error: BrowserPageError) {
+        if let Some(url) = &mut error.url {
+            truncate_utf8(url, MAX_NETWORK_FIELD_BYTES);
+        }
         self.next_error_sequence = self.next_error_sequence.saturating_add(1);
         error.sequence = self.next_error_sequence;
+        if error.text.len() > MAX_DIAGNOSTIC_TEXT_BYTES {
+            self.dropped_errors = self.dropped_errors.saturating_add(1);
+            return;
+        }
         if self.errors.len() == MAX_PAGE_ERRORS {
             self.errors.pop_front();
             self.dropped_errors = self.dropped_errors.saturating_add(1);
@@ -281,6 +315,10 @@ impl Diagnostics {
         started_at_monotonic_seconds: f64,
         mut request: BrowserNetworkRequest,
     ) {
+        truncate_utf8(&mut request.url, MAX_DIAGNOSTIC_TEXT_BYTES);
+        truncate_utf8(&mut request.method, MAX_NETWORK_FIELD_BYTES);
+        truncate_utf8(&mut request.document_url, MAX_DIAGNOSTIC_TEXT_BYTES);
+        truncate_utf8(&mut request.resource_type, MAX_NETWORK_FIELD_BYTES);
         self.next_request_sequence = self.next_request_sequence.saturating_add(1);
         let sequence = self.next_request_sequence;
         request.sequence = sequence;
@@ -355,8 +393,8 @@ impl Diagnostics {
         resource_type: String,
     ) {
         if let Some(entry) = self.request_entry_mut(request_id) {
-            entry.request.failure = Some(error);
-            entry.request.resource_type = resource_type;
+            entry.request.failure = Some(bounded_string(&error, MAX_DIAGNOSTIC_TEXT_BYTES));
+            entry.request.resource_type = bounded_string(&resource_type, MAX_NETWORK_FIELD_BYTES);
             finish_request(entry, timestamp_seconds, 0.0);
             return;
         }
@@ -402,8 +440,9 @@ impl Diagnostics {
                     error,
                     resource_type,
                 } => {
-                    entry.request.failure = Some(error);
-                    entry.request.resource_type = resource_type;
+                    entry.request.failure = Some(bounded_string(&error, MAX_DIAGNOSTIC_TEXT_BYTES));
+                    entry.request.resource_type =
+                        bounded_string(&resource_type, MAX_NETWORK_FIELD_BYTES);
                     finish_request(entry, timestamp_seconds, 0.0);
                 }
             }
@@ -417,13 +456,17 @@ impl Diagnostics {
         timestamp_seconds: f64,
         frame: &WebSocketFrame,
     ) {
+        self.next_web_socket_message_sequence =
+            self.next_web_socket_message_sequence.saturating_add(1);
+        let sequence = self.next_web_socket_message_sequence;
+        if frame.payload_data.len() > MAX_WEB_SOCKET_PAYLOAD_BYTES {
+            self.dropped_web_socket_messages = self.dropped_web_socket_messages.saturating_add(1);
+            return;
+        }
         if self.web_socket_messages.len() == MAX_WEB_SOCKET_MESSAGES {
             self.web_socket_messages.pop_front();
             self.dropped_web_socket_messages = self.dropped_web_socket_messages.saturating_add(1);
         }
-        self.next_web_socket_message_sequence =
-            self.next_web_socket_message_sequence.saturating_add(1);
-        let sequence = self.next_web_socket_message_sequence;
         let opcode = web_socket_opcode(frame.opcode);
         self.web_socket_messages.push_back(BrowserWebSocketMessage {
             sequence,
@@ -434,6 +477,58 @@ impl Diagnostics {
             payload: frame.payload_data.clone(),
             base64_encoded: opcode != 1,
         });
+    }
+}
+
+fn truncate_utf8(value: &mut String, maximum: usize) {
+    if value.len() <= maximum {
+        return;
+    }
+    let mut boundary = maximum;
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value.truncate(boundary);
+}
+
+fn bounded_string(value: &str, maximum: usize) -> String {
+    let mut value = value.to_owned();
+    truncate_utf8(&mut value, maximum);
+    value
+}
+
+fn serialized_size(value: &impl Serialize) -> Result<u64, BrowserError> {
+    let mut counter = ByteCounter::default();
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.bytes)
+}
+
+fn ensure_action_value_size(bytes: usize) -> Result<(), BrowserError> {
+    let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+    if bytes > MAX_ACTION_VALUE_BYTES {
+        return Err(BrowserError::ActionValueTooLarge {
+            bytes,
+            maximum: MAX_ACTION_VALUE_BYTES,
+        });
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct ByteCounter {
+    bytes: u64,
+}
+
+impl Write for ByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .saturating_add(u64::try_from(buffer.len()).unwrap_or(u64::MAX));
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -563,15 +658,16 @@ impl Session {
         }
         page.execute(SetAutoAttachParams::new(false, false)).await?;
         let diagnostics = Arc::new(StdMutex::new(Diagnostics::default()));
-        let browser_tasks =
-            start_download_diagnostics(&browser, &download_dir, Arc::clone(&diagnostics)).await?;
+        let mut browser_tasks =
+            start_download_diagnostics(&browser, &page, &download_dir, Arc::clone(&diagnostics))
+                .await?;
         let (source_maps, source_maps_task) = source_maps::start(&page).await?;
         let mut page_tasks = vec![source_maps_task];
         let (devtools, devtools_tasks) = devtools::start(&page, source_maps.clone()).await?;
         page_tasks.extend(devtools_tasks);
         page_tasks.extend(start_diagnostics(&page, Arc::clone(&diagnostics)).await?);
         let network_controls = network_control::NetworkControls::new(egress_policy);
-        page_tasks.push(
+        browser_tasks.push(
             network_control::start(&page, network_controls.clone(), Arc::clone(&diagnostics))
                 .await?,
         );
@@ -579,10 +675,10 @@ impl Session {
             browser.websocket_address(),
             page.target_id().clone(),
             Arc::clone(&diagnostics),
-            network_controls.clone(),
         )
         .await?;
-        page_tasks.push(network_task);
+        browser_tasks.push(network_task);
+        let egress_targets = HashSet::from([page.target_id().as_ref().to_owned()]);
 
         Ok(Self {
             browser,
@@ -603,6 +699,7 @@ impl Session {
                 .map(|session| session.allowed_origins().to_vec())
                 .unwrap_or_default(),
             network_controls,
+            egress_targets,
             file_root,
             visual_artifacts: HashMap::new(),
             visual_trace: None,
@@ -710,6 +807,18 @@ impl Session {
             install_restricted_network_guards(&page).await?;
         }
         page.execute(SetAutoAttachParams::new(false, false)).await?;
+        let target_id = page.target_id().as_ref().to_owned();
+        if !self.egress_targets.contains(&target_id) {
+            let task = network_control::start(
+                &page,
+                self.network_controls.clone(),
+                Arc::clone(&self.diagnostics),
+            )
+            .await?;
+            self.egress_targets.insert(target_id.clone());
+            self.browser_tasks.push(task);
+        }
+        self.network_observer.activate(target_id).await?;
         if let Ok(mut diagnostics) = self.diagnostics.lock() {
             diagnostics.reset_page();
         }
@@ -718,25 +827,8 @@ impl Session {
         let (devtools, devtools_tasks) = devtools::start(&page, source_maps.clone()).await?;
         page_tasks.extend(devtools_tasks);
         page_tasks.extend(start_diagnostics(&page, Arc::clone(&self.diagnostics)).await?);
-        page_tasks.push(
-            network_control::start(
-                &page,
-                self.network_controls.clone(),
-                Arc::clone(&self.diagnostics),
-            )
-            .await?,
-        );
-        let (network_observer, network_task) = network_observer::start(
-            self.browser.websocket_address(),
-            page.target_id().clone(),
-            Arc::clone(&self.diagnostics),
-            self.network_controls.clone(),
-        )
-        .await?;
-        page_tasks.push(network_task);
         self.page = page;
         self.page_tasks = page_tasks;
-        self.network_observer = network_observer;
         self.source_maps = source_maps;
         self.devtools = devtools;
         self.refs.clear();
@@ -850,34 +942,48 @@ impl Session {
         .ok_or_else(|| BrowserError::NetworkBodyUnavailable {
             request_id: request_id.to_owned(),
         })?;
-        match source {
-            NetworkSource::Page => match kind {
-                BrowserNetworkBodyKind::Request => {
-                    let response = self
-                        .page
-                        .execute(GetRequestPostDataParams::new(request_id.to_owned()))
+        let body = tokio::time::timeout(MAX_NETWORK_BODY_WAIT, async {
+            match source {
+                NetworkSource::Page => match kind {
+                    BrowserNetworkBodyKind::Request => {
+                        let response = self
+                            .page
+                            .execute(GetRequestPostDataParams::new(request_id.to_owned()))
+                            .await?;
+                        Ok::<_, BrowserError>((response.post_data.clone(), false))
+                    }
+                    BrowserNetworkBodyKind::Response => {
+                        let response = self
+                            .page
+                            .execute(GetResponseBodyParams::new(request_id.to_owned()))
+                            .await?;
+                        Ok((response.body.clone(), response.base64_encoded))
+                    }
+                },
+                NetworkSource::ChildTarget {
+                    session_id,
+                    request_id,
+                } => {
+                    let body = self
+                        .network_observer
+                        .body(session_id, request_id, kind)
                         .await?;
-                    Ok((response.post_data.clone(), false))
+                    Ok((body.body, body.base64_encoded))
                 }
-                BrowserNetworkBodyKind::Response => {
-                    let response = self
-                        .page
-                        .execute(GetResponseBodyParams::new(request_id.to_owned()))
-                        .await?;
-                    Ok((response.body.clone(), response.base64_encoded))
-                }
-            },
-            NetworkSource::ChildTarget {
-                session_id,
-                request_id,
-            } => {
-                let body = self
-                    .network_observer
-                    .body(session_id, request_id, kind)
-                    .await?;
-                Ok((body.body, body.base64_encoded))
             }
+        })
+        .await
+        .map_err(|_| BrowserError::NetworkBodyTimeout {
+            request_id: request_id.to_owned(),
+        })??;
+        if body.0.len() > MAX_NETWORK_BODY_BYTES {
+            return Err(BrowserError::NetworkBodyTooLarge {
+                request_id: request_id.to_owned(),
+                bytes: body.0.len(),
+                maximum: MAX_NETWORK_BODY_BYTES,
+            });
         }
+        Ok(body)
     }
 
     async fn target(&self, target: &BrowserTarget) -> Result<ElementTarget, BrowserError> {
@@ -1009,6 +1115,12 @@ impl Session {
     }
 
     async fn upload_paths(&self, paths: Vec<PathBuf>) -> Result<Vec<String>, BrowserError> {
+        if paths.len() > MAX_UPLOAD_FILES {
+            return Err(BrowserError::UploadFileLimit {
+                count: paths.len(),
+                maximum: MAX_UPLOAD_FILES,
+            });
+        }
         let root = self
             .file_root
             .as_ref()
@@ -1022,11 +1134,26 @@ impl Session {
             if !candidate.starts_with(root) {
                 return Err(BrowserError::FileOutsideRoot { path: candidate });
             }
+            let metadata = tokio::fs::metadata(&candidate).await?;
+            if !metadata.is_file() {
+                return Err(BrowserError::UploadFileInvalid { path: candidate });
+            }
+            if metadata.len() > MAX_UPLOAD_FILE_BYTES {
+                return Err(BrowserError::UploadFileTooLarge {
+                    path: candidate,
+                    bytes: metadata.len(),
+                    maximum: MAX_UPLOAD_FILE_BYTES,
+                });
+            }
             resolved.push(candidate.to_string_lossy().into_owned());
         }
         Ok(resolved)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "cross-frame snapshot assembly keeps reference identity and aggregate limits in one ordered pass"
+    )]
     async fn snapshot(
         &mut self,
         interactive: bool,
@@ -1087,6 +1214,10 @@ impl Session {
                     }
                     Err(error) => return Err(error),
                 };
+            if let Err(error) = validate_snapshot_wire(snapshot.len(), refs.len(), &wire) {
+                self.refs.clear();
+                return Err(error);
+            }
             if index == 0 {
                 origin.clone_from(&wire.origin);
                 snapshot.clone_from(&wire.snapshot);
@@ -1251,6 +1382,13 @@ impl Session {
             }
         }
 
+        let active_targets = pages
+            .iter()
+            .map(|page| page.target_id().as_ref().to_owned())
+            .collect::<std::collections::HashSet<_>>();
+        self.authenticators
+            .retain(|target_id, _| active_targets.contains(target_id));
+
         for page in pages {
             let target_id = page.target_id().as_ref().to_owned();
             if self.authenticators.contains_key(&target_id) {
@@ -1292,6 +1430,26 @@ impl Session {
         }
         Ok(credentials)
     }
+}
+
+fn validate_snapshot_wire(
+    retained_bytes: usize,
+    retained_refs: usize,
+    wire: &SnapshotWire,
+) -> Result<(), BrowserError> {
+    let bytes = u64::try_from(retained_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(serialized_size(wire)?);
+    let refs = retained_refs.saturating_add(wire.refs.len());
+    if bytes > u64::try_from(MAX_SNAPSHOT_BYTES).unwrap_or(u64::MAX) || refs > MAX_SNAPSHOT_REFS {
+        return Err(BrowserError::SnapshotTooLarge {
+            bytes,
+            refs,
+            maximum_bytes: MAX_SNAPSHOT_BYTES,
+            maximum_refs: MAX_SNAPSHOT_REFS,
+        });
+    }
+    Ok(())
 }
 
 async fn export_brave_cookies(
@@ -1819,6 +1977,13 @@ impl NativeBrowser {
         &self,
         action: BrowserAction,
     ) -> Result<BrowserActionResult, BrowserError> {
+        let action_bytes = serialized_size(&action)?;
+        if action_bytes > MAX_ACTION_INPUT_BYTES {
+            return Err(BrowserError::ActionInputTooLarge {
+                bytes: action_bytes,
+                maximum: MAX_ACTION_INPUT_BYTES,
+            });
+        }
         let mut state = self.state.lock().await;
         let sequence = state.next_sequence;
         state.next_sequence = state.next_sequence.saturating_add(1);
@@ -2139,6 +2304,12 @@ async fn execute_action(
             include_dom_rects,
             include_paint_order,
         } => {
+            if computed_styles.len() > MAX_DOM_COMPUTED_STYLES {
+                return Err(BrowserError::DomComputedStylesLimit {
+                    count: computed_styles.len(),
+                    maximum: MAX_DOM_COMPUTED_STYLES,
+                });
+            }
             let snapshot = capture_dom_snapshot(
                 &session.page,
                 computed_styles,
@@ -2546,6 +2717,11 @@ return element.checked;"#
             full_page,
             annotate,
         } => {
+            if session.visual_artifacts.len() >= MAX_VISUAL_ARTIFACTS {
+                return Err(BrowserError::VisualArtifactLimit {
+                    maximum: MAX_VISUAL_ARTIFACTS,
+                });
+            }
             if annotate {
                 install_annotations(session).await?;
             }
@@ -2598,6 +2774,11 @@ return element.checked;"#
             })
         }
         BrowserAction::VisualBaseline { full_page } => {
+            if session.visual_artifacts.len() >= MAX_VISUAL_ARTIFACTS {
+                return Err(BrowserError::VisualArtifactLimit {
+                    maximum: MAX_VISUAL_ARTIFACTS,
+                });
+            }
             let image = artifacts::capture(
                 &session.page,
                 &session.output_dir,
@@ -2626,6 +2807,11 @@ return element.checked;"#
                 .ok_or_else(|| BrowserError::VisualArtifactUnavailable {
                     artifact_id: baseline_id.clone(),
                 })?;
+            if session.visual_artifacts.len() >= MAX_VISUAL_ARTIFACTS {
+                return Err(BrowserError::VisualArtifactLimit {
+                    maximum: MAX_VISUAL_ARTIFACTS,
+                });
+            }
             let current = artifacts::capture(
                 &session.page,
                 &session.output_dir,
@@ -2738,7 +2924,7 @@ return element.checked;"#
         }
         BrowserAction::GetText { target } => {
             let target = session.target(&target).await?;
-            let text = evaluate_typed_in_context(
+            let text: String = evaluate_typed_in_context(
                 &session.page,
                 element_script(
                     &target.query,
@@ -2747,6 +2933,7 @@ return element.checked;"#
                 target.context_id,
             )
             .await?;
+            ensure_action_value_size(text.len())?;
             Ok(BrowserActionResult::Text {
                 sequence,
                 executed: true,
@@ -2755,12 +2942,13 @@ return element.checked;"#
         }
         BrowserAction::GetHtml { target } => {
             let target = session.target(&target).await?;
-            let html = evaluate_typed_in_context(
+            let html: String = evaluate_typed_in_context(
                 &session.page,
                 element_script(&target.query, "return element.innerHTML;")?,
                 target.context_id,
             )
             .await?;
+            ensure_action_value_size(html.len())?;
             Ok(BrowserActionResult::Html {
                 sequence,
                 executed: true,
@@ -2769,7 +2957,7 @@ return element.checked;"#
         }
         BrowserAction::GetValue { target } => {
             let target = session.target(&target).await?;
-            let value = evaluate_typed_in_context(
+            let value: Option<String> = evaluate_typed_in_context(
                 &session.page,
                 element_script(
                     &target.query,
@@ -2778,6 +2966,9 @@ return element.checked;"#
                 target.context_id,
             )
             .await?;
+            if let Some(value) = &value {
+                ensure_action_value_size(value.len())?;
+            }
             Ok(BrowserActionResult::Value {
                 sequence,
                 executed: true,
@@ -2786,7 +2977,7 @@ return element.checked;"#
         }
         BrowserAction::GetAttribute { target, name } => {
             let target = session.target(&target).await?;
-            let value = evaluate_typed_in_context(
+            let value: Option<String> = evaluate_typed_in_context(
                 &session.page,
                 element_script(
                     &target.query,
@@ -2798,6 +2989,9 @@ return element.checked;"#
                 target.context_id,
             )
             .await?;
+            if let Some(value) = &value {
+                ensure_action_value_size(value.len())?;
+            }
             Ok(BrowserActionResult::Attribute {
                 sequence,
                 executed: true,
@@ -2806,6 +3000,7 @@ return element.checked;"#
         }
         BrowserAction::GetTitle => {
             let title: String = evaluate_typed(&session.page, "document.title").await?;
+            ensure_action_value_size(title.len())?;
             Ok(BrowserActionResult::Title {
                 sequence,
                 executed: true,
@@ -3282,8 +3477,8 @@ return {
             if !session.cpu_profile_active {
                 return Err(BrowserError::CpuProfileNotActive);
             }
-            session.cpu_profile_active = false;
             let profile = profiling::stop_cpu(&session.page, &session.output_dir, sequence).await?;
+            session.cpu_profile_active = false;
             Ok(BrowserActionResult::CpuProfile {
                 sequence,
                 executed: true,
@@ -3302,9 +3497,9 @@ return {
             if !session.coverage_active {
                 return Err(BrowserError::CoverageNotActive);
             }
-            session.coverage_active = false;
             let coverage =
                 profiling::stop_coverage(&session.page, &session.output_dir, sequence).await?;
+            session.coverage_active = false;
             Ok(BrowserActionResult::Coverage {
                 sequence,
                 executed: true,
@@ -3312,6 +3507,11 @@ return {
             })
         }
         BrowserAction::HeapSnapshot { collect_garbage } => {
+            if session.heap_snapshots.len() >= MAX_HEAP_SNAPSHOTS {
+                return Err(BrowserError::HeapSnapshotLimit {
+                    maximum: MAX_HEAP_SNAPSHOTS,
+                });
+            }
             let (snapshot, analysis) = profiling::capture_heap(
                 &session.page,
                 &session.output_dir,
@@ -3739,6 +3939,13 @@ return {
             .map_err(|_| BrowserError::EvaluationTimeout {
                 maximum: MAX_SCRIPT_EVALUATION,
             })??;
+            let bytes = serialized_size(&value)?;
+            if bytes > MAX_ACTION_VALUE_BYTES {
+                return Err(BrowserError::ActionValueTooLarge {
+                    bytes,
+                    maximum: MAX_ACTION_VALUE_BYTES,
+                });
+            }
             Ok(BrowserActionResult::Evaluation {
                 sequence,
                 executed: true,
@@ -3766,6 +3973,24 @@ async fn capture_dom_snapshot(
     params.include_dom_rects = Some(include_dom_rects);
     params.include_paint_order = Some(include_paint_order);
     let raw = page.execute(params).await?;
+    let node_count = raw
+        .documents
+        .iter()
+        .map(|document| document.nodes.node_type.as_deref().map_or(0, <[i64]>::len))
+        .fold(0_usize, usize::saturating_add);
+    let string_bytes = raw
+        .strings
+        .iter()
+        .map(String::len)
+        .fold(0_usize, usize::saturating_add);
+    if node_count > MAX_DOM_SNAPSHOT_NODES || string_bytes > MAX_DOM_SNAPSHOT_STRING_BYTES {
+        return Err(BrowserError::DomSnapshotTooLarge {
+            nodes: node_count,
+            string_bytes,
+            maximum_nodes: MAX_DOM_SNAPSHOT_NODES,
+            maximum_string_bytes: MAX_DOM_SNAPSHOT_STRING_BYTES,
+        });
+    }
     decode_dom_snapshot(&raw, &computed_styles)
 }
 
@@ -4592,6 +4817,7 @@ async fn start_diagnostics(
 
 async fn start_download_diagnostics(
     browser: &Chromium,
+    page: &Page,
     download_dir: &Path,
     diagnostics: Arc<StdMutex<Diagnostics>>,
 ) -> Result<Vec<JoinHandle<()>>, BrowserError> {
@@ -4607,72 +4833,124 @@ async fn start_download_diagnostics(
         .await?;
     let mut started_events = browser.event_listener::<EventDownloadWillBegin>().await?;
     let started_diagnostics = Arc::clone(&diagnostics);
+    let started_page = page.clone();
     let started = tokio::spawn(async move {
         while let Some(event) = started_events.next().await {
-            let Ok(mut diagnostics) = started_diagnostics.lock() else {
-                break;
+            let cancel = {
+                let Ok(mut diagnostics) = started_diagnostics.lock() else {
+                    break;
+                };
+                record_download_start(&mut diagnostics, &event)
             };
-            diagnostics.downloads.insert(
-                event.guid.clone(),
-                BrowserDownload {
-                    id: event.guid.clone(),
-                    url: event.url.clone(),
-                    suggested_filename: event.suggested_filename.clone(),
-                    path: None,
-                    received_bytes: 0,
-                    total_bytes: None,
-                    completed: false,
-                    failure: None,
-                },
-            );
+            if cancel {
+                let _ = started_page
+                    .execute(CancelDownloadParams::new(event.guid.clone()))
+                    .await;
+            }
         }
     });
 
     let mut progress_events = browser.event_listener::<EventDownloadProgress>().await?;
+    let progress_page = page.clone();
     let progress = tokio::spawn(async move {
         while let Some(event) = progress_events.next().await {
-            let Ok(mut diagnostics) = diagnostics.lock() else {
-                break;
+            let cancel = {
+                let Ok(mut diagnostics) = diagnostics.lock() else {
+                    break;
+                };
+                record_download_progress(&mut diagnostics, &event)
             };
-            let download = diagnostics
-                .downloads
-                .entry(event.guid.clone())
-                .or_insert_with(|| BrowserDownload {
-                    id: event.guid.clone(),
-                    url: String::new(),
-                    suggested_filename: String::new(),
-                    path: None,
-                    received_bytes: 0,
-                    total_bytes: None,
-                    completed: false,
-                    failure: None,
-                });
-            download.received_bytes = nonnegative_f64_to_u64(event.received_bytes);
-            download.total_bytes =
-                (event.total_bytes > 0.0).then(|| nonnegative_f64_to_u64(event.total_bytes));
-            download.path = event.file_path.as_ref().map(PathBuf::from);
-            match event.state {
-                DownloadProgressState::InProgress => {}
-                DownloadProgressState::Completed => download.completed = true,
-                DownloadProgressState::Canceled => {
-                    download.failure = Some("download canceled".to_owned());
-                }
+            if cancel {
+                let _ = progress_page
+                    .execute(CancelDownloadParams::new(event.guid.clone()))
+                    .await;
             }
         }
     });
     Ok(vec![started, progress])
 }
 
+fn record_download_start(diagnostics: &mut Diagnostics, event: &EventDownloadWillBegin) -> bool {
+    if !diagnostics.downloads.contains_key(&event.guid)
+        && diagnostics.downloads.len() >= MAX_DOWNLOADS
+    {
+        return true;
+    }
+    diagnostics.downloads.insert(
+        event.guid.clone(),
+        BrowserDownload {
+            id: event.guid.clone(),
+            url: bounded_string(&event.url, MAX_DIAGNOSTIC_TEXT_BYTES),
+            suggested_filename: bounded_string(&event.suggested_filename, MAX_NETWORK_FIELD_BYTES),
+            path: None,
+            received_bytes: 0,
+            total_bytes: None,
+            completed: false,
+            failure: None,
+        },
+    );
+    false
+}
+
+fn record_download_progress(diagnostics: &mut Diagnostics, event: &EventDownloadProgress) -> bool {
+    if !diagnostics.downloads.contains_key(&event.guid)
+        && diagnostics.downloads.len() >= MAX_DOWNLOADS
+    {
+        return true;
+    }
+    let download = diagnostics
+        .downloads
+        .entry(event.guid.clone())
+        .or_insert_with(|| BrowserDownload {
+            id: event.guid.clone(),
+            url: String::new(),
+            suggested_filename: String::new(),
+            path: None,
+            received_bytes: 0,
+            total_bytes: None,
+            completed: false,
+            failure: None,
+        });
+    download.received_bytes = nonnegative_f64_to_u64(event.received_bytes);
+    download.total_bytes =
+        (event.total_bytes > 0.0).then(|| nonnegative_f64_to_u64(event.total_bytes));
+    download.path = event.file_path.as_ref().map(PathBuf::from);
+    let oversized = download.received_bytes > MAX_DOWNLOAD_BYTES
+        || download
+            .total_bytes
+            .is_some_and(|bytes| bytes > MAX_DOWNLOAD_BYTES);
+    match event.state {
+        DownloadProgressState::InProgress => {}
+        DownloadProgressState::Completed => download.completed = true,
+        DownloadProgressState::Canceled => {
+            download.failure = Some("download canceled".to_owned());
+        }
+    }
+    if oversized {
+        download.failure = Some(format!(
+            "download exceeded the {MAX_DOWNLOAD_BYTES}-byte session limit"
+        ));
+    }
+    oversized
+}
+
 fn apply_response(request: &mut BrowserNetworkRequest, response: &Response) {
     request.status = Some(response.status);
-    request.status_text = Some(response.status_text.clone());
+    request.status_text = Some(bounded_string(
+        &response.status_text,
+        MAX_NETWORK_FIELD_BYTES,
+    ));
     request.response_headers = network_headers(&response.headers);
-    request.mime_type = Some(response.mime_type.clone());
-    request.charset = Some(response.charset.clone());
-    request.protocol.clone_from(&response.protocol);
-    request
+    request.mime_type = Some(bounded_string(&response.mime_type, MAX_NETWORK_FIELD_BYTES));
+    request.charset = Some(bounded_string(&response.charset, MAX_NETWORK_FIELD_BYTES));
+    request.protocol = response
+        .protocol
+        .as_deref()
+        .map(|value| bounded_string(value, MAX_NETWORK_FIELD_BYTES));
+    request.remote_ip_address = response
         .remote_ip_address
-        .clone_from(&response.remote_ip_address);
+        .as_deref()
+        .map(|value| bounded_string(value, MAX_NETWORK_FIELD_BYTES));
     request.remote_port = response.remote_port;
     request.from_disk_cache = response.from_disk_cache.unwrap_or(false);
     request.from_service_worker = response.from_service_worker.unwrap_or(false);
@@ -4696,22 +4974,36 @@ fn network_headers(headers: &Headers) -> Vec<BrowserHttpHeader> {
     let Some(headers) = headers.inner().as_object() else {
         return Vec::new();
     };
+    let mut retained_bytes = 0_usize;
     let mut headers = headers
         .iter()
-        .map(|(name, value)| {
+        .take(MAX_NETWORK_HEADERS)
+        .filter_map(|(name, value)| {
+            let name = bounded_string(name, MAX_NETWORK_FIELD_BYTES);
             let sensitive = matches!(
                 name.to_ascii_lowercase().as_str(),
                 "authorization" | "proxy-authorization" | "cookie" | "set-cookie"
             );
-            BrowserHttpHeader {
-                name: name.clone(),
-                value: (!sensitive).then(|| {
+            let value = (!sensitive)
+                .then(|| {
                     value
                         .as_str()
                         .map_or_else(|| value.to_string(), str::to_owned)
-                }),
-                sensitive,
+                })
+                .map(|mut value| {
+                    truncate_utf8(&mut value, MAX_NETWORK_FIELD_BYTES);
+                    value
+                });
+            let bytes = name.len() + value.as_ref().map_or(0, String::len);
+            if retained_bytes.saturating_add(bytes) > MAX_NETWORK_HEADER_BYTES {
+                return None;
             }
+            retained_bytes = retained_bytes.saturating_add(bytes);
+            Some(BrowserHttpHeader {
+                name,
+                value,
+                sensitive,
+            })
         })
         .collect::<Vec<_>>();
     headers.sort_unstable_by(|left, right| {
@@ -4728,8 +5020,11 @@ fn network_initiator(initiator: &Initiator) -> BrowserNetworkInitiator {
         collect_stack_frames(trace, &mut stack);
     }
     BrowserNetworkInitiator {
-        kind: initiator.r#type.as_ref().to_owned(),
-        url: initiator.url.clone(),
+        kind: bounded_string(initiator.r#type.as_ref(), MAX_NETWORK_FIELD_BYTES),
+        url: initiator
+            .url
+            .as_deref()
+            .map(|url| bounded_string(url, MAX_NETWORK_FIELD_BYTES)),
         line_number: initiator.line_number,
         column_number: initiator.column_number,
         request_id: initiator
@@ -4741,19 +5036,21 @@ fn network_initiator(initiator: &Initiator) -> BrowserNetworkInitiator {
 }
 
 fn collect_stack_frames(trace: &StackTrace, frames: &mut Vec<BrowserNetworkCallFrame>) {
-    frames.extend(
-        trace
-            .call_frames
-            .iter()
-            .map(|frame| BrowserNetworkCallFrame {
-                function_name: frame.function_name.clone(),
-                url: frame.url.clone(),
+    let mut trace = Some(trace);
+    while let Some(current) = trace {
+        let available = MAX_NETWORK_STACK_FRAMES.saturating_sub(frames.len());
+        frames.extend(current.call_frames.iter().take(available).map(|frame| {
+            BrowserNetworkCallFrame {
+                function_name: bounded_string(&frame.function_name, MAX_NETWORK_FIELD_BYTES),
+                url: bounded_string(&frame.url, MAX_NETWORK_FIELD_BYTES),
                 line_number: frame.line_number,
                 column_number: frame.column_number,
-            }),
-    );
-    if let Some(parent) = trace.parent.as_deref() {
-        collect_stack_frames(parent, frames);
+            }
+        }));
+        if frames.len() == MAX_NETWORK_STACK_FRAMES {
+            break;
+        }
+        trace = current.parent.as_deref();
     }
 }
 
@@ -5408,14 +5705,14 @@ struct SnapshotOptions<'a> {
     reference_start: usize,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct SnapshotWire {
     origin: String,
     snapshot: String,
     refs: Vec<SnapshotRefWire>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct SnapshotRefWire {
     reference: String,
     #[serde(rename = "selectorPath")]
@@ -5448,16 +5745,24 @@ pub enum BrowserError {
         #[source]
         source: reqwest::Error,
     },
+    #[error("CrUX response exceeded the {maximum}-byte limit")]
+    CruxResponseTooLarge { maximum: usize },
     #[error("browser image artifact failed")]
     Image(#[from] image::ImageError),
     #[error("browser image artifact is {bytes} bytes, above the {maximum}-byte limit")]
     ImageArtifactTooLarge { bytes: u64, maximum: u64 },
     #[error("browser image artifact contains {pixels} pixels, above the {maximum}-pixel limit")]
     ImageArtifactPixels { pixels: u64, maximum: u64 },
+    #[error("browser PDF is {bytes} bytes, above the {maximum}-byte limit")]
+    PdfTooLarge { bytes: usize, maximum: usize },
     #[error(transparent)]
     BraveSession(#[from] BraveSessionError),
     #[error("browser configuration is invalid: {message}")]
     Configuration { message: String },
+    #[error("browser action input is {bytes} bytes, above the {maximum}-byte limit")]
+    ActionInputTooLarge { bytes: u64, maximum: u64 },
+    #[error("browser action result is {bytes} bytes, above the {maximum}-byte limit")]
+    ActionValueTooLarge { bytes: u64, maximum: u64 },
     #[error("browser navigation does not allow the `{scheme}` URL scheme")]
     UnsupportedUrlScheme { scheme: String },
     #[error("browser navigation requires an absolute URL")]
@@ -5508,8 +5813,40 @@ pub enum BrowserError {
     ReactDiagnosticsProtocol { expected: u32, actual: u32 },
     #[error("Chromium returned an invalid DOM snapshot: {message}")]
     InvalidDomSnapshot { message: String },
+    #[error(
+        "browser semantic snapshot is {bytes} bytes with {refs} references; limits are {maximum_bytes} bytes and {maximum_refs} references"
+    )]
+    SnapshotTooLarge {
+        bytes: u64,
+        refs: usize,
+        maximum_bytes: usize,
+        maximum_refs: usize,
+    },
+    #[error(
+        "browser DOM snapshot contains {nodes} nodes and {string_bytes} string bytes; limits are {maximum_nodes} nodes and {maximum_string_bytes} string bytes"
+    )]
+    DomSnapshotTooLarge {
+        nodes: usize,
+        string_bytes: usize,
+        maximum_nodes: usize,
+        maximum_string_bytes: usize,
+    },
+    #[error(
+        "browser DOM snapshot requested {count} computed styles, above the {maximum}-style limit"
+    )]
+    DomComputedStylesLimit { count: usize, maximum: usize },
     #[error("network body is unavailable for request `{request_id}`")]
     NetworkBodyUnavailable { request_id: String },
+    #[error("network body for request `{request_id}` did not arrive before the deadline")]
+    NetworkBodyTimeout { request_id: String },
+    #[error(
+        "network body for request `{request_id}` is {bytes} bytes, above the {maximum}-byte limit"
+    )]
+    NetworkBodyTooLarge {
+        request_id: String,
+        bytes: usize,
+        maximum: usize,
+    },
     #[error("network observer failed: {message}")]
     NetworkObserver { message: String },
     #[error("browser network route is invalid: {message}")]
@@ -5526,6 +5863,16 @@ pub enum BrowserError {
     FileRootNotConfigured,
     #[error("browser file path escapes the configured file root: {path:?}")]
     FileOutsideRoot { path: PathBuf },
+    #[error("browser upload requested {count} files, above the {maximum}-file limit")]
+    UploadFileLimit { count: usize, maximum: usize },
+    #[error("browser upload path is not a regular file: {path:?}")]
+    UploadFileInvalid { path: PathBuf },
+    #[error("browser upload file {path:?} is {bytes} bytes, above the {maximum}-byte limit")]
+    UploadFileTooLarge {
+        path: PathBuf,
+        bytes: u64,
+        maximum: u64,
+    },
     #[error("browser visual trace is already active")]
     VisualTraceActive,
     #[error("browser visual trace is not active")]
@@ -5547,12 +5894,18 @@ pub enum BrowserError {
         status: Option<i32>,
         stderr_path: PathBuf,
     },
+    #[error("Lighthouse report is {bytes} bytes, above the {maximum}-byte limit")]
+    LighthouseReportTooLarge { bytes: u64, maximum: u64 },
+    #[error("Lighthouse report read task failed")]
+    LighthouseReadTask(#[source] tokio::task::JoinError),
     #[error("CrUX field data requires a harness-configured client")]
     CruxNotConfigured,
     #[error("CrUX field data requires an HTTP(S) page URL, received `{url}`")]
     CruxUrl { url: String },
     #[error("browser visual artifact `{artifact_id}` is unavailable")]
     VisualArtifactUnavailable { artifact_id: String },
+    #[error("browser retains at most {maximum} visual artifacts per session")]
+    VisualArtifactLimit { maximum: usize },
     #[error("browser performance trace is already active")]
     PerformanceTraceActive,
     #[error("browser performance trace is not active")]
@@ -5587,6 +5940,8 @@ pub enum BrowserError {
     HeapClassUnavailable { index: usize },
     #[error("browser heap snapshot `{artifact_id}` is unavailable")]
     HeapSnapshotUnavailable { artifact_id: String },
+    #[error("browser retains at most {maximum} heap snapshots per session")]
+    HeapSnapshotLimit { maximum: usize },
     #[error("browser heap node {node_id} is unavailable in snapshot `{artifact_id}`")]
     HeapNodeUnavailable { artifact_id: String, node_id: u64 },
     #[error("a browser video recording is already active")]
@@ -5909,13 +6264,14 @@ mod tests {
     use futures_util::StreamExt;
 
     use super::{
-        BrowserConfig, Chromium, Diagnostics, GateSignals, MAX_CONSOLE_ENTRIES,
-        MAX_NETWORK_REQUESTS, NetworkSource, allowed_cookie_params, brave_launch_config,
-        build_config, classify_gate, close_chromium, cookie_param, diagnostic_limit, validate_url,
+        BrowserConfig, Chromium, Diagnostics, GateSignals, MAX_ACTION_INPUT_BYTES,
+        MAX_CONSOLE_ENTRIES, MAX_DIAGNOSTIC_TEXT_BYTES, MAX_NETWORK_REQUESTS, NetworkSource,
+        allowed_cookie_params, brave_launch_config, build_config, classify_gate, close_chromium,
+        cookie_param, diagnostic_limit, validate_url,
     };
     use crate::{
         BraveSession, Browser, BrowserAction, BrowserActionResult, BrowserConsoleEntry,
-        BrowserGate, BrowserNetworkRequest,
+        BrowserError, BrowserGate, BrowserNetworkRequest,
     };
 
     #[test]
@@ -5976,6 +6332,33 @@ mod tests {
         );
         assert_eq!(diagnostic_limit(None), 200);
         assert_eq!(diagnostic_limit(Some(u16::MAX)), 1_000);
+
+        diagnostics.push_console(BrowserConsoleEntry {
+            sequence: 0,
+            level: "log".to_owned(),
+            text: "x".repeat(MAX_DIAGNOSTIC_TEXT_BYTES + 1),
+            stack: Vec::new(),
+        });
+        assert_eq!(diagnostics.console.len(), MAX_CONSOLE_ENTRIES);
+        assert_eq!(diagnostics.dropped_console, 3);
+        assert_eq!(
+            diagnostics.next_console_sequence,
+            u64::try_from(MAX_CONSOLE_ENTRIES).unwrap_or(u64::MAX) + 3
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_action_is_rejected_before_chromium_launch() {
+        let browser = Browser::new().expect("browser handle");
+        let error = browser
+            .execute(BrowserAction::Evaluate {
+                expression: "x".repeat(
+                    usize::try_from(MAX_ACTION_INPUT_BYTES).expect("test limit fits usize") + 1,
+                ),
+            })
+            .await
+            .expect_err("oversized action must fail");
+        assert!(matches!(error, BrowserError::ActionInputTooLarge { .. }));
     }
 
     #[test]
