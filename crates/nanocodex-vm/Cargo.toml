@@ -22,7 +22,7 @@ mpp = ["host", "dep:mpp-egress"]
 [dependencies]
 async-trait = "0.1.89"
 mpp-egress = { workspace = true, optional = true }
-nanocodex-tools = { path = "../nanocodex-tools", default-features = false }
+nanocodex-tools = { path = "../nanocodex-tools", version = "0.2.0", default-features = false }
 nanovm = { workspace = true, optional = true }
 nix = { workspace = true, optional = true }
 serde.workspace = true
