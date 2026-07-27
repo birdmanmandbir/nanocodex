@@ -14,18 +14,25 @@ categories.workspace = true
 description = "VM-owned standard workspace tools for Nanocodex"
 
 [features]
-default = []
+default = ["host"]
+guest = ["dep:nix"]
+host = ["dep:nanovm"]
 
 [dependencies]
 async-trait = "0.1.89"
-nanocodex-tools.workspace = true
-nanovm.workspace = true
-nix.workspace = true
+nanocodex-tools = { version = "0.2.0", path = "../nanocodex-tools", default-features = false }
+nanovm = { workspace = true, optional = true }
+nix = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-std", "io-util"] }
+tokio = { workspace = true, features = ["fs", "io-std", "io-util", "process", "rt", "sync", "time"] }
 tracing.workspace = true
+
+[[bin]]
+name = "nanocodex-vm-guest"
+path = "src/bin/nanocodex-vm-guest.rs"
+required-features = ["guest"]
 
 [dev-dependencies]
 tempfile.workspace = true

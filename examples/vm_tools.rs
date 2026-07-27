@@ -1,13 +1,18 @@
 use std::{
     error::Error,
+    fs, io,
     net::Ipv4Addr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
 };
 
+use arcbox_ext4::{
+    Formatter,
+    constants::{file_mode, make_mode},
+};
 use axum::{
     Router,
     extract::Request,
@@ -22,7 +27,10 @@ use mpp::{
 use mpp_egress::{EgressPolicy, MppEgress};
 use nanocodex::{Tool, ToolContext, ToolExecution, ToolInput, ToolOutputBody, ToolOutputContent};
 use nanocodex_vm::{VmToolSession, mpp_egress_layer};
-use nanovm::{BlockDevice, EgressLease, GuestCommand, VmConfig, VmProcessConfig};
+use nanovm::{
+    BlockDevice, EgressLease, EgressMount, GUEST_EGRESS_ROOT, GuestCommand, VmConfig,
+    VmProcessConfig,
+};
 use serde::Deserialize;
 use serde_json::value::to_raw_value;
 use tokio::process::Command;
@@ -30,6 +38,7 @@ use tokio::process::Command;
 const GUEST_RUNTIME: &str = "/usr/local/bin/nanocodex-vm-guest";
 const RUNTIME_BLOCK_DEVICE: &str = "/dev/vdb";
 const RUNTIME_MOUNT: &str = "/run/nanocodex";
+const RUNTIME_DISK_BYTES: u64 = 128 * 1024 * 1024;
 type AnyError = Box<dyn Error + Send + Sync>;
 
 #[derive(Deserialize)]
@@ -69,12 +78,33 @@ async fn run_host(arguments: Vec<std::ffi::OsString>, prove_mpp: bool) -> Result
         .first()
         .cloned()
         .map(PathBuf::from)
-        .ok_or("usage: vm-tools ROOTFS [GUEST_RUNTIME_EXT4] [--prove-mpp]")?;
+        .ok_or("usage: vm-tools ROOTFS [GUEST_RUNTIME_BINARY_OR_EXT4] [--prove-mpp]")?;
+    let (_private_root, root) = if root.is_file() {
+        let directory = tempfile::tempdir()?;
+        let private = directory.path().join("rootfs.ext4");
+        reflink_or_sparse_copy(&root, &private)?;
+        (Some(directory), private)
+    } else {
+        (None, root)
+    };
     let runtime = arguments.get(1).cloned().map(PathBuf::from);
+    let (_runtime_disk, runtime) = match runtime {
+        Some(runtime) => {
+            let (guard, runtime) = prepare_runtime_disk(&runtime)?;
+            (guard, Some(runtime))
+        }
+        None => (None, None),
+    };
     let (egress, mpp_proof) = if prove_mpp {
         let proof = MppProof::start().await?;
-        let layer = mpp_egress_layer(Arc::clone(&proof.egress))?;
-        (EgressLease::internet().with_layer(layer)?, Some(proof))
+        let mpp = mpp_egress_layer(Arc::clone(&proof.egress))?;
+        let secrets = secret_style_proof_layer()?;
+        (
+            EgressLease::internet()
+                .with_layer(mpp)?
+                .with_layer(secrets)?,
+            Some(proof),
+        )
     } else {
         (EgressLease::disabled(), None)
     };
@@ -100,8 +130,6 @@ async fn run_host(arguments: Vec<std::ffi::OsString>, prove_mpp: bool) -> Result
             GuestCommand::new(GUEST_RUNTIME).arg("/workspace"),
         )
     };
-    let (config, command) = egress.configure(config, &guest);
-    let process_config = VmProcessConfig::new(config, command).write_private()?;
     let executable = std::env::current_exe()?;
     let mut vmm = Command::new(executable);
     vmm.env_clear();
@@ -110,11 +138,10 @@ async fn run_host(arguments: Vec<std::ffi::OsString>, prove_mpp: bool) -> Result
             vmm.env(name, value);
         }
     }
-    vmm.arg("--vmm").arg(process_config.path());
-    let mut session = VmToolSession::spawn(&mut vmm)?;
-    session.provision_egress(egress).await?;
+    vmm.arg("--vmm");
+    let session = VmToolSession::spawn_configured(vmm, config, guest, egress).await?;
     let vm = session.tools();
-    let _agent_tools = vm
+    let agent_tools = vm
         .tools_builder()
         .working_directory("/workspace")
         .default_shell("sh")
@@ -247,6 +274,29 @@ async fn run_host(arguments: Vec<std::ffi::OsString>, prove_mpp: bool) -> Result
             .execute(
                 function_input(&serde_json::json!({
                     "cmd": format!(
+                        "test \"$NANOCENTAUR_SECRET_BASE_URL\" = \
+                         https://secret-gateway.invalid/v1; \
+                         if printf tamper 2>/dev/null >> {GUEST_EGRESS_ROOT}/secrets/route.txt; \
+                         then exit 9; fi; \
+                         cat {GUEST_EGRESS_ROOT}/secrets/route.txt"
+                    ),
+                    "workdir": "/workspace",
+                    "login": false
+                }))?,
+                context,
+            )
+            .await?;
+        let output = command_output(execution)?;
+        if output.exit_code != Some(0) || output.output.trim() != "public-route" {
+            return Err(format!("secret-style egress proof failed: {}", output.output).into());
+        }
+        println!("secret egress: independent environment and read-only mount composed");
+
+        let execution = vm
+            .exec_command_tool()
+            .execute(
+                function_input(&serde_json::json!({
+                    "cmd": format!(
                         "curl --fail --silent --show-error --request POST --data same-body {}",
                         proof.url
                     ),
@@ -266,8 +316,88 @@ async fn run_host(arguments: Vec<std::ffi::OsString>, prove_mpp: bool) -> Result
         println!("mpp egress: guest curl paid and replayed exactly once");
     }
     println!("all VM-owned tools executed through one retained libkrun VM");
+    drop(agent_tools);
+    drop(vm);
     session.shutdown().await?;
     Ok(())
+}
+
+fn reflink_or_sparse_copy(source: &Path, destination: &Path) -> io::Result<u64> {
+    match reflink_copy::reflink(source, destination) {
+        Ok(()) => return Ok(fs::metadata(destination)?.len()),
+        Err(_) => remove_partial_copy(destination)?,
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::process::Command::new("cp")
+            .args(["--reflink=never", "--sparse=always", "--"])
+            .arg(source)
+            .arg(destination)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        if status.success() {
+            return Ok(fs::metadata(destination)?.len());
+        }
+        remove_partial_copy(destination)?;
+        Err(io::Error::other(format!(
+            "sparse disk copy failed with {status}"
+        )))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fs::copy(source, destination)
+}
+
+fn prepare_runtime_disk(runtime: &Path) -> Result<(Option<tempfile::TempDir>, PathBuf), AnyError> {
+    let contents = fs::read(runtime)?;
+    if !contents.starts_with(b"\x7fELF") {
+        return Ok((None, runtime.to_owned()));
+    }
+
+    let directory = tempfile::tempdir()?;
+    let image = directory.path().join("runtime.ext4");
+    let mut runtime_reader = contents.as_slice();
+    let mut formatter = Formatter::new(&image, 4_096, RUNTIME_DISK_BYTES)?;
+    formatter.create(
+        "/nanocodex-vm-guest",
+        make_mode(file_mode::S_IFREG, 0o755),
+        None,
+        None,
+        Some(&mut runtime_reader),
+        Some(0),
+        Some(0),
+        None,
+    )?;
+    formatter.close()?;
+    Ok((Some(directory), image))
+}
+
+fn secret_style_proof_layer() -> Result<EgressLease, AnyError> {
+    let directory = Arc::new(tempfile::tempdir()?);
+    fs::write(directory.path().join("route.txt"), "public-route\n")?;
+    let mut layer = EgressLease::internet();
+    layer.insert_environment(
+        "NANOCENTAUR_SECRET_BASE_URL",
+        "https://secret-gateway.invalid/v1",
+    )?;
+    layer.insert_mount(EgressMount {
+        tag: "secret-proof".to_owned(),
+        host_path: directory.path().to_owned(),
+        guest_path: Path::new(GUEST_EGRESS_ROOT).join("secrets"),
+    })?;
+    layer.retain(directory);
+    Ok(layer)
+}
+
+fn remove_partial_copy(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 struct MppProof {

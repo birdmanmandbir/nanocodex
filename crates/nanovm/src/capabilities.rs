@@ -1,3 +1,8 @@
+#![allow(
+    unsafe_code,
+    reason = "this module is one of the two audited libkrun FFI boundaries"
+)]
+
 use std::collections::BTreeSet;
 
 use crate::VmError;
@@ -36,7 +41,6 @@ const FEATURES: [KrunFeature; 10] = [
 pub struct Capabilities {
     max_vcpus: u32,
     nested_virtualization: bool,
-    pause_resume: bool,
     features: BTreeSet<KrunFeature>,
 }
 
@@ -67,7 +71,6 @@ impl Capabilities {
         Ok(Self {
             max_vcpus,
             nested_virtualization,
-            pause_resume: cfg!(target_os = "macos"),
             features,
         })
     }
@@ -80,11 +83,6 @@ impl Capabilities {
     #[must_use]
     pub const fn nested_virtualization(&self) -> bool {
         self.nested_virtualization
-    }
-
-    #[must_use]
-    pub const fn pause_resume(&self) -> bool {
-        self.pause_resume
     }
 
     #[must_use]

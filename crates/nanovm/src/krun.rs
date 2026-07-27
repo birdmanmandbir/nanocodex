@@ -1,3 +1,8 @@
+#![allow(
+    unsafe_code,
+    reason = "this module is one of the two audited libkrun FFI boundaries"
+)]
+
 use std::{
     ffi::{CString, NulError, OsStr, c_char},
     io,
@@ -52,6 +57,9 @@ pub enum VmError {
         field: &'static str,
         source: NulError,
     },
+
+    #[error("{field} contains a double quote unsupported by libkrun's command-line transport")]
+    UnsupportedDoubleQuote { field: &'static str },
 
     #[error("libkrun {operation} failed with errno {errno}")]
     Libkrun { operation: &'static str, errno: i32 },
@@ -185,17 +193,6 @@ impl KrunVm {
         Ok(vm)
     }
 
-    /// Returns a thread-safe out-of-band pause/resume capability.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error after this context has entered the VMM loop.
-    pub fn control(&self) -> Result<KrunVmControl, VmError> {
-        self.context
-            .map(|context| KrunVmControl { context })
-            .ok_or(VmError::ContextConsumed)
-    }
-
     /// Configures the guest command and enters libkrun's blocking VMM loop.
     ///
     /// On successful boot this function does not return: libkrun exits the VMM
@@ -211,7 +208,7 @@ impl KrunVm {
         let arguments = command
             .arguments()
             .iter()
-            .map(|argument| c_string(argument, "guest argument"))
+            .map(|argument| array_string(argument, "guest argument"))
             .collect::<Result<Vec<_>, _>>()?;
         let mut argument_pointers = arguments
             .iter()
@@ -225,7 +222,7 @@ impl KrunVm {
                 let mut entry = name.clone();
                 entry.push("=");
                 entry.push(value);
-                c_string(&entry, "guest environment")
+                array_string(&entry, "guest environment")
             })
             .collect::<Result<Vec<_>, _>>()?;
         let mut environment_pointers = environment
@@ -260,8 +257,11 @@ impl KrunVm {
             "configure guest working directory",
         )?;
 
+        let status = krun::krun_start_enter(context);
+        if status < 0 {
+            return check(status, "start VM");
+        }
         self.context = None;
-        check(krun::krun_start_enter(context), "start VM")?;
         Err(VmError::UnexpectedReturn)
     }
 }
@@ -372,36 +372,6 @@ fn attach_shared_directories(context: u32, directories: &[SharedDirectory]) -> R
     Ok(())
 }
 
-/// Out-of-band control for a VM running in libkrun's event loop.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct KrunVmControl {
-    context: u32,
-}
-
-impl KrunVmControl {
-    /// Requests that every guest vCPU pause at an instruction boundary.
-    ///
-    /// libkrun currently implements this operation on macOS. The request is
-    /// idempotent and completes asynchronously in the VMM event loop.
-    ///
-    /// # Errors
-    ///
-    /// Returns an OS error reported by libkrun, including unsupported-platform
-    /// and not-yet-running errors.
-    pub fn pause(self) -> Result<(), VmError> {
-        check(krun::krun_vm_pause(self.context), "pause VM")
-    }
-
-    /// Resumes a VM previously paused with [`Self::pause`].
-    ///
-    /// # Errors
-    ///
-    /// Returns an OS error reported by libkrun.
-    pub fn resume(self) -> Result<(), VmError> {
-        check(krun::krun_vm_resume(self.context), "resume VM")
-    }
-}
-
 impl Drop for KrunVm {
     fn drop(&mut self) {
         if let Some(context) = self.context.take() {
@@ -412,6 +382,20 @@ impl Drop for KrunVm {
 
 fn c_string(value: &OsStr, field: &'static str) -> Result<CString, VmError> {
     CString::new(value.as_bytes()).map_err(|source| VmError::Nul { field, source })
+}
+
+/// Validates values for libkrun's quoted command-line array serialization.
+///
+/// `krun_set_exec` does not preserve the supplied C array directly: it wraps
+/// every entry in double quotes and forwards the resulting string through the
+/// guest kernel command line. Its parser cannot represent a literal double
+/// quote reliably, so fail closed instead of silently changing argv/envp.
+fn array_string(value: &OsStr, field: &'static str) -> Result<CString, VmError> {
+    let bytes = value.as_bytes();
+    if bytes.contains(&b'"') {
+        return Err(VmError::UnsupportedDoubleQuote { field });
+    }
+    CString::new(bytes).map_err(|source| VmError::Nul { field, source })
 }
 
 fn positive_context(status: i32, operation: &'static str) -> Result<u32, VmError> {
@@ -429,5 +413,26 @@ fn check(status: i32, operation: &'static str) -> Result<(), VmError> {
         })
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+
+    use super::{VmError, array_string};
+
+    #[test]
+    fn libkrun_array_values_reject_unrepresentable_quotes() {
+        assert!(matches!(
+            array_string(OsStr::new(r#"printf "%s""#), "test"),
+            Err(VmError::UnsupportedDoubleQuote { field: "test" })
+        ));
+        assert_eq!(
+            array_string(OsStr::new(r"backslash\path"), "test")
+                .unwrap()
+                .as_c_str(),
+            c"backslash\\path"
+        );
     }
 }

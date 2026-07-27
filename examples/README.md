@@ -25,7 +25,7 @@ cargo run -p nanocodex-examples --bin subagents -- \
 NANOCODEX_SUBAGENT_JSONL=1 cargo run -p nanocodex-examples --bin subagents
 cargo run -p nanocodex-examples --bin mcp
 just build-vm-example
-target/debug/vm-tools ROOTFS [GUEST_RUNTIME_EXT4] [--prove-mpp]
+target/debug/vm-tools ROOTFS [GUEST_RUNTIME_BINARY_OR_EXT4] [--prove-mpp]
 just smoke-python
 just smoke-wasm-node
 just build-react-example
@@ -37,8 +37,10 @@ standard browser WebSockets cannot attach the upgrade authorization header.
 
 `vm-tools` does not call the model. It proves all VM-backed standard workspace
 tools against one retained guest and accepts either a directory root containing
-`/usr/local/bin/nanocodex-vm-guest` or an ext4 root plus a read-only guest
-runtime image. On macOS, `just build-vm-example` also applies the required
+`/usr/local/bin/nanocodex-vm-guest` or an ext4 root plus a guest-runtime ELF or
+read-only runtime image. A runtime ELF is packed into a temporary ext4 image,
+and a supplied ext4 root is reflinked or sparse-copied into a private per-run
+disk before boot. On macOS, `just build-vm-example` also applies the required
 Hypervisor entitlement.
 Pass `--prove-mpp` to additionally run a real guest `curl` through the
 host-owned MPP proxy and verify one payment and one exact replay.

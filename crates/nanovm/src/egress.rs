@@ -1,8 +1,10 @@
 use std::{
     any::Any,
     collections::BTreeMap,
+    ffi::{OsStr, OsString},
     fmt,
-    path::{Path, PathBuf},
+    os::unix::ffi::{OsStrExt, OsStringExt},
+    path::{Component, Path, PathBuf},
     sync::Arc,
 };
 
@@ -10,16 +12,8 @@ use thiserror::Error;
 
 use crate::{GuestCommand, Network, SharedDirectory, VmConfig};
 
-const MOUNT_AND_EXEC: &str = concat!(
-    "set -eu; ",
-    "workdir=$1; shift; ",
-    "while [ \"$1\" != -- ]; do ",
-    "tag=$1; guest=$2; shift 2; ",
-    "mkdir -p -- \"$guest\"; ",
-    "mount -t virtiofs -o ro \"$tag\" \"$guest\"; ",
-    "done; ",
-    "shift; cd -- \"$workdir\"; exec \"$@\"",
-);
+pub const GUEST_EGRESS_ROOT: &str = "/tmp/nanocodex/egress";
+pub const MAX_EGRESS_FILE_BYTES: usize = 4 * 1024 * 1024;
 
 /// VM-facing outbound-access configuration retained for one guest lifetime.
 ///
@@ -116,6 +110,9 @@ impl EgressLease {
             return Err(EgressError::InvalidEnvironmentName(name));
         }
         let value = value.into();
+        if value.contains('\0') {
+            return Err(EgressError::EnvironmentValueContainsNul(name));
+        }
         if self
             .guest_environment
             .get(&name)
@@ -134,14 +131,18 @@ impl EgressLease {
     /// Returns an error when the tag or guest path collides with a different
     /// mount.
     pub fn insert_mount(&mut self, mount: EgressMount) -> Result<(), EgressError> {
-        if mount.tag.is_empty() {
-            return Err(EgressError::EmptyMountTag);
+        if !valid_mount_tag(&mount.tag) {
+            return Err(EgressError::InvalidMountTag(mount.tag));
         }
-        if self
-            .guest_mounts
-            .values()
-            .any(|current| current.guest_path == mount.guest_path && current != &mount)
-        {
+        if !mount.host_path.is_absolute() {
+            return Err(EgressError::HostMountPathNotAbsolute(mount.host_path));
+        }
+        if !valid_guest_egress_path(&mount.guest_path) {
+            return Err(EgressError::GuestMountPathOutsideRoot(mount.guest_path));
+        }
+        if self.guest_mounts.values().any(|current| {
+            paths_overlap(&current.guest_path, &mount.guest_path) && current != &mount
+        }) {
             return Err(EgressError::GuestMountConflict(mount.guest_path));
         }
         if self
@@ -150,6 +151,13 @@ impl EgressLease {
             .is_some_and(|current| current != &mount)
         {
             return Err(EgressError::MountTagConflict(mount.tag));
+        }
+        if self
+            .guest_files
+            .keys()
+            .any(|path| path.starts_with(&mount.guest_path))
+        {
+            return Err(EgressError::GuestMountFileOverlap(mount.guest_path));
         }
         self.guest_mounts.insert(mount.tag.clone(), mount);
         Ok(())
@@ -162,8 +170,28 @@ impl EgressLease {
     /// Returns an error when the guest path is not absolute or conflicts with
     /// a different provider file.
     pub fn insert_file(&mut self, file: EgressFile) -> Result<(), EgressError> {
-        if !file.guest_path.is_absolute() {
-            return Err(EgressError::GuestFilePathNotAbsolute(file.guest_path));
+        if !valid_guest_egress_path(&file.guest_path) {
+            return Err(EgressError::GuestFilePathOutsideRoot(file.guest_path));
+        }
+        if file.contents.len() > MAX_EGRESS_FILE_BYTES {
+            return Err(EgressError::GuestFileTooLarge {
+                path: file.guest_path,
+                size: file.contents.len(),
+                limit: MAX_EGRESS_FILE_BYTES,
+            });
+        }
+        if file.mode & !0o777 != 0 {
+            return Err(EgressError::InvalidGuestFileMode {
+                path: file.guest_path,
+                mode: file.mode,
+            });
+        }
+        if self
+            .guest_mounts
+            .values()
+            .any(|mount| file.guest_path.starts_with(&mount.guest_path))
+        {
+            return Err(EgressError::GuestMountFileOverlap(file.guest_path));
         }
         if self
             .guest_files
@@ -241,15 +269,28 @@ impl EgressLease {
         let mut configured = if self.guest_mounts.is_empty() {
             command.clone()
         } else {
-            let mut configured =
-                GuestCommand::new("/bin/sh").args(["-c", MOUNT_AND_EXEC, "nanovm-egress"]);
-            configured = configured.arg(command.current_directory().as_os_str());
+            let mut script = OsString::from("set -eu;");
             for mount in self.guest_mounts() {
                 vm = vm.shared_directory(SharedDirectory::read_only(&mount.tag, &mount.host_path));
-                configured = configured.arg(&mount.tag).arg(mount.guest_path.as_os_str());
+                append_shell_command(&mut script, " mkdir -p -- ", [mount.guest_path.as_os_str()]);
+                append_shell_command(
+                    &mut script,
+                    "; mount -t virtiofs -o ro ",
+                    [OsStr::new(&mount.tag), mount.guest_path.as_os_str()],
+                );
             }
-            configured = configured.arg("--").arg(command.program().as_os_str());
-            configured = configured.args(command.arguments().iter().cloned());
+            append_shell_command(
+                &mut script,
+                "; cd -- ",
+                [command.current_directory().as_os_str()],
+            );
+            append_shell_command(
+                &mut script,
+                "; exec ",
+                std::iter::once(command.program().as_os_str())
+                    .chain(command.arguments().iter().map(OsString::as_os_str)),
+            );
+            let mut configured = GuestCommand::new("/bin/sh").args(["-c"]).arg(script);
             for (name, value) in command.environment() {
                 configured = configured.env(name, value);
             }
@@ -310,14 +351,30 @@ pub enum EgressError {
     InvalidEnvironmentName(String),
     #[error("guest environment `{0}` has conflicting egress values")]
     EnvironmentConflict(String),
-    #[error("egress mount tag must not be empty")]
-    EmptyMountTag,
+    #[error("guest environment `{0}` contains a NUL byte")]
+    EnvironmentValueContainsNul(String),
+    #[error("egress mount tag `{0}` is not a portable identifier")]
+    InvalidMountTag(String),
+    #[error("host egress mount path must be absolute: {0}")]
+    HostMountPathNotAbsolute(PathBuf),
+    #[error("guest egress mount path must be a normalized child of {GUEST_EGRESS_ROOT}: {0}")]
+    GuestMountPathOutsideRoot(PathBuf),
     #[error("egress mount tag `{0}` has conflicting host paths")]
     MountTagConflict(String),
     #[error("guest egress mount path `{0}` has conflicting providers")]
     GuestMountConflict(PathBuf),
-    #[error("guest egress file path must be absolute: {0}")]
-    GuestFilePathNotAbsolute(PathBuf),
+    #[error("guest egress mount and file paths overlap at `{0}`")]
+    GuestMountFileOverlap(PathBuf),
+    #[error("guest egress file path must be a normalized child of {GUEST_EGRESS_ROOT}: {0}")]
+    GuestFilePathOutsideRoot(PathBuf),
+    #[error("guest egress file `{path}` is {size} bytes, exceeding the {limit}-byte limit")]
+    GuestFileTooLarge {
+        path: PathBuf,
+        size: usize,
+        limit: usize,
+    },
+    #[error("guest egress file `{path}` has invalid mode {mode:#o}")]
+    InvalidGuestFileMode { path: PathBuf, mode: u32 },
     #[error("guest egress file path `{0}` has conflicting providers")]
     GuestFileConflict(PathBuf),
 }
@@ -328,6 +385,60 @@ fn valid_environment_name(name: &str) -> bool {
         .next()
         .is_some_and(|byte| byte == b'_' || byte.is_ascii_alphabetic())
         && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+}
+
+fn valid_mount_tag(tag: &str) -> bool {
+    !tag.is_empty()
+        && tag.len() <= 64
+        && tag
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn valid_guest_egress_path(path: &Path) -> bool {
+    path.is_absolute()
+        && path != Path::new(GUEST_EGRESS_ROOT)
+        && path.starts_with(GUEST_EGRESS_ROOT)
+        && path
+            .components()
+            .all(|component| !matches!(component, Component::CurDir | Component::ParentDir))
+}
+
+fn paths_overlap(first: &Path, second: &Path) -> bool {
+    first.starts_with(second) || second.starts_with(first)
+}
+
+fn append_shell_command<'a>(
+    script: &mut OsString,
+    prefix: &str,
+    arguments: impl IntoIterator<Item = &'a OsStr>,
+) {
+    script.push(prefix);
+    let mut first = true;
+    for argument in arguments {
+        if !first {
+            script.push(" ");
+        }
+        first = false;
+        script.push(shell_single_quote(argument));
+    }
+}
+
+fn shell_single_quote(value: &OsStr) -> OsString {
+    let bytes = value.as_bytes();
+    let mut quoted = Vec::with_capacity(bytes.len().saturating_add(2));
+    quoted.push(b'\'');
+    for byte in bytes {
+        match *byte {
+            b'\'' => quoted.extend_from_slice(b"'\\''"),
+            // libkrun cannot carry a literal double quote in an argv entry.
+            // Produce it at wrapper-shell evaluation time instead.
+            b'"' => quoted.extend_from_slice(b"'$(printf '\\042')'"),
+            byte => quoted.push(byte),
+        }
+    }
+    quoted.push(b'\'');
+    OsString::from_vec(quoted)
 }
 
 #[cfg(test)]
@@ -345,7 +456,7 @@ mod tests {
             .insert_mount(EgressMount {
                 tag: "secret-ca".to_owned(),
                 host_path: PathBuf::from("/host/ca"),
-                guest_path: PathBuf::from("/run/egress/ca"),
+                guest_path: PathBuf::from("/tmp/nanocodex/egress/secrets/ca"),
             })
             .unwrap();
         secrets.retain(Arc::clone(&guard));
@@ -388,7 +499,7 @@ mod tests {
 
     #[test]
     fn provider_files_compose_idempotently_and_conflicts_fail_closed() {
-        let path = "/tmp/nanovm/ca.pem";
+        let path = "/tmp/nanocodex/egress/mpp/ca.pem";
         let file = EgressFile::new(path, b"public ca".to_vec(), 0o444);
         let mut first = EgressLease::internet();
         first.insert_file(file.clone()).unwrap();
@@ -412,7 +523,7 @@ mod tests {
         let mut lease = EgressLease::internet();
         assert_eq!(
             lease.insert_file(EgressFile::new("relative/ca.pem", Vec::new(), 0o444)),
-            Err(EgressError::GuestFilePathNotAbsolute(PathBuf::from(
+            Err(EgressError::GuestFilePathOutsideRoot(PathBuf::from(
                 "relative/ca.pem"
             )))
         );
@@ -428,11 +539,12 @@ mod tests {
             .insert_mount(EgressMount {
                 tag: "mpp-ca".to_owned(),
                 host_path: PathBuf::from("/host/mpp"),
-                guest_path: PathBuf::from("/run/egress/mpp"),
+                guest_path: PathBuf::from("/tmp/nanocodex/egress/mpp"),
             })
             .unwrap();
         let command = GuestCommand::new("/usr/local/bin/nanocodex-vm-guest")
             .arg("/workspace")
+            .arg(r#"say "hello""#)
             .env("HTTPS_PROXY", "http://untrusted")
             .current_dir("/workspace");
 
@@ -447,17 +559,95 @@ mod tests {
             &[SharedDirectory::read_only("mpp-ca", "/host/mpp")]
         );
         assert_eq!(command.program(), std::path::Path::new("/bin/sh"));
+        assert_eq!(command.arguments()[0], "-c");
+        let script = command.arguments()[1].to_string_lossy();
+        assert!(script.contains("mount -t virtiofs -o ro 'mpp-ca'"));
+        assert!(script.contains("cd -- '/workspace'"));
+        assert!(script.contains("exec '/usr/local/bin/nanocodex-vm-guest' '/workspace'"));
+        assert!(script.contains("$(printf '\\042')"));
+        assert!(!script.contains('"'));
         assert_eq!(
             command
                 .environment()
                 .get(&std::ffi::OsString::from("HTTPS_PROXY")),
             Some(&std::ffi::OsString::from("http://host.internal:8080"))
         );
-        assert!(
-            command
-                .arguments()
-                .contains(&std::ffi::OsString::from("/run/egress/mpp"))
+    }
+
+    #[test]
+    fn mount_and_file_path_hierarchy_conflicts_fail_before_launch() {
+        let mut lease = EgressLease::internet();
+        lease
+            .insert_mount(EgressMount {
+                tag: "provider".to_owned(),
+                host_path: PathBuf::from("/host/provider"),
+                guest_path: PathBuf::from("/tmp/nanocodex/egress/provider"),
+            })
+            .unwrap();
+
+        assert_eq!(
+            lease.insert_file(EgressFile::new(
+                "/tmp/nanocodex/egress/provider/ca.pem",
+                Vec::new(),
+                0o444,
+            )),
+            Err(EgressError::GuestMountFileOverlap(PathBuf::from(
+                "/tmp/nanocodex/egress/provider/ca.pem"
+            )))
         );
+        assert_eq!(
+            lease.insert_mount(EgressMount {
+                tag: "nested".to_owned(),
+                host_path: PathBuf::from("/host/nested"),
+                guest_path: PathBuf::from("/tmp/nanocodex/egress/provider/nested"),
+            }),
+            Err(EgressError::GuestMountConflict(PathBuf::from(
+                "/tmp/nanocodex/egress/provider/nested"
+            )))
+        );
+    }
+
+    #[test]
+    fn egress_rejects_unsafe_values_before_vmm_configuration() {
+        let mut lease = EgressLease::internet();
+        assert_eq!(
+            lease.insert_environment("HTTPS_PROXY", "http://proxy\0hidden"),
+            Err(EgressError::EnvironmentValueContainsNul(
+                "HTTPS_PROXY".to_owned()
+            ))
+        );
+        assert!(matches!(
+            lease.insert_file(EgressFile::new(
+                "/tmp/nanocodex/egress/mpp/ca.pem",
+                vec![0; MAX_EGRESS_FILE_BYTES + 1],
+                0o444,
+            )),
+            Err(EgressError::GuestFileTooLarge { .. })
+        ));
+        assert!(matches!(
+            lease.insert_file(EgressFile::new(
+                "/tmp/nanocodex/egress/mpp/ca.pem",
+                Vec::new(),
+                0o4755,
+            )),
+            Err(EgressError::InvalidGuestFileMode { .. })
+        ));
+        assert!(matches!(
+            lease.insert_mount(EgressMount {
+                tag: "bad tag".to_owned(),
+                host_path: PathBuf::from("/host/provider"),
+                guest_path: PathBuf::from("/tmp/nanocodex/egress/provider"),
+            }),
+            Err(EgressError::InvalidMountTag(_))
+        ));
+        assert!(matches!(
+            lease.insert_mount(EgressMount {
+                tag: "provider".to_owned(),
+                host_path: PathBuf::from("relative"),
+                guest_path: PathBuf::from("/tmp/nanocodex/egress/provider"),
+            }),
+            Err(EgressError::HostMountPathNotAbsolute(_))
+        ));
     }
 
     #[test]
