@@ -14,6 +14,7 @@ use thiserror::Error;
 
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
 const API_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_API_RESPONSE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Error)]
 pub enum GvproxyError {
@@ -34,6 +35,9 @@ pub enum GvproxyError {
 
     #[error("gvproxy services API returned an invalid HTTP response")]
     InvalidApiResponse,
+
+    #[error("gvproxy services API response exceeded {MAX_API_RESPONSE_BYTES} bytes")]
+    ApiResponseTooLarge,
 
     #[error(transparent)]
     Json(#[from] serde_json::Error),
@@ -144,6 +148,12 @@ impl Gvproxy {
     /// Returns an error when the services socket cannot be reached or gvproxy
     /// rejects the request.
     pub fn unforward_tcp(&self, local: SocketAddr) -> Result<(), GvproxyError> {
+        if !local.ip().is_loopback() {
+            return Err(GvproxyError::NonLoopbackForward(local));
+        }
+        if local.port() == 0 {
+            return Err(GvproxyError::UnspecifiedHostPort);
+        }
         let body = serde_json::to_vec(&UnexposeRequest {
             local,
             protocol: "tcp",
@@ -193,7 +203,16 @@ fn services_request(socket: &Path, path: &str, body: &[u8]) -> Result<(), Gvprox
     stream.flush()?;
 
     let mut response = Vec::new();
-    stream.read_to_end(&mut response)?;
+    stream
+        .take(
+            u64::try_from(MAX_API_RESPONSE_BYTES)
+                .unwrap_or(u64::MAX)
+                .saturating_add(1),
+        )
+        .read_to_end(&mut response)?;
+    if response.len() > MAX_API_RESPONSE_BYTES {
+        return Err(GvproxyError::ApiResponseTooLarge);
+    }
     let response = String::from_utf8_lossy(&response);
     let (head, body) = response
         .split_once("\r\n\r\n")
@@ -213,7 +232,10 @@ fn services_request(socket: &Path, path: &str, body: &[u8]) -> Result<(), Gvprox
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::{
+        net::{Ipv4Addr, SocketAddrV4},
+        os::unix::net::UnixListener,
+    };
 
     use super::*;
 
@@ -231,5 +253,30 @@ mod tests {
             proxy.forward_tcp(local, remote),
             Err(GvproxyError::NonLoopbackForward(address)) if address == local
         ));
+        assert!(matches!(
+            proxy.unforward_tcp(local),
+            Err(GvproxyError::NonLoopbackForward(address)) if address == local
+        ));
+    }
+
+    #[test]
+    fn bounds_untrusted_services_api_responses() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("services.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4 * 1024];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(&vec![b'x'; MAX_API_RESPONSE_BYTES + 1])
+                .unwrap();
+        });
+
+        assert!(matches!(
+            services_request(&socket, "/services/test", b"{}"),
+            Err(GvproxyError::ApiResponseTooLarge)
+        ));
+        server.join().unwrap();
     }
 }
