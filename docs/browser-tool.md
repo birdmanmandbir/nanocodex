@@ -522,8 +522,11 @@ flattened snapshot containing light DOM, open, closed, and user-agent shadow
 trees, template contents, child documents, layout rectangles, paint order, and
 explicitly requested computed-style properties. Its result is fully typed but
 can be large, so Code Mode should filter it before returning model-visible
-text. Closed shadow content is inspectable through this read-only snapshot; it
-does not become addressable by ordinary CSS-selector actions.
+text. The boundary accepts at most 128 computed-style names, 250,000 nodes, and
+64 MiB of Chromium string-table data. Semantic snapshots are capped at 4 MiB
+and 20,000 references. Closed shadow content is inspectable through this
+read-only snapshot; it does not become addressable by ordinary CSS-selector
+actions.
 
 Console entries, page errors, and network requests use bounded recent-history
 buffers. Reads return the newest 200 matching records by default, accept an
@@ -534,15 +537,19 @@ Network records cover the page and recursively attached child targets,
 including dedicated and module workers. Child targets are paused long enough
 to enable capture before their first script runs, then resumed. Request and
 response bodies are fetched only when requested rather than retained in every
-summary. Network and WebSocket reads use monotonic cursors so Code Mode can
-drain a busy session without silently losing records.
+summary. An on-demand body has a 30-second deadline and an 8 MiB encoded
+payload limit. Oversized console/page-error entries and WebSocket frames above
+32 KiB are counted as dropped rather than retained partially. Network and
+WebSocket reads use monotonic cursors so Code Mode can drain a busy session
+without silently losing records.
 Deterministic network fixtures retain at most 128 routes; each response is
 limited to 128 headers, 64 KiB of header data, and a 4 MiB body, and header
 newlines are rejected.
 Console and page-error stack frames preserve one-based generated locations.
 Inline and same-origin source maps are loaded through Chromium with the active
 session's credentials and add original authored locations without discarding
-the generated evidence.
+the generated evidence. A document retains at most 256 parsed maps and 4,096
+script URLs, and oversized data URLs are rejected before base64 decoding.
 
 `browser-inspect` exercises this complete path through the real Code Mode
 nested-tool binding:
@@ -584,7 +591,8 @@ selectors, layout shifts, LCP candidates, render-blocking resources, request
 dependency chains, repeated JavaScript resources, cache opportunities, DOM
 size, and third-party transfer cost. Trace collection drains data emitted
 before Chromium's completion marker and fails explicitly rather than silently
-returning a partial result when Chromium reports data loss.
+returning a partial result when Chromium reports data loss. Retention is capped
+by both 250,000 events and 128 MiB of encoded event data.
 
 `cpu_profile_start`/`cpu_profile_stop` retain the complete V8 profile and rank
 the highest-sampled functions. `coverage_start`/`coverage_stop` retain precise
@@ -592,7 +600,8 @@ V8 coverage and report nested-range-correct used and unused bytes; start it
 before loading the application when initial unused modules matter. A
 `heap_snapshot` retains the complete V8 artifact and a bounded class summary
 using self size plus the largest dominator-based retained size and representative
-node ID for that class. Two retained snapshots can be compared with
+node ID for that class. A session retains at most four heap snapshots. Two
+retained snapshots can be compared with
 `heap_compare`. `heap_retainers` then walks strong incoming references from a
 representative node toward GC roots. Its depth and node bounds make the
 reverse-reference graph safe to consume directly in Code Mode.
@@ -629,7 +638,7 @@ Its reproducible source and notices live under
 `crates/nanocodex-browser/assets-src` and
 [`AXE_NOTICE.md`](../crates/nanocodex-browser/assets/AXE_NOTICE.md).
 `pdf` uses Chromium's print protocol and returns a private file-backed
-artifact.
+artifact; PDFs above 64 MiB are rejected.
 
 Exact Lighthouse remains deliberately opt-in because Lighthouse itself is a
 Node application rather than a Chromium protocol primitive:
@@ -644,7 +653,8 @@ let browser = Browser::builder()
 debugging port, disables storage reset, retains the complete JSON report, and
 returns typed category scores plus bounded failing-audit summaries. Supplying a
 different executable named `lighthouse` (for example, an unrelated blockchain
-client) fails normally rather than being auto-discovered.
+client) fails normally rather than being auto-discovered. Reports above 64 MiB
+are rejected before parsing.
 
 CrUX is a separate field-data path and requires explicit harness credentials:
 
@@ -661,6 +671,7 @@ optional desktop/phone/tablet filter, and returns typed p75 values, histograms,
 categorical fractions, and collection dates. The API key is absent from tool
 schemas and redacted from `Debug`; HTTP failures discard their request URL
 before becoming browser errors so the query-string credential is not exposed.
+The response body is capped at 1 MiB while streaming.
 
 ## Frames, tabs, inputs, and downloads
 
@@ -668,18 +679,21 @@ Snapshot references retain their frame ID, so ordinary clicks, fills, input
 state changes, uploads, and targeted reads work in child frames without a
 special selector dialect. `list_frames` and `evaluate_frame` cover explicit
 frame diagnostics. Tabs use Chromium target IDs and remain within the same
-owned browser session. Switching tabs reinstalls the page diagnostics and
-network controls before returning.
+owned browser session. The egress interceptor remains active for background
+tabs and recursively attached workers; switching tabs reinstalls the
+page-specific diagnostics before returning.
 
 The strict input surface includes scrolling, native select values, checked
 state, drag/drop, and file uploads. Uploads may read only canonical paths below
 the harness-configured `.file_root(...)`; the root is not model-callable.
 Remote-CDP builds reject a host file root because the two processes do not share
-a filesystem.
+a filesystem. One action accepts at most 64 regular files, each no larger than
+256 MiB.
 
 Downloads are forced into the session-private download directory.
 `downloads` reports progress, final path, byte counts, and failure state. The
-model cannot choose an arbitrary host destination.
+model cannot choose an arbitrary host destination. A session retains at most
+128 downloads and cancels a transfer once its reported size exceeds 256 MiB.
 
 ## Network control and HAR
 

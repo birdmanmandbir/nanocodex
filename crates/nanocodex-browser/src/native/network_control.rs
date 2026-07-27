@@ -262,7 +262,7 @@ pub(super) fn fulfill_params(
     params
 }
 
-fn record_blocked_request(diagnostics: &Arc<StdMutex<Diagnostics>>, url: &str) {
+pub(super) fn record_blocked_request(diagnostics: &Arc<StdMutex<Diagnostics>>, url: &str) {
     if let Ok(mut diagnostics) = diagnostics.lock() {
         diagnostics.push_error(BrowserPageError {
             sequence: 0,

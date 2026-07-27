@@ -26,7 +26,7 @@ chromiumoxide.workspace = true
 futures-util.workspace = true
 image.workspace = true
 nanocodex-tools.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
 rusqlite.workspace = true
 schemars.workspace = true
 serde.workspace = true

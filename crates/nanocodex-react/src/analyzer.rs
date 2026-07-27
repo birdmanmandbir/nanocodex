@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::Read,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -237,17 +238,30 @@ impl ReactDoctor {
             });
             return;
         }
-        let source = match fs::read_to_string(path) {
-            Ok(source) => source,
-            Err(error) => {
-                report.failures.push(ReactAnalysisFailure {
-                    path: relative_path,
-                    kind: ReactAnalysisFailureKind::Read,
-                    message: bounded_message(error.to_string()),
-                });
-                return;
-            }
-        };
+        let mut source = String::new();
+        let read = fs::File::open(path).and_then(|file| {
+            file.take(self.max_file_bytes.saturating_add(1))
+                .read_to_string(&mut source)
+        });
+        if let Err(error) = read {
+            report.failures.push(ReactAnalysisFailure {
+                path: relative_path,
+                kind: ReactAnalysisFailureKind::Read,
+                message: bounded_message(error.to_string()),
+            });
+            return;
+        }
+        if u64::try_from(source.len()).unwrap_or(u64::MAX) > self.max_file_bytes {
+            report.failures.push(ReactAnalysisFailure {
+                path: relative_path,
+                kind: ReactAnalysisFailureKind::TooLarge,
+                message: format!(
+                    "file grew beyond the configured maximum of {} bytes while being read",
+                    self.max_file_bytes
+                ),
+            });
+            return;
+        }
         let Ok(source_type) = SourceType::from_path(path) else {
             return;
         };

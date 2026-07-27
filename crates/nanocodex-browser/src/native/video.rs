@@ -28,6 +28,7 @@ const VIDEO_STOP_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_VIDEO_FRAMES: usize = 18_000;
 
 pub(super) struct VideoState {
+    page: Page,
     path: PathBuf,
     started_at: Instant,
     frames: Arc<AtomicUsize>,
@@ -35,6 +36,7 @@ pub(super) struct VideoState {
     height: u32,
     stop: watch::Sender<bool>,
     task: Option<JoinHandle<Result<(), BrowserError>>>,
+    stopped: bool,
 }
 
 impl Drop for VideoState {
@@ -43,6 +45,16 @@ impl Drop for VideoState {
         if let Some(task) = &self.task {
             task.abort();
         }
+        if self.stopped {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let page = self.page.clone();
+        runtime.spawn(async move {
+            let _ = page.execute(StopScreencastParams::default()).await;
+        });
     }
 }
 
@@ -157,6 +169,7 @@ pub(super) async fn start(
         return Err(error.into());
     }
     Ok(VideoState {
+        page: page.clone(),
         path,
         started_at: Instant::now(),
         frames,
@@ -164,6 +177,7 @@ pub(super) async fn start(
         height: viewport.height,
         stop: stop_tx,
         task: Some(task),
+        stopped: false,
     })
 }
 
@@ -172,6 +186,7 @@ pub(super) async fn stop(
     mut state: VideoState,
 ) -> Result<BrowserVideoArtifact, BrowserError> {
     page.execute(StopScreencastParams::default()).await?;
+    state.stopped = true;
     let _ = state.stop.send(true);
     let task = state.task.take().ok_or(BrowserError::VideoUnavailable)?;
     timeout(VIDEO_STOP_TIMEOUT, task)

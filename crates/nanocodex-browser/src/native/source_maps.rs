@@ -31,6 +31,11 @@ use crate::{
 use super::BrowserError;
 
 const MAX_SOURCE_MAP_BYTES: usize = 20 * 1024 * 1024;
+const MAX_SOURCE_MAP_ENCODED_BYTES: usize = MAX_SOURCE_MAP_BYTES.div_ceil(3) * 4;
+const MAX_SOURCE_MAPS: usize = 256;
+const MAX_SCRIPT_URLS: usize = 4_096;
+const MAX_STACK_FRAMES: usize = 64;
+const MAX_STACK_FIELD_BYTES: usize = 4 * 1024;
 
 #[derive(Clone, Default)]
 pub(super) struct SourceMaps {
@@ -221,7 +226,12 @@ pub(super) async fn start(
                 let Ok(mut script_urls) = task_maps.script_urls.lock() else {
                     break;
                 };
-                script_urls.insert(script_id.clone(), event.url.clone());
+                if script_urls.len() < MAX_SCRIPT_URLS || script_urls.contains_key(&script_id) {
+                    script_urls.insert(
+                        script_id.clone(),
+                        bounded_string(&event.url, MAX_STACK_FIELD_BYTES),
+                    );
+                }
             }
             let Some(source_map_url) = event.source_map_url.as_deref() else {
                 continue;
@@ -231,7 +241,9 @@ pub(super) async fn start(
                     let Ok(mut maps) = task_maps.maps.lock() else {
                         break;
                     };
-                    maps.insert(script_id, Arc::new(map));
+                    if maps.len() < MAX_SOURCE_MAPS || maps.contains_key(&script_id) {
+                        maps.insert(script_id, Arc::new(map));
+                    }
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -262,27 +274,30 @@ fn collect_frames(
     async_parent: Option<&str>,
     frames: &mut Vec<BrowserStackFrame>,
 ) {
-    for (index, frame) in trace.call_frames.iter().enumerate() {
+    let available = MAX_STACK_FRAMES.saturating_sub(frames.len());
+    for (index, frame) in trace.call_frames.iter().take(available).enumerate() {
         frames.push(BrowserStackFrame {
-            script_id: frame.script_id.as_ref().to_owned(),
-            function_name: frame.function_name.clone(),
+            script_id: bounded_string(frame.script_id.as_ref(), MAX_STACK_FIELD_BYTES),
+            function_name: bounded_string(&frame.function_name, MAX_STACK_FIELD_BYTES),
             generated: BrowserSourceLocation {
-                url: frame.url.clone(),
+                url: bounded_string(&frame.url, MAX_STACK_FIELD_BYTES),
                 line_number: u64::try_from(frame.line_number)
                     .unwrap_or_default()
                     .saturating_add(1),
                 column_number: u64::try_from(frame.column_number)
                     .unwrap_or_default()
                     .saturating_add(1),
-                function_name: Some(frame.function_name.clone()),
+                function_name: Some(bounded_string(&frame.function_name, MAX_STACK_FIELD_BYTES)),
             },
             original: None,
             async_parent: (index == 0)
-                .then(|| async_parent.map(str::to_owned))
+                .then(|| async_parent.map(|parent| bounded_string(parent, MAX_STACK_FIELD_BYTES)))
                 .flatten(),
         });
     }
-    if let Some(parent) = trace.parent.as_deref() {
+    if frames.len() < MAX_STACK_FRAMES
+        && let Some(parent) = trace.parent.as_deref()
+    {
         collect_frames(
             parent,
             Some(trace.description.as_deref().unwrap_or("async")),
@@ -323,9 +338,26 @@ fn decode_data_url(value: &str) -> Result<Vec<u8>, BrowserError> {
     if !metadata.ends_with(";base64") {
         return Err(BrowserError::UnsupportedSourceMapDataUrl);
     }
+    if payload.len() > MAX_SOURCE_MAP_ENCODED_BYTES {
+        return Err(BrowserError::SourceMapTooLarge {
+            bytes: payload.len().saturating_mul(3) / 4,
+            maximum: MAX_SOURCE_MAP_BYTES,
+        });
+    }
     STANDARD
         .decode(payload)
         .map_err(BrowserError::SourceMapBase64)
+}
+
+fn bounded_string(value: &str, maximum: usize) -> String {
+    if value.len() <= maximum {
+        return value.to_owned();
+    }
+    let mut boundary = maximum;
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value[..boundary].to_owned()
 }
 
 fn resolve_same_origin(script_url: &str, source_map_url: &str) -> Option<Url> {
