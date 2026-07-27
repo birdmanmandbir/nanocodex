@@ -26,7 +26,6 @@ pub(crate) struct MppArgs {
     /// Connect directly to `OpenAI`. This is the default provider.
     #[arg(
         long = "provider.openai",
-        global = true,
         env = "NANOCODEX_PROVIDER_OPENAI",
         default_value_t = false,
         action = ArgAction::SetTrue,
@@ -38,7 +37,6 @@ pub(crate) struct MppArgs {
     #[arg(
         long = "provider.tempo",
         id = "tempo",
-        global = true,
         env = "NANOCODEX_PROVIDER_TEMPO",
         default_value_t = false,
         action = ArgAction::SetTrue
@@ -49,7 +47,6 @@ pub(crate) struct MppArgs {
     #[arg(
         long = "provider.tempo.api-base-url",
         id = "tempo_api_base_url",
-        global = true,
         env = "NANOCODEX_PROVIDER_TEMPO_API_BASE_URL",
         default_value = DEFAULT_MPP_API_BASE_URL,
         value_parser = NonEmptyStringValueParser::new()
@@ -59,7 +56,6 @@ pub(crate) struct MppArgs {
     /// Tempo Accounts state containing the logged-in account and access keys.
     #[arg(
         long = "provider.tempo.wallet-store",
-        global = true,
         env = "NANOCODEX_PROVIDER_TEMPO_WALLET_STORE"
     )]
     wallet_store: Option<PathBuf>,
@@ -67,7 +63,6 @@ pub(crate) struct MppArgs {
     /// Maximum slippage for automatic swaps from `NanoUSD`, in basis points.
     #[arg(
         long = "provider.tempo.swap-slippage-bps",
-        global = true,
         env = "NANOCODEX_PROVIDER_TEMPO_SWAP_SLIPPAGE_BPS",
         default_value_t = DEFAULT_TEMPO_SWAP_SLIPPAGE_BPS
     )]
@@ -76,7 +71,6 @@ pub(crate) struct MppArgs {
     /// Maximum one-shot Charge payment in `NanoUSD` atomic units.
     #[arg(
         long = "provider.tempo.egress-max-charge",
-        global = true,
         env = "NANOCODEX_PROVIDER_TEMPO_EGRESS_MAX_CHARGE",
         default_value_t = DEFAULT_MAX_EGRESS_CHARGE
     )]
@@ -85,7 +79,6 @@ pub(crate) struct MppArgs {
     /// Optional access key for gated MPP deployments.
     #[arg(
         long = "provider.tempo.api-key",
-        global = true,
         env = "NANOCODEX_PROVIDER_TEMPO_API_KEY",
         hide_env_values = true,
         value_parser = NonEmptyStringValueParser::new()

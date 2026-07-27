@@ -1,6 +1,6 @@
 use std::{fmt, num::NonZeroU16, path::PathBuf};
 
-use nanocodex::{NanocodexBuilder, StandardResponses};
+use nanocodex_agent::{NanocodexBuilder, StandardResponses};
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 use crate::Task;
@@ -51,35 +51,54 @@ struct RunTask {
     root: PathBuf,
 }
 
+/// Failure to construct a filesystem-safe agent recipe identity.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum AgentIdError {
+    /// The identity was empty.
     #[error("agent identifier must not be empty")]
     Empty,
 
+    /// The first character was not alphanumeric.
     #[error("agent identifier `{value}` must begin with an ASCII letter or digit")]
-    InvalidStart { value: String },
+    InvalidStart {
+        /// Rejected identity.
+        value: String,
+    },
 
+    /// The identity contained a character unsafe for retained trial paths.
     #[error("agent identifier `{value}` contains invalid character `{character}`")]
-    InvalidCharacter { value: String, character: char },
+    InvalidCharacter {
+        /// Rejected identity.
+        value: String,
+        /// First invalid character.
+        character: char,
+    },
 }
 
+/// Failure to validate a finite evaluation sweep.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum SweepError {
+    /// No tasks were configured.
     #[error("an evaluation sweep requires at least one task")]
     NoTasks,
 
+    /// No agent recipes were configured.
     #[error("an evaluation sweep requires at least one agent")]
     NoAgents,
 
+    /// Trial count was zero.
     #[error("sweep trial count must be greater than zero")]
     ZeroTrials,
 
+    /// The same canonical task root was configured twice.
     #[error("task `{0}` appears more than once in the evaluation sweep")]
     DuplicateTask(String),
 
+    /// The same agent identity was configured twice.
     #[error("agent `{0}` appears more than once in the evaluation sweep")]
     DuplicateAgent(AgentId),
 
+    /// The task × agent × trial product overflowed [`usize`].
     #[error("evaluation sweep contains too many attempts")]
     TooManyAttempts,
 }
@@ -107,6 +126,7 @@ impl AgentId {
         Ok(Self(value.into_boxed_str()))
     }
 
+    /// Returns the validated identity.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -129,6 +149,7 @@ impl<'de> Deserialize<'de> for AgentId {
 }
 
 impl Sweep {
+    /// Starts an empty sweep builder with one trial.
     #[must_use]
     pub fn builder() -> SweepBuilder {
         SweepBuilder {
@@ -138,21 +159,25 @@ impl Sweep {
         }
     }
 
+    /// Returns tasks in execution order.
     #[must_use]
     pub fn tasks(&self) -> &[Task] {
         &self.tasks
     }
 
+    /// Returns agent recipe identities in execution order.
     #[must_use]
     pub fn agents(&self) -> impl ExactSizeIterator<Item = &AgentId> {
         self.agents.iter().map(|agent| &agent.id)
     }
 
+    /// Returns the number of independent trials per task and agent.
     #[must_use]
     pub const fn trials(&self) -> u16 {
         self.trials.get()
     }
 
+    /// Returns the complete task × agent × trial attempt count.
     #[must_use]
     pub const fn attempt_count(&self) -> usize {
         self.attempt_count
@@ -221,18 +246,21 @@ impl fmt::Debug for SweepAgent {
 }
 
 impl SweepBuilder {
+    /// Replaces the ordered task collection.
     #[must_use]
     pub fn tasks(mut self, tasks: Vec<Task>) -> Self {
         self.tasks = tasks;
         self
     }
 
+    /// Appends one task.
     #[must_use]
     pub fn task(mut self, task: Task) -> Self {
         self.tasks.push(task);
         self
     }
 
+    /// Sets the independent trial count for every task and agent.
     #[must_use]
     pub const fn trials(mut self, trials: u16) -> Self {
         self.trials = trials;
@@ -333,7 +361,7 @@ impl SweepAttempt<'_> {
 mod tests {
     use std::path::PathBuf;
 
-    use nanocodex::Nanocodex;
+    use nanocodex_agent::Nanocodex;
 
     use super::*;
 

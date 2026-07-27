@@ -13,9 +13,9 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
-use nanocodex::{
-    AgentEvent, AgentEventKind, MODEL, NanocodexBuilder, NanocodexError, ResponsesError,
-    StandardResponses,
+use nanocodex_agent::{
+    AgentEvent, AgentEventKind, AgentEvents, MODEL, Nanocodex, NanocodexBuilder, NanocodexError,
+    ResponsesError, SessionId, StandardResponses,
 };
 use serde::Deserialize;
 use tokio::{
@@ -26,8 +26,8 @@ use tracing::{Instrument, Span, info, info_span};
 use uuid::Uuid;
 
 use crate::{
-    AgentId, AgentMetadata, AgentResult, EvalArtifacts, EvalEvent, EvalEventKind, EvalFailure,
-    EvalFailureKind, EvalResult, EvalStatus, EvalTiming, NanoevalEvents, PhaseTiming, Sweep,
+    AgentId, AgentMetadata, AgentResult, EvalArtifacts, EvalEvent, EvalEventKind, EvalEvents,
+    EvalFailure, EvalFailureKind, EvalResult, EvalStatus, EvalTiming, PhaseTiming, Sweep,
     SweepAttemptResult, SweepResults, Task, VerifierResult,
     job::EvalJob,
     native::{NativeAttempt, VerifierExecution},
@@ -41,12 +41,12 @@ const PROMPT_CACHE_COHORT_SIZE: u64 = 3;
 /// A reusable evaluation recipe. Every task call creates an independent agent
 /// session and disposable workspace.
 #[derive(Clone)]
-pub struct Nanoeval {
-    inner: Arc<NanoevalInner>,
+pub struct Evaluator {
+    inner: Arc<EvaluatorInner>,
 }
 
 /// Deliberate evaluator policy configured before running tasks.
-pub struct NanoevalBuilder {
+pub struct EvaluatorBuilder {
     nanocodex: NanocodexBuilder<StandardResponses>,
     output_directory: PathBuf,
     max_concurrency: usize,
@@ -55,7 +55,7 @@ pub struct NanoevalBuilder {
     finite_run: Option<FiniteRun>,
 }
 
-struct NanoevalInner {
+struct EvaluatorInner {
     nanocodex: NanocodexBuilder<StandardResponses>,
     job: EvalJob,
     planned_attempts: Option<usize>,
@@ -109,15 +109,22 @@ type AttemptAgentFactory = Arc<
 
 type AttemptVerifierFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AttemptVerification, AttemptError>> + Send + 'a>>;
+type AttemptReadinessFuture =
+    Pin<Box<dyn Future<Output = Result<(), AttemptError>> + Send + 'static>>;
 
 /// The Nanocodex configuration and resources owned by one attempt.
 pub struct AttemptAgent {
     nanocodex: NanocodexBuilder<StandardResponses>,
+    readiness: Option<AttemptReadinessFuture>,
     verifier: Option<Box<dyn AttemptVerifier>>,
 }
 
 /// A verifier that runs against the same retained environment as the agent.
 pub trait AttemptVerifier: Send {
+    /// Verifies one completed agent attempt.
+    ///
+    /// The returned future may borrow the verifier, task, and attempt for its
+    /// complete execution. Failures are retained as typed evaluation errors.
     fn verify<'a>(
         &'a mut self,
         task: &'a Task,
@@ -127,8 +134,11 @@ pub trait AttemptVerifier: Send {
 
 /// Complete typed output returned by an attempt-owned verifier.
 pub struct AttemptVerification {
+    /// Process-equivalent exit status and named rewards.
     pub result: VerifierResult,
+    /// Complete captured verifier standard output.
     pub stdout: String,
+    /// Complete captured verifier standard error.
     pub stderr: String,
 }
 
@@ -157,63 +167,89 @@ pub struct EvalAttempt<'a> {
     workspace: &'a Path,
 }
 
+/// Failure to configure, execute, verify, or durably retain an attempt.
 #[derive(Debug, thiserror::Error)]
 pub enum EvalError {
+    /// Configured concurrency was zero.
     #[error("maximum concurrency must be greater than zero")]
     InvalidConcurrency,
 
+    /// Configured aggregate memory was zero.
     #[error("maximum task memory must be greater than zero")]
     InvalidMemory,
 
+    /// A task requires behavior unavailable in the native backend.
     #[error("task {task} cannot run with the native backend: {reason}")]
-    UnsupportedNativeTask { task: String, reason: &'static str },
+    UnsupportedNativeTask {
+        /// Stable task name.
+        task: String,
+        /// Unsupported task requirement.
+        reason: &'static str,
+    },
 
+    /// Filesystem or process I/O failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
+    /// Native workspace materialization encountered a non-file entry.
     #[error("unsupported non-file entry in task environment: {0}")]
     UnsupportedEnvironmentEntry(PathBuf),
 
+    /// Agent setup or execution failed.
     #[error("Nanocodex failed: {0}")]
     Nanocodex(#[from] NanocodexError),
 
+    /// The attempt backend factory failed.
     #[error("failed to configure attempt agent: {0}")]
     AttemptAgent(#[source] AttemptError),
 
+    /// An attempt-owned verifier failed.
     #[error("attempt verifier failed: {0}")]
     AttemptVerifier(#[source] AttemptError),
 
+    /// Agent execution exceeded the task deadline.
     #[error("agent exceeded its {0:?} timeout")]
     AgentTimeout(Duration),
 
+    /// Verifier execution exceeded the task deadline.
     #[error("verifier exceeded its {0:?} timeout")]
     VerifierTimeout(Duration),
 
+    /// The agent firehose ended without a terminal event.
     #[error("agent event stream closed before a terminal event")]
     AgentEventsClosed,
 
+    /// Typed artifact JSON could not be encoded or decoded.
     #[error("failed to encode or decode JSON: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// An existing job is bound to a different sweep manifest.
     #[error("evaluation job is already bound to a different run: {0}")]
     RunConflict(PathBuf),
 
+    /// Another process still owns the matching resumable job.
     #[error("matching incomplete evaluation job is already active: {0}")]
     RunActive(PathBuf),
 
+    /// A verifier emitted an invalid numeric reward.
     #[error("invalid verifier reward: {0}")]
     ParseReward(#[from] ParseFloatError),
 
+    /// Internal sweep execution lost its stable coordinate.
     #[error("sweep execution lost its task-agent-trial coordinates")]
     MissingSweepCoordinate,
 }
 
-impl Nanoeval {
+impl Evaluator {
+    /// Starts an evaluator builder from a reusable Nanocodex recipe.
+    ///
+    /// Every attempt receives an independent session and workspace. The recipe
+    /// automatically shares only its immutable prompt-cache warmup.
     #[must_use]
-    pub fn builder(nanocodex: NanocodexBuilder<StandardResponses>) -> NanoevalBuilder {
-        NanoevalBuilder {
+    pub fn builder(nanocodex: NanocodexBuilder<StandardResponses>) -> EvaluatorBuilder {
+        EvaluatorBuilder {
             nanocodex: nanocodex.shared_prompt_cache(),
-            output_directory: PathBuf::from("nanoeval-runs"),
+            output_directory: PathBuf::from(".nanocodex/evals"),
             max_concurrency: 1,
             max_memory_mb: None,
             attempt_agent: None,
@@ -443,7 +479,8 @@ impl Nanoeval {
             nanocodex,
             coordinate,
         } = input;
-        let attempt_id = Uuid::new_v4();
+        let session_id = SessionId::new();
+        let attempt_id = session_id.as_uuid();
         let prompt_cache_cohort = self
             .inner
             .next_prompt_cache_attempt
@@ -452,7 +489,7 @@ impl Nanoeval {
         let trial_name = trial_name(&task, attempt_id, coordinate.as_ref());
         let started_at = Utc::now();
         let mut emitter =
-            AttemptEmitter::new(self, attempt_id, prompt_cache_cohort, &task, &trial_name);
+            AttemptEmitter::new(self, session_id, prompt_cache_cohort, &task, &trial_name);
         let span = attempt_span(
             self,
             &task,
@@ -494,7 +531,7 @@ impl Nanoeval {
     ) -> Result<EvalResult, EvalError> {
         let attempt = {
             let span = info_span!(
-                target: "nanoeval",
+                target: "nanocodex_eval",
                 "eval.environment.setup",
                 otel.kind = "internal",
                 otel.status_code = tracing::field::Empty,
@@ -564,7 +601,7 @@ impl Nanoeval {
         verifier: Option<Box<dyn AttemptVerifier>>,
     ) -> Result<VerifierExecution, EvalError> {
         let span = info_span!(
-            target: "nanoeval",
+            target: "nanocodex_eval",
             "eval.verifier",
             otel.kind = "internal",
             otel.status_code = tracing::field::Empty,
@@ -631,59 +668,15 @@ impl Nanoeval {
         attempt: &NativeAttempt,
         nanocodex: NanocodexBuilder<StandardResponses>,
     ) -> Result<AgentExecution, EvalError> {
-        let (agent, mut events, verifier, setup_timing) = {
-            let setup_started = Utc::now();
-            let span = info_span!(
-                target: "nanoeval",
-                "eval.agent.setup",
-                otel.kind = "internal",
-                otel.status_code = tracing::field::Empty,
-                eval.task.name = task.name(),
-                eval.attempt.id = %emitter.attempt_id,
-                workspace = %attempt.paths.workspace.display(),
-                status = tracing::field::Empty,
-                error.message = tracing::field::Empty,
-                duration_ns = tracing::field::Empty,
-            );
-            let trace_started = Instant::now();
-            let result = span.in_scope(|| -> Result<_, EvalError> {
-                let builder = nanocodex
-                    .workspace(&attempt.paths.workspace)
-                    .session_id(emitter.attempt_id.to_string())
-                    .prompt_cache_key(format!(
-                        "nanoeval:{}:{:x}",
-                        self.id().simple(),
-                        emitter.prompt_cache_cohort
-                    ));
-                let configured = if let Some(factory) = &self.inner.attempt_agent {
-                    factory(
-                        EvalAttempt {
-                            task,
-                            directory: &attempt.paths.root,
-                            workspace: &attempt.paths.workspace,
-                        },
-                        builder,
-                    )
-                    .map_err(EvalError::AttemptAgent)?
-                } else {
-                    AttemptAgent::new(builder)
-                };
-                let (builder, verifier) = configured.into_parts();
-                let (agent, events) = builder.build()?;
-                Ok((agent, events, verifier))
-            });
-            record_span_result(&span, trace_started, &result);
-            let (agent, events, verifier) = result?;
-            (
-                agent,
-                events,
-                verifier,
-                PhaseTiming::finished(setup_started),
-            )
-        };
+        let AgentSetup {
+            agent,
+            mut events,
+            verifier,
+            timing: setup_timing,
+        } = self.setup_agent(emitter, task, attempt, nanocodex).await?;
         let execution_started = Utc::now();
         let span = info_span!(
-            target: "nanoeval",
+            target: "nanocodex_eval",
             "eval.agent.execution",
             otel.kind = "internal",
             otel.status_code = tracing::field::Empty,
@@ -722,10 +715,72 @@ impl Nanoeval {
         let (turn_result, terminal_event) = result?;
         drop(agent);
         Ok(AgentExecution {
-            result: AgentResult::from_terminal(turn_result.final_message, &terminal_event)?,
+            result: AgentResult::from_terminal(turn_result.into_final_message(), &terminal_event)?,
             verifier,
             setup_timing,
             execution_timing: PhaseTiming::finished(execution_started),
+        })
+    }
+
+    async fn setup_agent(
+        &self,
+        emitter: &AttemptEmitter<'_>,
+        task: &Task,
+        attempt: &NativeAttempt,
+        nanocodex: NanocodexBuilder<StandardResponses>,
+    ) -> Result<AgentSetup, EvalError> {
+        let setup_started = Utc::now();
+        let span = info_span!(
+            target: "nanocodex_eval",
+            "eval.agent.setup",
+            otel.kind = "internal",
+            otel.status_code = tracing::field::Empty,
+            eval.task.name = task.name(),
+            eval.attempt.id = %emitter.attempt_id,
+            workspace = %attempt.paths.workspace.display(),
+            status = tracing::field::Empty,
+            error.message = tracing::field::Empty,
+            duration_ns = tracing::field::Empty,
+        );
+        let trace_started = Instant::now();
+        let result = async {
+            let builder = nanocodex
+                .workspace(&attempt.paths.workspace)
+                .session_id(emitter.session_id)
+                .prompt_cache_key(format!(
+                    "nanoeval:{}:{:x}",
+                    self.id().simple(),
+                    emitter.prompt_cache_cohort
+                ));
+            let configured = if let Some(factory) = &self.inner.attempt_agent {
+                factory(
+                    EvalAttempt {
+                        task,
+                        directory: &attempt.paths.root,
+                        workspace: &attempt.paths.workspace,
+                    },
+                    builder,
+                )
+                .map_err(EvalError::AttemptAgent)?
+            } else {
+                AttemptAgent::new(builder)
+            };
+            let (builder, readiness, verifier) = configured.into_parts();
+            if let Some(readiness) = readiness {
+                readiness.await.map_err(EvalError::AttemptAgent)?;
+            }
+            let (agent, events) = builder.build()?;
+            Ok::<_, EvalError>((agent, events, verifier))
+        }
+        .instrument(span.clone())
+        .await;
+        record_span_result(&span, trace_started, &result);
+        let (agent, events, verifier) = result?;
+        Ok(AgentSetup {
+            agent,
+            events,
+            verifier,
+            timing: PhaseTiming::finished(setup_started),
         })
     }
 }
@@ -737,7 +792,14 @@ struct AgentExecution {
     execution_timing: PhaseTiming,
 }
 
-impl NanoevalBuilder {
+struct AgentSetup {
+    agent: Nanocodex,
+    events: AgentEvents,
+    verifier: Option<Box<dyn AttemptVerifier>>,
+    timing: PhaseTiming,
+}
+
+impl EvaluatorBuilder {
     /// Sets the parent under which this evaluator creates one UUID-named
     /// artifact directory.
     #[must_use]
@@ -768,6 +830,9 @@ impl NanoevalBuilder {
         self
     }
 
+    /// Sets the maximum number of attempts allowed to execute concurrently.
+    ///
+    /// The default is one. [`Self::build`] rejects zero.
     #[must_use]
     pub const fn max_concurrency(mut self, max_concurrency: usize) -> Self {
         self.max_concurrency = max_concurrency;
@@ -810,7 +875,7 @@ impl NanoevalBuilder {
     /// # Errors
     ///
     /// Returns an error for invalid concurrency or an unavailable output path.
-    pub fn build(self) -> Result<(Nanoeval, NanoevalEvents), EvalError> {
+    pub fn build(self) -> Result<(Evaluator, EvalEvents), EvalError> {
         if self.max_concurrency == 0 {
             return Err(EvalError::InvalidConcurrency);
         }
@@ -836,8 +901,8 @@ impl NanoevalBuilder {
         };
         let (event_sender, _) = broadcast::channel(EVENT_CAPACITY);
         Ok((
-            Nanoeval {
-                inner: Arc::new(NanoevalInner {
+            Evaluator {
+                inner: Arc::new(EvaluatorInner {
                     nanocodex: self.nanocodex,
                     job,
                     planned_attempts,
@@ -852,7 +917,7 @@ impl NanoevalBuilder {
                     attempt_agent: self.attempt_agent,
                 }),
             },
-            NanoevalEvents::new(event_sender),
+            EvalEvents::new(event_sender),
         ))
     }
 }
@@ -911,14 +976,37 @@ impl Drop for AdmissionPermit {
 }
 
 impl AttemptAgent {
+    /// Uses `nanocodex` for one attempt with the default native verifier.
     #[must_use]
     pub fn new(nanocodex: NanocodexBuilder<StandardResponses>) -> Self {
         Self {
             nanocodex,
+            readiness: None,
             verifier: None,
         }
     }
 
+    /// Installs asynchronous environment readiness work that must complete
+    /// before the agent is built or any model request is sent.
+    ///
+    /// VM adapters use this to wait for a typed guest handshake. A readiness
+    /// failure aborts the attempt as an environment error without spending a
+    /// model request.
+    #[must_use]
+    pub fn ready<F, E>(mut self, readiness: F) -> Self
+    where
+        F: Future<Output = Result<(), E>> + Send + 'static,
+        E: Error + Send + Sync + 'static,
+    {
+        self.readiness = Some(Box::pin(async move {
+            readiness
+                .await
+                .map_err(|error| Box::new(error) as AttemptError)
+        }));
+        self
+    }
+
+    /// Installs the verifier that owns this attempt's environment backend.
     #[must_use]
     pub fn verifier(mut self, verifier: impl AttemptVerifier + 'static) -> Self {
         self.verifier = Some(Box::new(verifier));
@@ -929,23 +1017,27 @@ impl AttemptAgent {
         self,
     ) -> (
         NanocodexBuilder<StandardResponses>,
+        Option<AttemptReadinessFuture>,
         Option<Box<dyn AttemptVerifier>>,
     ) {
-        (self.nanocodex, self.verifier)
+        (self.nanocodex, self.readiness, self.verifier)
     }
 }
 
 impl EvalAttempt<'_> {
+    /// Returns the immutable task definition.
     #[must_use]
     pub const fn task(&self) -> &Task {
         self.task
     }
 
+    /// Returns the retained attempt root.
     #[must_use]
     pub const fn directory(&self) -> &Path {
         self.directory
     }
 
+    /// Returns the workspace path presented to the agent.
     #[must_use]
     pub const fn workspace(&self) -> &Path {
         self.workspace
@@ -953,8 +1045,9 @@ impl EvalAttempt<'_> {
 }
 
 struct AttemptEmitter<'a> {
-    eval: &'a Nanoeval,
+    eval: &'a Evaluator,
     attempt_id: Uuid,
+    session_id: SessionId,
     prompt_cache_cohort: u64,
     task_name: String,
     trial_name: String,
@@ -963,15 +1056,16 @@ struct AttemptEmitter<'a> {
 
 impl<'a> AttemptEmitter<'a> {
     fn new(
-        eval: &'a Nanoeval,
-        attempt_id: Uuid,
+        eval: &'a Evaluator,
+        session_id: SessionId,
         prompt_cache_cohort: u64,
         task: &Task,
         trial_name: &str,
     ) -> Self {
         Self {
             eval,
-            attempt_id,
+            attempt_id: session_id.as_uuid(),
+            session_id,
             prompt_cache_cohort,
             task_name: task.name().to_owned(),
             trial_name: trial_name.to_owned(),
@@ -1003,7 +1097,7 @@ struct ResponsesApiError {
 }
 
 fn attempt_failure(
-    eval: &Nanoeval,
+    eval: &Evaluator,
     attempt_id: Uuid,
     task: Task,
     trial_name: String,
@@ -1082,7 +1176,7 @@ fn error_traceback(error: &dyn Error) -> String {
 }
 
 fn attempt_span(
-    eval: &Nanoeval,
+    eval: &Evaluator,
     task: &Task,
     attempt_id: Uuid,
     trial_name: &str,
@@ -1090,7 +1184,7 @@ fn attempt_span(
     coordinate: Option<&SweepCoordinate>,
 ) -> Span {
     let span = info_span!(
-        target: "nanoeval",
+        target: "nanocodex_eval",
         parent: None,
         "eval.attempt",
         otel.kind = "internal",
@@ -1145,7 +1239,7 @@ fn record_attempt_result(span: &Span, started_at: Instant, result: &Result<EvalR
             record_attempt_success(span, result);
             span.in_scope(|| {
                 info!(
-                    target: "nanoeval",
+                    target: "nanocodex_eval",
                     duration_ns,
                     score.status = eval_status(result.status),
                     "evaluation attempt completed"
@@ -1158,7 +1252,7 @@ fn record_attempt_result(span: &Span, started_at: Instant, result: &Result<EvalR
             span.record("error.message", tracing::field::display(error));
             span.in_scope(|| {
                 info!(
-                    target: "nanoeval",
+                    target: "nanocodex_eval",
                     duration_ns,
                     error = %error,
                     "evaluation attempt failed"
@@ -1256,7 +1350,7 @@ where
             span.record("otel.status_code", "OK");
             span.in_scope(|| {
                 info!(
-                    target: "nanoeval",
+                    target: "nanocodex_eval",
                     duration_ns,
                     status = "completed",
                     "evaluation phase completed"
@@ -1269,7 +1363,7 @@ where
             span.record("error.message", tracing::field::display(error));
             span.in_scope(|| {
                 info!(
-                    target: "nanoeval",
+                    target: "nanocodex_eval",
                     duration_ns,
                     status = "failed",
                     error = %error,
@@ -1283,7 +1377,7 @@ where
 fn record_content(span: &tracing::Span, kind: &'static str, content: &str) {
     span.in_scope(|| {
         info!(
-            target: "nanoeval",
+            target: "nanocodex_eval",
             content_kind = kind,
             content,
             "evaluation content"
@@ -1350,7 +1444,7 @@ mod tracing_tests {
         time::Duration,
     };
 
-    use nanocodex::{Nanocodex, NanocodexError, ResponsesError};
+    use nanocodex_agent::{Nanocodex, NanocodexError, ResponsesError};
     use tempfile::tempdir;
     use tracing::{Id, Instrument, Subscriber, field::Visit, span::Attributes};
     use tracing_subscriber::{
@@ -1358,7 +1452,7 @@ mod tracing_tests {
     };
 
     use super::{
-        AdmissionController, EvalError, Nanoeval, failure_kind, validate_attempt_environment,
+        AdmissionController, EvalError, Evaluator, failure_kind, validate_attempt_environment,
     };
     use crate::{EvalFailureKind, Sweep, Task};
 
@@ -1387,7 +1481,7 @@ mod tracing_tests {
             .unwrap()
             .build()
             .unwrap();
-        let (eval, _) = Nanoeval::builder(Nanocodex::builder("test-key"))
+        let (eval, _) = Evaluator::builder(Nanocodex::builder("test-key"))
             .output_directory(output.path())
             .fresh_run(&sweep)
             .build()
@@ -1533,7 +1627,7 @@ allow_internet = false
 
         tracing::dispatcher::with_default(&dispatch, || {
             runtime.block_on(async {
-                let (eval, _events) = Nanoeval::builder(Nanocodex::builder("test"))
+                let (eval, _events) = Evaluator::builder(Nanocodex::builder("test"))
                     .output_directory(output.path())
                     .build()
                     .unwrap();

@@ -6,9 +6,11 @@ AR_aarch64_unknown_linux_musl = { value = "scripts/aarch64-unknown-linux-musl-ar
 
 [target.aarch64-apple-darwin]
 linker = "/usr/bin/clang"
+runner = "scripts/codesign-runner"
 
 [target.aarch64-unknown-linux-musl]
 linker = "scripts/aarch64-unknown-linux-musl-linker"
 
 [target.x86_64-apple-darwin]
 linker = "/usr/bin/clang"
+runner = "scripts/codesign-runner"

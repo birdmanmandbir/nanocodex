@@ -1,7 +1,7 @@
 use std::{env, error::Error, path::PathBuf};
 
 use nanocodex::{Nanocodex, OpenAiAuth, Thinking};
-use nanoeval::{Nanoeval, Sweep, Task};
+use nanocodex_eval::{Evaluator, Sweep, Task};
 
 const K: u16 = 5;
 type AnyError = Box<dyn Error + Send + Sync>;
@@ -23,8 +23,8 @@ async fn main() -> Result<(), AnyError> {
         .build()?;
 
     println!("planned {} independent attempts", sweep.attempt_count());
-    let (eval, _events) = Nanoeval::builder(nanocodex)
-        .output_directory("nanoeval-sweep-runs/thinking")
+    let (eval, _events) = Evaluator::builder(nanocodex)
+        .output_directory(".nanocodex/evals/sweeps/thinking")
         .max_concurrency(sweep.attempt_count())
         .build()?;
     let results = eval.sweep(sweep).await?;

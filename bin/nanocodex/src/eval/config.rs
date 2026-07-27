@@ -18,6 +18,10 @@ pub(crate) struct AgentArgs {
     #[arg(long, env = "OPENAI_REASONING_EFFORT")]
     thinking: Option<Thinking>,
 
+    /// JSON pricing snapshot used to estimate USD cost for every attempt.
+    #[arg(long, env = "NANOCODEX_PRICING_FILE")]
+    pricing_file: Option<PathBuf>,
+
     /// Allow the agent to search the public web. Disabled by default for eval integrity.
     #[arg(long, action = clap::ArgAction::SetTrue)]
     web_search: Option<bool>,
@@ -25,9 +29,14 @@ pub(crate) struct AgentArgs {
 
 impl AgentArgs {
     pub(crate) fn builder(self, thinking: Thinking, web_search: bool) -> Result<NanocodexBuilder> {
+        let pricing = crate::config::load_pricing(self.pricing_file.as_deref())?;
         let auth = Self::select_auth(self.api_key, self.auth_file, Self::environment_api_key()?)?;
         let tools = Tools::builder().web_search(web_search).build()?;
-        Ok(Nanocodex::builder(auth).thinking(thinking).tools(tools))
+        let mut builder = Nanocodex::builder(auth).thinking(thinking).tools(tools);
+        if let Some(pricing) = pricing {
+            builder = builder.pricing(pricing);
+        }
+        Ok(builder)
     }
 
     pub(crate) const fn thinking(&self) -> Option<Thinking> {

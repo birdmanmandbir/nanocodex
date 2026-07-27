@@ -1,7 +1,7 @@
 use std::{env, error::Error, path::PathBuf};
 
 use nanocodex::{Nanocodex, OpenAiAuth};
-use nanoeval::{EvalEventKind, Nanoeval, Task};
+use nanocodex_eval::{EvalEventKind, Evaluator, Task};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -10,9 +10,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .map_or_else(|| PathBuf::from("tasks/write-greeting"), PathBuf::from);
     let output_directory = env::args_os()
         .nth(2)
-        .map_or_else(|| PathBuf::from("nanoeval-native-runs"), PathBuf::from);
+        .map_or_else(|| PathBuf::from(".nanocodex/evals/native"), PathBuf::from);
     let task = Task::load(task_directory)?;
-    let (eval, events) = Nanoeval::builder(Nanocodex::builder(auth()?))
+    let (eval, events) = Evaluator::builder(Nanocodex::builder(auth()?))
         .output_directory(output_directory)
         .build()?;
     let mut event_stream = events.subscribe();
@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 break;
             }
         }
-        Ok::<_, nanoeval::EvalEventStreamError>(count)
+        Ok::<_, nanocodex_eval::EvalEventStreamError>(count)
     });
     let result = eval.task(task).await?;
     let event_count = observer_task.await??;

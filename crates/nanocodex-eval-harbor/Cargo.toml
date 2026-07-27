@@ -1,5 +1,5 @@
 [package]
-name = "nanoeval-harbor"
+name = "nanocodex-eval-harbor"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,24 +11,24 @@ repository.workspace = true
 readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Streaming Harbor and ATIF output for Nanoeval"
+description = "Harbor and ATIF projection for Nanocodex evaluations"
 
 [dependencies]
 chrono.workspace = true
 futures-util.workspace = true
 ignore.workspace = true
-nanoeval.workspace = true
+nanocodex-eval.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thread", "sync"] }
 url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-nanocodex.workspace = true
+nanocodex-agent.workspace = true
 tempfile.workspace = true
 
 [lints]

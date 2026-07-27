@@ -8,7 +8,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use clap::Args;
 use eyre::{Result, eyre};
-use nanoeval::{AtifSource, AtifTrajectory};
+use nanocodex_eval::{AtifSource, AtifTrajectory};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 use yansi::Painted;
@@ -174,7 +174,7 @@ impl JobInspection {
         if self.failed + self.refused + self.errored > 0 {
             writeln!(
                 output,
-                "\nUse `nanoeval inspect {} --trial <name> --full` for complete evidence.",
+                "\nUse `nanocodex eval inspect {} --trial <name> --full` for complete evidence.",
                 self.directory.display()
             )?;
         }
@@ -620,7 +620,7 @@ struct HarborAgentResult {
     n_input_tokens: u64,
     n_cache_tokens: u64,
     n_output_tokens: u64,
-    metadata: nanoeval::AgentMetadata,
+    metadata: nanocodex_eval::AgentMetadata,
 }
 
 #[derive(Deserialize)]

@@ -5,6 +5,8 @@ members = [
     "bin/nanousd-api",
     "crates/nanocodex",
     "crates/nanocodex-agent",
+    "crates/nanocodex-eval",
+    "crates/nanocodex-eval-harbor",
     "crates/nanocodex-oai-api",
     "crates/nanocodex-observability",
     "crates/nanocodex-tools",
@@ -63,6 +65,8 @@ krun = { package = "libkrun", version = "=2.0.0-dev", git = "https://github.com/
 mpp = { version = "=0.11.0", git = "https://github.com/tempoxyz/mpp-rs", rev = "5caad442edeab796821b7f3bb009ab6945106e35", default-features = false }
 nanocodex = { version = "0.2.0", path = "crates/nanocodex" }
 nanocodex-agent = { version = "0.2.0", path = "crates/nanocodex-agent" }
+nanocodex-eval = { version = "0.2.0", path = "crates/nanocodex-eval" }
+nanocodex-eval-harbor = { version = "0.2.0", path = "crates/nanocodex-eval-harbor" }
 nanocodex-oai-api = { version = "0.2.0", path = "crates/nanocodex-oai-api" }
 nanocodex-observability = { version = "0.2.0", path = "crates/nanocodex-observability" }
 nanocodex-tools = { version = "0.2.0", path = "crates/nanocodex-tools" }
@@ -73,6 +77,7 @@ nanovm = { version = "0.2.0", path = "crates/nanovm" }
 nanovm-image = { version = "0.2.0", path = "crates/nanovm-image" }
 oci-client = { version = "0.17.0", default-features = false, features = ["rustls-tls"] }
 rand = "0.9.2"
+regex = "1"
 reflink-copy = "0.1.30"
 image = { version = "0.25.9", default-features = false, features = ["gif", "jpeg", "png", "pnm", "webp"] }
 iana-time-zone = "0.1.64"
@@ -107,6 +112,7 @@ shlex = "2.0.1"
 simd-json = "=0.15.1"
 smallvec = { version = "1.15.1", features = ["serde"] }
 sonic-rs = "0.5.8"
+sysinfo = { version = "0.37.2", default-features = false, features = ["system"] }
 syn = { version = "2.0.119", features = ["full"] }
 thiserror = "2.0.17"
 tempfile = "3.27.0"
@@ -129,6 +135,7 @@ vergen = { version = "8", default-features = false }
 wasm-bindgen = "0.2.105"
 wasm-bindgen-futures = "0.4.55"
 web-time = "1.1.0"
+yansi = { version = "1.0", features = ["detect-env", "detect-tty"] }
 zstd = "0.13"
 
 [workspace.lints.rust]

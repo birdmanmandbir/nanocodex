@@ -14,7 +14,7 @@ const GVPROXY_VERSION: &str = "v0.8.9";
 
 #[derive(Debug, Error)]
 pub(crate) enum GvproxyError {
-    #[error("NANOEVAL_GVPROXY does not name a file: {0}")]
+    #[error("NANOCODEX_EVAL_GVPROXY does not name a file: {0}")]
     InvalidOverride(PathBuf),
 
     #[error("gvproxy is not published for {os}/{architecture}")]
@@ -48,7 +48,7 @@ pub(crate) struct Gvproxy {
 impl Gvproxy {
     pub(crate) fn spawn(binary: &Path, log: &Path) -> Result<Self, GvproxyError> {
         let directory = tempfile::Builder::new()
-            .prefix("nanoeval-gvproxy-")
+            .prefix("nanocodex-eval-gvproxy-")
             .tempdir()?;
         let process = GvproxyProcess::spawn(binary, directory.path(), log)?;
         Ok(Self {
@@ -63,7 +63,10 @@ impl Gvproxy {
 }
 
 pub(crate) async fn prepare_gvproxy(cache: &Path) -> Result<PathBuf, GvproxyError> {
-    if let Some(path) = env::var_os("NANOEVAL_GVPROXY").map(PathBuf::from) {
+    let override_path = env::var_os("NANOCODEX_EVAL_GVPROXY")
+        .or_else(|| env::var_os("NANOEVAL_GVPROXY"))
+        .map(PathBuf::from);
+    if let Some(path) = override_path {
         return path
             .is_file()
             .then_some(path.clone())

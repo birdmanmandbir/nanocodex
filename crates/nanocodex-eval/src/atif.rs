@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use nanocodex::{AgentEvent, AgentEventKind, MODEL, Usage};
+use nanocodex_agent::{AgentEvent, AgentEventKind, MODEL, Usage};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
@@ -9,14 +9,20 @@ use crate::{AgentMetadata, AgentResult, Task, UsageTotals};
 /// A complete ATIF-v1.7 projection of one agent attempt.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AtifTrajectory {
+    /// Schema revision used to encode this trajectory.
     pub schema_version: AtifSchemaVersion,
+    /// Stable agent session identity.
     pub session_id: String,
+    /// Agent and model identity for the attempt.
     pub agent: AtifAgent,
+    /// Ordered user, model, tool-call, and observation steps.
     pub steps: Vec<AtifStep>,
+    /// Aggregate attempt metrics.
     pub final_metrics: AtifFinalMetrics,
 }
 
 impl AtifTrajectory {
+    /// Counts tool calls across every agent step.
     #[must_use]
     pub fn tool_call_count(&self) -> usize {
         self.steps
@@ -26,6 +32,7 @@ impl AtifTrajectory {
             .sum()
     }
 
+    /// Counts tool observations across every agent step.
     #[must_use]
     pub fn observation_count(&self) -> usize {
         self.steps
@@ -36,147 +43,230 @@ impl AtifTrajectory {
     }
 }
 
+/// ATIF schema revision emitted by this crate.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub enum AtifSchemaVersion {
+    /// Agent Trajectory Interchange Format version 1.7.
     #[serde(rename = "ATIF-v1.7")]
     V1_7,
 }
 
+/// Agent identity recorded in an ATIF trajectory.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AtifAgent {
+    /// Harness name.
     pub name: String,
+    /// Harness package version.
     pub version: String,
+    /// `OpenAI` model used by the attempt.
     pub model_name: String,
+    /// Nanocodex-specific transport metadata.
     pub extra: AtifAgentExtra,
 }
 
+/// Nanocodex-specific ATIF agent metadata.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AtifAgentExtra {
+    /// Responses transport used by the session.
     pub transport: String,
+    /// Agent orchestration mode.
     pub orchestration: String,
 }
 
+/// One ordered ATIF user or agent step.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AtifStep {
+    /// One-based position in the trajectory.
     pub step_id: u32,
+    /// Whether the step originated from the user or agent.
     pub source: AtifSource,
+    /// Model used for this agent step.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_name: Option<String>,
+    /// Reasoning effort used for this agent step.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// User prompt or assistant message text.
     pub message: String,
+    /// API-visible reasoning summary content.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// Tool calls requested by the model in this step.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<AtifToolCall>>,
+    /// Results for tool calls associated with this step.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observation: Option<AtifObservation>,
+    /// Usage and latency for the model call that produced this step.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metrics: Option<AtifMetrics>,
+    /// One-based model-call count at this step.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llm_call_count: Option<u32>,
+    /// Nanocodex terminal metadata attached to the final step.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extra: Option<AtifStepExtra>,
 }
 
+/// Producer of an ATIF step.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AtifSource {
+    /// Benchmark task prompt.
     User,
+    /// Agent model output.
     Agent,
 }
 
+/// One model-requested tool call in ATIF form.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AtifToolCall {
+    /// Provider-assigned tool-call identity.
     pub tool_call_id: String,
+    /// Model-visible tool name.
     pub function_name: String,
+    /// Complete raw JSON arguments.
     pub arguments: Box<RawValue>,
+    /// Nanocodex model-call correlation.
     pub extra: AtifToolCallExtra,
 }
 
+/// Nanocodex-specific tool-call metadata.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AtifToolCallExtra {
+    /// Zero-based model-call index that requested the tool.
     pub model_call_index: u32,
 }
 
+/// Tool results observed after one agent step.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AtifObservation {
+    /// Ordered tool results.
     pub results: Vec<AtifObservationResult>,
 }
 
+/// One ATIF tool result.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AtifObservationResult {
+    /// Tool-call identity that produced this result.
     pub source_call_id: String,
+    /// Complete model-visible tool result.
     pub content: String,
+    /// Nanocodex execution metadata.
     pub extra: AtifObservationExtra,
 }
 
+/// Nanocodex-specific tool-result metadata.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AtifObservationExtra {
+    /// Tool execution status.
     pub status: String,
+    /// Tool wall duration in nanoseconds.
     pub duration_ns: u64,
 }
 
+/// Token, cost, and latency metrics for one model call.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AtifMetrics {
+    /// Input tokens charged to the model call.
     pub prompt_tokens: u64,
+    /// Output tokens produced by the model call.
     pub completion_tokens: u64,
+    /// Input tokens served from provider cache.
     pub cached_tokens: u64,
+    /// Estimated USD cost when a pricing snapshot was configured.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+    /// Nanocodex transport and execution metrics.
     pub extra: AtifModelCallMetrics,
 }
 
+/// Nanocodex-specific metrics for one model call.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AtifModelCallMetrics {
+    /// Zero-based logical model-call index.
     pub model_call_index: u32,
+    /// One-based transport attempt within the logical call.
     pub attempt: u32,
+    /// WebSocket connection generation used by the attempt.
     pub connection_generation: u32,
+    /// Complete model-call duration in nanoseconds.
     pub duration_ns: u64,
+    /// Duration to the first Responses event in nanoseconds.
     pub time_to_first_event_ns: u64,
+    /// Duration to the first visible output, when any, in nanoseconds.
     pub time_to_first_output_ns: Option<u64>,
+    /// Number of tool calls requested by this model call.
     pub tool_calls: usize,
+    /// Provider-reported cache-write input tokens.
     pub cache_write_input_tokens: u64,
+    /// Provider-reported reasoning output tokens.
     pub reasoning_output_tokens: u64,
 }
 
+/// Terminal Nanocodex metadata attached to the final ATIF step.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AtifStepExtra {
+    /// Stable terminal event spelling, such as `run.completed`.
     pub terminal_event_type: String,
+    /// Complete typed terminal payload.
     pub terminal_payload: AgentMetadata,
 }
 
+/// Aggregate metrics for a complete ATIF trajectory.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AtifFinalMetrics {
+    /// Total model input tokens.
     pub total_prompt_tokens: u64,
+    /// Total model output tokens.
     pub total_completion_tokens: u64,
+    /// Total cached input tokens.
     pub total_cached_tokens: u64,
+    /// Aggregate estimated USD cost when pricing was configured.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_cost_usd: Option<f64>,
+    /// Number of user and agent steps.
     pub total_steps: u32,
+    /// Nanocodex aggregate execution metrics.
     pub extra: AtifFinalMetricsExtra,
 }
 
+/// Nanocodex-specific aggregate ATIF metrics.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AtifFinalMetricsExtra {
+    /// Logical model calls in the attempt.
     pub model_calls: u32,
+    /// Tool calls in the attempt.
     pub tool_calls: u32,
+    /// Complete attempt duration in nanoseconds.
     pub duration_ns: u64,
+    /// Detailed transport and runtime metrics.
     #[serde(flatten)]
     pub runtime: AtifRuntimeMetrics,
 }
 
+/// Aggregate transport, model, warmup, and tool measurements.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct AtifRuntimeMetrics {
+    /// Responses connection attempts.
     pub connection_attempts: u32,
+    /// Successful WebSocket replacements.
     pub websocket_reconnects: u32,
+    /// Time spent establishing Responses connections.
     pub connection_duration_ns: u64,
+    /// Time spent inside model calls.
     pub model_duration_ns: u64,
+    /// Time spent priming the prompt cache.
     pub warmup_duration_ns: u64,
+    /// Sum of actual tool execution time.
     pub tool_work_duration_ns: u64,
+    /// Tool wall time including scheduling and overlap.
     pub tool_wall_duration_ns: u64,
+    /// Tokens consumed by prompt-cache warmup.
     pub warmup_usage: UsageTotals,
+    /// Provider-reported cache-write input tokens.
     pub cache_write_input_tokens: u64,
+    /// Provider-reported reasoning output tokens.
     pub reasoning_output_tokens: u64,
 }
 
@@ -286,6 +376,10 @@ impl AtifBuilder {
         Ok(())
     }
 
+    /// Finishes a successful attempt using its typed terminal result.
+    ///
+    /// The trajectory begins with the complete task prompt and attaches the
+    /// terminal agent payload to the final agent step.
     #[must_use]
     pub fn finish(self, task: &Task, result: &AgentResult) -> AtifTrajectory {
         let runtime = AtifRuntimeMetrics::from(&result.metadata);
@@ -588,7 +682,7 @@ struct ToolResultPayload {
 mod tests {
     use std::path::Path;
 
-    use nanocodex::AgentEvent;
+    use nanocodex_agent::AgentEvent;
 
     use crate::{AgentMetadata, AgentResult, AtifSource, Task};
 

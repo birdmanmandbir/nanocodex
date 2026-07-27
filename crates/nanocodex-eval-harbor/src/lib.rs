@@ -1,3 +1,33 @@
+//! Harbor-compatible artifacts for [`nanocodex_eval`].
+//!
+//! The evaluator's typed result is authoritative. This crate subscribes to its
+//! optional event stream and durably projects each attempt into Harbor job,
+//! trial, trajectory, verifier, and ATIF files.
+//!
+//! # Record a job
+//!
+//! ```no_run
+//! use nanocodex_agent::Nanocodex;
+//! use nanocodex_eval::{Evaluator, Task};
+//! use nanocodex_eval_harbor::Harbor;
+//!
+//! # async fn evaluate() -> Result<(), Box<dyn std::error::Error>> {
+//! let agent = Nanocodex::builder(std::env::var("OPENAI_API_KEY")?).instructions(
+//!     "Work in the provided workspace, complete the task, and verify it.",
+//! );
+//! let (evaluator, events) = Evaluator::builder(agent)
+//!     .output_directory(".nanocodex/evals")
+//!     .build()?;
+//! let recorder = Harbor::new(&evaluator)?.record(events.subscribe())?;
+//! let result = evaluator.task(Task::load("tasks/write-greeting")?).await?;
+//! let job = recorder.finish(vec![result]).await?;
+//! println!("{}", job.directory().display());
+//! # Ok(())
+//! # }
+//! ```
+
+#![deny(missing_docs, rustdoc::broken_intra_doc_links)]
+
 mod checksum;
 mod published;
 
@@ -18,9 +48,9 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use nanoeval::{
-    AgentMetadata, AtifBuilder, AtifTrajectory, EvalEventKind, EvalEventStreamError, EvalFailure,
-    EvalResult, Nanoeval, NanoevalEventStream, PhaseTiming, Task,
+use nanocodex_eval::{
+    AgentMetadata, AtifBuilder, AtifTrajectory, EvalEventKind, EvalEventStream,
+    EvalEventStreamError, EvalFailure, EvalResult, Evaluator, PhaseTiming, Task,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{sync::oneshot, task::JoinHandle};
@@ -30,43 +60,57 @@ use uuid::Uuid;
 use checksum::{directory_hash, package_content_hash};
 
 #[derive(Debug, thiserror::Error)]
+/// An error produced while recording or publishing Harbor-compatible artifacts.
 pub enum HarborError {
+    /// A filesystem operation failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
+    /// A Harbor JSON document could not be encoded or decoded.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 
+    /// Task ignore rules could not be compiled.
     #[error("failed to compile task ignore rules: {0}")]
     Ignore(#[from] ignore::Error),
 
+    /// A task directory contained no packageable files.
     #[error("task directory is empty: {0}")]
     EmptyTask(PathBuf),
 
+    /// Following a symbolic link would make task packaging cyclic.
     #[error("task directory contains a cyclic symbolic link: {0}")]
     CyclicTaskDirectory(PathBuf),
 
+    /// A trial path could not be represented as a `file:` URL.
     #[error("trial directory cannot be represented as a file URL: {0}")]
     InvalidTrialPath(PathBuf),
 
+    /// The evaluator event subscription lagged or otherwise failed.
     #[error(transparent)]
     EventStream(#[from] EvalEventStreamError),
 
+    /// An event referenced an attempt before its start event.
     #[error("received events for attempt {0} before attempt.started")]
     MissingAttempt(Uuid),
 
+    /// More than one start event was received for an attempt.
     #[error("received duplicate attempt.started for attempt {0}")]
     DuplicateAttempt(Uuid),
 
+    /// The recorder task stopped before it could be finalized.
     #[error("Harbor recorder stopped before finish")]
     RecorderStopped,
 
-    #[error("Nanoeval event stream closed before Harbor recording finished")]
+    /// The evaluator event stream ended before the requested batch completed.
+    #[error("Evaluator event stream closed before Harbor recording finished")]
     EventStreamClosed,
 
+    /// The background recorder task failed.
     #[error("Harbor recorder task failed: {0}")]
     Join(#[from] tokio::task::JoinError),
 
+    /// Recording was started without an active Tokio runtime.
     #[error("Harbor recording requires an active Tokio runtime: {0}")]
     Runtime(#[from] tokio::runtime::TryCurrentError),
 }
@@ -83,6 +127,7 @@ pub struct HarborRecorder {
 }
 
 #[derive(Clone, Debug)]
+/// A durably committed Harbor-compatible evaluation job.
 pub struct HarborJob {
     id: Uuid,
     directory: PathBuf,
@@ -95,7 +140,7 @@ impl Harbor {
     ///
     /// Returns an error when the evaluator directory cannot be initialized with
     /// Harbor job metadata.
-    pub fn new(eval: &Nanoeval) -> Result<Self, HarborError> {
+    pub fn new(eval: &Evaluator) -> Result<Self, HarborError> {
         Ok(Self {
             artifacts: HarborArtifacts::attach(eval)?,
         })
@@ -106,7 +151,7 @@ impl Harbor {
     /// # Errors
     ///
     /// Returns an error when called without an active Tokio runtime.
-    pub fn record(self, events: NanoevalEventStream) -> Result<HarborRecorder, HarborError> {
+    pub fn record(self, events: EvalEventStream) -> Result<HarborRecorder, HarborError> {
         let (finish, finish_receiver) = oneshot::channel();
         let task = tokio::runtime::Handle::try_current()?.spawn(record(
             self.artifacts,
@@ -171,11 +216,13 @@ impl Drop for HarborRecorder {
 }
 
 impl HarborJob {
+    /// Returns the stable job identifier.
     #[must_use]
     pub const fn id(&self) -> Uuid {
         self.id
     }
 
+    /// Returns the directory containing the committed Harbor artifacts.
     #[must_use]
     pub fn directory(&self) -> &Path {
         &self.directory
@@ -211,7 +258,7 @@ fn finished_attempt_count(
 
 async fn record(
     artifacts: HarborArtifacts,
-    mut events: NanoevalEventStream,
+    mut events: EvalEventStream,
     mut finish: oneshot::Receiver<FinishRequest>,
 ) -> Result<HarborJob, HarborError> {
     let mut attempts = HashMap::<Uuid, AttemptRecording>::new();
@@ -318,7 +365,7 @@ struct HarborArtifacts {
 }
 
 impl HarborArtifacts {
-    fn attach(eval: &Nanoeval) -> Result<Self, HarborError> {
+    fn attach(eval: &Evaluator) -> Result<Self, HarborError> {
         let root = eval.directory().to_path_buf();
         let baseline = Self::read_json_if_exists(&root.join("result.json"))?;
         let recorded_trials = Self::read_json_if_exists::<HarborJobLock>(&root.join("lock.json"))?
@@ -388,7 +435,7 @@ impl HarborArtifacts {
         let config = HarborTrialConfig {
             task: HarborTaskConfig {
                 path: task_path.clone(),
-                source: Some("nanoeval/local".to_owned()),
+                source: Some("nanocodex/local".to_owned()),
             },
             trial_name: &result.trial_name,
             trials_dir: &self.root,
@@ -415,7 +462,7 @@ impl HarborArtifacts {
             trial_name: &result.trial_name,
             trial_uri,
             task_id: HarborTaskId { path: task_path },
-            source: "nanoeval/local",
+            source: "nanocodex/local",
             task_checksum,
             config,
             agent_info: HarborAgentInfo {
@@ -465,7 +512,7 @@ impl HarborArtifacts {
             recorded.push(HarborRecordedTrial {
                 task: HarborTaskConfig {
                     path: task.root().to_path_buf(),
-                    source: Some("nanoeval/local".to_owned()),
+                    source: Some("nanocodex/local".to_owned()),
                 },
                 agent: harbor_agent_config(&result.agent.model, &result.agent.effort),
                 lock,
@@ -494,7 +541,7 @@ impl HarborArtifacts {
         let config = HarborTrialConfig {
             task: HarborTaskConfig {
                 path: task_path.clone(),
-                source: Some("nanoeval/local".to_owned()),
+                source: Some("nanocodex/local".to_owned()),
             },
             trial_name: &failure.trial_name,
             trials_dir: &self.root,
@@ -521,7 +568,7 @@ impl HarborArtifacts {
             trial_name: &failure.trial_name,
             trial_uri,
             task_id: HarborTaskId { path: task_path },
-            source: "nanoeval/local",
+            source: "nanocodex/local",
             task_checksum,
             config,
             agent_info: HarborAgentInfo {
@@ -562,7 +609,7 @@ impl HarborArtifacts {
             recorded.push(HarborRecordedTrial {
                 task: HarborTaskConfig {
                     path: task.root().to_path_buf(),
-                    source: Some("nanoeval/local".to_owned()),
+                    source: Some("nanocodex/local".to_owned()),
                 },
                 agent: harbor_agent_config(model, effort),
                 lock,
@@ -680,7 +727,7 @@ impl HarborArtifacts {
         let mut name: OsString = path
             .file_name()
             .map_or_else(|| OsString::from("artifact"), OsString::from);
-        name.push(format!(".{}.tmp", Uuid::new_v4()));
+        name.push(format!(".{}.tmp", Uuid::now_v7()));
         let temporary = path.with_file_name(name);
         Self::write_file(&temporary, bytes)?;
         fs::rename(&temporary, path)?;
@@ -818,7 +865,7 @@ impl HarborTrialLock {
                     .to_owned(),
                 kind: HarborTaskLockKind::Local,
                 digest: format!("sha256:{digest}"),
-                source: Some("nanoeval/local".to_owned()),
+                source: Some("nanocodex/local".to_owned()),
                 path: task.root().to_path_buf(),
             },
             install_only: false,
@@ -903,7 +950,7 @@ impl HarborEnvironmentConfig {
     fn native() -> Self {
         Self {
             environment_type: None,
-            import_path: "nanoeval.native:NativeEnvironment".to_owned(),
+            import_path: "nanocodex_eval.native:NativeEnvironment".to_owned(),
             delete: false,
             cpu_enforcement_policy: ResourceMode::Ignore,
             memory_enforcement_policy: ResourceMode::Ignore,
@@ -937,7 +984,7 @@ struct HarborVerifierConfig {
 impl HarborVerifierConfig {
     fn native() -> Self {
         Self {
-            import_path: "nanoeval.native:Verifier".to_owned(),
+            import_path: "nanocodex_eval.native:Verifier".to_owned(),
         }
     }
 }
@@ -1058,7 +1105,7 @@ impl HarborJobDelta {
             .first()
             .map(|result| result.agent.model.as_str())
             .or_else(|| failures.first().map(|failure| failure.model.as_str()))
-            .map(|model| format!("nanocodex__{model}__nanoeval/local"));
+            .map(|model| format!("nanocodex__{model}__nanocodex/local"));
         Self {
             eval_key,
             eval_stats: HarborAgentDatasetStats {
@@ -1096,7 +1143,7 @@ impl HarborJobDelta {
         } else if stats.evals.is_empty() {
             stats
                 .evals
-                .insert("nanocodex__nanoeval/local".to_owned(), self.eval_stats);
+                .insert("nanocodex__nanocodex/local".to_owned(), self.eval_stats);
         }
         stats.n_completed_trials += completed;
         stats.n_errored_trials += errors;
@@ -1288,8 +1335,8 @@ struct HarborMetric {}
 mod tests {
     use std::{collections::BTreeMap, fs};
 
-    use nanocodex::{Nanocodex, OpenAiAuth};
-    use nanoeval::{AtifTrajectory, Nanoeval, Sweep, Task};
+    use nanocodex_agent::{Nanocodex, OpenAiAuth};
+    use nanocodex_eval::{AtifTrajectory, Evaluator, Sweep, Task};
     use serde::Deserialize;
     use tempfile::tempdir;
 
@@ -1352,7 +1399,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        let (eval, _) = Nanoeval::builder(Nanocodex::builder("test-key"))
+        let (eval, _) = Evaluator::builder(Nanocodex::builder("test-key"))
             .output_directory(output.path())
             .fresh_run(&sweep)
             .build()
@@ -1399,7 +1446,7 @@ allow_internet = false
         fs::write(task_root.path().join("tests/test.sh"), "exit 0\n").unwrap();
         let task = Task::load(task_root.path()).unwrap();
         let output = tempdir().unwrap();
-        let (eval, events) = Nanoeval::builder(Nanocodex::builder(OpenAiAuth::api_key("test")))
+        let (eval, events) = Evaluator::builder(Nanocodex::builder(OpenAiAuth::api_key("test")))
             .output_directory(output.path())
             .build()
             .unwrap();

@@ -29,11 +29,13 @@ pub struct Task {
     requires_compose: bool,
 }
 
+/// OCI image declared by a benchmark task.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OciImage {
     reference: Box<str>,
 }
 
+/// Verifier recipe loaded from a task.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Verifier {
     script: PathBuf,
@@ -43,64 +45,100 @@ pub struct Verifier {
     collect: Vec<VerifierCollect>,
 }
 
+/// Whether verification reuses the agent environment or a separate image.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VerifierEnvironmentMode {
+    /// Run verification in the mutated agent environment.
     #[default]
     Same,
+    /// Run verification in the task's dedicated `tests/Dockerfile` image.
     Separate,
 }
 
+/// One post-verifier artifact collection command.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct VerifierCollect {
     command: Box<str>,
 }
 
+/// Task-declared resource requirements used by admission and VM sizing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Resources {
+    /// Virtual CPU count.
     pub cpus: u32,
+    /// Required memory in mebibytes.
     pub memory_mb: u64,
+    /// Required storage in mebibytes.
     pub storage_mb: u64,
+    /// Required GPU count.
     pub gpus: u32,
 }
 
+/// Task network policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NetworkPolicy {
+    /// The task may reach public network destinations.
     Public,
+    /// The task must run without a network device.
     Disabled,
 }
 
+/// Failure to load or validate an immutable task directory.
 #[derive(Debug, thiserror::Error)]
 pub enum TaskLoadError {
+    /// The task root could not be canonicalized.
     #[error("failed to resolve task directory {path}: {source}")]
     ResolveDirectory {
+        /// Requested task path.
         path: PathBuf,
+        /// Filesystem failure.
         #[source]
         source: std::io::Error,
     },
 
+    /// A task file could not be read.
     #[error("failed to read task file {path}: {source}")]
     Read {
+        /// File that could not be read.
         path: PathBuf,
+        /// Filesystem failure.
         #[source]
         source: std::io::Error,
     },
 
+    /// `task.toml` was not valid TOML.
     #[error("failed to parse task configuration {path}: {source}")]
     Parse {
+        /// Configuration path.
         path: PathBuf,
+        /// TOML parser failure.
         #[source]
         source: toml::de::Error,
     },
 
+    /// The manifest declares an unsupported schema revision.
     #[error("unsupported task schema version {found:?}; expected \"1.1\"")]
-    UnsupportedSchema { found: String },
+    UnsupportedSchema {
+        /// Unsupported revision read from the manifest.
+        found: String,
+    },
 
+    /// A known task field or directory shape is invalid.
     #[error("task configuration {path} is invalid: {message}")]
-    Invalid { path: PathBuf, message: String },
+    Invalid {
+        /// File or directory containing the invalid value.
+        path: PathBuf,
+        /// Validation failure.
+        message: String,
+    },
 
+    /// A required task file or directory is absent.
     #[error("task is missing required file {path}")]
-    MissingFile { path: PathBuf },
+    MissingFile {
+        /// Missing path.
+        path: PathBuf,
+    },
 }
 
 impl Task {
@@ -207,21 +245,25 @@ impl Task {
         })
     }
 
+    /// Returns the canonical task root.
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
     }
 
+    /// Returns the stable task name.
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
 
+    /// Returns the human-readable task description.
     #[must_use]
     pub fn description(&self) -> &str {
         &self.description
     }
 
+    /// Returns the complete instruction presented to the agent.
     #[must_use]
     pub fn prompt(&self) -> &str {
         &self.prompt
@@ -233,41 +275,49 @@ impl Task {
         self.root.join(TASK_ENVIRONMENT)
     }
 
+    /// Returns the task's declared OCI image.
     #[must_use]
     pub const fn image(&self) -> &OciImage {
         &self.image
     }
 
+    /// Returns the maximum agent execution duration.
     #[must_use]
     pub const fn agent_timeout(&self) -> Duration {
         self.agent_timeout
     }
 
+    /// Returns the verifier recipe.
     #[must_use]
     pub const fn verifier(&self) -> &Verifier {
         &self.verifier
     }
 
+    /// Returns task-relative artifact paths requested after verification.
     #[must_use]
     pub fn artifacts(&self) -> &[PathBuf] {
         &self.artifacts
     }
 
+    /// Returns declared resource requirements.
     #[must_use]
     pub const fn resources(&self) -> &Resources {
         &self.resources
     }
 
+    /// Returns the task's network policy.
     #[must_use]
     pub const fn network(&self) -> NetworkPolicy {
         self.network
     }
 
+    /// Returns environment variables supplied to the task process.
     #[must_use]
     pub fn environment(&self) -> &BTreeMap<String, String> {
         &self.environment
     }
 
+    /// Returns whether the task requires a custom Docker Compose topology.
     #[must_use]
     pub const fn requires_compose(&self) -> bool {
         self.requires_compose
@@ -275,6 +325,7 @@ impl Task {
 }
 
 impl OciImage {
+    /// Returns the manifest's image reference.
     #[must_use]
     pub fn reference(&self) -> &str {
         &self.reference
@@ -282,6 +333,7 @@ impl OciImage {
 }
 
 impl NetworkPolicy {
+    /// Returns the stable artifact and telemetry spelling.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -292,26 +344,31 @@ impl NetworkPolicy {
 }
 
 impl Verifier {
+    /// Returns the canonical verifier script path.
     #[must_use]
     pub fn script(&self) -> &Path {
         &self.script
     }
 
+    /// Returns the verifier execution deadline.
     #[must_use]
     pub const fn timeout(&self) -> Duration {
         self.timeout
     }
 
+    /// Returns environment variables supplied to the verifier.
     #[must_use]
     pub fn environment(&self) -> &BTreeMap<String, String> {
         &self.environment
     }
 
+    /// Returns where verification executes.
     #[must_use]
     pub const fn environment_mode(&self) -> VerifierEnvironmentMode {
         self.environment_mode
     }
 
+    /// Returns post-verifier collection commands.
     #[must_use]
     pub fn collect(&self) -> &[VerifierCollect] {
         &self.collect
@@ -319,6 +376,7 @@ impl Verifier {
 }
 
 impl VerifierCollect {
+    /// Returns the complete shell command.
     #[must_use]
     pub fn command(&self) -> &str {
         &self.command
@@ -326,6 +384,7 @@ impl VerifierCollect {
 }
 
 impl VerifierEnvironmentMode {
+    /// Returns the stable manifest and artifact spelling.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
