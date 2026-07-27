@@ -1,0 +1,57 @@
+[package]
+name = "nanocodex-vm-egress"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Host-owned payment and secret egress capabilities for Nanocodex VMs"
+
+[features]
+default = ["onepassword-connect"]
+onepassword-connect = []
+onepassword-sdk = [
+    "onepassword-connect",
+    "dep:chrono",
+    "dep:extism",
+    "dep:getrandom",
+]
+
+[dependencies]
+async-trait.workspace = true
+chrono = { workspace = true, optional = true }
+extism = { workspace = true, optional = true }
+futures-util.workspace = true
+getrandom = { workspace = true, optional = true }
+http.workspace = true
+mpp = { workspace = true, features = ["client"] }
+mpp-egress.workspace = true
+nanovm.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync", "time"] }
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+criterion.workspace = true
+serde_json.workspace = true
+tracing-subscriber.workspace = true
+
+[[bench]]
+name = "vm_egress"
+harness = false
+
+[lints]
+workspace = true

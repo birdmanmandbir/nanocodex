@@ -91,8 +91,9 @@ read-only runtime image. A runtime ELF is packed into a temporary ext4 image,
 and a supplied ext4 root is reflinked or sparse-copied into a private per-run
 disk before boot. On macOS, `just build-vm-example` also applies the required
 Hypervisor entitlement.
-Pass `--prove-mpp` to additionally run a real guest `curl` through the
-host-owned MPP proxy and verify one payment and one exact replay.
+Pass `--prove-mpp` to additionally run real guest requests through the unified
+host proxy, prove scoped secret injection without guest disclosure, and verify
+one MPP payment and one exact replay.
 Pass `--prove-browser` to additionally compose the cloneable VM tools and one
 host-owned browser in the same `Tools` value, then exercise both concurrently
 from one Code Mode cell.
@@ -103,6 +104,9 @@ drives the headed Chromium process through the public `BrowserVm` and `Browser`
 APIs, verifies a semantic snapshot, writes a screenshot, and shuts the VM down
 cleanly. The `prepare-browser-vm-image` and `smoke-browser-vm` recipes build and
 ad-hoc-sign the required macOS VMM before running those consumers.
+`smoke-browser-vm-egress` additionally proves proxy-only authentication,
+host-side secret injection, and Chromium trust of the ephemeral interception
+CA against a real HTTPS navigation.
 
 The Rust `browser-tool` example does not call the model and needs no API key. It
 exercises the real browser through the same Code Mode nested-tool path used by

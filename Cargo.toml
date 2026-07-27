@@ -1,5 +1,5 @@
 [workspace]
-members = ["bin/nanocodex", "bin/nanousd-api", "crates/mpp-egress", "crates/nanocodex", "crates/nanocodex-agent", "crates/nanocodex-browser", "crates/nanocodex-browser-vm", "crates/nanocodex-core", "crates/nanocodex-oai-api", "crates/nanocodex-observability", "crates/nanocodex-react", "crates/nanocodex-service", "crates/nanocodex-tools", "crates/nanocodex-tools-macros", "crates/nanocodex-vm", "crates/nanousd", "crates/nanovm", "crates/nanovm-image", "examples", "js/bindings", "py/bindings"]
+members = ["bin/nanocodex", "bin/nanousd-api", "crates/mpp-egress", "crates/nanocodex", "crates/nanocodex-agent", "crates/nanocodex-browser", "crates/nanocodex-browser-vm", "crates/nanocodex-core", "crates/nanocodex-oai-api", "crates/nanocodex-observability", "crates/nanocodex-react", "crates/nanocodex-service", "crates/nanocodex-tools", "crates/nanocodex-tools-macros", "crates/nanocodex-vm", "crates/nanocodex-vm-egress", "crates/nanousd", "crates/nanovm", "crates/nanovm-image", "examples", "js/bindings", "py/bindings"]
 default-members = ["bin/nanocodex"]
 resolver = "2"
 
@@ -20,6 +20,7 @@ publish = true
 alloy = { version = "2.1.0", default-features = false, features = ["contract", "provider-http", "reqwest", "reqwest-rustls-tls", "rpc-types", "sol-types", "std"] }
 arboard = "3"
 base64 = "0.22.1"
+percent-encoding = "2.3.2"
 async-trait = "0.1.89"
 alloy-primitives = "1.6.1"
 arcbox-ext4 = "0.1.2"
@@ -32,6 +33,7 @@ crossterm = { version = "0.28.1", features = ["bracketed-paste", "event-stream"]
 criterion = { version = "0.7.0", features = ["async_tokio"] }
 dotenvy = "0.15.7"
 eyre = "0.6.12"
+extism = "1.30.0"
 flate2 = "1.1"
 fs2 = "0.4"
 futures-util = "0.3.31"
@@ -56,6 +58,7 @@ nanocodex-service = { version = "0.2.0", path = "crates/nanocodex-service" }
 nanocodex-tools = { version = "0.2.0", path = "crates/nanocodex-tools" }
 nanocodex-tools-macros = { version = "0.2.0", path = "crates/nanocodex-tools-macros" }
 nanocodex-vm = { version = "0.2.0", path = "crates/nanocodex-vm" }
+nanocodex-vm-egress = { version = "0.2.0", path = "crates/nanocodex-vm-egress", default-features = false }
 nanousd = { version = "0.2.0", path = "crates/nanousd" }
 nanovm = { version = "0.2.0", path = "crates/nanovm" }
 nanovm-image = { version = "0.2.0", path = "crates/nanovm-image" }

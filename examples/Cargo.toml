@@ -11,15 +11,16 @@ repository.workspace = true
 description = "Public Nanocodex library examples"
 
 [dependencies]
+async-trait.workspace = true
 clap.workspace = true
 dotenvy.workspace = true
 eyre.workspace = true
 futures-util.workspace = true
 http.workspace = true
 mpp.workspace = true
-mpp-egress.workspace = true
 nanocodex.workspace = true
 nanocodex-vm = { workspace = true, features = ["mpp"] }
+nanocodex-vm-egress.workspace = true
 nanovm.workspace = true
 nanocodex-browser.workspace = true
 nanocodex-browser-vm.workspace = true

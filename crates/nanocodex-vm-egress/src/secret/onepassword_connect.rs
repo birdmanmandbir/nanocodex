@@ -56,7 +56,7 @@ impl OnePasswordConnectSecretManager {
             .redirect(Policy::none())
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(15))
-            .user_agent(concat!("nanocentaur/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("nanocodex-vm-egress/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(OnePasswordConnectConfigError::Client)?;
         Ok(Self {
@@ -178,12 +178,16 @@ impl SecretManager for OnePasswordConnectSecretManager {
     }
 }
 
+/// Invalid 1Password Connect client configuration.
 #[derive(Debug, Error)]
 pub enum OnePasswordConnectConfigError {
+    /// The Connect host was not a credential-free HTTP(S) origin.
     #[error("1Password Connect host must be an HTTP(S) origin without credentials or a path")]
     InvalidHost,
+    /// The Connect access token was empty or not a valid header value.
     #[error("1Password Connect token is empty or invalid")]
     InvalidToken,
+    /// The bounded redirect-disabled HTTP client could not be built.
     #[error("1Password Connect HTTP client could not be built")]
     Client(#[source] reqwest::Error),
 }

@@ -150,6 +150,10 @@ bench-vm:
     cargo bench -p nanovm-image --bench image_cache
     cargo bench -p nanocodex-vm --bench vm_session -- vm_session_protocol
 
+# Loopback direct, authenticated MPP, and dynamic secret-injection boundaries.
+bench-egress:
+    cargo bench -p nanocodex-vm-egress --bench vm_egress
+
 # Include actual libkrun boot, first RPC, and graceful shutdown. The root disk
 # is reflinked before each timed sample and is never mutated directly.
 bench-vm-live rootfs runtime firmware=".cache/libkrunfw/libkrunfw":
@@ -193,6 +197,18 @@ smoke-browser-vm rootfs gvproxy firmware=".cache/libkrunfw/libkrunfw":
         "{{gvproxy}}" \
         --vmm-arg=--vmm \
         --firmware-directory "{{firmware}}"
+
+# Add unified host secret injection and a real HTTPS CA-trust navigation to the
+# ordinary headed-browser smoke.
+smoke-browser-vm-egress rootfs gvproxy firmware=".cache/libkrunfw/libkrunfw":
+    just build-browser-vm-vmm
+    "{{justfile_directory()}}/target/release/browser-vm" \
+        "{{rootfs}}" \
+        "{{justfile_directory()}}/target/release/vm-tools" \
+        "{{gvproxy}}" \
+        --vmm-arg=--vmm \
+        --firmware-directory "{{firmware}}" \
+        --prove-egress
 
 # Deterministic typed browser protocol and retained-recording latency gates.
 bench-browser:

@@ -56,6 +56,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use nanocodex_browser::{Browser, BrowserBuildError, BrowserBuilder, BrowserError, BrowserTool};
 use nanovm::{
     EgressLease, GUEST_EGRESS_ROOT, GuestCommand, Gvproxy, Network, PrivateVmProcessConfig,
@@ -69,6 +70,7 @@ use tracing::{Instrument, info, info_span, warn};
 use url::Url;
 
 const GUEST_ADDRESS: Ipv4Addr = Ipv4Addr::new(192, 168, 127, 2);
+const GVPROXY_HOST_ADDRESS: Ipv4Addr = Ipv4Addr::new(192, 168, 127, 254);
 const GUEST_CDP_RELAY_PORT: u16 = 9_223;
 const DEFAULT_CPUS: u8 = 2;
 const DEFAULT_MEMORY_MIB: u32 = 2_048;
@@ -80,6 +82,15 @@ const EGRESS_FILES_TAG: &str = "ncx-egress";
 const NO_EGRESS_FILES_ARGUMENT: &str = "-";
 const EGRESS_FILES_HOST_DIRECTORY: &str = "egress-files";
 const BROWSER_INIT_PROGRAM: &str = "/usr/local/bin/nanocodex-browser-vm-init";
+const BROWSER_PROXY_ENVIRONMENT: &str = "NANOCODEX_BROWSER_PROXY_SERVER";
+const BROWSER_PROXY_USERNAME_ENVIRONMENT: &str = "NANOCODEX_BROWSER_PROXY_USERNAME_B64";
+const BROWSER_PROXY_PASSWORD_ENVIRONMENT: &str = "NANOCODEX_BROWSER_PROXY_PASSWORD_B64";
+const BROWSER_INTERNAL_ENVIRONMENT: [&str; 3] = [
+    BROWSER_PROXY_ENVIRONMENT,
+    BROWSER_PROXY_USERNAME_ENVIRONMENT,
+    BROWSER_PROXY_PASSWORD_ENVIRONMENT,
+];
+const PROXY_ENVIRONMENT: [&str; 4] = ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"];
 
 #[derive(Debug, Error)]
 /// Failure to configure, start, connect to, or stop a browser VM.
@@ -115,6 +126,18 @@ pub enum BrowserVmError {
     /// A provider mount cannot be placed at a relative guest path.
     #[error("browser VM egress guest mount must be absolute: {0}")]
     InvalidGuestMount(PathBuf),
+
+    /// A configured proxy environment value was not a usable HTTP(S) URL.
+    #[error("browser VM egress proxy `{0}` is not a valid HTTP(S) proxy URL")]
+    InvalidProxyEnvironment(String),
+
+    /// Proxy environment aliases resolve to different front proxies.
+    #[error("browser VM egress proxy aliases must identify one front proxy")]
+    ConflictingProxyEnvironment,
+
+    /// A provider attempted to claim a browser VM internal proxy setting.
+    #[error("browser VM egress cannot define browser-internal proxy settings")]
+    ReservedProxyEnvironment,
 
     /// The disposable root disk could not be created.
     #[error("failed to create the browser VM's private root disk: {0}")]
@@ -305,6 +328,11 @@ impl BrowserVmBuilder {
     /// provider lifecycle guards. The browser owns its dedicated gvproxy
     /// transport, so the lease must request internet access rather than a
     /// caller-owned network socket.
+    ///
+    /// All HTTP proxy aliases must identify the same endpoint. A host-loopback
+    /// endpoint is projected through gvproxy, its public CA is installed into
+    /// Chromium's system and NSS trust, and credentials answer only proxy
+    /// authentication challenges. Conflicts fail during [`Self::spawn`].
     #[must_use]
     pub fn egress(mut self, egress: EgressLease) -> Self {
         self.egress = egress;
@@ -397,6 +425,10 @@ impl BrowserVmBuilder {
             .map_err(BrowserVmError::RootDisk)?;
         let egress_files = directory.path().join(EGRESS_FILES_HOST_DIRECTORY);
         stage_egress_files(&self.egress, &egress_files)?;
+        let BrowserEgressProjection {
+            guest_environment,
+            browser_proxy,
+        } = browser_proxy(&self.egress)?;
 
         let network_directory = tempfile::Builder::new()
             .prefix("ncx-net-")
@@ -431,8 +463,22 @@ impl BrowserVmBuilder {
                 .arg(mount.tag())
                 .arg(mount.guest_path().as_os_str());
         }
-        for (name, value) in self.egress.guest_environment() {
+        for (name, value) in guest_environment {
             guest_command = guest_command.env(name, value);
+        }
+        if let Some(proxy) = &browser_proxy {
+            guest_command = guest_command.env(BROWSER_PROXY_ENVIRONMENT, proxy.server.as_str());
+            if let Some(credentials) = &proxy.credentials {
+                guest_command = guest_command
+                    .env(
+                        BROWSER_PROXY_USERNAME_ENVIRONMENT,
+                        STANDARD.encode(credentials.username.as_bytes()),
+                    )
+                    .env(
+                        BROWSER_PROXY_PASSWORD_ENVIRONMENT,
+                        STANDARD.encode(credentials.password.as_bytes()),
+                    );
+            }
         }
         let process_config = VmProcessConfig::new(vm_config, guest_command).write_private()?;
 
@@ -675,6 +721,100 @@ fn validate_file(
         .ok_or_else(|| error(path.to_path_buf()))
 }
 
+struct BrowserProxy {
+    server: String,
+    credentials: Option<BrowserProxyCredentials>,
+}
+
+struct BrowserProxyCredentials {
+    username: String,
+    password: String,
+}
+
+struct BrowserEgressProjection {
+    guest_environment: Vec<(String, String)>,
+    browser_proxy: Option<BrowserProxy>,
+}
+
+fn browser_proxy(egress: &EgressLease) -> Result<BrowserEgressProjection, BrowserVmError> {
+    if BROWSER_INTERNAL_ENVIRONMENT
+        .iter()
+        .any(|name| egress.guest_environment().contains_key(*name))
+    {
+        return Err(BrowserVmError::ReservedProxyEnvironment);
+    }
+    let mut environment = Vec::with_capacity(egress.guest_environment().len());
+    let mut selected = None::<Url>;
+    for (name, value) in egress.guest_environment() {
+        if PROXY_ENVIRONMENT.contains(&name.as_str()) {
+            let url = gvproxy_proxy_url(name, value)?;
+            if selected.as_ref().is_some_and(|selected| selected != &url) {
+                return Err(BrowserVmError::ConflictingProxyEnvironment);
+            }
+            selected = Some(url.clone());
+            environment.push((name.clone(), url.to_string()));
+        } else {
+            environment.push((name.clone(), value.clone()));
+        }
+    }
+    let Some(mut url) = selected else {
+        return Ok(BrowserEgressProjection {
+            guest_environment: environment,
+            browser_proxy: None,
+        });
+    };
+    let username = decode_proxy_credential(url.username())?;
+    let password = url.password().map(decode_proxy_credential).transpose()?;
+    url.set_username("")
+        .map_err(|()| BrowserVmError::InvalidProxyEnvironment("proxy".to_owned()))?;
+    url.set_password(None)
+        .map_err(|()| BrowserVmError::InvalidProxyEnvironment("proxy".to_owned()))?;
+    let credentials =
+        (!username.is_empty() || password.is_some()).then(|| BrowserProxyCredentials {
+            username,
+            password: password.unwrap_or_default(),
+        });
+    Ok(BrowserEgressProjection {
+        guest_environment: environment,
+        browser_proxy: Some(BrowserProxy {
+            server: url[..url::Position::BeforePath].to_owned(),
+            credentials,
+        }),
+    })
+}
+
+fn decode_proxy_credential(value: &str) -> Result<String, BrowserVmError> {
+    percent_encoding::percent_decode_str(value)
+        .decode_utf8()
+        .map(std::borrow::Cow::into_owned)
+        .map_err(|_| BrowserVmError::InvalidProxyEnvironment("proxy credentials".to_owned()))
+}
+
+fn gvproxy_proxy_url(name: &str, value: &str) -> Result<Url, BrowserVmError> {
+    let mut url =
+        Url::parse(value).map_err(|_| BrowserVmError::InvalidProxyEnvironment(name.to_owned()))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(BrowserVmError::InvalidProxyEnvironment(name.to_owned()));
+    }
+    let loopback = url
+        .host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case("localhost"))
+        || url
+            .host_str()
+            .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+            .is_some_and(|address| address.is_loopback());
+    if loopback {
+        url.set_host(Some(&GVPROXY_HOST_ADDRESS.to_string()))
+            .map_err(|_| BrowserVmError::InvalidProxyEnvironment(name.to_owned()))?;
+    }
+    Ok(url)
+}
+
 fn stage_egress_files(egress: &EgressLease, directory: &Path) -> Result<(), BrowserVmError> {
     fs::create_dir_all(directory).map_err(BrowserVmError::EgressFiles)?;
     for file in egress.guest_files() {
@@ -766,6 +906,12 @@ mod tests {
         assert!(script.contains("Xvfb :99"));
         assert!(script.contains("socat TCP-LISTEN:9223"));
         assert!(script.contains("--remote-debugging-port=9222"));
+        assert!(script.contains("--proxy-server=$NANOCODEX_BROWSER_PROXY_SERVER"));
+        assert!(script.contains("--proxy-bypass-list=<-loopback>"));
+        assert!(script.contains("update-ca-certificates"));
+        assert!(script.contains("certutil -A"));
+        assert!(script.contains("details.isProxy"));
+        assert!(script.contains("--load-extension=$NANOCODEX_BROWSER_PROXY_EXTENSION"));
         assert!(script.contains("files_tag=$1"));
         assert!(script.contains("mount -t virtiofs -o ro \"$files_tag\""));
         assert!(!script.contains("mount -t virtiofs -o ro nanocodex-egress-files"));
@@ -835,5 +981,64 @@ mod tests {
             endpoint.as_str(),
             "ws://127.0.0.1:41337/devtools/browser/session"
         );
+    }
+
+    #[test]
+    fn loopback_front_proxy_is_projected_through_the_gvproxy_host_address() {
+        let mut egress = EgressLease::internet();
+        for name in PROXY_ENVIRONMENT {
+            egress
+                .insert_environment(name, "http://nanocodex:host-capability@127.0.0.1:41337")
+                .unwrap();
+        }
+
+        let projection = browser_proxy(&egress).unwrap();
+        let browser = projection.browser_proxy.unwrap();
+
+        assert_eq!(
+            projection
+                .guest_environment
+                .iter()
+                .find(|(name, _)| name == "HTTPS_PROXY")
+                .map(|(_, value)| value.as_str()),
+            Some("http://nanocodex:host-capability@192.168.127.254:41337/")
+        );
+        assert_eq!(browser.server, "http://192.168.127.254:41337");
+        let credentials = browser.credentials.unwrap();
+        assert_eq!(credentials.username, "nanocodex");
+        assert_eq!(credentials.password, "host-capability");
+    }
+
+    #[test]
+    fn proxy_credentials_are_percent_decoded_before_browser_projection() {
+        let mut egress = EgressLease::internet();
+        egress
+            .insert_environment(
+                "HTTPS_PROXY",
+                "http://name%40example.test:p%40ss%3Aword@127.0.0.1:41337",
+            )
+            .unwrap();
+
+        let projection = browser_proxy(&egress).unwrap();
+        let credentials = projection.browser_proxy.unwrap().credentials.unwrap();
+
+        assert_eq!(credentials.username, "name@example.test");
+        assert_eq!(credentials.password, "p@ss:word");
+    }
+
+    #[test]
+    fn conflicting_front_proxy_aliases_fail_closed() {
+        let mut egress = EgressLease::internet();
+        egress
+            .insert_environment("HTTP_PROXY", "http://127.0.0.1:4100")
+            .unwrap();
+        egress
+            .insert_environment("HTTPS_PROXY", "http://127.0.0.1:4200")
+            .unwrap();
+
+        assert!(matches!(
+            browser_proxy(&egress),
+            Err(BrowserVmError::ConflictingProxyEnvironment)
+        ));
     }
 }

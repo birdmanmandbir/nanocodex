@@ -2,9 +2,10 @@
 
 ## Boundary
 
-MPP remains an application concern. `bin/nanocodex` composes the private
-`mpp-egress` support crate with the normal Nanocodex HTTPS Responses client.
-No public Nanocodex library crate contains wallet or payment behavior.
+MPP wallet selection remains an application concern. `bin/nanocodex` supplies
+the concrete Tempo provider to `mpp-egress`; VM applications can supply the
+same provider to the reusable `nanocodex-vm-egress` composition. Agent, OAI,
+tool, and VM lifecycle crates contain no wallet or signing behavior.
 
 The Tempo provider supports one payment path: estimated, up-front
 `tempo/charge` over HTTPS. It deliberately does not configure an MPP
@@ -94,7 +95,10 @@ generic OpenAI API base setting while the Tempo provider is enabled.
 loopback port. Nanocodex routes its own Responses and remote-tool clients
 through that proxy and gives authenticated proxy environment variables plus an
 ephemeral CA to workspace-tool child processes. It does not mutate the parent
-environment or MCP transports.
+environment or MCP transports. `nanocodex-vm-egress::VmEgress` projects the
+same capability as an `EgressLease`; when scoped secret routes are configured,
+they share this one guest-visible proxy rather than competing for
+`HTTPS_PROXY`.
 
 The egress proxy buffers a request body up to 16 MiB so it can replay the exact
 request after a valid 402 challenge. It rejects redirects, protocol upgrades,
@@ -102,8 +106,12 @@ unsupported payment methods, malformed challenges, and charges above
 `--provider.tempo.egress-max-charge`. The wallet and signing key never leave
 the Nanocodex process.
 
-MPP tracing records full request, response, challenge, and credential content.
-Operators must protect those traces like wallet and conversation data.
+MPP tracing records full child-visible requests, responses, challenges, and
+payment credential content. A composed secret route records authorization and
+the pre-injection request, not the origin-facing injected header. If an upstream
+echoes that credential in its response, the response remains full-fidelity
+agent data and is traced normally. Operators must protect these traces like
+wallet and conversation data.
 
 ## Credits onramp
 

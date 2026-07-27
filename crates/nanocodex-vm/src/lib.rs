@@ -65,8 +65,6 @@ serve_guest("/workspace").await?;
 
 #[cfg(feature = "guest")]
 mod guest;
-#[cfg(feature = "mpp")]
-mod mpp;
 mod protocol;
 #[cfg(feature = "host")]
 mod runtime_disk;
@@ -87,7 +85,7 @@ use nanocodex_tools::{
 #[cfg(feature = "guest")]
 pub use guest::VmGuestError;
 #[cfg(feature = "mpp")]
-pub use mpp::{MppVmEgressError, mpp_egress_layer};
+pub use nanocodex_vm_egress::{MppVmEgressError, mpp_egress_layer};
 #[cfg(feature = "host")]
 pub use runtime_disk::{GuestRuntimeDisk, GuestRuntimeDiskError, GuestRuntimeDiskStatus};
 #[cfg(feature = "host")]

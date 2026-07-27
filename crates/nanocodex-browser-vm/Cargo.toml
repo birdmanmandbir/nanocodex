@@ -14,8 +14,10 @@ categories.workspace = true
 description = "Nanocodex browser controller hosted in an isolated libkrun microVM"
 
 [dependencies]
+base64.workspace = true
 nanocodex-browser.workspace = true
 nanovm.workspace = true
+percent-encoding.workspace = true
 reflink-copy.workspace = true
 reqwest.workspace = true
 serde.workspace = true

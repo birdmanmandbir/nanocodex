@@ -8,25 +8,28 @@ use mpp_egress::MppEgress;
 use nanovm::{EgressError, EgressFile, EgressLease, GUEST_EGRESS_ROOT};
 use thiserror::Error;
 
+// Retain the original guest-visible projection used by
+// `nanocodex_vm::mpp_egress_layer`.
 const GUEST_LAYER: &str = "mpp";
 const CA_FILENAME: &str = "mpp-egress-ca.pem";
-const CA_ENVIRONMENT: [&str; 4] = [
+const CA_ENVIRONMENT: [&str; 5] = [
     "CURL_CA_BUNDLE",
     "SSL_CERT_FILE",
     "REQUESTS_CA_BUNDLE",
     "NODE_EXTRA_CA_CERTS",
+    "GIT_SSL_CAINFO",
 ];
 
-/// Converts one running MPP proxy into a VM-facing egress layer.
+/// Converts one running host proxy into a VM-facing egress lease.
 ///
-/// The guest receives only the proxy lease credentials and public CA. The
-/// payment provider and wallet remain in the host proxy retained by the
-/// returned lease.
+/// The guest receives only the authenticated proxy URL and public CA. Payment
+/// providers, wallets, secret managers, request policy, and signing material
+/// remain in the host proxy retained by the returned lease.
 ///
 /// # Errors
 ///
-/// Returns an error when the proxy's public CA is unavailable, generated
-/// environment is not UTF-8, or it conflicts with another value in the layer.
+/// Returns an error when the public CA is unavailable, generated environment
+/// is not UTF-8, or the lease conflicts with a VM egress invariant.
 pub fn mpp_egress_layer(egress: Arc<MppEgress>) -> Result<EgressLease, MppVmEgressError> {
     let certificate = egress.certificate_path();
     layer_from_parts(egress.environment(), &certificate, egress)
@@ -45,8 +48,9 @@ where
             certificate.to_path_buf(),
         ));
     }
-    let guest_directory = Path::new(GUEST_EGRESS_ROOT).join(GUEST_LAYER);
-    let guest_certificate = guest_directory.join(CA_FILENAME);
+    let guest_certificate = Path::new(GUEST_EGRESS_ROOT)
+        .join(GUEST_LAYER)
+        .join(CA_FILENAME);
     let guest_certificate = guest_certificate
         .to_str()
         .ok_or(MppVmEgressError::GuestCertificatePath)?
@@ -75,23 +79,23 @@ where
     Ok(lease)
 }
 
-/// Failure to project a host-owned MPP proxy into a VM egress lease.
+/// Failure to project a host proxy into a VM egress lease.
 #[derive(Debug, Error)]
 pub enum MppVmEgressError {
-    /// The proxy's public CA path is not a regular file.
-    #[error("MPP egress CA is not a regular file: {0}")]
+    /// The proxy public CA path is not a regular file.
+    #[error("host egress CA is not a regular file: {0}")]
     CertificateNotFile(PathBuf),
     /// The public CA could not be read.
-    #[error("failed to read the MPP egress CA: {0}")]
+    #[error("failed to read the host egress CA: {0}")]
     ReadCertificate(#[source] std::io::Error),
     /// The fixed guest CA destination was not valid UTF-8.
-    #[error("MPP guest CA path is not valid UTF-8")]
+    #[error("host egress guest CA path is not valid UTF-8")]
     GuestCertificatePath,
     /// A proxy-provided environment name was not valid UTF-8.
-    #[error("MPP egress produced a non-UTF-8 environment name")]
+    #[error("host egress produced a non-UTF-8 environment name")]
     EnvironmentName,
     /// A proxy-provided environment value was not valid UTF-8.
-    #[error("MPP egress produced a non-UTF-8 value for `{0}`")]
+    #[error("host egress produced a non-UTF-8 value for `{0}`")]
     EnvironmentValue(String),
     /// The resulting capability conflicted with VM egress invariants.
     #[error(transparent)]
@@ -103,7 +107,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mpp_layer_routes_curl_through_proxy_and_provisions_public_ca() {
+    fn layer_exposes_only_proxy_capability_and_public_ca() {
         let directory = tempfile::tempdir().unwrap();
         let certificate = directory.path().join(CA_FILENAME);
         std::fs::write(&certificate, "public ca").unwrap();
@@ -127,9 +131,8 @@ mod tests {
         );
         assert_eq!(
             lease.guest_environment().get("CURL_CA_BUNDLE"),
-            Some(&format!("{GUEST_EGRESS_ROOT}/{GUEST_LAYER}/{CA_FILENAME}"))
+            Some(&"/tmp/nanocodex/egress/mpp/mpp-egress-ca.pem".to_owned())
         );
-        assert_eq!(lease.guest_mounts().count(), 0);
         assert_eq!(lease.guest_files().count(), 1);
         assert_eq!(Arc::strong_count(&guard), 2);
         assert!(!format!("{lease:?}").contains("secret"));

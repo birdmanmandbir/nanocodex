@@ -310,6 +310,22 @@ complete harness configuration, credential-bearing storage, raw DevTools
 messages, actions, and results in order. Operators must protect that backend as
 a copy of the browser session.
 
+## Host-owned VM egress
+
+`nanocodex-vm-egress` turns application payment and secret policy into one
+cloneable `EgressLease`. The VM receives an authenticated proxy capability,
+public CA, and public route configuration. MPP wallets, signing state, secret
+providers, dynamic policy, and revocation stay in the host; resolved values are
+injected only into authorized host-side origin requests.
+
+Secret policy is checked on every request before resolution, so rotation and
+revocation are immediate. MPP `402` handling and secret injection share one
+front proxy; callers never have to choose an unsafe `HTTPS_PROXY` ordering.
+The same lease works with retained workspace VMs and headed browser VMs.
+See [VM-backed tools and egress](docs/VM.md) for the complete API and
+[the retained egress baseline](benchmarks/refactor_egress_baseline_2026-07-26.md)
+for latency, stress, non-disclosure, and live proof evidence.
+
 ## Components
 
 The core dependency direction is:
@@ -333,7 +349,7 @@ The monorepo also contains independently useful systems components:
 | `nanocodex-browser` | Deterministic typed CDP controller and ordinary browser tool |
 | `nanocodex-react` | Bounded Rust-native React source diagnostics and tool |
 | `nanocodex-browser-vm` | A headed browser inside an isolated VM with a private CDP endpoint |
-| VM egress | Host-owned network, MPP payment, and secret-injection policy |
+| `nanocodex-vm-egress` | One host-owned VM proxy for MPP payment and scoped secret injection |
 | `nanocodex-eval` | Typed tasks, attempts, scheduling, results, and sweeps |
 | Harbor adapter | Canonical Harbor/ATIF import and export |
 | `nanocentaur` | A durable managed-agent service built from the same libraries |
@@ -411,6 +427,7 @@ cargo add nanovm --git https://github.com/gakonst/nanocodex
 cargo add nanocodex-vm --git https://github.com/gakonst/nanocodex
 cargo add nanovm-image --git https://github.com/gakonst/nanocodex
 cargo add nanocodex-browser-vm --git https://github.com/gakonst/nanocodex
+cargo add nanocodex-vm-egress --git https://github.com/gakonst/nanocodex
 ```
 
 The daily-driver CLI is available on macOS and Linux:

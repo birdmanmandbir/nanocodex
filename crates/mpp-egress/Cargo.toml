@@ -8,9 +8,10 @@ authors.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Private embedded MPP-aware HTTP egress proxy for Nanocodex"
+description = "Embedded MPP-aware HTTP egress proxy for Nanocodex"
 
 [dependencies]
+async-trait.workspace = true
 base64.workspace = true
 futures-util.workspace = true
 http-body-util.workspace = true

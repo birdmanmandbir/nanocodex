@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque, hash_map::Entry},
-    io::Write,
+    io::{Read, Write},
     path::Path,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -21,9 +21,12 @@ use tokio::{
 
 use super::{SecretError, SecretManager, SecretRef, onepassword_connect::OpReference};
 
+/// Pinned upstream release containing the 1Password SDK core.
 pub const ONEPASSWORD_CORE_VERSION: &str = "v0.4.0";
+/// Auditable upstream URL for the pinned 1Password SDK core.
 pub const ONEPASSWORD_CORE_URL: &str =
     "https://raw.githubusercontent.com/1Password/onepassword-sdk-go/v0.4.0/internal/wasm/core.wasm";
+/// SHA-256 digest required before executing the pinned SDK core.
 pub const ONEPASSWORD_CORE_SHA256: &str =
     "ee73572134c6cda202703cfa41c9c9223180bd7affba88f749261ea277657099";
 const ONEPASSWORD_SDK_VERSION: &str = "0040003";
@@ -31,7 +34,7 @@ const MAX_WASM_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RANDOM_BYTES: usize = 1024 * 1024;
 const MAX_SECRET_BYTES: usize = 4 * 1024 * 1024;
 const MAX_WASM_MEMORY_PAGES: u32 = 4_096;
-const PLUGIN_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+const PLUGIN_CALL_TIMEOUT: Duration = Duration::from_mins(1);
 const SDK_REQUEST_TIMEOUT: Duration = Duration::from_secs(65);
 const SDK_REQUEST_CAPACITY: usize = 64;
 const MAX_SDK_WORKERS: usize = 8;
@@ -111,11 +114,18 @@ impl OnePasswordSdkSecretManager {
                 maximum: MAX_SDK_WORKERS,
             });
         }
-        let metadata = std::fs::metadata(core_path).map_err(OnePasswordSdkConfigError::CoreIo)?;
+        let file = std::fs::File::open(core_path).map_err(OnePasswordSdkConfigError::CoreIo)?;
+        let metadata = file.metadata().map_err(OnePasswordSdkConfigError::CoreIo)?;
         if !metadata.is_file() || metadata.len() > MAX_WASM_BYTES {
             return Err(OnePasswordSdkConfigError::InvalidCore);
         }
-        let core = std::fs::read(core_path).map_err(OnePasswordSdkConfigError::CoreIo)?;
+        let mut core = Vec::new();
+        file.take(MAX_WASM_BYTES + 1)
+            .read_to_end(&mut core)
+            .map_err(OnePasswordSdkConfigError::CoreIo)?;
+        if core.len() as u64 > MAX_WASM_BYTES {
+            return Err(OnePasswordSdkConfigError::InvalidCore);
+        }
         let digest = format!("{:x}", Sha256::digest(&core));
         if digest != ONEPASSWORD_CORE_SHA256 {
             return Err(OnePasswordSdkConfigError::CoreDigest {
@@ -132,7 +142,7 @@ impl OnePasswordSdkSecretManager {
         let (ready, initialized) = std::sync::mpsc::sync_channel(1);
         let token = token.to_owned();
         let worker = std::thread::Builder::new()
-            .name("nanocentaur-onepassword-pool".to_owned())
+            .name("nanocodex-onepassword-pool".to_owned())
             .spawn(move || {
                 run_sdk_pool(&Arc::new(compiled), token, workers, receiver, &ready);
             })
@@ -252,7 +262,7 @@ fn run_sdk_pool(
         let token = token.clone();
         let events = events.clone();
         match std::thread::Builder::new()
-            .name(format!("nanocentaur-onepassword-{index}"))
+            .name(format!("nanocodex-onepassword-{index}"))
             .spawn(move || {
                 let client = OnePasswordSdkClient::from_compiled(&compiled, &token);
                 drop(token);
@@ -346,8 +356,13 @@ fn wait_for_initial_sdk_worker(
             startup_error.get_or_insert(error);
             None
         }
-        Some(SdkWorkerEvent::Completed { .. }) => {
-            unreachable!("a worker cannot complete a job before becoming ready");
+        Some(SdkWorkerEvent::Completed { worker, .. }) => {
+            tracing::error!(
+                worker,
+                "1Password SDK worker completed before initialization"
+            );
+            startup_error.get_or_insert(OnePasswordSdkConfigError::CoreInitialization);
+            None
         }
         None => {
             startup_error.get_or_insert(OnePasswordSdkConfigError::CoreInitialization);
@@ -440,9 +455,11 @@ fn dispatch_sdk_jobs(
     queued: &mut VecDeque<String>,
     idle: &mut Vec<usize>,
 ) {
-    while !idle.is_empty() && !queued.is_empty() {
-        let worker = idle.pop().expect("idle worker checked above");
-        let reference = queued.pop_front().expect("queued job checked above");
+    while let Some(worker) = idle.pop() {
+        let Some(reference) = queued.pop_front() else {
+            idle.push(worker);
+            break;
+        };
         let Some(replies) = waiting.get_mut(&reference) else {
             idle.push(worker);
             continue;
@@ -453,7 +470,15 @@ fn dispatch_sdk_jobs(
             idle.push(worker);
             continue;
         }
-        if workers[worker]
+        let Some(sender) = workers.get(worker) else {
+            if let Some(replies) = waiting.remove(&reference) {
+                for reply in replies {
+                    drop(reply.send(Err(())));
+                }
+            }
+            continue;
+        };
+        if sender
             .try_send(SdkJob {
                 reference: reference.clone(),
             })
@@ -595,7 +620,7 @@ impl OnePasswordSdkClient {
             service_account_token: token,
             programming_language: "Rust",
             sdk_version: ONEPASSWORD_SDK_VERSION,
-            integration_name: "nanocentaur",
+            integration_name: "nanocodex-vm-egress",
             integration_version: env!("CARGO_PKG_VERSION"),
             request_library_name: "Extism HTTP",
             request_library_version: env!("CARGO_PKG_VERSION"),
@@ -756,31 +781,48 @@ fn normalized_architecture() -> &'static str {
     }
 }
 
+/// Invalid 1Password SDK provider configuration.
 #[derive(Debug, Error)]
 pub enum OnePasswordSdkConfigError {
+    /// The service-account token was empty.
     #[error("1Password service-account token must not be empty")]
     InvalidToken,
+    /// The bounded worker-pool size was zero or too large.
     #[error("1Password SDK worker count must be between 1 and {maximum}")]
-    InvalidWorkerCount { maximum: usize },
+    InvalidWorkerCount {
+        /// Defensive maximum accepted by the provider.
+        maximum: usize,
+    },
+    /// The supplied SDK core was missing, not a file, or unbounded.
     #[error("1Password SDK core is missing, not a regular file, or too large")]
     InvalidCore,
+    /// The SDK core could not be read.
     #[error("1Password SDK core could not be read")]
     CoreIo(#[source] std::io::Error),
+    /// The SDK core did not match the pinned digest.
     #[error("1Password SDK core digest mismatch: expected {expected}, got {actual}")]
     CoreDigest {
+        /// Pinned digest compiled into this crate.
         expected: &'static str,
+        /// Digest of the supplied core.
         actual: String,
     },
+    /// Extism could not compile or initialize the SDK core.
     #[error("1Password SDK core could not initialize")]
     CoreInitialization,
+    /// The optional Wasmtime cache path was invalid.
     #[error("1Password SDK cache directory is not a directory or valid UTF-8 path")]
     InvalidCacheDirectory,
+    /// The cache directory permitted another user to replace compiled code.
     #[error("1Password SDK cache directory must not be group- or world-writable")]
     InsecureCacheDirectory,
+    /// Secure cache preparation failed.
     #[error("1Password SDK cache setup failed")]
     CacheIo(#[source] std::io::Error),
+    /// The pinned SDK rejected the service-account token.
     #[error("1Password SDK rejected the service-account configuration")]
     Authentication,
+    /// The dedicated bounded SDK worker pool could not start.
     #[error("1Password SDK client thread could not start")]
     ClientThread(#[source] std::io::Error),
 }

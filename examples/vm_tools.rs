@@ -9,25 +9,31 @@ use std::{
     },
 };
 
+use async_trait::async_trait;
 use axum::{
     Router,
     extract::Request,
-    http::{StatusCode, header::WWW_AUTHENTICATE},
+    http::{
+        StatusCode,
+        header::{AUTHORIZATION, WWW_AUTHENTICATE},
+    },
     response::IntoResponse,
-    routing::post,
+    routing::get,
 };
 use mpp::{
     Base64UrlJson, MppError, PaymentChallenge, PaymentCredential, PaymentPayload,
     client::PaymentProvider, format_www_authenticate,
 };
-use mpp_egress::{EgressPolicy, MppEgress};
 use nanocodex::{Tool, ToolContext, ToolExecution, ToolInput, ToolOutputBody, ToolOutputContent};
 use nanocodex_browser::{Browser, BrowserTool};
 use nanocodex_tools::ToolRuntime;
-use nanocodex_vm::{GuestRuntimeDisk, VmToolSession, mpp_egress_layer};
+use nanocodex_vm::{GuestRuntimeDisk, VmToolSession};
+use nanocodex_vm_egress::{
+    EgressContext, SecretDelivery, SecretError, SecretGuestConfig, SecretHttpMethod, SecretManager,
+    SecretRef, SecretRequestRule, SecretSpec, StaticSecretPolicy, UnmatchedEgress, VmEgress,
+};
 use nanovm::{
-    BlockDevice, EgressLease, EgressMount, GUEST_EGRESS_ROOT, GuestCommand, VmConfig,
-    VmProcessConfig,
+    BlockDevice, EgressLease, GUEST_EGRESS_ROOT, GuestCommand, VmConfig, VmProcessConfig,
 };
 use serde::Deserialize;
 use serde_json::value::to_raw_value;
@@ -36,6 +42,7 @@ use tokio::process::Command;
 const GUEST_RUNTIME: &str = "/usr/local/bin/nanocodex-vm-guest";
 const RUNTIME_BLOCK_DEVICE: &str = "/dev/vdb";
 const RUNTIME_MOUNT: &str = "/run/nanocodex";
+const PROOF_SECRET: &str = "host-only-secret";
 const VM_BROWSER_PROOF: &str = r#"
 const [shell, opened] = await Promise.all([
   tools.exec_command({
@@ -124,14 +131,8 @@ async fn run_host(
         .or(runtime_input);
     let (egress, mpp_proof) = if prove_mpp {
         let proof = MppProof::start().await?;
-        let mpp = mpp_egress_layer(Arc::clone(&proof.egress))?;
-        let secrets = secret_style_proof_layer()?;
-        (
-            EgressLease::internet()
-                .with_layer(mpp)?
-                .with_layer(secrets)?,
-            Some(proof),
-        )
+        let lease = proof.egress.lease();
+        (lease, Some(proof))
     } else {
         (EgressLease::disabled(), None)
     };
@@ -141,9 +142,9 @@ async fn run_host(
             .memory_mib(768)
             .block_device(BlockDevice::read_only("nanocodex-runtime", runtime));
         let init = format!(
-            "set -eu; mkdir -p \"$1\" {RUNTIME_MOUNT}; \
+            "set -eu; mkdir -p $1 {RUNTIME_MOUNT}; \
              mount -t ext4 -o ro {RUNTIME_BLOCK_DEVICE} {RUNTIME_MOUNT}; \
-             exec {RUNTIME_MOUNT}/nanocodex-vm-guest \"$1\""
+             exec {RUNTIME_MOUNT}/nanocodex-vm-guest $1"
         );
         let guest = GuestCommand::new("/bin/sh")
             .arg("-c")
@@ -299,11 +300,19 @@ async fn run_host(
             .execute(
                 function_input(&serde_json::json!({
                     "cmd": format!(
-                        "test \"$NANOCENTAUR_SECRET_BASE_URL\" = \
-                         https://secret-gateway.invalid/v1; \
-                         if printf tamper 2>/dev/null >> {GUEST_EGRESS_ROOT}/secrets/route.txt; \
-                         then exit 9; fi; \
-                         cat {GUEST_EGRESS_ROOT}/secrets/route.txt"
+                        "set -eu; \
+                         test \"$NANOCODEX_PROOF_BASE_URL\" = '{}'; \
+                         printf '%s\\n' __guest_egress_state__; \
+                         env; \
+                         find {GUEST_EGRESS_ROOT} -type f -exec cat {{}} \\;; \
+                         printf '%s\\n' __secret_response__; \
+                         if command -v curl >/dev/null; then \
+                           curl --fail --silent --show-error \
+                             \"$NANOCODEX_PROOF_BASE_URL/allowed\"; \
+                         else \
+                           wget -qO- \"$NANOCODEX_PROOF_BASE_URL/allowed\"; \
+                         fi",
+                        proof.secret_base_url
                     ),
                     "workdir": "/workspace",
                     "login": false
@@ -312,17 +321,38 @@ async fn run_host(
             )
             .await?;
         let output = command_output(execution)?;
-        if output.exit_code != Some(0) || output.output.trim() != "public-route" {
-            return Err(format!("secret-style egress proof failed: {}", output.output).into());
+        let leaked = output.output.contains(PROOF_SECRET);
+        let inspected = output.output.contains("__guest_egress_state__");
+        let requested = output.output.contains("__secret_response__");
+        let authorized = output.output.contains("__secret_response__\nauthorized");
+        let secret_calls = proof.secret_calls.load(Ordering::SeqCst);
+        if output.exit_code != Some(0) || leaked || !authorized || secret_calls != 1 {
+            let early_diagnostic = if inspected {
+                "<guest state omitted>"
+            } else {
+                output.output.trim()
+            };
+            return Err(format!(
+                "host-only secret egress proof failed: exit={:?}, leaked={leaked}, \
+                 inspected={inspected}, requested={requested}, authorized={authorized}, \
+                 origin_calls={secret_calls}, early_diagnostic={early_diagnostic:?}",
+                output.exit_code
+            )
+            .into());
         }
-        println!("secret egress: independent environment and read-only mount composed");
+        println!("secret egress: host injected one scoped credential absent from guest state");
 
         let execution = vm
             .exec_command_tool()
             .execute(
                 function_input(&serde_json::json!({
                     "cmd": format!(
-                        "curl --fail --silent --show-error --request POST --data same-body {}",
+                        "if command -v curl >/dev/null; then \
+                           curl --fail --silent --show-error {}; \
+                         else \
+                           wget -qO- {}; \
+                         fi",
+                        proof.url,
                         proof.url
                     ),
                     "workdir": "/workspace",
@@ -333,12 +363,12 @@ async fn run_host(
             .await?;
         let output = command_output(execution)?;
         if output.exit_code != Some(0) || output.output.trim() != "paid" {
-            return Err(format!("MPP curl proof failed: {}", output.output).into());
+            return Err(format!("MPP request proof failed: {}", output.output).into());
         }
         if proof.payments.load(Ordering::SeqCst) != 1 || proof.calls.load(Ordering::SeqCst) != 2 {
-            return Err("MPP curl was not paid and replayed exactly once".into());
+            return Err("MPP request was not paid and replayed exactly once".into());
         }
-        println!("mpp egress: guest curl paid and replayed exactly once");
+        println!("mpp egress: guest request paid and replayed exactly once");
     }
     if let Some(browser) = browser {
         let runtime = ToolRuntime::new_with_tools(".", None, None, &agent_tools);
@@ -353,6 +383,10 @@ async fn run_host(
     drop(agent_tools);
     drop(vm);
     session.shutdown().await?;
+    drop(session);
+    if let Some(proof) = mpp_proof {
+        proof.egress.shutdown().await?;
+    }
     Ok(())
 }
 
@@ -395,23 +429,6 @@ fn is_elf(path: &Path) -> io::Result<bool> {
     }
 }
 
-fn secret_style_proof_layer() -> Result<EgressLease, AnyError> {
-    let directory = Arc::new(tempfile::tempdir()?);
-    fs::write(directory.path().join("route.txt"), "public-route\n")?;
-    let mut layer = EgressLease::internet();
-    layer.insert_environment(
-        "NANOCENTAUR_SECRET_BASE_URL",
-        "https://secret-gateway.invalid/v1",
-    )?;
-    layer.insert_mount(EgressMount::read_only(
-        "secret-proof",
-        directory.path(),
-        Path::new(GUEST_EGRESS_ROOT).join("secrets"),
-    ))?;
-    layer.retain(directory);
-    Ok(layer)
-}
-
 fn remove_partial_copy(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -434,10 +451,12 @@ fn take_flag(arguments: &mut Vec<std::ffi::OsString>, flag: &str) -> bool {
 }
 
 struct MppProof {
-    egress: Arc<MppEgress>,
+    egress: VmEgress,
     url: String,
+    secret_base_url: String,
     payments: Arc<AtomicUsize>,
     calls: Arc<AtomicUsize>,
+    secret_calls: Arc<AtomicUsize>,
 }
 
 impl MppProof {
@@ -446,7 +465,7 @@ impl MppProof {
         let challenge = payment_challenge()?;
         let app = Router::new().route(
             "/paid",
-            post({
+            get({
                 let calls = Arc::clone(&calls);
                 move |request: Request| {
                     let calls = Arc::clone(&calls);
@@ -474,15 +493,87 @@ impl MppProof {
                 eprintln!("MPP proof origin failed: {error}");
             }
         });
+
+        let secret_calls = Arc::new(AtomicUsize::new(0));
+        let secret_app = Router::new().route(
+            "/allowed",
+            get({
+                let calls = Arc::clone(&secret_calls);
+                move |request: Request| {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        if request
+                            .headers()
+                            .get(AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            == Some("Bearer host-only-secret")
+                        {
+                            (StatusCode::OK, "authorized")
+                        } else {
+                            (StatusCode::UNAUTHORIZED, "missing host credential")
+                        }
+                    }
+                }
+            }),
+        );
+        let secret_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let secret_address = secret_listener.local_addr()?;
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(secret_listener, secret_app).await {
+                eprintln!("secret proof origin failed: {error}");
+            }
+        });
+
         let provider = ProofPaymentProvider::default();
         let payments = Arc::clone(&provider.payments);
-        let egress = Arc::new(MppEgress::start(provider, EgressPolicy::default()).await?);
+        let secret_base_url = format!("http://{secret_address}");
+        let secret = SecretSpec::builder(
+            "vm-proof",
+            SecretRef::new("proof", "host-token"),
+            &secret_base_url,
+            SecretDelivery::inject_header("authorization", "Bearer "),
+            SecretGuestConfig::new("NANOCODEX_PROOF_BASE_URL"),
+        )
+        .rule(
+            SecretRequestRule::new()
+                .method(SecretHttpMethod::Get)
+                .path_prefix("/allowed"),
+        )
+        .build()?;
+        let egress = VmEgress::builder(provider)
+            .secrets(
+                EgressContext::new("vm-proof", "local-example"),
+                Arc::new(StaticSecretPolicy::new([secret])),
+                Arc::new(ProofSecretManager),
+            )
+            .unmatched_egress(UnmatchedEgress::Allow)
+            .spawn()
+            .await?;
         Ok(Self {
             egress,
             url: format!("http://{address}/paid"),
+            secret_base_url,
             payments,
             calls,
+            secret_calls,
         })
+    }
+}
+
+struct ProofSecretManager;
+
+#[async_trait]
+impl SecretManager for ProofSecretManager {
+    async fn resolve(&self, reference: &SecretRef) -> Result<String, SecretError> {
+        if reference.provider() == "proof" && reference.key() == "host-token" {
+            Ok(PROOF_SECRET.to_owned())
+        } else {
+            Err(SecretError::NotFound {
+                provider: reference.provider().to_owned(),
+                key: reference.key().to_owned(),
+            })
+        }
     }
 }
 

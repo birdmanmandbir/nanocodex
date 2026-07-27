@@ -145,8 +145,8 @@ nanocentaur
 └── nanocodex-vm-egress
 ```
 
-The exact names of the VM image and egress crates remain subject to the
-standalone-API review. Their ownership boundaries do not.
+The standalone-API review fixed the systems names as `nanovm-image` for image
+preparation and `nanocodex-vm-egress` for composed host egress.
 
 ## Agreed core APIs
 
@@ -522,13 +522,18 @@ Secret egress adopts the Nanocentaur/Iron design:
 
 - policy authorizes principal, origin, method, and path before resolution;
 - a host gateway resolves secrets only for an authorized request;
-- credentials are injected into the upstream request and never returned to the
-  guest;
+- credentials are injected into the upstream request and are not returned by
+  the gateway itself;
 - providers sit behind an async `SecretManager` boundary;
-- resolved values never enter model context, VMM arguments, guest environment,
-  snapshots, logs, or durable session state;
-- redirects, bodies, concurrency, and response sizes are bounded; and
-- revocation terminates the lease.
+- the egress layer never places resolved values in model context, VMM
+  arguments, guest environment, snapshots, logs, or durable session state;
+- redirects, request bodies, concurrency, and response streaming are bounded;
+  and
+- revocation denies subsequent requests immediately.
+
+An upstream can still echo a credential in its response. That response is then
+ordinary agent-observed data and follows the full-fidelity tracing contract; the
+egress layer does not redact it.
 
 MPP and secret gateways compose behind one VM-facing front proxy when both
 need `HTTPS_PROXY`.
@@ -769,12 +774,30 @@ composition depends directly on `nanovm`; it does not route through
 
 ### 8. MPP and secret egress
 
-- Consolidate the existing MPP proxy behind the VM egress lease.
-- Extract Nanocentaur's policy-aware secret gateway and provider boundary.
-- Compose payment and secret routing behind one guest-visible front proxy.
-- Prove by test that wallet and secret material never enter guest-visible or
+- [x] Consolidate the existing MPP proxy behind the VM egress lease.
+- [x] Extract Nanocentaur's policy-aware secret gateway and provider boundary.
+- [x] Compose payment and secret routing behind one guest-visible front proxy.
+- [x] Prove by test that wallet and secret material never enter guest-visible or
   persisted state.
-- Stress concurrency, backpressure, cancellation, replay, and revocation.
+- [x] Stress concurrency, backpressure, cancellation, replay, and revocation.
+
+Evidence:
+[`benchmarks/refactor_egress_baseline_2026-07-26.md`](benchmarks/refactor_egress_baseline_2026-07-26.md)
+records direct, authenticated MPP, and dynamic secret-policy round trips. The
+new `nanocodex-vm-egress` crate owns one proxy, cloneable neutral lease,
+dynamic `SecretPolicy`, standalone `SecretManager` implementations, scoped
+delivery, and typed shutdown. The existing direct `MppEgress` API and
+`nanocodex_vm::mpp_egress_layer` path remain available.
+
+Deterministic gates include byte-identical exact-once replay across 10,000
+bounded-parallel paid requests, connection and origin backpressure, client
+cancellation with bounded shutdown, live rotation and revocation, ambiguous
+route rejection, and non-disclosure by the egress layer itself. The retained
+libkrun proof uses one proxy for both a host-injected secret and an MPP `402`.
+The headed
+browser proof uses that lease through gvproxy, answers only proxy auth
+challenges, trusts the ephemeral CA for real HTTPS, and never receives the
+origin secret.
 
 ### 9. Evaluations
 
@@ -821,7 +844,6 @@ These are intentionally not hidden behind provisional APIs:
   registration;
 - exact stable normalized `ResponseEvent` variants versus explicitly raw
   OpenAI events;
-- final crate names for reusable VM image preparation and composed egress;
 - which observability conveniences belong in the facade prelude;
 - final feature policy for heavyweight VM, browser, eval, and managed-service
   crates; and

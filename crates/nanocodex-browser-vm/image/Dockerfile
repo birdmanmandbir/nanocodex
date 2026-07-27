@@ -5,6 +5,7 @@ RUN apk add --no-cache \
       chromium \
       font-noto \
       mesa-dri-gallium \
+      nss-tools \
       socat \
       xvfb-run \
     && adduser -D browser \

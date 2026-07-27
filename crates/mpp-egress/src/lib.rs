@@ -3,6 +3,29 @@
 //! The proxy listens only on loopback. Callers pass [`MppEgress::environment`]
 //! to untrusted child processes; the payment provider and its signing material
 //! remain in the embedding process.
+//!
+//! # Start a bounded proxy
+//!
+//! ```
+//! use mpp::client::MultiProvider;
+//! use mpp_egress::{EgressPolicy, MppEgress};
+//!
+//! # async fn run() -> Result<(), mpp_egress::EgressError> {
+//! // An empty provider forwards ordinary requests and rejects payment
+//! // challenges. Add concrete providers with `MultiProvider::with`.
+//! let proxy = MppEgress::start(MultiProvider::new(), EgressPolicy::default()).await?;
+//! let child_environment = proxy.environment();
+//! assert!(
+//!     child_environment
+//!         .iter()
+//!         .any(|(name, _)| name == "HTTPS_PROXY"),
+//! );
+//! proxy.shutdown().await?;
+//! # Ok(())
+//! # }
+//! ```
+
+#![deny(missing_docs, rustdoc::broken_intra_doc_links)]
 
 use std::{
     collections::HashSet,
@@ -15,6 +38,7 @@ use std::{
     },
 };
 
+use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::TryStreamExt;
 use http_body_util::{BodyExt, Limited};
@@ -57,6 +81,107 @@ const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 128;
 const MAX_IDLE_CONNECTIONS_PER_HOST: usize = 4;
 const CA_FILENAME: &str = "mpp-egress-ca.pem";
 const MPP_REQUEST_ID: &str = "mpp-request-id";
+
+/// Host-visible request metadata passed through an egress authorization layer.
+///
+/// The method and URI are immutable. A policy may replace or remove headers
+/// before the request reaches the origin, which is sufficient for injecting a
+/// host-resolved credential without exposing it to the child process.
+///
+/// This type deliberately has no `Debug` implementation because its headers
+/// may contain credentials after authorization.
+#[derive(Clone)]
+pub struct EgressRequest {
+    method: Method,
+    uri: hudsucker::hyper::Uri,
+    headers: hudsucker::hyper::HeaderMap,
+}
+
+impl EgressRequest {
+    /// Creates request metadata for a host policy or deterministic test.
+    #[must_use]
+    pub fn new(
+        method: Method,
+        uri: hudsucker::hyper::Uri,
+        headers: hudsucker::hyper::HeaderMap,
+    ) -> Self {
+        Self {
+            method,
+            uri,
+            headers,
+        }
+    }
+
+    fn from_request(request: &Request<Body>) -> Self {
+        Self::new(
+            request.method().clone(),
+            request.uri().clone(),
+            request.headers().clone(),
+        )
+    }
+
+    /// Returns the immutable HTTP method.
+    #[must_use]
+    pub const fn method(&self) -> &Method {
+        &self.method
+    }
+
+    /// Returns the immutable absolute request URI or CONNECT authority.
+    #[must_use]
+    pub const fn uri(&self) -> &hudsucker::hyper::Uri {
+        &self.uri
+    }
+
+    /// Returns the headers supplied by the authenticated child.
+    #[must_use]
+    pub const fn headers(&self) -> &hudsucker::hyper::HeaderMap {
+        &self.headers
+    }
+
+    /// Returns the host-owned header mutation boundary.
+    pub fn headers_mut(&mut self) -> &mut hudsucker::hyper::HeaderMap {
+        &mut self.headers
+    }
+
+    fn into_headers(self) -> hudsucker::hyper::HeaderMap {
+        self.headers
+    }
+}
+
+/// Failure returned by a host request policy.
+#[derive(Clone, Copy, Debug, thiserror::Error, Eq, PartialEq)]
+pub enum RequestPolicyError {
+    /// The authenticated lease does not authorize this destination or action.
+    #[error("egress request denied by host policy")]
+    Denied,
+    /// The request cannot be matched safely against policy.
+    #[error("egress request is invalid")]
+    InvalidRequest,
+    /// Policy or credential resolution is temporarily unavailable.
+    #[error("egress request policy is unavailable")]
+    Unavailable,
+}
+
+/// Asynchronous host authorization applied before origin forwarding.
+///
+/// Implementations receive no body and cannot change the destination. They can
+/// fail closed or return a request whose headers contain host-resolved
+/// credentials. `MppEgress` records the child-visible request before invoking
+/// this boundary and never records the returned headers.
+#[async_trait]
+pub trait RequestPolicy: Send + Sync {
+    /// Authorizes one request and returns its origin-facing headers.
+    async fn authorize(&self, request: EgressRequest) -> Result<EgressRequest, RequestPolicyError>;
+}
+
+struct AllowAllRequests;
+
+#[async_trait]
+impl RequestPolicy for AllowAllRequests {
+    async fn authorize(&self, request: EgressRequest) -> Result<EgressRequest, RequestPolicyError> {
+        Ok(request)
+    }
+}
 
 /// Policy owned by one embedded proxy instance.
 #[derive(Clone, Debug)]
@@ -113,6 +238,27 @@ impl MppEgress {
     where
         P: PaymentProvider + 'static,
     {
+        Self::start_with_request_policy(provider, policy, AllowAllRequests).await
+    }
+
+    /// Starts an MPP-aware proxy with an additional host request policy.
+    ///
+    /// The request policy runs after child proxy authentication and before
+    /// CONNECT forwarding, upgrades, or replayable MPP handling. This is the
+    /// composition point for host-side secret authorization and injection.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same initialization errors as [`Self::start`].
+    pub async fn start_with_request_policy<P, R>(
+        provider: P,
+        policy: EgressPolicy,
+        request_policy: R,
+    ) -> Result<Self, EgressError>
+    where
+        P: PaymentProvider + 'static,
+        R: RequestPolicy + 'static,
+    {
         drop(rustls::crypto::ring::default_provider().install_default());
         if policy.max_request_bytes == 0 {
             return Err(EgressError::InvalidPolicy(
@@ -163,6 +309,7 @@ impl MppEgress {
             provider,
             client,
             policy,
+            request_policy: Arc::new(request_policy),
             origin_permits,
             proxy_authorization: proxy_authorization.clone(),
             authenticated_clients: Arc::new(Mutex::new(HashSet::new())),
@@ -216,7 +363,8 @@ impl MppEgress {
             ("CURL_CA_BUNDLE", certificate.clone()),
             ("SSL_CERT_FILE", certificate.clone()),
             ("REQUESTS_CA_BUNDLE", certificate.clone()),
-            ("NODE_EXTRA_CA_CERTS", certificate),
+            ("NODE_EXTRA_CA_CERTS", certificate.clone()),
+            ("GIT_SSL_CAINFO", certificate),
             (
                 "NANOCODEX_MPP_EGRESS_PASSWORD",
                 OsString::from(&self.proxy_password),
@@ -269,6 +417,7 @@ struct PaymentHandler<P> {
     provider: P,
     client: reqwest::Client,
     policy: EgressPolicy,
+    request_policy: Arc<dyn RequestPolicy>,
     origin_permits: Arc<Semaphore>,
     proxy_authorization: String,
     authenticated_clients: Arc<Mutex<HashSet<SocketAddr>>>,
@@ -319,6 +468,29 @@ where
                 "MPP egress authenticated its child client"
             );
             request.headers_mut().remove(PROXY_AUTHORIZATION);
+            let authorized = match self
+                .request_policy
+                .authorize(EgressRequest::from_request(&request))
+                .await
+            {
+                Ok(authorized) => authorized,
+                Err(error) => {
+                    let status = match error {
+                        RequestPolicyError::Denied => StatusCode::FORBIDDEN,
+                        RequestPolicyError::InvalidRequest => StatusCode::BAD_REQUEST,
+                        RequestPolicyError::Unavailable => StatusCode::BAD_GATEWAY,
+                    };
+                    tracing::warn!(
+                        target: "mpp_egress",
+                        stage = "mpp.egress.request_policy.rejected",
+                        failure.kind = %error,
+                        http.response.status_code = status.as_u16(),
+                        "MPP egress host policy rejected the request"
+                    );
+                    return error_response(status, &error.to_string()).into();
+                }
+            };
+            *request.headers_mut() = authorized.into_headers();
             if request.method() == Method::CONNECT || is_upgrade(&request) {
                 tracing::info!(
                     target: "mpp_egress",
@@ -768,23 +940,33 @@ fn ephemeral_authority() -> Result<(EphemeralAuthority, String), EgressError> {
 }
 
 #[derive(Debug, thiserror::Error)]
+/// Failure to configure, start, run, or stop an MPP egress proxy.
 pub enum EgressError {
+    /// A numeric policy bound was zero or otherwise unsupported.
     #[error("invalid MPP egress policy: {0}")]
     InvalidPolicy(&'static str),
+    /// The ephemeral loopback listener could not be bound.
     #[error("failed to bind the MPP egress listener")]
     Bind(#[source] std::io::Error),
+    /// The bound listener address could not be read.
     #[error("failed to read the MPP egress listener address")]
     LocalAddress(#[source] std::io::Error),
+    /// The private ephemeral CA directory could not be created.
     #[error("failed to create the ephemeral MPP egress directory")]
     TempDir(#[source] std::io::Error),
+    /// The generated public CA could not be persisted for child runtimes.
     #[error("failed to write the ephemeral MPP egress CA certificate")]
     WriteCertificate(#[source] std::io::Error),
+    /// Ephemeral CA or leaf-certificate generation failed.
     #[error("failed to generate the ephemeral MPP egress CA")]
     Certificate(#[source] hudsucker::rcgen::Error),
+    /// The origin-facing HTTP client could not be constructed.
     #[error("failed to build the MPP egress HTTP client")]
     Client(#[source] reqwest::Error),
+    /// The proxy rejected its configuration or failed while serving.
     #[error("MPP egress proxy failed")]
     Proxy(#[from] hudsucker::Error),
+    /// The background proxy task panicked or was cancelled unexpectedly.
     #[error("MPP egress proxy task failed")]
     Join(#[source] tokio::task::JoinError),
 }
@@ -1138,6 +1320,63 @@ mod tests {
         assert!(statuses.iter().all(|status| *status == AxumStatus::OK));
         assert_eq!(maximum.load(Ordering::SeqCst), CONNECTIONS);
         egress.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_client_releases_origin_capacity_and_shutdown() {
+        let slow_started = Arc::new(tokio::sync::Notify::new());
+        let slow_gate = Arc::new(Semaphore::new(0));
+        let app = Router::new()
+            .route(
+                "/slow",
+                get({
+                    let slow_started = Arc::clone(&slow_started);
+                    let slow_gate = Arc::clone(&slow_gate);
+                    move || {
+                        let slow_started = Arc::clone(&slow_started);
+                        let slow_gate = Arc::clone(&slow_gate);
+                        async move {
+                            slow_started.notify_one();
+                            let _permit = slow_gate.acquire().await.unwrap();
+                            "slow"
+                        }
+                    }
+                }),
+            )
+            .route("/fast", get(|| async { "fast" }));
+        let origin = spawn_origin(app).await;
+        let egress = MppEgress::start(
+            MockProvider::default(),
+            EgressPolicy {
+                max_concurrent_requests: 1,
+                ..EgressPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+        let slow_client = proxied_client(&egress);
+        let slow_url = format!("{origin}/slow");
+        let slow = tokio::spawn(async move { slow_client.get(slow_url).send().await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), slow_started.notified())
+            .await
+            .unwrap();
+
+        slow.abort();
+        assert!(slow.await.unwrap_err().is_cancelled());
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            proxied_client(&egress).get(format!("{origin}/fast")).send(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(response.status(), AxumStatus::OK);
+        assert_eq!(response.text().await.unwrap(), "fast");
+        tokio::time::timeout(std::time::Duration::from_secs(2), egress.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
