@@ -7,7 +7,7 @@
 //! # Quick start
 //!
 //! Developer instructions create the stable boundary of a client-owned
-//! [`Session`]. Follow-on calls retain completed history automatically:
+//! `Session`. Follow-on calls retain completed history automatically:
 //!
 //! ```no_run
 //! use nanocodex_oai_api::OpenAi;
@@ -30,7 +30,7 @@
 //! # }
 //! ```
 //!
-//! A [`Response`] is also a typed stream. It retains the completed aggregate
+//! A `Response` is also a typed stream. It retains the completed aggregate
 //! after the stream reaches [`ResponseEvent::Completed`]:
 //!
 //! ```no_run
@@ -60,7 +60,7 @@
 //! # Ownership and replay
 //!
 //! A session owns authoritative typed history and one concrete Tower service.
-//! A [`ResponseTurn`] marks a logical agent turn and keeps WebSocket
+//! A `ResponseTurn` marks a logical agent turn and keeps WebSocket
 //! turn-scoped state stable across sequential `create` and `compact` calls.
 //! Only completed operations commit. Healthy calls send a delta plus a private
 //! continuation ID; reconnects replay complete committed history.
@@ -71,8 +71,8 @@
 //!
 //! # Tower
 //!
-//! [`OpenAiBuilder::layer`] wraps each session's concrete service without
-//! boxing it. [`OpenAiBuilder::service`] installs a fresh caller-defined
+//! `OpenAiBuilder::layer` wraps each session's concrete service without
+//! boxing it. `OpenAiBuilder::service` installs a fresh caller-defined
 //! `Service<ResponsesAttempt>` and is useful for custom transports,
 //! deterministic tests, and controlled replay. The standard stack owns its
 //! retry and reconnect policy; caller middleware should add deadlines,
@@ -80,46 +80,70 @@
 //! second retry loop.
 //!
 //! Lower-level protocol types are grouped under [`responses`]. Most consumers
-//! need only [`OpenAi`], [`Session`], [`ResponseTurn`], [`Response`], and
-//! [`CompletedResponse`].
+//! need only `OpenAi`, `Session`, `ResponseTurn`, `Response`, and
+//! `CompletedResponse`.
+//!
+//! # Dependency-light contract
+//!
+//! The default `client` feature supplies the complete Tower, HTTP, and
+//! WebSocket implementation. Process-isolated runtimes that need only typed
+//! Responses values and the [`Tool`] contract can disable default features;
+//! doing so does not link a network or TLS implementation:
+//!
+//! ```toml
+//! nanocodex-oai-api = { version = "0.2", default-features = false }
+//! ```
 
 #![deny(missing_docs, rustdoc::broken_intra_doc_links)]
 
+#[cfg(feature = "client")]
 mod attempt;
 mod auth;
+#[cfg(feature = "client")]
 mod client;
+#[cfg(feature = "client")]
 #[doc(hidden)]
 #[allow(missing_docs)]
 pub mod compaction;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "client", not(target_family = "wasm")))]
 mod connector;
+#[cfg(feature = "client")]
 #[doc(hidden)]
 #[allow(missing_docs)]
 pub mod context;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "client", not(target_family = "wasm")))]
 mod error;
-#[cfg(target_family = "wasm")]
+#[cfg(all(feature = "client", target_family = "wasm"))]
 #[allow(missing_docs)]
 #[path = "error_wasm.rs"]
 mod error;
+#[cfg(feature = "client")]
 mod event_data;
+#[cfg(feature = "client")]
 #[allow(missing_docs)]
 mod events;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "client", not(target_family = "wasm")))]
 mod http;
+#[cfg(feature = "client")]
 mod middleware;
+#[cfg(feature = "client")]
 mod openai;
 mod pricing;
 pub mod responses;
+#[cfg(feature = "client")]
 mod service;
+#[cfg(feature = "client")]
 mod service_error;
+#[cfg(feature = "client")]
 mod session;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "client", not(target_family = "wasm")))]
 mod socket;
-#[cfg(target_family = "wasm")]
+#[cfg(all(feature = "client", target_family = "wasm"))]
 #[path = "socket_wasm.rs"]
 mod socket;
+#[cfg(feature = "client")]
 mod stream;
+#[cfg(feature = "client")]
 mod telemetry;
 mod tool;
 
@@ -127,6 +151,7 @@ use std::{fmt, path::PathBuf, str::FromStr, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "client")]
 pub use attempt::{
     ResponsesAttempt, ResponsesAttemptFactory, ResponsesAttemptKind, ResponsesOutput,
     ResponsesServiceResponse, TransportStats, TransportStatsDelta, TransportStatsSnapshot,
@@ -135,8 +160,11 @@ pub use auth::{
     OpenAiAuth, OpenAiAuthError, OpenAiAuthFuture, OpenAiAuthMode, OpenAiAuthSnapshot,
     OpenAiAuthSource,
 };
+#[cfg(feature = "client")]
 pub use client::ResponsesClient;
+#[cfg(feature = "client")]
 pub use error::{ResponsesError, RetryAdvice};
+#[cfg(feature = "client")]
 pub use event_data::{
     AgentEventData, AssistantDelta, AssistantEvent, AssistantMessage, CompactionCompleted,
     CompactionFailed, CompactionStarted, ContextEvent, EventUsage, ModelCallCompleted,
@@ -145,12 +173,15 @@ pub use event_data::{
     RunMetrics, RunStarted, RunStatus, RunSteered, RunTerminal, ToolCall, ToolEvent,
     ToolResultEvent, ToolStatus, TransportEvent,
 };
+#[cfg(feature = "client")]
 #[doc(hidden)]
 pub use events::{
     AgentEvent, AgentEventKind, AgentEventTiming, AgentEvents, EventError, EventSink,
     TimedAgentEvent, monotonic_now_ns,
 };
+#[cfg(feature = "client")]
 pub use middleware::{DefaultResponsesService, ResponsesRetryPolicy};
+#[cfg(feature = "client")]
 pub use openai::{
     CallerServiceFactory, LayeredServiceFactory, MakeResponsesService, OpenAi, OpenAiBuilder,
     OpenAiError, StandardServiceFactory,
@@ -167,23 +198,32 @@ pub use responses::{
     ReasoningContent, ReasoningSummary, RequestProfile, ResponseEvent, ResponseItem,
     ResponseItemId, ToolCaller, ToolDefinition, Usage, WarmupResponse, WebSearchAction,
 };
+#[cfg(feature = "client")]
 pub use service::ResponsesService;
+#[cfg(feature = "client")]
 pub use service_error::ResponsesServiceError;
+#[cfg(feature = "client")]
 pub use session::{
     CompletedCompaction, CompletedResponse, Response, ResponseCheckpoint, ResponseError,
     ResponseInput, ResponseTurn, Session, SessionBuildError, SessionBuilder, SessionId,
     SessionIdError,
 };
+#[cfg(feature = "client")]
 #[doc(hidden)]
 pub use session::{ManagedSessionState, ManagedSessionStateError};
+#[cfg(feature = "client")]
 pub use socket::EncodedRequest;
+#[cfg(feature = "client")]
 pub use stream::{
     CodeCall, CodeCallKind, CompactionOutput, GenerationOutput, ResponsePipelineStats,
 };
+#[cfg(feature = "client")]
 #[doc(hidden)]
 pub type CompactionResult = CompactionOutput;
+#[cfg(feature = "client")]
 #[doc(hidden)]
 pub type TurnResult = GenerationOutput;
+#[cfg(feature = "client")]
 pub use telemetry::TRANSPORT;
 pub use tool::{
     DEFAULT_TOOL_OUTPUT_TOKENS, ProcessTraceWire, Tool, ToolContext, ToolError, ToolExecution,
@@ -617,7 +657,7 @@ impl FromStr for Thinking {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "client"))]
 mod tests {
     use serde_json::json;
 

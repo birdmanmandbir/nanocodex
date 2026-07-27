@@ -7,12 +7,16 @@ use std::{
 };
 
 use async_trait::async_trait;
-use nanocodex_oai_api::{
-    OpenAiAuth, ResponseItem, Tool, ToolContext, ToolDefinition, ToolExecution, ToolInput,
-};
+#[cfg(feature = "code-mode")]
+use nanocodex_oai_api::ResponseItem;
+use nanocodex_oai_api::{OpenAiAuth, Tool, ToolContext, ToolDefinition, ToolExecution, ToolInput};
 use schemars::{JsonSchema, r#gen::SchemaSettings};
+#[cfg(feature = "code-mode")]
+use serde_json::json;
+#[cfg(feature = "code-mode")]
 use serde_json::value::to_raw_value;
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
+#[cfg(feature = "code-mode")]
 use tracing::{Instrument, info, info_span};
 
 #[cfg(feature = "code-mode")]
@@ -970,7 +974,7 @@ pub fn schema_for<T: JsonSchema>() -> Value {
     Value::Object(tool_schema)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "code-mode"))]
 mod tests {
     use std::sync::{
         Arc,

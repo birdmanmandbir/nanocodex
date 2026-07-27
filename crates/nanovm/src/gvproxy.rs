@@ -16,32 +16,52 @@ const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
 const API_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_API_RESPONSE_BYTES: usize = 64 * 1024;
 
+/// Failure to launch, configure, or communicate with gvproxy.
 #[derive(Debug, Error)]
 pub enum GvproxyError {
+    /// The child exited before publishing its control sockets.
     #[error("gvproxy exited before creating its sockets: {0}")]
     EarlyExit(std::process::ExitStatus),
 
+    /// A required socket did not become ready before the startup deadline.
     #[error("gvproxy did not create {path} within {timeout:?}")]
-    SocketTimeout { path: PathBuf, timeout: Duration },
+    SocketTimeout {
+        /// Socket that remained unavailable.
+        path: PathBuf,
+        /// Enforced startup deadline.
+        timeout: Duration,
+    },
 
+    /// A caller attempted to expose a guest port beyond host loopback.
     #[error("refusing to expose a VM port on non-loopback host address {0}")]
     NonLoopbackForward(SocketAddr),
 
+    /// Port zero cannot identify a listener created outside gvproxy.
     #[error("host port zero cannot identify the resulting gvproxy listener")]
     UnspecifiedHostPort,
 
+    /// The gvproxy services API returned a non-success response.
     #[error("gvproxy services API returned {status}: {body}")]
-    Api { status: String, body: String },
+    Api {
+        /// HTTP status line returned by gvproxy.
+        status: String,
+        /// Bounded response body returned by gvproxy.
+        body: String,
+    },
 
+    /// The gvproxy services response was not valid HTTP.
     #[error("gvproxy services API returned an invalid HTTP response")]
     InvalidApiResponse,
 
+    /// The gvproxy services response exceeded the fixed bound.
     #[error("gvproxy services API response exceeded {MAX_API_RESPONSE_BYTES} bytes")]
     ApiResponseTooLarge,
 
+    /// A gvproxy request or response could not be encoded.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 
+    /// Child-process, socket, or filesystem I/O failed.
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -115,6 +135,7 @@ impl Gvproxy {
         })
     }
 
+    /// Returns the vfkit-compatible unixgram network socket.
     #[must_use]
     pub fn network_socket(&self) -> &Path {
         &self.network_socket

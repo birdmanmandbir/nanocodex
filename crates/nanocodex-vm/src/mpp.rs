@@ -75,18 +75,25 @@ where
     Ok(lease)
 }
 
+/// Failure to project a host-owned MPP proxy into a VM egress lease.
 #[derive(Debug, Error)]
 pub enum MppVmEgressError {
+    /// The proxy's public CA path is not a regular file.
     #[error("MPP egress CA is not a regular file: {0}")]
     CertificateNotFile(PathBuf),
+    /// The public CA could not be read.
     #[error("failed to read the MPP egress CA: {0}")]
     ReadCertificate(#[source] std::io::Error),
+    /// The fixed guest CA destination was not valid UTF-8.
     #[error("MPP guest CA path is not valid UTF-8")]
     GuestCertificatePath,
+    /// A proxy-provided environment name was not valid UTF-8.
     #[error("MPP egress produced a non-UTF-8 environment name")]
     EnvironmentName,
+    /// A proxy-provided environment value was not valid UTF-8.
     #[error("MPP egress produced a non-UTF-8 value for `{0}`")]
     EnvironmentValue(String),
+    /// The resulting capability conflicted with VM egress invariants.
     #[error(transparent)]
     Egress(#[from] EgressError),
 }

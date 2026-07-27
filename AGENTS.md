@@ -64,6 +64,13 @@
   modules, and a small prelude. It contains no runtime implementation.
 - `nanocodex-tools-macros` implements `#[tool]`. Keep the executable under
   `bin/nanocodex`; do not move CLI behavior into the library.
+- `nanovm` owns the audited libkrun boundary, typed VM/process configuration,
+  gvproxy lifecycle, and provider-neutral egress capabilities.
+- `nanocodex-vm` owns the bounded retained host/guest protocol and VM-backed
+  standard tool adapters. Its guest build uses only local workspace tools and
+  dependency-light OAI contract types.
+- `nanovm-image` owns OCI/Dockerfile resolution, content-addressed immutable
+  ext4 preparation, cache locking, and per-attempt reflinks.
 - Each lower crate must remain useful without importing the higher orchestration
   crate. Avoid circular concepts and leaky socket/runtime types.
 

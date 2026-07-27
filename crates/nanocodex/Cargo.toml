@@ -19,7 +19,7 @@ rustdoc-args = ["-D", "warnings"]
 
 [dependencies]
 nanocodex-agent.workspace = true
-nanocodex-oai-api.workspace = true
+nanocodex-oai-api = { workspace = true, features = ["client"] }
 nanocodex-tools.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]

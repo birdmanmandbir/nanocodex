@@ -15,19 +15,29 @@ description = "VM-owned standard workspace tools for Nanocodex"
 
 [features]
 default = ["host"]
-guest = ["dep:nix"]
-host = ["dep:nanovm"]
+guest = ["dep:nix", "nanocodex-tools/guest"]
+host = [
+    "dep:arcbox-ext4",
+    "dep:fs2",
+    "dep:nanovm",
+    "dep:sha2",
+    "dep:tempfile",
+]
 mpp = ["host", "dep:mpp-egress"]
 
 [dependencies]
+arcbox-ext4 = { workspace = true, optional = true }
 async-trait = "0.1.89"
 base64.workspace = true
+fs2 = { workspace = true, optional = true }
 mpp-egress = { workspace = true, optional = true }
 nanocodex-tools = { path = "../nanocodex-tools", version = "0.2.0", default-features = false }
 nanovm = { workspace = true, optional = true }
 nix = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
+sha2 = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-std", "io-util", "process", "rt", "sync", "time"] }
 tracing.workspace = true
@@ -38,8 +48,15 @@ path = "src/bin/nanocodex-vm-guest.rs"
 required-features = ["guest"]
 
 [dev-dependencies]
+criterion.workspace = true
+reflink-copy.workspace = true
 tempfile.workspace = true
 tracing-subscriber.workspace = true
+
+[[bench]]
+name = "vm_session"
+harness = false
+required-features = ["host"]
 
 [lints]
 workspace = true

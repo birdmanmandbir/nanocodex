@@ -1,0 +1,46 @@
+[package]
+name = "nanovm-image"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Content-addressed OCI and Dockerfile root disks for NanoVM"
+
+[dependencies]
+arcbox-ext4.workspace = true
+flate2.workspace = true
+fs2.workspace = true
+futures-util.workspace = true
+ignore.workspace = true
+nanocodex-vm.workspace = true
+nanovm.workspace = true
+oci-client.workspace = true
+reflink-copy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tar.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "process", "rt", "time"] }
+tracing.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing-subscriber.workspace = true
+
+[[bench]]
+name = "image_cache"
+harness = false
+
+[lints]
+workspace = true

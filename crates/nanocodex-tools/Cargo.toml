@@ -14,9 +14,24 @@ categories.workspace = true
 description = "Code Mode and heterogeneous tool runtime for Nanocodex"
 
 [features]
-default = ["code-mode", "remote-tools"]
-code-mode = ["dep:rquickjs"]
-remote-tools = []
+default = ["code-mode", "native", "remote-tools"]
+code-mode = ["dep:futures-util", "dep:rquickjs"]
+guest = []
+native = [
+    "oai-client",
+    "dep:bm25",
+    "dep:futures-util",
+    "dep:http",
+    "dep:image",
+    "dep:nanocodex-tools-macros",
+    "dep:oauth2",
+    "dep:reqwest",
+    "dep:rmcp",
+    "dep:rustls",
+    "dep:sha1",
+]
+oai-client = ["nanocodex-oai-api/client"]
+remote-tools = ["oai-client", "dep:reqwest"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -31,20 +46,20 @@ tracing.workspace = true
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 async-trait.workspace = true
 base64.workspace = true
-bm25.workspace = true
-futures-util.workspace = true
-http.workspace = true
-image.workspace = true
-oauth2.workspace = true
-nanocodex-tools-macros.workspace = true
+bm25 = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+image = { workspace = true, optional = true }
+oauth2 = { workspace = true, optional = true }
+nanocodex-tools-macros = { workspace = true, optional = true }
 portable-pty.workspace = true
 rand.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, optional = true }
 rquickjs = { workspace = true, optional = true }
-rmcp.workspace = true
-rustls.workspace = true
+rmcp = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
 schemars.workspace = true
-sha1.workspace = true
+sha1 = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt", "sync", "time"] }
 
@@ -62,9 +77,18 @@ eyre.workspace = true
 futures-util.workspace = true
 tracing-subscriber.workspace = true
 
+[[test]]
+name = "tool_macro"
+required-features = ["native"]
+
+[[test]]
+name = "tracing"
+required-features = ["code-mode"]
+
 [[bench]]
 name = "mcp_tool_search"
 harness = false
+required-features = ["native"]
 
 [[bench]]
 name = "tool_process_output"

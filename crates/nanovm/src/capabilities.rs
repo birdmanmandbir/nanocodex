@@ -11,15 +11,25 @@ use crate::VmError;
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(u64)]
 pub enum KrunFeature {
+    /// Virtio networking support.
     Network = 0,
+    /// Virtio block-device support.
     Block = 1,
+    /// GPU device support.
     Gpu = 2,
+    /// Guest input-device support.
     Input = 4,
+    /// Trusted-execution-environment support.
     Tee = 6,
+    /// AMD SEV confidential-computing support.
     AmdSev = 7,
+    /// Intel TDX confidential-computing support.
     IntelTdx = 8,
+    /// AWS Nitro enclave support.
     AwsNitro = 9,
+    /// `VirGL` resource-map version 2 support.
     VirglResourceMap2 = 10,
+    /// Embedded guest init-blob support.
     InitBlob = 11,
 }
 
@@ -41,6 +51,7 @@ const FEATURES: [KrunFeature; 10] = [
 pub struct Capabilities {
     max_vcpus: u32,
     nested_virtualization: bool,
+    pause_resume: bool,
     features: BTreeSet<KrunFeature>,
 }
 
@@ -71,25 +82,36 @@ impl Capabilities {
         Ok(Self {
             max_vcpus,
             nested_virtualization,
+            pause_resume: cfg!(target_os = "macos"),
             features,
         })
     }
 
+    /// Returns the maximum number of virtual CPUs supported by the host.
     #[must_use]
     pub const fn max_vcpus(&self) -> u32 {
         self.max_vcpus
     }
 
+    /// Returns whether the host can expose nested virtualization.
     #[must_use]
     pub const fn nested_virtualization(&self) -> bool {
         self.nested_virtualization
     }
 
+    /// Whether the host supports out-of-band VM pause and resume.
+    #[must_use]
+    pub const fn pause_resume(&self) -> bool {
+        self.pause_resume
+    }
+
+    /// Returns whether the pinned libkrun build includes `feature`.
     #[must_use]
     pub fn has(&self, feature: KrunFeature) -> bool {
         self.features.contains(&feature)
     }
 
+    /// Iterates over optional features included in the pinned libkrun build.
     pub fn features(&self) -> impl Iterator<Item = KrunFeature> + '_ {
         self.features.iter().copied()
     }

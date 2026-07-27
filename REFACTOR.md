@@ -121,8 +121,11 @@ nanocodex-tools-macros
 Systems and evaluation crates remain below the agent:
 
 ```text
-nanovm-image ──> nanovm ──> nanocodex-vm
-                      └────> nanocodex-browser-vm ──> nanocodex-browser
+nanovm-image ──> nanocodex-vm ──> nanovm
+
+nanocodex-browser-vm
+├── nanocodex-browser
+└── nanocodex-vm ──> nanovm
 
 nanocodex-vm-egress
 ├── neutral EgressLease composition
@@ -715,10 +718,35 @@ tracing spans, the CLI/TUI, PyO3, and Node/browser WASM.
 
 ### 6. VM and images
 
-- Reconcile Nanoeval's VM/image code with the Nanocodex VM draft.
-- Extract reusable content-addressed OCI/Dockerfile image preparation.
-- Land the retained VM tool session and composable neutral egress lease.
-- Benchmark warm image lookup, snapshot/reflink, boot, RPC, and shutdown.
+- [x] Reconcile Nanoeval's VM/image code with the hardened Nanocodex VM draft.
+- [x] Extract reusable content-addressed OCI/Dockerfile image preparation into
+  `nanovm-image`.
+- [x] Land the retained VM tool session and composable neutral egress lease.
+- [x] Move current guest ELF staging behind the content-addressed
+  `GuestRuntimeDisk` API while retaining Nanoeval's cache identity.
+- [x] Keep the guest dependency graph limited to local workspace tools and the
+  dependency-light OAI contract while preserving MCP in normal native tools.
+- [x] Benchmark warm image lookup, reflink, protocol overhead, real retained
+  guest RPC, boot, and shutdown.
+
+Evidence:
+[`benchmarks/refactor_vm_baseline_2026-07-26.md`](benchmarks/refactor_vm_baseline_2026-07-26.md)
+records the deterministic and live libkrun baselines. The real smoke builds the
+current musl guest, boots an immutable retained Alpine disk, and exercises
+`exec_command`, `write_stdin`, `apply_patch`, and `view_image` through one
+retained VM before graceful shutdown. A second live proof drives a Dockerfile
+`RUN` through the public `VmImageBuilder`/private-process-config boundary and
+reads the exact mutation from the resulting ext4. Nanoeval's cache identities
+remain byte-compatible, same-key runtime/image work single-flights, unrelated
+resolution is bounded-parallel, and init4-style bounded spans preserve the
+complete Dockerfile. Build CPU, memory, egress, and instruction timeouts are
+explicit builder policy rather than hidden constants.
+
+The three VM crates deliberately remain `publish = false` while `nanovm`
+targets the reviewed libkrun `2.0.0-dev` Git checkpoint, which is not available
+on crates.io. Their public APIs and Rustdoc are complete for path/Git consumers;
+Stack 10 owns publication once that exact dependency can be packaged without
+substituting an older hypervisor API.
 
 ### 7. Browser on VM
 

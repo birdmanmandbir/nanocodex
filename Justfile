@@ -145,6 +145,21 @@ bench-stream:
     cargo bench -p nanocodex-bin --bench tui_render -- tui_transcript_delta
     cargo bench -p nanocodex-bin --bench tui_render -- tui_trace_render
 
+# Deterministic warm-image and retained VM protocol latency gates.
+bench-vm:
+    cargo bench -p nanovm-image --bench image_cache
+    cargo bench -p nanocodex-vm --bench vm_session -- vm_session_protocol
+
+# Include actual libkrun boot, first RPC, and graceful shutdown. The root disk
+# is reflinked before each timed sample and is never mutated directly.
+bench-vm-live rootfs runtime firmware=".cache/libkrunfw/libkrunfw":
+    just build-vm-example
+    NANOCODEX_VM_VMM="{{justfile_directory()}}/target/debug/vm-tools" \
+    NANOCODEX_VM_ROOTFS="{{rootfs}}" \
+    NANOCODEX_VM_RUNTIME="{{runtime}}" \
+    NANOCODEX_VM_FIRMWARE="{{firmware}}" \
+    cargo bench -p nanocodex-vm --bench vm_session -- vm_session_live
+
 # Run a tool-using turn and retain events and diagnostic logs independently.
 otel-demo:
     @test -n "${OPENAI_API_KEY:-}" || { echo "set OPENAI_API_KEY in .env or the environment" >&2; exit 2; }

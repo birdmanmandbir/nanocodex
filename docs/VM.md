@@ -6,17 +6,73 @@ execute. The default `Tools` selection runs `exec_command`, `write_stdin`,
 replace those handlers with one persistent libkrun VM without changing their
 model-visible names or schemas.
 
-Two packages own the boundary:
+Three packages own the boundary:
 
 - `nanovm` owns typed libkrun configuration, the small audited FFI boundary,
   private VMM process configuration, gvproxy lifecycle, and provider-neutral
   egress leases.
+- `nanovm-image` owns content-addressed OCI resolution, the supported
+  Dockerfile subset, immutable ext4 preparation, cache locking, and disposable
+  attempt reflinks.
 - `nanocodex-vm` owns the typed host/guest tool protocol, retained guest shell
   sessions, bounded VMM process ownership, and adapters for
   Nanocodex's standard workspace tools.
 
-Neither package owns application policy, agent identity, payment limits,
-secret resolution, rootfs preparation, or the choice to enable VM tools.
+These packages do not own application policy, agent identity, payment limits,
+secret resolution, or the choice to enable VM tools.
+
+## Preparing immutable images
+
+`VmImageBuilder` turns a directory containing a concrete `Dockerfile` into one
+validated immutable disk. The cache key includes the Dockerfile, deterministic
+context archive, target architecture, base manifest digests, and disk size.
+Every mutable VM gets a reflink or sparse copy:
+
+```rust,no_run
+use nanocodex_vm::GuestRuntimeDisk;
+use nanovm_image::{CachePolicy, VmImageBuilder};
+
+# async fn prepare() -> Result<(), Box<dyn std::error::Error>> {
+let runtime = GuestRuntimeDisk::prepare(
+    "target/aarch64-unknown-linux-musl/release/nanocodex-vm-guest",
+    ".cache/vm",
+)?;
+let images = VmImageBuilder::new(
+    "target/debug/vm-tools",
+    runtime.path(),
+)
+.firmware_directory(".cache/libkrunfw/libkrunfw")
+.vmm_arg("--vmm");
+let image = images
+    .prepare(
+        "evals/history-derived/embedded-prompt/environment",
+        10 * 1024 * 1024 * 1024,
+        ".cache/vm",
+        CachePolicy::Reuse,
+    )
+    .await?;
+std::fs::create_dir_all(".nanocodex/attempts/018f")?;
+image.reflink_to(".nanocodex/attempts/018f/rootfs.ext4")?;
+# Ok(())
+# }
+```
+
+`GuestRuntimeDisk::prepare` hashes the exact guest ELF, validates a compatible
+Nanoeval `v2` cache entry when present, and otherwise formats and atomically
+publishes one read-only 128 MiB ext4 runtime disk. Same-key processes
+single-flight on a filesystem lock. The returned path remains in the
+caller-selected cache after the value is dropped.
+
+Dockerfile build VMs default to 2 vCPUs, 4096 MiB, ordinary internet egress, a
+30-minute `RUN` timeout, and a 10-minute mount/`COPY` timeout.
+`VmImageBuilder::cpus`, `memory_mib`, `egress`, `run_timeout`, and
+`copy_timeout` make each policy explicit when those defaults are unsuitable.
+
+OCI references and layers resolve concurrently, with at most eight operations
+at either boundary. Same-key work single-flights across tasks and processes,
+while unrelated images remain parallel. Cache records and disks publish
+atomically; a valid warm disk hit never launches a VM or decodes layer
+contents.
 
 ## Selecting host or VM tools
 
@@ -103,7 +159,7 @@ Independent provider layers compose transactionally:
 
 ```rust,no_run
 use nanovm::{EgressFile, EgressLease, EgressMount};
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 
 # fn configure() -> Result<EgressLease, nanovm::EgressError> {
 let mut mpp = EgressLease::internet();
@@ -122,11 +178,11 @@ secrets.insert_environment(
     "NANOCENTAUR_SECRET_BASE_URL",
     "https://secret-gateway.internal/v1",
 )?;
-secrets.insert_mount(EgressMount {
-    tag: "secret-ca".to_owned(),
-    host_path: PathBuf::from("/host/secret-ca"),
-    guest_path: PathBuf::from("/tmp/nanocodex/egress/secrets/ca"),
-})?;
+secrets.insert_mount(EgressMount::read_only(
+    "secret-ca",
+    "/host/secret-ca",
+    "/tmp/nanocodex/egress/secrets/ca",
+))?;
 secrets.retain(Arc::new(())); // the real layer retains its proxy lease
 
 EgressLease::internet()
@@ -221,8 +277,18 @@ provider's credentials.
 - Read-only provider mounts and environment conflicts are explicit.
 - The libkrun unsafe surface stays inside `nanovm`; the rest of Nanocodex
   remains safe Rust.
+- The guest-only build selects the dependency-light OAI/tool contract and local
+  workspace runtime. It does not link the OpenAI client, TLS, MCP, remote
+  tools, or Code Mode. Normal native `nanocodex-tools` builds still include MCP
+  and the complete agreed tool surface by default.
 
-See `cargo run -p nanocodex-examples --bin vm-tools -- ROOTFS` for the
-end-to-end tool protocol example. The rootfs must contain
-`/usr/local/bin/nanocodex-vm-guest`. Build the lean guest artifact with
-`just build-vm-guest`; its guest-only feature excludes `nanovm` and libkrun.
+See
+`cargo run -p nanocodex-examples --bin vm-tools -- ROOTFS GUEST_RUNTIME_BINARY`
+for the end-to-end tool protocol example. Build the lean guest artifact with
+`just build-vm-guest`; the example stages that ELF through
+`GuestRuntimeDisk::prepare` and mounts the resulting disk read-only.
+If the runtime argument is omitted, the rootfs must already contain
+`/usr/local/bin/nanocodex-vm-guest`.
+
+The retained baseline and regression budgets are recorded in
+[`benchmarks/refactor_vm_baseline_2026-07-26.md`](../benchmarks/refactor_vm_baseline_2026-07-26.md).

@@ -19,7 +19,7 @@ rustdoc-args = ["-D", "warnings"]
 
 [dependencies]
 futures-util.workspace = true
-nanocodex-oai-api.workspace = true
+nanocodex-oai-api = { workspace = true, features = ["client"] }
 nanocodex-tools.workspace = true
 serde.workspace = true
 serde_json.workspace = true

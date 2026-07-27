@@ -1,8 +1,75 @@
+//! Retained VM sessions for Nanocodex workspace tools.
+//!
+//! This crate keeps the model-visible tool contract identical while forwarding
+//! `exec_command`, `write_stdin`, `apply_patch`, and `view_image` to one
+//! isolated guest. The default `host` feature owns the VMM child, cancellation,
+//! bounded protocol, and egress lease. The narrow `guest` feature compiles the
+//! companion server without the host VM or network-client dependency graph.
+
+#![cfg_attr(
+    feature = "host",
+    doc = r#"
+# Compose VM-backed tools
+
+```no_run
+use nanocodex_vm::VmToolSession;
+use nanovm::{EgressLease, GuestCommand, VmConfig};
+use tokio::process::Command;
+
+# async fn build() -> Result<(), Box<dyn std::error::Error>> {
+let vmm = Command::new("nanovm-vmm");
+let session = VmToolSession::spawn_configured(
+    vmm,
+    VmConfig::ext4("attempts/018f/root.ext4")
+        .cpus(2)
+        .memory_mib(768),
+    GuestCommand::new("/usr/local/bin/nanocodex-vm-guest")
+        .arg("/workspace"),
+    EgressLease::disabled(),
+)
+.await?;
+let tools = session
+    .tools()
+    .tools_builder()
+    .working_directory("/workspace")
+    .build()?;
+# let _ = tools;
+# Ok(())
+# }
+```
+
+Dropping the last session capability kills the VMM. Call
+[`VmToolSession::shutdown`] when the application wants a graceful guest
+filesystem sync and bounded exit wait.
+"#
+)]
+#![cfg_attr(
+    feature = "guest",
+    doc = r#"
+# Run the companion guest server
+
+The dedicated guest process reserves stdin/stdout for the bounded typed
+protocol and keeps one native workspace-tool runtime alive:
+
+```no_run
+use nanocodex_vm::serve_guest;
+
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+serve_guest("/workspace").await?;
+# Ok(())
+# }
+```
+"#
+)]
+#![deny(missing_docs, rustdoc::broken_intra_doc_links)]
+
 #[cfg(feature = "guest")]
 mod guest;
 #[cfg(feature = "mpp")]
 mod mpp;
 mod protocol;
+#[cfg(feature = "host")]
+mod runtime_disk;
 #[cfg(feature = "host")]
 mod session;
 
@@ -22,6 +89,8 @@ pub use guest::VmGuestError;
 #[cfg(feature = "mpp")]
 pub use mpp::{MppVmEgressError, mpp_egress_layer};
 #[cfg(feature = "host")]
+pub use runtime_disk::{GuestRuntimeDisk, GuestRuntimeDiskError, GuestRuntimeDiskStatus};
+#[cfg(feature = "host")]
 pub use session::{
     VmCommand, VmCommandOutput, VmToolSession, VmToolSessionError, VmToolSessionHandle,
 };
@@ -33,6 +102,7 @@ pub use session::{
 #[async_trait::async_trait]
 #[cfg(feature = "host")]
 pub trait VmToolClient: Send + Sync {
+    /// Executes one standard tool through the client-owned VM capability.
     async fn execute(
         &self,
         tool: StandardTool,
@@ -50,6 +120,7 @@ pub struct VmTools {
 
 #[cfg(feature = "host")]
 impl VmTools {
+    /// Creates a VM tool family over one clone-cheap execution capability.
     #[must_use]
     pub fn new(client: impl VmToolClient + 'static) -> Self {
         Self {
@@ -57,21 +128,25 @@ impl VmTools {
         }
     }
 
+    /// Returns the VM-backed `exec_command` tool.
     #[must_use]
     pub fn exec_command_tool(&self) -> VmTool {
         self.tool(StandardTool::ExecCommand)
     }
 
+    /// Returns the VM-backed `write_stdin` tool.
     #[must_use]
     pub fn write_stdin_tool(&self) -> VmTool {
         self.tool(StandardTool::WriteStdin)
     }
 
+    /// Returns the VM-backed `apply_patch` tool.
     #[must_use]
     pub fn apply_patch_tool(&self) -> VmTool {
         self.tool(StandardTool::ApplyPatch)
     }
 
+    /// Returns the VM-backed `view_image` tool.
     #[must_use]
     pub fn view_image_tool(&self) -> VmTool {
         self.tool(StandardTool::ViewImage)
@@ -113,6 +188,7 @@ pub struct VmTool {
 
 #[cfg(feature = "host")]
 impl VmTool {
+    /// Returns which canonical standard tool this adapter implements.
     #[must_use]
     pub const fn standard(&self) -> StandardTool {
         self.standard
@@ -122,10 +198,6 @@ impl VmTool {
 #[async_trait::async_trait]
 #[cfg(feature = "host")]
 impl Tool for VmTool {
-    fn name(&self) -> &'static str {
-        self.standard.name()
-    }
-
     fn definition(&self) -> ToolDefinition {
         self.standard.definition()
     }
@@ -198,7 +270,7 @@ mod tests {
             (vm.apply_patch_tool(), StandardTool::ApplyPatch),
             (vm.view_image_tool(), StandardTool::ViewImage),
         ] {
-            assert_eq!(tool.name(), standard.name());
+            assert_eq!(tool.definition().name(), standard.name());
             assert_eq!(
                 serde_json::to_value(tool.definition()).unwrap(),
                 serde_json::to_value(standard.definition()).unwrap()

@@ -49,6 +49,8 @@ pub struct VmCommand {
 }
 
 impl VmCommand {
+    /// Creates a trusted guest command with a one-minute deadline, `/` as its
+    /// working directory, and an 8 MiB combined output limit.
     #[must_use]
     pub fn new(program: impl Into<String>) -> Self {
         Self {
@@ -61,24 +63,28 @@ impl VmCommand {
         }
     }
 
+    /// Appends one argument.
     #[must_use]
     pub fn arg(mut self, argument: impl Into<String>) -> Self {
         self.arguments.push(argument.into());
         self
     }
 
+    /// Sets the guest working directory.
     #[must_use]
     pub fn current_directory(mut self, directory: impl Into<String>) -> Self {
         self.current_directory = directory.into();
         self
     }
 
+    /// Extends the guest environment.
     #[must_use]
     pub fn environment(mut self, environment: impl IntoIterator<Item = (String, String)>) -> Self {
         self.environment.extend(environment);
         self
     }
 
+    /// Sets the execution deadline.
     #[must_use]
     pub const fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
@@ -96,61 +102,86 @@ impl VmCommand {
 /// Complete output from one trusted harness command in the guest.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VmCommandOutput {
+    /// Guest process exit code.
     pub exit_code: i32,
+    /// Complete bounded standard output.
     pub stdout: Vec<u8>,
+    /// Complete bounded standard error.
     pub stderr: Vec<u8>,
 }
 
+/// Failure to start, use, provision, or stop one retained VM tool session.
 #[derive(Debug, Error)]
 pub enum VmToolSessionError {
+    /// A session was started without an active Tokio runtime.
+    #[error("starting a VM tool session requires an active Tokio runtime")]
+    NoRuntime,
+
+    /// The VMM child could not be spawned.
     #[error("failed to spawn the VMM process: {0}")]
     Spawn(#[source] std::io::Error),
 
+    /// The VMM command did not expose a required protocol pipe.
     #[error("the VMM process did not expose piped {0}")]
     MissingPipe(&'static str),
 
+    /// Host-side process or protocol I/O failed.
     #[error("VM tool console I/O failed: {0}")]
     Io(#[from] std::io::Error),
 
+    /// A host or guest protocol frame was not valid JSON.
     #[error("VM tool protocol JSON failed: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// The VMM console closed before a pending response arrived.
     #[error("the VM tool console closed before replying")]
     Closed,
 
+    /// The background response router failed.
     #[error("VM tool response router failed: {0}")]
     Router(String),
 
+    /// The guest returned an application-level tool error.
     #[error("guest tool execution failed: {0}")]
     Guest(String),
 
+    /// A trusted harness command exceeded its deadline.
     #[error("guest command exceeded {0:?}")]
     GuestTimeout(Duration),
 
+    /// A trusted harness command exceeded its combined output limit.
     #[error("guest command output exceeded the {0}-byte limit")]
     GuestOutputLimit(usize),
 
+    /// The guest returned a response of the wrong typed shape.
     #[error("invalid VM tool response: {0}")]
     Protocol(&'static str),
 
+    /// An inbound or outbound protocol frame exceeded the fixed limit.
     #[error("VM tool protocol frame exceeded the {MAX_FRAME_BYTES}-byte limit")]
     FrameTooLarge,
 
+    /// Graceful guest shutdown did not stop the VMM before the deadline.
     #[error("the VMM did not exit within {0:?} after guest shutdown")]
     ShutdownTimeout(Duration),
 
+    /// The VMM returned an unsuccessful status after guest shutdown.
     #[error("the VMM exited unsuccessfully after guest shutdown: {0}")]
     VmmExit(ExitStatus),
 
+    /// Public egress assets were provisioned more than once.
     #[error("egress was already provisioned for this VM session")]
     EgressAlreadyProvisioned,
 
+    /// Graceful shutdown was requested while sibling capabilities remained.
     #[error("cannot shut down the VM while {0} sibling capabilities are still alive")]
     ActiveCapabilities(usize),
 
+    /// A public egress destination could not be represented by the guest protocol.
     #[error("egress guest file path is not valid UTF-8: {0}")]
     EgressFilePath(PathBuf),
 
+    /// Private VMM launch-record persistence failed.
     #[error(transparent)]
     VmProcess(#[from] VmProcessError),
 }
@@ -243,6 +274,8 @@ impl VmToolSession {
     /// Returns an error when the child or either protocol pipe cannot be
     /// created.
     pub fn spawn(command: &mut Command) -> Result<Self, VmToolSessionError> {
+        let runtime =
+            tokio::runtime::Handle::try_current().map_err(|_| VmToolSessionError::NoRuntime)?;
         let program = command
             .as_std()
             .get_program()
@@ -296,7 +329,7 @@ impl VmToolSession {
                 egress: StdMutex::new(None),
                 process_config: StdMutex::new(None),
             });
-            tokio::spawn(write_requests(
+            runtime.spawn(write_requests(
                 input,
                 input_receiver,
                 Arc::downgrade(&inner),
@@ -464,8 +497,8 @@ impl VmToolSessionHandle {
             rpc.system = "libkrun.console",
             rpc.method = tool.name(),
             tool.name = tool.name(),
-            session.id = context.session_id,
-            tool.call_id = context.call_id,
+            session.id = context.session_id(),
+            tool.call_id = context.call_id(),
             tool.input.kind = input_kind,
             tool.input.bytes = input_bytes,
             rpc.request.id = tracing::field::Empty,
@@ -503,10 +536,10 @@ impl VmToolSessionHandle {
             tool,
             input: WireToolInput::from(input),
             context: WireToolContext {
-                model: context.model.to_owned(),
-                session_id: context.session_id.to_owned(),
-                call_id: context.call_id.to_owned(),
-                output_token_budget: context.output_token_budget,
+                model: context.model().to_owned(),
+                session_id: context.session_id().to_owned(),
+                call_id: context.call_id().to_owned(),
+                output_token_budget: context.output_token_budget(),
             },
         });
         let (response, response_bytes) = self.send_request(request, span, false).await?;
@@ -1078,6 +1111,16 @@ mod tracing_tests {
     }
 
     #[test]
+    fn spawning_without_a_tokio_runtime_returns_a_typed_error() {
+        let mut command = tokio::process::Command::new("/bin/true");
+
+        assert!(matches!(
+            VmToolSession::spawn(&mut command),
+            Err(VmToolSessionError::NoRuntime)
+        ));
+    }
+
+    #[test]
     fn vm_rpc_is_timed_and_parented_to_the_calling_tool() {
         let _test_guard = TRACE_TEST_LOCK.lock().unwrap();
         let response = r#"{"kind":"tool","payload":{"id":0,"execution":{"output":"ok","success":true,"code_mode_value":null,"metadata":null,"process_trace":null},"error":null}}"#;
@@ -1095,13 +1138,8 @@ mod tracing_tests {
         tracing::dispatcher::with_default(&dispatch, || {
             runtime.block_on(async {
                 let session = VmToolSession::spawn(&mut command).unwrap();
-                let context = ToolContext {
-                    model: "test-model",
-                    session_id: "test-session",
-                    call_id: "test-call",
-                    history: &[],
-                    output_token_budget: 1_000,
-                };
+                let context =
+                    ToolContext::new("test-model", "test-session", "test-call", &[], 1_000);
                 let execution = session
                     .handle()
                     .request(

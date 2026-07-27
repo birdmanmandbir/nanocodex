@@ -1,7 +1,7 @@
 //! Tool building blocks for `OpenAI`-compatible agents.
 //!
 //! This crate is useful without the Nanocodex agent loop. It provides the
-//! caller-defined [`Tool`] contract, [`tool`] macro, heterogeneous [`Tools`]
+//! caller-defined [`Tool`] contract, `#[tool]` macro, heterogeneous [`Tools`]
 //! registry, Code Mode runtime, standard workspace tools, and native MCP
 //! clients. The dependency-light contract types are defined by
 //! `nanocodex-oai-api` and re-exported here so a tool implementation has one
@@ -56,9 +56,15 @@
 //! # }
 //! ```
 //!
-//! Handshakes and discovery start with the owning runtime. [`mcp::Mcp`] exposes
+//! Handshakes and discovery start with the owning runtime. `mcp::Mcp` exposes
 //! only `tool_search` directly and activates matching remote definitions for
 //! Code Mode, keeping large catalogs out of the model's initial tool list.
+//!
+//! The default native surface always includes MCP, the macro, image handling,
+//! and the OpenAI-backed remote tools. The `guest` feature is a deliberately
+//! narrow process-build profile used by `nanocodex-vm`: it retains local
+//! workspace tools and exact contract types without linking network clients,
+//! TLS, MCP, or Code Mode. It is not a second agent runtime.
 
 #![deny(missing_docs, rustdoc::broken_intra_doc_links)]
 #![cfg_attr(target_family = "wasm", allow(clippy::module_name_repetitions))]
@@ -67,11 +73,11 @@
 mod apply_patch;
 #[cfg(all(not(target_family = "wasm"), feature = "code-mode"))]
 mod code_mode;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "native"))]
 mod image;
 #[cfg(all(not(target_family = "wasm"), feature = "remote-tools"))]
 mod image_generation;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "native"))]
 pub mod mcp;
 #[cfg(not(target_family = "wasm"))]
 mod plan;
@@ -90,9 +96,9 @@ mod web_search;
 
 #[cfg(all(not(target_family = "wasm"), feature = "code-mode"))]
 pub use code_mode::{CodeModeExecution, CodeModeObserver, CodeModeUpdate, NestedToolCall};
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "native"))]
 pub use image::{prepare_output_images, prepare_user_input};
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "native"))]
 pub use mcp::{
     Mcp, McpBuildError, McpBuilder, McpControlError, McpHandle, McpLogin, McpOAuthCredentials,
     McpOAuthStore, McpServer,
@@ -102,7 +108,7 @@ pub use nanocodex_oai_api::{
     ToolError, ToolExecution, ToolExecutionWire, ToolInput, ToolInputError, ToolOutput,
     ToolOutputBody, ToolOutputContent, ToolOutputWire, ToolResult,
 };
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "native"))]
 pub use nanocodex_tools_macros::tool;
 #[cfg(not(target_family = "wasm"))]
 pub use plan::UpdatePlanTool;
@@ -110,15 +116,15 @@ pub use plan::UpdatePlanTool;
 pub use runtime::OwnedToolContext;
 #[cfg(not(target_family = "wasm"))]
 pub use runtime::{
-    DynamicToolProvider, ImageGenerationConfig, OwnedToolContext, ToolRuntime, ToolRuntimeControl,
-    Tools, ToolsBuildError, ToolsBuilder, WebSearchConfig, schema_for,
+    DynamicToolProvider, ImageGenerationConfig, ToolRuntime, ToolRuntimeControl, Tools,
+    ToolsBuildError, ToolsBuilder, WebSearchConfig, schema_for,
 };
 #[cfg(not(target_family = "wasm"))]
 pub use standard::StandardTool;
 #[cfg(target_family = "wasm")]
 pub use wasm::*;
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "native"))]
 #[doc(hidden)]
 pub mod __private {
     pub use async_trait::async_trait;
