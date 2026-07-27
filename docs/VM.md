@@ -82,9 +82,12 @@ let (agent, events) = Nanocodex::builder(auth)
 # }
 ```
 
-The `VmToolSession` is the non-cloneable owner. Only it can shut the VM down.
-`VmTools` and `VmToolSessionHandle` are cloneable capabilities and cannot stop
-the shared VM out from under sibling drivers.
+The `VmToolSession` is the non-cloneable graceful-shutdown capability.
+`VmTools` and `VmToolSessionHandle` are cloneable capabilities. Every one of
+them keeps the VMM, private launch configuration, and egress guards alive, so
+capturing `VmTools` in a driver factory is sufficient for the complete agent
+tree. Graceful shutdown fails while sibling capabilities remain; drop the
+agents, tool registries, and cloned handles before calling it.
 
 ## Configurable egress
 
@@ -122,7 +125,7 @@ secrets.insert_environment(
 secrets.insert_mount(EgressMount {
     tag: "secret-ca".to_owned(),
     host_path: PathBuf::from("/host/secret-ca"),
-    guest_path: PathBuf::from("/run/egress/secret-ca"),
+    guest_path: PathBuf::from("/tmp/nanocodex/egress/secrets/ca"),
 })?;
 secrets.retain(Arc::new(())); // the real layer retains its proxy lease
 
@@ -132,30 +135,36 @@ EgressLease::internet()
 # }
 ```
 
-Applying the result to a `VmConfig` and `GuestCommand` selects the network,
+`VmToolSession::spawn_configured` consumes the complete lease and applies it to
+both launch configuration and retained session state. This selects the network,
 attaches provider directories read-only, mounts them before the guest runtime
-starts, and injects only the resolved guest environment. After spawning, give
-the same lease to the session so it provisions public files and retains all
-provider guards:
+starts, injects only the resolved guest environment, provisions public files,
+and retains every provider guard:
 
 ```rust,no_run
 # use nanocodex_vm::VmToolSession;
 # use nanovm::{EgressLease, GuestCommand, VmConfig};
-# async fn configure(egress: EgressLease, mut session: VmToolSession) -> Result<(), Box<dyn std::error::Error>> {
+# use tokio::process::Command;
+# async fn launch(egress: EgressLease) -> Result<VmToolSession, Box<dyn std::error::Error>> {
 let guest = GuestCommand::new("/usr/local/bin/nanocodex-vm-guest").arg("/workspace");
-let (vm, command) = egress.configure(
-    VmConfig::ext4("rootfs.ext4"),
-    &guest,
-);
-# drop((vm, command)); // spawn the configured VMM here
-session.provision_egress(egress).await?;
-# Ok(())
+let mut vmm = Command::new("dedicated-vmm-process");
+vmm.arg("--run-config");
+let session = VmToolSession::spawn_configured(
+    vmm,
+    VmConfig::ext4("private-session-rootfs.ext4"),
+    guest,
+    egress,
+).await?;
+# Ok(session)
 # }
 ```
 
-The complete configuration can be serialized to a mode-`0600` temporary file
-with `VmProcessConfig::write_private`. This keeps bearer proxy URLs and
-secret-route placeholders out of the VMM command line.
+The method serializes complete launch configuration to a mode-`0600` temporary
+file and retains it until the last VM capability is dropped. This keeps bearer
+proxy URLs and secret-route placeholders out of the VMM command line and avoids
+a process-start race. Lower-level `configure`, `write_private`, `spawn`, and
+`provision_egress` operations remain available for specialized launchers, but
+the application must then preserve the same ownership ordering itself.
 
 ### MPP and secret proxy layers
 
@@ -185,8 +194,19 @@ provider's credentials.
   interactive guest processes across sequential turns and subagent calls.
 - Concurrent drivers are multiplexed by request ID; one slow guest command
   does not block unrelated subagent calls.
-- Dropping the session kills its VMM child. Explicit shutdown asks the guest to
-  stop and bounds the wait for process exit.
+- The last session/tool capability kills its VMM child and releases egress.
+  Explicit shutdown first rejects live sibling capabilities, asks the guest to
+  cancel in-flight work and sync filesystems, then bounds the wait for exit.
+- Protocol frames are limited to 64 MiB, harness file reads to 32 MiB, and
+  trusted command output to 8 MiB by default. Command timeouts, output-limit
+  cancellation, guest shutdown, and capability drop terminate process groups,
+  including descendants.
+- Egress files are limited to 4 MiB. Mounts and files must be non-overlapping
+  descendants of `/tmp/nanocodex/egress`; mount tags and modes are validated
+  before launch.
+- A writable ext4 root is session-private. Reflink or sparse-copy an immutable
+  base image for each VM rather than attaching a shared benchmark image
+  directly.
 - On macOS, the dedicated VMM executable must carry the
   `com.apple.security.hypervisor` entitlement. `just build-vm-example` builds
   and ad-hoc signs the public proof binary with `nanovm.entitlements`.
@@ -200,4 +220,5 @@ provider's credentials.
 
 See `cargo run -p nanocodex-examples --bin vm-tools -- ROOTFS` for the
 end-to-end tool protocol example. The rootfs must contain
-`/usr/local/bin/nanocodex-vm-guest`.
+`/usr/local/bin/nanocodex-vm-guest`. Build the lean guest artifact with
+`just build-vm-guest`; its guest-only feature excludes `nanovm` and libkrun.

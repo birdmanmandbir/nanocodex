@@ -11,11 +11,22 @@ if [ "$(uname -s)" = "Darwin" ]; then
     fi
     PATH="$("$brew_bin" --prefix lld)/bin:$PATH"
     export PATH
-    exec /usr/bin/clang \
-        -target aarch64-linux-gnu \
-        -fuse-ld=lld \
-        -Wl,-strip-debug \
-        "$@"
+    case " $* " in
+        *" -c "*)
+            exec /usr/bin/clang \
+                -target aarch64-linux-gnu \
+                -Wno-unused-command-line-argument \
+                "$@"
+            ;;
+        *)
+            exec /usr/bin/clang \
+                -target aarch64-linux-gnu \
+                -fuse-ld=lld \
+                -Wno-unused-command-line-argument \
+                -Wl,-strip-debug \
+                "$@"
+            ;;
+    esac
 fi
 
 exec cc "$@"

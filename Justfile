@@ -93,6 +93,11 @@ smoke-mcp:
 
 # Build the end-to-end VM tool example. macOS VMM executables need the
 # Hypervisor entitlement; signing the built artifact keeps Cargo inputs clean.
+build-vm-guest:
+    CC_aarch64_unknown_linux_musl="{{justfile_directory()}}/scripts/aarch64-unknown-linux-musl-linker" \
+    AR_aarch64_unknown_linux_musl="{{justfile_directory()}}/scripts/aarch64-unknown-linux-musl-ar" \
+    cargo build -p nanocodex-vm --bin nanocodex-vm-guest --no-default-features --features guest --target aarch64-unknown-linux-musl
+
 build-vm-example:
     cargo build -p nanocodex-examples --bin vm-tools --all-features
     @if [ "$(uname -s)" = "Darwin" ]; then \

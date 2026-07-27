@@ -106,6 +106,8 @@ pub use nanocodex_oai_api::{
 pub use nanocodex_tools_macros::tool;
 #[cfg(not(target_family = "wasm"))]
 pub use plan::UpdatePlanTool;
+#[cfg(all(not(target_family = "wasm"), feature = "code-mode"))]
+pub use runtime::OwnedToolContext;
 #[cfg(not(target_family = "wasm"))]
 pub use runtime::{
     DynamicToolProvider, ImageGenerationConfig, OwnedToolContext, ToolRuntime, ToolRuntimeControl,
