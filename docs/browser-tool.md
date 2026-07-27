@@ -132,8 +132,10 @@ In this mode a short-lived invisible Brave broker opens the filtered private
 copy on the host, lets Brave and the operating-system keychain decrypt the
 cookies, and exports typed cookie records into the dedicated CDP browser. The
 broker then closes and its temporary profile is deleted. Cookie values are
-never returned by a browser action or included in tracing. The Brave profile,
-`Local State`, keychain, and encrypted cookie database never enter the VM.
+never returned by a browser action. Full-fidelity browser tracing does include
+the filtered typed cookies that cross the remote CDP boundary; the Brave
+profile, `Local State`, keychain, and encrypted cookie database never enter the
+VM or tracing.
 The remote browser's existing cookies are replaced because the CDP endpoint is
 required to be dedicated to this one `Browser` session.
 
@@ -167,8 +169,8 @@ next.restore_storage_state(state).await?;
 This is deliberately a direct `Browser` API, not a `BrowserAction`: the model
 cannot read cookie values, inject a state file, or widen its authenticated
 origins. `Debug` output redacts values, but the serialized
-`BrowserStorageState` is credential-bearing data and must be protected like a
-cookie jar.
+`BrowserStorageState` and full-fidelity tracing are credential-bearing data and
+must be protected like a cookie jar.
 
 When a real passkey, device posture check, or other human authentication gate
 is required, the harness can perform an explicit handoff without giving the
@@ -669,9 +671,10 @@ let browser = Browser::builder()
 `crux` queries either the current normalized URL or its origin, with an
 optional desktop/phone/tablet filter, and returns typed p75 values, histograms,
 categorical fractions, and collection dates. The API key is absent from tool
-schemas and redacted from `Debug`; HTTP failures discard their request URL
-before becoming browser errors so the query-string credential is not exposed.
-The response body is capped at 1 MiB while streaming.
+schemas and redacted from `Debug`; model-visible HTTP failures discard their
+request URL. Full-fidelity tracing retains the configured key and protocol
+traffic, so its backend has the same access and retention requirements as the
+credential store. The response body is capped at 1 MiB while streaming.
 
 ## Frames, tabs, inputs, and downloads
 
@@ -702,7 +705,9 @@ A route has a stable ID, an explicit URL substring, and a deterministic typed
 response. Routes are resolved before egress policy, which lets tests serve
 fixtures for otherwise nonexistent domains without opening network access.
 HAR export uses retained request ordering and redacted headers; response bodies
-are fetched only when explicitly requested and available.
+are fetched only when explicitly requested and available. Those model-facing
+and artifact boundaries stay credential-safe; enabled operational tracing
+records raw DevTools request, response, and WebSocket events before redaction.
 
 Egress policy is harness policy and therefore lives only on `BrowserBuilder`:
 

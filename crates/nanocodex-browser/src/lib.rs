@@ -3,6 +3,48 @@
 //! [`Browser`] owns Chromium and its `DevTools` connection in-process.
 //! [`BrowserTool`] exposes that same typed session through Nanocodex's ordinary
 //! [`Tool`] boundary.
+//!
+//! # Direct typed control
+//!
+//! ```no_run
+//! use nanocodex_browser::{Browser, BrowserAction, BrowserActionResult};
+//!
+//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! let browser = Browser::new()?;
+//! let result = browser
+//!     .execute(BrowserAction::Open {
+//!         url: "https://example.com/".to_owned(),
+//!     })
+//!     .await?;
+//! assert!(matches!(result, BrowserActionResult::Action { .. }));
+//! browser.close().await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Install the ordinary tool
+//!
+//! ```no_run
+//! use nanocodex_browser::{Browser, BrowserTool};
+//! use nanocodex_tools::Tools;
+//!
+//! # fn build() -> Result<(), Box<dyn std::error::Error>> {
+//! let browser = Browser::new()?;
+//! let tools = Tools::builder()
+//!     .without_defaults()
+//!     .tool(BrowserTool::from_browser(browser))
+//!     .build()?;
+//! # let _ = tools;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The browser starts lazily on its first action. Use [`Browser::builder`] for
+//! deterministic context, egress, storage, diagnostics, or a dedicated remote
+//! CDP endpoint. `nanocodex-browser-vm` owns the production headed-VM
+//! composition without changing this controller API.
+
+#![deny(rustdoc::broken_intra_doc_links)]
 
 mod features;
 mod native;
@@ -21,9 +63,36 @@ use nanocodex_tools::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 const MAX_VIEWPORT_DIMENSION: u32 = 16_384;
+
+pub(crate) fn trace_serialized<T>(kind: &'static str, value: &T)
+where
+    T: Serialize + ?Sized,
+{
+    if !tracing::enabled!(target: "nanocodex_browser", tracing::Level::INFO) {
+        return;
+    }
+    match serde_json::to_string(value) {
+        Ok(content) => {
+            info!(
+                target: "nanocodex_browser",
+                browser_content_kind = kind,
+                content,
+                "browser observed ordered content"
+            );
+        }
+        Err(error) => {
+            warn!(
+                target: "nanocodex_browser",
+                browser_content_kind = kind,
+                %error,
+                "failed to serialize browser trace content"
+            );
+        }
+    }
+}
 
 pub use features::{
     BrowserAccessibilityAudit, BrowserAccessibilityImpact, BrowserAccessibilityViolation,
@@ -2491,12 +2560,14 @@ impl BrowserRecording {
             state.current_url.clone_from(url);
         }
         let result = recording_result(sequence, &action, &state.current_url);
+        trace_serialized("recording.action.input", &action);
         info!(
             target: "nanocodex_browser",
             sequence,
             action = ?action,
             "recorded no-op browser action"
         );
+        trace_serialized("recording.action.result", &result);
         state
             .actions
             .push(RecordedBrowserAction { sequence, action });
@@ -3542,6 +3613,9 @@ impl Browser {
     /// Captures credential-bearing cookies and storage for currently open
     /// origins at the harness boundary.
     ///
+    /// Enabled browser tracing records the complete returned state. Protect
+    /// that backend with the same access and retention policy as a cookie jar.
+    ///
     /// # Errors
     ///
     /// Returns a typed browser or serialization error.
@@ -3551,6 +3625,7 @@ impl Browser {
 
     /// Replaces cookies and installs per-origin storage before future
     /// navigations. This method is deliberately absent from the browser tool.
+    /// Enabled browser tracing records the complete input state.
     ///
     /// # Errors
     ///
@@ -3662,12 +3737,8 @@ impl BrowserTool {
 
 #[async_trait]
 impl Tool for BrowserTool {
-    fn name(&self) -> &'static str {
-        "browser"
-    }
-
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition::function(self.name(), TOOL_DESCRIPTION, schema_for::<BrowserAction>())
+        ToolDefinition::function("browser", TOOL_DESCRIPTION, schema_for::<BrowserAction>())
             .with_output_schema(schema_for::<BrowserActionResult>())
     }
 

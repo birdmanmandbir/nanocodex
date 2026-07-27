@@ -11,6 +11,7 @@ repository.workspace = true
 description = "Public Nanocodex library examples"
 
 [dependencies]
+clap.workspace = true
 dotenvy.workspace = true
 eyre.workspace = true
 futures-util.workspace = true
@@ -21,8 +22,10 @@ nanocodex.workspace = true
 nanocodex-vm = { workspace = true, features = ["mpp"] }
 nanovm.workspace = true
 nanocodex-browser.workspace = true
+nanocodex-browser-vm.workspace = true
 nanocodex-react.workspace = true
 nanocodex-tools.workspace = true
+nanovm-image.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 reflink-copy.workspace = true
@@ -34,6 +37,7 @@ tokio-tungstenite.workspace = true
 tower.workspace = true
 axum.workspace = true
 tempfile.workspace = true
+tracing-subscriber.workspace = true
 url.workspace = true
 
 [[bin]]
@@ -103,6 +107,14 @@ path = "browser_canary.rs"
 [[bin]]
 name = "browser-bench"
 path = "browser_bench.rs"
+
+[[bin]]
+name = "browser-vm"
+path = "browser_vm.rs"
+
+[[bin]]
+name = "browser-vm-image"
+path = "browser_vm_image.rs"
 
 [[bin]]
 name = "browser-debug-bench"

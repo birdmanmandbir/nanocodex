@@ -10,7 +10,8 @@ use crate::BrowserSourceLocation;
 ///
 /// This is harness policy rather than a model-callable action. Header and HTTP
 /// credential values therefore never enter the browser tool schema or action
-/// results.
+/// results. When browser tracing is enabled, the complete policy is recorded
+/// as credential-bearing operational data.
 #[derive(Clone, Default)]
 pub struct BrowserContext {
     pub(crate) viewport: Option<BrowserViewport>,
@@ -64,60 +65,70 @@ impl std::fmt::Debug for BrowserContext {
 }
 
 impl BrowserContext {
+    /// Sets the viewport and input-device emulation.
     #[must_use]
     pub const fn viewport(mut self, viewport: BrowserViewport) -> Self {
         self.viewport = Some(viewport);
         self
     }
 
+    /// Overrides `navigator.language` and the browser locale.
     #[must_use]
     pub fn locale(mut self, locale: impl Into<String>) -> Self {
         self.locale = Some(locale.into());
         self
     }
 
+    /// Overrides the page timezone with an IANA timezone identifier.
     #[must_use]
     pub fn timezone(mut self, timezone: impl Into<String>) -> Self {
         self.timezone = Some(timezone.into());
         self
     }
 
+    /// Overrides the HTTP and JavaScript user-agent string.
     #[must_use]
     pub fn user_agent(mut self, user_agent: impl Into<String>) -> Self {
         self.user_agent = Some(user_agent.into());
         self
     }
 
+    /// Overrides `navigator.platform`.
     #[must_use]
     pub fn platform(mut self, platform: impl Into<String>) -> Self {
         self.platform = Some(platform.into());
         self
     }
 
+    /// Overrides the `Accept-Language` request header.
     #[must_use]
     pub fn accept_language(mut self, accept_language: impl Into<String>) -> Self {
         self.accept_language = Some(accept_language.into());
         self
     }
 
+    /// Overrides the `prefers-color-scheme` media feature.
     #[must_use]
     pub const fn color_scheme(mut self, color_scheme: BrowserColorScheme) -> Self {
         self.color_scheme = Some(color_scheme);
         self
     }
 
+    /// Overrides the `prefers-reduced-motion` media feature.
     #[must_use]
     pub const fn reduced_motion(mut self, reduced_motion: BrowserReducedMotion) -> Self {
         self.reduced_motion = Some(reduced_motion);
         self
     }
 
+    /// Supplies a fixed geolocation to pages granted geolocation permission.
     #[must_use]
     pub const fn geolocation(mut self, geolocation: BrowserGeolocation) -> Self {
         self.geolocation = Some(geolocation);
         self
     }
 
+    /// Grants one permission, optionally scoped to a single origin.
     #[must_use]
     pub fn grant_permission(mut self, permission: BrowserPermission, origin: Option<Url>) -> Self {
         self.permissions
@@ -125,12 +136,14 @@ impl BrowserContext {
         self
     }
 
+    /// Adds one request header to every page request.
     #[must_use]
     pub fn extra_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.extra_headers.push((name.into(), value.into()));
         self
     }
 
+    /// Configures HTTP basic-authentication credentials.
     #[must_use]
     pub fn http_credentials(
         mut self,
@@ -141,18 +154,21 @@ impl BrowserContext {
         self
     }
 
+    /// Evaluates JavaScript before application scripts on every page.
     #[must_use]
     pub fn init_script(mut self, source: impl Into<String>) -> Self {
         self.init_scripts.push(source.into());
         self
     }
 
+    /// Applies a deterministic CPU slowdown multiplier.
     #[must_use]
     pub const fn cpu_throttle_rate(mut self, rate: f64) -> Self {
         self.cpu_throttle_rate = Some(rate);
         self
     }
 
+    /// Applies deterministic offline, latency, and bandwidth conditions.
     #[must_use]
     pub const fn network(mut self, conditions: BrowserNetworkConditions) -> Self {
         self.network = Some(conditions);
@@ -172,6 +188,7 @@ pub struct BrowserViewport {
 }
 
 impl BrowserViewport {
+    /// Creates a desktop viewport with no touch emulation.
     #[must_use]
     pub const fn desktop(width: u32, height: u32) -> Self {
         Self {
@@ -184,6 +201,7 @@ impl BrowserViewport {
         }
     }
 
+    /// Creates a mobile viewport with touch emulation.
     #[must_use]
     pub const fn mobile(width: u32, height: u32, device_scale_factor: f64) -> Self {
         Self {
@@ -248,6 +266,7 @@ pub struct BrowserNetworkConditions {
 }
 
 impl BrowserNetworkConditions {
+    /// Creates an online connection without latency or bandwidth limits.
     #[must_use]
     pub const fn unrestricted() -> Self {
         Self {

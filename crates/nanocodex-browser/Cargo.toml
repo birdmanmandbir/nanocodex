@@ -40,8 +40,14 @@ url.workspace = true
 v8-heap-parser.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 eyre.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
+tracing-subscriber.workspace = true
+
+[[bench]]
+name = "browser_protocol"
+harness = false
 
 [lints]
 workspace = true

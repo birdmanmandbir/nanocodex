@@ -4,6 +4,7 @@
 [patch.crates-io]
 nanocodex = { path = "crates/nanocodex" }
 nanocodex-agent = { path = "crates/nanocodex-agent" }
+nanocodex-browser = { path = "crates/nanocodex-browser" }
 nanocodex-core = { path = "crates/nanocodex-core" }
 nanocodex-oai-api = { path = "crates/nanocodex-oai-api" }
 nanocodex-observability = { path = "crates/nanocodex-observability" }

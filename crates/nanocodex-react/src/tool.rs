@@ -31,12 +31,8 @@ impl ReactDoctorTool {
 
 #[async_trait::async_trait]
 impl Tool for ReactDoctorTool {
-    fn name(&self) -> &'static str {
-        "react_doctor"
-    }
-
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition::function(self.name(), DESCRIPTION, schema_for::<ReactDoctorArgs>())
+        ToolDefinition::function("react_doctor", DESCRIPTION, schema_for::<ReactDoctorArgs>())
             .with_output_schema(schema_for::<ReactReport>())
     }
 

@@ -105,6 +105,16 @@ impl BraveSession {
         self.include_site_data
     }
 
+    pub(crate) fn trace_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "executable": self.executable,
+            "userDataDirectory": self.user_data_dir,
+            "profileDirectory": self.profile_directory,
+            "allowedOrigins": self.allowed_origins,
+            "includeSiteData": self.include_site_data,
+        })
+    }
+
     pub(crate) fn validate_handoff_url(&self, url: &Url) -> Result<(), BraveSessionError> {
         if self
             .allowed_origins

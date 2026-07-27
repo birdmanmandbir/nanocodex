@@ -98,6 +98,7 @@ use crate::{
     VirtualAuthenticator, VirtualCredential,
     features::{BrowserColorScheme, BrowserContext, BrowserPermission, BrowserReducedMotion},
     session::cookie_applies_to,
+    trace_serialized,
 };
 
 const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(25);
@@ -562,12 +563,112 @@ struct PageStateWire {
     ready_state: String,
 }
 
+fn browser_context_trace_value(context: &BrowserContext) -> serde_json::Value {
+    let viewport = context.viewport.map(|viewport| {
+        serde_json::json!({
+            "width": viewport.width,
+            "height": viewport.height,
+            "deviceScaleFactor": viewport.device_scale_factor,
+            "mobile": viewport.mobile,
+            "touch": viewport.touch,
+            "maxTouchPoints": viewport.max_touch_points,
+        })
+    });
+    let geolocation = context.geolocation.map(|geolocation| {
+        serde_json::json!({
+            "latitude": geolocation.latitude,
+            "longitude": geolocation.longitude,
+            "accuracyMeters": geolocation.accuracy_meters,
+        })
+    });
+    let permissions = context
+        .permissions
+        .iter()
+        .map(|grant| {
+            serde_json::json!({
+                "permission": format!("{:?}", grant.permission),
+                "origin": grant.origin,
+            })
+        })
+        .collect::<Vec<_>>();
+    let extra_headers = context
+        .extra_headers
+        .iter()
+        .map(|(name, value)| serde_json::json!({ "name": name, "value": value }))
+        .collect::<Vec<_>>();
+    let http_credentials = context.http_credentials.as_ref().map(
+        |(username, password)| serde_json::json!({ "username": username, "password": password }),
+    );
+    let network = context.network.map(|network| {
+        serde_json::json!({
+            "offline": network.offline,
+            "latencyMs": network.latency_ms,
+            "downloadBytesPerSecond": network.download_bytes_per_second,
+            "uploadBytesPerSecond": network.upload_bytes_per_second,
+        })
+    });
+    serde_json::json!({
+        "viewport": viewport,
+        "locale": context.locale,
+        "timezone": context.timezone,
+        "userAgent": context.user_agent,
+        "platform": context.platform,
+        "acceptLanguage": context.accept_language,
+        "colorScheme": context.color_scheme.map(|value| format!("{value:?}")),
+        "reducedMotion": context.reduced_motion.map(|value| format!("{value:?}")),
+        "geolocation": geolocation,
+        "permissions": permissions,
+        "extraHeaders": extra_headers,
+        "httpCredentials": http_credentials,
+        "initScripts": context.init_scripts,
+        "cpuThrottleRate": context.cpu_throttle_rate,
+        "network": network,
+    })
+}
+
+fn trace_browser_configuration(owner: &NativeBrowser) {
+    let egress_policy = owner.egress_policy.as_ref().map(|policy| {
+        serde_json::json!({
+            "allowedOrigins": policy.allowed_origins,
+            "allowedDomainSuffixes": policy.allowed_domain_suffixes,
+            "allowLoopback": policy.allow_loopback,
+        })
+    });
+    let crux_client = owner.crux_client.as_ref().map(|client| {
+        serde_json::json!({
+            "apiKey": client.api_key,
+            "endpoint": client.endpoint,
+        })
+    });
+    let value = serde_json::json!({
+        "executable": owner.executable,
+        "cdpEndpoint": owner.cdp_endpoint,
+        "braveSession": owner.brave_session.as_ref().map(BraveSession::trace_value),
+        "virtualAuthenticator": owner.virtual_authenticator.is_some(),
+        "reactDiagnostics": owner.react_diagnostics.map(|diagnostics| {
+            serde_json::json!({
+                "includeProfilingHooks": diagnostics.include_profiling_hooks(),
+            })
+        }),
+        "egressPolicy": egress_policy,
+        "fileRoot": owner.file_root,
+        "context": browser_context_trace_value(&owner.context),
+        "storageState": owner.storage_state,
+        "afterAction": format!("{:?}", owner.after_action),
+        "ffmpegExecutable": owner.ffmpeg_executable,
+        "lighthouseExecutable": owner.lighthouse_executable,
+        "cruxClient": crux_client,
+    });
+    trace_serialized("session.configuration", &value);
+}
+
 impl Session {
     #[allow(
         clippy::too_many_lines,
         reason = "launch ordering is security-sensitive: guards and observers precede any real navigation"
     )]
     async fn launch(owner: &NativeBrowser) -> Result<Self, BrowserError> {
+        trace_browser_configuration(owner);
         let runtime_dir = owner.runtime_dir.path();
         let executable = owner.executable.as_deref();
         let cdp_endpoint = owner.cdp_endpoint.as_ref();
@@ -589,6 +690,9 @@ impl Session {
         } else {
             None
         };
+        if let Some(cookies) = &imported_cookies {
+            trace_serialized("session.imported_brave_cookies", cookies);
+        }
         if cdp_endpoint.is_none()
             && let Some(brave_session) = brave_session
         {
@@ -738,6 +842,7 @@ impl Session {
         brave_session: &BraveSession,
     ) -> Result<(), BrowserError> {
         let cookies = export_brave_cookies(runtime_dir, brave_session).await?;
+        trace_serialized("session.refreshed_brave_cookies", &cookies);
         replace_browser_cookies(&self.browser, cookies).await?;
         Ok(())
     }
@@ -1973,6 +2078,10 @@ impl NativeBrowser {
         }))
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the method keeps one browser action's bounded lifecycle and trace ordering linear"
+    )]
     pub(crate) async fn execute(
         &self,
         action: BrowserAction,
@@ -1995,6 +2104,7 @@ impl NativeBrowser {
             browser.action = ?action_name,
         );
         async {
+            trace_serialized("action.input", &action);
             if state.closed {
                 return Err(BrowserError::Closed);
             }
@@ -2055,9 +2165,16 @@ impl NativeBrowser {
                             .record_failure(sequence, duration, trace_action, error.to_string())
                             .await?;
                     }
+                    info!(
+                        target: "nanocodex_browser",
+                        sequence,
+                        error = %error,
+                        "browser action failed"
+                    );
                     return Err(error);
                 }
             };
+            trace_serialized("action.result", &result);
             info!(
                 target: "nanocodex_browser",
                 sequence,
@@ -2086,34 +2203,47 @@ impl NativeBrowser {
     }
 
     pub(crate) async fn storage_state(&self) -> Result<BrowserStorageState, BrowserError> {
-        let mut state = self.state.lock().await;
-        if state.closed {
-            return Err(BrowserError::Closed);
+        let span = info_span!(target: "nanocodex_browser", "browser.storage_state");
+        async {
+            let mut state = self.state.lock().await;
+            if state.closed {
+                return Err(BrowserError::Closed);
+            }
+            self.ensure_session(&mut state).await?;
+            let storage_state = state
+                .session
+                .as_ref()
+                .ok_or(BrowserError::SessionUnavailable)?
+                .storage_state()
+                .await?;
+            trace_serialized("storage_state.result", &storage_state);
+            Ok(storage_state)
         }
-        self.ensure_session(&mut state).await?;
-        state
-            .session
-            .as_ref()
-            .ok_or(BrowserError::SessionUnavailable)?
-            .storage_state()
-            .await
+        .instrument(span)
+        .await
     }
 
     pub(crate) async fn restore_storage_state(
         &self,
         storage_state: BrowserStorageState,
     ) -> Result<(), BrowserError> {
-        let mut state = self.state.lock().await;
-        if state.closed {
-            return Err(BrowserError::Closed);
+        let span = info_span!(target: "nanocodex_browser", "browser.restore_storage_state");
+        async {
+            trace_serialized("storage_state.input", &storage_state);
+            let mut state = self.state.lock().await;
+            if state.closed {
+                return Err(BrowserError::Closed);
+            }
+            self.ensure_session(&mut state).await?;
+            state
+                .session
+                .as_mut()
+                .ok_or(BrowserError::SessionUnavailable)?
+                .restore_storage_state(storage_state)
+                .await
         }
-        self.ensure_session(&mut state).await?;
-        state
-            .session
-            .as_mut()
-            .ok_or(BrowserError::SessionUnavailable)?
-            .restore_storage_state(storage_state)
-            .await
+        .instrument(span)
+        .await
     }
 
     async fn ensure_session(&self, state: &mut BrowserState) -> Result<(), BrowserError> {
@@ -4450,6 +4580,7 @@ async fn start_diagnostics(
     let console_diagnostics = Arc::clone(&diagnostics);
     let console = tokio::spawn(async move {
         while let Some(event) = console_events.next().await {
+            trace_serialized("devtools.Runtime.consoleAPICalled", event.as_ref());
             let entry = BrowserConsoleEntry {
                 sequence: 0,
                 level: event.r#type.as_ref().to_owned(),
@@ -4472,6 +4603,7 @@ async fn start_diagnostics(
     let error_diagnostics = Arc::clone(&diagnostics);
     let errors = tokio::spawn(async move {
         while let Some(event) = error_events.next().await {
+            trace_serialized("devtools.Runtime.exceptionThrown", event.as_ref());
             let details = &event.exception_details;
             let error = BrowserPageError {
                 sequence: 0,
@@ -4496,6 +4628,7 @@ async fn start_diagnostics(
     let request_diagnostics = Arc::clone(&diagnostics);
     let requests = tokio::spawn(async move {
         while let Some(event) = request_events.next().await {
+            trace_serialized("devtools.Network.requestWillBeSent", event.as_ref());
             let id = event.request_id.as_ref().to_owned();
             let timestamp = *event.timestamp.inner();
             let Ok(mut diagnostics) = request_diagnostics.lock() else {
@@ -4551,6 +4684,7 @@ async fn start_diagnostics(
     let response_diagnostics = Arc::clone(&diagnostics);
     let responses = tokio::spawn(async move {
         while let Some(event) = response_events.next().await {
+            trace_serialized("devtools.Network.responseReceived", event.as_ref());
             let id = event.request_id.as_ref();
             let Ok(mut diagnostics) = response_diagnostics.lock() else {
                 break;
@@ -4563,6 +4697,7 @@ async fn start_diagnostics(
     let finished_diagnostics = Arc::clone(&diagnostics);
     let finished = tokio::spawn(async move {
         while let Some(event) = finished_events.next().await {
+            trace_serialized("devtools.Network.loadingFinished", event.as_ref());
             let id = event.request_id.as_ref();
             let Ok(mut diagnostics) = finished_diagnostics.lock() else {
                 break;
@@ -4579,6 +4714,7 @@ async fn start_diagnostics(
     let failed_diagnostics = Arc::clone(&diagnostics);
     let failures = tokio::spawn(async move {
         while let Some(event) = failed_events.next().await {
+            trace_serialized("devtools.Network.loadingFailed", event.as_ref());
             let id = event.request_id.as_ref();
             let Ok(mut diagnostics) = failed_diagnostics.lock() else {
                 break;
@@ -4596,6 +4732,7 @@ async fn start_diagnostics(
     let web_socket_created_diagnostics = Arc::clone(&diagnostics);
     let web_socket_created = tokio::spawn(async move {
         while let Some(event) = web_socket_created_events.next().await {
+            trace_serialized("devtools.Network.webSocketCreated", event.as_ref());
             let id = event.request_id.as_ref().to_owned();
             let Ok(mut diagnostics) = web_socket_created_diagnostics.lock() else {
                 break;
@@ -4646,6 +4783,10 @@ async fn start_diagnostics(
     let web_socket_request_diagnostics = Arc::clone(&diagnostics);
     let web_socket_requests = tokio::spawn(async move {
         while let Some(event) = web_socket_request_events.next().await {
+            trace_serialized(
+                "devtools.Network.webSocketWillSendHandshakeRequest",
+                event.as_ref(),
+            );
             let id = event.request_id.as_ref().to_owned();
             let timestamp = *event.timestamp.inner();
             let Ok(mut diagnostics) = web_socket_request_diagnostics.lock() else {
@@ -4701,6 +4842,10 @@ async fn start_diagnostics(
     let web_socket_response_diagnostics = Arc::clone(&diagnostics);
     let web_socket_responses = tokio::spawn(async move {
         while let Some(event) = web_socket_response_events.next().await {
+            trace_serialized(
+                "devtools.Network.webSocketHandshakeResponseReceived",
+                event.as_ref(),
+            );
             let id = event.request_id.as_ref();
             let Ok(mut diagnostics) = web_socket_response_diagnostics.lock() else {
                 break;
@@ -4717,6 +4862,7 @@ async fn start_diagnostics(
     let web_socket_sent_diagnostics = Arc::clone(&diagnostics);
     let web_socket_sent = tokio::spawn(async move {
         while let Some(event) = web_socket_sent_events.next().await {
+            trace_serialized("devtools.Network.webSocketFrameSent", event.as_ref());
             let Ok(mut diagnostics) = web_socket_sent_diagnostics.lock() else {
                 break;
             };
@@ -4734,6 +4880,7 @@ async fn start_diagnostics(
     let web_socket_received_diagnostics = Arc::clone(&diagnostics);
     let web_socket_received = tokio::spawn(async move {
         while let Some(event) = web_socket_received_events.next().await {
+            trace_serialized("devtools.Network.webSocketFrameReceived", event.as_ref());
             let Ok(mut diagnostics) = web_socket_received_diagnostics.lock() else {
                 break;
             };
@@ -4750,6 +4897,7 @@ async fn start_diagnostics(
     let web_socket_error_diagnostics = Arc::clone(&diagnostics);
     let web_socket_errors = tokio::spawn(async move {
         while let Some(event) = web_socket_error_events.next().await {
+            trace_serialized("devtools.Network.webSocketFrameError", event.as_ref());
             let Ok(mut diagnostics) = web_socket_error_diagnostics.lock() else {
                 break;
             };
@@ -4764,6 +4912,7 @@ async fn start_diagnostics(
     let web_socket_closed_diagnostics = diagnostics;
     let web_socket_closed = tokio::spawn(async move {
         while let Some(event) = web_socket_closed_events.next().await {
+            trace_serialized("devtools.Network.webSocketClosed", event.as_ref());
             let Ok(mut diagnostics) = web_socket_closed_diagnostics.lock() else {
                 break;
             };
@@ -4778,6 +4927,7 @@ async fn start_diagnostics(
         .await?;
     let dialogs = tokio::spawn(async move {
         while let Some(event) = dialog_events.next().await {
+            trace_serialized("devtools.Page.javascriptDialogOpening", event.as_ref());
             let kind = match event.r#type.as_ref() {
                 "alert" => BrowserDialogKind::Alert,
                 "confirm" => BrowserDialogKind::Confirm,
@@ -4836,6 +4986,7 @@ async fn start_download_diagnostics(
     let started_page = page.clone();
     let started = tokio::spawn(async move {
         while let Some(event) = started_events.next().await {
+            trace_serialized("devtools.Browser.downloadWillBegin", event.as_ref());
             let cancel = {
                 let Ok(mut diagnostics) = started_diagnostics.lock() else {
                     break;
@@ -4854,6 +5005,7 @@ async fn start_download_diagnostics(
     let progress_page = page.clone();
     let progress = tokio::spawn(async move {
         while let Some(event) = progress_events.next().await {
+            trace_serialized("devtools.Browser.downloadProgress", event.as_ref());
             let cancel = {
                 let Ok(mut diagnostics) = diagnostics.lock() else {
                     break;
@@ -6258,6 +6410,8 @@ const REMOVE_ANNOTATIONS_SCRIPT: &str =
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex as StdMutex};
+
     use chromiumoxide::cdp::browser_protocol::network::{
         Cookie, CookieParam, CookiePriority, CookieSourceScheme, TimeSinceEpoch,
     };
@@ -6267,12 +6421,93 @@ mod tests {
         BrowserConfig, Chromium, Diagnostics, GateSignals, MAX_ACTION_INPUT_BYTES,
         MAX_CONSOLE_ENTRIES, MAX_DIAGNOSTIC_TEXT_BYTES, MAX_NETWORK_REQUESTS, NetworkSource,
         allowed_cookie_params, brave_launch_config, build_config, classify_gate, close_chromium,
-        cookie_param, diagnostic_limit, validate_url,
+        cookie_param, diagnostic_limit, trace_browser_configuration, validate_url,
     };
     use crate::{
         BraveSession, Browser, BrowserAction, BrowserActionResult, BrowserConsoleEntry,
-        BrowserError, BrowserGate, BrowserNetworkRequest,
+        BrowserContext, BrowserCookie, BrowserCruxClient, BrowserError, BrowserGate,
+        BrowserNetworkRequest, BrowserOriginStorage, BrowserStorageState,
     };
+
+    #[derive(Clone, Default)]
+    struct TraceLog(Arc<StdMutex<Vec<u8>>>);
+
+    struct TraceWriter(Arc<StdMutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TraceLog {
+        type Writer = TraceWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            TraceWriter(Arc::clone(&self.0))
+        }
+    }
+
+    impl std::io::Write for TraceWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().write(bytes)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn full_fidelity_trace_retains_credential_bearing_configuration() {
+        let storage_state = BrowserStorageState {
+            cookies: vec![BrowserCookie {
+                name: "session".to_owned(),
+                value: "cookie-secret".to_owned(),
+                domain: "example.com".to_owned(),
+                path: "/".to_owned(),
+                expires_epoch_seconds: None,
+                http_only: true,
+                secure: true,
+                same_site: None,
+            }],
+            origins: vec![BrowserOriginStorage {
+                origin: "https://example.com".to_owned(),
+                local_storage: [("token".to_owned(), "storage-secret".to_owned())]
+                    .into_iter()
+                    .collect(),
+                session_storage: std::collections::BTreeMap::default(),
+            }],
+        };
+        let browser = Browser::builder()
+            .context(
+                BrowserContext::default()
+                    .extra_header("x-private", "header-secret")
+                    .http_credentials("trace-user", "password-secret")
+                    .init_script("globalThis.traceSecret = 'script-secret';"),
+            )
+            .storage_state(storage_state)
+            .crux_client(BrowserCruxClient::new("crux-secret"))
+            .build()
+            .unwrap();
+        let logs = TraceLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(logs.clone())
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        tracing::dispatcher::with_default(&dispatch, || {
+            trace_browser_configuration(&browser.inner);
+        });
+        let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+
+        for expected in [
+            "header-secret",
+            "password-secret",
+            "script-secret",
+            "cookie-secret",
+            "storage-secret",
+            "crux-secret",
+        ] {
+            assert!(logs.contains(expected), "trace omitted {expected}: {logs}");
+        }
+    }
 
     #[test]
     fn navigation_accepts_web_content_but_rejects_host_files() {

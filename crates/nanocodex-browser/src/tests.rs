@@ -2245,13 +2245,13 @@ text({
 "#;
 
 fn context() -> ToolContext<'static> {
-    ToolContext {
-        model: "test-model",
-        session_id: "test-session",
-        call_id: "test-call",
-        history: &[],
-        output_token_budget: DEFAULT_TOOL_OUTPUT_TOKENS,
-    }
+    ToolContext::new(
+        "test-model",
+        "test-session",
+        "test-call",
+        &[],
+        DEFAULT_TOOL_OUTPUT_TOKENS,
+    )
 }
 
 fn execution_text(output: &ToolOutputBody) -> Result<&str> {

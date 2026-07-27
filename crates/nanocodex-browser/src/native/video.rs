@@ -20,7 +20,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use tokio::{io::AsyncWriteExt, process::Command, sync::watch, task::JoinHandle, time::timeout};
 
-use crate::BrowserVideoArtifact;
+use crate::{BrowserVideoArtifact, trace_serialized};
 
 use super::{BrowserError, evaluate_typed};
 
@@ -123,6 +123,7 @@ pub(super) async fn start(
                     let Some(event) = event else {
                         break;
                     };
+                    trace_serialized("devtools.Page.screencastFrame", event.as_ref());
                     let retained = task_frames.load(Ordering::Relaxed) < MAX_VIDEO_FRAMES;
                     if retained {
                         let frame = STANDARD

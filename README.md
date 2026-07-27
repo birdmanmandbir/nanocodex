@@ -246,6 +246,70 @@ Tool schemas, inputs, outputs, errors, and call context are typed; workspace,
 agent-driver, MCP-connection, and process-manager state stay in higher
 implementations.
 
+## Browser and browser VM
+
+`nanocodex-browser` is a standalone deterministic CDP controller. Its typed
+actions cover semantic targeting, actionability, DOM and network inspection,
+screenshots, traces, audits, React diagnostics, passkeys, and replayable
+evidence. The same cloneable `Browser` can be driven directly or wrapped as an
+ordinary tool:
+
+```rust,ignore
+use nanocodex_browser::{Browser, BrowserAction, BrowserTool};
+
+let browser = Browser::new()?;
+browser
+    .execute(BrowserAction::Open {
+        url: "https://example.com/".to_owned(),
+    })
+    .await?;
+let browser_tool = BrowserTool::from_browser(browser.clone());
+```
+
+`nanocodex-browser-vm` composes that controller with a headed Chromium process
+inside a libkrun VM. The browser image is prepared once from
+[`crates/nanocodex-browser-vm/image/Dockerfile`](crates/nanocodex-browser-vm/image/Dockerfile);
+each session receives a disposable reflink, private gvproxy network, and random
+host-loopback CDP endpoint:
+
+```sh
+just prepare-browser-vm-image .cache/libkrunfw/libkrunfw
+```
+
+The command prints the content-addressed ext4 path. Supposing it printed the
+path from the retained baseline:
+
+```rust,ignore
+use nanocodex_browser::{Browser, ReactDiagnostics};
+use nanocodex_browser_vm::BrowserVm;
+
+let browser = BrowserVm::builder(
+    ".cache/browser-vm/builds/3f3f66dc5c70b2da77323f1ee1f0789b2bd61213c0d7eace6ef6bb2197af1f2d.ext4",
+    "target/release/vm-tools",
+    ".cache/gvproxy/v0.8.9/gvproxy",
+)
+.vmm_arg("--vmm")
+.firmware_directory(".cache/libkrunfw/libkrunfw")
+.browser(
+    Browser::builder()
+        .react_diagnostics(ReactDiagnostics::default()),
+)
+.spawn()
+.await?;
+
+let tools = nanocodex::Tools::builder()
+    .tool(browser.tool())
+    .build()?;
+let _ = tools;
+browser.shutdown().await?;
+```
+
+Authentication state and egress policy remain host configuration rather than
+model inputs. When `nanocodex_browser=info` is enabled, tracing records the
+complete harness configuration, credential-bearing storage, raw DevTools
+messages, actions, and results in order. Operators must protect that backend as
+a copy of the browser session.
+
 ## Components
 
 The core dependency direction is:
@@ -266,7 +330,9 @@ The monorepo also contains independently useful systems components:
 | `nanovm` | Typed libkrun lifecycle, disks, networking, egress capabilities, and shutdown |
 | `nanocodex-vm` | Bounded retained host/guest RPC and agent tools backed by one VM session tree |
 | `nanovm-image` | OCI/Dockerfile inputs to content-addressed immutable ext4 disks and attempt reflinks |
-| Browser VM | A headed browser inside an isolated VM with a private CDP endpoint |
+| `nanocodex-browser` | Deterministic typed CDP controller and ordinary browser tool |
+| `nanocodex-react` | Bounded Rust-native React source diagnostics and tool |
+| `nanocodex-browser-vm` | A headed browser inside an isolated VM with a private CDP endpoint |
 | VM egress | Host-owned network, MPP payment, and secret-injection policy |
 | `nanocodex-eval` | Typed tasks, attempts, scheduling, results, and sweeps |
 | Harbor adapter | Canonical Harbor/ATIF import and export |
@@ -326,6 +392,8 @@ Lower-level consumers can depend only on the component they need:
 cargo add nanocodex-oai-api
 cargo add nanocodex-tools
 cargo add nanocodex-agent
+cargo add nanocodex-browser
+cargo add nanocodex-react
 ```
 
 `nanocodex-oai-api` enables its Tower transports and managed session client by
@@ -342,6 +410,7 @@ published on crates.io, so Git/path consumers select them explicitly:
 cargo add nanovm --git https://github.com/gakonst/nanocodex
 cargo add nanocodex-vm --git https://github.com/gakonst/nanocodex
 cargo add nanovm-image --git https://github.com/gakonst/nanocodex
+cargo add nanocodex-browser-vm --git https://github.com/gakonst/nanocodex
 ```
 
 The daily-driver CLI is available on macOS and Linux:

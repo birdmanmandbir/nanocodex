@@ -28,7 +28,7 @@ use crate::{
     BrowserCoverage, BrowserCpuFunction, BrowserCpuProfile, BrowserHeapClass,
     BrowserHeapClassDelta, BrowserHeapComparison, BrowserHeapDuplicateString,
     BrowserHeapInspection, BrowserHeapNode, BrowserHeapRetainerNode, BrowserHeapRetainers,
-    BrowserHeapSnapshot, BrowserScriptCoverage,
+    BrowserHeapSnapshot, BrowserScriptCoverage, trace_serialized,
 };
 
 use super::BrowserError;
@@ -275,6 +275,10 @@ fn collect_heap_chunks(
                     let Some(chunk) = chunk else {
                         break;
                     };
+                    trace_serialized(
+                        "devtools.HeapProfiler.addHeapSnapshotChunk",
+                        chunk.as_ref(),
+                    );
                     file.write_all(chunk.chunk.as_bytes()).await?;
                     bytes = bytes.saturating_add(
                         u64::try_from(chunk.chunk.len()).unwrap_or(u64::MAX)
@@ -292,6 +296,7 @@ fn collect_heap_chunks(
         }
         if *stop.borrow() {
             while let Ok(Some(chunk)) = timeout(Duration::from_millis(50), chunks.next()).await {
+                trace_serialized("devtools.HeapProfiler.addHeapSnapshotChunk", chunk.as_ref());
                 file.write_all(chunk.chunk.as_bytes()).await?;
                 bytes = bytes.saturating_add(u64::try_from(chunk.chunk.len()).unwrap_or(u64::MAX));
                 if bytes > MAX_HEAP_BYTES {

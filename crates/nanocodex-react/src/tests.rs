@@ -212,11 +212,11 @@ text({
 }
 
 fn context() -> ToolContext<'static> {
-    ToolContext {
-        model: "react-doctor-test",
-        session_id: "react-doctor-test",
-        call_id: "react-doctor-test",
-        history: &[],
-        output_token_budget: DEFAULT_TOOL_OUTPUT_TOKENS,
-    }
+    ToolContext::new(
+        "react-doctor-test",
+        "react-doctor-test",
+        "react-doctor-test",
+        &[],
+        DEFAULT_TOOL_OUTPUT_TOKENS,
+    )
 }

@@ -160,6 +160,59 @@ bench-vm-live rootfs runtime firmware=".cache/libkrunfw/libkrunfw":
     NANOCODEX_VM_FIRMWARE="{{firmware}}" \
     cargo bench -p nanocodex-vm --bench vm_session -- vm_session_live
 
+# Build the release proof VMM and headed-browser consumers. The VMM requires
+# the Hypervisor entitlement on macOS.
+build-browser-vm-vmm:
+    cargo build --release -p nanocodex-examples --bin vm-tools --bin browser-vm --bin browser-vm-image
+    @if [ "$(uname -s)" = "Darwin" ]; then \
+        codesign --entitlements nanovm.entitlements --force --sign - target/release/vm-tools; \
+        codesign --verify --verbose=2 target/release/vm-tools; \
+    fi
+
+# Materialize the checked-in browser Dockerfile as one content-addressed ext4
+# image. The printed path is the input to smoke-browser-vm/bench-browser-live.
+prepare-browser-vm-image firmware=".cache/libkrunfw/libkrunfw" cache=".cache/browser-vm":
+    just build-vm-guest
+    just build-browser-vm-vmm
+    cargo run --release -p nanocodex-examples --bin browser-vm-image -- \
+        crates/nanocodex-browser-vm/image \
+        --vmm "{{justfile_directory()}}/target/release/vm-tools" \
+        --guest-runtime "{{justfile_directory()}}/target/aarch64-unknown-linux-musl/debug/nanocodex-vm-guest" \
+        --firmware-directory "{{firmware}}" \
+        --vmm-arg=--vmm \
+        --cache "{{cache}}" \
+        --disk-gib 2
+
+# Exercise headed Chromium, semantic snapshotting, screenshot capture, private
+# CDP forwarding, and graceful cleanup through the public browser-VM API.
+smoke-browser-vm rootfs gvproxy firmware=".cache/libkrunfw/libkrunfw":
+    just build-browser-vm-vmm
+    "{{justfile_directory()}}/target/release/browser-vm" \
+        "{{rootfs}}" \
+        "{{justfile_directory()}}/target/release/vm-tools" \
+        "{{gvproxy}}" \
+        --vmm-arg=--vmm \
+        --firmware-directory "{{firmware}}"
+
+# Deterministic typed browser protocol and retained-recording latency gates.
+bench-browser:
+    cargo bench -p nanocodex-browser --bench browser_protocol
+
+# Live cached-image boot, first action, warm CDP actions, screenshot, and
+# teardown. Criterion runs with the crate as cwd, so normalize artifact paths.
+bench-browser-live rootfs gvproxy firmware=".cache/libkrunfw/libkrunfw":
+    just build-browser-vm-vmm
+    browser_rootfs="$(realpath "{{rootfs}}")"; \
+    browser_vmm="$(realpath "{{justfile_directory()}}/target/release/vm-tools")"; \
+    browser_gvproxy="$(realpath "{{gvproxy}}")"; \
+    browser_firmware="$(realpath "{{firmware}}")"; \
+    NANOCODEX_BROWSER_VM_ROOTFS="$browser_rootfs" \
+    NANOCODEX_BROWSER_VM_VMM="$browser_vmm" \
+    NANOCODEX_BROWSER_VM_GVPROXY="$browser_gvproxy" \
+    NANOCODEX_BROWSER_VM_FIRMWARE="$browser_firmware" \
+    NANOCODEX_BROWSER_VM_VMM_ARGS='["--vmm"]' \
+    cargo bench -p nanocodex-browser-vm --bench browser_vm
+
 # Run a tool-using turn and retain events and diagnostic logs independently.
 otel-demo:
     @test -n "${OPENAI_API_KEY:-}" || { echo "set OPENAI_API_KEY in .env or the environment" >&2; exit 2; }

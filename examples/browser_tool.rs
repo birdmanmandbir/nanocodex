@@ -150,13 +150,13 @@ async fn main() -> Result<()> {
 }
 
 fn context() -> ToolContext<'static> {
-    ToolContext {
-        model: "browser-tool-example",
-        session_id: "browser-tool-example",
-        call_id: "browser-tool-example",
-        history: &[],
-        output_token_budget: DEFAULT_TOOL_OUTPUT_TOKENS,
-    }
+    ToolContext::new(
+        "browser-tool-example",
+        "browser-tool-example",
+        "browser-tool-example",
+        &[],
+        DEFAULT_TOOL_OUTPUT_TOKENS,
+    )
 }
 
 fn execution_text(output: &ToolOutputBody) -> Result<&str> {

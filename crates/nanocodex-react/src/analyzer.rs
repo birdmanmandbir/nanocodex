@@ -28,11 +28,17 @@ const MAX_FAILURE_MESSAGE_BYTES: usize = 4 * 1024;
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ReactRule {
+    /// A rendered list uses its unstable array position as the React key.
     ArrayIndexKey,
+    /// An effect callback is `async` instead of returning a cleanup function.
     AsyncEffectCallback,
+    /// A button omits its explicit HTML `type`.
     ButtonMissingType,
+    /// An image omits alternative text.
     ImageMissingAlt,
+    /// A context provider creates a new object or array value during render.
     UnstableContextValue,
+    /// A component injects unsanitized HTML through `dangerouslySetInnerHTML`.
     UnsafeRawHtml,
 }
 
@@ -40,7 +46,9 @@ pub enum ReactRule {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReactSeverity {
+    /// A finding worth reviewing that may be intentional.
     Warning,
+    /// A finding likely to cause incorrect or unsafe behavior.
     Error,
 }
 
@@ -48,9 +56,13 @@ pub enum ReactSeverity {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReactCategory {
+    /// Semantics that affect assistive technologies and keyboard users.
     Accessibility,
+    /// Behavior that can render or update incorrectly.
     Correctness,
+    /// Patterns that can cause avoidable rendering work.
     Performance,
+    /// Patterns that can cross a trust boundary unsafely.
     Security,
 }
 
@@ -58,11 +70,17 @@ pub enum ReactCategory {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReactSourceSpan {
+    /// Inclusive zero-based UTF-8 byte offset.
     pub start_byte: u32,
+    /// Exclusive zero-based UTF-8 byte offset.
     pub end_byte: u32,
+    /// One-based starting line.
     pub line: u32,
+    /// One-based starting column.
     pub column: u32,
+    /// One-based ending line.
     pub end_line: u32,
+    /// One-based ending column.
     pub end_column: u32,
 }
 
@@ -70,12 +88,19 @@ pub struct ReactSourceSpan {
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReactDiagnostic {
+    /// Source path relative to the analyzer root.
     pub path: PathBuf,
+    /// Rule that produced this finding.
     pub rule: ReactRule,
+    /// Review priority assigned by the rule.
     pub severity: ReactSeverity,
+    /// User-facing class of problem.
     pub category: ReactCategory,
+    /// Exact source range that triggered the rule.
     pub span: ReactSourceSpan,
+    /// Concise explanation of the finding.
     pub message: String,
+    /// Concrete remediation guidance.
     pub help: String,
 }
 
@@ -83,8 +108,11 @@ pub struct ReactDiagnostic {
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReactAnalysisFailure {
+    /// Source path relative to the analyzer root.
     pub path: PathBuf,
+    /// Stable failure classification.
     pub kind: ReactAnalysisFailureKind,
+    /// Bounded parser, filesystem, or walker diagnostic.
     pub message: String,
 }
 
@@ -92,9 +120,13 @@ pub struct ReactAnalysisFailure {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReactAnalysisFailureKind {
+    /// The source file could not be opened or read as UTF-8.
     Read,
+    /// The Oxc parser rejected the source.
     Syntax,
+    /// The source exceeded the configured per-file byte limit.
     TooLarge,
+    /// Directory traversal failed for this path.
     Walk,
 }
 
@@ -102,10 +134,15 @@ pub enum ReactAnalysisFailureKind {
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReactReport {
+    /// Analyzed file or subtree relative to the configured root.
     pub root: PathBuf,
+    /// Number of source files parsed successfully.
     pub analyzed_files: usize,
+    /// Deterministically ordered actionable findings.
     pub diagnostics: Vec<ReactDiagnostic>,
+    /// Recoverable per-file failures that did not abort the scan.
     pub failures: Vec<ReactAnalysisFailure>,
+    /// Whether findings exceeded the configured report limit.
     pub diagnostics_truncated: bool,
 }
 
@@ -358,16 +395,21 @@ impl ReactDoctorBuilder {
 /// Error building a React analyzer.
 #[derive(Debug, thiserror::Error)]
 pub enum ReactDoctorBuildError {
+    /// At least one configured hard limit was zero.
     #[error("React analyzer limits must be greater than zero")]
     ZeroLimit,
 
+    /// The configured analyzer root could not be canonicalized.
     #[error("failed to resolve React analyzer root {}", root.display())]
     ResolveRoot {
+        /// Unresolved caller-supplied root.
         root: PathBuf,
+        /// Filesystem failure returned while resolving it.
         #[source]
         source: std::io::Error,
     },
 
+    /// The resolved analyzer root is not a directory.
     #[error("React analyzer root is not a directory: {}", .0.display())]
     RootNotDirectory(PathBuf),
 }
@@ -375,25 +417,40 @@ pub enum ReactDoctorBuildError {
 /// Error running a React analysis.
 #[derive(Debug, thiserror::Error)]
 pub enum ReactDoctorError {
+    /// The selected file or subtree could not be canonicalized.
     #[error("failed to resolve React analysis target {}", path.display())]
     ResolveTarget {
+        /// Unresolved caller-selected target.
         path: PathBuf,
+        /// Filesystem failure returned while resolving it.
         #[source]
         source: std::io::Error,
     },
 
+    /// The selected target resolves outside the configured security boundary.
     #[error(
         "React analysis target {} escapes configured root {}",
         target.display(),
         root.display()
     )]
-    OutsideRoot { root: PathBuf, target: PathBuf },
+    OutsideRoot {
+        /// Canonical configured security boundary.
+        root: PathBuf,
+        /// Canonical target that escaped it.
+        target: PathBuf,
+    },
 
+    /// Candidate source files exceeded the configured hard limit.
     #[error(
         "React analysis target {} exceeded the configured limit of {maximum} source files",
         target.display()
     )]
-    FileLimit { target: PathBuf, maximum: usize },
+    FileLimit {
+        /// File or subtree being analyzed.
+        target: PathBuf,
+        /// Maximum candidate source-file count.
+        maximum: usize,
+    },
 }
 
 fn canonicalize_target(root: &Path, path: &Path) -> Result<PathBuf, ReactDoctorError> {

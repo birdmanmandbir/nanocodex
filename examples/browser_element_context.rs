@@ -74,13 +74,13 @@ async fn main() -> Result<()> {
 }
 
 fn context() -> ToolContext<'static> {
-    ToolContext {
-        model: "browser-element-context-example",
-        session_id: "browser-element-context-example",
-        call_id: "browser-element-context-example",
-        history: &[],
-        output_token_budget: DEFAULT_TOOL_OUTPUT_TOKENS,
-    }
+    ToolContext::new(
+        "browser-element-context-example",
+        "browser-element-context-example",
+        "browser-element-context-example",
+        &[],
+        DEFAULT_TOOL_OUTPUT_TOKENS,
+    )
 }
 
 fn execution_text(output: &ToolOutputBody) -> Result<&str> {

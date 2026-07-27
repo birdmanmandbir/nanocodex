@@ -28,7 +28,7 @@ use tokio::time::{sleep, timeout};
 
 use crate::{
     BrowserActionNetwork, BrowserClickOptions, BrowserKeyModifier, BrowserLoadState,
-    BrowserMouseButton, BrowserSnapshotMatch, BrowserWaitForSelectorState,
+    BrowserMouseButton, BrowserSnapshotMatch, BrowserWaitForSelectorState, trace_serialized,
 };
 
 use super::{
@@ -368,20 +368,21 @@ pub(super) async fn dispatch_drag(
             moved.buttons = Some(1);
             page.execute(moved).await?;
         }
-        Ok::<_, BrowserError>(
-            timeout(Duration::from_secs(2), intercepted.next())
-                .await
-                .ok()
-                .flatten()
-                .map_or_else(
-                    || DragData {
-                        items: vec![DragDataItem::new("text/plain", "")],
-                        files: None,
-                        drag_operations_mask: 1,
-                    },
-                    |event| event.data.clone(),
-                ),
-        )
+        let intercepted = timeout(Duration::from_secs(2), intercepted.next())
+            .await
+            .ok()
+            .flatten();
+        if let Some(event) = &intercepted {
+            trace_serialized("devtools.Input.dragIntercepted", event.as_ref());
+        }
+        Ok::<_, BrowserError>(intercepted.map_or_else(
+            || DragData {
+                items: vec![DragDataItem::new("text/plain", "")],
+                files: None,
+                drag_operations_mask: 1,
+            },
+            |event| event.data.clone(),
+        ))
     }
     .await;
     let disable = page.execute(SetInterceptDragsParams::new(false)).await;

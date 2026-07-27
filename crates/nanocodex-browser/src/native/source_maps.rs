@@ -25,7 +25,7 @@ use url::Url;
 
 use crate::{
     BrowserConsoleEntry, BrowserPageError, BrowserPerformanceInsight, BrowserPerformanceSource,
-    BrowserSourceLocation, BrowserStackFrame,
+    BrowserSourceLocation, BrowserStackFrame, trace_serialized,
 };
 
 use super::BrowserError;
@@ -221,6 +221,7 @@ pub(super) async fn start(
     let page = page.clone();
     let task = tokio::spawn(async move {
         while let Some(event) = events.next().await {
+            trace_serialized("devtools.Debugger.scriptParsed", event.as_ref());
             let script_id = event.script_id.as_ref().to_owned();
             {
                 let Ok(mut script_urls) = task_maps.script_urls.lock() else {

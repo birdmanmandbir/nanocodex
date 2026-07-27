@@ -3,7 +3,7 @@
 All language consumers live at this repository boundary:
 
 - Rust: `minimal.rs`, `follow_on.rs`, `lifecycle.rs`, `custom_tool.rs`,
-  `vm_tools.rs`,
+  `vm_tools.rs`, `browser_vm.rs`, `browser_vm_image.rs`,
   `browser_tool.rs`, `browser_bench.rs`, `browser_debug_bench.rs`,
   `browser_inspect.rs`, `browser_element_context.rs`,
   `react_doctor.rs`,
@@ -30,6 +30,11 @@ NANOCODEX_SUBAGENT_JSONL=1 cargo run -p nanocodex-examples --bin subagents
 cargo run -p nanocodex-examples --bin mcp
 just build-vm-example
 target/debug/vm-tools ROOTFS [GUEST_RUNTIME_BINARY_OR_EXT4] [--prove-mpp] [--prove-browser]
+just prepare-browser-vm-image .cache/libkrunfw/libkrunfw
+just smoke-browser-vm \
+  .cache/browser-vm/builds/CONTENT_HASH.ext4 \
+  .cache/gvproxy/v0.8.9/gvproxy \
+  .cache/libkrunfw/libkrunfw
 cargo run -p nanocodex-examples --bin browser-tool
 cargo run -p nanocodex-examples --bin browser-tool -- \
   --cdp-endpoint ws://127.0.0.1:9222/devtools/browser/SESSION
@@ -91,6 +96,13 @@ host-owned MPP proxy and verify one payment and one exact replay.
 Pass `--prove-browser` to additionally compose the cloneable VM tools and one
 host-owned browser in the same `Tools` value, then exercise both concurrently
 from one Code Mode cell.
+
+`browser-vm-image` prepares the checked-in browser Dockerfile as a
+content-addressed ext4 image and prints its path. `browser-vm` boots that image,
+drives the headed Chromium process through the public `BrowserVm` and `Browser`
+APIs, verifies a semantic snapshot, writes a screenshot, and shuts the VM down
+cleanly. The `prepare-browser-vm-image` and `smoke-browser-vm` recipes build and
+ad-hoc-sign the required macOS VMM before running those consumers.
 
 The Rust `browser-tool` example does not call the model and needs no API key. It
 exercises the real browser through the same Code Mode nested-tool path used by

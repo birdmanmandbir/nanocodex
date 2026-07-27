@@ -36,7 +36,7 @@ use crate::{
     BrowserBreakpoint, BrowserCssProperty, BrowserCssRule, BrowserCssSourceRange,
     BrowserDebuggerFrame, BrowserDebuggerPause, BrowserDebuggerScope, BrowserEventListener,
     BrowserMatchedStyles, BrowserPauseOnExceptions, BrowserPseudoClass, BrowserSourceLocation,
-    BrowserStorageReport,
+    BrowserStorageReport, trace_serialized,
 };
 
 use super::{BrowserError, ElementTarget, element_script, evaluate_typed, source_maps::SourceMaps};
@@ -73,6 +73,7 @@ pub(super) async fn start(
     let style_sheets = Arc::clone(&diagnostics.style_sheets);
     let styles = tokio::spawn(async move {
         while let Some(event) = style_events.next().await {
+            trace_serialized("devtools.CSS.styleSheetAdded", event.as_ref());
             let Ok(mut style_sheets) = style_sheets.lock() else {
                 break;
             };
@@ -94,6 +95,7 @@ pub(super) async fn start(
     let pause_state = Arc::clone(&diagnostics.pause);
     let pauses = tokio::spawn(async move {
         while let Some(event) = pause_events.next().await {
+            trace_serialized("devtools.Debugger.paused", event.as_ref());
             let frames = event
                 .call_frames
                 .iter()
@@ -115,7 +117,8 @@ pub(super) async fn start(
     });
     let document_requested = Arc::clone(&diagnostics.dom_document_requested);
     let documents = tokio::spawn(async move {
-        while document_events.next().await.is_some() {
+        while let Some(event) = document_events.next().await {
+            trace_serialized("devtools.DOM.documentUpdated", event.as_ref());
             let Ok(mut requested) = document_requested.lock() else {
                 break;
             };

@@ -13,6 +13,8 @@ crates=(
   nanocodex-service
   nanocodex-tools
   nanocodex-agent
+  nanocodex-browser
+  nanocodex-react
   nanocodex
 )
 

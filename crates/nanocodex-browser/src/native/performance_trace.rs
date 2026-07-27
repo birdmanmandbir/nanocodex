@@ -23,7 +23,7 @@ use tokio::{sync::oneshot, task::JoinHandle, time::timeout};
 
 use crate::{
     BrowserNetworkRequest, BrowserPerformanceInsight, BrowserPerformanceSource,
-    BrowserPerformanceTrace,
+    BrowserPerformanceTrace, trace_serialized,
 };
 
 use super::{BrowserError, evaluate_typed, source_maps::SourceMaps};
@@ -80,6 +80,7 @@ pub(super) async fn start(
                     let Some(event) = event else {
                         break true;
                     };
+                    trace_serialized("devtools.Tracing.dataCollected", event.as_ref());
                     if !retain_events(
                         &task_events,
                         &task_dropped,
@@ -90,10 +91,14 @@ pub(super) async fn start(
                     }
                 }
                 event = completed.next() => {
+                    if let Some(event) = event.as_ref() {
+                        trace_serialized("devtools.Tracing.tracingComplete", event.as_ref());
+                    }
                     let data_loss = event.is_none_or(|event| event.data_loss_occurred);
                     while let Ok(Some(event)) =
                         timeout(Duration::from_millis(50), data.next()).await
                     {
+                        trace_serialized("devtools.Tracing.dataCollected", event.as_ref());
                         if !retain_events(
                             &task_events,
                             &task_dropped,

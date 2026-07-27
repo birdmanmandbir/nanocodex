@@ -121,11 +121,12 @@ nanocodex-tools-macros
 Systems and evaluation crates remain below the agent:
 
 ```text
-nanovm-image ──> nanocodex-vm ──> nanovm
+nanovm-image ────────────────> nanovm
+nanocodex-vm ────────────────> nanovm
 
 nanocodex-browser-vm
 ├── nanocodex-browser
-└── nanocodex-vm ──> nanovm
+└── nanovm
 
 nanocodex-vm-egress
 ├── neutral EgressLease composition
@@ -750,11 +751,21 @@ substituting an older hypervisor API.
 
 ### 7. Browser on VM
 
-- Land the deterministic browser controller as its own component.
-- Compose it with the headed browser-in-VM lifecycle.
-- Keep authentication, policy, and secrets host-owned.
-- Benchmark warm boot, first action, semantic snapshot, screenshot, and
+- [x] Land the deterministic browser controller as its own component.
+- [x] Compose it with the headed browser-in-VM lifecycle.
+- [x] Keep authentication, policy, and secrets host-owned.
+- [x] Benchmark warm boot, first action, semantic snapshot, screenshot, and
   teardown with retained browser fixtures.
+
+Evidence:
+[`benchmarks/refactor_browser_baseline_2026-07-26.md`](benchmarks/refactor_browser_baseline_2026-07-26.md)
+records deterministic typed-protocol and real headed-browser VM baselines. The
+live proof prepares the browser image through public image APIs, boots
+Chromium/Xvfb behind a private gvproxy network, drives the same typed
+`Browser`/`BrowserTool` contract used by host and remote-CDP consumers,
+captures a semantic snapshot and PNG, and reaps the complete runtime. The
+composition depends directly on `nanovm`; it does not route through
+`nanocodex-vm`, whose narrower job is retained agent tool RPC.
 
 ### 8. MPP and secret egress
 

@@ -9,7 +9,7 @@ use eyre::{Result, WrapErr, eyre};
 use nanocodex::{
     AgentEvents, DurableSession, McpHandle, Nanocodex, OpenAiAuth, OpenAiAuthMode, PricingSnapshot,
     ReasoningMode, Responses, ResponsesHistory, ResponsesTransport, RolloutConfig, SessionId,
-    SessionSnapshot, Thinking, Tools,
+    SessionSnapshot, Thinking, Tools, ToolsBuilder,
 };
 use nanocodex_browser::{
     BraveSession, Browser, BrowserTool, ReactDiagnostics, VirtualAuthenticator,
@@ -211,6 +211,7 @@ impl AgentArgs {
     async fn build_inner(self, durable: Option<DurableSession>) -> Result<ConfiguredAgent> {
         let codex_home = default_codex_home()?;
         let pricing = load_pricing(self.pricing_file.as_deref())?;
+        let mut tools = self.tools_builder()?;
         let responses_transport = self.responses_transport();
         let session = prepare_session_build(self.cwd, self.rollouts, &codex_home, durable)?;
         let mpp_enabled = self.mpp.is_enabled();
@@ -327,6 +328,14 @@ impl AgentArgs {
             tools = tools.tool(ReactDoctorTool::new(react_doctor));
         }
         Ok(tools)
+    }
+
+    fn tools_builder(&self) -> Result<ToolsBuilder> {
+        self.configure_browser_tools(
+            Tools::builder()
+                .web_search(self.web_search)
+                .image_generation(self.image_generation),
+        )
     }
 
     fn build_browser(&self) -> Result<Option<Browser>> {

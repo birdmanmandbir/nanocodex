@@ -981,11 +981,11 @@ mod tests {
         atomic::{AtomicBool, Ordering},
     };
 
-    use nanocodex_oai_api::{OpenAiAuth, ToolDefinition};
+    use nanocodex_oai_api::{ImageDetail, OpenAiAuth, ToolDefinition};
     use serde::Deserialize;
     use serde_json::json;
 
-    use crate::{DEFAULT_TOOL_OUTPUT_TOKENS, ToolOutputBody, ToolResult};
+    use crate::{DEFAULT_TOOL_OUTPUT_TOKENS, ToolOutputBody, ToolOutputContent, ToolResult};
 
     use super::{
         DynamicToolProvider, ImageGenerationConfig, Tool, ToolContext, ToolExecution, ToolInput,
@@ -1023,7 +1023,7 @@ mod tests {
             }],
         );
 
-        assert_eq!(execution.value(), rich);
+        assert_eq!(execution.code_mode_value(), rich);
         let ToolOutputBody::Content(content) = execution.output else {
             panic!("expected multimodal content");
         };

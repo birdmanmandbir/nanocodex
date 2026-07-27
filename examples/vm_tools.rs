@@ -22,6 +22,8 @@ use mpp::{
 };
 use mpp_egress::{EgressPolicy, MppEgress};
 use nanocodex::{Tool, ToolContext, ToolExecution, ToolInput, ToolOutputBody, ToolOutputContent};
+use nanocodex_browser::{Browser, BrowserTool};
+use nanocodex_tools::ToolRuntime;
 use nanocodex_vm::{GuestRuntimeDisk, VmToolSession, mpp_egress_layer};
 use nanovm::{
     BlockDevice, EgressLease, EgressMount, GUEST_EGRESS_ROOT, GuestCommand, VmConfig,
@@ -34,6 +36,30 @@ use tokio::process::Command;
 const GUEST_RUNTIME: &str = "/usr/local/bin/nanocodex-vm-guest";
 const RUNTIME_BLOCK_DEVICE: &str = "/dev/vdb";
 const RUNTIME_MOUNT: &str = "/run/nanocodex";
+const VM_BROWSER_PROOF: &str = r#"
+const [shell, opened] = await Promise.all([
+  tools.exec_command({
+    cmd: "printf vm-workspace",
+    workdir: "/workspace",
+    login: false
+  }),
+  tools.browser({
+    action: "open",
+    url: "data:text/html,<main>host-browser</main>"
+  })
+]);
+const page = await tools.browser({
+  action: "get_text",
+  target: { by: "css", selector: "main" }
+});
+if (shell.exit_code !== 0 || !shell.output.includes("vm-workspace")) {
+  throw new Error("exec_command did not execute in the VM");
+}
+if (opened.result !== "action" || page.text !== "host-browser") {
+  throw new Error("browser did not execute in the shared host session");
+}
+text({ vm: shell.output, browser: page.text });
+"#;
 type AnyError = Box<dyn Error + Send + Sync>;
 
 #[derive(Deserialize)]
@@ -46,6 +72,10 @@ struct CommandOutput {
 fn main() -> Result<(), AnyError> {
     let mut arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     if arguments.first().is_some_and(|value| value == "--vmm") {
+        let _ = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(std::io::stderr)
+            .try_init();
         let config = arguments
             .get(1)
             .cloned()
@@ -111,9 +141,9 @@ async fn run_host(
             .memory_mib(768)
             .block_device(BlockDevice::read_only("nanocodex-runtime", runtime));
         let init = format!(
-            "set -eu; mkdir -p $1 {RUNTIME_MOUNT}; \
+            "set -eu; mkdir -p \"$1\" {RUNTIME_MOUNT}; \
              mount -t ext4 -o ro {RUNTIME_BLOCK_DEVICE} {RUNTIME_MOUNT}; \
-             exec {RUNTIME_MOUNT}/nanocodex-vm-guest $1"
+             exec {RUNTIME_MOUNT}/nanocodex-vm-guest \"$1\""
         );
         let guest = GuestCommand::new("/bin/sh")
             .arg("-c")
@@ -142,8 +172,11 @@ async fn run_host(
     let mut agent_tools = vm
         .tools_builder()
         .working_directory("/workspace")
-        .default_shell("sh")
-        .build()?;
+        .default_shell("sh");
+    if let Some(browser) = &browser {
+        agent_tools = agent_tools.tool(BrowserTool::from_browser(browser.clone()));
+    }
+    let agent_tools = agent_tools.build()?;
     let context = ToolContext::new("vm-proof", "session-1", "call-1", &[], 10_000);
 
     let execution = vm
