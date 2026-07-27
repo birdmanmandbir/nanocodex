@@ -20,6 +20,8 @@ mod source_maps;
 mod video;
 mod web_diagnostics;
 
+pub(crate) use artifacts::MAX_IMAGE_ARTIFACT_BYTES;
+
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chromiumoxide::{
     Browser as Chromium, Page,
@@ -92,8 +94,8 @@ use crate::{
     BrowserNetworkInitiator, BrowserNetworkRequest, BrowserNetworkTiming, BrowserOriginStorage,
     BrowserPageError, BrowserPageState, BrowserPostActionSnapshot, BrowserReactEvent,
     BrowserReactStatus, BrowserStorageState, BrowserTab, BrowserTarget, BrowserTargetIndex,
-    BrowserWebSocketDirection, BrowserWebSocketMessage, ReactDiagnostics, VirtualAuthenticator,
-    VirtualCredential,
+    BrowserWebSocketDirection, BrowserWebSocketMessage, MAX_VIEWPORT_DIMENSION, ReactDiagnostics,
+    VirtualAuthenticator, VirtualCredential,
     features::{BrowserColorScheme, BrowserContext, BrowserPermission, BrowserReducedMotion},
     session::cookie_applies_to,
 };
@@ -102,6 +104,7 @@ const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(25);
 const DEFAULT_NAVIGATION_TIMEOUT: Duration = Duration::from_secs(5);
 const MAIN_CONTEXT_RETRY_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_EXPLICIT_WAIT: Duration = Duration::from_secs(30);
+const MAX_SCRIPT_EVALUATION: Duration = Duration::from_secs(30);
 const MAX_CONSOLE_ENTRIES: usize = 1_000;
 const MAX_PAGE_ERRORS: usize = 1_000;
 const MAX_NETWORK_REQUESTS: usize = 4_000;
@@ -2466,6 +2469,17 @@ return element.checked;"#
             Ok(action_result(sequence, BrowserActionName::UploadFiles))
         }
         BrowserAction::SetViewport { width, height } => {
+            if width == 0
+                || height == 0
+                || width > MAX_VIEWPORT_DIMENSION
+                || height > MAX_VIEWPORT_DIMENSION
+            {
+                return Err(BrowserError::InvalidViewport {
+                    width,
+                    height,
+                    maximum: MAX_VIEWPORT_DIMENSION,
+                });
+            }
             session
                 .page
                 .execute(SetDeviceMetricsOverrideParams::new(
@@ -3428,9 +3442,14 @@ return {
             expression,
         } => {
             let context_id = session.frame_context(&frame_id).await?;
-            let value =
-                evaluate_value_in_context(&session.page, expression, Some(context_id), false)
-                    .await?;
+            let value = timeout(
+                MAX_SCRIPT_EVALUATION,
+                evaluate_value_in_context(&session.page, expression, Some(context_id), false),
+            )
+            .await
+            .map_err(|_| BrowserError::EvaluationTimeout {
+                maximum: MAX_SCRIPT_EVALUATION,
+            })??;
             Ok(BrowserActionResult::FrameEvaluation {
                 sequence,
                 executed: true,
@@ -3712,7 +3731,14 @@ return {
             })
         }
         BrowserAction::Evaluate { expression } => {
-            let value = evaluate_value(&session.page, expression).await?;
+            let value = timeout(
+                MAX_SCRIPT_EVALUATION,
+                evaluate_value(&session.page, expression),
+            )
+            .await
+            .map_err(|_| BrowserError::EvaluationTimeout {
+                maximum: MAX_SCRIPT_EVALUATION,
+            })??;
             Ok(BrowserActionResult::Evaluation {
                 sequence,
                 executed: true,
@@ -5424,6 +5450,10 @@ pub enum BrowserError {
     },
     #[error("browser image artifact failed")]
     Image(#[from] image::ImageError),
+    #[error("browser image artifact is {bytes} bytes, above the {maximum}-byte limit")]
+    ImageArtifactTooLarge { bytes: u64, maximum: u64 },
+    #[error("browser image artifact contains {pixels} pixels, above the {maximum}-pixel limit")]
+    ImageArtifactPixels { pixels: u64, maximum: u64 },
     #[error(transparent)]
     BraveSession(#[from] BraveSessionError),
     #[error("browser configuration is invalid: {message}")]
@@ -5444,6 +5474,14 @@ pub enum BrowserError {
     ActionabilityTimeout { selector: String, reason: String },
     #[error("browser click count must be between 1 and 3, received {click_count}")]
     InvalidClickCount { click_count: u8 },
+    #[error(
+        "browser viewport {width}x{height} is invalid; each dimension must be within 1..={maximum}"
+    )]
+    InvalidViewport {
+        width: u32,
+        height: u32,
+        maximum: u32,
+    },
     #[error("browser session could not be initialized")]
     SessionUnavailable,
     #[error("browser session is closed")]
@@ -5611,6 +5649,8 @@ pub enum BrowserError {
     NavigationTimeout { url: String, milliseconds: u128 },
     #[error("browser wait of {milliseconds}ms exceeds the maximum of {maximum}ms")]
     WaitTooLong { milliseconds: u64, maximum: u128 },
+    #[error("browser JavaScript evaluation exceeded the {maximum:?} deadline")]
+    EvaluationTimeout { maximum: Duration },
 }
 
 const DETECT_GATE_SCRIPT: &str = r#"function() {
