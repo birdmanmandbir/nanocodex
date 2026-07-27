@@ -315,6 +315,7 @@ view jobs=default_jobs:
 
 # Checks stay small until the end-to-end agent path is real.
 check:
+    ./scripts/check-experimental-boundary.sh
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets --all-features -- -D warnings
     cargo test --workspace
@@ -342,6 +343,10 @@ release-check version:
         cargo package --locked --allow-dirty --no-verify --config .cargo/release.toml --package "$crate"; \
     done
     ./scripts/check-docs.sh
+
+# Enforce the one-way dependency and publication boundary for experimental crates.
+check-experimental:
+    ./scripts/check-experimental-boundary.sh
 
 # Regenerate the committed Alloy-style changelog for a release preparation PR.
 changelog version:

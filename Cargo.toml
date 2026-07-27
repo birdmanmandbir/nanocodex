@@ -1,5 +1,26 @@
 [workspace]
-members = ["bin/nanocodex", "bin/nanousd-api", "crates/mpp-egress", "crates/nanocodex", "crates/nanocodex-agent", "crates/nanocodex-core", "crates/nanocodex-eval", "crates/nanocodex-eval-harbor", "crates/nanocodex-oai-api", "crates/nanocodex-observability", "crates/nanocodex-service", "crates/nanocodex-tools", "crates/nanocodex-tools-macros", "crates/nanocodex-vm", "crates/nanousd", "crates/nanovm", "crates/nanovm-image", "examples", "js/bindings", "py/bindings"]
+members = [
+    "bin/nanocodex",
+    "bin/nanousd-api",
+    "crates/mpp-egress",
+    "crates/nanocodex",
+    "crates/nanocodex-agent",
+    "crates/nanocodex-core",
+    "crates/nanocodex-eval",
+    "crates/nanocodex-eval-harbor",
+    "crates/nanocodex-oai-api",
+    "crates/nanocodex-observability",
+    "crates/nanocodex-service",
+    "crates/nanocodex-tools",
+    "crates/nanocodex-tools-macros",
+    "crates/nanousd",
+    "crates/experimental/nanocodex-vm",
+    "crates/experimental/nanovm",
+    "crates/experimental/nanovm-image",
+    "examples",
+    "js/bindings",
+    "py/bindings",
+]
 default-members = ["bin/nanocodex"]
 resolver = "2"
 
@@ -53,10 +74,10 @@ nanocodex-observability = { version = "0.2.0", path = "crates/nanocodex-observab
 nanocodex-service = { version = "0.2.0", path = "crates/nanocodex-service" }
 nanocodex-tools = { version = "0.2.0", path = "crates/nanocodex-tools" }
 nanocodex-tools-macros = { version = "0.2.0", path = "crates/nanocodex-tools-macros" }
-nanocodex-vm = { version = "0.2.0", path = "crates/nanocodex-vm" }
+nanocodex-vm = { version = "0.2.0", path = "crates/experimental/nanocodex-vm" }
 nanousd = { version = "0.2.0", path = "crates/nanousd" }
-nanovm = { version = "0.2.0", path = "crates/nanovm" }
-nanovm-image = { version = "0.2.0", path = "crates/nanovm-image" }
+nanovm = { version = "0.2.0", path = "crates/experimental/nanovm" }
+nanovm-image = { version = "0.2.0", path = "crates/experimental/nanovm-image" }
 oci-client = { version = "0.17.0", default-features = false, features = ["rustls-tls"] }
 rand = "0.9.2"
 regex = "1"

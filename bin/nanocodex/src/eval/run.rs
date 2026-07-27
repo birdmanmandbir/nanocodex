@@ -1831,7 +1831,7 @@ fn vm_guest_build_record(workspace: &Path, runtime: &Path) -> Result<Option<VmGu
         workspace.join(".cargo/config.toml"),
         workspace.join("crates/nanocodex-oai-api/Cargo.toml"),
         workspace.join("crates/nanocodex-tools/Cargo.toml"),
-        workspace.join("crates/nanocodex-vm/Cargo.toml"),
+        workspace.join("crates/experimental/nanocodex-vm/Cargo.toml"),
     ]);
     for script in [
         format!("scripts/{VM_GUEST_TARGET}-linker"),
@@ -3551,13 +3551,15 @@ mod tests {
             ".cargo/config.toml",
             "crates/nanocodex-oai-api/Cargo.toml",
             "crates/nanocodex-tools/Cargo.toml",
-            "crates/nanocodex-vm/Cargo.toml",
+            "crates/experimental/nanocodex-vm/Cargo.toml",
         ] {
             let path = workspace.path().join(path);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, "fixture").unwrap();
         }
-        let source = workspace.path().join("crates/nanocodex-vm/src/guest.rs");
+        let source = workspace
+            .path()
+            .join("crates/experimental/nanocodex-vm/src/guest.rs");
         fs::create_dir_all(source.parent().unwrap()).unwrap();
         fs::write(&source, "first guest source").unwrap();
         let runtime = workspace.path().join("target/guest/debug/guest");
