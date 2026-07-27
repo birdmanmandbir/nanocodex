@@ -4535,7 +4535,7 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-vm"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "mpp-egress",
@@ -4604,7 +4604,7 @@ dependencies = [
 
 [[package]]
 name = "nanovm"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "imago",
  "libkrun",
