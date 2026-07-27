@@ -310,18 +310,16 @@ bin/nanousd                       shared private credits protocol
 bin/nanousd-api                   credits service
 ```
 
-The monorepo also contains independently useful systems components:
+The monorepo also contains independently useful systems components. VM
+components live under [`crates/experimental/`](crates/experimental/README.md):
 
 | Component | Responsibility |
 | --- | --- |
-| `nanovm` | Typed libkrun lifecycle, disks, networking, egress capabilities, and shutdown |
-| `nanocodex-vm` | Bounded retained host/guest RPC and agent tools backed by one VM session tree |
-| `nanovm-image` | OCI/Dockerfile inputs to content-addressed immutable ext4 disks and attempt reflinks |
-| Browser VM | A headed browser inside an isolated VM with a private CDP endpoint |
-| VM egress | Host-owned network, MPP payment, and secret-injection policy |
+| `nanovm` *(experimental)* | Typed libkrun lifecycle, disks, networking, egress capabilities, and shutdown |
+| `nanocodex-vm` *(experimental)* | Bounded retained host/guest RPC and agent tools backed by one VM session tree |
+| `nanovm-image` *(experimental)* | OCI/Dockerfile inputs to content-addressed immutable ext4 disks and attempt reflinks |
 | `nanocodex-eval` | Typed tasks, attempts, scheduling, results, and sweeps |
-| Harbor adapter | Canonical Harbor/ATIF import and export |
-| `nanocentaur` | A durable managed-agent service built from the same libraries |
+| `nanocodex-eval-harbor` | Canonical Harbor/ATIF import and export |
 
 The CLI is a consumer of these libraries. Evaluation is exposed as
 `nanocodex eval ...`; it does not install Nanocodex into every task image or
@@ -389,8 +387,9 @@ Responses/tool types without linking HTTP, WebSocket, or TLS code. Normal
 native `nanocodex-tools` builds retain MCP, `tool_search`, Code Mode, image
 processing, and remote tools by default.
 
-The VM crates currently track a reviewed libkrun Git checkpoint that is not
-published on crates.io, so Git/path consumers select them explicitly:
+The experimental VM crates currently track a reviewed libkrun Git checkpoint
+and are not published on crates.io, so Git/path consumers select them
+explicitly:
 
 ```sh
 cargo add nanovm --git https://github.com/gakonst/nanocodex
