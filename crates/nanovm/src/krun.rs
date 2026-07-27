@@ -29,44 +29,99 @@ const NET_FEATURE_GUEST_UFO: u32 = 1 << 10;
 const NET_FEATURE_HOST_TSO4: u32 = 1 << 11;
 const NET_FEATURE_HOST_UFO: u32 = 1 << 14;
 
+/// Failure to validate, configure, control, or enter a libkrun VM.
 #[derive(Debug, Error)]
 pub enum VmError {
+    /// A typed VM policy value violates a libkrun precondition.
     #[error("invalid VM configuration: {0}")]
     InvalidConfig(&'static str),
 
+    /// The root filesystem could not be canonicalized.
     #[error("failed to resolve root filesystem {path}: {source}")]
-    ResolveRoot { path: PathBuf, source: io::Error },
+    ResolveRoot {
+        /// Requested host path.
+        path: PathBuf,
+        /// Canonicalization failure.
+        source: io::Error,
+    },
 
+    /// An additional block-device path could not be canonicalized.
+    #[error("failed to resolve block device {path}: {source}")]
+    ResolveBlockDevice {
+        /// Requested host path.
+        path: PathBuf,
+        /// Canonicalization failure.
+        source: io::Error,
+    },
+
+    /// A virtiofs share path could not be canonicalized.
+    #[error("failed to resolve shared directory {path}: {source}")]
+    ResolveSharedDirectory {
+        /// Requested host path.
+        path: PathBuf,
+        /// Canonicalization failure.
+        source: io::Error,
+    },
+
+    /// A gvproxy network socket could not be canonicalized.
     #[error("failed to resolve network socket {path}: {source}")]
-    ResolveNetworkSocket { path: PathBuf, source: io::Error },
+    ResolveNetworkSocket {
+        /// Requested socket path.
+        path: PathBuf,
+        /// Canonicalization failure.
+        source: io::Error,
+    },
 
+    /// A directory root policy resolved to a non-directory.
     #[error("root filesystem is not a directory: {0}")]
     RootNotDirectory(PathBuf),
 
+    /// An ext4 root policy resolved to a non-file.
     #[error("root disk is not a file: {0}")]
     RootNotFile(PathBuf),
 
+    /// An additional block-device path resolved to a non-file.
     #[error("block device is not a file: {0}")]
     BlockDeviceNotFile(PathBuf),
 
+    /// A virtiofs share resolved to a non-directory.
     #[error("shared directory is not a directory: {0}")]
     SharedDirectoryNotDirectory(PathBuf),
 
+    /// The guest working directory is not absolute.
+    #[error("guest working directory must be absolute: {0}")]
+    WorkingDirectoryNotAbsolute(PathBuf),
+
+    /// A path or command value contains a C-string terminator.
     #[error("{field} contains a NUL byte")]
     Nul {
+        /// Configuration field that could not be represented.
         field: &'static str,
+        /// C-string construction failure.
         source: NulError,
     },
 
+    /// A command argument cannot survive libkrun's quoted kernel transport.
     #[error("{field} contains a double quote unsupported by libkrun's command-line transport")]
-    UnsupportedDoubleQuote { field: &'static str },
+    UnsupportedDoubleQuote {
+        /// Command field that could not be represented.
+        field: &'static str,
+    },
 
+    /// A libkrun API operation returned a negative errno.
     #[error("libkrun {operation} failed with errno {errno}")]
-    Libkrun { operation: &'static str, errno: i32 },
+    Libkrun {
+        /// Stable description of the failed operation.
+        operation: &'static str,
+        /// Positive errno reported by libkrun.
+        errno: i32,
+    },
 
+    /// The blocking VMM loop unexpectedly returned success.
     #[error("libkrun returned after starting the VM")]
     UnexpectedReturn,
 
+    /// A caller reused a context already handed to the VMM loop.
     #[error("the libkrun context has already entered the VM")]
     ContextConsumed,
 }
@@ -193,6 +248,17 @@ impl KrunVm {
         Ok(vm)
     }
 
+    /// Returns a thread-safe out-of-band pause/resume capability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after this context has entered the VMM loop.
+    pub fn control(&self) -> Result<KrunVmControl, VmError> {
+        self.context
+            .map(|context| KrunVmControl { context })
+            .ok_or(VmError::ContextConsumed)
+    }
+
     /// Configures the guest command and enters libkrun's blocking VMM loop.
     ///
     /// On successful boot this function does not return: libkrun exits the VMM
@@ -204,6 +270,7 @@ impl KrunVm {
     /// Returns an error when a command value contains a NUL byte, libkrun
     /// rejects the command, or the VMM loop unexpectedly returns.
     pub fn run(mut self, command: &GuestCommand) -> Result<(), VmError> {
+        validate_guest_command(command)?;
         let executable = c_string(command.program().as_os_str(), "guest executable")?;
         let arguments = command
             .arguments()
@@ -319,7 +386,7 @@ fn attach_block_devices(context: u32, devices: &[BlockDevice]) -> Result<(), VmE
         let path = device
             .path()
             .canonicalize()
-            .map_err(|source| VmError::ResolveRoot {
+            .map_err(|source| VmError::ResolveBlockDevice {
                 path: device.path().to_path_buf(),
                 source,
             })?;
@@ -342,13 +409,14 @@ fn attach_block_devices(context: u32, devices: &[BlockDevice]) -> Result<(), VmE
 
 fn attach_shared_directories(context: u32, directories: &[SharedDirectory]) -> Result<(), VmError> {
     for directory in directories {
-        let path = directory
-            .path()
-            .canonicalize()
-            .map_err(|source| VmError::ResolveRoot {
-                path: directory.path().to_path_buf(),
-                source,
-            })?;
+        let path =
+            directory
+                .path()
+                .canonicalize()
+                .map_err(|source| VmError::ResolveSharedDirectory {
+                    path: directory.path().to_path_buf(),
+                    source,
+                })?;
         if !path.is_dir() {
             return Err(VmError::SharedDirectoryNotDirectory(path));
         }
@@ -370,6 +438,39 @@ fn attach_shared_directories(context: u32, directories: &[SharedDirectory]) -> R
         )?;
     }
     Ok(())
+}
+
+/// Out-of-band control for a VM running in libkrun's event loop.
+///
+/// This capability is valid only while the [`KrunVm`] context is alive in its
+/// dedicated VMM process. Do not retain it after the VMM exits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KrunVmControl {
+    context: u32,
+}
+
+impl KrunVmControl {
+    /// Requests that every guest vCPU pause at an instruction boundary.
+    ///
+    /// libkrun currently implements this operation on macOS. The request is
+    /// idempotent and completes asynchronously in the VMM event loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an OS error reported by libkrun, including unsupported-platform
+    /// and not-yet-running errors.
+    pub fn pause(self) -> Result<(), VmError> {
+        check(krun::krun_vm_pause(self.context), "pause VM")
+    }
+
+    /// Resumes a VM previously paused with [`Self::pause`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an OS error reported by libkrun.
+    pub fn resume(self) -> Result<(), VmError> {
+        check(krun::krun_vm_resume(self.context), "resume VM")
+    }
 }
 
 impl Drop for KrunVm {
@@ -398,6 +499,15 @@ fn array_string(value: &OsStr, field: &'static str) -> Result<CString, VmError> 
     CString::new(bytes).map_err(|source| VmError::Nul { field, source })
 }
 
+fn validate_guest_command(command: &GuestCommand) -> Result<(), VmError> {
+    if !command.current_directory().is_absolute() {
+        return Err(VmError::WorkingDirectoryNotAbsolute(
+            command.current_directory().to_path_buf(),
+        ));
+    }
+    Ok(())
+}
+
 fn positive_context(status: i32, operation: &'static str) -> Result<u32, VmError> {
     u32::try_from(status).map_err(|_| VmError::Libkrun {
         operation,
@@ -418,9 +528,9 @@ fn check(status: i32, operation: &'static str) -> Result<(), VmError> {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
+    use std::{ffi::OsStr, path::Path};
 
-    use super::{VmError, array_string};
+    use super::{GuestCommand, VmError, array_string, validate_guest_command};
 
     #[test]
     fn libkrun_array_values_reject_unrepresentable_quotes() {
@@ -434,5 +544,15 @@ mod tests {
                 .as_c_str(),
             c"backslash\\path"
         );
+    }
+
+    #[test]
+    fn guest_working_directory_must_be_absolute() {
+        assert!(matches!(
+            validate_guest_command(&GuestCommand::new("/bin/true").current_dir("workspace")),
+            Err(VmError::WorkingDirectoryNotAbsolute(path))
+                if path == Path::new("workspace")
+        ));
+        validate_guest_command(&GuestCommand::new("/bin/true").current_dir("/workspace")).unwrap();
     }
 }

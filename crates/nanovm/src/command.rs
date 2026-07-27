@@ -30,6 +30,8 @@ impl fmt::Debug for GuestCommand {
 }
 
 impl GuestCommand {
+    /// Creates a guest command with `/` as its working directory and a
+    /// conventional system `PATH`.
     pub fn new(program: impl Into<OsString>) -> Self {
         Self {
             program: program.into(),
@@ -39,12 +41,14 @@ impl GuestCommand {
         }
     }
 
+    /// Appends one argument.
     #[must_use]
     pub fn arg(mut self, argument: impl Into<OsString>) -> Self {
         self.arguments.push(argument.into());
         self
     }
 
+    /// Appends arguments in order.
     #[must_use]
     pub fn args<I, A>(mut self, arguments: I) -> Self
     where
@@ -55,33 +59,39 @@ impl GuestCommand {
         self
     }
 
+    /// Sets or replaces one environment variable.
     #[must_use]
     pub fn env(mut self, name: impl Into<OsString>, value: impl Into<OsString>) -> Self {
         self.environment.insert(name.into(), value.into());
         self
     }
 
+    /// Sets the absolute guest working directory.
     #[must_use]
     pub fn current_dir(mut self, directory: impl Into<OsString>) -> Self {
         self.current_dir = directory.into();
         self
     }
 
+    /// Returns the guest executable.
     #[must_use]
     pub fn program(&self) -> &Path {
         Path::new(&self.program)
     }
 
+    /// Returns the ordered guest arguments.
     #[must_use]
     pub fn arguments(&self) -> &[OsString] {
         &self.arguments
     }
 
+    /// Returns the complete guest environment.
     #[must_use]
     pub fn environment(&self) -> &BTreeMap<OsString, OsString> {
         &self.environment
     }
 
+    /// Returns the guest working directory.
     #[must_use]
     pub fn current_directory(&self) -> &Path {
         Path::new(&self.current_dir)

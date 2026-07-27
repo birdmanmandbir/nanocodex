@@ -12,7 +12,9 @@ use thiserror::Error;
 
 use crate::{GuestCommand, Network, SharedDirectory, VmConfig};
 
+/// Exclusive guest root under which provider egress assets may be exposed.
 pub const GUEST_EGRESS_ROOT: &str = "/tmp/nanocodex/egress";
+/// Maximum size of one public file provisioned through an egress lease.
 pub const MAX_EGRESS_FILE_BYTES: usize = 4 * 1024 * 1024;
 
 /// VM-facing outbound-access configuration retained for one guest lifetime.
@@ -33,9 +35,43 @@ pub struct EgressLease {
 /// One provider-owned host directory mounted read-only into the guest.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EgressMount {
-    pub tag: String,
-    pub host_path: PathBuf,
-    pub guest_path: PathBuf,
+    tag: String,
+    host_path: PathBuf,
+    guest_path: PathBuf,
+}
+
+impl EgressMount {
+    /// Creates one provider directory that will be mounted read-only.
+    #[must_use]
+    pub fn read_only(
+        tag: impl Into<String>,
+        host_path: impl Into<PathBuf>,
+        guest_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            tag: tag.into(),
+            host_path: host_path.into(),
+            guest_path: guest_path.into(),
+        }
+    }
+
+    /// Returns the virtiofs mount tag.
+    #[must_use]
+    pub fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    /// Returns the provider-owned host directory.
+    #[must_use]
+    pub fn host_path(&self) -> &Path {
+        &self.host_path
+    }
+
+    /// Returns the path at which the guest mounts the directory.
+    #[must_use]
+    pub fn guest_path(&self) -> &Path {
+        &self.guest_path
+    }
 }
 
 /// One provider-owned public file provisioned before agent tools are exposed.
@@ -47,6 +83,7 @@ pub struct EgressFile {
 }
 
 impl EgressFile {
+    /// Creates one public file to provision before guest tools are exposed.
     #[must_use]
     pub fn new(guest_path: impl Into<PathBuf>, contents: impl Into<Vec<u8>>, mode: u32) -> Self {
         Self {
@@ -56,16 +93,19 @@ impl EgressFile {
         }
     }
 
+    /// Returns the normalized guest destination.
     #[must_use]
     pub fn guest_path(&self) -> &Path {
         &self.guest_path
     }
 
+    /// Returns the complete public file contents.
     #[must_use]
     pub fn contents(&self) -> &[u8] {
         &self.contents
     }
 
+    /// Returns Unix permission bits applied to the guest file.
     #[must_use]
     pub const fn mode(&self) -> u32 {
         self.mode
@@ -73,6 +113,7 @@ impl EgressFile {
 }
 
 impl EgressLease {
+    /// Creates an empty lease for an explicit network mode.
     #[must_use]
     pub fn new(network: Network) -> Self {
         Self {
@@ -84,11 +125,13 @@ impl EgressLease {
         }
     }
 
+    /// Creates an empty lease with outbound internet access.
     #[must_use]
     pub fn internet() -> Self {
         Self::new(Network::Internet)
     }
 
+    /// Creates an empty lease with networking disabled.
     #[must_use]
     pub fn disabled() -> Self {
         Self::new(Network::Disabled)
@@ -302,20 +345,26 @@ impl EgressLease {
         (vm, configured)
     }
 
+    /// Returns the network mode required by the complete lease.
     #[must_use]
     pub const fn network(&self) -> &Network {
         &self.network
     }
 
+    /// Returns guest-visible environment entries.
+    ///
+    /// Values may contain short-lived capabilities and must not be logged.
     #[must_use]
     pub fn guest_environment(&self) -> &BTreeMap<String, String> {
         &self.guest_environment
     }
 
+    /// Iterates over read-only provider mounts.
     pub fn guest_mounts(&self) -> impl Iterator<Item = &EgressMount> {
         self.guest_mounts.values()
     }
 
+    /// Iterates over public files to provision before tool execution.
     pub fn guest_files(&self) -> impl Iterator<Item = &EgressFile> {
         self.guest_files.values()
     }
@@ -343,38 +392,61 @@ impl fmt::Debug for EgressLease {
     }
 }
 
+/// Invalid or conflicting egress capability composition.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum EgressError {
+    /// Two layers require different guest network modes.
     #[error("egress fragments require conflicting VM network modes")]
     NetworkConflict,
+    /// A guest environment name is not a portable shell identifier.
     #[error("guest environment name `{0}` is not a shell identifier")]
     InvalidEnvironmentName(String),
+    /// Two layers assign different values to one guest environment name.
     #[error("guest environment `{0}` has conflicting egress values")]
     EnvironmentConflict(String),
+    /// A guest environment value cannot be represented as a process value.
     #[error("guest environment `{0}` contains a NUL byte")]
     EnvironmentValueContainsNul(String),
+    /// A virtiofs tag is empty, too long, or contains unsupported characters.
     #[error("egress mount tag `{0}` is not a portable identifier")]
     InvalidMountTag(String),
+    /// A provider mount refers to a relative host path.
     #[error("host egress mount path must be absolute: {0}")]
     HostMountPathNotAbsolute(PathBuf),
+    /// A mount destination escapes the exclusive guest egress root.
     #[error("guest egress mount path must be a normalized child of {GUEST_EGRESS_ROOT}: {0}")]
     GuestMountPathOutsideRoot(PathBuf),
+    /// Two different provider mounts claim the same virtiofs tag.
     #[error("egress mount tag `{0}` has conflicting host paths")]
     MountTagConflict(String),
+    /// Two different provider mounts overlap inside the guest.
     #[error("guest egress mount path `{0}` has conflicting providers")]
     GuestMountConflict(PathBuf),
+    /// A provisioned file overlaps a provider directory mount.
     #[error("guest egress mount and file paths overlap at `{0}`")]
     GuestMountFileOverlap(PathBuf),
+    /// A provisioned file escapes the exclusive guest egress root.
     #[error("guest egress file path must be a normalized child of {GUEST_EGRESS_ROOT}: {0}")]
     GuestFilePathOutsideRoot(PathBuf),
+    /// A provisioned file exceeds [`MAX_EGRESS_FILE_BYTES`].
     #[error("guest egress file `{path}` is {size} bytes, exceeding the {limit}-byte limit")]
     GuestFileTooLarge {
+        /// Guest destination.
         path: PathBuf,
+        /// Requested file size.
         size: usize,
+        /// Enforced maximum.
         limit: usize,
     },
+    /// A provisioned file contains mode bits outside Unix permissions.
     #[error("guest egress file `{path}` has invalid mode {mode:#o}")]
-    InvalidGuestFileMode { path: PathBuf, mode: u32 },
+    InvalidGuestFileMode {
+        /// Guest destination.
+        path: PathBuf,
+        /// Rejected mode bits.
+        mode: u32,
+    },
+    /// Two layers assign different files to one guest destination.
     #[error("guest egress file path `{0}` has conflicting providers")]
     GuestFileConflict(PathBuf),
 }
@@ -453,11 +525,11 @@ mod tests {
             .insert_environment("NANOCENTAUR_SECRET_BASE_URL", "https://secret-gateway/v1")
             .unwrap();
         secrets
-            .insert_mount(EgressMount {
-                tag: "secret-ca".to_owned(),
-                host_path: PathBuf::from("/host/ca"),
-                guest_path: PathBuf::from("/tmp/nanocodex/egress/secrets/ca"),
-            })
+            .insert_mount(EgressMount::read_only(
+                "secret-ca",
+                "/host/ca",
+                "/tmp/nanocodex/egress/secrets/ca",
+            ))
             .unwrap();
         secrets.retain(Arc::clone(&guard));
 
@@ -536,11 +608,11 @@ mod tests {
             .insert_environment("HTTPS_PROXY", "http://host.internal:8080")
             .unwrap();
         lease
-            .insert_mount(EgressMount {
-                tag: "mpp-ca".to_owned(),
-                host_path: PathBuf::from("/host/mpp"),
-                guest_path: PathBuf::from("/tmp/nanocodex/egress/mpp"),
-            })
+            .insert_mount(EgressMount::read_only(
+                "mpp-ca",
+                "/host/mpp",
+                "/tmp/nanocodex/egress/mpp",
+            ))
             .unwrap();
         let command = GuestCommand::new("/usr/local/bin/nanocodex-vm-guest")
             .arg("/workspace")
@@ -578,11 +650,11 @@ mod tests {
     fn mount_and_file_path_hierarchy_conflicts_fail_before_launch() {
         let mut lease = EgressLease::internet();
         lease
-            .insert_mount(EgressMount {
-                tag: "provider".to_owned(),
-                host_path: PathBuf::from("/host/provider"),
-                guest_path: PathBuf::from("/tmp/nanocodex/egress/provider"),
-            })
+            .insert_mount(EgressMount::read_only(
+                "provider",
+                "/host/provider",
+                "/tmp/nanocodex/egress/provider",
+            ))
             .unwrap();
 
         assert_eq!(
@@ -596,11 +668,11 @@ mod tests {
             )))
         );
         assert_eq!(
-            lease.insert_mount(EgressMount {
-                tag: "nested".to_owned(),
-                host_path: PathBuf::from("/host/nested"),
-                guest_path: PathBuf::from("/tmp/nanocodex/egress/provider/nested"),
-            }),
+            lease.insert_mount(EgressMount::read_only(
+                "nested",
+                "/host/nested",
+                "/tmp/nanocodex/egress/provider/nested",
+            )),
             Err(EgressError::GuestMountConflict(PathBuf::from(
                 "/tmp/nanocodex/egress/provider/nested"
             )))
@@ -633,19 +705,19 @@ mod tests {
             Err(EgressError::InvalidGuestFileMode { .. })
         ));
         assert!(matches!(
-            lease.insert_mount(EgressMount {
-                tag: "bad tag".to_owned(),
-                host_path: PathBuf::from("/host/provider"),
-                guest_path: PathBuf::from("/tmp/nanocodex/egress/provider"),
-            }),
+            lease.insert_mount(EgressMount::read_only(
+                "bad tag",
+                "/host/provider",
+                "/tmp/nanocodex/egress/provider",
+            )),
             Err(EgressError::InvalidMountTag(_))
         ));
         assert!(matches!(
-            lease.insert_mount(EgressMount {
-                tag: "provider".to_owned(),
-                host_path: PathBuf::from("relative"),
-                guest_path: PathBuf::from("/tmp/nanocodex/egress/provider"),
-            }),
+            lease.insert_mount(EgressMount::read_only(
+                "provider",
+                "relative",
+                "/tmp/nanocodex/egress/provider",
+            )),
             Err(EgressError::HostMountPathNotAbsolute(_))
         ));
     }

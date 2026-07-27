@@ -23,7 +23,9 @@ pub enum Network {
     ///
     /// Unlike TSI, this gives the guest its own loopback and port namespace.
     Gvproxy {
+        /// Host unixgram socket exposed by the owned gvproxy process.
         socket: PathBuf,
+        /// Stable private MAC address assigned to the guest interface.
         mac_address: [u8; 6],
     },
 }
@@ -66,16 +68,19 @@ impl BlockDevice {
         }
     }
 
+    /// Returns the libkrun block-device identifier.
     #[must_use]
     pub fn id(&self) -> &str {
         &self.id
     }
 
+    /// Returns the host path of the block image.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    /// Returns whether guest writes to the device are prohibited.
     #[must_use]
     pub const fn is_read_only(&self) -> bool {
         self.read_only
@@ -109,16 +114,19 @@ impl SharedDirectory {
         }
     }
 
+    /// Returns the virtiofs mount tag.
     #[must_use]
     pub fn tag(&self) -> &str {
         &self.tag
     }
 
+    /// Returns the host directory shared through virtiofs.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    /// Returns whether guest writes to the share are prohibited.
     #[must_use]
     pub const fn is_read_only(&self) -> bool {
         self.read_only
@@ -162,36 +170,42 @@ impl VmConfig {
         }
     }
 
+    /// Sets the number of virtual CPUs.
     #[must_use]
     pub fn cpus(mut self, cpus: u8) -> Self {
         self.cpus = cpus;
         self
     }
 
+    /// Sets guest memory in mebibytes.
     #[must_use]
     pub fn memory_mib(mut self, memory_mib: u32) -> Self {
         self.memory_mib = memory_mib;
         self
     }
 
+    /// Selects the guest network mode.
     #[must_use]
     pub fn network(mut self, network: Network) -> Self {
         self.network = network;
         self
     }
 
+    /// Adds one virtiofs directory.
     #[must_use]
     pub fn shared_directory(mut self, directory: SharedDirectory) -> Self {
         self.shared_directories.push(directory);
         self
     }
 
+    /// Adds one block device after the root disk.
     #[must_use]
     pub fn block_device(mut self, device: BlockDevice) -> Self {
         self.block_devices.push(device);
         self
     }
 
+    /// Returns the host root filesystem path.
     #[must_use]
     pub fn root(&self) -> &Path {
         match &self.root {
@@ -199,31 +213,37 @@ impl VmConfig {
         }
     }
 
+    /// Returns the selected root filesystem kind.
     #[must_use]
     pub const fn root_filesystem(&self) -> &RootFilesystem {
         &self.root
     }
 
+    /// Returns the configured virtual CPU count.
     #[must_use]
     pub const fn cpus_value(&self) -> u8 {
         self.cpus
     }
 
+    /// Returns configured guest memory in mebibytes.
     #[must_use]
     pub const fn memory_mib_value(&self) -> u32 {
         self.memory_mib
     }
 
+    /// Returns the selected guest network mode.
     #[must_use]
     pub const fn network_value(&self) -> &Network {
         &self.network
     }
 
+    /// Returns additional virtiofs directories in attachment order.
     #[must_use]
     pub fn shared_directories(&self) -> &[SharedDirectory] {
         &self.shared_directories
     }
 
+    /// Returns additional block devices in attachment order.
     #[must_use]
     pub fn block_devices(&self) -> &[BlockDevice] {
         &self.block_devices
