@@ -64,6 +64,10 @@ impl NativeAttempt {
             .env_clear()
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
             .env("HOME", &self.paths.workspace)
+            .env("NANOCODEX_EVAL_WORKSPACE", &self.paths.workspace)
+            .env("NANOCODEX_EVAL_VERIFIER_LOGS", &self.paths.verifier)
+            // Retained tasks from the temporary Nanoeval repository still
+            // consume these names.
             .env("NANOEVAL_WORKSPACE", &self.paths.workspace)
             .env("NANOEVAL_VERIFIER_LOGS", &self.paths.verifier)
             .envs(task.environment().iter())

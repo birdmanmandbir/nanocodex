@@ -2,7 +2,7 @@ use std::{
     fs::{self, File},
     io,
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Instant, UNIX_EPOCH},
 };
 
 use arcbox_ext4::{
@@ -10,13 +10,15 @@ use arcbox_ext4::{
     constants::{file_mode, make_mode},
     error::{FormatError, ReadError},
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tracing::info_span;
+use tracing::{info, info_span};
 
 const BLOCK_SIZE: u32 = 4_096;
 const DISK_BYTES: u64 = 128 * 1024 * 1024;
 const GUEST_PATH: &str = "/nanocodex-vm-guest";
 const IDENTITY_VERSION: &[u8] = b"nanoeval-vm-guest-runtime-v2\0";
+const RECORD_VERSION: u32 = 1;
 
 /// Whether preparing a guest runtime disk reused or created its cache entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,9 +75,11 @@ impl GuestRuntimeDisk {
     /// ```
     ///
     /// Equal binary bytes produce the same SHA-256 digest and cache path,
-    /// including caches created by Nanoeval's `v2` runtime staging. Concurrent
-    /// callers serialize on a per-digest filesystem lock and publish through a
-    /// unique temporary file.
+    /// including caches created by Nanoeval's `v2` runtime staging. A healthy
+    /// warm call validates an atomic size/mtime record rather than rereading the
+    /// binary or opening ext4. A changed source, disk, or record falls back to a
+    /// complete byte-for-byte validation. Concurrent callers serialize on a
+    /// per-digest filesystem lock and publish through unique temporary files.
     ///
     /// # Errors
     ///
@@ -142,18 +146,37 @@ impl GuestRuntimeDisk {
     }
 
     fn prepare_inner(binary: &Path, cache: &Path) -> Result<Self, GuestRuntimeDiskError> {
-        let bytes = fs::read(binary).map_err(|source| GuestRuntimeDiskError::ReadBinary {
-            path: binary.to_path_buf(),
+        let binary =
+            fs::canonicalize(binary).map_err(|source| GuestRuntimeDiskError::ReadBinary {
+                path: binary.to_path_buf(),
+                source,
+            })?;
+        let source_snapshot = binary_snapshot(&binary)?;
+        let record_path = runtime_record_path(cache, &binary);
+        if let Some((digest, path)) = recorded_runtime_disk(&record_path, source_snapshot, cache)? {
+            return Ok(Self {
+                path,
+                digest,
+                status: GuestRuntimeDiskStatus::Hit,
+            });
+        }
+
+        let bytes = fs::read(&binary).map_err(|source| GuestRuntimeDiskError::ReadBinary {
+            path: binary.clone(),
             source,
         })?;
         if !bytes.starts_with(b"\x7fELF") {
-            return Err(GuestRuntimeDiskError::NotElf(binary.to_path_buf()));
+            return Err(GuestRuntimeDiskError::NotElf(binary));
+        }
+        if binary_snapshot(&binary)? != source_snapshot {
+            return Err(GuestRuntimeDiskError::BinaryChanged(binary));
         }
 
         let digest = runtime_digest(&bytes);
         let directory = cache.join("runtimes").join(&digest);
         let path = directory.join("runtime.ext4");
         if valid_cached_disk(&path, &bytes)? {
+            write_runtime_record(&record_path, source_snapshot, &digest, &path)?;
             return Ok(Self {
                 path,
                 digest,
@@ -164,6 +187,7 @@ impl GuestRuntimeDisk {
         fs::create_dir_all(&directory).map_err(|source| cache_error(directory.clone(), source))?;
         let _lock = CacheLock::acquire(cache, &digest)?;
         if valid_cached_disk(&path, &bytes)? {
+            write_runtime_record(&record_path, source_snapshot, &digest, &path)?;
             return Ok(Self {
                 path,
                 digest,
@@ -193,6 +217,7 @@ impl GuestRuntimeDisk {
         temporary
             .persist(&path)
             .map_err(|error| cache_error(path.clone(), error.error))?;
+        write_runtime_record(&record_path, source_snapshot, &digest, &path)?;
 
         Ok(Self {
             path,
@@ -214,6 +239,9 @@ pub enum GuestRuntimeDiskError {
         #[source]
         source: io::Error,
     },
+    /// The runtime binary changed while it was being indexed.
+    #[error("VM guest runtime binary {} changed while it was being indexed", .0.display())]
+    BinaryChanged(PathBuf),
     /// The supplied runtime is not a Linux ELF executable.
     #[error("VM guest runtime {} is not an ELF executable", .0.display())]
     NotElf(PathBuf),
@@ -270,6 +298,161 @@ fn runtime_digest(bytes: &[u8]) -> String {
     identity.update(IDENTITY_VERSION);
     identity.update(bytes);
     format!("{:x}", identity.finalize())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileSnapshot {
+    bytes: u64,
+    modified_unix_ns: u64,
+}
+
+impl FileSnapshot {
+    fn from_metadata(metadata: &fs::Metadata) -> io::Result<Self> {
+        let modified = metadata
+            .modified()?
+            .duration_since(UNIX_EPOCH)
+            .map_err(io::Error::other)?;
+        Ok(Self {
+            bytes: metadata.len(),
+            modified_unix_ns: u64::try_from(modified.as_nanos()).map_err(io::Error::other)?,
+        })
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GuestRuntimeRecord {
+    version: u32,
+    binary_bytes: u64,
+    binary_modified_unix_ns: u64,
+    digest: String,
+    disk_bytes: u64,
+    disk_modified_unix_ns: u64,
+}
+
+fn binary_snapshot(path: &Path) -> Result<FileSnapshot, GuestRuntimeDiskError> {
+    let metadata = fs::metadata(path).map_err(|source| GuestRuntimeDiskError::ReadBinary {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(GuestRuntimeDiskError::ReadBinary {
+            path: path.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::InvalidInput, "runtime binary is not a file"),
+        });
+    }
+    FileSnapshot::from_metadata(&metadata).map_err(|source| GuestRuntimeDiskError::ReadBinary {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn runtime_record_path(cache: &Path, binary: &Path) -> PathBuf {
+    let mut identity = Sha256::new();
+    identity.update(b"nanocodex-vm-runtime-record-v1\0");
+    identity.update(binary.as_os_str().as_encoded_bytes());
+    cache
+        .join("runtime-records")
+        .join(format!("{:x}.json", identity.finalize()))
+}
+
+fn recorded_runtime_disk(
+    record_path: &Path,
+    source: FileSnapshot,
+    cache: &Path,
+) -> Result<Option<(String, PathBuf)>, GuestRuntimeDiskError> {
+    let contents = match fs::read(record_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(cache_error(record_path.to_path_buf(), source)),
+    };
+    let record = match serde_json::from_slice::<GuestRuntimeRecord>(&contents) {
+        Ok(record) => record,
+        Err(error) => {
+            info!(
+                target: "nanocodex_vm",
+                cache_record_path = %record_path.display(),
+                error = %error,
+                "ignoring invalid VM guest runtime cache record"
+            );
+            return Ok(None);
+        }
+    };
+    if record.version != RECORD_VERSION
+        || record.binary_bytes != source.bytes
+        || record.binary_modified_unix_ns != source.modified_unix_ns
+        || !is_sha256_digest(&record.digest)
+        || record.disk_bytes != DISK_BYTES
+    {
+        return Ok(None);
+    }
+
+    let path = cache
+        .join("runtimes")
+        .join(&record.digest)
+        .join("runtime.ext4");
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(cache_error(path, source)),
+    };
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    let disk = FileSnapshot::from_metadata(&metadata)
+        .map_err(|source| cache_error(path.clone(), source))?;
+    if disk.bytes != record.disk_bytes || disk.modified_unix_ns != record.disk_modified_unix_ns {
+        return Ok(None);
+    }
+    Ok(Some((record.digest, path)))
+}
+
+fn write_runtime_record(
+    record_path: &Path,
+    source: FileSnapshot,
+    digest: &str,
+    disk_path: &Path,
+) -> Result<(), GuestRuntimeDiskError> {
+    let metadata =
+        fs::metadata(disk_path).map_err(|source| cache_error(disk_path.to_path_buf(), source))?;
+    let disk = FileSnapshot::from_metadata(&metadata)
+        .map_err(|source| cache_error(disk_path.to_path_buf(), source))?;
+    let record = GuestRuntimeRecord {
+        version: RECORD_VERSION,
+        binary_bytes: source.bytes,
+        binary_modified_unix_ns: source.modified_unix_ns,
+        digest: digest.to_owned(),
+        disk_bytes: disk.bytes,
+        disk_modified_unix_ns: disk.modified_unix_ns,
+    };
+    let directory = record_path
+        .parent()
+        .ok_or_else(|| {
+            cache_error(
+                record_path.to_path_buf(),
+                io::Error::other("runtime cache record has no parent directory"),
+            )
+        })?
+        .to_path_buf();
+    fs::create_dir_all(&directory).map_err(|source| cache_error(directory.clone(), source))?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".runtime-record.")
+        .tempfile_in(&directory)
+        .map_err(|source| cache_error(directory, source))?;
+    serde_json::to_writer(temporary.as_file_mut(), &record)
+        .map_err(|source| cache_error(record_path.to_path_buf(), io::Error::other(source)))?;
+    temporary
+        .into_temp_path()
+        .persist(record_path)
+        .map_err(|error| cache_error(record_path.to_path_buf(), error.error))?;
+    Ok(())
+}
+
+fn is_sha256_digest(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn valid_cached_disk(path: &Path, binary: &[u8]) -> Result<bool, GuestRuntimeDiskError> {

@@ -15,6 +15,9 @@ while IFS= read -r request; do
   id=${id%%,*}
   id=${id%%\}*}
   case "$request" in
+    *'"kind":"ready"'*)
+      printf '{"kind":"ready","payload":{"id":%s,"error":null}}\n' "$id"
+      ;;
     *'"kind":"execute"'*)
       printf '{"kind":"execute","payload":{"id":%s,"exit_code":0,"stdout":"","stderr":"","error":null,"timed_out":false,"output_limit_exceeded":false}}\n' "$id"
       ;;
@@ -31,6 +34,26 @@ done
     let mut command = Command::new("/bin/sh");
     command.arg("-c").arg(script);
     command
+}
+
+fn benchmark_guest_runtime_cache(criterion: &mut Criterion) {
+    let directory = tempfile::tempdir().expect("runtime cache fixture");
+    let binary = directory.path().join("nanocodex-vm-guest");
+    let cache = directory.path().join("cache");
+    std::fs::write(&binary, b"\x7fELF benchmark guest runtime").expect("benchmark guest runtime");
+    GuestRuntimeDisk::prepare(&binary, &cache).expect("prime guest runtime cache");
+
+    let mut group = criterion.benchmark_group("vm_guest_runtime_cache");
+    group.measurement_time(Duration::from_secs(2));
+    group.bench_function("warm_prepare", |bencher| {
+        bencher.iter(|| {
+            black_box(
+                GuestRuntimeDisk::prepare(black_box(&binary), black_box(&cache))
+                    .expect("warm guest runtime cache"),
+            );
+        });
+    });
+    group.finish();
 }
 
 fn benchmark_protocol(criterion: &mut Criterion) {
@@ -198,5 +221,10 @@ fn benchmark_runtime() -> tokio::runtime::Runtime {
         .expect("benchmark runtime")
 }
 
-criterion_group!(benches, benchmark_protocol, benchmark_live_vm);
+criterion_group!(
+    benches,
+    benchmark_guest_runtime_cache,
+    benchmark_protocol,
+    benchmark_live_vm
+);
 criterion_main!(benches);

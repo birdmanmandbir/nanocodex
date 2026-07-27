@@ -147,6 +147,10 @@ async fn serve_io(
 
 async fn execute_request(runtime: Arc<ToolRuntime>, request: SessionRequest) -> SessionResponse {
     match request {
+        SessionRequest::Ready(request) => SessionResponse::Ready(ControlResponse {
+            id: request.id,
+            error: None,
+        }),
         SessionRequest::Tool(request) => {
             let context = ToolContext::new(
                 &request.context.model,

@@ -35,14 +35,20 @@ struct JobIdentity {
 
 #[derive(Debug)]
 struct JobLease {
-    _file: File,
+    file: File,
+}
+
+impl Drop for JobLease {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
 }
 
 impl EvalJob {
     pub(crate) fn create(parent_directory: &Path) -> Result<Self, EvalError> {
         fs::create_dir_all(parent_directory)?;
         let parent_directory = fs::canonicalize(parent_directory)?;
-        let id = Uuid::new_v4();
+        let id = Uuid::now_v7();
         let directory = parent_directory.join(id.to_string());
         fs::create_dir_all(&directory)?;
         let lease = Self::lease(&directory)?;
@@ -194,7 +200,7 @@ impl EvalJob {
             .truncate(false)
             .open(directory.join(LOCK_FILE))?;
         file.try_lock_exclusive()?;
-        Ok(JobLease { _file: file })
+        Ok(JobLease { file })
     }
 
     fn read_json<T>(path: &Path) -> Result<T, EvalError>
@@ -224,7 +230,7 @@ impl EvalJob {
 mod tests {
     use std::path::PathBuf;
 
-    use nanocodex::Nanocodex;
+    use nanocodex_agent::Nanocodex;
     use tempfile::tempdir;
 
     use super::*;

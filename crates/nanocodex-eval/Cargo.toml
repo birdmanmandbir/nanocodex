@@ -1,5 +1,5 @@
 [package]
-name = "nanoeval"
+name = "nanocodex-eval"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,25 +11,30 @@ repository.workspace = true
 readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Fast, library-first evaluation for Nanocodex agents"
+description = "Typed, durable evaluation for Nanocodex agents"
 
 [dependencies]
 chrono.workspace = true
 futures-util.workspace = true
 fs2.workspace = true
-nanocodex.workspace = true
+nanocodex-agent.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs", "macros", "process", "rt-multi-thread", "sync", "time"] }
 toml.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 tempfile.workspace = true
 tracing-subscriber.workspace = true
+
+[[bench]]
+name = "eval_runtime"
+harness = false
 
 [lints]
 workspace = true

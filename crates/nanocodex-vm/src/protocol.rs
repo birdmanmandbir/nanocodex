@@ -5,6 +5,7 @@ use serde_json::value::RawValue;
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
 pub(crate) enum SessionRequest {
+    Ready(ReadyRequest),
     Tool(ToolRequest),
     WriteFile(WriteFileRequest),
     ReadFile(ReadFileRequest),
@@ -17,6 +18,7 @@ impl SessionRequest {
     #[cfg(feature = "guest")]
     pub const fn id(&self) -> u64 {
         match self {
+            Self::Ready(request) => request.id,
             Self::Tool(request) => request.id,
             Self::WriteFile(request) => request.id,
             Self::ReadFile(request) => request.id,
@@ -30,6 +32,7 @@ impl SessionRequest {
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
 pub(crate) enum SessionResponse {
+    Ready(ControlResponse),
     Tool(ToolResponse),
     WriteFile(ControlResponse),
     ReadFile(ReadFileResponse),
@@ -41,6 +44,7 @@ pub(crate) enum SessionResponse {
 impl SessionResponse {
     pub const fn id(&self) -> u64 {
         match self {
+            Self::Ready(response) => response.id,
             Self::Tool(response) => response.id,
             Self::WriteFile(response) | Self::Cancel(response) | Self::Shutdown(response) => {
                 response.id
@@ -49,6 +53,12 @@ impl SessionResponse {
             Self::Execute(response) => response.id,
         }
     }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReadyRequest {
+    pub id: u64,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -193,9 +203,17 @@ mod tests {
     use serde_json::{json, value::to_raw_value};
 
     use super::{
-        SessionRequest, ShutdownRequest, ToolRequest, ToolResponse, WireToolContext, WireToolInput,
-        WriteFileRequest,
+        ReadyRequest, SessionRequest, ShutdownRequest, ToolRequest, ToolResponse, WireToolContext,
+        WireToolInput, WriteFileRequest,
     };
+
+    #[test]
+    fn readiness_request_has_a_stable_typed_shape() {
+        let request = SessionRequest::Ready(ReadyRequest { id: 4 });
+        let encoded = serde_json::to_string(&request).unwrap();
+
+        assert_eq!(encoded, r#"{"kind":"ready","payload":{"id":4}}"#);
+    }
 
     #[test]
     fn shutdown_request_has_a_stable_typed_shape() {

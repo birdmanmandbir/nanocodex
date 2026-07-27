@@ -1,11 +1,10 @@
 mod cleanup;
 mod compare;
 mod config;
-mod disk;
-mod eval;
+mod image;
 mod inspect;
 mod observability;
-mod vm_image;
+mod run;
 mod vm_network;
 
 use std::{
@@ -16,29 +15,31 @@ use std::{
     time::Instant,
 };
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Args, Subcommand};
 use eyre::{Result, eyre};
-use nanoeval::{Task, VerifierCollect, VerifierEnvironmentMode};
+use nanocodex_eval::{Task, VerifierCollect, VerifierEnvironmentMode};
 use nanovm::{
     BlockDevice, GuestCommand, KrunVm, Network, SharedDirectory, VmConfig, VmProcessConfig,
 };
+use nanovm_image::{CachePolicy, DiskStatus, VmImageBuilder};
 use serde::Serialize;
 
-#[derive(Parser)]
-#[command(
-    name = "nanoeval",
-    version,
-    about = "Fast, Docker-free evaluation for coding agents"
-)]
-struct Cli {
+use self::image::{prepare_task_image, prepare_verifier_image};
+
+#[derive(Args)]
+#[command(args_conflicts_with_subcommands = true, subcommand_required = true)]
+pub(crate) struct Eval {
     #[command(subcommand)]
-    command: Option<Command>,
+    command: EvalCommand,
 }
 
 #[derive(Subcommand)]
-enum Command {
+enum EvalCommand {
     /// Run fresh Nanocodex attempts and retain Harbor-compatible outputs.
-    Run(Box<eval::Eval>),
+    Run(Box<run::Run>),
+
+    /// Prepare task VM images without running agents.
+    Prepare(Prepare),
 
     /// Load, validate, and inspect a benchmark task directory.
     Task {
@@ -70,6 +71,33 @@ enum Command {
     },
 }
 
+#[derive(Args)]
+struct Prepare {
+    /// Terminal-Bench task directory. Repeat to prepare several environments.
+    #[arg(
+        long = "task",
+        value_name = "DIRECTORY",
+        required_unless_present = "suites"
+    )]
+    tasks: Vec<PathBuf>,
+
+    /// Terminal-Bench suite directory whose immediate task children should prepare.
+    #[arg(
+        long = "suite",
+        value_name = "DIRECTORY",
+        required_unless_present = "tasks"
+    )]
+    suites: Vec<PathBuf>,
+
+    /// Content-addressed VM cache directory.
+    #[arg(long, default_value = ".cache/vm")]
+    cache: PathBuf,
+
+    /// Resolve image references at the registry even when locally cached.
+    #[arg(long)]
+    refresh: bool,
+}
+
 #[derive(Subcommand)]
 enum VmCommand {
     /// Prepare one or more tasks' Linux/ARM64 root disks without running agents.
@@ -99,7 +127,7 @@ enum VmCommand {
         refresh: bool,
     },
 
-    /// Boot a root filesystem and replace Nanoeval with the guest command.
+    /// Boot a root filesystem and replace Evaluator with the guest command.
     Run {
         /// Linux root filesystem directory exposed to the guest.
         #[arg(long)]
@@ -255,64 +283,75 @@ enum GuestEnvironmentParseError {
     InvalidName,
 }
 
-fn main() -> Result<()> {
-    if !is_vmm_process() {
-        let _ = dotenvy::dotenv();
-    }
-    enable_paint();
-    let cli = Cli::parse();
-
-    if let Some(Command::Vm {
-        command: VmCommand::RunConfig { config },
-    }) = &cli.command
-    {
-        return VmProcessConfig::read(config)?.run().map_err(Into::into);
+impl Eval {
+    pub(crate) fn requires_synchronous_vm(&self) -> bool {
+        matches!(
+            self.command,
+            EvalCommand::Vm {
+                command: VmCommand::Run { .. } | VmCommand::RunConfig { .. }
+            }
+        )
     }
 
-    if let Some(Command::Vm {
-        command:
-            VmCommand::Run {
-                root,
-                ext4,
-                cpus,
-                memory_mib,
-                network_socket,
-                no_network,
-                runtime_directory,
-                writable_share,
-                read_only_disk,
-                writable_disk,
-                environment,
-                guest_command,
-            },
-    }) = &cli.command
-    {
-        return run_vm(RunVm {
-            root,
-            ext4: *ext4,
-            cpus: *cpus,
-            memory_mib: *memory_mib,
-            network_socket: network_socket.as_deref(),
-            no_network: *no_network,
-            runtime_directory: runtime_directory.as_deref(),
-            writable_shares: writable_share,
-            read_only_disks: read_only_disk,
-            writable_disks: writable_disk,
-            environment,
-            guest_command,
-        });
+    pub(crate) fn run_synchronous_vm(&self) -> Result<()> {
+        match &self.command {
+            EvalCommand::Vm {
+                command: command @ VmCommand::Run { .. },
+            } => run_raw_vm(command),
+            EvalCommand::Vm {
+                command: VmCommand::RunConfig { config },
+            } => run_private_vmm(config),
+            _ => Err(eyre!("evaluation command is not a synchronous VM command")),
+        }
     }
 
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(run(cli))
+    pub(crate) async fn run(self) -> Result<()> {
+        enable_paint();
+        run(self).await
+    }
 }
 
-fn is_vmm_process() -> bool {
-    let mut arguments = std::env::args_os().skip(1);
-    arguments.next().as_deref() == Some(std::ffi::OsStr::new("vm"))
-        && arguments.next().as_deref() == Some(std::ffi::OsStr::new("run-config"))
+fn run_private_vmm(config: &Path) -> Result<()> {
+    VmProcessConfig::read(config)?.run().map_err(Into::into)
+}
+
+/*
+ * `nanocodex eval vm` is intentionally retained as a low-level diagnostic
+ * boundary. Normal image and attempt paths use the typed VM crates.
+ */
+fn run_raw_vm(command: &VmCommand) -> Result<()> {
+    let VmCommand::Run {
+        root,
+        ext4,
+        cpus,
+        memory_mib,
+        network_socket,
+        no_network,
+        runtime_directory,
+        writable_share,
+        read_only_disk,
+        writable_disk,
+        environment,
+        guest_command,
+    } = command
+    else {
+        return Err(eyre!("invalid raw VM command"));
+    };
+    enable_paint();
+    run_vm(RunVm {
+        root,
+        ext4: *ext4,
+        cpus: *cpus,
+        memory_mib: *memory_mib,
+        network_socket: network_socket.as_deref(),
+        no_network: *no_network,
+        runtime_directory: runtime_directory.as_deref(),
+        writable_shares: writable_share,
+        read_only_disks: read_only_disk,
+        writable_disks: writable_disk,
+        environment,
+        guest_command,
+    })
 }
 
 fn enable_paint() {
@@ -354,7 +393,7 @@ fn run_vm(input: RunVm<'_>) -> Result<()> {
         config = config.network(Network::Disabled);
     }
     if let Some(directory) = input.runtime_directory {
-        config = config.shared_directory(SharedDirectory::read_only("nanoeval-tools", directory));
+        config = config.shared_directory(SharedDirectory::read_only("nanocodex-tools", directory));
     }
     for share in input.writable_shares {
         config = config.shared_directory(SharedDirectory::read_write(
@@ -383,43 +422,44 @@ async fn prepare_tasks(
     refresh: bool,
 ) -> Result<()> {
     let preparation_started = Instant::now();
-    let tasks = eval::load_task_paths(tasks, suites)?
+    let tasks = run::load_task_paths(tasks, suites)?
         .into_iter()
         .map(Task::load)
         .collect::<Result<Vec<_>, _>>()?;
     let policy = if refresh {
-        vm_image::CachePolicy::Refresh
+        CachePolicy::Refresh
     } else {
-        vm_image::CachePolicy::Reuse
+        CachePolicy::Reuse
     };
     // Resolve the running, entitled VMM executable before a nested guest
     // runtime build can cause Cargo's runner cache to rotate paths.
     let vmm = std::env::current_exe()?;
     let runtime_started = Instant::now();
-    let runtime_image = eval::prepare_vm_guest_runtime().await?;
+    let runtime_image = run::prepare_vm_guest_runtime().await?;
     let runtime_duration = runtime_started.elapsed();
-    let builder = vm_image::VmImageBuilder::new(vmm, runtime_image, ".cache/libkrunfw/libkrunfw");
+    let builder = VmImageBuilder::new(vmm, runtime_image)
+        .vmm_args(["eval", "vm", "run-config", "--config"])
+        .firmware_directory(".cache/libkrunfw/libkrunfw");
     let mut cache_hits = 0_usize;
     let mut cache_creations = 0_usize;
     let mut failures = Vec::new();
     for task in tasks {
         let task_started = Instant::now();
-        let prepared =
-            match vm_image::PreparedRootDisk::prepare(&task, &cache, policy, &builder).await {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    eprintln!(
-                        "{}: failed duration={:.3?}\n{error:#}",
-                        task.name(),
-                        task_started.elapsed()
-                    );
-                    failures.push(task.name().to_owned());
-                    continue;
-                }
-            };
+        let prepared = match prepare_task_image(&builder, &task, &cache, policy).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                eprintln!(
+                    "{}: failed duration={:.3?}\n{error:#}",
+                    task.name(),
+                    task_started.elapsed()
+                );
+                failures.push(task.name().to_owned());
+                continue;
+            }
+        };
         match prepared.disk_status() {
-            vm_image::DiskStatus::Hit => cache_hits += 1,
-            vm_image::DiskStatus::Created => cache_creations += 1,
+            DiskStatus::Hit => cache_hits += 1,
+            DiskStatus::Created => cache_creations += 1,
         }
         eprintln!(
             "{}: manifest={} ({}) root_disk={} duration={:.3?}",
@@ -432,24 +472,21 @@ async fn prepare_tasks(
         println!("{}", prepared.path().display());
         if task.verifier().environment_mode() == VerifierEnvironmentMode::Separate {
             let verifier_started = Instant::now();
-            let verifier =
-                match vm_image::PreparedRootDisk::prepare_verifier(&task, &cache, policy, &builder)
-                    .await
-                {
-                    Ok(verifier) => verifier,
-                    Err(error) => {
-                        eprintln!(
-                            "{} verifier: failed duration={:.3?}\n{error:#}",
-                            task.name(),
-                            verifier_started.elapsed()
-                        );
-                        failures.push(format!("{} verifier", task.name()));
-                        continue;
-                    }
-                };
+            let verifier = match prepare_verifier_image(&builder, &task, &cache, policy).await {
+                Ok(verifier) => verifier,
+                Err(error) => {
+                    eprintln!(
+                        "{} verifier: failed duration={:.3?}\n{error:#}",
+                        task.name(),
+                        verifier_started.elapsed()
+                    );
+                    failures.push(format!("{} verifier", task.name()));
+                    continue;
+                }
+            };
             match verifier.disk_status() {
-                vm_image::DiskStatus::Hit => cache_hits += 1,
-                vm_image::DiskStatus::Created => cache_creations += 1,
+                DiskStatus::Hit => cache_hits += 1,
+                DiskStatus::Created => cache_creations += 1,
             }
             eprintln!(
                 "{} verifier: manifest={} ({}) root_disk={} duration={:.3?}",
@@ -479,16 +516,25 @@ async fn prepare_tasks(
     }
 }
 
-async fn run(cli: Cli) -> Result<()> {
-    let Some(command) = cli.command else {
-        Cli::command().print_help()?;
-        println!();
-        return Ok(());
-    };
-
-    match command {
-        Command::Run(command) => command.run().await?,
-        Command::Task {
+async fn run(eval: Eval) -> Result<()> {
+    match eval.command {
+        EvalCommand::Run(command) => command.run().await?,
+        EvalCommand::Prepare(Prepare {
+            tasks,
+            suites,
+            cache,
+            refresh,
+        })
+        | EvalCommand::Vm {
+            command:
+                VmCommand::Prepare {
+                    tasks,
+                    suites,
+                    cache,
+                    refresh,
+                },
+        } => prepare_tasks(tasks, suites, cache, refresh).await?,
+        EvalCommand::Task {
             directory,
             json,
             prompt,
@@ -504,54 +550,15 @@ async fn run(cli: Cli) -> Result<()> {
                 output.write_human(&mut stdout, prompt)?;
             }
         }
-        Command::Inspect(command) => command.run()?,
-        Command::Compare(command) => command.run().await?,
-        Command::Cleanup(command) => command.run()?,
-        Command::Vm {
-            command:
-                VmCommand::Prepare {
-                    tasks,
-                    suites,
-                    cache,
-                    refresh,
-                },
-        } => prepare_tasks(tasks, suites, cache, refresh).await?,
-        Command::Vm {
-            command:
-                VmCommand::Run {
-                    root,
-                    ext4,
-                    cpus,
-                    memory_mib,
-                    network_socket,
-                    no_network,
-                    runtime_directory,
-                    writable_share,
-                    read_only_disk,
-                    writable_disk,
-                    environment,
-                    guest_command,
-                },
+        EvalCommand::Inspect(command) => command.run()?,
+        EvalCommand::Compare(command) => command.run().await?,
+        EvalCommand::Cleanup(command) => command.run()?,
+        EvalCommand::Vm {
+            command: VmCommand::Run { .. } | VmCommand::RunConfig { .. },
         } => {
-            run_vm(RunVm {
-                root: &root,
-                ext4,
-                cpus,
-                memory_mib,
-                network_socket: network_socket.as_deref(),
-                no_network,
-                runtime_directory: runtime_directory.as_deref(),
-                writable_shares: &writable_share,
-                read_only_disks: &read_only_disk,
-                writable_disks: &writable_disk,
-                environment: &environment,
-                guest_command: &guest_command,
-            })?;
-        }
-        Command::Vm {
-            command: VmCommand::RunConfig { config },
-        } => {
-            VmProcessConfig::read(config)?.run()?;
+            return Err(eyre!(
+                "VM commands must be dispatched before starting the async runtime"
+            ));
         }
     }
     Ok(())
@@ -659,14 +666,15 @@ impl TaskOutput<'_> {
 mod tests {
     use std::{path::Path, str::FromStr};
 
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
-    use super::{Cli, Command, ReadOnlyDisk, VmCommand, WritableShare};
+    use super::{Eval, EvalCommand, ReadOnlyDisk, VmCommand, WritableShare};
+    use crate::{Cli, Command};
 
     #[test]
     fn writable_share_is_a_strict_tag_and_directory_pair() {
-        let share = WritableShare::from_str("nanoeval-cache=/tmp/cache").unwrap();
-        assert_eq!(share.tag, "nanoeval-cache");
+        let share = WritableShare::from_str("nanocodex-cache=/tmp/cache").unwrap();
+        assert_eq!(share.tag, "nanocodex-cache");
         assert_eq!(share.directory, Path::new("/tmp/cache"));
 
         assert!(WritableShare::from_str("missing-directory=").is_err());
@@ -684,8 +692,8 @@ mod tests {
     #[test]
     fn prepare_accepts_repeated_tasks_in_input_order() {
         let cli = Cli::try_parse_from([
-            "nanoeval",
-            "vm",
+            "nanocodex",
+            "eval",
             "prepare",
             "--task",
             "tasks/first",
@@ -693,9 +701,9 @@ mod tests {
             "tasks/second",
         ])
         .unwrap();
-        let Some(Command::Vm {
-            command: VmCommand::Prepare { tasks, .. },
-        }) = cli.command
+        let Some(Command::Eval(Eval {
+            command: EvalCommand::Prepare(super::Prepare { tasks, .. }),
+        })) = cli.command
         else {
             panic!("expected vm prepare command");
         };
@@ -711,12 +719,21 @@ mod tests {
 
     #[test]
     fn prepare_accepts_a_complete_suite() {
-        let cli =
-            Cli::try_parse_from(["nanoeval", "vm", "prepare", "--suite", "terminal-bench-2-1"])
-                .unwrap();
-        let Some(Command::Vm {
-            command: VmCommand::Prepare { suites, .. },
-        }) = cli.command
+        let cli = Cli::try_parse_from([
+            "nanocodex",
+            "eval",
+            "vm",
+            "prepare",
+            "--suite",
+            "terminal-bench-2-1",
+        ])
+        .unwrap();
+        let Some(Command::Eval(Eval {
+            command:
+                EvalCommand::Vm {
+                    command: VmCommand::Prepare { suites, .. },
+                },
+        })) = cli.command
         else {
             panic!("expected vm prepare command");
         };
@@ -727,7 +744,8 @@ mod tests {
     #[test]
     fn vm_run_accepts_an_explicit_no_network_policy() {
         let cli = Cli::try_parse_from([
-            "nanoeval",
+            "nanocodex",
+            "eval",
             "vm",
             "run",
             "--root",
@@ -737,9 +755,12 @@ mod tests {
             "/bin/true",
         ])
         .unwrap();
-        let Some(Command::Vm {
-            command: VmCommand::Run { no_network, .. },
-        }) = cli.command
+        let Some(Command::Eval(Eval {
+            command:
+                EvalCommand::Vm {
+                    command: VmCommand::Run { no_network, .. },
+                },
+        })) = cli.command
         else {
             panic!("expected vm run command");
         };
@@ -750,7 +771,8 @@ mod tests {
     #[test]
     fn vm_run_rejects_conflicting_network_policies() {
         let parsed = Cli::try_parse_from([
-            "nanoeval",
+            "nanocodex",
+            "eval",
             "vm",
             "run",
             "--root",
@@ -762,5 +784,46 @@ mod tests {
         ]);
 
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn complete_eval_surface_is_nested_under_nanocodex() {
+        for arguments in [
+            vec![
+                "nanocodex",
+                "eval",
+                "run",
+                "--task",
+                "tasks/write-greeting",
+                "--pricing-file",
+                "pricing.json",
+            ],
+            vec![
+                "nanocodex",
+                "eval",
+                "task",
+                "tasks/write-greeting",
+                "--json",
+            ],
+            vec!["nanocodex", "eval", "inspect", ".nanocodex/evals/job"],
+            vec![
+                "nanocodex",
+                "eval",
+                "compare",
+                "terminal-bench/configure-git-webserver",
+            ],
+            vec![
+                "nanocodex",
+                "eval",
+                "cleanup",
+                ".nanocodex/evals",
+                "--dry-run",
+            ],
+        ] {
+            Cli::try_parse_from(arguments).expect("supported eval command must parse");
+        }
+
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("eval"));
     }
 }

@@ -1,20 +1,26 @@
 use std::{path::PathBuf, sync::Arc};
 
-use nanocodex::AgentEvent;
+use nanocodex_agent::AgentEvent;
 use serde::Serialize;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::{EvalFailure, EvalResult, VerifierResult};
 
-/// One event from a possibly concurrent Nanoeval attempt.
+/// One event from a possibly concurrent Evaluator attempt.
 #[derive(Clone, Debug, Serialize)]
 pub struct EvalEvent {
+    /// Evaluator job identity.
     pub run_id: Uuid,
+    /// `UUIDv7` identity for the emitting attempt.
     pub attempt_id: Uuid,
+    /// Stable task name.
     pub task_name: String,
+    /// Filesystem-safe unique trial name.
     pub trial_name: String,
+    /// One-based monotonic sequence within this attempt.
     pub sequence: u64,
+    /// Typed event payload.
     #[serde(flatten)]
     pub kind: EvalEventKind,
 }
@@ -23,33 +29,55 @@ pub struct EvalEvent {
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum EvalEventKind {
-    AttemptStarted { prompt: String, workspace: PathBuf },
+    /// The disposable environment is ready and agent setup is beginning.
+    AttemptStarted {
+        /// Complete task prompt.
+        prompt: String,
+        /// Workspace presented to the agent.
+        workspace: PathBuf,
+    },
+    /// One unmodified event from the owned agent lifecycle.
     Agent(AgentEvent),
+    /// Verification is beginning.
     VerifierStarted,
-    VerifierOutput { stdout: String, stderr: String },
+    /// Complete verifier output became available.
+    VerifierOutput {
+        /// Captured standard output.
+        stdout: String,
+        /// Captured standard error.
+        stderr: String,
+    },
+    /// Verification produced its exit code and rewards.
     VerifierCompleted(VerifierResult),
+    /// The scored result became terminal.
     Completed(Box<EvalResult>),
+    /// The attempt failed without a score.
     Failed(Box<EvalFailure>),
 }
 
 /// Cloneable source of independent subscriptions to one evaluation job.
 #[derive(Clone)]
-pub struct NanoevalEvents {
+pub struct EvalEvents {
     sender: broadcast::Sender<Arc<EvalEvent>>,
 }
 
 /// One independent, ordered subscription to an evaluation job.
-pub struct NanoevalEventStream {
+pub struct EvalEventStream {
     receiver: broadcast::Receiver<Arc<EvalEvent>>,
 }
 
+/// Failure while consuming a bounded evaluation event subscription.
 #[derive(Debug, thiserror::Error)]
 pub enum EvalEventStreamError {
+    /// The subscriber did not keep pace with producers.
     #[error("event subscriber fell behind and missed {missed} events")]
-    Lagged { missed: u64 },
+    Lagged {
+        /// Number of events dropped for this subscription.
+        missed: u64,
+    },
 }
 
-impl NanoevalEvents {
+impl EvalEvents {
     pub(crate) fn new(sender: broadcast::Sender<Arc<EvalEvent>>) -> Self {
         Self { sender }
     }
@@ -57,14 +85,14 @@ impl NanoevalEvents {
     /// Subscribes before attempts start. Each subscription receives the same
     /// subsequent events independently.
     #[must_use]
-    pub fn subscribe(&self) -> NanoevalEventStream {
-        NanoevalEventStream {
+    pub fn subscribe(&self) -> EvalEventStream {
+        EvalEventStream {
             receiver: self.sender.subscribe(),
         }
     }
 }
 
-impl NanoevalEventStream {
+impl EvalEventStream {
     /// Receives the next event, `None` after the run closes, or an explicit
     /// lag error rather than silently skipping events.
     ///
@@ -90,12 +118,12 @@ mod tests {
     use tokio::sync::broadcast;
     use uuid::Uuid;
 
-    use super::{EvalEvent, EvalEventKind, EvalEventStreamError, NanoevalEvents};
+    use super::{EvalEvent, EvalEventKind, EvalEventStreamError, EvalEvents};
 
     #[tokio::test]
     async fn subscriptions_receive_the_same_event_independently() {
         let (sender, _) = broadcast::channel(4);
-        let events = NanoevalEvents::new(sender.clone());
+        let events = EvalEvents::new(sender.clone());
         let mut first = events.subscribe();
         let mut second = events.subscribe();
         let event = Arc::new(event(1));
@@ -111,7 +139,7 @@ mod tests {
     #[tokio::test]
     async fn lag_is_reported_instead_of_silently_skipping_events() {
         let (sender, _) = broadcast::channel(1);
-        let events = NanoevalEvents::new(sender.clone());
+        let events = EvalEvents::new(sender.clone());
         let mut subscriber = events.subscribe();
 
         sender.send(Arc::new(event(1))).unwrap();

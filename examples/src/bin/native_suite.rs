@@ -1,10 +1,10 @@
 use std::{env, error::Error, path::PathBuf};
 
 use nanocodex::{Nanocodex, OpenAiAuth, Thinking};
-use nanoeval::{
-    EvalEventKind, EvalEventStreamError, EvalResult, Nanoeval, NanoevalEventStream, Task,
+use nanocodex_eval::{
+    EvalEventKind, EvalEventStream, EvalEventStreamError, EvalResult, Evaluator, Task,
 };
-use nanoeval_harbor::Harbor;
+use nanocodex_eval_harbor::Harbor;
 
 const K: usize = 5;
 const TASKS: [&str; 3] = [
@@ -17,11 +17,11 @@ const TASKS: [&str; 3] = [
 async fn main() -> Result<(), Box<dyn Error>> {
     let output_directory = env::args_os()
         .nth(1)
-        .map_or_else(|| PathBuf::from("nanoeval-runs"), PathBuf::from);
+        .map_or_else(|| PathBuf::from(".nanocodex/evals"), PathBuf::from);
     let [first, second, third] = TASKS.map(Task::load);
     let (first, second, third) = (first?, second?, third?);
     let agent = Nanocodex::builder(auth()?).thinking(Thinking::Low);
-    let (eval, events) = Nanoeval::builder(agent)
+    let (eval, events) = Evaluator::builder(agent)
         .output_directory(output_directory)
         .max_concurrency(TASKS.len() * K)
         .build()?;
@@ -74,10 +74,7 @@ fn print_results(results: impl IntoIterator<Item = EvalResult>) {
     }
 }
 
-async fn observe(
-    mut events: NanoevalEventStream,
-    expected: usize,
-) -> Result<(), EvalEventStreamError> {
+async fn observe(mut events: EvalEventStream, expected: usize) -> Result<(), EvalEventStreamError> {
     let mut completed = 0;
     while completed < expected {
         let Some(event) = events.recv().await? else {
