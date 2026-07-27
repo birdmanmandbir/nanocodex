@@ -20,6 +20,7 @@ host = ["dep:nanovm"]
 
 [dependencies]
 async-trait = "0.1.89"
+base64.workspace = true
 nanocodex-tools = { path = "../nanocodex-tools", version = "0.2.0", default-features = false }
 nanovm = { workspace = true, optional = true }
 nix = { workspace = true, optional = true }

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::{
@@ -26,12 +27,13 @@ use tokio::{
 };
 
 use crate::protocol::{
-    ControlResponse, ExecuteRequest, ExecuteResponse, ReadFileRequest, ReadFileResponse,
-    SessionRequest, SessionResponse, ShutdownRequest, ToolResponse, WriteFileRequest,
+    CancelRequest, ControlResponse, ExecuteRequest, ExecuteResponse, ReadFileRequest,
+    ReadFileResponse, SessionRequest, SessionResponse, ShutdownRequest, ToolResponse,
+    WriteFileRequest,
 };
 
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
-const MAX_CONTROL_FILE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_CONTROL_FILE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_IN_FLIGHT_REQUESTS: usize = 64;
 
 /// Failure while serving VM tool requests inside the guest.
@@ -51,6 +53,9 @@ pub enum VmGuestError {
 
     #[error("VM tool protocol frame exceeded the {MAX_FRAME_BYTES}-byte limit")]
     FrameTooLarge,
+
+    #[error("VM tool protocol reused active request ID {0}")]
+    DuplicateRequestId(u64),
 }
 
 pub(crate) async fn serve(workspace: &Path) -> Result<(), VmGuestError> {
@@ -64,7 +69,8 @@ async fn serve_io(
 ) -> Result<(), VmGuestError> {
     let runtime = Arc::new(ToolRuntime::new(workspace, None, None));
     let mut input = BufReader::new(input);
-    let mut requests = JoinSet::new();
+    let mut requests = JoinSet::<SessionResponse>::new();
+    let mut active = HashMap::<u64, tokio::task::AbortHandle>::new();
     let mut accepting = true;
     let mut shutdown = None;
 
@@ -73,8 +79,11 @@ async fn serve_io(
             tokio::select! {
                 joined = requests.join_next(), if !requests.is_empty() => {
                     match joined.ok_or(VmGuestError::Closed)? {
-                        Ok(response) => write_response(&mut output, &response).await?,
-                        Err(error) if error.is_cancelled() && !accepting => {}
+                        Ok(response) => {
+                            active.remove(&response.id());
+                            write_response(&mut output, &response).await?;
+                        }
+                        Err(error) if error.is_cancelled() => {}
                         Err(error) => return Err(VmGuestError::Task(error.to_string())),
                     }
                 }
@@ -91,11 +100,28 @@ async fn serve_io(
                             shutdown = Some(request);
                             accepting = false;
                             runtime.control().cancel().await;
+                            active.clear();
                             requests.abort_all();
                         }
+                        SessionRequest::Cancel(request) => {
+                            if let Some(task) = active.remove(&request.target_id) {
+                                task.abort();
+                            }
+                            let response = SessionResponse::Cancel(ControlResponse {
+                                id: request.id,
+                                error: None,
+                            });
+                            write_response(&mut output, &response).await?;
+                        }
                         request => {
+                            let id = request.id();
+                            if active.contains_key(&id) {
+                                return Err(VmGuestError::DuplicateRequestId(id));
+                            }
                             let runtime = Arc::clone(&runtime);
-                            requests.spawn(async move { execute_request(runtime, request).await });
+                            let task =
+                                requests.spawn(async move { execute_request(runtime, request).await });
+                            active.insert(id, task);
                         }
                     }
                 }
@@ -135,6 +161,12 @@ async fn execute_request(runtime: Arc<ToolRuntime>, request: SessionRequest) -> 
         SessionRequest::ReadFile(request) => SessionResponse::ReadFile(read_file(request).await),
         SessionRequest::Execute(request) => {
             SessionResponse::Execute(execute_command(request).await)
+        }
+        SessionRequest::Cancel(CancelRequest { id, .. }) => {
+            SessionResponse::Cancel(ControlResponse {
+                id,
+                error: Some("cancel cannot be dispatched as a concurrent request".to_owned()),
+            })
         }
         SessionRequest::Shutdown(request) => SessionResponse::Shutdown(ControlResponse {
             id: request.id,
@@ -253,14 +285,34 @@ async fn atomic_write_file(
 
 async fn read_file(request: ReadFileRequest) -> ReadFileResponse {
     let contents = async {
-        let metadata = tokio::fs::metadata(&request.path).await?;
-        if metadata.len() > MAX_CONTROL_FILE_BYTES {
+        let file = tokio::fs::File::open(&request.path).await?;
+        let metadata = file.metadata().await?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::other(
+                "control reads require a regular file",
+            ));
+        }
+        let maximum = u64::try_from(MAX_CONTROL_FILE_BYTES).unwrap_or(u64::MAX);
+        if metadata.len() > maximum {
             return Err(std::io::Error::other(format!(
                 "file is {} bytes, exceeding the {MAX_CONTROL_FILE_BYTES}-byte control limit",
                 metadata.len()
             )));
         }
-        tokio::fs::read(&request.path).await
+        let mut contents = Vec::with_capacity(
+            usize::try_from(metadata.len())
+                .unwrap_or(usize::MAX)
+                .min(MAX_CONTROL_FILE_BYTES),
+        );
+        file.take(maximum.saturating_add(1))
+            .read_to_end(&mut contents)
+            .await?;
+        if contents.len() > MAX_CONTROL_FILE_BYTES {
+            return Err(std::io::Error::other(format!(
+                "file grew beyond the {MAX_CONTROL_FILE_BYTES}-byte control limit while reading"
+            )));
+        }
+        Ok(contents)
     }
     .await;
     match contents {
@@ -478,8 +530,11 @@ mod tests {
 
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    use super::{execute_command, serve_io};
-    use crate::protocol::{ExecuteRequest, SessionRequest, SessionResponse, ShutdownRequest};
+    use super::{execute_command, read_file, serve_io};
+    use crate::protocol::{
+        CancelRequest, ExecuteRequest, ReadFileRequest, SessionRequest, SessionResponse,
+        ShutdownRequest,
+    };
 
     const DEFAULT_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 
@@ -520,6 +575,26 @@ mod tests {
         assert!(response.error.is_none());
         assert!(response.stdout.is_none());
         assert!(response.stderr.is_none());
+    }
+
+    #[tokio::test]
+    async fn control_read_rejects_non_regular_files_without_blocking() {
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_file(ReadFileRequest {
+                id: 1,
+                path: "/dev/zero".to_owned(),
+            }),
+        )
+        .await
+        .expect("special-file rejection must not wait for EOF");
+
+        assert!(response.contents.is_none());
+        assert!(
+            response
+                .error
+                .is_some_and(|error| error.contains("regular file"))
+        );
     }
 
     #[tokio::test]
@@ -630,6 +705,83 @@ mod tests {
             SessionResponse::Shutdown(response) if response.id == 1 && response.error.is_none()
         ));
         drop(host_write);
+        guest_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn targeted_cancel_aborts_only_the_requested_guest_task() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (host, guest) = tokio::io::duplex(64 * 1024);
+        let (host_read, mut host_write) = tokio::io::split(host);
+        let (guest_read, guest_write) = tokio::io::split(guest);
+        let guest_task = tokio::spawn({
+            let workspace = workspace.path().to_owned();
+            async move { serve_io(&workspace, guest_read, guest_write).await }
+        });
+        for request in [
+            SessionRequest::Execute(ExecuteRequest {
+                id: 0,
+                program: "/bin/sh".to_owned(),
+                arguments: vec!["-c".to_owned(), "sleep 30 & wait".to_owned()],
+                current_directory: workspace.path().to_string_lossy().into_owned(),
+                environment: Vec::new(),
+                timeout_millis: 60_000,
+                max_output_bytes: DEFAULT_OUTPUT_BYTES,
+            }),
+            SessionRequest::Cancel(CancelRequest {
+                id: 1,
+                target_id: 0,
+            }),
+            SessionRequest::Execute(ExecuteRequest {
+                id: 2,
+                program: "/usr/bin/true".to_owned(),
+                arguments: Vec::new(),
+                current_directory: workspace.path().to_string_lossy().into_owned(),
+                environment: Vec::new(),
+                timeout_millis: 5_000,
+                max_output_bytes: DEFAULT_OUTPUT_BYTES,
+            }),
+        ] {
+            host_write
+                .write_all(&serde_json::to_vec(&request).unwrap())
+                .await
+                .unwrap();
+            host_write.write_all(b"\n").await.unwrap();
+        }
+
+        let mut responses = BufReader::new(host_read).lines();
+        let mut cancelled = false;
+        let mut follow_up = false;
+        while !cancelled || !follow_up {
+            let line = tokio::time::timeout(Duration::from_secs(2), responses.next_line())
+                .await
+                .expect("cancellation and the independent follow-up must complete")
+                .unwrap()
+                .unwrap();
+            match serde_json::from_str::<SessionResponse>(&line).unwrap() {
+                SessionResponse::Cancel(response) if response.id == 1 => cancelled = true,
+                SessionResponse::Execute(response) if response.id == 2 => {
+                    assert!(response.error.is_none());
+                    assert!(!response.timed_out);
+                    follow_up = true;
+                }
+                response => panic!("unexpected response ID {}", response.id()),
+            }
+        }
+
+        host_write
+            .write_all(
+                &serde_json::to_vec(&SessionRequest::Shutdown(ShutdownRequest { id: 3 })).unwrap(),
+            )
+            .await
+            .unwrap();
+        host_write.write_all(b"\n").await.unwrap();
+        drop(host_write);
+        let shutdown = responses.next_line().await.unwrap().unwrap();
+        assert!(matches!(
+            serde_json::from_str::<SessionResponse>(&shutdown).unwrap(),
+            SessionResponse::Shutdown(response) if response.id == 3 && response.error.is_none()
+        ));
         guest_task.await.unwrap().unwrap();
     }
 }

@@ -9,7 +9,22 @@ pub(crate) enum SessionRequest {
     WriteFile(WriteFileRequest),
     ReadFile(ReadFileRequest),
     Execute(ExecuteRequest),
+    Cancel(CancelRequest),
     Shutdown(ShutdownRequest),
+}
+
+impl SessionRequest {
+    #[cfg(feature = "guest")]
+    pub const fn id(&self) -> u64 {
+        match self {
+            Self::Tool(request) => request.id,
+            Self::WriteFile(request) => request.id,
+            Self::ReadFile(request) => request.id,
+            Self::Execute(request) => request.id,
+            Self::Cancel(request) => request.id,
+            Self::Shutdown(request) => request.id,
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -19,15 +34,17 @@ pub(crate) enum SessionResponse {
     WriteFile(ControlResponse),
     ReadFile(ReadFileResponse),
     Execute(ExecuteResponse),
+    Cancel(ControlResponse),
     Shutdown(ControlResponse),
 }
 
 impl SessionResponse {
-    #[cfg(feature = "host")]
     pub const fn id(&self) -> u64 {
         match self {
             Self::Tool(response) => response.id,
-            Self::WriteFile(response) | Self::Shutdown(response) => response.id,
+            Self::WriteFile(response) | Self::Cancel(response) | Self::Shutdown(response) => {
+                response.id
+            }
             Self::ReadFile(response) => response.id,
             Self::Execute(response) => response.id,
         }
@@ -45,6 +62,7 @@ pub(crate) struct ShutdownRequest {
 pub(crate) struct WriteFileRequest {
     pub id: u64,
     pub path: String,
+    #[serde(with = "wire_bytes")]
     pub contents: Vec<u8>,
     pub mode: u32,
 }
@@ -70,6 +88,13 @@ pub(crate) struct ExecuteRequest {
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct CancelRequest {
+    pub id: u64,
+    pub target_id: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ControlResponse {
     pub id: u64,
     pub error: Option<String>,
@@ -79,6 +104,7 @@ pub(crate) struct ControlResponse {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReadFileResponse {
     pub id: u64,
+    #[serde(default, with = "optional_wire_bytes")]
     pub contents: Option<Vec<u8>>,
     pub error: Option<String>,
 }
@@ -88,11 +114,61 @@ pub(crate) struct ReadFileResponse {
 pub(crate) struct ExecuteResponse {
     pub id: u64,
     pub exit_code: Option<i32>,
+    #[serde(default, with = "optional_wire_bytes")]
     pub stdout: Option<Vec<u8>>,
+    #[serde(default, with = "optional_wire_bytes")]
     pub stderr: Option<Vec<u8>>,
     pub error: Option<String>,
     pub timed_out: bool,
     pub output_limit_exceeded: bool,
+}
+
+mod wire_bytes {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        STANDARD.decode(encoded).map_err(D::Error::custom)
+    }
+}
+
+mod optional_wire_bytes {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
+
+    #[allow(
+        clippy::ref_option,
+        reason = "serde's `with` module contract passes the field by reference"
+    )]
+    pub fn serialize<S>(bytes: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match bytes {
+            Some(bytes) => serializer.serialize_some(&STANDARD.encode(bytes)),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<String>::deserialize(deserializer)?
+            .map(|encoded| STANDARD.decode(encoded).map_err(D::Error::custom))
+            .transpose()
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -118,6 +194,7 @@ mod tests {
 
     use super::{
         SessionRequest, ShutdownRequest, ToolRequest, ToolResponse, WireToolContext, WireToolInput,
+        WriteFileRequest,
     };
 
     #[test]
@@ -165,6 +242,25 @@ mod tests {
         let encoded = serde_json::to_string(&response).unwrap();
         let decoded = serde_json::from_str::<ToolResponse>(&encoded).unwrap();
         assert_eq!(decoded.id, 8);
+    }
+
+    #[test]
+    fn binary_control_payloads_use_bounded_base64_strings() {
+        let request = SessionRequest::WriteFile(WriteFileRequest {
+            id: 4,
+            path: "/tmp/output".to_owned(),
+            contents: vec![0, 127, 128, 255],
+            mode: 0o600,
+        });
+        let encoded = serde_json::to_string(&request).unwrap();
+
+        assert!(encoded.contains(r#""contents":"AH+A/w==""#));
+        assert!(!encoded.contains(r#""contents":[0,127,128,255]"#));
+        let decoded = serde_json::from_str::<SessionRequest>(&encoded).unwrap();
+        let SessionRequest::WriteFile(decoded) = decoded else {
+            panic!("write-file request changed variants");
+        };
+        assert_eq!(decoded.contents, [0, 127, 128, 255]);
     }
 }
 
