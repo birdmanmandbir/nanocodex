@@ -564,8 +564,8 @@ worker response body through its child DevTools session.
 `visual_diff` captures the current page, performs a deterministic pixel
 comparison, and returns change ratios plus a magenta diff image. Neither action
 requires an application dependency. Viewport dimensions are bounded at 16,384
-CSS pixels, and model-visible PNGs are rejected above 32 MiB or 32 Mi pixels
-before image decoding or base64 expansion.
+CSS pixels, and model-visible image captures are rejected above 32 MiB or
+32 Mi pixels before image decoding or base64 expansion.
 
 `visual_trace_start` runs a bounded screenshot sampler in the owned browser
 session. `visual_trace_stop` compares consecutive frames, incorporates the
