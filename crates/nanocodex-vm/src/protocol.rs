@@ -23,6 +23,7 @@ pub(crate) enum SessionResponse {
 }
 
 impl SessionResponse {
+    #[cfg(feature = "host")]
     pub const fn id(&self) -> u64 {
         match self {
             Self::Tool(response) => response.id,
@@ -64,6 +65,7 @@ pub(crate) struct ExecuteRequest {
     pub current_directory: String,
     pub environment: Vec<(String, String)>,
     pub timeout_millis: u64,
+    pub max_output_bytes: usize,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -90,6 +92,7 @@ pub(crate) struct ExecuteResponse {
     pub stderr: Option<Vec<u8>>,
     pub error: Option<String>,
     pub timed_out: bool,
+    pub output_limit_exceeded: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -198,6 +201,7 @@ pub(crate) struct ToolResponse {
 }
 
 impl ToolResponse {
+    #[cfg(feature = "guest")]
     pub const fn completed(id: u64, execution: ToolExecutionWire) -> Self {
         Self {
             id,
@@ -206,6 +210,7 @@ impl ToolResponse {
         }
     }
 
+    #[cfg(feature = "guest")]
     pub const fn failed(id: u64, error: String) -> Self {
         Self {
             id,

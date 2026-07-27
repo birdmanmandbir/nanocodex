@@ -4,8 +4,11 @@ use async_trait::async_trait;
 use nanocodex_core::{ImageDetail, OpenAiAuth, ResponseItem, ToolDefinition};
 use schemars::{JsonSchema, r#gen::SchemaSettings};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+#[cfg(any(feature = "code-mode", test))]
+use serde_json::json;
 use serde_json::value::{RawValue, to_raw_value};
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
+#[cfg(feature = "code-mode")]
 use tracing::{Instrument, info, info_span};
 
 #[cfg(feature = "code-mode")]
@@ -78,6 +81,7 @@ pub struct ProcessTraceWire {
 /// Owned context used when a Code Mode cell may outlive the model tool call
 /// that started it.
 #[doc(hidden)]
+#[cfg(feature = "code-mode")]
 pub struct OwnedToolContext {
     pub(crate) model: String,
     pub(crate) session_id: String,
@@ -86,6 +90,7 @@ pub struct OwnedToolContext {
     pub(crate) output_token_budget: usize,
 }
 
+#[cfg(feature = "code-mode")]
 impl OwnedToolContext {
     #[must_use]
     pub fn new(
@@ -207,6 +212,7 @@ impl ToolExecution {
         }
     }
 
+    #[cfg(any(feature = "code-mode", feature = "remote-tools"))]
     pub(crate) fn value(&self) -> Value {
         if let Some(value) = &self.code_mode_value {
             return value.clone();
@@ -996,6 +1002,7 @@ impl ToolRegistry {
         }
     }
 
+    #[cfg(feature = "code-mode")]
     pub(crate) async fn execute_nested(
         &self,
         name: &str,
@@ -1099,6 +1106,7 @@ impl ToolRegistry {
         execution
     }
 
+    #[cfg(feature = "code-mode")]
     async fn execute_nested_inner(
         &self,
         name: &str,
@@ -1140,6 +1148,7 @@ impl ToolRegistry {
         }
     }
 
+    #[cfg(feature = "code-mode")]
     pub(crate) fn nested_tool_metadata(&self) -> Vec<Value> {
         let mut metadata = self
             .entries()
@@ -1183,15 +1192,18 @@ impl ToolRegistry {
         Some((self.ordered.get(index)?, self.definitions.get(index)?))
     }
 
+    #[cfg(feature = "code-mode")]
     pub(crate) fn definitions(&self) -> &[ToolDefinition] {
         &self.definitions
     }
 
+    #[cfg(feature = "code-mode")]
     fn entries(&self) -> impl Iterator<Item = (&Arc<dyn Tool>, &ToolDefinition)> {
         self.ordered.iter().zip(&self.definitions)
     }
 }
 
+#[cfg(feature = "code-mode")]
 fn record_tool_content(span: &tracing::Span, kind: &'static str, content: &str) {
     span.in_scope(|| {
         info!(
@@ -1203,6 +1215,7 @@ fn record_tool_content(span: &tracing::Span, kind: &'static str, content: &str) 
     });
 }
 
+#[cfg(feature = "code-mode")]
 fn definition_metadata(name: &str, definition: &ToolDefinition) -> Value {
     let kind = match definition {
         ToolDefinition::Function { .. } => "function",

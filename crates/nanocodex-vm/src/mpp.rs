@@ -5,10 +5,10 @@ use std::{
 };
 
 use mpp_egress::MppEgress;
-use nanovm::{EgressError, EgressFile, EgressLease};
+use nanovm::{EgressError, EgressFile, EgressLease, GUEST_EGRESS_ROOT};
 use thiserror::Error;
 
-const GUEST_DIRECTORY: &str = "/tmp/nanocodex/egress/mpp";
+const GUEST_LAYER: &str = "mpp";
 const CA_FILENAME: &str = "mpp-egress-ca.pem";
 const CA_ENVIRONMENT: [&str; 4] = [
     "CURL_CA_BUNDLE",
@@ -45,7 +45,7 @@ where
             certificate.to_path_buf(),
         ));
     }
-    let guest_directory = PathBuf::from(GUEST_DIRECTORY);
+    let guest_directory = Path::new(GUEST_EGRESS_ROOT).join(GUEST_LAYER);
     let guest_certificate = guest_directory.join(CA_FILENAME);
     let guest_certificate = guest_certificate
         .to_str()
@@ -120,7 +120,7 @@ mod tests {
         );
         assert_eq!(
             lease.guest_environment().get("CURL_CA_BUNDLE"),
-            Some(&format!("{GUEST_DIRECTORY}/{CA_FILENAME}"))
+            Some(&format!("{GUEST_EGRESS_ROOT}/{GUEST_LAYER}/{CA_FILENAME}"))
         );
         assert_eq!(lease.guest_mounts().count(), 0);
         assert_eq!(lease.guest_files().count(), 1);

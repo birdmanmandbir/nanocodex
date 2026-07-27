@@ -421,6 +421,7 @@ fn load_for_prompt_bytes(
     Ok(image)
 }
 
+#[cfg(feature = "remote-tools")]
 pub(super) fn load_for_prompt_data_url(
     path: &Path,
     file_bytes: Vec<u8>,
