@@ -1,4 +1,5 @@
 use std::{
+    io::Cursor,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex as StdMutex,
@@ -8,7 +9,7 @@ use std::{
 };
 
 use chromiumoxide::{Page, page::ScreenshotParams};
-use image::{DynamicImage, GenericImageView, ImageBuffer, Rgba};
+use image::{DynamicImage, ImageBuffer, Rgba};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
@@ -20,6 +21,8 @@ use crate::{
 use super::BrowserError;
 
 const DEFAULT_PIXEL_THRESHOLD: u8 = 16;
+pub(crate) const MAX_IMAGE_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_IMAGE_ARTIFACT_PIXELS: u64 = 32 * 1024 * 1024;
 const FLASH_CHANGE_RATIO: f64 = 0.35;
 const RETURN_CHANGE_RATIO: f64 = 0.08;
 const BLANK_PIXEL_RATIO: f64 = 0.985;
@@ -63,9 +66,24 @@ pub(super) async fn capture(
     let path = output_dir.join(format!("{artifact_id}.png"));
     let params = ScreenshotParams::builder().full_page(full_page).build();
     let bytes = page.screenshot(params).await?;
+    let byte_count = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if byte_count > MAX_IMAGE_ARTIFACT_BYTES {
+        return Err(BrowserError::ImageArtifactTooLarge {
+            bytes: byte_count,
+            maximum: MAX_IMAGE_ARTIFACT_BYTES,
+        });
+    }
+    let (width, height) = image::ImageReader::new(Cursor::new(&bytes))
+        .with_guessed_format()?
+        .into_dimensions()?;
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    if pixels > MAX_IMAGE_ARTIFACT_PIXELS {
+        return Err(BrowserError::ImageArtifactPixels {
+            pixels,
+            maximum: MAX_IMAGE_ARTIFACT_PIXELS,
+        });
+    }
     tokio::fs::write(&path, &bytes).await?;
-    let image = image::load_from_memory(&bytes)?;
-    let (width, height) = image.dimensions();
     Ok(BrowserImageArtifact {
         artifact_id,
         path,

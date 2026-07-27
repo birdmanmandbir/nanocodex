@@ -4650,7 +4650,7 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-browser"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -4699,8 +4699,8 @@ dependencies = [
  "nanocodex-tools",
  "nanocodex-vm",
  "nanovm",
- "reflink-copy",
  "rand 0.9.5",
+ "reflink-copy",
  "reqwest",
  "rustls",
  "serde",
@@ -4773,7 +4773,7 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-react"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "eyre",

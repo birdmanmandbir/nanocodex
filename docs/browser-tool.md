@@ -536,6 +536,9 @@ to enable capture before their first script runs, then resumed. Request and
 response bodies are fetched only when requested rather than retained in every
 summary. Network and WebSocket reads use monotonic cursors so Code Mode can
 drain a busy session without silently losing records.
+Deterministic network fixtures retain at most 128 routes; each response is
+limited to 128 headers, 64 KiB of header data, and a 4 MiB body, and header
+newlines are rejected.
 Console and page-error stack frames preserve one-based generated locations.
 Inline and same-origin source maps are loaded through Chromium with the active
 session's credentials and add original authored locations without discarding
@@ -560,7 +563,9 @@ worker response body through its child DevTools session.
 `visual_baseline` retains a private PNG and returns an opaque artifact ID.
 `visual_diff` captures the current page, performs a deterministic pixel
 comparison, and returns change ratios plus a magenta diff image. Neither action
-requires an application dependency.
+requires an application dependency. Viewport dimensions are bounded at 16,384
+CSS pixels, and model-visible PNGs are rejected above 32 MiB or 32 Mi pixels
+before image decoding or base64 expansion.
 
 `visual_trace_start` runs a bounded screenshot sampler in the owned browser
 session. `visual_trace_stop` compares consecutive frames, incorporates the

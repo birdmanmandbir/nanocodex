@@ -1928,6 +1928,20 @@ return true;
     Ok(())
 }
 
+#[test]
+fn browser_context_rejects_unbounded_viewports() {
+    let result = Browser::builder()
+        .context(BrowserContext::default().viewport(BrowserViewport::desktop(
+            super::MAX_VIEWPORT_DIMENSION + 1,
+            720,
+        )))
+        .build();
+    assert!(matches!(
+        result,
+        Err(BrowserBuildError::Configuration { .. })
+    ));
+}
+
 #[tokio::test]
 #[ignore = "requires local Chrome and NANOCODEX_TEST_LIGHTHOUSE pointing to the Chrome Lighthouse CLI"]
 async fn exact_lighthouse_audit_attaches_to_the_owned_chrome_session() -> Result<()> {

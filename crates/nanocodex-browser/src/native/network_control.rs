@@ -24,6 +24,13 @@ use crate::{BrowserEgressPolicy, BrowserPageError, BrowserRouteResponse};
 
 use super::{BrowserError, Diagnostics};
 
+const MAX_NETWORK_ROUTES: usize = 128;
+const MAX_ROUTE_ID_BYTES: usize = 256;
+const MAX_ROUTE_PATTERN_BYTES: usize = 4 * 1024;
+const MAX_ROUTE_BODY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ROUTE_HEADERS: usize = 128;
+const MAX_ROUTE_HEADER_BYTES: usize = 64 * 1024;
+
 #[derive(Clone)]
 pub(super) struct NetworkControls {
     inner: Arc<StdMutex<NetworkControlState>>,
@@ -77,9 +84,25 @@ impl NetworkControls {
                 message: "route_id cannot be empty".to_owned(),
             });
         }
+        if route_id.len() > MAX_ROUTE_ID_BYTES {
+            return Err(BrowserError::InvalidNetworkRoute {
+                message: format!(
+                    "route_id is {} bytes, above the {MAX_ROUTE_ID_BYTES}-byte limit",
+                    route_id.len()
+                ),
+            });
+        }
         if url_contains.is_empty() {
             return Err(BrowserError::InvalidNetworkRoute {
                 message: "url_contains cannot be empty".to_owned(),
+            });
+        }
+        if url_contains.len() > MAX_ROUTE_PATTERN_BYTES {
+            return Err(BrowserError::InvalidNetworkRoute {
+                message: format!(
+                    "url_contains is {} bytes, above the {MAX_ROUTE_PATTERN_BYTES}-byte limit",
+                    url_contains.len()
+                ),
             });
         }
         if !(100..=599).contains(&response.status) {
@@ -87,17 +110,60 @@ impl NetworkControls {
                 message: format!("HTTP status {} is outside 100..=599", response.status),
             });
         }
-        self.inner
+        if response.body.len() > MAX_ROUTE_BODY_BYTES {
+            return Err(BrowserError::InvalidNetworkRoute {
+                message: format!(
+                    "response body is {} bytes, above the {MAX_ROUTE_BODY_BYTES}-byte limit",
+                    response.body.len()
+                ),
+            });
+        }
+        if response.headers.len() > MAX_ROUTE_HEADERS {
+            return Err(BrowserError::InvalidNetworkRoute {
+                message: format!(
+                    "response has {} headers, above the {MAX_ROUTE_HEADERS}-header limit",
+                    response.headers.len()
+                ),
+            });
+        }
+        let header_bytes = response.headers.iter().fold(0_usize, |total, header| {
+            total
+                .saturating_add(header.name.len())
+                .saturating_add(header.value.len())
+        });
+        if header_bytes > MAX_ROUTE_HEADER_BYTES {
+            return Err(BrowserError::InvalidNetworkRoute {
+                message: format!(
+                    "response headers are {header_bytes} bytes, above the \
+                     {MAX_ROUTE_HEADER_BYTES}-byte limit"
+                ),
+            });
+        }
+        if response.headers.iter().any(|header| {
+            header.name.trim().is_empty()
+                || header.name.contains(['\r', '\n'])
+                || header.value.contains(['\r', '\n'])
+        }) {
+            return Err(BrowserError::InvalidNetworkRoute {
+                message: "response headers contain an empty name or newline".to_owned(),
+            });
+        }
+        let mut state = self
+            .inner
             .lock()
-            .map_err(|_| BrowserError::DiagnosticsUnavailable)?
-            .routes
-            .insert(
-                route_id,
-                NetworkRoute {
-                    url_contains,
-                    response,
-                },
-            );
+            .map_err(|_| BrowserError::DiagnosticsUnavailable)?;
+        if !state.routes.contains_key(&route_id) && state.routes.len() >= MAX_NETWORK_ROUTES {
+            return Err(BrowserError::InvalidNetworkRoute {
+                message: format!("browser retains at most {MAX_NETWORK_ROUTES} network routes"),
+            });
+        }
+        state.routes.insert(
+            route_id,
+            NetworkRoute {
+                url_contains,
+                response,
+            },
+        );
         Ok(())
     }
 
@@ -264,6 +330,14 @@ fn is_loopback(host: &Host<&str>) -> bool {
 mod tests {
     use super::*;
 
+    fn response() -> BrowserRouteResponse {
+        BrowserRouteResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: String::new(),
+        }
+    }
+
     #[test]
     fn egress_matching_is_boundary_aware() {
         let policy = BrowserEgressPolicy::deny_by_default()
@@ -275,5 +349,56 @@ mod tests {
         assert!(url_allowed("https://exact.test:8443/", &policy));
         assert!(!url_allowed("https://exact.test/", &policy));
         assert!(!url_allowed("http://127.0.0.1/", &policy));
+    }
+
+    #[test]
+    fn routes_bound_retained_state_and_response_size() {
+        let controls = NetworkControls::new(None);
+        for index in 0..MAX_NETWORK_ROUTES {
+            controls
+                .route(format!("route-{index}"), "/fixture".to_owned(), response())
+                .unwrap();
+        }
+        controls
+            .route("route-0".to_owned(), "/replacement".to_owned(), response())
+            .unwrap();
+        assert!(
+            controls
+                .route("overflow".to_owned(), "/fixture".to_owned(), response())
+                .is_err()
+        );
+
+        let mut oversized = response();
+        oversized.body = "x".repeat(MAX_ROUTE_BODY_BYTES + 1);
+        assert!(
+            NetworkControls::new(None)
+                .route("oversized".to_owned(), "/fixture".to_owned(), oversized)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn routes_reject_header_injection() {
+        let mut injected = response();
+        injected.headers.push(crate::BrowserRouteHeader {
+            name: "x-safe".to_owned(),
+            value: "value\r\nx-injected: yes".to_owned(),
+        });
+        assert!(
+            NetworkControls::new(None)
+                .route("headers".to_owned(), "/fixture".to_owned(), injected)
+                .is_err()
+        );
+
+        let mut oversized = response();
+        oversized.headers.push(crate::BrowserRouteHeader {
+            name: "x-large".to_owned(),
+            value: "x".repeat(MAX_ROUTE_HEADER_BYTES),
+        });
+        assert!(
+            NetworkControls::new(None)
+                .route("headers".to_owned(), "/fixture".to_owned(), oversized)
+                .is_err()
+        );
     }
 }

@@ -23,6 +23,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+const MAX_VIEWPORT_DIMENSION: u32 = 16_384;
+
 pub use features::{
     BrowserAccessibilityAudit, BrowserAccessibilityImpact, BrowserAccessibilityViolation,
     BrowserAfterAction, BrowserAxeAudit, BrowserAxeFinding, BrowserAxeNode, BrowserBreakpoint,
@@ -3368,6 +3370,8 @@ fn validate_browser_context(context: &BrowserContext) -> Result<(), BrowserBuild
     if let Some(viewport) = context.viewport
         && (viewport.width == 0
             || viewport.height == 0
+            || viewport.width > MAX_VIEWPORT_DIMENSION
+            || viewport.height > MAX_VIEWPORT_DIMENSION
             || !viewport.device_scale_factor.is_finite()
             || viewport.device_scale_factor <= 0.0
             || viewport.max_touch_points > 16
@@ -3675,7 +3679,16 @@ impl Tool for BrowserTool {
         };
         let mut content = Vec::new();
         let mut model_images = BTreeMap::new();
+        let mut total_image_bytes = 0_u64;
         for path in result.image_paths() {
+            let bytes = tokio::fs::metadata(path).await?.len();
+            total_image_bytes = total_image_bytes.saturating_add(bytes);
+            if total_image_bytes > native::MAX_IMAGE_ARTIFACT_BYTES {
+                return Err(Box::new(BrowserError::ImageArtifactTooLarge {
+                    bytes: total_image_bytes,
+                    maximum: native::MAX_IMAGE_ARTIFACT_BYTES,
+                }));
+            }
             let bytes = tokio::fs::read(path).await?;
             let image_url = format!("data:image/png;base64,{}", STANDARD.encode(bytes));
             content.push(ToolOutputContent::InputImage {
