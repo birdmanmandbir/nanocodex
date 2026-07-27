@@ -115,7 +115,9 @@ nanocodex-tools-macros
 └── proc-macro implementation; no agent dependency
 ```
 
-Systems and evaluation crates remain below the agent:
+Systems and evaluation crates remain below the agent. VM packages live under
+`crates/experimental/`; they remain workspace members but are outside the
+stable publication and dependency surface:
 
 ```text
 nanovm-image ──> nanocodex-vm ──> nanovm
