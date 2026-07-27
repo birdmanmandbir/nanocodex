@@ -25,6 +25,7 @@ for the estimate, not a percentile claim.
 
 | Operation | Fixture | Estimate |
 | --- | --- | --- |
+| warm guest-runtime prepare | path-scoped source record and prepared 128 MiB ext4 disk | 32.662–38.613 µs |
 | warm image prepare | local immutable OCI reference and prepared 512 MiB ext4 disk | 62.020–63.628 µs |
 | attempt root reflink | prepared 512 MiB ext4 disk to a fresh APFS path | 114.22–119.44 µs |
 | retained protocol RPC | typed command over a retained local process protocol | 145.61–147.85 µs |
@@ -61,6 +62,7 @@ host because filesystem and hypervisor timings are machine-sensitive.
 
 | Operation | Budget |
 | --- | --- |
+| warm guest-runtime prepare | ≤ 100 µs |
 | warm image prepare | ≤ 100 µs |
 | attempt root reflink | ≤ 200 µs |
 | retained protocol RPC | ≤ 250 µs |
@@ -69,6 +71,8 @@ host because filesystem and hypervisor timings are machine-sensitive.
 
 Hard structural gates:
 
+- a healthy guest-runtime hit reads only its source/disk metadata and atomic
+  record; source or disk changes trigger complete byte/ext4 validation;
 - a valid warm prepared-disk hit does not decode OCI layer contents or launch a
   VM;
 - two concurrent preparations of one cache key publish exactly one disk and

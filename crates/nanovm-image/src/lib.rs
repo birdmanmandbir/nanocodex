@@ -49,6 +49,8 @@
 
 mod disk;
 
+pub use disk::reflink_or_sparse_copy;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
@@ -72,8 +74,6 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use tracing::{Instrument, info, info_span};
-
-use crate::disk::reflink_or_sparse_copy;
 
 const BLOCK_SIZE: u32 = 4_096;
 const MINIMUM_DISK_BYTES: u64 = 512 * 1024 * 1024;
@@ -774,10 +774,12 @@ impl DockerfileRecipe {
                     .instructions
                     .push(DockerfileInstruction::Copy(parse_copy(arguments, &line)?)),
                 "ENV" => {
-                    let (name, value) = parse_assignment(arguments, &line)?;
-                    current_stage(&mut stages, &line)?
-                        .instructions
-                        .push(DockerfileInstruction::Env { name, value });
+                    let assignments = parse_environment_assignments(arguments, &line)?;
+                    current_stage(&mut stages, &line)?.instructions.extend(
+                        assignments
+                            .into_iter()
+                            .map(|(name, value)| DockerfileInstruction::Env { name, value }),
+                    );
                 }
                 "ARG" => {
                     let (name, default) = match arguments.split_once('=') {
@@ -904,14 +906,35 @@ fn parse_copy(arguments: &str, line: &str) -> Result<DockerfileCopy, ImageError>
     })
 }
 
-fn parse_assignment(arguments: &str, line: &str) -> Result<(String, String), ImageError> {
-    let (name, value) = arguments
-        .split_once('=')
+fn parse_environment_assignments(
+    arguments: &str,
+    line: &str,
+) -> Result<Vec<(String, String)>, ImageError> {
+    let mut fields = shlex::split(arguments)
         .ok_or_else(|| ImageError::UnsupportedDockerfile(line.to_owned()))?;
-    if !valid_environment_name(name) {
+    let Some(first) = fields.first() else {
         return Err(ImageError::UnsupportedDockerfile(line.to_owned()));
+    };
+    if !first.contains('=') {
+        if fields.len() < 2 || !valid_environment_name(first) {
+            return Err(ImageError::UnsupportedDockerfile(line.to_owned()));
+        }
+        let name = fields.remove(0);
+        return Ok(vec![(name, fields.join(" "))]);
     }
-    Ok((name.to_owned(), value.to_owned()))
+
+    fields
+        .into_iter()
+        .map(|assignment| {
+            let (name, value) = assignment
+                .split_once('=')
+                .ok_or_else(|| ImageError::UnsupportedDockerfile(line.to_owned()))?;
+            if !valid_environment_name(name) {
+                return Err(ImageError::UnsupportedDockerfile(line.to_owned()));
+            }
+            Ok((name.to_owned(), value.to_owned()))
+        })
+        .collect()
 }
 
 fn valid_environment_name(name: &str) -> bool {
@@ -2293,6 +2316,33 @@ mod tests {
             environment.get("PATH").map(String::as_str),
             Some(super::DEFAULT_GUEST_PATH)
         );
+    }
+
+    #[test]
+    fn docker_environment_removes_quotes_and_expands_in_order() {
+        let recipe = DockerfileRecipe::parse(
+            r#"FROM oven/bun:1.2.15-debian
+ENV PATH="/opt/venv/bin:${PATH}" MODE='frontier bench' EMPTY=
+ENV LEGACY value with spaces
+"#,
+        )
+        .unwrap();
+        let mut environment = BTreeMap::from([("PATH".to_owned(), "/bin".to_owned())]);
+        let arguments = BTreeMap::new();
+        for instruction in &recipe.stages[0].instructions {
+            let super::DockerfileInstruction::Env { name, value } = instruction else {
+                continue;
+            };
+            environment.insert(
+                name.clone(),
+                super::expand_variables(value, &environment, &arguments),
+            );
+        }
+
+        assert_eq!(environment["PATH"], "/opt/venv/bin:/bin");
+        assert_eq!(environment["MODE"], "frontier bench");
+        assert_eq!(environment["EMPTY"], "");
+        assert_eq!(environment["LEGACY"], "value with spaces");
     }
 
     #[test]

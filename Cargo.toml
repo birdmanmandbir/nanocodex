@@ -1,5 +1,5 @@
 [workspace]
-members = ["bin/nanocodex", "bin/nanousd-api", "crates/mpp-egress", "crates/nanocodex", "crates/nanocodex-agent", "crates/nanocodex-core", "crates/nanocodex-oai-api", "crates/nanocodex-observability", "crates/nanocodex-service", "crates/nanocodex-tools", "crates/nanocodex-tools-macros", "crates/nanocodex-vm", "crates/nanousd", "crates/nanovm", "crates/nanovm-image", "examples", "js/bindings", "py/bindings"]
+members = ["bin/nanocodex", "bin/nanousd-api", "crates/mpp-egress", "crates/nanocodex", "crates/nanocodex-agent", "crates/nanocodex-core", "crates/nanocodex-eval", "crates/nanocodex-eval-harbor", "crates/nanocodex-oai-api", "crates/nanocodex-observability", "crates/nanocodex-service", "crates/nanocodex-tools", "crates/nanocodex-tools-macros", "crates/nanocodex-vm", "crates/nanousd", "crates/nanovm", "crates/nanovm-image", "examples", "js/bindings", "py/bindings"]
 default-members = ["bin/nanocodex"]
 resolver = "2"
 
@@ -46,6 +46,8 @@ mpp-egress = { version = "0.2.0", path = "crates/mpp-egress" }
 nanocodex = { version = "0.2.0", path = "crates/nanocodex" }
 nanocodex-agent = { version = "0.2.0", path = "crates/nanocodex-agent" }
 nanocodex-core = { version = "0.2.0", path = "crates/nanocodex-core" }
+nanocodex-eval = { version = "0.2.0", path = "crates/nanocodex-eval" }
+nanocodex-eval-harbor = { version = "0.2.0", path = "crates/nanocodex-eval-harbor" }
 nanocodex-oai-api = { version = "0.2.0", path = "crates/nanocodex-oai-api", default-features = false }
 nanocodex-observability = { version = "0.2.0", path = "crates/nanocodex-observability" }
 nanocodex-service = { version = "0.2.0", path = "crates/nanocodex-service" }
@@ -57,6 +59,7 @@ nanovm = { version = "0.2.0", path = "crates/nanovm" }
 nanovm-image = { version = "0.2.0", path = "crates/nanovm-image" }
 oci-client = { version = "0.17.0", default-features = false, features = ["rustls-tls"] }
 rand = "0.9.2"
+regex = "1"
 reflink-copy = "0.1.30"
 image = { version = "0.25.9", default-features = false, features = ["gif", "jpeg", "png", "pnm", "webp"] }
 iana-time-zone = "0.1.64"
@@ -92,6 +95,7 @@ shlex = "2.0.1"
 simd-json = "=0.15.1"
 smallvec = { version = "1.15.1", features = ["serde"] }
 sonic-rs = "0.5.8"
+sysinfo = { version = "0.37.2", default-features = false, features = ["system"] }
 syn = { version = "2.0.119", features = ["full"] }
 thiserror = "2.0.17"
 tempfile = "3.27.0"
@@ -113,6 +117,7 @@ vergen = { version = "8", default-features = false }
 wasm-bindgen = "0.2.105"
 wasm-bindgen-futures = "0.4.55"
 web-time = "1.1.0"
+yansi = { version = "1.0", features = ["detect-env", "detect-tty"] }
 zstd = "0.13"
 
 [workspace.lints.rust]

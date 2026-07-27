@@ -3,7 +3,16 @@ use std::{fs, io, path::Path};
 #[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
 
-pub(crate) fn reflink_or_sparse_copy(source: &Path, destination: &Path) -> io::Result<u64> {
+/// Copies a disk with reflink semantics when available and a sparse fallback.
+///
+/// The destination must not exist. A failed reflink attempt is cleaned before
+/// the fallback begins, and a failed fallback never leaves a partial disk.
+///
+/// # Errors
+///
+/// Returns an I/O error when the source cannot be read, the destination
+/// cannot be created, or neither reflink nor sparse copying succeeds.
+pub fn reflink_or_sparse_copy(source: &Path, destination: &Path) -> io::Result<u64> {
     match reflink_copy::reflink(source, destination) {
         Ok(()) => return Ok(fs::metadata(destination)?.len()),
         Err(_) => remove_partial_copy(destination)?,

@@ -8,7 +8,7 @@ use std::{
 
 use clap::Args;
 use eyre::{Context, Result, bail, eyre};
-use nanoeval_harbor::{
+use nanocodex_eval_harbor::{
     PublishedAgentInfo, PublishedAttempts, PublishedQuery, PublishedResults, PublishedTask,
     PublishedTrajectory, PublishedTrial,
 };
@@ -18,7 +18,7 @@ use tokio::task::JoinSet;
 
 #[derive(Args)]
 pub(crate) struct Compare {
-    /// Terminal-Bench task name or retained Nanoeval Harbor job directory.
+    /// Terminal-Bench task name or retained Evaluator Harbor job directory.
     #[arg(value_name = "TASK_OR_JOB")]
     target: PathBuf,
 
@@ -47,7 +47,7 @@ pub(crate) struct Compare {
     local_trial: Option<String>,
 
     /// Content-addressed cache for the public archive index and downloaded artifacts.
-    #[arg(long, default_value = ".cache/nanoeval/published")]
+    #[arg(long, default_value = ".cache/nanocodex/eval/published")]
     cache: PathBuf,
 
     /// Refresh the public archive tree index before querying.
@@ -611,7 +611,7 @@ impl TrajectoryComparison {
             .map_or(String::new(), |path| format!(" · {path}"));
         Ok(Self {
             local: ComparedTrajectory {
-                label: format!("nanoeval · {} · {}", local.agent, local.model),
+                label: format!("nanocodex eval · {} · {}", local.agent, local.model),
                 trial_name: local_attempt.trial_name.clone(),
                 task_checksum: local.single_task()?.task_checksum.clone(),
                 passed: local_attempt.passed,
@@ -1050,7 +1050,7 @@ fn sort_runs(runs: &mut [RunScore]) {
 }
 
 impl PublishedRun {
-    fn record(&mut self, attempt: nanoeval_harbor::PublishedAttempt) {
+    fn record(&mut self, attempt: nanocodex_eval_harbor::PublishedAttempt) {
         self.agent.get_or_insert_with(|| attempt.agent.clone());
         self.thinking.insert(attempt.thinking);
         self.runs.insert(attempt.run);
@@ -1401,7 +1401,7 @@ fn one_line(value: &str, full: bool) -> String {
 
 #[cfg(test)]
 mod tests {
-    use nanoeval_harbor::{PublishedAttempt, PublishedModelInfo};
+    use nanocodex_eval_harbor::{PublishedAttempt, PublishedModelInfo};
 
     use super::*;
 

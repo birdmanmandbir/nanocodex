@@ -150,6 +150,10 @@ bench-vm:
     cargo bench -p nanovm-image --bench image_cache
     cargo bench -p nanocodex-vm --bench vm_session -- vm_session_protocol
 
+# Deterministic task loading, sweep planning, durable resume, and ATIF gates.
+bench-eval:
+    cargo bench -p nanocodex-eval --bench eval_runtime
+
 # Include actual libkrun boot, first RPC, and graceful shutdown. The root disk
 # is reflinked before each timed sample and is never mutated directly.
 bench-vm-live rootfs runtime firmware=".cache/libkrunfw/libkrunfw":

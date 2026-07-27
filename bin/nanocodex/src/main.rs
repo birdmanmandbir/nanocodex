@@ -1,6 +1,7 @@
 mod auth;
 mod config;
 mod credits;
+mod eval;
 mod mcp;
 mod mpp;
 mod observability;
@@ -49,6 +50,8 @@ enum Command {
     Auth(auth::Auth),
     /// Inspect or purchase Nanocodex NANOUSD credits.
     Credits(credits::Credits),
+    /// Run and inspect durable agent evaluations.
+    Eval(eval::Eval),
     /// Run one prompt and stream JSONL events to stdout.
     Run(Box<RunCommand>),
     /// Resume a Codex or Nanocodex thread in the interactive TUI.
@@ -86,8 +89,7 @@ struct ResumeCommand {
     prompt: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     install_rustls_crypto_provider();
 
     // Keep direct `cargo run` behavior consistent with the Justfile without
@@ -95,11 +97,29 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
 
     let cli = Cli::parse();
+    if let Some(Command::Eval(command)) = &cli.command
+        && command.requires_synchronous_vm()
+    {
+        // libkrun's disk backend owns a small internal Tokio runtime. Entering
+        // the blocking VMM loop from this process's async runtime makes disk
+        // flush panic on guest exit, so dedicated VMM commands must run first.
+        return command.run_synchronous_vm();
+    }
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(cli))
+}
+
+async fn run(cli: Cli) -> Result<()> {
     let uses_tempo = match &cli.command {
         Some(Command::Run(command)) => command.agent.uses_tempo(),
         Some(Command::Resume(command)) => command.agent.uses_tempo(),
         None => cli.agent.uses_tempo(),
-        Some(Command::Auth(_) | Command::Credits(_) | Command::Update(_)) => false,
+        Some(Command::Auth(_) | Command::Credits(_) | Command::Eval(_) | Command::Update(_)) => {
+            false
+        }
     };
     if uses_tempo {
         resource::ensure_mpp_file_descriptor_capacity()?;
@@ -107,6 +127,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(Command::Auth(command)) => command.run().await,
         Some(Command::Credits(command)) => command.run().await,
+        Some(Command::Eval(command)) => command.run().await,
         Some(Command::Run(command)) => {
             let _observability = command.observability.install(false, command.agent.cwd())?;
             command.run.run(command.agent).await
@@ -196,6 +217,52 @@ mod tests {
             cli.agent.responses_transport(),
             nanocodex::ResponsesTransport::WebSocket
         );
+    }
+
+    #[test]
+    fn raw_vm_is_dispatched_before_tokio_starts() {
+        let cli = Cli::try_parse_from([
+            "nanocodex",
+            "eval",
+            "vm",
+            "run",
+            "--root",
+            "/tmp/rootfs.ext4",
+            "--ext4",
+            "--no-network",
+            "/bin/true",
+        ])
+        .unwrap();
+
+        let Some(Command::Eval(command)) = cli.command else {
+            unreachable!();
+        };
+        assert!(command.requires_synchronous_vm());
+    }
+
+    #[test]
+    fn ordinary_eval_stays_on_the_async_runtime() {
+        let cli = Cli::try_parse_from(["nanocodex", "eval", "task", "/tmp/frontier-task"]).unwrap();
+
+        let Some(Command::Eval(command)) = cli.command else {
+            unreachable!();
+        };
+        assert!(!command.requires_synchronous_vm());
+    }
+
+    #[test]
+    fn eval_does_not_accept_unimplemented_provider_flags() {
+        let Err(error) = Cli::try_parse_from([
+            "nanocodex",
+            "eval",
+            "task",
+            "/tmp/frontier-task",
+            "--provider.tempo",
+        ]) else {
+            panic!("eval unexpectedly accepted an unimplemented provider flag");
+        };
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]

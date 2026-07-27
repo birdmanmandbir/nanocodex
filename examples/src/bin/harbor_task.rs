@@ -1,8 +1,8 @@
 use std::{env, error::Error, path::PathBuf};
 
 use nanocodex::{Nanocodex, OpenAiAuth};
-use nanoeval::{EvalEventKind, Nanoeval, Task};
-use nanoeval_harbor::Harbor;
+use nanocodex_eval::{EvalEventKind, Evaluator, Task};
+use nanocodex_eval_harbor::Harbor;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -11,9 +11,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .map_or_else(|| PathBuf::from("tasks/write-greeting"), PathBuf::from);
     let output_directory = env::args_os()
         .nth(2)
-        .map_or_else(|| PathBuf::from("nanoeval-runs"), PathBuf::from);
+        .map_or_else(|| PathBuf::from(".nanocodex/evals"), PathBuf::from);
     let task = Task::load(task_directory)?;
-    let (eval, events) = Nanoeval::builder(Nanocodex::builder(auth()?))
+    let (eval, events) = Evaluator::builder(Nanocodex::builder(auth()?))
         .output_directory(output_directory)
         .build()?;
 
@@ -30,7 +30,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 break;
             }
         }
-        Ok::<_, nanoeval::EvalEventStreamError>(count)
+        Ok::<_, nanocodex_eval::EvalEventStreamError>(count)
     });
 
     let result = eval.task(task).await?;

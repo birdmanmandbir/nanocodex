@@ -246,6 +246,59 @@ Tool schemas, inputs, outputs, errors, and call context are typed; workspace,
 agent-driver, MCP-connection, and process-manager state stay in higher
 implementations.
 
+## Evaluations
+
+`nanocodex-eval` runs immutable tasks through fresh agent sessions and
+workspaces. Scheduling is bounded by both concurrency and task-declared memory;
+completed attempts are durable and an interrupted finite sweep resumes without
+re-running committed results. Events are optional and independent from typed
+results.
+
+```rust,ignore
+use nanocodex::{Nanocodex, Thinking};
+use nanocodex_eval::{Evaluator, Sweep, Task};
+
+let agent = Nanocodex::builder(std::env::var("OPENAI_API_KEY")?)
+    .instructions(
+        "Work directly in the provided workspace. Complete the requested task, \
+         verify your changes, and keep the final answer concise.",
+    )
+    .thinking(Thinking::Medium);
+let sweep = Sweep::builder()
+    .task(Task::load("tasks/write-greeting")?)
+    .agent("gpt-5.6-sol-medium", agent.clone())?
+    .trials(5)
+    .build()?;
+let (evaluator, _events) = Evaluator::builder(agent)
+    .output_directory(".nanocodex/evals")
+    .max_concurrency(4)
+    .max_memory_mb(16_384)
+    .resume_incomplete(&sweep)
+    .build()?;
+
+let results = evaluator.sweep(sweep).await?;
+println!("{} fresh attempts", results.attempts().len());
+```
+
+`nanocodex-eval-harbor` projects an independent event subscription into
+canonical Harbor and ATIF artifacts; it does not become a second result owner.
+The CLI composes native execution, VM image preparation, Terminal-Bench,
+Frontier-Bench artifact handoff, inspection, published-result comparison, and
+cleanup:
+
+```sh
+nanocodex eval run --task tasks/write-greeting --trials 5 --thinking medium
+nanocodex eval prepare --task /path/to/terminal-bench-task
+nanocodex eval inspect .nanocodex/evals/<job-id>
+nanocodex eval compare terminal-bench/configure-git-webserver
+nanocodex eval cleanup .nanocodex/evals --dry-run
+```
+
+Pass `--pricing-file pricing.json` (or `NANOCODEX_PRICING_FILE`) to retain and
+print the known estimated USD cost alongside exact token usage. Existing
+Nanoeval jobs and environment overrides remain readable during migration, but
+new state is written beneath `.nanocodex`.
+
 ## Components
 
 The core dependency direction is:
@@ -326,6 +379,8 @@ Lower-level consumers can depend only on the component they need:
 cargo add nanocodex-oai-api
 cargo add nanocodex-tools
 cargo add nanocodex-agent
+cargo add nanocodex-eval
+cargo add nanocodex-eval-harbor
 ```
 
 `nanocodex-oai-api` enables its Tower transports and managed session client by

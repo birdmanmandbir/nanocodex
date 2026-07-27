@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     str::FromStr,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use arcbox_ext4::{
@@ -21,14 +21,22 @@ use chrono::{DateTime, Utc};
 use clap::{Args, ValueEnum};
 use eyre::{Result, eyre};
 use fs2::FileExt as _;
-use nanocodex::{Thinking, Tools, ToolsBuildError, UpdatePlanTool};
-use nanocodex_vm::{VmCommand, VmCommandOutput, VmToolSession, VmToolSessionError, VmTools};
-use nanoeval::{
-    AttemptAgent, AttemptVerification, AttemptVerifier, EvalAttempt, EvalEventKind, EvalFailure,
-    EvalFailureKind, EvalResult, EvalStatus, Nanoeval, NanoevalBuilder, NanoevalEventStream,
-    NetworkPolicy, Sweep, SweepResults, Task, VerifierEnvironmentMode, VerifierResult,
+use nanocodex::{
+    NanocodexBuilder, StandardResponses, Thinking, Tools, ToolsBuildError, UpdatePlanTool,
 };
-use nanoeval_harbor::{Harbor, HarborJob, HarborRecorder};
+use nanocodex_eval::{
+    AttemptAgent, AttemptVerification, AttemptVerifier, EvalAttempt, EvalEventKind,
+    EvalEventStream, EvalFailure, EvalFailureKind, EvalResult, EvalStatus, Evaluator,
+    EvaluatorBuilder, NetworkPolicy, Sweep, SweepResults, Task, VerifierEnvironmentMode,
+    VerifierResult,
+};
+use nanocodex_eval_harbor::{Harbor, HarborJob, HarborRecorder};
+use nanocodex_vm::{
+    GuestRuntimeDisk, GuestRuntimeDiskStatus, VmCommand, VmCommandOutput, VmToolSession,
+    VmToolSessionError,
+};
+use nanovm::{BlockDevice, GuestCommand, Network, VmConfig};
+use nanovm_image::{CachePolicy, VmImageBuilder, reflink_or_sparse_copy};
 use regex::RegexSet;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -37,15 +45,17 @@ use tokio::process::Command;
 use tracing::{info, info_span, warn};
 use yansi::Painted;
 
-use crate::config::AgentArgs;
-use crate::disk::reflink_or_sparse_copy;
-use crate::observability::ObservabilityArgs;
-use crate::vm_image::{CachePolicy, PreparedRootDisk, VmImageBuilder};
-use crate::vm_network::{Gvproxy, GvproxyError, prepare_gvproxy};
+use super::{
+    config::AgentArgs,
+    image::{prepare_task_image, prepare_verifier_image},
+    observability::ObservabilityArgs,
+    vm_network::{Gvproxy, GvproxyError, prepare_gvproxy},
+};
 
-const DEFAULT_OUTPUT_DIRECTORY: &str = "nanoeval-runs";
+const DEFAULT_OUTPUT_DIRECTORY: &str = ".nanocodex/evals";
 const INVOCATION_FILE: &str = "invocation.json";
-const LAST_RUN_FILE: &str = ".nanoeval/last-run.json";
+const LAST_RUN_FILE: &str = ".nanocodex/eval/last-run.json";
+const LEGACY_LAST_RUN_FILE: &str = ".nanoeval/last-run.json";
 const INVOCATION_VERSION: u32 = 1;
 const DEFAULT_TRIALS: u16 = 5;
 const DEFAULT_HOST_UTILIZATION_PERCENT: u8 = 80;
@@ -53,7 +63,7 @@ const BYTES_PER_MIB: u64 = 1024 * 1024;
 
 #[derive(Args)]
 #[group(id = "task_input", required = true, multiple = true)]
-pub(crate) struct Eval {
+pub(crate) struct Run {
     #[command(flatten)]
     observability: ObservabilityArgs,
 
@@ -126,7 +136,7 @@ pub(crate) struct Eval {
 
 #[derive(Args)]
 struct RetryArgs {
-    /// Rerun unresolved tasks from the latest completed Nanoeval job.
+    /// Rerun unresolved tasks from the latest completed Evaluator job.
     #[arg(long, group = "task_input", conflicts_with_all = ["tasks", "suites"])]
     rerun: bool,
 
@@ -347,7 +357,7 @@ enum RetainedTrialStatus {
     Errored,
 }
 
-impl Eval {
+impl Run {
     fn resolve_scheduling(
         &self,
         retained: Option<&RunInvocation>,
@@ -515,18 +525,10 @@ impl Eval {
         .await?;
         let vm_environments_duration = vm_environments_started.elapsed();
         let evaluation_setup_started = Instant::now();
+        let new_job = self.lifecycle.new_job;
         let nanocodex = self.agent.builder(resolved.thinking, resolved.web_search)?;
-        let sweep = Sweep::builder()
-            .tasks(tasks)
-            .trials(resolved.trials)
-            .agent("default", nanocodex.clone())?
-            .build()?;
-        let attempt_count = sweep.attempt_count();
-        let evaluator = Nanoeval::builder(nanocodex)
-            .output_directory(&resolved.output)
-            .max_concurrency(usize::from(resolved.concurrency));
-        let evaluator = configure_memory_limit(evaluator, resolved.max_memory_mb);
-        let mut evaluator = bind_finite_run(evaluator, &sweep, self.lifecycle.new_job);
+        let (mut evaluator, sweep, attempt_count) =
+            Self::build_evaluator(&resolved, tasks, nanocodex, new_job)?;
         if let Some(environments) = vm_environments {
             evaluator = evaluator.attempt_agent(move |attempt, builder| {
                 let environment = environments.get(attempt.task().root()).ok_or_else(|| {
@@ -543,8 +545,16 @@ impl Eval {
                     },
                     attempt,
                 )?;
+                let readiness = runtime
+                    .verifier
+                    .agent_session
+                    .as_ref()
+                    .ok_or(VmAttemptError::AgentSessionAlreadyFinished)?
+                    .handle();
                 Ok::<_, VmAttemptError>(
-                    AttemptAgent::new(builder.tools(runtime.tools)).verifier(runtime.verifier),
+                    AttemptAgent::new(builder.tools(runtime.tools))
+                        .ready(async move { readiness.ready().await })
+                        .verifier(runtime.verifier),
                 )
             });
         }
@@ -590,6 +600,26 @@ impl Eval {
         finish_run(finished.run_error)
     }
 
+    fn build_evaluator(
+        resolved: &ResolvedRun,
+        tasks: Vec<Task>,
+        nanocodex: NanocodexBuilder<StandardResponses>,
+        new_job: bool,
+    ) -> Result<(EvaluatorBuilder, Sweep, usize)> {
+        let sweep = Sweep::builder()
+            .tasks(tasks)
+            .trials(resolved.trials)
+            .agent("default", nanocodex.clone())?
+            .build()?;
+        let attempt_count = sweep.attempt_count();
+        let evaluator = Evaluator::builder(nanocodex)
+            .output_directory(&resolved.output)
+            .max_concurrency(usize::from(resolved.concurrency));
+        let evaluator = configure_memory_limit(evaluator, resolved.max_memory_mb);
+        let evaluator = bind_finite_run(evaluator, &sweep, new_job);
+        Ok((evaluator, sweep, attempt_count))
+    }
+
     fn write_report(
         job: &HarborJob,
         outcomes: Vec<AttemptOutcome>,
@@ -616,6 +646,18 @@ impl Eval {
             report.summary.total
         );
         println!("Harbor job: {}", report.job_directory.display());
+        match report.summary.known_estimated_cost_usd {
+            Some(cost) => println!(
+                "Known estimated cost: ${cost:.6} ({} of {} attempt{} priced)",
+                report.summary.priced_attempts,
+                report.summary.total,
+                if report.summary.total == 1 { "" } else { "s" }
+            ),
+            None => println!(
+                "Estimated cost: unavailable (configure --pricing-file or \
+                 NANOCODEX_PRICING_FILE)"
+            ),
+        }
         if report.skipped > 0 {
             println!(
                 "Resumed: {} previously completed attempt{} retained",
@@ -625,7 +667,7 @@ impl Eval {
         }
         if report.summary.failed + report.summary.refused + report.summary.errored > 0 {
             println!(
-                "Inspect failures: nanoeval inspect {}",
+                "Inspect failures: nanocodex eval inspect {}",
                 report.job_directory.display()
             );
         }
@@ -636,7 +678,7 @@ impl ResolvedRun {
     fn report_configuration(&self) {
         let environment = if self.vm { "microVM" } else { "host" };
         eprintln!(
-            "Eval config: thinking={} · trials={} · concurrency={} · environment={environment} · web_search={}",
+            "Run config: thinking={} · trials={} · concurrency={} · environment={environment} · web_search={}",
             self.thinking, self.trials, self.concurrency, self.web_search
         );
     }
@@ -698,14 +740,14 @@ impl LegacyJobConfig {
     }
 }
 
-fn resolve_rerun_source(eval: &Eval) -> Result<RerunSelection> {
+fn resolve_rerun_source(eval: &Run) -> Result<RerunSelection> {
     let job = match &eval.retry.rerun_from {
         Some(job) => resolve_job_path(job, eval.output.as_deref())?,
         None => latest_completed_job(eval.output.as_deref())?,
     };
     if !job.join("result.json").is_file() {
         return Err(eyre!(
-            "rerun source is not a completed Nanoeval job: {}",
+            "rerun source is not a completed Evaluator job: {}",
             job.display()
         ));
     }
@@ -727,7 +769,8 @@ fn resolve_rerun_source(eval: &Eval) -> Result<RerunSelection> {
             )
         };
         return Err(eyre!(
-            "no unresolved tasks{filter}; inspect the queue with `nanoeval run --rerun --list`"
+            "no unresolved tasks{filter}; inspect the queue with \
+             `nanocodex eval run --rerun --list`"
         ));
     }
     eprintln!(
@@ -752,7 +795,7 @@ fn retry_matcher(retry: &RetryArgs) -> Result<Option<RegexSet>> {
 }
 
 fn retry_selection_summary(
-    eval: &Eval,
+    eval: &Run,
     queue: &RetainedRetryQueue,
     job: &Path,
     selected: usize,
@@ -812,10 +855,10 @@ fn short_task_name(name: &str) -> &str {
 }
 
 fn latest_completed_job(output: Option<&Path>) -> Result<PathBuf> {
-    if let Ok(retained) = read_json::<LastRun>(Path::new(LAST_RUN_FILE))
-        && let Ok(job) = resolve_job_path(&retained.job, output)
-        && job.join("result.json").is_file()
-    {
+    if let Some(job) = completed_job_from_last_run(
+        output,
+        [Path::new(LAST_RUN_FILE), Path::new(LEGACY_LAST_RUN_FILE)],
+    ) {
         return Ok(job);
     }
     let current = std::env::current_dir()?;
@@ -841,8 +884,23 @@ fn latest_completed_job(output: Option<&Path>) -> Result<PathBuf> {
     }
     candidates.sort_unstable_by_key(|(started_at, _)| *started_at);
     candidates.pop().map(|(_, job)| job).ok_or_else(|| {
-        eyre!("no completed Nanoeval job was found; run an eval or pass --rerun-from <JOB>")
+        eyre!("no completed Evaluator job was found; run an eval or pass --rerun-from <JOB>")
     })
+}
+
+fn completed_job_from_last_run<'a>(
+    output: Option<&Path>,
+    last_run_files: impl IntoIterator<Item = &'a Path>,
+) -> Option<PathBuf> {
+    for last_run in last_run_files {
+        if let Ok(retained) = read_json::<LastRun>(last_run)
+            && let Ok(job) = resolve_job_path(&retained.job, output)
+            && job.join("result.json").is_file()
+        {
+            return Some(job);
+        }
+    }
+    None
 }
 
 fn collect_completed_job(directory: &Path, candidates: &mut Vec<(DateTime<Utc>, PathBuf)>) {
@@ -870,7 +928,7 @@ fn resolve_job_path(job: &Path, output: Option<&Path>) -> Result<PathBuf> {
     };
     fs::canonicalize(&candidate).map_err(|error| {
         eyre!(
-            "Nanoeval job does not exist: {}: {error}",
+            "Evaluator job does not exist: {}: {error}",
             candidate.display()
         )
     })
@@ -1029,7 +1087,7 @@ fn load_invocation(job: &Path) -> Result<Option<RunInvocation>> {
             let invocation: RunInvocation = serde_json::from_slice(&contents)?;
             if invocation.version != INVOCATION_VERSION {
                 return Err(eyre!(
-                    "unsupported Nanoeval invocation version {} in {}",
+                    "unsupported Evaluator invocation version {} in {}",
                     invocation.version,
                     path.display()
                 ));
@@ -1067,7 +1125,7 @@ fn persist_invocation(job: &Path, invocation: &RunInvocation) -> Result<()> {
             ));
         }
         info!(
-            target: "nanoeval",
+            target: "nanocodex_eval",
             previous_concurrency = retained.concurrency,
             concurrency = invocation.concurrency,
             previous_max_memory_mb = retained.max_memory_mb,
@@ -1106,7 +1164,7 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
         .map_err(Into::into)
 }
 
-fn report_resume(eval: &Nanoeval, skipped: usize, total: usize) {
+fn report_resume(eval: &Evaluator, skipped: usize, total: usize) {
     if eval.resumed() {
         eprintln!(
             "Resuming Harbor job {} ({skipped} of {total} attempts already durable)",
@@ -1115,7 +1173,7 @@ fn report_resume(eval: &Nanoeval, skipped: usize, total: usize) {
     }
 }
 
-fn finish_run(error: Option<nanoeval::EvalError>) -> Result<()> {
+fn finish_run(error: Option<nanocodex_eval::EvalError>) -> Result<()> {
     error.map_or(Ok(()), |error| Err(error.into()))
 }
 
@@ -1140,7 +1198,7 @@ struct FinishedEvaluation {
     job: HarborJob,
     outcomes: Vec<AttemptOutcome>,
     results: Vec<EvalResult>,
-    run_error: Option<nanoeval::EvalError>,
+    run_error: Option<nanocodex_eval::EvalError>,
     failed: usize,
     harbor_finish: Duration,
 }
@@ -1149,7 +1207,7 @@ async fn finish_evaluation(
     harbor: HarborRecorder,
     remaining_attempts: usize,
     progress: tokio::task::JoinHandle<Result<Progress>>,
-    sweep_result: Result<SweepResults, nanoeval::EvalError>,
+    sweep_result: Result<SweepResults, nanocodex_eval::EvalError>,
 ) -> Result<FinishedEvaluation> {
     let started_at = Instant::now();
     let job = harbor.finish_all(remaining_attempts).await?;
@@ -1168,7 +1226,7 @@ async fn finish_evaluation(
     })
 }
 
-fn bind_finite_run(evaluator: NanoevalBuilder, sweep: &Sweep, fresh: bool) -> NanoevalBuilder {
+fn bind_finite_run(evaluator: EvaluatorBuilder, sweep: &Sweep, fresh: bool) -> EvaluatorBuilder {
     if fresh {
         evaluator.fresh_run(sweep)
     } else {
@@ -1177,9 +1235,9 @@ fn bind_finite_run(evaluator: NanoevalBuilder, sweep: &Sweep, fresh: bool) -> Na
 }
 
 fn configure_memory_limit(
-    evaluator: NanoevalBuilder,
+    evaluator: EvaluatorBuilder,
     max_memory_mb: Option<u64>,
-) -> NanoevalBuilder {
+) -> EvaluatorBuilder {
     match max_memory_mb {
         Some(max_memory_mb) => evaluator.max_memory_mb(max_memory_mb),
         None => evaluator,
@@ -1252,7 +1310,7 @@ fn retained_task_durations(output: &Path) -> Result<BTreeMap<String, Duration>> 
             if result.exception_info.as_ref().is_some_and(|exception| {
                 matches!(
                     exception.exception_type.as_str(),
-                    "EnvironmentError" | "VerifierError" | "NanoevalError"
+                    "EnvironmentError" | "VerifierError" | "NanocodexEvalError" | "NanoevalError"
                 )
             }) {
                 continue;
@@ -1363,8 +1421,9 @@ async fn selected_vm_environments(
     } else {
         CachePolicy::Reuse
     };
-    let image_builder =
-        VmImageBuilder::new(vmm, runtime_image, Path::new(DEFAULT_KRUNFW_DIRECTORY));
+    let image_builder = VmImageBuilder::new(vmm, runtime_image)
+        .vmm_args(["eval", "vm", "run-config", "--config"])
+        .firmware_directory(DEFAULT_KRUNFW_DIRECTORY);
     Ok(Some(
         prepare_vm_environments(tasks, Path::new(DEFAULT_VM_CACHE), policy, &image_builder).await?,
     ))
@@ -1448,7 +1507,7 @@ impl RunMeasurements {
             .map(|result| result.agent.usage.input_tokens)
             .sum::<u64>();
         info!(
-            target: "nanoeval",
+            target: "nanocodex_eval",
             duration_ns = duration_ns(self.total),
             observability_duration_ns = duration_ns(self.observability),
             task_loading_duration_ns = duration_ns(self.task_loading),
@@ -1489,11 +1548,11 @@ async fn prepare_vm_environments(
         if environments.contains_key(task.root()) {
             continue;
         }
-        let prepared = PreparedRootDisk::prepare(task, cache, policy, builder).await?;
+        let prepared = prepare_task_image(builder, task, cache, policy).await?;
         let verifier = if task.verifier().environment_mode() == VerifierEnvironmentMode::Separate {
-            let verifier = PreparedRootDisk::prepare_verifier(task, cache, policy, builder).await?;
+            let verifier = prepare_verifier_image(builder, task, cache, policy).await?;
             info!(
-                target: "nanoeval",
+                target: "nanocodex_eval",
                 task_name = task.name(),
                 oci_manifest_digest = verifier.manifest_digest(),
                 oci_manifest_source = verifier.manifest_source().as_str(),
@@ -1511,7 +1570,7 @@ async fn prepare_vm_environments(
             None
         };
         info!(
-            target: "nanoeval",
+            target: "nanocodex_eval",
             task_name = task.name(),
             oci_manifest_digest = prepared.manifest_digest(),
             oci_manifest_source = prepared.manifest_source().as_str(),
@@ -1596,11 +1655,7 @@ const VM_GUEST_TARGET: &str = "aarch64-unknown-linux-musl";
 #[cfg(target_arch = "x86_64")]
 const VM_GUEST_TARGET: &str = "x86_64-unknown-linux-musl";
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-compile_error!("Nanoeval VM guests are only supported on aarch64 and x86_64 hosts");
-const VM_GUEST_RUNTIME_RECORD_VERSION: u32 = 2;
-// arcbox-ext4 uses a 32,768-block minimum geometry. Keep the backing file at
-// least that large so the Linux ext4 driver sees the complete filesystem.
-const VM_GUEST_RUNTIME_DISK_BYTES: u64 = 128 * 1024 * 1024;
+compile_error!("Evaluator VM guests are only supported on aarch64 and x86_64 hosts");
 const VERIFIER_CACHE_VERSION: u32 = 2;
 const MINIMUM_VERIFIER_CACHE_DISK_BYTES: u64 = 512 * 1024 * 1024;
 const MAXIMUM_VERIFIER_CACHE_DISK_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -1614,6 +1669,7 @@ const GUEST_PUBLIC_RESOLV_CONF: &str =
     "nameserver 192.168.127.1\\nnameserver 1.1.1.1\\noptions timeout:2 attempts:5\\n";
 const VERIFIER_NETWORK_RETRIES: usize = 4;
 const VERIFIER_NETWORK_RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
+const VM_GUEST_BUILD_RECORD_VERSION: u32 = 1;
 
 #[derive(Clone)]
 struct VmEnvironment {
@@ -1641,53 +1697,32 @@ struct VmAttemptHost<'a> {
     web_search: bool,
 }
 
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct VmGuestRuntimeRecord {
-    version: u32,
-    target: String,
-    binary_size: u64,
-    binary_modified_unix_ns: u64,
-    digest: String,
-}
-
 pub(crate) async fn prepare_vm_guest_runtime() -> Result<PathBuf> {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
-        .ok_or_else(|| eyre!("nanoeval binary crate is not inside its Cargo workspace"))?;
+        .ok_or_else(|| eyre!("nanocodex binary crate is not inside its Cargo workspace"))?;
     let started_at = Instant::now();
     let runtime = workspace
         .join("target")
         .join(VM_GUEST_TARGET)
         .join("debug/nanocodex-vm-guest");
-    let runtime_is_fresh = vm_guest_runtime_is_fresh(workspace, &runtime)?;
-    let cached = if runtime_is_fresh {
-        load_vm_guest_runtime_record(workspace, &runtime)?
-    } else {
-        None
-    };
-    let build_status = if cached.is_some() {
+    let build_status = if vm_guest_runtime_is_fresh(workspace, &runtime)? {
         "hit"
-    } else if runtime_is_fresh {
-        "indexed"
     } else {
-        let exit = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
-            .current_dir(workspace)
-            .arg("build")
-            .arg("--quiet")
-            .arg("--target")
-            .arg(VM_GUEST_TARGET)
-            .arg("--package")
-            .arg("nanocodex-vm")
-            .arg("--bin")
-            .arg("nanocodex-vm-guest")
-            .status()
-            .await?;
+        let previous_runtime = file_metadata_snapshot(&runtime)?;
+        let exit = vm_guest_build_command(workspace).status().await?;
         if !exit.success() {
             return Err(eyre!("building the VM guest runtime failed with {exit}"));
         }
-        "rebuilt"
+        let current_runtime = file_metadata_snapshot(&runtime)?;
+        let build_status = if previous_runtime.is_some() && previous_runtime == current_runtime {
+            "indexed"
+        } else {
+            "rebuilt"
+        };
+        write_vm_guest_build_record(workspace, &runtime)?;
+        build_status
     };
     if !runtime.is_file() {
         return Err(eyre!(
@@ -1695,203 +1730,207 @@ pub(crate) async fn prepare_vm_guest_runtime() -> Result<PathBuf> {
             runtime.display()
         ));
     }
-    let (runtime_digest, runtime_directory) = match cached {
-        Some(record) => {
-            let directory = vm_guest_runtime_directory(workspace, &record.digest);
-            (record.digest, directory)
-        }
-        None => stage_vm_guest_runtime(workspace, &runtime)?,
+    let runtime_disk = GuestRuntimeDisk::prepare(&runtime, workspace.join(DEFAULT_VM_CACHE))?;
+    let cache_status = match runtime_disk.status() {
+        GuestRuntimeDiskStatus::Hit => "hit",
+        GuestRuntimeDiskStatus::Created => "created",
     };
-    let runtime_image = runtime_directory.join("runtime.ext4");
     info!(
-        target: "nanoeval",
+        target: "nanocodex_eval",
         duration_ns = u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
         vm_guest_build_status = build_status,
         vm_guest_target = VM_GUEST_TARGET,
-        vm_guest_runtime_digest = runtime_digest,
-        vm_guest_runtime_disk = %runtime_image.display(),
+        vm_guest_runtime_cache_status = cache_status,
+        vm_guest_runtime_digest = runtime_disk.digest(),
+        vm_guest_runtime_disk = %runtime_disk.path().display(),
         "VM guest runtime ready"
     );
-    Ok(runtime_image)
+    Ok(runtime_disk.path().to_path_buf())
 }
 
-fn load_vm_guest_runtime_record(
-    workspace: &Path,
-    runtime: &Path,
-) -> Result<Option<VmGuestRuntimeRecord>> {
-    let path = vm_guest_runtime_record_path(workspace);
-    let contents = match fs::read(&path) {
-        Ok(contents) => contents,
+fn vm_guest_build_command(workspace: &Path) -> Command {
+    let mut command = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    command
+        .current_dir(workspace)
+        .arg("build")
+        .arg("--quiet")
+        .arg("--no-default-features")
+        .arg("--features")
+        .arg("guest")
+        .arg("--target")
+        .arg(VM_GUEST_TARGET)
+        .arg("--package")
+        .arg("nanocodex-vm")
+        .arg("--bin")
+        .arg("nanocodex-vm-guest");
+    command
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct VmGuestBuildRecord {
+    version: u32,
+    target: String,
+    runtime_bytes: u64,
+    runtime_modified_unix_ns: u64,
+    input_count: usize,
+    input_metadata_digest: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileMetadataSnapshot {
+    bytes: u64,
+    modified_unix_ns: u64,
+}
+
+fn vm_guest_runtime_is_fresh(workspace: &Path, runtime: &Path) -> Result<bool> {
+    let path = vm_guest_build_record_path(workspace);
+    let record = match fs::read(&path) {
+        Ok(contents) => match serde_json::from_slice::<VmGuestBuildRecord>(&contents) {
+            Ok(record) => record,
+            Err(error) => {
+                warn!(
+                    target: "nanocodex_eval",
+                    cache_record = %path.display(),
+                    %error,
+                    "ignoring invalid VM guest build record"
+                );
+                return Ok(false);
+            }
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(vm_guest_build_record(workspace, runtime)?.as_ref() == Some(&record))
+}
+
+fn write_vm_guest_build_record(workspace: &Path, runtime: &Path) -> Result<()> {
+    let record = vm_guest_build_record(workspace, runtime)?.ok_or_else(|| {
+        eyre!(
+            "Cargo completed without producing {} and its dependency record",
+            runtime.display()
+        )
+    })?;
+    write_json_atomic(&vm_guest_build_record_path(workspace), &record)
+}
+
+fn vm_guest_build_record(workspace: &Path, runtime: &Path) -> Result<Option<VmGuestBuildRecord>> {
+    let Some(runtime_metadata) = file_metadata_snapshot(runtime)? else {
+        return Ok(None);
+    };
+    let dependency_path = runtime.with_extension("d");
+    let dependencies = match fs::read_to_string(&dependency_path) {
+        Ok(contents) => parse_cargo_dep_info(&contents)?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    let record = match serde_json::from_slice::<VmGuestRuntimeRecord>(&contents) {
-        Ok(record) => record,
-        Err(error) => {
-            warn!(
-                target: "nanoeval",
-                cache_record = %path.display(),
-                %error,
-                "ignoring invalid VM guest runtime cache record"
-            );
-            return Ok(None);
+    let mut inputs = dependencies;
+    inputs.extend([
+        workspace.join("Cargo.toml"),
+        workspace.join("Cargo.lock"),
+        workspace.join(".cargo/config.toml"),
+        workspace.join("crates/nanocodex-oai-api/Cargo.toml"),
+        workspace.join("crates/nanocodex-tools/Cargo.toml"),
+        workspace.join("crates/nanocodex-vm/Cargo.toml"),
+    ]);
+    for script in [
+        format!("scripts/{VM_GUEST_TARGET}-linker"),
+        format!("scripts/{VM_GUEST_TARGET}-ar"),
+    ] {
+        let path = workspace.join(script);
+        if path.exists() {
+            inputs.push(path);
         }
-    };
-    let metadata = fs::metadata(runtime)?;
-    if record.version != VM_GUEST_RUNTIME_RECORD_VERSION
-        || record.target != VM_GUEST_TARGET
-        || record.binary_size != metadata.len()
-        || record.binary_modified_unix_ns != modified_unix_ns(&metadata)?
-        || !is_sha256_digest(&record.digest)
-    {
-        return Ok(None);
     }
-    let runtime_directory = vm_guest_runtime_directory(workspace, &record.digest);
-    let staged_runtime = runtime_directory.join("nanocodex-vm-guest");
-    let staged_metadata = match fs::metadata(staged_runtime) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    if !staged_metadata.is_file() || staged_metadata.len() != record.binary_size {
-        return Ok(None);
-    }
-    let runtime_image = runtime_directory.join("runtime.ext4");
-    let runtime_image_metadata = match fs::metadata(&runtime_image) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    if !runtime_image_metadata.is_file()
-        || runtime_image_metadata.len() != VM_GUEST_RUNTIME_DISK_BYTES
-    {
-        return Ok(None);
-    }
-    let Ok(mut reader) = Reader::new(&runtime_image) else {
-        return Ok(None);
-    };
-    let Ok((_, inode)) = reader.stat("/nanocodex-vm-guest") else {
-        return Ok(None);
-    };
-    if !inode.is_reg() || inode.file_size() != record.binary_size {
-        return Ok(None);
-    }
-    Ok(Some(record))
-}
+    inputs.sort_unstable();
+    inputs.dedup();
 
-fn stage_vm_guest_runtime(workspace: &Path, runtime: &Path) -> Result<(String, PathBuf)> {
-    let runtime_bytes = fs::read(runtime)?;
-    let mut runtime_identity = Sha256::new();
-    runtime_identity.update(b"nanoeval-vm-guest-runtime-v2\0");
-    runtime_identity.update(&runtime_bytes);
-    let runtime_digest = format!("{:x}", runtime_identity.finalize());
-    let runtime_directory = vm_guest_runtime_directory(workspace, &runtime_digest);
-    let staged_runtime = runtime_directory.join("nanocodex-vm-guest");
-    if !staged_runtime.is_file() {
-        fs::create_dir_all(&runtime_directory)?;
-        let temporary = staged_runtime.with_extension(format!("{}.tmp", std::process::id()));
-        fs::write(&temporary, &runtime_bytes)?;
-        let mut permissions = fs::metadata(&temporary)?.permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
-        fs::set_permissions(&temporary, permissions)?;
-        fs::rename(temporary, &staged_runtime)?;
+    let mut digest = Sha256::new();
+    digest.update(b"nanocodex-vm-guest-build-inputs-v1\0");
+    for input in &inputs {
+        let Some(metadata) = file_metadata_snapshot(input)? else {
+            return Ok(None);
+        };
+        digest.update(input.as_os_str().as_encoded_bytes());
+        digest.update([0]);
+        digest.update(metadata.bytes.to_le_bytes());
+        digest.update(metadata.modified_unix_ns.to_le_bytes());
     }
-    let runtime_image = runtime_directory.join("runtime.ext4");
-    if !runtime_image.is_file() {
-        let temporary = runtime_image.with_extension(format!("{}.tmp", std::process::id()));
-        let mut runtime_reader = runtime_bytes.as_slice();
-        let mut formatter = Formatter::new(&temporary, 4_096, VM_GUEST_RUNTIME_DISK_BYTES)?;
-        formatter.create(
-            "/nanocodex-vm-guest",
-            make_mode(file_mode::S_IFREG, 0o755),
-            None,
-            None,
-            Some(&mut runtime_reader),
-            Some(0),
-            Some(0),
-            None,
-        )?;
-        formatter.close()?;
-        fs::rename(temporary, &runtime_image)?;
-    }
-    let metadata = fs::metadata(runtime)?;
-    let record = VmGuestRuntimeRecord {
-        version: VM_GUEST_RUNTIME_RECORD_VERSION,
+    Ok(Some(VmGuestBuildRecord {
+        version: VM_GUEST_BUILD_RECORD_VERSION,
         target: VM_GUEST_TARGET.to_owned(),
-        binary_size: metadata.len(),
-        binary_modified_unix_ns: modified_unix_ns(&metadata)?,
-        digest: runtime_digest.clone(),
-    };
-    let record_path = vm_guest_runtime_record_path(workspace);
-    let parent = record_path
-        .parent()
-        .ok_or_else(|| eyre!("VM guest runtime record has no parent directory"))?;
-    fs::create_dir_all(parent)?;
-    let temporary = record_path.with_extension(format!("{}.tmp", std::process::id()));
-    fs::write(&temporary, serde_json::to_vec_pretty(&record)?)?;
-    fs::rename(temporary, record_path)?;
-    Ok((runtime_digest, runtime_directory))
+        runtime_bytes: runtime_metadata.bytes,
+        runtime_modified_unix_ns: runtime_metadata.modified_unix_ns,
+        input_count: inputs.len(),
+        input_metadata_digest: format!("{:x}", digest.finalize()),
+    }))
 }
 
-fn vm_guest_runtime_directory(workspace: &Path, digest: &str) -> PathBuf {
+fn vm_guest_build_record_path(workspace: &Path) -> PathBuf {
     workspace
         .join(DEFAULT_VM_CACHE)
-        .join("runtimes")
-        .join(digest)
-}
-
-fn vm_guest_runtime_record_path(workspace: &Path) -> PathBuf {
-    workspace
-        .join(DEFAULT_VM_CACHE)
-        .join("runtime-records")
+        .join("runtime-build-records")
         .join(format!("{VM_GUEST_TARGET}.json"))
 }
 
-fn modified_unix_ns(metadata: &fs::Metadata) -> io::Result<u64> {
-    let elapsed = metadata
+fn file_metadata_snapshot(path: &Path) -> io::Result<Option<FileMetadataSnapshot>> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    let modified = metadata
         .modified()?
         .duration_since(UNIX_EPOCH)
         .map_err(io::Error::other)?;
-    u64::try_from(elapsed.as_nanos()).map_err(io::Error::other)
+    Ok(Some(FileMetadataSnapshot {
+        bytes: metadata.len(),
+        modified_unix_ns: u64::try_from(modified.as_nanos()).map_err(io::Error::other)?,
+    }))
 }
 
-fn is_sha256_digest(digest: &str) -> bool {
-    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-fn vm_guest_runtime_is_fresh(workspace: &Path, runtime: &Path) -> io::Result<bool> {
-    let built_at = match fs::metadata(runtime) {
-        Ok(metadata) => metadata.modified()?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    for input in [
-        "Cargo.toml",
-        "Cargo.lock",
-        ".cargo/config.toml",
-        "scripts/aarch64-unknown-linux-musl-linker",
-        "scripts/aarch64-unknown-linux-musl-ar",
-        "crates/nanocodex-vm/Cargo.toml",
-        "crates/nanocodex-vm/src",
-    ] {
-        if path_changed_after(&workspace.join(input), built_at)? {
-            return Ok(false);
+fn parse_cargo_dep_info(contents: &str) -> io::Result<Vec<PathBuf>> {
+    let (_, dependencies) = contents
+        .split_once(": ")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid Cargo dep-info"))?;
+    let mut paths = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+    for character in dependencies.chars() {
+        if escaped {
+            if character != '\n' && character != '\r' {
+                current.push(character);
+            }
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character.is_whitespace() {
+            if !current.is_empty() {
+                paths.push(PathBuf::from(std::mem::take(&mut current)));
+            }
+        } else {
+            current.push(character);
         }
     }
-    Ok(true)
-}
-
-fn path_changed_after(path: &Path, built_at: SystemTime) -> io::Result<bool> {
-    let metadata = fs::metadata(path)?;
-    if metadata.is_file() {
-        return Ok(metadata.modified()? > built_at);
+    if escaped {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Cargo dep-info ends with an escape",
+        ));
     }
-    for entry in fs::read_dir(path)? {
-        if path_changed_after(&entry?.path(), built_at)? {
-            return Ok(true);
-        }
+    if !current.is_empty() {
+        paths.push(PathBuf::from(current));
     }
-    Ok(false)
+    if paths.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Cargo dep-info contains no dependencies",
+        ));
+    }
+    Ok(paths)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1984,7 +2023,7 @@ fn vm_attempt(
     attempt: EvalAttempt<'_>,
 ) -> Result<VmAttempt, VmAttemptError> {
     let span = info_span!(
-        target: "nanoeval",
+        target: "nanocodex_eval",
         "vm.attempt.setup",
         otel.kind = "internal",
         otel.status_code = tracing::field::Empty,
@@ -2049,7 +2088,7 @@ fn vm_attempt_inner(
         .map(|cache| cache.materialize(&verifier_directory))
         .transpose()?;
     let session = launch.spawn(attempt_cache.as_ref())?;
-    let vm = VmTools::new(session.clone());
+    let vm = session.tools();
     let tools = Tools::builder()
         .without_defaults()
         .web_search(host.web_search)
@@ -2102,7 +2141,7 @@ fn materialize_attempt_root(
         return Err(VmAttemptError::MissingGuestRuntime(guest_runtime));
     }
     let span = info_span!(
-        target: "nanoeval",
+        target: "nanocodex_eval",
         "vm.rootfs.materialize",
         otel.kind = "internal",
         otel.status_code = tracing::field::Empty,
@@ -2187,51 +2226,76 @@ impl VmLaunch {
         if firmware.join("libkrunfw.5.dylib").is_file() {
             command.env("DYLD_LIBRARY_PATH", firmware.canonicalize()?);
         }
-        command.arg("vm").arg("run").arg("--root").arg(&self.root);
-        if let Some(socket) = &self.network_socket {
-            command.arg("--network-socket").arg(socket);
+        command.args(["eval", "vm", "run-config", "--config"]);
+
+        let network = if let Some(socket) = &self.network_socket {
+            Network::gvproxy(socket)
         } else {
-            command.arg("--no-network");
+            Network::Disabled
+        };
+        let mut vm = if self.ext4 {
+            VmConfig::ext4(&self.root)
+        } else {
+            VmConfig::new(&self.root)
         }
+        .cpus(u8::try_from(self.cpus).unwrap_or(u8::MAX))
+        .memory_mib(u32::try_from(self.memory_mib).unwrap_or(u32::MAX))
+        .network(network);
         if self.ext4 {
-            command.arg("--ext4").arg("--read-only-disk").arg(format!(
-                "{GUEST_RUNTIME_BLOCK_ID}={}",
-                self.runtime_image.display()
+            vm = vm.block_device(BlockDevice::read_only(
+                GUEST_RUNTIME_BLOCK_ID,
+                &self.runtime_image,
             ));
             if let Some(cache) = verifier_cache {
-                command.arg("--writable-disk").arg(format!(
-                    "{VERIFIER_CACHE_BLOCK_ID}={}",
-                    cache.disk.display()
+                vm = vm.block_device(BlockDevice::read_write(
+                    VERIFIER_CACHE_BLOCK_ID,
+                    &cache.disk,
                 ));
             }
         }
-        for (name, value) in &self.environment {
-            command.arg("--env").arg(format!("{name}={value}"));
-        }
-        command
-            .arg("--cpus")
-            .arg(self.cpus.to_string())
-            .arg("--memory-mib")
-            .arg(self.memory_mib.to_string())
-            .arg(if self.ext4 {
-                "/bin/sh"
-            } else {
-                EMBEDDED_GUEST_TOOL_RUNTIME
-            });
-        if self.ext4 {
-            let resolver_configuration = &self.resolver_configuration;
-            command
+
+        let mut guest = if self.ext4 {
+            GuestCommand::new("/bin/sh")
                 .arg("-c")
-                .arg(format!(
-                    "rm -f /etc/resolv.conf && printf '{resolver_configuration}' > /etc/resolv.conf && mkdir -p \"$1\" /logs/verifier {GUEST_RUNTIME_MOUNT} && mount -t ext4 -o ro {GUEST_RUNTIME_BLOCK_DEVICE} {GUEST_RUNTIME_MOUNT} && exec {BLOCK_GUEST_TOOL_RUNTIME} \"$1\""
+                .arg(vm_guest_bootstrap_script(
+                    &self.workspace,
+                    &self.resolver_configuration,
                 ))
-                .arg("nanoeval-init")
-                .arg(&self.workspace);
         } else {
-            command.arg(&self.workspace);
+            GuestCommand::new(EMBEDDED_GUEST_TOOL_RUNTIME).arg(&self.workspace)
+        };
+        for (name, value) in &self.environment {
+            guest = guest.env(name, value);
         }
-        VmToolSession::spawn(&mut command).map_err(Into::into)
+        VmToolSession::spawn_vm(command, vm, guest).map_err(Into::into)
     }
+}
+
+fn vm_guest_bootstrap_script(workspace: &str, resolver_configuration: &str) -> String {
+    let workspace = shell_word_without_double_quotes(workspace);
+    let resolver_configuration = shell_word_without_double_quotes(resolver_configuration);
+    format!(
+        "set -eu; rm -f /etc/resolv.conf; printf %b {resolver_configuration} > /etc/resolv.conf; \
+         mkdir -p -- {workspace} /logs/verifier {GUEST_RUNTIME_MOUNT}; \
+         mount -t ext4 -o ro {GUEST_RUNTIME_BLOCK_DEVICE} {GUEST_RUNTIME_MOUNT}; \
+         exec {BLOCK_GUEST_TOOL_RUNTIME} {workspace}"
+    )
+}
+
+fn shell_word_without_double_quotes(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len().saturating_add(2));
+    quoted.push('\'');
+    for character in value.chars() {
+        match character {
+            '\'' => quoted.push_str("'\\''"),
+            // libkrun cannot carry a literal double quote in an argv entry.
+            // Synthesize it only after the wrapper shell starts.
+            '"' => quoted.push_str("'$(printf '\\042')'"),
+            character => quoted.push(character),
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 impl VerifierCache {
@@ -2239,7 +2303,7 @@ impl VerifierCache {
         let script = fs::read(task.verifier().script())?;
         let Some(setup) = recognized_verifier_setup(&script) else {
             info!(
-                target: "nanoeval",
+                target: "nanocodex_eval",
                 task_name = task.name(),
                 verifier_cache_status = "unsupported",
                 "canonical verifier will use the cold dependency path"
@@ -2270,7 +2334,7 @@ impl VerifierCache {
             "miss"
         };
         info!(
-            target: "nanoeval",
+            target: "nanocodex_eval",
             task_name = task.name(),
             verifier_cache_key = key,
             verifier_cache_status = status,
@@ -2337,7 +2401,7 @@ impl VerifierCache {
         .map_err(io::Error::other)??;
         if self.is_ready()? {
             info!(
-                target: "nanoeval",
+                target: "nanocodex_eval",
                 verifier_cache_key = self.key,
                 "verifier cache preparation reused another process's result"
             );
@@ -2423,7 +2487,7 @@ impl VerifierCache {
             }
             let delay = verifier_network_retry_delay(retry);
             warn!(
-                target: "nanoeval",
+                target: "nanocodex_eval",
                 verifier_cache_key = self.key,
                 retry = retry + 1,
                 max_retries = VERIFIER_NETWORK_RETRIES,
@@ -2449,7 +2513,7 @@ impl VerifierCache {
             return Err(io::Error::other("verifier cache setup produced no reusable cache").into());
         }
         info!(
-            target: "nanoeval",
+            target: "nanocodex_eval",
             verifier_cache_key = self.key,
             "verifier cache prepared before agent execution"
         );
@@ -2815,14 +2879,14 @@ impl VmVerifier {
         {
             if cache.mark_ready(attempt_cache)? {
                 info!(
-                    target: "nanoeval",
+                    target: "nanocodex_eval",
                     verifier_cache_key = cache.key,
                     verifier_cache_previous_status = cache.status,
                     "post-agent verifier dependency cache committed"
                 );
             } else {
                 warn!(
-                    target: "nanoeval",
+                    target: "nanocodex_eval",
                     verifier_cache_key = cache.key,
                     "verifier dependency cache remained incomplete"
                 );
@@ -2842,7 +2906,7 @@ impl VmVerifier {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => warn!(
-                target: "nanoeval",
+                target: "nanocodex_eval",
                 verifier_cache_path = %attempt_cache.disk.display(),
                 %error,
                 "failed to remove disposable attempt verifier cache"
@@ -2857,13 +2921,13 @@ impl VmVerifier {
             }
             match remove_passed_rootfs(&launch.root) {
                 Ok(true) => info!(
-                    target: "nanoeval",
+                    target: "nanocodex_eval",
                     vm_rootfs_path = %launch.root.display(),
                     "removed passed attempt VM root disk"
                 ),
                 Ok(false) => {}
                 Err(error) => warn!(
-                    target: "nanoeval",
+                    target: "nanocodex_eval",
                     vm_rootfs_path = %launch.root.display(),
                     %error,
                     "failed to remove passed attempt VM root disk"
@@ -2911,7 +2975,7 @@ impl VmVerifier {
             }
             let delay = verifier_network_retry_delay(retry);
             warn!(
-                target: "nanoeval",
+                target: "nanocodex_eval",
                 retry = retry + 1,
                 max_retries = VERIFIER_NETWORK_RETRIES,
                 retry_delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
@@ -2970,7 +3034,7 @@ impl VmVerifier {
                 .as_ref()
                 .ok_or_else(|| io::Error::other("verifier cache metadata is missing"))?;
             info!(
-                target: "nanoeval",
+                target: "nanocodex_eval",
                 verifier_cache_key = cache.key,
                 verifier_setup_bytes_skipped = cache.cacheable_end - cache.cacheable_start,
                 verifier_system_setup_bytes = cache.cacheable_start,
@@ -3096,6 +3160,13 @@ fn base_guest_environment(task: &Task, workspace: &str) -> Vec<(String, String)>
             "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned(),
         ),
         ("HOME".to_owned(), "/root".to_owned()),
+        ("NANOCODEX_EVAL_WORKSPACE".to_owned(), workspace.to_owned()),
+        (
+            "NANOCODEX_EVAL_VERIFIER_LOGS".to_owned(),
+            "/logs/verifier".to_owned(),
+        ),
+        // Retained tasks from the temporary Nanoeval repository still
+        // consume these names.
         ("NANOEVAL_WORKSPACE".to_owned(), workspace.to_owned()),
         (
             "NANOEVAL_VERIFIER_LOGS".to_owned(),
@@ -3119,7 +3190,7 @@ where
             span.record("otel.status_code", "OK");
             span.in_scope(|| {
                 info!(
-                    target: "nanoeval",
+                    target: "nanocodex_eval",
                     duration_ns,
                     status = "completed",
                     "VM attempt operation completed"
@@ -3132,7 +3203,7 @@ where
             span.record("error.message", tracing::field::display(error));
             span.in_scope(|| {
                 info!(
-                    target: "nanoeval",
+                    target: "nanocodex_eval",
                     duration_ns,
                     status = "failed",
                     error = %error,
@@ -3204,13 +3275,15 @@ impl RunReport {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
 struct RunSummary {
     total: usize,
     passed: usize,
     failed: usize,
     refused: usize,
     errored: usize,
+    known_estimated_cost_usd: Option<f64>,
+    priced_attempts: usize,
 }
 
 impl RunSummary {
@@ -3221,13 +3294,28 @@ impl RunSummary {
         };
         for attempt in attempts {
             match attempt {
-                AttemptOutcome::Passed(_) => summary.passed += 1,
-                AttemptOutcome::Failed(_) => summary.failed += 1,
+                AttemptOutcome::Passed(result) => {
+                    summary.passed += 1;
+                    summary.record_estimated_cost(result.agent.cost_usd);
+                }
+                AttemptOutcome::Failed(result) => {
+                    summary.failed += 1;
+                    summary.record_estimated_cost(result.agent.cost_usd);
+                }
                 AttemptOutcome::Refused(_) => summary.refused += 1,
                 AttemptOutcome::Errored(_) => summary.errored += 1,
             }
         }
         summary
+    }
+
+    fn record_estimated_cost(&mut self, cost_usd: Option<f64>) {
+        let Some(cost_usd) = cost_usd else {
+            return;
+        };
+        self.known_estimated_cost_usd =
+            Some(self.known_estimated_cost_usd.unwrap_or_default() + cost_usd);
+        self.priced_attempts += 1;
     }
 }
 
@@ -3284,7 +3372,7 @@ impl Progress {
 }
 
 async fn report_progress(
-    mut events: NanoevalEventStream,
+    mut events: EvalEventStream,
     expected: usize,
     concurrency: usize,
     max_memory_mb: Option<u64>,
@@ -3401,27 +3489,126 @@ fn format_milliseconds(milliseconds: i64) -> String {
 mod tests {
     use std::{
         fs,
-        path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
+        path::{Path, PathBuf},
+        process::Command as StdCommand,
     };
 
     use clap::Parser;
+    use nanocodex_eval::Task;
     use nanocodex_vm::VmCommandOutput;
-    use nanoeval::Task;
 
     use super::{
-        CACHED_VERIFIER_SCRIPT, DEFAULT_HOST_UTILIZATION_PERCENT, DEFAULT_TRIALS, Eval,
-        HostResources, RunInvocation, VM_GUEST_TARGET, VmRetention, cached_verifier_script,
-        load_tasks, load_vm_guest_runtime_record, recognized_verifier_setup, remove_passed_rootfs,
-        retained_retry_task_names, retained_task_durations, stage_vm_guest_runtime,
-        verifier_bootstrap_network_failed, verifier_cache_key, verifier_network_retry_delay,
-        verifier_shell,
+        CACHED_VERIFIER_SCRIPT, DEFAULT_HOST_UTILIZATION_PERCENT, DEFAULT_TRIALS, HostResources,
+        Run, RunInvocation, RunSummary, VmRetention, cached_verifier_script, load_tasks,
+        recognized_verifier_setup, remove_passed_rootfs, retained_retry_task_names,
+        retained_task_durations, verifier_bootstrap_network_failed, verifier_cache_key,
+        verifier_network_retry_delay, verifier_shell,
     };
 
     #[derive(Parser)]
     struct TestCli {
         #[command(flatten)]
-        eval: Eval,
+        eval: Run,
+    }
+
+    #[test]
+    fn vm_guest_build_enables_only_the_guest_runtime() {
+        let command = super::vm_guest_build_command(Path::new("/tmp/nanocodex-workspace"));
+        let arguments = command
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            arguments,
+            [
+                "build",
+                "--quiet",
+                "--no-default-features",
+                "--features",
+                "guest",
+                "--target",
+                super::VM_GUEST_TARGET,
+                "--package",
+                "nanocodex-vm",
+                "--bin",
+                "nanocodex-vm-guest",
+            ]
+        );
+        assert_eq!(
+            command.as_std().get_current_dir(),
+            Some(Path::new("/tmp/nanocodex-workspace"))
+        );
+    }
+
+    #[test]
+    fn guest_build_record_tracks_exact_cargo_dependencies() {
+        let workspace = tempfile::tempdir().unwrap();
+        for path in [
+            "Cargo.toml",
+            "Cargo.lock",
+            ".cargo/config.toml",
+            "crates/nanocodex-oai-api/Cargo.toml",
+            "crates/nanocodex-tools/Cargo.toml",
+            "crates/nanocodex-vm/Cargo.toml",
+        ] {
+            let path = workspace.path().join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "fixture").unwrap();
+        }
+        let source = workspace.path().join("crates/nanocodex-vm/src/guest.rs");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, "first guest source").unwrap();
+        let runtime = workspace.path().join("target/guest/debug/guest");
+        fs::create_dir_all(runtime.parent().unwrap()).unwrap();
+        fs::write(&runtime, "guest binary").unwrap();
+        fs::write(
+            runtime.with_extension("d"),
+            format!("{}: {}\n", runtime.display(), source.display()),
+        )
+        .unwrap();
+
+        super::write_vm_guest_build_record(workspace.path(), &runtime).unwrap();
+        assert!(super::vm_guest_runtime_is_fresh(workspace.path(), &runtime).unwrap());
+
+        fs::write(source, "changed guest source with a different size").unwrap();
+        assert!(!super::vm_guest_runtime_is_fresh(workspace.path(), &runtime).unwrap());
+    }
+
+    #[test]
+    fn cargo_dep_info_parser_preserves_escaped_paths() {
+        let paths = super::parse_cargo_dep_info(
+            "/tmp/guest: /tmp/plain.rs /tmp/with\\ space.rs /tmp/back\\\\slash.rs\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            paths,
+            [
+                PathBuf::from("/tmp/plain.rs"),
+                PathBuf::from("/tmp/with space.rs"),
+                PathBuf::from("/tmp/back\\slash.rs"),
+            ]
+        );
+    }
+
+    #[test]
+    fn vm_bootstrap_preserves_shell_words_without_libkrun_quotes() {
+        let workspace = "/workspace with 'single' and \"double\"";
+        let quoted = super::shell_word_without_double_quotes(workspace);
+        let script = format!("printf %s {quoted}");
+        assert!(!script.contains('"'));
+        let output = StdCommand::new("/bin/sh")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, workspace.as_bytes());
+
+        let bootstrap = super::vm_guest_bootstrap_script(workspace, "nameserver 192.168.127.1\\n");
+        assert!(!bootstrap.contains('"'));
+        assert!(bootstrap.contains(&quoted));
     }
 
     #[test]
@@ -3474,6 +3661,21 @@ mod tests {
         let resolved = cli.eval.resolve_run().unwrap();
 
         assert!(resolved.web_search);
+    }
+
+    #[test]
+    fn cost_summary_distinguishes_known_and_unpriced_attempts() {
+        let mut summary = RunSummary {
+            total: 3,
+            ..RunSummary::default()
+        };
+
+        summary.record_estimated_cost(Some(0.125));
+        summary.record_estimated_cost(None);
+        summary.record_estimated_cost(Some(0.375));
+
+        assert_eq!(summary.known_estimated_cost_usd, Some(0.5));
+        assert_eq!(summary.priced_attempts, 2);
     }
 
     #[test]
@@ -3807,6 +4009,20 @@ mod tests {
     }
 
     #[test]
+    fn legacy_last_run_marker_remains_readable() {
+        let root = tempfile::tempdir().unwrap();
+        let job = root.path().join("job");
+        fs::create_dir(&job).unwrap();
+        fs::write(job.join("result.json"), "{}").unwrap();
+        let marker = root.path().join(".nanoeval/last-run.json");
+        super::write_json_atomic(&marker, &super::LastRun { job: job.clone() }).unwrap();
+
+        let resolved = super::completed_job_from_last_run(None, [marker.as_path()]).unwrap();
+
+        assert_eq!(resolved, job.canonicalize().unwrap());
+    }
+
+    #[test]
     fn cold_verifier_uses_the_prepared_environment_shell() {
         assert_eq!(verifier_shell("sh", false), "sh");
         assert_eq!(verifier_shell("bash", false), "bash");
@@ -3822,46 +4038,6 @@ mod tests {
             error.kind(),
             clap::error::ErrorKind::MissingRequiredArgument
         );
-    }
-
-    #[test]
-    fn guest_runtime_record_reuses_only_the_indexed_binary() {
-        let workspace = std::env::temp_dir().join(format!(
-            "nanoeval-runtime-record-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let runtime = workspace
-            .join("target")
-            .join(VM_GUEST_TARGET)
-            .join("debug/guest");
-        fs::create_dir_all(runtime.parent().unwrap()).unwrap();
-        fs::write(&runtime, b"first-runtime").unwrap();
-
-        let (digest, directory) = stage_vm_guest_runtime(&workspace, &runtime).unwrap();
-        let record = load_vm_guest_runtime_record(&workspace, &runtime)
-            .unwrap()
-            .unwrap();
-        assert_eq!(record.digest, digest);
-        assert_eq!(
-            directory
-                .join("nanocodex-vm-guest")
-                .metadata()
-                .unwrap()
-                .len(),
-            13
-        );
-
-        fs::write(&runtime, b"different-runtime").unwrap();
-        assert!(
-            load_vm_guest_runtime_record(&workspace, &runtime)
-                .unwrap()
-                .is_none()
-        );
-        fs::remove_dir_all(workspace).unwrap();
     }
 
     #[test]

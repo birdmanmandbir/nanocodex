@@ -3,11 +3,11 @@ use std::path::PathBuf;
 use clap::{Args, ValueEnum, builder::NonEmptyStringValueParser};
 use nanocodex_observability::{LogFormat, LogOutput, ObservabilityBuilder, ObservabilityGuard};
 
-const DEFAULT_FILTER: &str = "warn,nanoeval=info,nanocodex_vm=info,nanocodex=info,nanocodex_service=info,nanocodex_tools=info,nanocodex_mcp=info";
+const DEFAULT_FILTER: &str = "warn,nanocodex_eval=info,nanocodex_vm=info,nanocodex=info,nanocodex_service=info,nanocodex_tools=info,nanocodex_mcp=info";
 
 #[derive(Args)]
 pub(crate) struct ObservabilityArgs {
-    /// Tracing filter directive. Defaults to Nanoeval and Nanocodex lifecycle spans at info.
+    /// Tracing filter directive. Defaults to Evaluator and Nanocodex lifecycle spans at info.
     #[arg(
         long,
         env = "RUST_LOG",
@@ -26,12 +26,29 @@ pub(crate) struct ObservabilityArgs {
     otel_filter: String,
 
     /// Local tracing output format.
-    #[arg(long, env = "NANOEVAL_LOG_FORMAT", default_value_t, value_enum)]
-    log_format: LogFormatArg,
+    #[arg(long, env = "NANOCODEX_EVAL_LOG_FORMAT", value_enum)]
+    log_format: Option<LogFormatArg>,
+
+    // Keep the temporary Nanoeval environment contract readable while callers
+    // migrate to the Nanocodex-owned spelling.
+    #[arg(
+        long = "__legacy-nanoeval-log-format",
+        env = "NANOEVAL_LOG_FORMAT",
+        hide = true,
+        value_enum
+    )]
+    legacy_log_format: Option<LogFormatArg>,
 
     /// Append local tracing output to this file instead of stderr.
-    #[arg(long, env = "NANOEVAL_LOG_FILE")]
+    #[arg(long, env = "NANOCODEX_EVAL_LOG_FILE")]
     log_file: Option<PathBuf>,
+
+    #[arg(
+        long = "__legacy-nanoeval-log-file",
+        env = "NANOEVAL_LOG_FILE",
+        hide = true
+    )]
+    legacy_log_file: Option<PathBuf>,
 
     /// Export spans through OTLP/HTTP protobuf.
     #[arg(
@@ -63,11 +80,18 @@ impl ObservabilityArgs {
     pub(crate) fn install(
         self,
     ) -> Result<ObservabilityGuard, nanocodex_observability::ObservabilityError> {
-        let output = self.log_file.map_or(LogOutput::Stderr, LogOutput::File);
-        let mut builder = ObservabilityBuilder::new("nanoeval", env!("CARGO_PKG_VERSION"))
+        let output = self
+            .log_file
+            .or(self.legacy_log_file)
+            .map_or(LogOutput::Stderr, LogOutput::File);
+        let format = self
+            .log_format
+            .or(self.legacy_log_format)
+            .unwrap_or_default();
+        let mut builder = ObservabilityBuilder::new("nanocodex-eval", env!("CARGO_PKG_VERSION"))
             .filter(self.log_filter)
             .otel_filter(self.otel_filter)
-            .format(self.log_format.into())
+            .format(format.into())
             .output(output)
             .environment(self.otel_environment);
         if let Some(endpoint) = self.otel_endpoint {

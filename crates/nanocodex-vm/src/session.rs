@@ -25,8 +25,8 @@ use crate::{
     VmToolClient,
     protocol::{
         CancelRequest, ControlResponse, ExecuteRequest, ExecuteResponse, ReadFileRequest,
-        ReadFileResponse, SessionRequest, SessionResponse, ShutdownRequest, ToolRequest,
-        WireToolContext, WireToolInput, WriteFileRequest,
+        ReadFileResponse, ReadyRequest, SessionRequest, SessionResponse, ShutdownRequest,
+        ToolRequest, WireToolContext, WireToolInput, WriteFileRequest,
     },
 };
 
@@ -232,6 +232,32 @@ struct PendingRequestGuard {
 }
 
 impl VmToolSession {
+    /// Spawns one VM from complete typed inputs without an egress provider.
+    ///
+    /// `command` must invoke a dedicated VMM process that accepts the private
+    /// [`VmProcessConfig`] path as its next argument. The configuration remains
+    /// alive until the returned session stops, and keeps guest environment
+    /// values out of process arguments.
+    ///
+    /// Use [`Self::spawn_configured`] when a host-owned egress lease must also
+    /// configure and provision the guest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the private configuration cannot be written or
+    /// the VMM process cannot start.
+    pub fn spawn_vm(
+        mut command: Command,
+        vm: VmConfig,
+        guest: GuestCommand,
+    ) -> Result<Self, VmToolSessionError> {
+        let process_config = VmProcessConfig::new(vm, guest).write_private()?;
+        command.arg(process_config.path());
+        let session = Self::spawn(&mut command)?;
+        *lock_unpoisoned(&session.handle.inner.process_config) = Some(process_config);
+        Ok(session)
+    }
+
     /// Configures, spawns, and provisions one VM from the same egress lease.
     ///
     /// `command` must invoke a dedicated VMM process that accepts the private
@@ -250,16 +276,14 @@ impl VmToolSession {
     /// Returns an error when private configuration cannot be written, the VMM
     /// cannot start, or guest egress provisioning fails.
     pub async fn spawn_configured(
-        mut command: Command,
+        command: Command,
         vm: VmConfig,
         guest: GuestCommand,
         egress: EgressLease,
     ) -> Result<Self, VmToolSessionError> {
         let (vm, guest) = egress.configure(vm, &guest);
-        let process_config = VmProcessConfig::new(vm, guest).write_private()?;
-        command.arg(process_config.path());
-        let session = Self::spawn(&mut command)?;
-        *lock_unpoisoned(&session.handle.inner.process_config) = Some(process_config);
+        let session = Self::spawn_vm(command, vm, guest)?;
+        session.ready().await?;
         session.provision_egress(egress).await?;
         Ok(session)
     }
@@ -352,6 +376,20 @@ impl VmToolSession {
     #[must_use]
     pub fn tools(&self) -> crate::VmTools {
         crate::VmTools::new(self.handle())
+    }
+
+    /// Waits until the guest tool server has accepted and answered a typed
+    /// readiness request.
+    ///
+    /// Call this before exposing tools to model work when VM startup failure
+    /// should abort setup without spending a model request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the VMM exits before the guest server is ready or
+    /// the readiness response is malformed.
+    pub async fn ready(&self) -> Result<(), VmToolSessionError> {
+        self.handle.ready().await
     }
 
     /// Provisions provider-owned public files and retains the complete egress
@@ -479,6 +517,42 @@ impl Drop for VmToolSessionInner {
 }
 
 impl VmToolSessionHandle {
+    /// Waits until the guest tool server answers a typed readiness request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the VMM exits before the guest server is ready or
+    /// the readiness response is malformed.
+    pub async fn ready(&self) -> Result<(), VmToolSessionError> {
+        let span = info_span!(
+            target: "nanocodex_vm",
+            "vm.session.ready",
+            otel.kind = "internal",
+            otel.status_code = tracing::field::Empty,
+            vm.session.age_ns = tracing::field::Empty,
+            status = tracing::field::Empty,
+            error.message = tracing::field::Empty,
+            duration_ns = tracing::field::Empty,
+        );
+        let started_at = Instant::now();
+        let result = async {
+            let response = self
+                .control_request(|id| SessionRequest::Ready(ReadyRequest { id }))
+                .await?;
+            let SessionResponse::Ready(response) = response else {
+                return Err(VmToolSessionError::Protocol(
+                    "expected a readiness response",
+                ));
+            };
+            control_result(response)
+        }
+        .instrument(span.clone())
+        .await;
+        span.record("vm.session.age_ns", elapsed_ns(self.inner.spawned_at));
+        record_vm_result(&span, started_at, &result);
+        result
+    }
+
     async fn request(
         &self,
         tool: StandardTool,
@@ -924,6 +998,7 @@ async fn read_frame(
 
 fn set_request_id(request: &mut SessionRequest, id: u64) {
     match request {
+        SessionRequest::Ready(request) => request.id = id,
         SessionRequest::Tool(request) => request.id = id,
         SessionRequest::WriteFile(request) => request.id = id,
         SessionRequest::ReadFile(request) => request.id = id,
@@ -1178,6 +1253,24 @@ mod tracing_tests {
     }
 
     #[test]
+    fn readiness_waits_for_a_typed_guest_response() {
+        let _test_guard = TRACE_TEST_LOCK.lock().unwrap();
+        let response = r#"{"kind":"ready","payload":{"id":0,"error":null}}"#;
+        let script = format!("IFS= read -r request\nprintf '%s\\n' '{response}'");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.arg("-c").arg(script);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let session = VmToolSession::spawn(&mut command).unwrap();
+            session.ready().await.unwrap();
+        });
+    }
+
+    #[test]
     fn cancelled_request_sends_targeted_guest_cancellation() {
         let _test_guard = TRACE_TEST_LOCK.lock().unwrap();
         let cancel = r#"{"kind":"cancel","payload":{"id":1,"error":null}}"#;
@@ -1328,9 +1421,12 @@ mod tracing_tests {
     #[test]
     fn configured_spawn_retains_private_input_until_the_vmm_has_loaded_it() {
         let _test_guard = TRACE_TEST_LOCK.lock().unwrap();
-        let response = r#"{"kind":"shutdown","payload":{"id":0,"error":null}}"#;
+        let ready = r#"{"kind":"ready","payload":{"id":0,"error":null}}"#;
+        let shutdown = r#"{"kind":"shutdown","payload":{"id":1,"error":null}}"#;
         let script = format!(
-            "config=$1\nsleep 0.05\ntest -f \"$config\" || exit 9\nIFS= read -r request\nprintf '%s\\n' '{response}'"
+            "config=$1\nsleep 0.05\ntest -f \"$config\" || exit 9\n\
+             IFS= read -r request\nprintf '%s\\n' '{ready}'\n\
+             IFS= read -r request\nprintf '%s\\n' '{shutdown}'"
         );
         let mut command = tokio::process::Command::new("/bin/sh");
         command.arg("-c").arg(script).arg("vm-test");

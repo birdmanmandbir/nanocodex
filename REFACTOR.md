@@ -767,12 +767,32 @@ substituting an older hypervisor API.
 
 ### 9. Evaluations
 
-- Move Nanoeval libraries, Harbor projection, task/image preparation, durable
+- [x] Move Nanoeval libraries, Harbor projection, task/image preparation, durable
   scheduling, inspection, comparison, and cleanup into this workspace.
-- Expose the complete supported surface as `nanocodex eval`.
-- Remove adjacent-repository path dependencies and duplicated VM code.
-- Run native, Terminal-Bench VM, Frontier-Bench artifact, resume, failure
+- [x] Expose the complete supported surface as `nanocodex eval`.
+- [x] Remove adjacent-repository path dependencies and duplicated VM code.
+- [x] Run native, Terminal-Bench VM, Frontier-Bench artifact, resume, failure
   retention, and Harbor-view compatibility gates.
+
+Evidence:
+[`benchmarks/refactor_eval_baseline_2026-07-26.md`](benchmarks/refactor_eval_baseline_2026-07-26.md)
+records the exact `nanoeval/master@10aed6b` capability mapping, compatibility
+inputs, retained end-to-end measurements, and the new task/sweep/resume/ATIF
+Criterion budgets. The imported task and verifier fixtures are unchanged.
+`nanocodex-eval` and `nanocodex-eval-harbor` now provide warnings-denied
+progressive rustdoc examples; the CLI accepts the same pricing snapshot as the
+agent and carries estimated USD through results, ATIF, Harbor, JSON, tracing,
+and human summaries. A clean-cache CLI proof rebuilt the guest, ran the task
+Dockerfile through the content-addressed entitled VMM, reached the typed guest
+tool server in 292.595 ms, retained complete failure evidence after a deliberate
+zero-cost authentication failure, and was decoded through Harbor's live viewer
+API. Valid-auth native and signed-VM `write-greeting` jobs then scored 1.0
+against the untouched verifier. The final VM proof performs a typed guest
+readiness exchange before the first model request. Two complete untouched
+Frontier-Bench trials exercised declared artifact transfer into a fresh
+verifier VM and retained canonical result, event, CTRF, ATIF, and Harbor
+evidence with no harness error; the stronger stochastic agent solution passed
+34/36 hidden assertions.
 
 ### 10. Managed API and release cleanup
 

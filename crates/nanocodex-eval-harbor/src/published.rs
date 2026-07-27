@@ -22,43 +22,63 @@ const DOWNLOAD_CONCURRENCY: usize = 4;
 const DOWNLOAD_ATTEMPTS: u32 = 8;
 
 #[derive(Debug, thiserror::Error)]
+/// An error produced while reading Harbor's published result archive.
 pub enum PublishedError {
+    /// A filesystem or Git process I/O operation failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
+    /// A published JSON artifact could not be decoded.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 
+    /// An HTTP request for a published artifact failed.
     #[error(transparent)]
     Http(#[from] reqwest::Error),
 
+    /// A configured artifact base was not a valid URL.
     #[error(transparent)]
     Url(#[from] url::ParseError),
 
+    /// The configured cache path had no parent directory.
     #[error("published-results cache path has no parent: {0}")]
     MissingCacheParent(PathBuf),
 
+    /// A Git operation on the archive index exited unsuccessfully.
     #[error("git {operation} failed with {status}: {stderr}")]
     Git {
+        /// The operation being performed.
         operation: &'static str,
+        /// The Git process exit status.
         status: ExitStatus,
+        /// Git's standard-error output.
         stderr: String,
     },
 
+    /// Git emitted non-UTF-8 output for a textual result.
     #[error("git returned non-UTF-8 output while {0}")]
     GitUtf8(&'static str),
 
+    /// A remote artifact exceeded the bounded download size.
     #[error("published artifact is larger than {limit} bytes: {url}")]
-    ArtifactTooLarge { limit: usize, url: Url },
+    ArtifactTooLarge {
+        /// The maximum accepted artifact size in bytes.
+        limit: usize,
+        /// The rejected artifact URL.
+        url: Url,
+    },
 
+    /// A referenced artifact does not exist in the archive.
     #[error("published artifact does not exist: {0}")]
     MissingArtifact(Url),
 
+    /// An archive path did not match Harbor's result layout.
     #[error("invalid published result path: {0}")]
     InvalidResultPath(String),
 }
 
 #[derive(Clone, Debug)]
+/// Builder for a cached [`PublishedResults`] reader.
 pub struct PublishedResultsBuilder {
     cache_directory: PathBuf,
     repository: String,
@@ -67,6 +87,7 @@ pub struct PublishedResultsBuilder {
 }
 
 impl PublishedResultsBuilder {
+    /// Sets the local directory used for the Git index and downloaded artifacts.
     #[must_use]
     pub fn cache_directory(mut self, directory: impl Into<PathBuf>) -> Self {
         self.cache_directory = directory.into();
@@ -105,6 +126,7 @@ impl PublishedResultsBuilder {
 }
 
 #[derive(Clone, Debug)]
+/// Cached, typed access to Harbor's published Terminal-Bench results.
 pub struct PublishedResults {
     cache_directory: PathBuf,
     repository: String,
@@ -115,11 +137,10 @@ pub struct PublishedResults {
 
 impl PublishedResults {
     /// Builds a cached reader for Harbor's public Terminal-Bench archive.
-    ///
     #[must_use]
     pub fn builder() -> PublishedResultsBuilder {
         PublishedResultsBuilder {
-            cache_directory: PathBuf::from(".cache/nanoeval/published"),
+            cache_directory: PathBuf::from(".cache/nanocodex/eval/published"),
             repository: DEFAULT_REPOSITORY.to_owned(),
             download_base: DEFAULT_DOWNLOAD_BASE.to_owned(),
             refresh: false,
@@ -375,7 +396,7 @@ impl PublishedResults {
         if let Some(parent) = manifest.parent() {
             fs::create_dir_all(parent).await?;
         }
-        let temporary = manifest.with_extension(format!("{}.tmp", Uuid::new_v4()));
+        let temporary = manifest.with_extension(format!("{}.tmp", Uuid::now_v7()));
         fs::write(&temporary, serde_json::to_vec(&downloads)?).await?;
         fs::rename(temporary, manifest).await?;
         Ok(downloads)
@@ -414,7 +435,7 @@ impl PublishedResults {
         if let Some(parent) = manifest.parent() {
             fs::create_dir_all(parent).await?;
         }
-        let temporary = manifest.with_extension(format!("{}.tmp", Uuid::new_v4()));
+        let temporary = manifest.with_extension(format!("{}.tmp", Uuid::now_v7()));
         fs::write(&temporary, serde_json::to_vec(&candidates)?).await?;
         fs::rename(temporary, manifest).await?;
         Ok(candidates)
@@ -499,7 +520,7 @@ impl PublishedResults {
         if let Some(parent) = cached.parent() {
             fs::create_dir_all(parent).await?;
         }
-        let temporary = cached.with_extension(format!("{}.tmp", Uuid::new_v4()));
+        let temporary = cached.with_extension(format!("{}.tmp", Uuid::now_v7()));
         fs::write(&temporary, &bytes).await?;
         fs::rename(temporary, &cached).await?;
         Ok(bytes.to_vec())
@@ -507,6 +528,7 @@ impl PublishedResults {
 }
 
 #[derive(Clone, Debug)]
+/// Filters one task's records in Harbor's published result archive.
 pub struct PublishedQuery {
     task: String,
     checksum: Option<String>,
@@ -515,6 +537,9 @@ pub struct PublishedQuery {
 }
 
 impl PublishedQuery {
+    /// Creates a query for a Terminal-Bench task name.
+    ///
+    /// An optional `terminal-bench/` prefix is removed automatically.
     #[must_use]
     pub fn new(task: impl Into<String>) -> Self {
         let task = task.into();
@@ -529,18 +554,23 @@ impl PublishedQuery {
         }
     }
 
+    /// Prefers and counts attempts matching an exact task checksum.
     #[must_use]
     pub fn checksum(mut self, checksum: impl Into<String>) -> Self {
         self.checksum = Some(checksum.into());
         self
     }
 
+    /// Limits the number of distinct passing submissions whose trajectories are downloaded.
     #[must_use]
     pub const fn limit(mut self, limit: usize) -> Self {
         self.limit = limit;
         self
     }
 
+    /// Restricts results to submissions, agents, or models containing `agent`.
+    ///
+    /// Calling this method more than once matches any configured value.
     #[must_use]
     pub fn agent(mut self, agent: impl Into<String>) -> Self {
         self.agents.push(agent.into());
@@ -573,67 +603,114 @@ impl PublishedQuery {
 }
 
 #[derive(Clone, Debug, Serialize)]
+/// Passing published trials and aggregate counts for one task query.
 pub struct PublishedTask {
+    /// The normalized Terminal-Bench task name.
     pub task: String,
+    /// The exact checksum requested by the caller, if any.
     pub requested_checksum: Option<String>,
+    /// The immutable Git revision used for the query.
     pub archive_revision: String,
+    /// The number of result documents found before pass and agent filtering.
     pub matching_results: usize,
+    /// The number of passing results matching the agent filters.
     pub passing_results: usize,
+    /// The number of passing results with the requested checksum.
     pub exact_passing_results: usize,
+    /// Selected passing trials, including downloaded trajectories when available.
     pub trials: Vec<PublishedTrial>,
 }
 
 #[derive(Clone, Debug, Serialize)]
+/// Typed attempt metadata for one task query without downloaded trajectories.
 pub struct PublishedAttempts {
+    /// The normalized Terminal-Bench task name.
     pub task: String,
+    /// The exact checksum requested by the caller, if any.
     pub requested_checksum: Option<String>,
+    /// The immutable Git revision used for the query.
     pub archive_revision: String,
+    /// Every attempt matching the query's agent filters.
     pub attempts: Vec<PublishedAttempt>,
 }
 
 #[derive(Clone, Debug, Serialize)]
+/// Metadata for one attempt in Harbor's published result archive.
 pub struct PublishedAttempt {
+    /// The archive submission name.
     pub submission: String,
+    /// The run directory within the submission.
     pub run: String,
+    /// The task name reported by Harbor.
     pub task_name: String,
+    /// The packaged task checksum reported by Harbor.
     pub task_checksum: String,
+    /// The trial name reported by Harbor.
     pub trial_name: String,
+    /// Whether the verifier awarded a positive reward without an exception.
     pub passed: bool,
+    /// Whether Harbor recorded an exception for the trial.
     pub errored: bool,
+    /// The published agent and model identity.
     pub agent: PublishedAgentInfo,
+    /// The configured reasoning effort, when recorded.
     pub thinking: Option<String>,
+    /// The configured Harbor agent import path, when recorded.
     pub agent_import_path: Option<String>,
+    /// The result artifact's path within the archive.
     pub result_path: String,
+    /// The trajectory artifact's path within the archive, when present.
     pub trajectory_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
+/// One selected passing trial, optionally including its decoded trajectory.
 pub struct PublishedTrial {
+    /// The archive submission name.
     pub submission: String,
+    /// The run directory within the submission.
     pub run: String,
+    /// The trial name reported by Harbor.
     pub trial_name: String,
+    /// The task name reported by Harbor.
     pub task_name: String,
+    /// The packaged task checksum reported by Harbor.
     pub task_checksum: String,
+    /// The verifier's scalar reward.
     pub reward: f64,
+    /// The published agent and model identity.
     pub agent: PublishedAgentInfo,
+    /// The configured reasoning effort, when recorded.
     pub thinking: Option<String>,
+    /// The configured Harbor agent import path, when recorded.
     pub agent_import_path: Option<String>,
+    /// The result artifact's path within the archive.
     pub result_path: String,
+    /// The trajectory artifact's path within the archive, when present.
     pub trajectory_path: Option<String>,
+    /// The decoded ATIF trajectory, when available and valid.
     pub trajectory: Option<PublishedTrajectory>,
+    /// A trajectory download or decode error that did not invalidate the result.
     pub trajectory_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+/// Agent identity recorded in a published Harbor result.
 pub struct PublishedAgentInfo {
+    /// The agent implementation name.
     pub name: String,
+    /// The agent implementation version, when recorded.
     pub version: Option<String>,
+    /// Model identity recorded for the attempt, when available.
     pub model_info: Option<PublishedModelInfo>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+/// Model identity recorded in a published Harbor result.
 pub struct PublishedModelInfo {
+    /// The model name.
     pub name: String,
+    /// The model provider, when recorded.
     pub provider: Option<String>,
 }
 
@@ -728,10 +805,15 @@ struct PublishedVerifierResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+/// A decoded ATIF trajectory from Harbor's published archive.
 pub struct PublishedTrajectory {
+    /// The ATIF schema version.
     pub schema_version: String,
+    /// The source agent session identifier, when recorded.
     pub session_id: Option<String>,
+    /// The trajectory's agent identity.
     pub agent: PublishedAgent,
+    /// Ordered agent, tool, and observation steps.
     pub steps: Vec<PublishedStep>,
 }
 
@@ -750,59 +832,87 @@ fn decode_published_trajectory(bytes: &[u8]) -> Result<PublishedTrajectory, serd
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(untagged)]
+/// Agent identity as either structured metadata or a legacy name.
 pub enum PublishedAgent {
+    /// Structured agent metadata.
     Details(PublishedAgentDetails),
+    /// A legacy agent name.
     Name(String),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+/// Structured agent metadata in a published trajectory.
 pub struct PublishedAgentDetails {
+    /// The agent implementation name.
     pub name: String,
+    /// The agent implementation version, when recorded.
     pub version: Option<String>,
+    /// The model name, when recorded.
     pub model_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+/// One ordered step in a published ATIF trajectory.
 pub struct PublishedStep {
+    /// The source trajectory's numeric or textual step identifier.
     pub step_id: PublishedStepId,
+    /// The source timestamp, when recorded.
     pub timestamp: Option<String>,
+    /// The step producer, such as `agent`, `tool`, or `user`.
     pub source: String,
+    /// The model that produced the step, when recorded.
     pub model_name: Option<String>,
     #[serde(alias = "content")]
+    /// User-visible message content, including legacy `content` fields.
     pub message: Option<String>,
+    /// Model reasoning content exposed by the source artifact.
     pub reasoning_content: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_vec")]
+    /// Tool calls requested by this step.
     pub tool_calls: Vec<PublishedToolCall>,
+    /// Tool results observed by this step.
     pub observation: Option<PublishedObservation>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(untagged)]
+/// A published trajectory step identifier.
 pub enum PublishedStepId {
+    /// A numeric ATIF step identifier.
     Number(u64),
+    /// A textual identifier used by some legacy publishers.
     Text(String),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+/// A tool call recorded in a published trajectory.
 pub struct PublishedToolCall {
     #[serde(default)]
+    /// The source tool-call identifier, when recorded.
     pub tool_call_id: Option<String>,
     #[serde(alias = "tool_name")]
+    /// The invoked function name.
     pub function_name: String,
     #[serde(alias = "parameters")]
+    /// The retained raw JSON arguments.
     pub arguments: Box<RawValue>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+/// Tool results recorded in a published trajectory step.
 pub struct PublishedObservation {
     #[serde(default)]
+    /// Ordered tool results.
     pub results: Vec<PublishedObservationResult>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+/// One tool result recorded in a published trajectory.
 pub struct PublishedObservationResult {
     #[serde(default)]
+    /// The tool call that produced this result.
     pub source_call_id: String,
+    /// The tool's textual result content.
     pub content: String,
 }
 

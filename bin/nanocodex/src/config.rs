@@ -262,7 +262,7 @@ impl AgentArgs {
     }
 }
 
-fn load_pricing(path: Option<&Path>) -> Result<Option<PricingSnapshot>> {
+pub(crate) fn load_pricing(path: Option<&Path>) -> Result<Option<PricingSnapshot>> {
     let Some(path) = path else {
         return Ok(None);
     };
