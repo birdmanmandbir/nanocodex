@@ -9,10 +9,6 @@ use std::{
     },
 };
 
-use arcbox_ext4::{
-    Formatter,
-    constants::{file_mode, make_mode},
-};
 use axum::{
     Router,
     extract::Request,
@@ -26,7 +22,7 @@ use mpp::{
 };
 use mpp_egress::{EgressPolicy, MppEgress};
 use nanocodex::{Tool, ToolContext, ToolExecution, ToolInput, ToolOutputBody, ToolOutputContent};
-use nanocodex_vm::{VmToolSession, mpp_egress_layer};
+use nanocodex_vm::{GuestRuntimeDisk, VmToolSession, mpp_egress_layer};
 use nanovm::{
     BlockDevice, EgressLease, EgressMount, GUEST_EGRESS_ROOT, GuestCommand, VmConfig,
     VmProcessConfig,
@@ -38,7 +34,6 @@ use tokio::process::Command;
 const GUEST_RUNTIME: &str = "/usr/local/bin/nanocodex-vm-guest";
 const RUNTIME_BLOCK_DEVICE: &str = "/dev/vdb";
 const RUNTIME_MOUNT: &str = "/run/nanocodex";
-const RUNTIME_DISK_BYTES: u64 = 128 * 1024 * 1024;
 type AnyError = Box<dyn Error + Send + Sync>;
 
 #[derive(Deserialize)]
@@ -87,14 +82,15 @@ async fn run_host(arguments: Vec<std::ffi::OsString>, prove_mpp: bool) -> Result
     } else {
         (None, root)
     };
-    let runtime = arguments.get(1).cloned().map(PathBuf::from);
-    let (_runtime_disk, runtime) = match runtime {
-        Some(runtime) => {
-            let (guard, runtime) = prepare_runtime_disk(&runtime)?;
-            (guard, Some(runtime))
-        }
-        None => (None, None),
+    let runtime_input = arguments.get(1).cloned().map(PathBuf::from);
+    let prepared_runtime = match runtime_input.as_deref() {
+        Some(runtime) if is_elf(runtime)? => Some(GuestRuntimeDisk::prepare(runtime, ".cache/vm")?),
+        Some(_) | None => None,
     };
+    let runtime = prepared_runtime
+        .as_ref()
+        .map(|runtime| runtime.path().to_owned())
+        .or(runtime_input);
     let (egress, mpp_proof) = if prove_mpp {
         let proof = MppProof::start().await?;
         let mpp = mpp_egress_layer(Arc::clone(&proof.egress))?;
@@ -114,9 +110,9 @@ async fn run_host(arguments: Vec<std::ffi::OsString>, prove_mpp: bool) -> Result
             .memory_mib(768)
             .block_device(BlockDevice::read_only("nanocodex-runtime", runtime));
         let init = format!(
-            "set -eu; mkdir -p \"$1\" {RUNTIME_MOUNT}; \
+            "set -eu; mkdir -p $1 {RUNTIME_MOUNT}; \
              mount -t ext4 -o ro {RUNTIME_BLOCK_DEVICE} {RUNTIME_MOUNT}; \
-             exec {RUNTIME_MOUNT}/nanocodex-vm-guest \"$1\""
+             exec {RUNTIME_MOUNT}/nanocodex-vm-guest $1"
         );
         let guest = GuestCommand::new("/bin/sh")
             .arg("-c")
@@ -146,13 +142,7 @@ async fn run_host(arguments: Vec<std::ffi::OsString>, prove_mpp: bool) -> Result
         .working_directory("/workspace")
         .default_shell("sh")
         .build()?;
-    let context = ToolContext {
-        model: "vm-proof",
-        session_id: "session-1",
-        call_id: "call-1",
-        history: &[],
-        output_token_budget: 10_000,
-    };
+    let context = ToolContext::new("vm-proof", "session-1", "call-1", &[], 10_000);
 
     let execution = vm
         .exec_command_tool()
@@ -351,28 +341,14 @@ fn reflink_or_sparse_copy(source: &Path, destination: &Path) -> io::Result<u64> 
     fs::copy(source, destination)
 }
 
-fn prepare_runtime_disk(runtime: &Path) -> Result<(Option<tempfile::TempDir>, PathBuf), AnyError> {
-    let contents = fs::read(runtime)?;
-    if !contents.starts_with(b"\x7fELF") {
-        return Ok((None, runtime.to_owned()));
+fn is_elf(path: &Path) -> io::Result<bool> {
+    let mut file = fs::File::open(path)?;
+    let mut magic = [0_u8; 4];
+    match io::Read::read_exact(&mut file, &mut magic) {
+        Ok(()) => Ok(magic == *b"\x7fELF"),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error),
     }
-
-    let directory = tempfile::tempdir()?;
-    let image = directory.path().join("runtime.ext4");
-    let mut runtime_reader = contents.as_slice();
-    let mut formatter = Formatter::new(&image, 4_096, RUNTIME_DISK_BYTES)?;
-    formatter.create(
-        "/nanocodex-vm-guest",
-        make_mode(file_mode::S_IFREG, 0o755),
-        None,
-        None,
-        Some(&mut runtime_reader),
-        Some(0),
-        Some(0),
-        None,
-    )?;
-    formatter.close()?;
-    Ok((Some(directory), image))
 }
 
 fn secret_style_proof_layer() -> Result<EgressLease, AnyError> {
@@ -383,11 +359,11 @@ fn secret_style_proof_layer() -> Result<EgressLease, AnyError> {
         "NANOCENTAUR_SECRET_BASE_URL",
         "https://secret-gateway.invalid/v1",
     )?;
-    layer.insert_mount(EgressMount {
-        tag: "secret-proof".to_owned(),
-        host_path: directory.path().to_owned(),
-        guest_path: Path::new(GUEST_EGRESS_ROOT).join("secrets"),
-    })?;
+    layer.insert_mount(EgressMount::read_only(
+        "secret-proof",
+        directory.path(),
+        Path::new(GUEST_EGRESS_ROOT).join("secrets"),
+    ))?;
     layer.retain(directory);
     Ok(layer)
 }

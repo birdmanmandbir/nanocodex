@@ -25,6 +25,7 @@ pub struct VmProcessConfig {
 }
 
 impl VmProcessConfig {
+    /// Creates a versioned launch record from complete owned VM inputs.
     #[must_use]
     pub fn new(vm: VmConfig, command: GuestCommand) -> Self {
         Self {
@@ -79,18 +80,23 @@ pub struct PrivateVmProcessConfig {
 }
 
 impl PrivateVmProcessConfig {
+    /// Returns the mode-0600 temporary configuration path.
     #[must_use]
     pub fn path(&self) -> &Path {
         self.file.path()
     }
 }
 
+/// Failure to persist or load a private VMM launch record.
 #[derive(Debug, Error)]
 pub enum VmProcessError {
+    /// Private configuration file I/O failed.
     #[error("failed to access the private VM process configuration: {0}")]
     Io(#[from] io::Error),
+    /// Private configuration serialization failed.
     #[error("failed to encode the private VM process configuration: {0}")]
     Json(#[from] serde_json::Error),
+    /// The file uses a launch-record version this crate does not understand.
     #[error("unsupported VM process configuration version {0}")]
     UnsupportedVersion(u32),
 }

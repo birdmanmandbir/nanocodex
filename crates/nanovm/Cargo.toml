@@ -14,15 +14,11 @@ categories.workspace = true
 description = "Small, embedded libkrun microVM primitives for Rust"
 
 [dependencies]
-# libkrun's reviewed checkpoint accepts imago 0.2, but 0.2.4 selects an
-# incompatible vm-memory release. Keep consumers on the proven resolution.
-imago.workspace = true
 krun.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
-vm-memory.workspace = true
 
 [lints.clippy]
 all = "warn"

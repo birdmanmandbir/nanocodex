@@ -261,9 +261,9 @@ The monorepo also contains independently useful systems components:
 
 | Component | Responsibility |
 | --- | --- |
-| `nanovm` | Typed VM lifecycle, immutable disks, networking, and shutdown |
-| VM image builder | OCI/Dockerfile inputs to cached, pre-snapshotted disks |
-| `nanocodex-vm` | Agent tools backed by one retained VM session tree |
+| `nanovm` | Typed libkrun lifecycle, disks, networking, egress capabilities, and shutdown |
+| `nanocodex-vm` | Bounded retained host/guest RPC and agent tools backed by one VM session tree |
+| `nanovm-image` | OCI/Dockerfile inputs to content-addressed immutable ext4 disks and attempt reflinks |
 | Browser VM | A headed browser inside an isolated VM with a private CDP endpoint |
 | VM egress | Host-owned network, MPP payment, and secret-injection policy |
 | `nanocodex-eval` | Typed tasks, attempts, scheduling, results, and sweeps |
@@ -325,6 +325,22 @@ Lower-level consumers can depend only on the component they need:
 cargo add nanocodex-oai-api
 cargo add nanocodex-tools
 cargo add nanocodex-agent
+```
+
+`nanocodex-oai-api` enables its Tower transports and managed session client by
+default. Low-level process components can select its dependency-light contract
+without that `client` feature; this is how the musl VM guest reuses exact
+Responses/tool types without linking HTTP, WebSocket, or TLS code. Normal
+native `nanocodex-tools` builds retain MCP, `tool_search`, Code Mode, image
+processing, and remote tools by default.
+
+The VM crates currently track a reviewed libkrun Git checkpoint that is not
+published on crates.io, so Git/path consumers select them explicitly:
+
+```sh
+cargo add nanovm --git https://github.com/gakonst/nanocodex
+cargo add nanocodex-vm --git https://github.com/gakonst/nanocodex
+cargo add nanovm-image --git https://github.com/gakonst/nanocodex
 ```
 
 The daily-driver CLI is available on macOS and Linux:

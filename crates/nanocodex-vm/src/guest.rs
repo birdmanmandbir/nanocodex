@@ -39,21 +39,27 @@ const MAX_IN_FLIGHT_REQUESTS: usize = 64;
 /// Failure while serving VM tool requests inside the guest.
 #[derive(Debug, Error)]
 pub enum VmGuestError {
+    /// Guest console I/O failed.
     #[error("VM tool console I/O failed: {0}")]
     Io(#[from] std::io::Error),
 
+    /// A protocol frame was not valid JSON.
     #[error("VM tool protocol JSON failed: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// The host closed the console in the middle of a frame.
     #[error("the VM tool console closed before a complete frame")]
     Closed,
 
+    /// A concurrently executed guest request task failed.
     #[error("guest tool execution task failed: {0}")]
     Task(String),
 
+    /// An inbound or outbound protocol frame exceeded the fixed limit.
     #[error("VM tool protocol frame exceeded the {MAX_FRAME_BYTES}-byte limit")]
     FrameTooLarge,
 
+    /// The host reused an identifier while its earlier request was active.
     #[error("VM tool protocol reused active request ID {0}")]
     DuplicateRequestId(u64),
 }
@@ -142,13 +148,13 @@ async fn serve_io(
 async fn execute_request(runtime: Arc<ToolRuntime>, request: SessionRequest) -> SessionResponse {
     match request {
         SessionRequest::Tool(request) => {
-            let context = ToolContext {
-                model: &request.context.model,
-                session_id: &request.context.session_id,
-                call_id: &request.context.call_id,
-                history: &[],
-                output_token_budget: request.context.output_token_budget,
-            };
+            let context = ToolContext::new(
+                &request.context.model,
+                &request.context.session_id,
+                &request.context.call_id,
+                &[],
+                request.context.output_token_budget,
+            );
             let execution = runtime
                 .execute_tool(request.tool.name(), request.input.into(), context)
                 .await;
