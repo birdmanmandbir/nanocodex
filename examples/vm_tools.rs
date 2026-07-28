@@ -8,15 +8,10 @@ use nanocodex::{
     Tool,
     tools::contract::{ToolContext, ToolInput, ToolOutput, ToolOutputBody, ToolOutputContent},
 };
-use nanocodex_vm::{BlockDevice, EgressLease, GuestCommand, VmConfig, VmProcessConfig};
-use nanocodex_vm::{GuestRuntimeDisk, VmToolSession};
+use nanocodex_vm::{GuestRuntimeDisk, VmProcessConfig, VmWorkspace, VmWorkspaceBuilder};
 use serde::Deserialize;
 use serde_json::value::to_raw_value;
-use tokio::process::Command;
 
-const GUEST_RUNTIME: &str = "/usr/local/bin/nanocodex-vm-guest";
-const RUNTIME_BLOCK_DEVICE: &str = "/dev/vdb";
-const RUNTIME_MOUNT: &str = "/run/nanocodex";
 type AnyError = Box<dyn Error + Send + Sync>;
 
 #[derive(Deserialize)]
@@ -53,13 +48,14 @@ async fn run_host(arguments: Vec<std::ffi::OsString>) -> Result<(), AnyError> {
         .cloned()
         .map(PathBuf::from)
         .ok_or("usage: vm-tools ROOTFS [GUEST_RUNTIME_BINARY_OR_EXT4]")?;
-    let (_private_root, root) = if root.is_file() {
+    let executable = std::env::current_exe()?;
+    let (private_root, mut workspace) = if root.is_file() {
         let directory = tempfile::tempdir()?;
         let private = directory.path().join("rootfs.ext4");
-        reflink_or_sparse_copy(&root, &private)?;
-        (Some(directory), private)
+        let builder = VmWorkspaceBuilder::private_from(&root, &private, &executable)?;
+        (Some(directory), builder)
     } else {
-        (None, root)
+        (None, VmWorkspace::builder(&root, &executable))
     };
     let runtime_input = arguments.get(1).cloned().map(PathBuf::from);
     let prepared_runtime = match runtime_input.as_deref() {
@@ -70,45 +66,25 @@ async fn run_host(arguments: Vec<std::ffi::OsString>) -> Result<(), AnyError> {
         .as_ref()
         .map(|runtime| runtime.path().to_owned())
         .or(runtime_input);
-    let egress = EgressLease::disabled();
-    let (config, guest) = if let Some(runtime) = runtime {
-        let config = VmConfig::ext4(root)
-            .cpus(2)
-            .memory_mib(768)
-            .block_device(BlockDevice::read_only("nanocodex-runtime", runtime));
-        let init = format!(
-            "set -eu; mkdir -p $1 {RUNTIME_MOUNT}; \
-             mount -t ext4 -o ro {RUNTIME_BLOCK_DEVICE} {RUNTIME_MOUNT}; \
-             exec {RUNTIME_MOUNT}/nanocodex-vm-guest $1"
-        );
-        let guest = GuestCommand::new("/bin/sh")
-            .arg("-c")
-            .arg(init)
-            .arg("nanocodex-vm-init")
-            .arg("/workspace");
-        (config, guest)
-    } else {
-        (
-            VmConfig::new(root).cpus(2).memory_mib(768),
-            GuestCommand::new(GUEST_RUNTIME).arg("/workspace"),
-        )
-    };
-    let executable = std::env::current_exe()?;
-    let mut vmm = Command::new(executable);
-    vmm.env_clear();
-    for name in ["DYLD_LIBRARY_PATH", "LD_LIBRARY_PATH"] {
-        if let Some(value) = std::env::var_os(name) {
-            vmm.env(name, value);
-        }
+    if let Some(runtime) = runtime {
+        workspace = workspace.guest_runtime_disk(runtime);
     }
-    vmm.arg("--vmm");
-    let session = VmToolSession::spawn_configured(vmm, config, guest, egress).await?;
-    let vm = session.tools();
-    let agent_tools = vm
-        .tools_builder()
-        .working_directory("/workspace")
-        .default_shell("sh")
-        .build()?;
+    workspace = workspace
+        .vmm_argument("--vmm")
+        .guest_workspace("/workspace")
+        .cpus(2)
+        .memory_mib(768)
+        .offline();
+    if let Some(loader_path) = std::env::var_os(if cfg!(target_os = "macos") {
+        "DYLD_LIBRARY_PATH"
+    } else {
+        "LD_LIBRARY_PATH"
+    }) {
+        workspace = workspace.firmware_directory(loader_path);
+    }
+    let workspace = workspace.launch().await?;
+    let vm = workspace.tools();
+    let agent_tools = workspace.tools_builder().build()?;
     let context = ToolContext::new("vm-proof", "session-1", "call-1", &[], 10_000);
 
     let execution = vm
@@ -228,37 +204,9 @@ async fn run_host(arguments: Vec<std::ffi::OsString>) -> Result<(), AnyError> {
     println!("all VM-owned tools executed through one retained libkrun VM");
     drop(agent_tools);
     drop(vm);
-    session.shutdown().await?;
+    workspace.shutdown().await?;
+    drop(private_root);
     Ok(())
-}
-
-fn reflink_or_sparse_copy(source: &Path, destination: &Path) -> io::Result<u64> {
-    match reflink_copy::reflink(source, destination) {
-        Ok(()) => return Ok(fs::metadata(destination)?.len()),
-        Err(_) => remove_partial_copy(destination)?,
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let status = std::process::Command::new("cp")
-            .args(["--reflink=never", "--sparse=always", "--"])
-            .arg(source)
-            .arg(destination)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()?;
-        if status.success() {
-            return Ok(fs::metadata(destination)?.len());
-        }
-        remove_partial_copy(destination)?;
-        Err(io::Error::other(format!(
-            "sparse disk copy failed with {status}"
-        )))
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fs::copy(source, destination)
 }
 
 fn is_elf(path: &Path) -> io::Result<bool> {
@@ -267,14 +215,6 @@ fn is_elf(path: &Path) -> io::Result<bool> {
     match io::Read::read_exact(&mut file, &mut magic) {
         Ok(()) => Ok(magic == *b"\x7fELF"),
         Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
-        Err(error) => Err(error),
-    }
-}
-
-fn remove_partial_copy(path: &Path) -> io::Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
 }
