@@ -202,6 +202,13 @@ pub enum VmToolSessionError {
     VmProcess(#[from] VmProcessError),
 }
 
+#[derive(Debug, Error)]
+#[error("VM tool session ended before this request completed")]
+struct ModelSafeVmToolError {
+    #[source]
+    diagnostic: VmToolSessionError,
+}
+
 /// Owner of one persistent VMM child carrying workspace tool calls.
 ///
 /// Keep this value alive for the complete root-agent tree. Clone
@@ -1220,9 +1227,13 @@ impl VmToolClient for VmToolSessionHandle {
         input: ToolInput,
         context: ToolContext<'_>,
     ) -> ToolResult {
-        self.request(tool, input, context)
-            .await
-            .map_err(|error| Box::new(error) as _)
+        match self.request(tool, input, context).await {
+            Ok(execution) => Ok(execution),
+            Err(diagnostic @ VmToolSessionError::Router(_)) => {
+                Err(Box::new(ModelSafeVmToolError { diagnostic }))
+            }
+            Err(error) => Err(Box::new(error)),
+        }
     }
 }
 
@@ -1234,7 +1245,10 @@ mod tracing_tests {
         time::Duration,
     };
 
-    use nanocodex_tools::{ToolContext, ToolInput, standard::StandardTool};
+    use nanocodex_tools::{
+        ToolContext, ToolInput, contract::ToolOutputBody, runtime::ToolRuntime,
+        standard::StandardTool,
+    };
     use serde_json::{json, value::to_raw_value};
     use tracing::{Id, Instrument, Subscriber, field::Visit, span::Attributes};
     use tracing_subscriber::{
@@ -1401,14 +1415,14 @@ mod tracing_tests {
     }
 
     #[test]
-    fn terminal_router_failure_preserves_vmm_stderr_cause() {
+    fn model_tool_error_hides_terminal_stderr_while_operator_error_retains_it() {
+        const SENTINEL: &str = "SENTINEL_VM_SECRET_7f35ad";
+
         let _test_guard = TRACE_TEST_LOCK.lock().unwrap();
         let mut command = tokio::process::Command::new("/bin/sh");
-        command.arg("-c").arg(
-            "IFS= read -r request\n\
-             printf '%s\\n' 'guest runtime failed: FrameTooLarge' >&2\n\
-             exit 23",
-        );
+        command.arg("-c").arg(format!(
+            "IFS= read -r request\nprintf '%s\\n' 'guest runtime failed: {SENTINEL}' >&2\nexit 23"
+        ));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1416,12 +1430,37 @@ mod tracing_tests {
 
         runtime.block_on(async {
             let session = VmToolSession::spawn(&mut command).unwrap();
+            let tools = session
+                .tools()
+                .tools_builder()
+                .web_search(false)
+                .image_generation(false)
+                .build()
+                .unwrap();
+            let tool_runtime = ToolRuntime::new_with_tools("/", None, None, &tools);
+            let output = tool_runtime
+                .execute_tool(
+                    StandardTool::ExecCommand.name(),
+                    ToolInput::Function(to_raw_value(&json!({"cmd": "true"})).unwrap()),
+                    ToolContext::new("model", "session", "call", &[], 1_000),
+                )
+                .await;
+            assert!(!output.success);
+            let ToolOutputBody::Text(model_error) = output.output else {
+                panic!("tool registry should produce a model-visible text error");
+            };
+            assert_eq!(
+                model_error,
+                "VM tool session ended before this request completed"
+            );
+            assert!(!model_error.contains(SENTINEL));
+
             let error = session.ready().await.unwrap_err();
             let VmToolSessionError::Router(message) = error else {
                 panic!("expected a terminal router failure");
             };
             assert!(message.contains("VM tool console closed"));
-            assert!(message.contains("guest runtime failed: FrameTooLarge"));
+            assert!(message.contains(SENTINEL));
         });
     }
 
