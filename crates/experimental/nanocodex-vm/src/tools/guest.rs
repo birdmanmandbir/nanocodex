@@ -367,11 +367,11 @@ async fn execute_command(request: ExecuteRequest) -> ExecuteResponse {
             timed_out: false,
             output_limit_exceeded: false,
         },
-        Ok(CommandOutcome::TimedOut) => ExecuteResponse {
+        Ok(CommandOutcome::TimedOut { stdout, stderr }) => ExecuteResponse {
             id: request.id,
             exit_code: None,
-            stdout: None,
-            stderr: None,
+            stdout: Some(stdout),
+            stderr: Some(stderr),
             error: None,
             timed_out: true,
             output_limit_exceeded: false,
@@ -399,7 +399,7 @@ async fn execute_command(request: ExecuteRequest) -> ExecuteResponse {
 
 enum CommandOutcome {
     Completed(std::process::Output),
-    TimedOut,
+    TimedOut { stdout: Vec<u8>, stderr: Vec<u8> },
     OutputLimitExceeded,
 }
 
@@ -479,7 +479,7 @@ async fn command_output(
             stdout,
             stderr,
         })),
-        WaitOutcome::TimedOut => Ok(CommandOutcome::TimedOut),
+        WaitOutcome::TimedOut => Ok(CommandOutcome::TimedOut { stdout, stderr }),
         WaitOutcome::OutputLimitExceeded => Ok(CommandOutcome::OutputLimitExceeded),
     }
 }
@@ -558,16 +558,27 @@ mod tests {
         let response = execute_command(ExecuteRequest {
             id: 1,
             program: "/bin/sh".to_owned(),
-            arguments: vec!["-c".to_owned(), "sleep 30 & wait".to_owned()],
+            arguments: vec![
+                "-c".to_owned(),
+                "printf 'partial stdout'; printf 'partial stderr' >&2; sleep 30 & wait".to_owned(),
+            ],
             current_directory: "/".to_owned(),
             environment: Vec::new(),
-            timeout_millis: 25,
+            timeout_millis: 100,
             max_output_bytes: DEFAULT_OUTPUT_BYTES,
         })
         .await;
 
         assert!(response.timed_out);
         assert!(response.error.is_none());
+        assert_eq!(
+            response.stdout.as_deref(),
+            Some(b"partial stdout".as_slice())
+        );
+        assert_eq!(
+            response.stderr.as_deref(),
+            Some(b"partial stderr".as_slice())
+        );
         assert!(started_at.elapsed() < Duration::from_secs(1));
     }
 
