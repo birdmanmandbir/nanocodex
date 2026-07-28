@@ -113,6 +113,10 @@ pub enum HarborError {
     #[error("received duplicate attempt.started for attempt {0}")]
     DuplicateAttempt(Uuid),
 
+    /// More than one terminal event was received for an attempt.
+    #[error("received duplicate terminal event for attempt {0}")]
+    DuplicateTerminal(Uuid),
+
     /// The recorder task stopped before it could be finalized.
     #[error("Harbor recorder stopped before finish")]
     RecorderStopped,
@@ -209,15 +213,7 @@ impl HarborRecorder {
         mut self,
         outcomes: Vec<EvalAttemptOutcome>,
     ) -> Result<HarborJob, HarborError> {
-        self.finish
-            .take()
-            .ok_or(HarborError::RecorderStopped)?
-            .send(FinishRequest::Outcomes(outcomes))
-            .map_err(|_| HarborError::RecorderStopped)?;
-        self.task
-            .take()
-            .ok_or(HarborError::RecorderStopped)?
-            .await?
+        self.finish_request(FinishRequest::Outcomes(outcomes)).await
     }
 
     /// Finishes after the requested number of completed or errored attempts.
@@ -230,15 +226,17 @@ impl HarborRecorder {
     /// Returns an error on event lag, malformed event payloads, filesystem
     /// failures, premature recorder termination, or a mismatched attempt count.
     pub async fn finish_all(mut self, attempts: usize) -> Result<HarborJob, HarborError> {
-        self.finish
-            .take()
-            .ok_or(HarborError::RecorderStopped)?
-            .send(FinishRequest::TerminalCount(attempts))
-            .map_err(|_| HarborError::RecorderStopped)?;
-        self.task
-            .take()
-            .ok_or(HarborError::RecorderStopped)?
-            .await?
+        self.finish_request(FinishRequest::TerminalCount(attempts))
+            .await
+    }
+
+    async fn finish_request(&mut self, request: FinishRequest) -> Result<HarborJob, HarborError> {
+        let finish = self.finish.take().ok_or(HarborError::RecorderStopped)?;
+        let task = self.task.take().ok_or(HarborError::RecorderStopped)?;
+        // A closed finish receiver means the recorder already stopped. Its
+        // retained task result carries the specific projection failure.
+        drop(finish.send(request));
+        task.await?
     }
 }
 
@@ -343,12 +341,13 @@ async fn record(
     mut finish: oneshot::Receiver<FinishRequest>,
 ) -> Result<HarborJob, HarborError> {
     let mut attempts = HashMap::<Uuid, AttemptRecording>::new();
+    let mut seen = HashSet::<Uuid>::new();
     let mut completed = HashSet::<Uuid>::new();
     let mut finish_request = None::<FinishRequest>;
 
     loop {
         if let Some(n_total_trials) = finished_attempt_count(finish_request.as_ref(), &completed) {
-            artifacts.write_job(n_total_trials)?;
+            artifacts.write_job(n_total_trials, attempts.len())?;
             return Ok(HarborJob {
                 id: artifacts.job_id,
                 directory: artifacts.root.clone(),
@@ -363,17 +362,19 @@ async fn record(
                 let event = event?.ok_or(HarborError::EventStreamClosed)?;
                 match &event.kind {
                     EvalEventKind::AttemptStarted { prompt, .. } => {
+                        if !seen.insert(event.attempt_id) {
+                            return Err(HarborError::DuplicateAttempt(event.attempt_id));
+                        }
                         let writer = artifacts.write_input(
                             event.attempt_id,
                             &event.trial_name,
                             prompt,
                         )?;
-                        if attempts.insert(event.attempt_id, AttemptRecording {
+                        attempts.insert(event.attempt_id, AttemptRecording {
                             events: writer,
                             atif: AtifBuilder::default(),
-                        }).is_some() {
-                            return Err(HarborError::DuplicateAttempt(event.attempt_id));
-                        }
+                        });
+                        artifacts.write_job(completed.len(), attempts.len())?;
                     }
                     EvalEventKind::Agent(agent_event) => {
                         let attempt = attempts
@@ -385,6 +386,9 @@ async fn record(
                         attempt.atif.apply(agent_event)?;
                     }
                     EvalEventKind::Completed(result) => {
+                        if completed.contains(&event.attempt_id) {
+                            return Err(HarborError::DuplicateTerminal(event.attempt_id));
+                        }
                         let mut attempt = attempts
                             .remove(&event.attempt_id)
                             .ok_or(HarborError::MissingAttempt(event.attempt_id))?;
@@ -394,9 +398,13 @@ async fn record(
                         let trajectory = attempt.atif.finish(result.task(), &result.agent);
                         artifacts.write_trial(&result, &trajectory)?;
                         completed.insert(result.attempt_id);
-                        artifacts.write_job(completed.len())?;
+                        artifacts.write_job(completed.len(), attempts.len())?;
                     }
                     EvalEventKind::Failed(failure) => {
+                        if completed.contains(&event.attempt_id) {
+                            return Err(HarborError::DuplicateTerminal(event.attempt_id));
+                        }
+                        seen.insert(event.attempt_id);
                         let trajectory = if let Some(mut attempt) = attempts.remove(&event.attempt_id) {
                             attempt.events.flush()?;
                             attempt.events.get_ref().sync_all()?;
@@ -414,7 +422,7 @@ async fn record(
                         let failure = failure.as_ref().clone();
                         artifacts.write_failure(&failure, &trajectory)?;
                         completed.insert(failure.attempt_id);
-                        artifacts.write_job(completed.len())?;
+                        artifacts.write_job(completed.len(), attempts.len())?;
                     }
                     EvalEventKind::VerifierStarted
                     | EvalEventKind::VerifierOutput { .. }
@@ -466,7 +474,7 @@ impl HarborArtifacts {
         };
         Self::write_file(&artifacts.root.join("job.log"), [])?;
         artifacts.write_job_metadata()?;
-        artifacts.write_job(artifacts.planned_attempts.unwrap_or(0))?;
+        artifacts.write_job(artifacts.planned_attempts.unwrap_or(0), 0)?;
         Ok(artifacts)
     }
 
@@ -856,7 +864,7 @@ impl HarborArtifacts {
             .collect()
     }
 
-    fn write_job(&self, n_total_trials: usize) -> Result<(), HarborError> {
+    fn write_job(&self, n_total_trials: usize, n_running_trials: usize) -> Result<(), HarborError> {
         let now = Utc::now();
         let trials = Self::durable_trials(&self.root, self.job_id, self.manifest.as_ref())?;
         let mut stats = HarborJobStats::from_trials(&trials);
@@ -873,8 +881,11 @@ impl HarborArtifacts {
         let n_total_trials = n_total_trials
             .max(self.planned_attempts.unwrap_or(0))
             .max(baseline_total)
-            .max(stats.n_completed_trials);
-        stats.n_pending_trials = n_total_trials.saturating_sub(stats.n_completed_trials);
+            .max(stats.n_completed_trials.saturating_add(n_running_trials));
+        stats.n_running_trials = n_running_trials;
+        stats.n_pending_trials = n_total_trials
+            .saturating_sub(stats.n_completed_trials)
+            .saturating_sub(stats.n_running_trials);
         let job = HarborJobResult {
             id: self.job_id,
             started_at: self
@@ -1876,21 +1887,31 @@ struct HarborMetric {}
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::{collections::BTreeMap, fs, path::Path};
+    use std::{
+        collections::BTreeMap,
+        fs,
+        os::unix::fs::MetadataExt as _,
+        path::Path,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
 
     use crate::{
-        AtifTrajectory, BillingCompleteness, EvalEnvironment, EvalOutcome, Evaluator, Sweep, Task,
+        AtifTrajectory, BillingCompleteness, EvalArtifacts, EvalCleanup, EvalEnvironment,
+        EvalEvent, EvalEventKind, EvalEvents, EvalFailure, EvalFailureKind, EvalFailureTiming,
+        EvalOutcome, Evaluator, PhaseTiming, Sweep, Task,
     };
-    use chrono::Utc;
+    use chrono::{DateTime, Utc};
     use nanocodex_agent::{Nanocodex, OpenAi};
     use serde::Deserialize;
     use serde_json::json;
     use tempfile::tempdir;
+    use tokio::sync::broadcast;
     use uuid::Uuid;
 
     use super::{
-        Harbor, HarborArtifacts, HarborError, HarborJob, compute_pass_at_k_for_tasks,
-        pass_at_k_for_task,
+        Harbor, HarborArtifacts, HarborError, HarborJob, HarborRecorder,
+        compute_pass_at_k_for_tasks, pass_at_k_for_task,
     };
 
     #[derive(Deserialize)]
@@ -1906,6 +1927,7 @@ mod tests {
 
     #[derive(Deserialize)]
     struct JobResult {
+        finished_at: Option<DateTime<Utc>>,
         n_total_trials: usize,
         stats: JobStats,
     }
@@ -1916,6 +1938,8 @@ mod tests {
         completed: usize,
         #[serde(rename = "n_errored_trials")]
         errored: usize,
+        #[serde(rename = "n_running_trials")]
+        running: usize,
         #[serde(rename = "n_pending_trials")]
         pending: usize,
     }
@@ -2287,6 +2311,279 @@ mod tests {
         assert!(legacy.nanocodex.is_none());
     }
 
+    #[tokio::test]
+    async fn finite_job_moves_one_trial_from_pending_to_running_to_completed() {
+        let output = tempdir().unwrap();
+        let task = write_greeting_task();
+        let sweep = test_sweep(task.clone(), 2);
+        let (eval, _) = Evaluator::builder(Nanocodex::builder(OpenAi::new("test-key").unwrap()))
+            .output_directory(output.path())
+            .fresh_run(&sweep)
+            .build()
+            .unwrap();
+        let (events, recorder) = test_recorder(&eval);
+        let attempt_id = Uuid::now_v7();
+        let trial_name = finite_trial_name(&task, "default", 1, attempt_id);
+
+        events
+            .send(started_event(&eval, &task, attempt_id, &trial_name))
+            .unwrap();
+        let running = wait_for_job_state(eval.directory(), (2, 0, 1, 1)).await;
+        assert!(running.finished_at.is_none());
+
+        events
+            .send(failed_event(&eval, task, attempt_id, trial_name, 2))
+            .unwrap();
+        let terminal = wait_for_job_state(eval.directory(), (2, 1, 0, 1)).await;
+        assert!(terminal.finished_at.is_none());
+
+        let job = recorder.finish_all(1).await.unwrap();
+        let final_result = read_job(job.directory());
+        assert_job_state(&final_result, (2, 1, 0, 1));
+        assert!(final_result.finished_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn unplanned_job_counts_running_attempt_in_observed_total() {
+        let output = tempdir().unwrap();
+        let task = write_greeting_task();
+        let (eval, _) = Evaluator::builder(Nanocodex::builder(OpenAi::new("test-key").unwrap()))
+            .output_directory(output.path())
+            .build()
+            .unwrap();
+        let (events, recorder) = test_recorder(&eval);
+        let attempt_id = Uuid::now_v7();
+        let trial_name = format!("write-greeting__{}", attempt_id.simple());
+
+        events
+            .send(started_event(&eval, &task, attempt_id, &trial_name))
+            .unwrap();
+        let running = wait_for_job_state(eval.directory(), (1, 0, 1, 0)).await;
+        assert!(running.finished_at.is_none());
+
+        events
+            .send(failed_event(&eval, task, attempt_id, trial_name, 2))
+            .unwrap();
+        let terminal = wait_for_job_state(eval.directory(), (1, 1, 0, 0)).await;
+        assert!(terminal.finished_at.is_some());
+
+        let job = recorder.finish_all(1).await.unwrap();
+        let final_result = read_job(job.directory());
+        assert_job_state(&final_result, (1, 1, 0, 0));
+        assert!(final_result.finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn duplicate_active_start_preserves_artifacts_and_live_stats() {
+        let output = tempdir().unwrap();
+        let task = write_greeting_task();
+        let (eval, _) = Evaluator::builder(Nanocodex::builder(OpenAi::new("test-key").unwrap()))
+            .output_directory(output.path())
+            .build()
+            .unwrap();
+        let (events, recorder) = test_recorder(&eval);
+        let attempt_id = Uuid::now_v7();
+        let trial_name = format!("write-greeting__{}", attempt_id.simple());
+        let started = started_event(&eval, &task, attempt_id, &trial_name);
+        events.send(Arc::clone(&started)).unwrap();
+        wait_for_job_state(eval.directory(), (1, 0, 1, 0)).await;
+
+        let trial = eval.directory().join(&trial_name);
+        let input = trial.join("agent/input.jsonl");
+        let event_log = trial.join("agent/events.jsonl");
+        fs::write(&event_log, b"must survive duplicate start\n").unwrap();
+        let job_result = eval.directory().join("result.json");
+        let before = [
+            file_snapshot(&job_result),
+            file_snapshot(&input),
+            file_snapshot(&event_log),
+        ];
+
+        events.send(started).unwrap();
+        wait_for_recorder_stop(&recorder).await;
+        let error = recorder.finish_all(1).await.unwrap_err();
+        assert!(matches!(
+            error,
+            HarborError::DuplicateAttempt(found) if found == attempt_id
+        ));
+        assert_eq!(
+            before,
+            [
+                file_snapshot(&job_result),
+                file_snapshot(&input),
+                file_snapshot(&event_log),
+            ]
+        );
+        assert_job_state(&read_job(eval.directory()), (1, 0, 1, 0));
+    }
+
+    #[tokio::test]
+    async fn start_replay_after_terminal_does_not_resurrect_or_rewrite_attempt() {
+        let output = tempdir().unwrap();
+        let task = write_greeting_task();
+        let (eval, _) = Evaluator::builder(Nanocodex::builder(OpenAi::new("test-key").unwrap()))
+            .output_directory(output.path())
+            .build()
+            .unwrap();
+        let (events, recorder) = test_recorder(&eval);
+        let attempt_id = Uuid::now_v7();
+        let trial_name = format!("write-greeting__{}", attempt_id.simple());
+        events
+            .send(failed_event(
+                &eval,
+                task.clone(),
+                attempt_id,
+                trial_name.clone(),
+                1,
+            ))
+            .unwrap();
+        wait_for_job_state(eval.directory(), (1, 1, 0, 0)).await;
+
+        let trial = eval.directory().join(&trial_name);
+        let job_result = eval.directory().join("result.json");
+        let trial_result = trial.join("result.json");
+        let event_log = trial.join("agent/events.jsonl");
+        let before = [
+            file_snapshot(&job_result),
+            file_snapshot(&trial_result),
+            file_snapshot(&event_log),
+        ];
+
+        events
+            .send(started_event(&eval, &task, attempt_id, &trial_name))
+            .unwrap();
+        wait_for_recorder_stop(&recorder).await;
+        let error = recorder.finish_all(1).await.unwrap_err();
+        assert!(matches!(
+            error,
+            HarborError::DuplicateAttempt(found) if found == attempt_id
+        ));
+        assert_eq!(
+            before,
+            [
+                file_snapshot(&job_result),
+                file_snapshot(&trial_result),
+                file_snapshot(&event_log),
+            ]
+        );
+        assert_job_state(&read_job(eval.directory()), (1, 1, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn duplicate_terminal_is_rejected_before_failure_fallback_rewrites_artifacts() {
+        let output = tempdir().unwrap();
+        let task = write_greeting_task();
+        let (eval, _) = Evaluator::builder(Nanocodex::builder(OpenAi::new("test-key").unwrap()))
+            .output_directory(output.path())
+            .build()
+            .unwrap();
+        let (events, recorder) = test_recorder(&eval);
+        let attempt_id = Uuid::now_v7();
+        let trial_name = format!("write-greeting__{}", attempt_id.simple());
+        let terminal = failed_event(&eval, task, attempt_id, trial_name.clone(), 1);
+        events.send(Arc::clone(&terminal)).unwrap();
+        wait_for_job_state(eval.directory(), (1, 1, 0, 0)).await;
+
+        let trial = eval.directory().join(&trial_name);
+        let job_result = eval.directory().join("result.json");
+        let trial_result = trial.join("result.json");
+        let event_log = trial.join("agent/events.jsonl");
+        let before = [
+            file_snapshot(&job_result),
+            file_snapshot(&trial_result),
+            file_snapshot(&event_log),
+        ];
+
+        events.send(terminal).unwrap();
+        wait_for_recorder_stop(&recorder).await;
+        let error = recorder.finish_all(1).await.unwrap_err();
+        assert!(matches!(
+            error,
+            HarborError::DuplicateTerminal(found) if found == attempt_id
+        ));
+        assert_eq!(
+            before,
+            [
+                file_snapshot(&job_result),
+                file_snapshot(&trial_result),
+                file_snapshot(&event_log),
+            ]
+        );
+        assert_job_state(&read_job(eval.directory()), (1, 1, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn finish_propagates_recorder_write_failure_after_finish_channel_closes() {
+        let output = tempdir().unwrap();
+        let task = write_greeting_task();
+        let (eval, _) = Evaluator::builder(Nanocodex::builder(OpenAi::new("test-key").unwrap()))
+            .output_directory(output.path())
+            .build()
+            .unwrap();
+        let (events, recorder) = test_recorder(&eval);
+        let job_result = eval.directory().join("result.json");
+        fs::remove_file(&job_result).unwrap();
+        fs::create_dir(&job_result).unwrap();
+        let attempt_id = Uuid::now_v7();
+        let trial_name = format!("write-greeting__{}", attempt_id.simple());
+
+        events
+            .send(started_event(&eval, &task, attempt_id, &trial_name))
+            .unwrap();
+        wait_for_recorder_stop(&recorder).await;
+        let error = recorder.finish(Vec::new()).await.unwrap_err();
+        assert!(matches!(error, HarborError::Io(_)));
+    }
+
+    #[tokio::test]
+    async fn resumed_job_discards_stale_running_count_and_rebuilds_durable_state() {
+        let output = tempdir().unwrap();
+        let task = write_greeting_task();
+        let sweep = test_sweep(task.clone(), 2);
+        let (eval, _) = Evaluator::builder(Nanocodex::builder(OpenAi::new("test-key").unwrap()))
+            .output_directory(output.path())
+            .fresh_run(&sweep)
+            .build()
+            .unwrap();
+        let job_id = eval.id();
+        let job_directory = eval.directory().to_path_buf();
+        let (events, recorder) = test_recorder(&eval);
+        let active_id = Uuid::now_v7();
+        let active_name = finite_trial_name(&task, "default", 2, active_id);
+        events
+            .send(started_event(&eval, &task, active_id, &active_name))
+            .unwrap();
+        wait_for_job_state(eval.directory(), (2, 0, 1, 1)).await;
+        drop(recorder);
+        drop(events);
+        tokio::task::yield_now().await;
+
+        write_retained_trial(
+            eval.directory(),
+            eval.id(),
+            &task,
+            "default",
+            1,
+            Some(1.0),
+            false,
+        );
+        drop(eval);
+
+        let (resumed, _) = Evaluator::builder(Nanocodex::builder(OpenAi::new("test-key").unwrap()))
+            .output_directory(output.path())
+            .resume_incomplete(&sweep)
+            .build()
+            .unwrap();
+        assert!(resumed.resumed());
+        assert_eq!(resumed.id(), job_id);
+        assert_eq!(resumed.directory(), job_directory);
+
+        Harbor::new(&resumed).unwrap();
+        let rebuilt = read_job(resumed.directory());
+        assert_job_state(&rebuilt, (2, 1, 0, 1));
+        assert!(rebuilt.finished_at.is_none());
+    }
+
     #[test]
     fn finite_job_records_pending_trials_before_execution() {
         let output = tempdir().unwrap();
@@ -2416,6 +2713,166 @@ allow_internet = false
         assert_eq!(result.stats.completed, 1);
         assert_eq!(result.stats.errored, 1);
         assert_eq!(result.stats.pending, 0);
+    }
+
+    fn test_sweep(task: Task, trials: u16) -> Sweep {
+        Sweep::builder()
+            .task(task)
+            .trials(trials)
+            .agent(
+                "default",
+                Nanocodex::builder(OpenAi::new("test-key").unwrap()),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    fn test_recorder(eval: &Evaluator) -> (broadcast::Sender<Arc<EvalEvent>>, HarborRecorder) {
+        let (sender, _) = broadcast::channel(8);
+        let events = EvalEvents::new(sender.clone());
+        let recorder = Harbor::new(eval)
+            .unwrap()
+            .record(events.subscribe())
+            .unwrap();
+        (sender, recorder)
+    }
+
+    fn finite_trial_name(task: &Task, agent: &str, trial: u16, attempt_id: Uuid) -> String {
+        let short_name = task.name().rsplit('/').next().unwrap();
+        format!("{short_name}__{agent}__{trial:03}__{}", attempt_id.simple())
+    }
+
+    fn started_event(
+        eval: &Evaluator,
+        task: &Task,
+        attempt_id: Uuid,
+        trial_name: &str,
+    ) -> Arc<EvalEvent> {
+        Arc::new(EvalEvent {
+            run_id: eval.id(),
+            attempt_id,
+            task_name: task.name().to_owned(),
+            trial_name: trial_name.to_owned(),
+            sequence: 1,
+            kind: EvalEventKind::AttemptStarted {
+                prompt: task.prompt().to_owned(),
+                workspace: eval.directory().join(trial_name).join("workspace"),
+            },
+        })
+    }
+
+    fn failed_event(
+        eval: &Evaluator,
+        task: Task,
+        attempt_id: Uuid,
+        trial_name: String,
+        sequence: u64,
+    ) -> Arc<EvalEvent> {
+        let occurred_at = Utc::now();
+        let root = eval.directory().join(&trial_name);
+        Arc::new(EvalEvent {
+            run_id: eval.id(),
+            attempt_id,
+            task_name: task.name().to_owned(),
+            trial_name: trial_name.clone(),
+            sequence,
+            kind: EvalEventKind::Failed(Box::new(EvalFailure {
+                attempt_id,
+                task_name: task.name().to_owned(),
+                trial_name,
+                kind: EvalFailureKind::Environment,
+                outcome: EvalOutcome::InfrastructureError,
+                message: "deterministic test failure".to_owned(),
+                traceback: "deterministic test failure".to_owned(),
+                model: "gpt-test".to_owned(),
+                effort: "high".to_owned(),
+                environment: EvalEnvironment::Native,
+                started_at: occurred_at,
+                occurred_at,
+                timing: EvalFailureTiming {
+                    queue_wait: PhaseTiming {
+                        started_at: occurred_at,
+                        finished_at: occurred_at,
+                    },
+                    environment_setup: None,
+                    environment_readiness: None,
+                    agent_setup: None,
+                    agent_execution: None,
+                    verifier: None,
+                },
+                agent: None,
+                verifier: None,
+                cleanup: EvalCleanup::default(),
+                artifacts: EvalArtifacts {
+                    directory: root.clone(),
+                    workspace: root.join("workspace"),
+                    verifier_output: root.join("verifier/test-stdout.txt"),
+                },
+                task,
+            })),
+        })
+    }
+
+    async fn wait_for_job_state(
+        directory: &Path,
+        expected: (usize, usize, usize, usize),
+    ) -> JobResult {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let result = read_job(directory);
+            if job_state(&result) == expected {
+                return result;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "job state remained {:?}, expected {expected:?}",
+                job_state(&result)
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn wait_for_recorder_stop(recorder: &HarborRecorder) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !recorder
+            .task
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            assert!(Instant::now() < deadline, "Harbor recorder did not stop");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct FileSnapshot {
+        inode: u64,
+        bytes: Vec<u8>,
+    }
+
+    fn file_snapshot(path: &Path) -> FileSnapshot {
+        FileSnapshot {
+            inode: fs::metadata(path).unwrap().ino(),
+            bytes: fs::read(path).unwrap(),
+        }
+    }
+
+    fn read_job(directory: &Path) -> JobResult {
+        serde_json::from_slice(&fs::read(directory.join("result.json")).unwrap()).unwrap()
+    }
+
+    fn assert_job_state(result: &JobResult, expected: (usize, usize, usize, usize)) {
+        assert_eq!(job_state(result), expected);
+    }
+
+    const fn job_state(result: &JobResult) -> (usize, usize, usize, usize) {
+        (
+            result.n_total_trials,
+            result.stats.completed,
+            result.stats.running,
+            result.stats.pending,
+        )
     }
 
     fn write_greeting_task() -> Task {
