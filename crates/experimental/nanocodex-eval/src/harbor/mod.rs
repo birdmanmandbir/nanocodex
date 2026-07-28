@@ -39,7 +39,6 @@ pub use published::{
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    ffi::OsString,
     fs::{self, File},
     io::{BufWriter, Write},
     path::{Path, PathBuf},
@@ -91,6 +90,10 @@ pub enum HarborError {
     /// A retained terminal result did not belong to its finite run.
     #[error("invalid durable evaluation trial: {0}")]
     InvalidDurableTrial(String),
+
+    /// A terminal result was about to be committed before one of its artifacts.
+    #[error("terminal evaluation result prerequisite is missing: {0}")]
+    MissingTerminalPrerequisite(PathBuf),
 
     /// The evaluator event subscription lagged or otherwise failed.
     #[error(transparent)]
@@ -360,6 +363,7 @@ async fn record(
                             .remove(&event.attempt_id)
                             .ok_or(HarborError::MissingAttempt(event.attempt_id))?;
                         attempt.events.flush()?;
+                        attempt.events.get_ref().sync_all()?;
                         let result = result.as_ref().clone();
                         let trajectory = attempt.atif.finish(result.task(), &result.agent);
                         artifacts.write_trial(&result, &trajectory)?;
@@ -369,6 +373,7 @@ async fn record(
                     EvalEventKind::Failed(failure) => {
                         let trajectory = if let Some(mut attempt) = attempts.remove(&event.attempt_id) {
                             attempt.events.flush()?;
+                            attempt.events.get_ref().sync_all()?;
                             attempt.atif.finish_failure(failure.task())
                         } else {
                             let mut events = artifacts.write_input(
@@ -377,6 +382,7 @@ async fn record(
                                 failure.task().prompt(),
                             )?;
                             events.flush()?;
+                            events.get_ref().sync_all()?;
                             AtifBuilder::default().finish_failure(failure.task())
                         };
                         let failure = failure.as_ref().clone();
@@ -492,6 +498,15 @@ impl HarborArtifacts {
         let task = result.task();
         let root = &result.artifacts.directory;
         let agent = root.join("agent");
+        let input_path = agent.join("input.jsonl");
+        let events_path = agent.join("events.jsonl");
+        let trajectory_path = agent.join("trajectory.json");
+        let stderr_path = agent.join("stderr.log");
+        let config_path = root.join("config.json");
+        let manifest_path = root.join("artifacts/manifest.json");
+        let trial_log_path = root.join("trial.log");
+        let lock_path = root.join("lock.json");
+        let result_path = root.join("result.json");
         let task_path = task.root().to_path_buf();
         let task_checksum = directory_hash(task.root())?;
         let task_digest = package_content_hash(task.root())?;
@@ -509,12 +524,9 @@ impl HarborArtifacts {
             extra_instruction_paths: Vec::new(),
             job_id: self.job_id,
         };
-        Self::write_json(&root.join("config.json"), &config)?;
-        Self::write_json(&agent.join("trajectory.json"), trajectory)?;
-        Self::write_json(
-            &root.join("artifacts/manifest.json"),
-            &Vec::<HarborArtifactManifestEntry>::new(),
-        )?;
+        Self::write_json(&config_path, &config)?;
+        Self::write_json(&trajectory_path, trajectory)?;
+        Self::write_json(&manifest_path, &Vec::<HarborArtifactManifestEntry>::new())?;
 
         let trial_uri = Url::from_directory_path(root)
             .map_err(|()| HarborError::InvalidTrialPath(root.clone()))?
@@ -558,8 +570,8 @@ impl HarborArtifacts {
             exception_info: None,
             step_results: None,
         };
-        Self::write_file(&root.join("trial.log"), [])?;
-        Self::write_file(&agent.join("stderr.log"), [])?;
+        Self::write_file(&trial_log_path, [])?;
+        Self::write_file(&stderr_path, [])?;
 
         let lock = HarborTrialLock::new(
             task,
@@ -568,7 +580,23 @@ impl HarborArtifacts {
             &task_digest,
             result.environment,
         );
-        Self::write_json(&root.join("lock.json"), &lock)?;
+        Self::write_json(&lock_path, &lock)?;
+        Self::write_terminal_json(
+            &result_path,
+            &trial_result,
+            &[
+                input_path.as_path(),
+                events_path.as_path(),
+                config_path.as_path(),
+                trajectory_path.as_path(),
+                manifest_path.as_path(),
+                trial_log_path.as_path(),
+                stderr_path.as_path(),
+                result.artifacts.verifier_output.as_path(),
+                lock_path.as_path(),
+            ],
+            &self.root,
+        )?;
         {
             let mut recorded = self
                 .recorded_trials
@@ -583,7 +611,6 @@ impl HarborArtifacts {
                 lock,
             });
         }
-        Self::write_json(&root.join("result.json"), &trial_result)?;
         self.write_job_metadata()
     }
 
@@ -595,6 +622,15 @@ impl HarborArtifacts {
         let task = failure.task();
         let root = &failure.artifacts.directory;
         let agent = root.join("agent");
+        let input_path = agent.join("input.jsonl");
+        let events_path = agent.join("events.jsonl");
+        let trajectory_path = agent.join("trajectory.json");
+        let stderr_path = agent.join("stderr.log");
+        let config_path = root.join("config.json");
+        let manifest_path = root.join("artifacts/manifest.json");
+        let trial_log_path = root.join("trial.log");
+        let lock_path = root.join("lock.json");
+        let result_path = root.join("result.json");
         let task_path = task.root().to_path_buf();
         let task_checksum = directory_hash(task.root())?;
         let task_digest = package_content_hash(task.root())?;
@@ -618,12 +654,9 @@ impl HarborArtifacts {
             extra_instruction_paths: Vec::new(),
             job_id: self.job_id,
         };
-        Self::write_json(&root.join("config.json"), &config)?;
-        Self::write_json(&agent.join("trajectory.json"), trajectory)?;
-        Self::write_json(
-            &root.join("artifacts/manifest.json"),
-            &Vec::<HarborArtifactManifestEntry>::new(),
-        )?;
+        Self::write_json(&config_path, &config)?;
+        Self::write_json(&trajectory_path, trajectory)?;
+        Self::write_json(&manifest_path, &Vec::<HarborArtifactManifestEntry>::new())?;
 
         let trial_uri = Url::from_directory_path(root)
             .map_err(|()| HarborError::InvalidTrialPath(root.clone()))?
@@ -663,11 +696,26 @@ impl HarborArtifacts {
             }),
             step_results: None,
         };
-        Self::write_file(&root.join("trial.log"), failure.traceback.as_bytes())?;
-        Self::write_file(&agent.join("stderr.log"), failure.traceback.as_bytes())?;
+        Self::write_file(&trial_log_path, failure.traceback.as_bytes())?;
+        Self::write_file(&stderr_path, failure.traceback.as_bytes())?;
 
         let lock = HarborTrialLock::new(task, model, effort, &task_digest, failure.environment);
-        Self::write_json(&root.join("lock.json"), &lock)?;
+        Self::write_json(&lock_path, &lock)?;
+        Self::write_terminal_json(
+            &result_path,
+            &trial_result,
+            &[
+                input_path.as_path(),
+                events_path.as_path(),
+                config_path.as_path(),
+                trajectory_path.as_path(),
+                manifest_path.as_path(),
+                trial_log_path.as_path(),
+                stderr_path.as_path(),
+                lock_path.as_path(),
+            ],
+            &self.root,
+        )?;
         {
             let mut recorded = self
                 .recorded_trials
@@ -682,7 +730,6 @@ impl HarborArtifacts {
                 lock,
             });
         }
-        Self::write_json(&root.join("result.json"), &trial_result)?;
         self.write_job_metadata()
     }
 
@@ -828,6 +875,62 @@ impl HarborArtifacts {
         Self::atomic_write(path, bytes)
     }
 
+    fn write_terminal_json(
+        path: &Path,
+        value: &impl Serialize,
+        prerequisites: &[&Path],
+        job_root: &Path,
+    ) -> Result<(), HarborError> {
+        Self::write_terminal_json_with_sync(path, value, prerequisites, job_root, sync_directory)
+    }
+
+    fn write_terminal_json_with_sync<F>(
+        path: &Path,
+        value: &impl Serialize,
+        prerequisites: &[&Path],
+        job_root: &Path,
+        mut sync_directory: F,
+    ) -> Result<(), HarborError>
+    where
+        F: FnMut(&Path) -> std::io::Result<()>,
+    {
+        for prerequisite in prerequisites {
+            Self::sync_terminal_prerequisite_with(prerequisite, &mut sync_directory)?;
+        }
+        let mut bytes = serde_json::to_vec_pretty(value)?;
+        bytes.push(b'\n');
+        Self::atomic_write_with_sync(path, bytes, &mut sync_directory)?;
+        sync_directory(job_root)?;
+        if let Some(output_root) = job_root.parent() {
+            sync_directory(output_root)?;
+        }
+        Ok(())
+    }
+
+    fn sync_terminal_prerequisite_with<F>(
+        path: &Path,
+        sync_directory: &mut F,
+    ) -> Result<(), HarborError>
+    where
+        F: FnMut(&Path) -> std::io::Result<()>,
+    {
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(HarborError::MissingTerminalPrerequisite(path.to_path_buf()));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !file.metadata()?.is_file() {
+            return Err(HarborError::MissingTerminalPrerequisite(path.to_path_buf()));
+        }
+        file.sync_all()?;
+        if let Some(parent) = path.parent() {
+            sync_directory(parent)?;
+        }
+        Ok(())
+    }
+
     fn read_json_if_exists<T>(path: &Path) -> Result<Option<T>, HarborError>
     where
         T: for<'de> Deserialize<'de>,
@@ -840,13 +943,29 @@ impl HarborArtifacts {
     }
 
     fn atomic_write(path: &Path, bytes: impl AsRef<[u8]>) -> Result<(), HarborError> {
-        let mut name: OsString = path
-            .file_name()
-            .map_or_else(|| OsString::from("artifact"), OsString::from);
-        name.push(format!(".{}.tmp", Uuid::now_v7()));
-        let temporary = path.with_file_name(name);
-        Self::write_file(&temporary, bytes)?;
-        fs::rename(&temporary, path)?;
+        let mut sync = sync_directory;
+        Self::atomic_write_with_sync(path, bytes, &mut sync)
+    }
+
+    fn atomic_write_with_sync<F>(
+        path: &Path,
+        bytes: impl AsRef<[u8]>,
+        sync_directory: &mut F,
+    ) -> Result<(), HarborError>
+    where
+        F: FnMut(&Path) -> std::io::Result<()>,
+    {
+        require_durable_directory_sync()?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        temporary.write_all(bytes.as_ref())?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(path).map_err(|error| error.error)?;
+        sync_directory(parent)?;
         Ok(())
     }
 
@@ -857,6 +976,35 @@ impl HarborArtifacts {
         fs::write(path, bytes)?;
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!(
+            "durable Harbor artifact commits require directory fsync support: {}",
+            path.display()
+        ),
+    ))
+}
+
+#[cfg(unix)]
+const fn require_durable_directory_sync() -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn require_durable_directory_sync() -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "durable Harbor artifact commits require directory fsync support",
+    ))
 }
 
 fn harbor_agent_config(model: &str, effort: &str) -> HarborAgentConfig {
@@ -1530,7 +1678,7 @@ fn pass_at_k_for_task(n: u32, correct: u32, k: u32) -> f64 {
 #[derive(Clone, Deserialize, Serialize)]
 struct HarborMetric {}
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::{collections::BTreeMap, fs, path::Path};
 
@@ -1542,7 +1690,10 @@ mod tests {
     use tempfile::tempdir;
     use uuid::Uuid;
 
-    use super::{Harbor, HarborJob, compute_pass_at_k_for_tasks, pass_at_k_for_task};
+    use super::{
+        Harbor, HarborArtifacts, HarborError, HarborJob, compute_pass_at_k_for_tasks,
+        pass_at_k_for_task,
+    };
 
     #[derive(Deserialize)]
     struct TrialResult {
@@ -1569,6 +1720,76 @@ mod tests {
         errored: usize,
         #[serde(rename = "n_pending_trials")]
         pending: usize,
+    }
+
+    #[test]
+    fn terminal_result_is_committed_only_after_artifacts_and_lock() {
+        let output = tempdir().unwrap();
+        let job = output.path().join("job");
+        let trial = job.join("trial");
+        let artifact = trial.join("agent/trajectory.json");
+        let lock = trial.join("lock.json");
+        let result = trial.join("result.json");
+        HarborArtifacts::write_file(&artifact, b"{}\n").unwrap();
+
+        let error = HarborArtifacts::write_terminal_json(
+            &result,
+            &json!({"status": "completed"}),
+            &[artifact.as_path(), lock.as_path()],
+            &job,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, HarborError::MissingTerminalPrerequisite(path) if path == lock));
+        assert!(!result.exists());
+
+        HarborArtifacts::write_file(&lock, b"{}\n").unwrap();
+        let mut directory_syncs = Vec::new();
+        HarborArtifacts::write_terminal_json_with_sync(
+            &result,
+            &json!({"status": "completed"}),
+            &[artifact.as_path(), lock.as_path()],
+            &job,
+            |directory| {
+                directory_syncs.push((directory.to_path_buf(), result.exists()));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let retained: serde_json::Value =
+            serde_json::from_slice(&fs::read(result).unwrap()).unwrap();
+        assert_eq!(retained["status"], "completed");
+        let terminal_trial_sync = directory_syncs
+            .iter()
+            .position(|(directory, result_exists)| directory == &trial && *result_exists)
+            .unwrap();
+        let terminal_job_sync = directory_syncs
+            .iter()
+            .position(|(directory, result_exists)| directory == &job && *result_exists)
+            .unwrap();
+        assert_eq!(
+            directory_syncs.last(),
+            Some(&(output.path().to_path_buf(), true))
+        );
+        assert!(terminal_trial_sync < terminal_job_sync);
+        assert!(terminal_job_sync < directory_syncs.len() - 1);
+    }
+
+    #[test]
+    fn atomic_write_replaces_target_without_leaving_temporary_files() {
+        let output = tempdir().unwrap();
+        let target = output.path().join("result.json");
+
+        HarborArtifacts::atomic_write(&target, b"first\n").unwrap();
+        HarborArtifacts::atomic_write(&target, b"second\n").unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"second\n");
+        let entries = fs::read_dir(output.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, [target]);
     }
 
     #[test]
@@ -1940,5 +2161,25 @@ allow_internet = false
         )
         .unwrap();
         id
+    }
+}
+
+#[cfg(all(test, not(unix)))]
+mod unsupported_platform_tests {
+    use tempfile::tempdir;
+
+    use super::{HarborArtifacts, HarborError};
+
+    #[test]
+    fn atomic_artifacts_fail_closed_without_durable_directory_sync() {
+        let output = tempdir().unwrap();
+        let target = output.path().join("result.json");
+
+        let error = HarborArtifacts::atomic_write(&target, b"terminal\n").unwrap_err();
+
+        assert!(
+            matches!(error, HarborError::Io(error) if error.kind() == std::io::ErrorKind::Unsupported)
+        );
+        assert!(!target.exists());
     }
 }
