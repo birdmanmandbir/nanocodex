@@ -137,6 +137,7 @@ pub struct VmImageBuilder {
     firmware_directory: Option<PathBuf>,
     cpus: u8,
     memory_mib: u32,
+    prefer_ipv4: bool,
     run_timeout: Duration,
     copy_timeout: Duration,
     egress: EgressLease,
@@ -159,6 +160,7 @@ impl VmImageBuilder {
             firmware_directory: None,
             cpus: DEFAULT_BUILD_VM_CPUS,
             memory_mib: DEFAULT_BUILD_VM_MEMORY_MIB,
+            prefer_ipv4: false,
             run_timeout: DEFAULT_RUN_TIMEOUT,
             copy_timeout: DEFAULT_COPY_TIMEOUT,
             egress: EgressLease::internet(),
@@ -215,6 +217,19 @@ impl VmImageBuilder {
     #[must_use]
     pub const fn memory_mib(mut self, memory_mib: u32) -> Self {
         self.memory_mib = memory_mib;
+        self
+    }
+
+    /// Prefers IPv4 inside each ephemeral Dockerfile build VM.
+    ///
+    /// The default leaves address selection unchanged. Under libkrun TSI this
+    /// policy makes normal/default address selection prefer IPv4; it does not
+    /// prevent a process from explicitly requesting `AF_INET6`. The policy
+    /// changes only the build guest's in-memory `/proc` network state, not the
+    /// prepared root filesystem or eventual task VM network policy.
+    #[must_use]
+    pub const fn prefer_ipv4(mut self) -> Self {
+        self.prefer_ipv4 = true;
         self
     }
 
@@ -278,6 +293,7 @@ impl VmImageBuilder {
             image.cache.path = %cache.display(),
             image.disk.bytes = disk_bytes.max(MINIMUM_DISK_BYTES),
             image.cache.policy = policy.as_str(),
+            image.build.prefer_ipv4 = self.prefer_ipv4,
             image.cache.status = tracing::field::Empty,
             image.manifest.source = tracing::field::Empty,
             image.manifest.digest = tracing::field::Empty,
@@ -1364,11 +1380,23 @@ fn build_vmm_inputs(
     let resolver = host_resolver_configuration()?;
     let guest = GuestCommand::new("/bin/sh")
         .arg("-c")
-        .arg(format!(
-            "printf '{resolver}' > /etc/resolv.conf && mkdir -p {BUILD_RUNTIME_MOUNT} && mount -t ext4 -o ro {BUILD_RUNTIME_DEVICE} {BUILD_RUNTIME_MOUNT} && exec {BUILD_RUNTIME_MOUNT}/nanocodex-vm-guest /"
-        ))
+        .arg(build_guest_bootstrap_script(&resolver, builder.prefer_ipv4))
         .arg("nanoeval-image-build");
     Ok((command, config, guest))
+}
+
+fn build_guest_bootstrap_script(resolver: &str, prefer_ipv4: bool) -> String {
+    let address_preference = if prefer_ipv4 {
+        concat!(
+            "if ! printf 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6; then printf '%s\\n' 'nanocodex image build bootstrap: failed to write /proc/sys/net/ipv6/conf/all/disable_ipv6' >&2; exit 125; fi; ",
+            "if ! printf 1 > /proc/sys/net/ipv6/conf/default/disable_ipv6; then printf '%s\\n' 'nanocodex image build bootstrap: failed to write /proc/sys/net/ipv6/conf/default/disable_ipv6' >&2; exit 125; fi; "
+        )
+    } else {
+        ""
+    };
+    format!(
+        "{address_preference}printf '{resolver}' > /etc/resolv.conf && mkdir -p {BUILD_RUNTIME_MOUNT} && mount -t ext4 -o ro {BUILD_RUNTIME_DEVICE} {BUILD_RUNTIME_MOUNT} && exec {BUILD_RUNTIME_MOUNT}/nanocodex-vm-guest /"
+    )
 }
 
 fn configure_firmware_library_path(command: &mut Command, directory: &Path) -> io::Result<()> {
@@ -2147,9 +2175,10 @@ mod tests {
         CACHE_RECORD_VERSION, CONTEXT_DISK_BYTES, COPY_SCRIPT, CachePolicy, DiskStatus,
         DockerfileRecipe, FIRMWARE_LIBRARY_FILENAME, FIRMWARE_LIBRARY_PATH_ENVIRONMENT, ImageError,
         ImageRuntimeConfig, LayerRecord, ManifestSource, PulledImage, PulledLayer, Reader,
-        ReferenceRecord, VmImageBuilder, blob_path, configure_firmware_library_path,
-        disk_cache_key, docker_process_environment, output_tail, prepare_copy_source_disk,
-        prepare_flattened_disk, reference_cache_key, resolver_configuration, write_cache_record,
+        ReferenceRecord, VmImageBuilder, blob_path, build_guest_bootstrap_script,
+        configure_firmware_library_path, disk_cache_key, docker_process_environment, output_tail,
+        prepare_copy_source_disk, prepare_flattened_disk, reference_cache_key,
+        resolver_configuration, write_cache_record,
     };
     use flate2::{Compression, write::GzEncoder};
     use tracing::{
@@ -2377,6 +2406,40 @@ mod tests {
         assert_eq!(builder.run_timeout, Duration::from_mins(15));
         assert_eq!(builder.copy_timeout, Duration::from_mins(2));
         assert_eq!(builder.egress.network(), &Network::Disabled);
+    }
+
+    #[test]
+    fn build_address_family_preference_is_explicit_and_ephemeral() {
+        let builder = VmImageBuilder::new("/opt/nanocodex-vmm", "/cache/runtime.ext4");
+        assert!(!builder.prefer_ipv4);
+        let builder = builder.prefer_ipv4();
+        assert!(builder.prefer_ipv4);
+
+        let resolver = "nameserver 213.186.33.99\\n";
+        let dual_stack = build_guest_bootstrap_script(resolver, false);
+        assert!(!dual_stack.contains("/proc/sys/net/ipv6"));
+
+        let prefer_ipv4 = build_guest_bootstrap_script(resolver, true);
+        let all = prefer_ipv4
+            .find("/proc/sys/net/ipv6/conf/all/disable_ipv6")
+            .unwrap();
+        let default = prefer_ipv4
+            .find("/proc/sys/net/ipv6/conf/default/disable_ipv6")
+            .unwrap();
+        let resolver = prefer_ipv4.find("/etc/resolv.conf").unwrap();
+        let runtime = prefer_ipv4
+            .find("exec /run/nanoeval/nanocodex-vm-guest")
+            .unwrap();
+        assert!(all < default);
+        assert!(default < resolver);
+        assert!(resolver < runtime);
+        assert!(!prefer_ipv4.contains("/etc/sysctl"));
+        assert!(prefer_ipv4.contains(
+            "nanocodex image build bootstrap: failed to write /proc/sys/net/ipv6/conf/all/disable_ipv6"
+        ));
+        assert!(prefer_ipv4.contains(
+            "nanocodex image build bootstrap: failed to write /proc/sys/net/ipv6/conf/default/disable_ipv6"
+        ));
     }
 
     #[test]
@@ -2677,7 +2740,7 @@ CMD ["/bin/sh"]
     fn preparation_has_one_bounded_root_with_parallel_work_below_it() {
         let _test_guard = IMAGE_PREPARE_TEST_LOCK.lock().unwrap();
         let fixture = LocalImageFixture::new();
-        let builder = fixture.builder();
+        let builder = fixture.builder().prefer_ipv4();
         let capture = TraceCapture::default();
         let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(capture.clone()));
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2722,6 +2785,13 @@ CMD ["/bin/sh"]
             Some("created")
         );
         assert!(prepare.fields.contains_key("duration_ns"));
+        assert_eq!(
+            prepare
+                .fields
+                .get("image.build.prefer_ipv4")
+                .map(String::as_str),
+            Some("true")
+        );
 
         let resolve = spans
             .values()
