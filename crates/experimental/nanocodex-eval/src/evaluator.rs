@@ -794,7 +794,7 @@ impl Evaluator {
         let result = result.instrument(span.clone()).await;
         record_span_result(&span, trace_started, &result);
         let (turn_result, terminal_event) = result?;
-        drop(agent);
+        agent.shutdown().await?;
         Ok(AgentExecution {
             result: AgentResult::from_terminal(turn_result.into_final_message(), &terminal_event)?,
             verifier,
@@ -1674,6 +1674,181 @@ impl PhaseTiming {
             started_at,
             finished_at: Utc::now(),
         }
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use std::{
+        collections::BTreeMap,
+        convert::Infallible,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use async_trait::async_trait;
+    use futures_util::{SinkExt, StreamExt};
+    use nanocodex_agent::{Nanocodex, OpenAi, Tools};
+    use nanocodex_tools::{ToolContext, ToolDefinition, ToolOutput, runtime::DynamicToolProvider};
+    use serde_json::{Value, json};
+    use tempfile::tempdir;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+    use super::{
+        AttemptAgent, AttemptVerification, AttemptVerifier, AttemptVerifierFuture, EvalAttempt,
+        Evaluator,
+    };
+    use crate::{EvalStatus, Task, VerifierResult};
+
+    struct AttemptResourceProvider {
+        live_resources: Arc<AtomicUsize>,
+    }
+
+    impl Drop for AttemptResourceProvider {
+        fn drop(&mut self) {
+            self.live_resources.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    #[async_trait]
+    impl DynamicToolProvider for AttemptResourceProvider {
+        fn start(&self) {}
+
+        fn direct_tools(&self) -> Vec<Arc<dyn nanocodex_tools::Tool>> {
+            Vec::new()
+        }
+
+        fn available_definitions(&self) -> Vec<ToolDefinition> {
+            Vec::new()
+        }
+
+        async fn execute(
+            &self,
+            _name: &str,
+            _input: Value,
+            _context: ToolContext<'_>,
+        ) -> Option<ToolOutput> {
+            None
+        }
+    }
+
+    struct ResourceProbeVerifier {
+        live_resources: Arc<AtomicUsize>,
+    }
+
+    impl AttemptVerifier for ResourceProbeVerifier {
+        fn verify<'a>(
+            &'a mut self,
+            _task: &'a Task,
+            _attempt: EvalAttempt<'a>,
+        ) -> AttemptVerifierFuture<'a> {
+            assert_eq!(
+                self.live_resources.load(Ordering::Acquire),
+                0,
+                "attempt-owned agent resources must be joined before verification starts"
+            );
+            Box::pin(async {
+                Ok(AttemptVerification {
+                    result: VerifierResult {
+                        exit_code: 0,
+                        rewards: BTreeMap::from([("reward".to_owned(), 1.0)]),
+                    },
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_resources_are_joined_before_attempt_verifier() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let warmup = socket.next().await.unwrap().unwrap();
+            assert!(warmup.is_text());
+            socket
+                .send(Message::Text(
+                    json!({
+                        "type": "response.completed",
+                        "response": { "id": "resp-warmup", "usage": null }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let generation = socket.next().await.unwrap().unwrap();
+            assert!(generation.is_text());
+            socket
+                .send(Message::Text(
+                    json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp-generation",
+                            "status": "completed",
+                            "output": [{
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{ "type": "output_text", "text": "done" }]
+                            }],
+                            "usage": {
+                                "input_tokens": 1,
+                                "input_tokens_details": { "cached_tokens": 0 },
+                                "output_tokens": 1,
+                                "output_tokens_details": { "reasoning_tokens": 0 },
+                                "total_tokens": 2
+                            }
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            while socket.next().await.is_some() {}
+        });
+        let live_resources = Arc::new(AtomicUsize::new(0));
+        let openai = OpenAi::builder("test")
+            .websocket_url(endpoint)
+            .build()
+            .unwrap();
+        let tool_resources = Arc::clone(&live_resources);
+        let nanocodex = Nanocodex::builder(openai).tools_factory(move |_agent| {
+            tool_resources.fetch_add(1, Ordering::AcqRel);
+            Tools::builder()
+                .without_defaults()
+                .provider(AttemptResourceProvider {
+                    live_resources: Arc::clone(&tool_resources),
+                })
+                .build()
+        });
+        let output = tempdir().unwrap();
+        let verifier_resources = Arc::clone(&live_resources);
+        let (evaluator, _events) = Evaluator::builder(nanocodex)
+            .output_directory(output.path())
+            .attempt_agent(move |_attempt, builder| {
+                Ok::<_, Infallible>(AttemptAgent::new(builder).verifier(ResourceProbeVerifier {
+                    live_resources: Arc::clone(&verifier_resources),
+                }))
+            })
+            .build()
+            .unwrap();
+        let task = Task::load(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tasks/write-greeting"),
+        )
+        .unwrap();
+
+        let result = evaluator.task(task).await.unwrap();
+
+        assert_eq!(result.status, EvalStatus::Passed);
+        assert_eq!(live_resources.load(Ordering::Acquire), 0);
+        server.await.unwrap();
     }
 }
 
