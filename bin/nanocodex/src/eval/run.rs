@@ -6,7 +6,7 @@ use std::{
     future::Future,
     io::{self, Read, Write},
     num::ParseFloatError,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     pin::Pin,
     str::FromStr,
     sync::{Arc, OnceLock},
@@ -2573,6 +2573,7 @@ fn retain_guest_runtime_bytes(job: &Path, bytes: &[u8]) -> Result<(PathBuf, Path
     let parent = artifact
         .parent()
         .ok_or_else(|| eyre!("VM guest runtime artifact path has no parent"))?;
+    ensure_artifact_parent_is_job_owned(job, &artifact)?;
     fs::create_dir_all(parent)?;
     ensure_artifact_parent_is_job_owned(job, &artifact)?;
     match fs::symlink_metadata(&artifact) {
@@ -2620,11 +2621,42 @@ fn retain_guest_runtime_bytes(job: &Path, bytes: &[u8]) -> Result<(PathBuf, Path
 }
 
 fn ensure_artifact_parent_is_job_owned(job: &Path, artifact: &Path) -> Result<()> {
+    let relative = artifact.strip_prefix(job).map_err(|_| {
+        eyre!(
+            "VM guest runtime artifact {} escapes job {}",
+            artifact.display(),
+            job.display()
+        )
+    })?;
+    if relative
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(eyre!(
+            "VM guest runtime artifact {} escapes job {}",
+            artifact.display(),
+            job.display()
+        ));
+    }
     let job = fs::canonicalize(job)?;
     let parent = artifact
         .parent()
         .ok_or_else(|| eyre!("VM guest runtime artifact path has no parent"))?;
-    let parent = fs::canonicalize(parent)?;
+    let mut existing = parent;
+    let parent = loop {
+        match fs::symlink_metadata(existing) {
+            Ok(_) => break fs::canonicalize(existing)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                existing = existing.parent().ok_or_else(|| {
+                    eyre!(
+                        "VM guest runtime artifact parent has no existing ancestor: {}",
+                        parent.display()
+                    )
+                })?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
     if !parent.starts_with(&job) {
         return Err(eyre!(
             "VM guest runtime artifact parent {} escapes job {}",
@@ -5347,8 +5379,8 @@ mod tests {
                 host_git_sha: "test".to_owned(),
             },
         };
-        fs::remove_file(&artifact).unwrap();
-        fs::remove_dir_all(job.join(super::GUEST_RUNTIME_CACHE_ROOT)).unwrap();
+        fs::remove_dir_all(job.join("guest-runtime")).unwrap();
+        assert!(!artifact.parent().unwrap().exists());
 
         let prepared =
             super::prepare_retained_guest_runtime(&job, &origin, Some(&requested), true).unwrap();
@@ -5357,6 +5389,24 @@ mod tests {
         assert!(prepared.disk.is_file());
         assert!(prepared.disk.starts_with(&job));
         assert_eq!(prepared.identity.unwrap(), origin.runtime);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guest_runtime_retention_rejects_a_symlink_escape_before_creating_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let job = root.path().join("job");
+        let outside = root.path().join("outside");
+        fs::create_dir(&job).unwrap();
+        fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, job.join("guest-runtime")).unwrap();
+
+        let error =
+            super::retain_guest_runtime_bytes(&job, &guest_elf(super::VM_GUEST_ELF_MACHINE))
+                .unwrap_err();
+
+        assert!(error.to_string().contains("escapes job"));
+        assert!(!outside.join("artifacts").exists());
     }
 
     #[test]
