@@ -57,7 +57,9 @@ const DEFAULT_OUTPUT_DIRECTORY: &str = ".nanocodex/evals";
 const INVOCATION_FILE: &str = "invocation.json";
 const LAST_RUN_FILE: &str = ".nanocodex/eval/last-run.json";
 const LEGACY_LAST_RUN_FILE: &str = ".nanoeval/last-run.json";
-const INVOCATION_VERSION: u32 = 1;
+const INVOCATION_VERSION: u32 = 2;
+const PRICING_REVISION: &str = "gpt-5.6-sol-standard-priority-v1";
+const SCHEDULING_POLICY: &str = "bounded_fifo_work_conserving-v1";
 const DEFAULT_TRIALS: u16 = 5;
 const DEFAULT_HOST_UTILIZATION_PERCENT: u8 = 80;
 const BYTES_PER_MIB: u64 = 1024 * 1024;
@@ -237,6 +239,12 @@ struct RetainedRetryQueue {
 #[serde(deny_unknown_fields)]
 struct RunInvocation {
     version: u32,
+    nanocodex_build: RetainedBuild,
+    model: String,
+    pricing_revision: String,
+    tool_profile: String,
+    seed: Option<u64>,
+    scheduling: RetainedScheduling,
     trials: u16,
     concurrency: u16,
     max_memory_mb: Option<u64>,
@@ -249,9 +257,33 @@ struct RunInvocation {
     rerun_from: Option<PathBuf>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RetainedBuild {
+    version: String,
+    git_sha: String,
+    built_at: String,
+    executable_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RetainedScheduling {
+    policy: String,
+    automatic_utilization_percent: Option<u8>,
+    concurrency_source: String,
+    memory_source: String,
+}
+
 impl RunInvocation {
     fn same_workload(&self, other: &Self) -> bool {
         self.version == other.version
+            && self.nanocodex_build == other.nanocodex_build
+            && self.model == other.model
+            && self.pricing_revision == other.pricing_revision
+            && self.tool_profile == other.tool_profile
+            && self.seed == other.seed
+            && self.scheduling.policy == other.scheduling.policy
             && self.trials == other.trials
             && self.vm == other.vm
             && self.vm_rootfs == other.vm_rootfs
@@ -564,7 +596,7 @@ impl Run {
                 });
         }
         let (eval, events) = evaluator.build()?;
-        persist_invocation(eval.directory(), &resolved.invocation())?;
+        persist_invocation(eval.directory(), &resolved.invocation()?)?;
         let remaining_attempts = eval.remaining_attempts(&sweep)?;
         let skipped_attempts = attempt_count.saturating_sub(remaining_attempts);
         report_resume(&eval, skipped_attempts, attempt_count);
@@ -736,9 +768,43 @@ impl ResolvedRun {
         );
     }
 
-    fn invocation(&self) -> RunInvocation {
-        RunInvocation {
+    fn invocation(&self) -> Result<RunInvocation> {
+        let scheduling = self.automatic_scheduling;
+        let executable = std::env::current_exe()?;
+        let executable_sha256 = hex::encode(Sha256::digest(fs::read(&executable)?));
+        Ok(RunInvocation {
             version: INVOCATION_VERSION,
+            nanocodex_build: RetainedBuild {
+                version: env!("NANOCODEX_SEMVER_VERSION").to_owned(),
+                git_sha: env!("VERGEN_GIT_SHA").to_owned(),
+                built_at: env!("VERGEN_BUILD_TIMESTAMP").to_owned(),
+                executable_sha256,
+            },
+            model: nanocodex::oai::MODEL.to_owned(),
+            pricing_revision: PRICING_REVISION.to_owned(),
+            tool_profile: if self.vm || self.vm_rootfs.is_some() {
+                "microvm_workspace".to_owned()
+            } else {
+                "native_workspace".to_owned()
+            },
+            seed: None,
+            scheduling: RetainedScheduling {
+                policy: SCHEDULING_POLICY.to_owned(),
+                automatic_utilization_percent: scheduling
+                    .map(|automatic| automatic.utilization_percent),
+                concurrency_source: if scheduling.is_some_and(|automatic| automatic.concurrency) {
+                    "automatic"
+                } else {
+                    "configured"
+                }
+                .to_owned(),
+                memory_source: if scheduling.is_some_and(|automatic| automatic.memory) {
+                    "automatic"
+                } else {
+                    "configured"
+                }
+                .to_owned(),
+            },
             trials: self.trials,
             concurrency: self.concurrency,
             max_memory_mb: self.max_memory_mb,
@@ -748,7 +814,7 @@ impl ResolvedRun {
             thinking: self.thinking.to_string(),
             web_search: self.web_search,
             rerun_from: self.rerun_from.clone(),
-        }
+        })
     }
 }
 
@@ -3565,10 +3631,11 @@ mod tests {
 
     use super::{
         CACHED_VERIFIER_SCRIPT, DEFAULT_HOST_UTILIZATION_PERCENT, DEFAULT_TRIALS, HostResources,
-        Run, RunInvocation, RunMeasurements, RunSummary, VmRetention, cached_verifier_script,
-        load_tasks, recognized_verifier_setup, remove_passed_rootfs, retained_retry_task_names,
-        retained_task_durations, verifier_bootstrap_network_failed, verifier_cache_key,
-        verifier_network_retry_delay, verifier_shell,
+        RetainedBuild, RetainedScheduling, Run, RunInvocation, RunMeasurements, RunSummary,
+        VmRetention, cached_verifier_script, load_tasks, recognized_verifier_setup,
+        remove_passed_rootfs, retained_retry_task_names, retained_task_durations,
+        verifier_bootstrap_network_failed, verifier_cache_key, verifier_network_retry_delay,
+        verifier_shell,
     };
 
     #[derive(Parser)]
@@ -3821,6 +3888,22 @@ mod tests {
     fn resumed_workload_allows_scheduler_changes_only() {
         let retained = RunInvocation {
             version: super::INVOCATION_VERSION,
+            nanocodex_build: RetainedBuild {
+                version: "test".to_owned(),
+                git_sha: "0123456789abcdef".to_owned(),
+                built_at: "2026-07-28T00:00:00Z".to_owned(),
+                executable_sha256: "abc123".to_owned(),
+            },
+            model: "gpt-5.6-sol".to_owned(),
+            pricing_revision: "test-pricing-v1".to_owned(),
+            tool_profile: "microvm_workspace".to_owned(),
+            seed: None,
+            scheduling: RetainedScheduling {
+                policy: super::SCHEDULING_POLICY.to_owned(),
+                automatic_utilization_percent: Some(80),
+                concurrency_source: "automatic".to_owned(),
+                memory_source: "automatic".to_owned(),
+            },
             trials: 5,
             concurrency: 16,
             max_memory_mb: Some(49_152),
@@ -4078,6 +4161,22 @@ mod tests {
             &child.join(super::INVOCATION_FILE),
             &super::RunInvocation {
                 version: super::INVOCATION_VERSION,
+                nanocodex_build: super::RetainedBuild {
+                    version: "test".to_owned(),
+                    git_sha: "0123456789abcdef".to_owned(),
+                    built_at: "2026-07-28T00:00:00Z".to_owned(),
+                    executable_sha256: "abc123".to_owned(),
+                },
+                model: "gpt-5.6-sol".to_owned(),
+                pricing_revision: "test-pricing-v1".to_owned(),
+                tool_profile: "native_workspace".to_owned(),
+                seed: None,
+                scheduling: super::RetainedScheduling {
+                    policy: super::SCHEDULING_POLICY.to_owned(),
+                    automatic_utilization_percent: None,
+                    concurrency_source: "configured".to_owned(),
+                    memory_source: "configured".to_owned(),
+                },
                 trials: 1,
                 concurrency: 1,
                 max_memory_mb: None,
