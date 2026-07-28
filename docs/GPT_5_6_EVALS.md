@@ -40,6 +40,74 @@ The remaining official evaluations are useful coverage and plot references,
 not a reason to expand Part 2 into browser, computer-use, biology, cyber, or
 generic multiple-choice infrastructure prematurely.
 
+## Runnable and access classification
+
+The classification below is the adapter backlog for every evaluation in the
+official launch table. `Runnable now` means this repository has a pinned task
+and verifier path today. `Bounded adapter` means public data or a published
+harness exists, but Nanocodex must pin and audit it before claiming a run.
+`Published comparison` means only reported aggregate or partner results are
+available to this project. `Unavailable/private` means the named dataset or
+verifier is not public. `Out of scope` means the evaluation does not exercise
+the Part 2 coding-agent/VM boundary.
+
+Only Terminal-Bench 2.1 is currently pinned end to end:
+dataset/task revision
+`sha256:7d7bdc1cbedad549fc1140404bd4dc45e5fd0ea7c4186773687d177ad3a0699`
+with Harbor's task-package checksum, canonical verifier, raw verifier reward,
+and leaderboard normalization retained separately. No other row below is
+silently assigned that revision or substituted with a similarly named suite.
+
+| Evaluation | Classification | Revision, license, or access blocker |
+| --- | --- | --- |
+| Agents' Last Exam | Bounded adapter | Public tasks, traces, and code/data are advertised as Apache-2.0/CC BY 4.0; the exact OpenAI subset and harness revision are not published or pinned here. |
+| GDPval-AA v2 | Published comparison | OpenAI/Artificial Analysis publish results; the exact launch-run task and grader package is not available here. |
+| Management Consulting Tasks (Internal) | Unavailable/private | OpenAI identifies the suite as internal; no public dataset or verifier revision is recorded. |
+| Big Finance Bench | Published comparison | Rogo publishes aggregate results, not the exact launch-run dataset, rubric, and grader revision. |
+| Artificial Analysis Intelligence Index v4.1 | Published comparison | Version 4.1 scores and cost estimates are public; the complete evaluated task/grader snapshot is not pinned here. |
+| Artificial Analysis Coding Agent Index v1.1 | Published comparison | The composite result is public; its exact DeepSWE, Terminal-Bench v2, and SWE-Atlas-QnA run inputs are not one published Nanocodex-runnable package. |
+| SWE-Bench Pro | Bounded adapter | A dataset/harness adapter requires a pinned public revision and verified redistribution/use terms; neither is recorded yet. |
+| DeepSWE v1.1 | Bounded adapter | A dataset/harness adapter requires a pinned public revision and license audit; neither is recorded yet. |
+| Terminal-Bench 2.1 | Runnable now | Pinned Harbor revision above; PR 174 is a debugging comparator, not ground truth. |
+| GeneBench Pro | Out of scope | Science/health workflow and verifier are outside the coding-agent VM slice; no revision is pinned. |
+| LifeSciBench | Out of scope | Science/health workflow is outside this slice; no exact launch revision is pinned. |
+| MedChemBench (Internal) | Unavailable/private | OpenAI identifies the suite as internal. |
+| HealthBench Professional | Out of scope | Medical evaluation is outside this slice and requires its own safety/grader review. |
+| OSWorld 2.0 | Out of scope | Requires computer-use/browser machinery explicitly excluded from Part 2. |
+| BrowseComp | Out of scope | Requires a deterministic browsing consumer explicitly deferred from Part 2. |
+| BenchCAD | Out of scope | Requires CAD/computer-use tooling not owned by this coding-agent slice. |
+| BenchCAD (Python tool) | Out of scope | Requires the BenchCAD task/grader and specialized Python tool contract. |
+| Capture-the-Flag Challenges | Out of scope | Cyber capability evaluation is safety-gated and outside the normal coding workspace contract. |
+| SEC-Bench Pro | Out of scope | Cyber exploitation work is outside this slice; no task/verifier revision is pinned. |
+| ExploitBench | Out of scope | Cyber exploitation work is outside this slice; no task/verifier revision is pinned. |
+| ExploitGym | Out of scope | Cyber exploitation work is outside this slice; no task/verifier revision is pinned. |
+| Internal Research Debugging Evaluation | Unavailable/private | OpenAI identifies the suite as internal. |
+| KernelGen 1P | Bounded adapter | A public/published harness may permit an adapter, but its exact launch dataset, verifier revision, and execution requirements are not pinned here. |
+| NanoGPT | Bounded adapter | A bounded training-task adapter is possible after pinning the exact launch task, scoring policy, compute budget, and code revision. |
+| PostTrainBench Lite | Bounded adapter | Requires a pinned public dataset/harness, verifier, and compute policy; none is recorded yet. |
+| RSI Index | Published comparison | The launch result is public, but the exact task and grader package is not available here. |
+| MMMU Pro (no tools) | Out of scope | Academic multimodal QA is not a coding-agent/VM evaluation. |
+| MMMU Pro (with tools) | Out of scope | Multimodal tool-use harness is outside this slice. |
+| gdp.pdf | Out of scope | PDF/multimodal professional-work evaluation is outside this slice. |
+| GPQA Diamond | Out of scope | Academic question answering does not exercise the Part 2 workspace-agent boundary. |
+| FrontierMath Tier 1–3 (v2) | Out of scope | Mathematics benchmark and grader are outside this slice. |
+| FrontierMath Tier 4 (v2) | Out of scope | Mathematics benchmark and grader are outside this slice. |
+| AutomationBench | Bounded adapter | Tool-use adapter requires a pinned public task/application harness and verifier revision; none is recorded yet. |
+| Toolathlon | Bounded adapter | Tool-use adapter requires a pinned public service/task snapshot and verifier revision; none is recorded yet. |
+| OpenAI MRCR v2, 8-needle, 256K–512K | Unavailable/private | The named OpenAI run dataset and grader revision are not published here. |
+| OpenAI MRCR v2, 8-needle, 512K–1M | Unavailable/private | The named OpenAI run dataset and grader revision are not published here. |
+| GraphWalks BFS 256K F1 | Bounded adapter | Requires the exact public generator, seed set, prompt format, and F1 grader revision used by the launch run. |
+| GraphWalks BFS 1M F1 | Bounded adapter | Requires the exact public generator, seed set, prompt format, and F1 grader revision used by the launch run. |
+| ARC-AGI-3 | Bounded adapter | ARC Prize publishes tasks/results under its own terms, but the exact OpenAI harness and per-environment policy are not pinned in this repository. |
+
+The system-card destructive-action suite is `Unavailable/private`: OpenAI did
+not publish its tasks or grader. A separately authored Nanocodex destructive
+workspace suite may be publicly runnable, but it must carry a distinct dataset
+name and revision and must never be reported as a reproduction. Other
+system-card safety, health, biology, cyber, deployment-simulation, alignment,
+and computer-use suites are either private/safety-gated or out of Part 2 scope
+until their exact inputs, access terms, and verifiers are available.
+
 ## Official launch table
 
 The following values transcribe the GPT-5.6 columns from OpenAI's launch table.
