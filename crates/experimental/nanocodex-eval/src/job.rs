@@ -53,8 +53,7 @@ impl EvalJob {
     pub(crate) fn create(parent_directory: &Path) -> Result<Self, EvalError> {
         let parent_directory = prepare_parent_directory(parent_directory)?;
         let id = Uuid::now_v7();
-        let directory = parent_directory.join(id.to_string());
-        create_durable_directory_all(&directory)?;
+        let directory = create_durable_directory_all(&parent_directory.join(id.to_string()))?;
         let lease = Self::lease(&directory)?;
         let started_at = Utc::now();
         Self::write_json(&directory, JOB_FILE, &JobIdentity { id, started_at })?;
@@ -272,31 +271,24 @@ fn prepare_parent_directory(path: &Path) -> io::Result<PathBuf> {
     } else {
         std::env::current_dir()?.join(path)
     };
-    create_durable_directory_all(&absolute)?;
-    fs::canonicalize(absolute)
+    create_durable_directory_all(&absolute)
 }
 
-fn create_durable_directory_all(path: &Path) -> io::Result<()> {
+fn create_durable_directory_all(path: &Path) -> io::Result<PathBuf> {
     create_durable_directory_all_with_sync(path, sync_directory)
 }
 
-fn create_durable_directory_all_with_sync<F>(path: &Path, mut sync_directory: F) -> io::Result<()>
+fn create_durable_directory_all_with_sync<F>(
+    path: &Path,
+    mut sync_directory: F,
+) -> io::Result<PathBuf>
 where
     F: FnMut(&Path) -> io::Result<()>,
 {
     let mut missing = Vec::new();
     let mut ancestor = path;
     loop {
-        match fs::symlink_metadata(ancestor) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "durable evaluation output ancestry must be symlink-free: {}",
-                        ancestor.display()
-                    ),
-                ));
-            }
+        match fs::metadata(ancestor) {
             Ok(metadata) if metadata.is_dir() => break,
             Ok(_) => {
                 return Err(io::Error::new(
@@ -305,7 +297,13 @@ where
                 ));
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                missing.push(ancestor.to_path_buf());
+                let component = ancestor.file_name().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("directory has no existing ancestor: {}", path.display()),
+                    )
+                })?;
+                missing.push(component.to_os_string());
                 ancestor = ancestor.parent().ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::NotFound,
@@ -317,7 +315,13 @@ where
         }
     }
 
-    for directory in missing.into_iter().rev() {
+    // The output root and its existing ancestry are app-owned and trusted not
+    // to change concurrently. Canonicalizing the deepest existing directory
+    // permits normal platform aliases such as macOS `/tmp -> /private/tmp`.
+    let mut directory = fs::canonicalize(ancestor)?;
+    let mut created = Vec::new();
+    for component in missing.into_iter().rev() {
+        directory.push(component);
         match fs::create_dir(&directory) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -326,7 +330,7 @@ where
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         format!(
-                            "durable evaluation output ancestry must be symlink-free: {}",
+                            "new evaluation output component was replaced: {}",
                             directory.display()
                         ),
                     ));
@@ -334,27 +338,42 @@ where
             }
             Err(error) => return Err(error),
         }
+        validate_created_directory(&directory)?;
+        created.push(directory.clone());
     }
 
     // Retrying after a failed fsync must not trust directory existence: a
     // prior call may have created an entry without durably committing it.
-    // Revalidate the symlink-free contract and sync every parent to the root.
-    for directory in path.ancestors() {
-        let metadata = fs::symlink_metadata(directory)?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "durable evaluation output ancestry must be symlink-free: {}",
-                    directory.display()
-                ),
-            ));
-        }
-        if let Some(parent) = directory.parent() {
-            sync_directory(parent)?;
-        }
+    // Sync the canonical parent chain on every call. Revalidation catches an
+    // accidental replacement observed at a sync boundary; this path-based
+    // helper is not a sandbox against hostile concurrent filesystem mutation.
+    for parent in directory.ancestors().skip(1) {
+        validate_created_directories(&created)?;
+        sync_directory(parent)?;
+        validate_created_directories(&created)?;
+    }
+    Ok(directory)
+}
+
+fn validate_created_directories(directories: &[PathBuf]) -> io::Result<()> {
+    for directory in directories {
+        validate_created_directory(directory)?;
     }
     Ok(())
+}
+
+fn validate_created_directory(directory: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(directory)?;
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "new evaluation output component was replaced: {}",
+            directory.display()
+        ),
+    ))
 }
 
 #[cfg(unix)]
@@ -404,14 +423,26 @@ mod tests {
         let nested = second.join("three");
         let mut synced = Vec::new();
 
-        create_durable_directory_all_with_sync(&nested, |directory| {
+        let created = create_durable_directory_all_with_sync(&nested, |directory| {
             synced.push(directory.to_path_buf());
             Ok(())
         })
         .unwrap();
 
         assert!(nested.is_dir());
-        assert_eq!(&synced[..3], &[second, first, output.path().to_path_buf()]);
+        let canonical_output = fs::canonicalize(output.path()).unwrap();
+        assert_eq!(
+            created,
+            canonical_output.join("one").join("two").join("three")
+        );
+        assert_eq!(
+            &synced[..3],
+            &[
+                canonical_output.join("one").join("two"),
+                canonical_output.join("one"),
+                canonical_output,
+            ]
+        );
         let job = EvalJob::create(&nested).unwrap();
         assert_eq!(job.parent_directory(), fs::canonicalize(&nested).unwrap());
         assert!(job.directory().is_dir());
@@ -429,27 +460,54 @@ mod tests {
         assert!(target.is_dir());
 
         let mut retried_syncs = Vec::new();
-        create_durable_directory_all_with_sync(&target, |directory| {
+        let created = create_durable_directory_all_with_sync(&target, |directory| {
             retried_syncs.push(directory.to_path_buf());
             Ok(())
         })
         .unwrap();
 
-        assert_eq!(retried_syncs.first(), Some(&output.path().to_path_buf()));
+        let canonical_output = fs::canonicalize(output.path()).unwrap();
+        assert_eq!(created, canonical_output.join(target.file_name().unwrap()));
+        assert_eq!(retried_syncs.first(), Some(&canonical_output));
     }
 
     #[test]
-    fn rejects_symlinks_in_the_output_ancestry_without_following_them() {
-        let output = tempdir().unwrap();
-        let outside = tempdir().unwrap();
-        let redirect = output.path().join("redirect");
-        std::os::unix::fs::symlink(outside.path(), &redirect).unwrap();
+    fn accepts_a_symlinked_existing_ancestor_and_pins_its_target() {
+        let aliases = tempdir().unwrap();
+        let trusted = tempdir().unwrap();
+        let alias = aliases.path().join("alias");
+        std::os::unix::fs::symlink(trusted.path(), &alias).unwrap();
+        let requested = alias.join("nested");
 
-        let error = create_durable_directory_all_with_sync(&redirect.join("nested"), |_| Ok(()))
-            .unwrap_err();
+        let created = create_durable_directory_all_with_sync(&requested, |_| Ok(())).unwrap();
+
+        assert_eq!(
+            created,
+            fs::canonicalize(trusted.path()).unwrap().join("nested")
+        );
+        assert!(trusted.path().join("nested").is_dir());
+        assert!(requested.is_dir());
+    }
+
+    #[test]
+    fn detects_a_new_output_component_substituted_during_sync() {
+        let trusted = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let target = trusted.path().join("new-output");
+        let mut substituted = false;
+
+        let error = create_durable_directory_all_with_sync(&target, |_| {
+            if !substituted {
+                fs::remove_dir(&target)?;
+                std::os::unix::fs::symlink(outside.path(), &target)?;
+                substituted = true;
+            }
+            Ok(())
+        })
+        .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert!(!outside.path().join("nested").exists());
+        assert!(target.symlink_metadata().unwrap().file_type().is_symlink());
     }
 
     #[test]
