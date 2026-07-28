@@ -6,20 +6,14 @@ execute. The default `Tools` selection runs `exec_command`, `write_stdin`,
 replace those handlers with one persistent libkrun VM without changing their
 model-visible names or schemas.
 
-Three packages own the boundary:
+The unpublished `nanocodex-vm` package owns this boundary in focused low-level,
+`image`, and `tools` modules: typed libkrun configuration and its small audited
+FFI surface, private VMM process configuration, gvproxy and neutral egress
+leases, OCI/Dockerfile image preparation and reflinks, and the retained
+host/guest tool protocol.
 
-- `nanovm` owns typed libkrun configuration, the small audited FFI boundary,
-  private VMM process configuration, gvproxy lifecycle, and provider-neutral
-  egress leases.
-- `nanovm-image` owns content-addressed OCI resolution, the supported
-  Dockerfile subset, immutable ext4 preparation, cache locking, and disposable
-  attempt reflinks.
-- `nanocodex-vm` owns the typed host/guest tool protocol, retained guest shell
-  sessions, bounded VMM process ownership, and adapters for
-  Nanocodex's standard workspace tools.
-
-These packages do not own application policy, agent identity, payment limits,
-secret resolution, or the choice to enable VM tools.
+The package does not own payment-provider policy, agent identity, secret
+resolution, or the caller's choice to enable VM tools.
 
 ## Preparing immutable images
 
@@ -30,7 +24,7 @@ Every mutable VM gets a reflink or sparse copy:
 
 ```rust,no_run
 use nanocodex_vm::GuestRuntimeDisk;
-use nanovm_image::{CachePolicy, VmImageBuilder};
+use nanocodex_vm::image::{CachePolicy, VmImageBuilder};
 
 # async fn prepare() -> Result<(), Box<dyn std::error::Error>> {
 let runtime = GuestRuntimeDisk::prepare(
@@ -86,6 +80,25 @@ let (agent, events) = Nanocodex::builder(auth).build()?;
 # Ok(())
 # }
 ```
+
+The shipped CLI exposes the same opt-in boundary in the normal TUI, one-shot
+runner, and resumed TUI:
+
+```sh
+nanocodex --vm .nanocodex/vm/session-rootfs.ext4 --vm-workspace /app
+nanocodex run "make the requested change" \
+  --vm .nanocodex/vm/session-rootfs.ext4 --vm-workspace /app
+nanocodex resume <thread-id> \
+  --vm .nanocodex/vm/session-rootfs.ext4 --vm-workspace /app
+```
+
+`--vm` accepts either a raw ext4 root or a directory rootfs, retains one VM
+across sequential turns and the root agent tree, and modifies that root in
+place. Raw ext4 roots receive the current content-addressed guest runtime as a
+read-only block device; directory roots must already contain
+`/usr/local/bin/nanocodex-vm-guest`. Use `--vm-no-network` for an offline guest.
+The provided root must be session-private; the CLI takes an exclusive advisory
+lock on raw disks to reject accidental concurrent attachment.
 
 A caller that has started one `VmToolSession` opts into VM workspace effects
 through the normal tool-selection API:
@@ -158,10 +171,10 @@ contribute:
 Independent provider layers compose transactionally:
 
 ```rust,no_run
-use nanovm::{EgressFile, EgressLease, EgressMount};
+use nanocodex_vm::{EgressFile, EgressLease, EgressMount};
 use std::sync::Arc;
 
-# fn configure() -> Result<EgressLease, nanovm::EgressError> {
+# fn configure() -> Result<EgressLease, nanocodex_vm::EgressError> {
 let mut payment_proxy = EgressLease::internet();
 payment_proxy.insert_environment(
     "HTTPS_PROXY",
@@ -199,7 +212,7 @@ and retains every provider guard:
 
 ```rust,no_run
 # use nanocodex_vm::VmToolSession;
-# use nanovm::{EgressLease, GuestCommand, VmConfig};
+# use nanocodex_vm::{EgressLease, GuestCommand, VmConfig};
 # use tokio::process::Command;
 # async fn launch(egress: EgressLease) -> Result<VmToolSession, Box<dyn std::error::Error>> {
 let guest = GuestCommand::new("/usr/local/bin/nanocodex-vm-guest").arg("/workspace");
@@ -227,7 +240,7 @@ the application must then preserve the same ownership ordering itself.
 Payment providers remain host-owned HTTP(S) proxies. An application-owned
 adapter can point the guest at a proxy, provision its public interception CA,
 and retain the wallet/proxy guard in a provider-neutral `EgressLease`.
-`nanocodex-vm` deliberately has no payment-provider feature or dependency;
+`nanocodex_vm` deliberately has no payment-provider integration;
 Tempo-specific payment policy stays under `bin/`.
 
 NanoCentaur's Iron/secret egress follows the same contract: its layer carries
@@ -267,18 +280,18 @@ provider's credentials.
   directly.
 - On macOS, the dedicated VMM executable must carry the
   `com.apple.security.hypervisor` entitlement. `just build-vm-example` builds
-  and ad-hoc signs the public proof binary with `nanovm.entitlements`.
+  and ad-hoc signs the public proof binary with `nanocodex-vm.entitlements`.
 - Failed partial protocol responses are not converted into successful tool
   results.
 - Egress values are omitted from `Debug`; only environment names, mount
   metadata, and guard counts are shown.
 - Read-only provider mounts and environment conflicts are explicit.
-- The libkrun unsafe surface stays inside `nanovm`; the rest of Nanocodex
-  remains safe Rust.
+- The libkrun unsafe surface stays inside two audited
+  `nanocodex_vm` modules; the rest of Nanocodex remains safe Rust.
 - The companion guest reuses the canonical `nanocodex-tools` request/result
-  contracts and workspace-tool implementations. VM feature selection does not
-  create an alternate tool runtime or change MCP availability in normal native
-  builds.
+  contracts and workspace-tool implementations. Cross-compiling the companion
+  guest target does not create an alternate tool runtime or change MCP
+  availability in normal native builds.
 
 See
 `cargo run -p nanocodex-examples --bin vm-tools -- ROOTFS GUEST_RUNTIME_BINARY`

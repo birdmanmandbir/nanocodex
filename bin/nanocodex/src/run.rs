@@ -4,6 +4,7 @@ use clap::{Args, builder::NonEmptyStringValueParser};
 use eyre::{Result, eyre};
 
 use crate::config::AgentArgs;
+use crate::vm::VmArgs;
 
 #[derive(Args)]
 pub(crate) struct Run {
@@ -17,8 +18,8 @@ pub(crate) struct Run {
 }
 
 impl Run {
-    pub(crate) async fn run(self, config: AgentArgs) -> Result<()> {
-        let configured = config.build().await?;
+    pub(crate) async fn run(self, config: AgentArgs, vm: VmArgs) -> Result<()> {
+        let configured = config.build(vm).await?;
         let handle = configured.handle;
         let mut events = configured.events;
         let run_result: Result<()> = async {
@@ -51,6 +52,11 @@ impl Run {
         if let Some(child_agents) = configured.child_agents {
             child_agents.shutdown().await;
         }
+        let vm_shutdown_result = if let Some(vm) = configured.vm {
+            vm.shutdown().await
+        } else {
+            Ok(())
+        };
         let shutdown_result = if let Some(adapter) = configured.mpp_adapter {
             adapter.shutdown().await
         } else {
@@ -58,6 +64,7 @@ impl Run {
         };
         run_result?;
         agent_shutdown?;
+        vm_shutdown_result?;
         shutdown_result
     }
 }

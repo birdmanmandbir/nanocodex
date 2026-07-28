@@ -10,7 +10,7 @@ use std::{
 
 use thiserror::Error;
 
-use crate::{GuestCommand, Network, SharedDirectory, VmConfig};
+use super::{GuestCommand, Network, SharedDirectory, VmConfig};
 
 /// Exclusive guest root under which provider egress assets may be exposed.
 pub const GUEST_EGRESS_ROOT: &str = "/tmp/nanocodex/egress";
@@ -20,8 +20,8 @@ pub const MAX_EGRESS_FILE_BYTES: usize = 4 * 1024 * 1024;
 /// VM-facing outbound-access configuration retained for one guest lifetime.
 ///
 /// An application-specific provider can resolve MPP, secret, or capability
-/// policy into this type without exposing that policy to `nanovm`. Values are
-/// deliberately omitted from `Debug`: proxy URLs may contain short-lived
+/// policy into this type without exposing that policy to the VM runtime.
+/// Values are deliberately omitted from `Debug`: proxy URLs may contain short-lived
 /// credentials.
 #[derive(Clone)]
 pub struct EgressLease {
@@ -355,7 +355,7 @@ impl EgressLease {
     ///
     /// Values may contain short-lived capabilities and must not be logged.
     #[must_use]
-    pub fn guest_environment(&self) -> &BTreeMap<String, String> {
+    pub const fn guest_environment(&self) -> &BTreeMap<String, String> {
         &self.guest_environment
     }
 

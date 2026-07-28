@@ -4410,13 +4410,10 @@ dependencies = [
  "mpp",
  "nanocodex",
  "nanocodex-eval",
- "nanocodex-eval-harbor",
  "nanocodex-observability",
  "nanocodex-tools",
  "nanocodex-vm",
  "nanousd",
- "nanovm",
- "nanovm-image",
  "nix 0.31.3",
  "oci-client",
  "pulldown-cmark",
@@ -4460,29 +4457,10 @@ dependencies = [
  "criterion",
  "fs2",
  "futures-util",
- "nanocodex-agent",
- "nanocodex-oai-api",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "nanocodex-eval-harbor"
-version = "0.2.0"
-dependencies = [
- "chrono",
- "futures-util",
  "hex",
  "ignore",
  "nanocodex-agent",
- "nanocodex-eval",
+ "nanocodex-oai-api",
  "reqwest",
  "serde",
  "serde_json",
@@ -4490,6 +4468,9 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
  "url",
  "uuid",
 ]
@@ -4504,9 +4485,7 @@ dependencies = [
  "http",
  "nanocodex",
  "nanocodex-eval",
- "nanocodex-eval-harbor",
  "nanocodex-vm",
- "nanovm",
  "reflink-copy",
  "reqwest",
  "serde",
@@ -4622,20 +4601,27 @@ dependencies = [
  "async-trait",
  "base64",
  "criterion",
+ "flate2",
  "fs2",
+ "futures-util",
  "hex",
+ "ignore",
+ "libkrun",
  "nanocodex-tools",
- "nanovm",
  "nix 0.31.3",
+ "oci-client",
  "reflink-copy",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "shlex",
+ "tar",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zstd",
 ]
 
 [[package]]
@@ -4692,45 +4678,6 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
-]
-
-[[package]]
-name = "nanovm"
-version = "0.2.0"
-dependencies = [
- "libkrun",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.19",
-]
-
-[[package]]
-name = "nanovm-image"
-version = "0.2.0"
-dependencies = [
- "arcbox-ext4",
- "criterion",
- "flate2",
- "fs2",
- "futures-util",
- "hex",
- "ignore",
- "nanocodex-vm",
- "nanovm",
- "oci-client",
- "reflink-copy",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "shlex",
- "tar",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "zstd",
 ]
 
 [[package]]

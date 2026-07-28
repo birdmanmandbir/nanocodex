@@ -6,14 +6,11 @@ members = [
     "crates/nanocodex",
     "crates/nanocodex-agent",
     "crates/experimental/nanocodex-eval",
-    "crates/experimental/nanocodex-eval-harbor",
+    "crates/experimental/nanocodex-vm",
     "crates/nanocodex-oai-api",
     "crates/nanocodex-observability",
     "crates/nanocodex-tools",
     "crates/nanocodex-tools/macros",
-    "crates/experimental/nanocodex-vm",
-    "crates/experimental/nanovm",
-    "crates/experimental/nanovm-image",
     "examples",
     "js/bindings",
     "py/bindings",
@@ -66,15 +63,12 @@ mpp = { version = "=0.11.0", git = "https://github.com/tempoxyz/mpp-rs", rev = "
 nanocodex = { version = "0.2.0", path = "crates/nanocodex" }
 nanocodex-agent = { version = "0.2.0", path = "crates/nanocodex-agent" }
 nanocodex-eval = { version = "0.2.0", path = "crates/experimental/nanocodex-eval" }
-nanocodex-eval-harbor = { version = "0.2.0", path = "crates/experimental/nanocodex-eval-harbor" }
+nanocodex-vm = { version = "0.2.0", path = "crates/experimental/nanocodex-vm" }
 nanocodex-oai-api = { version = "0.2.0", path = "crates/nanocodex-oai-api" }
 nanocodex-observability = { version = "0.2.0", path = "crates/nanocodex-observability" }
 nanocodex-tools = { version = "0.2.0", path = "crates/nanocodex-tools" }
 nanocodex-tools-macros = { version = "0.2.0", path = "crates/nanocodex-tools/macros" }
 nanousd = { version = "0.2.0", path = "bin/nanousd" }
-nanocodex-vm = { version = "0.2.0", path = "crates/experimental/nanocodex-vm" }
-nanovm = { version = "0.2.0", path = "crates/experimental/nanovm" }
-nanovm-image = { version = "0.2.0", path = "crates/experimental/nanovm-image" }
 oci-client = { version = "0.17.0", default-features = false, features = ["rustls-tls"] }
 rand = "0.9.2"
 regex = "1"

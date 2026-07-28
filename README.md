@@ -263,19 +263,33 @@ let results = evaluator.sweep(sweep).await?;
 println!("{} fresh attempts", results.attempts().len());
 ```
 
-`nanocodex-eval-harbor` projects an independent event subscription into
+`nanocodex_eval::harbor` projects an independent event subscription into
 canonical Harbor and ATIF artifacts; it does not become a second result owner.
 The CLI composes native execution, VM image preparation, Terminal-Bench,
 Frontier-Bench artifact handoff, inspection, published-result comparison, and
 cleanup:
 
 ```sh
-nanocodex eval run --task tasks/write-greeting --trials 5 --thinking medium
+nanocodex eval --task tasks/write-greeting --trials 5 --thinking medium
 nanocodex eval prepare --task /path/to/terminal-bench-task
 nanocodex eval inspect .nanocodex/evals/<job-id>
 nanocodex eval compare terminal-bench/configure-git-webserver
 nanocodex eval cleanup .nanocodex/evals --dry-run
 ```
+
+Normal agent sessions keep host workspace tools by default. The TUI, one-shot
+runner, and resume command can instead route `exec_command`, `write_stdin`,
+`apply_patch`, and `view_image` through one retained VM:
+
+```sh
+nanocodex --vm .nanocodex/vm/session-rootfs.ext4 --vm-workspace /app
+nanocodex run "inspect the repository" \
+  --vm .nanocodex/vm/session-rootfs.ext4 --vm-workspace /app
+```
+
+The rootfs is writable and modified in place, so it must be a session-private
+copy rather than an immutable eval cache entry. Web search, image generation,
+MCP, and `update_plan` remain independently configured host-side capabilities.
 
 Estimated USD cost is retained and printed automatically from provider-reported
 usage and Nanocodex's built-in pricing catalog. Existing Nanoeval jobs and
@@ -316,11 +330,8 @@ evaluation components live under
 
 | Component | Responsibility |
 | --- | --- |
-| `nanovm` *(experimental)* | Typed libkrun lifecycle, disks, networking, egress capabilities, and shutdown |
-| `nanocodex-vm` *(experimental)* | Bounded retained host/guest RPC and agent tools backed by one VM session tree |
-| `nanovm-image` *(experimental)* | OCI/Dockerfile inputs to content-addressed immutable ext4 disks and attempt reflinks |
-| `nanocodex-eval` *(experimental)* | Typed tasks, attempts, scheduling, results, and sweeps |
-| `nanocodex-eval-harbor` *(experimental)* | Canonical Harbor/ATIF import and export |
+| `nanocodex-vm` *(experimental)* | VM lifecycle and images plus retained guest-backed workspace tools |
+| `nanocodex-eval` *(experimental)* | Typed tasks and sweeps, durable results, and Harbor/ATIF projection |
 
 The CLI is a consumer of these libraries. Evaluation is exposed as
 `nanocodex eval ...`; it does not install Nanocodex into every task image or
@@ -384,16 +395,13 @@ default on native targets. Native `nanocodex-tools` builds include MCP,
 `tool_search`, Code Mode, image processing, and remote tools; MCP is not an
 optional compatibility layer.
 
-The experimental VM and evaluation crates are not published on crates.io. The
-VM crates currently track a reviewed libkrun Git checkpoint, so Git/path
-consumers select these packages explicitly:
+The experimental VM and evaluation crates are not published on crates.io.
+`nanocodex-vm` currently tracks a reviewed libkrun Git checkpoint, so Git/path
+consumers select them explicitly:
 
 ```sh
-cargo add nanovm --git https://github.com/gakonst/nanocodex
 cargo add nanocodex-vm --git https://github.com/gakonst/nanocodex
-cargo add nanovm-image --git https://github.com/gakonst/nanocodex
 cargo add nanocodex-eval --git https://github.com/gakonst/nanocodex
-cargo add nanocodex-eval-harbor --git https://github.com/gakonst/nanocodex
 ```
 
 The daily-driver CLI is available on macOS and Linux:

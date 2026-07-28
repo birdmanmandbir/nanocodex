@@ -26,7 +26,7 @@ use tokio::{
     task::JoinSet,
 };
 
-use crate::protocol::{
+use super::protocol::{
     CancelRequest, ControlResponse, ExecuteRequest, ExecuteResponse, ReadFileRequest,
     ReadFileResponse, SessionRequest, SessionResponse, ShutdownRequest, ToolResponse,
     WriteFileRequest,
@@ -64,6 +64,7 @@ pub enum VmGuestError {
     DuplicateRequestId(u64),
 }
 
+#[cfg(feature = "guest-runtime")]
 pub(crate) async fn serve(workspace: &Path) -> Result<(), VmGuestError> {
     serve_io(workspace, tokio::io::stdin(), tokio::io::stdout()).await
 }
@@ -540,11 +541,11 @@ mod tests {
 
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    use super::{execute_command, read_file, serve_io};
-    use crate::protocol::{
+    use super::super::protocol::{
         CancelRequest, ExecuteRequest, ReadFileRequest, SessionRequest, SessionResponse,
         ShutdownRequest,
     };
+    use super::{execute_command, read_file, serve_io};
 
     const DEFAULT_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 

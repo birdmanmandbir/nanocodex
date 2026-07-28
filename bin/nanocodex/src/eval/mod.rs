@@ -18,26 +18,27 @@ use std::{
 use clap::{Args, Subcommand};
 use eyre::{Result, eyre};
 use nanocodex_eval::{Task, VerifierCollect, VerifierEnvironmentMode};
-use nanovm::{
+use nanocodex_vm::image::{CachePolicy, DiskStatus, VmImageBuilder};
+use nanocodex_vm::{
     BlockDevice, GuestCommand, KrunVm, Network, SharedDirectory, VmConfig, VmProcessConfig,
 };
-use nanovm_image::{CachePolicy, DiskStatus, VmImageBuilder};
 use serde::Serialize;
 
 use self::image::{prepare_task_image, prepare_verifier_image};
+pub(crate) use self::run::prepare_vm_guest_runtime;
 
 #[derive(Args)]
-#[command(args_conflicts_with_subcommands = true, subcommand_required = true)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 pub(crate) struct Eval {
     #[command(subcommand)]
-    command: EvalCommand,
+    command: Option<EvalCommand>,
+
+    #[command(flatten)]
+    run: run::Run,
 }
 
 #[derive(Subcommand)]
 enum EvalCommand {
-    /// Run fresh Nanocodex attempts and retain Harbor-compatible outputs.
-    Run(Box<run::Run>),
-
     /// Prepare task VM images without running agents.
     Prepare(Prepare),
 
@@ -287,20 +288,20 @@ impl Eval {
     pub(crate) const fn requires_synchronous_vm(&self) -> bool {
         matches!(
             self.command,
-            EvalCommand::Vm {
+            Some(EvalCommand::Vm {
                 command: VmCommand::Run { .. } | VmCommand::RunConfig { .. }
-            }
+            })
         )
     }
 
     pub(crate) fn run_synchronous_vm(&self) -> Result<()> {
         match &self.command {
-            EvalCommand::Vm {
+            Some(EvalCommand::Vm {
                 command: command @ VmCommand::Run { .. },
-            } => run_raw_vm(command),
-            EvalCommand::Vm {
+            }) => run_raw_vm(command),
+            Some(EvalCommand::Vm {
                 command: VmCommand::RunConfig { config },
-            } => run_private_vmm(config),
+            }) => run_private_vmm(config),
             _ => Err(eyre!("evaluation command is not a synchronous VM command")),
         }
     }
@@ -517,15 +518,16 @@ async fn prepare_tasks(
 }
 
 async fn run(eval: Eval) -> Result<()> {
-    match eval.command {
-        EvalCommand::Run(command) => command.run().await?,
-        EvalCommand::Prepare(Prepare {
+    let Eval { command, run } = eval;
+    match command {
+        None => run.run().await?,
+        Some(EvalCommand::Prepare(Prepare {
             tasks,
             suites,
             cache,
             refresh,
-        })
-        | EvalCommand::Vm {
+        }))
+        | Some(EvalCommand::Vm {
             command:
                 VmCommand::Prepare {
                     tasks,
@@ -533,12 +535,12 @@ async fn run(eval: Eval) -> Result<()> {
                     cache,
                     refresh,
                 },
-        } => prepare_tasks(tasks, suites, cache, refresh).await?,
-        EvalCommand::Task {
+        }) => prepare_tasks(tasks, suites, cache, refresh).await?,
+        Some(EvalCommand::Task {
             directory,
             json,
             prompt,
-        } => {
+        }) => {
             let task = Task::load(directory)?;
             let output = TaskOutput::from(&task);
             let stdout = io::stdout();
@@ -550,12 +552,12 @@ async fn run(eval: Eval) -> Result<()> {
                 output.write_human(&mut stdout, prompt)?;
             }
         }
-        EvalCommand::Inspect(command) => command.run()?,
-        EvalCommand::Compare(command) => command.run().await?,
-        EvalCommand::Cleanup(command) => command.run()?,
-        EvalCommand::Vm {
+        Some(EvalCommand::Inspect(command)) => command.run()?,
+        Some(EvalCommand::Compare(command)) => command.run().await?,
+        Some(EvalCommand::Cleanup(command)) => command.run()?,
+        Some(EvalCommand::Vm {
             command: VmCommand::Run { .. } | VmCommand::RunConfig { .. },
-        } => {
+        }) => {
             return Err(eyre!(
                 "VM commands must be dispatched before starting the async runtime"
             ));
@@ -702,7 +704,8 @@ mod tests {
         ])
         .unwrap();
         let Some(Command::Eval(Eval {
-            command: EvalCommand::Prepare(super::Prepare { tasks, .. }),
+            command: Some(EvalCommand::Prepare(super::Prepare { tasks, .. })),
+            ..
         })) = cli.command
         else {
             panic!("expected vm prepare command");
@@ -730,9 +733,10 @@ mod tests {
         .unwrap();
         let Some(Command::Eval(Eval {
             command:
-                EvalCommand::Vm {
+                Some(EvalCommand::Vm {
                     command: VmCommand::Prepare { suites, .. },
-                },
+                }),
+            ..
         })) = cli.command
         else {
             panic!("expected vm prepare command");
@@ -757,9 +761,10 @@ mod tests {
         .unwrap();
         let Some(Command::Eval(Eval {
             command:
-                EvalCommand::Vm {
+                Some(EvalCommand::Vm {
                     command: VmCommand::Run { no_network, .. },
-                },
+                }),
+            ..
         })) = cli.command
         else {
             panic!("expected vm run command");
@@ -789,7 +794,7 @@ mod tests {
     #[test]
     fn complete_eval_surface_is_nested_under_nanocodex() {
         for arguments in [
-            vec!["nanocodex", "eval", "run", "--task", "tasks/write-greeting"],
+            vec!["nanocodex", "eval", "--task", "tasks/write-greeting"],
             vec![
                 "nanocodex",
                 "eval",

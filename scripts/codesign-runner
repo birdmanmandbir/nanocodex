@@ -15,6 +15,16 @@ if [ "${1:-}" = eval ]; then
             ;;
     esac
 fi
+if [ "$requires_hypervisor" = false ]; then
+    for argument in "$@"; do
+        case "$argument" in
+            --vm|--vm=*|--vm-rootfs|--vm-rootfs=*)
+                requires_hypervisor=true
+                break
+                ;;
+        esac
+    done
+fi
 
 if [ "$requires_hypervisor" = false ]; then
     exec "$binary" "$@"
@@ -22,7 +32,7 @@ fi
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repository_dir=$(dirname -- "$script_dir")
-entitlements="$repository_dir/nanovm.entitlements"
+entitlements="$repository_dir/nanocodex-vm.entitlements"
 binary_digest=$(shasum -a 256 "$binary" | cut -d ' ' -f 1)
 entitlements_digest=$(shasum -a 256 "$entitlements" | cut -d ' ' -f 1)
 signed_directory="$repository_dir/target/nanocodex-signed/$binary_digest-$entitlements_digest"

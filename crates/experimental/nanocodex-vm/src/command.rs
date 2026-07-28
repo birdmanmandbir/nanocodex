@@ -87,7 +87,7 @@ impl GuestCommand {
 
     /// Returns the complete guest environment.
     #[must_use]
-    pub fn environment(&self) -> &BTreeMap<OsString, OsString> {
+    pub const fn environment(&self) -> &BTreeMap<OsString, OsString> {
         &self.environment
     }
 

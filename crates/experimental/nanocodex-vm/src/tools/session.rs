@@ -9,10 +9,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use nanocodex_tools::{ToolContext, ToolInput, ToolOutput, ToolResult, standard::StandardTool};
-use nanovm::{
+use crate::{
     EgressLease, GuestCommand, PrivateVmProcessConfig, VmConfig, VmProcessConfig, VmProcessError,
 };
+use nanocodex_tools::{ToolContext, ToolInput, ToolOutput, ToolResult, standard::StandardTool};
 use thiserror::Error;
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -21,7 +21,7 @@ use tokio::{
 };
 use tracing::{Instrument, Span, info, info_span};
 
-use crate::{
+use super::{
     VmToolClient,
     protocol::{
         CancelRequest, ControlResponse, ExecuteRequest, ExecuteResponse, ReadFileRequest,
@@ -189,7 +189,7 @@ pub enum VmToolSessionError {
 /// Owner of one persistent VMM child carrying workspace tool calls.
 ///
 /// Keep this value alive for the complete root-agent tree. Clone
-/// [`VmToolSessionHandle`] or [`crate::VmTools`] into each driver's tool
+/// [`VmToolSessionHandle`] or [`super::VmTools`] into each driver's tool
 /// factory; all of those handles route to this one VM.
 pub struct VmToolSession {
     handle: VmToolSessionHandle,
@@ -374,8 +374,8 @@ impl VmToolSession {
 
     /// Returns the standard VM-backed workspace tool factory for this session.
     #[must_use]
-    pub fn tools(&self) -> crate::VmTools {
-        crate::VmTools::new(self.handle())
+    pub fn tools(&self) -> super::VmTools {
+        super::VmTools::new(self.handle())
     }
 
     /// Waits until the guest tool server has accepted and answered a typed
@@ -1204,13 +1204,17 @@ mod tracing_tests {
         command.arg("-c").arg(script);
         let capture = TraceCapture::default();
         let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(capture.clone()));
-        tracing::callsite::rebuild_interest_cache();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
 
         tracing::dispatcher::with_default(&dispatch, || {
+            // Earlier tests may have registered these static callsites while
+            // no subscriber was active. Rebuild only after installing this
+            // dispatch so cached `never` interest cannot make the assertion
+            // order-dependent.
+            tracing::callsite::rebuild_interest_cache();
             runtime.block_on(async {
                 let session = VmToolSession::spawn(&mut command).unwrap();
                 let context =
@@ -1375,7 +1379,7 @@ mod tracing_tests {
             let session = VmToolSession::spawn(&mut command).unwrap();
             let guard = Arc::new(());
             let weak_guard = Arc::downgrade(&guard);
-            let mut egress = nanovm::EgressLease::disabled();
+            let mut egress = crate::EgressLease::disabled();
             egress.retain(guard);
             session.provision_egress(egress).await.unwrap();
             let tools = session.tools();
@@ -1438,9 +1442,9 @@ mod tracing_tests {
         runtime.block_on(async {
             let session = VmToolSession::spawn_configured(
                 command,
-                nanovm::VmConfig::ext4("/unused/root.ext4"),
-                nanovm::GuestCommand::new("/bin/true"),
-                nanovm::EgressLease::disabled(),
+                crate::VmConfig::ext4("/unused/root.ext4"),
+                crate::GuestCommand::new("/bin/true"),
+                crate::EgressLease::disabled(),
             )
             .await
             .unwrap();

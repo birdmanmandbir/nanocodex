@@ -98,7 +98,7 @@ build-vm-guest:
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="{{justfile_directory()}}/scripts/aarch64-unknown-linux-musl-linker" \
     CC_aarch64_unknown_linux_musl="{{justfile_directory()}}/scripts/aarch64-unknown-linux-musl-linker" \
     AR_aarch64_unknown_linux_musl="{{justfile_directory()}}/scripts/aarch64-unknown-linux-musl-ar" \
-    cargo build -p nanocodex-vm --bin nanocodex-vm-guest --no-default-features --features guest --target aarch64-unknown-linux-musl
+    cargo build -p nanocodex-vm --bin nanocodex-vm-guest --no-default-features --features guest-runtime --target aarch64-unknown-linux-musl
 
 build-vm-example:
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="{{justfile_directory()}}/scripts/aarch64-unknown-linux-musl-linker" \
@@ -106,7 +106,7 @@ build-vm-example:
     AR_aarch64_unknown_linux_musl="{{justfile_directory()}}/scripts/aarch64-unknown-linux-musl-ar" \
     cargo build -p nanocodex-examples --bin vm-tools --all-features
     @if [ "$(uname -s)" = "Darwin" ]; then \
-        codesign --entitlements nanovm.entitlements --force --sign - target/debug/vm-tools; \
+        codesign --entitlements nanocodex-vm.entitlements --force --sign - target/debug/vm-tools; \
     fi
 
 # Start the ephemeral localhost Jaeger backend used by the OTLP trace demo.
@@ -161,7 +161,7 @@ bench-pr50:
 
 # Deterministic warm-image and retained VM protocol latency gates.
 bench-vm:
-    cargo bench -p nanovm-image --bench image_cache
+    cargo bench -p nanocodex-vm --bench image_cache
     cargo bench -p nanocodex-vm --bench vm_session -- vm_session_protocol
 
 # Deterministic task loading, sweep planning, durable resume, and ATIF gates.

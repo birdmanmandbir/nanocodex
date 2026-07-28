@@ -67,18 +67,14 @@
   CLI behavior into the library.
 - Tempo payment, egress, and `NanoUSD` support stay under `bin/`; public
   `nanocodex-*` library crates must not depend on them.
-- `nanovm` owns the audited libkrun boundary, typed VM/process configuration,
-  gvproxy lifecycle, and provider-neutral egress capabilities.
-- `nanocodex-vm` owns the bounded retained host/guest protocol and VM-backed
-  standard tool adapters. Its guest reuses the canonical local workspace-tool
-  contracts rather than introducing a second tool runtime.
-- `nanovm-image` owns OCI/Dockerfile resolution, content-addressed immutable
-  ext4 preparation, cache locking, and per-attempt reflinks.
-- `nanocodex-eval` owns typed tasks, attempts, durable scheduling, sweeps,
-  retained results, and native or VM evaluator policy.
-- `nanocodex-eval-harbor` owns the canonical Harbor and ATIF projection of
-  retained evaluation events. It does not own model decisions or task
-  mutation.
+- The unpublished experimental `nanocodex-vm` crate owns the complete VM
+  boundary: the audited libkrun interface, VM/process configuration, gvproxy
+  and provider-neutral egress, OCI/Dockerfile image preparation, and retained
+  host/guest workspace tools. Its guest reuses the canonical local
+  workspace-tool contracts rather than introducing a second tool runtime.
+- The unpublished experimental `nanocodex-eval` crate owns typed tasks and
+  attempts, durable scheduling and sweeps, retained results, and Harbor/ATIF
+  projection.
 - Each lower crate must remain useful without importing the higher orchestration
   crate. Avoid circular concepts and leaky socket/runtime types.
 - `scripts/check-crate-boundaries.sh` is the executable dependency policy.

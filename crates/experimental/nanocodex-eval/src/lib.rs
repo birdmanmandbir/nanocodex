@@ -1,8 +1,8 @@
 //! Typed, durable evaluation for Nanocodex agents.
 //!
 //! This crate owns task loading, fresh attempt lifecycles, bounded admission,
-//! resumable jobs, typed events and results, and task × agent × trial sweeps.
-//! It does not require Harbor or a VM. Install an attempt backend with
+//! resumable jobs, Harbor projection, typed events and results, and
+//! task × agent × trial sweeps. Install an attempt backend with
 //! [`EvaluatorBuilder::attempt_agent`] when a task should run somewhere other
 //! than a native disposable workspace.
 //!
@@ -55,6 +55,7 @@
 mod atif;
 mod evaluator;
 mod event;
+pub mod harbor;
 mod job;
 mod native;
 mod result;
