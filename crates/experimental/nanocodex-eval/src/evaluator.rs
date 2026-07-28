@@ -83,6 +83,8 @@ struct AdmissionController {
 struct AdmissionState {
     running: usize,
     memory_mb: u64,
+    admitted: usize,
+    draining: bool,
 }
 
 struct AdmissionPermit {
@@ -181,6 +183,10 @@ pub enum EvalError {
     #[error("maximum task memory must be greater than zero")]
     InvalidMemory,
 
+    /// The evaluator stopped admitting new attempts while draining.
+    #[error("evaluation is draining and no longer admits new attempts")]
+    Draining,
+
     /// A task requires behavior unavailable in the native backend.
     #[error("task {task} cannot run with the native backend: {reason}")]
     UnsupportedNativeTask {
@@ -272,7 +278,8 @@ impl Evaluator {
             .inner
             .admission
             .acquire(task.resources().memory_mb)
-            .await;
+            .await
+            .ok_or(EvalError::Draining)?;
         self.run_task(AttemptInput {
             task,
             nanocodex: self.inner.nanocodex.clone(),
@@ -410,15 +417,18 @@ impl Evaluator {
                         .inner
                         .admission
                         .acquire(input.task.resources().memory_mb)
-                        .await;
+                        .await?;
                     let result = evaluator.run_task(input).await;
-                    (index, result)
+                    Some((index, result))
                 }
             })
             .buffer_unordered(scheduling_window);
         let mut results = Vec::new();
         let mut first_error = None;
-        while let Some((index, result)) = completed.next().await {
+        while let Some(output) = completed.next().await {
+            let Some((index, result)) = output else {
+                continue;
+            };
             match result {
                 Ok(result) => results.push((index, result)),
                 Err(error) if first_error.is_none() => first_error = Some(error),
@@ -479,6 +489,15 @@ impl Evaluator {
     #[must_use]
     pub fn max_memory_mb(&self) -> Option<u64> {
         self.inner.max_memory_mb
+    }
+
+    /// Stops admission of attempts that have not started and returns the number
+    /// admitted since this evaluator was built.
+    ///
+    /// Attempts that already hold admission continue normally. Repeated calls
+    /// are idempotent and return the same final admitted count.
+    pub fn begin_drain(&self) -> usize {
+        self.inner.admission.begin_drain()
     }
 
     /// Returns the execution environment selected for every attempt.
@@ -968,7 +987,7 @@ impl AdmissionController {
         }
     }
 
-    async fn acquire(self: &Arc<Self>, requested_memory_mb: u64) -> AdmissionPermit {
+    async fn acquire(self: &Arc<Self>, requested_memory_mb: u64) -> Option<AdmissionPermit> {
         let memory_mb = self
             .max_memory_mb
             .map_or(0, |limit| requested_memory_mb.min(limit));
@@ -976,6 +995,9 @@ impl AdmissionController {
             let changed = self.changed.notified();
             {
                 let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                if state.draining {
+                    return None;
+                }
                 let concurrency_available = state.running < self.max_concurrency;
                 let memory_available = self.max_memory_mb.is_none_or(|limit| {
                     state
@@ -986,14 +1008,24 @@ impl AdmissionController {
                 if concurrency_available && memory_available {
                     state.running += 1;
                     state.memory_mb += memory_mb;
-                    return AdmissionPermit {
+                    state.admitted = state.admitted.saturating_add(1);
+                    return Some(AdmissionPermit {
                         controller: Arc::clone(self),
                         memory_mb,
-                    };
+                    });
                 }
             }
             changed.await;
         }
+    }
+
+    fn begin_drain(&self) -> usize {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.draining = true;
+        let admitted = state.admitted;
+        drop(state);
+        self.changed.notify_waiters();
+        admitted
     }
 }
 
@@ -1183,6 +1215,7 @@ fn failure_kind(error: &EvalError) -> EvalFailureKind {
         | EvalError::AttemptAgent(_) => EvalFailureKind::Environment,
         EvalError::InvalidConcurrency
         | EvalError::InvalidMemory
+        | EvalError::Draining
         | EvalError::Io(_)
         | EvalError::Json(_)
         | EvalError::RunConflict(_)
@@ -1542,7 +1575,7 @@ mod tracing_tests {
             .unwrap();
         runtime.block_on(async {
             let admission = Arc::new(AdmissionController::new(2, Some(4)));
-            let three = admission.acquire(3).await;
+            let three = admission.acquire(3).await.unwrap();
 
             assert!(
                 tokio::time::timeout(Duration::from_millis(5), admission.acquire(2))
@@ -1551,6 +1584,7 @@ mod tracing_tests {
             );
             let one = tokio::time::timeout(Duration::from_millis(5), admission.acquire(1))
                 .await
+                .unwrap()
                 .unwrap();
             assert!(
                 tokio::time::timeout(Duration::from_millis(5), admission.acquire(1))
@@ -1560,13 +1594,36 @@ mod tracing_tests {
 
             drop(one);
             drop(three);
-            let oversized = admission.acquire(10).await;
+            let oversized = admission.acquire(10).await.unwrap();
             assert!(
                 tokio::time::timeout(Duration::from_millis(5), admission.acquire(1))
                     .await
                     .is_err()
             );
             drop(oversized);
+        });
+    }
+
+    #[test]
+    fn draining_closes_admission_without_cancelling_admitted_work() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let admission = Arc::new(AdmissionController::new(1, None));
+            let admitted = admission.acquire(1).await.unwrap();
+            let waiting = {
+                let admission = Arc::clone(&admission);
+                tokio::spawn(async move { admission.acquire(1).await })
+            };
+
+            assert_eq!(admission.begin_drain(), 1);
+            assert_eq!(admission.begin_drain(), 1);
+            assert!(waiting.await.unwrap().is_none());
+
+            drop(admitted);
+            assert!(admission.acquire(1).await.is_none());
         });
     }
 

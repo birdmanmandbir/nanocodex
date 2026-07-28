@@ -42,7 +42,7 @@ use regex::RegexSet;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
-use tokio::process::Command;
+use tokio::{process::Command, sync::watch};
 use tracing::{info, info_span, warn};
 use yansi::Painted;
 
@@ -601,18 +601,39 @@ impl Run {
         let skipped_attempts = attempt_count.saturating_sub(remaining_attempts);
         report_resume(&eval, skipped_attempts, attempt_count);
         let harbor = Harbor::new(&eval)?.record(events.subscribe())?;
+        let (expected_attempts, expected_attempts_rx) = watch::channel(remaining_attempts);
         let progress = tokio::spawn(report_progress(
             events.subscribe(),
-            remaining_attempts,
+            expected_attempts_rx,
             usize::from(resolved.concurrency),
             resolved.max_memory_mb,
         ));
         let evaluation_setup = evaluation_setup_started.elapsed();
         let attempts_started = Instant::now();
-        let sweep_result = eval.sweep(sweep).await;
+        let execution = finish_or_drain(
+            eval.sweep(sweep),
+            tokio::signal::ctrl_c(),
+            remaining_attempts,
+            || {
+                let admitted = eval.begin_drain();
+                eprintln!(
+                    "Interrupt received; stopped admitting new trials after {admitted} \
+                     attempt(s), draining admitted work"
+                );
+                admitted
+            },
+        )
+        .await?;
+        expected_attempts.send_replace(execution.terminal_attempts);
+        drop(expected_attempts);
         let attempts = attempts_started.elapsed();
-        let finished =
-            finish_evaluation(harbor, remaining_attempts, progress, sweep_result).await?;
+        let finished = finish_evaluation(
+            harbor,
+            execution.terminal_attempts,
+            progress,
+            execution.result,
+        )
+        .await?;
         let output_started = Instant::now();
         persist_aggregate(finished.job.directory(), &finished.results)?;
         Self::write_report(
@@ -635,8 +656,18 @@ impl Run {
         };
         measurements.persist(finished.job.directory())?;
         measurements.record(&finished.results, attempt_count, finished.failed);
-        record_last_run(finished.job.directory())?;
-        finish_run(finished.run_error)
+        if !execution.interrupted {
+            record_last_run(finished.job.directory())?;
+        }
+        finish_run(finished.run_error)?;
+        if execution.interrupted {
+            return Err(eyre!(
+                "evaluation interrupted after draining admitted attempts; rerun the same \
+                 workload to resume {}",
+                finished.job.directory().display()
+            ));
+        }
+        Ok(())
     }
 
     fn build_evaluator(
@@ -1292,6 +1323,44 @@ struct FinishedEvaluation {
     run_error: Option<nanocodex_eval::EvalError>,
     failed: usize,
     harbor_finish: Duration,
+}
+
+struct DrainExecution<T, E> {
+    result: Result<T, E>,
+    terminal_attempts: usize,
+    interrupted: bool,
+}
+
+async fn finish_or_drain<T, E, Work, Shutdown, Drain>(
+    work: Work,
+    shutdown: Shutdown,
+    terminal_attempts: usize,
+    drain: Drain,
+) -> io::Result<DrainExecution<T, E>>
+where
+    Work: Future<Output = Result<T, E>>,
+    Shutdown: Future<Output = io::Result<()>>,
+    Drain: FnOnce() -> usize,
+{
+    tokio::pin!(work);
+    tokio::pin!(shutdown);
+    tokio::select! {
+        result = &mut work => Ok(DrainExecution {
+            result,
+            terminal_attempts,
+            interrupted: false,
+        }),
+        signal = &mut shutdown => {
+            signal?;
+            let terminal_attempts = drain();
+            let result = work.await;
+            Ok(DrainExecution {
+                result,
+                terminal_attempts,
+                interrupted: true,
+            })
+        }
+    }
 }
 
 async fn finish_evaluation(
@@ -3540,10 +3609,11 @@ impl Progress {
 
 async fn report_progress(
     mut events: EvalEventStream,
-    expected: usize,
+    mut expected_attempts: watch::Receiver<usize>,
     concurrency: usize,
     max_memory_mb: Option<u64>,
 ) -> Result<Progress> {
+    let mut expected = *expected_attempts.borrow_and_update();
     let count = if expected == 1 { "" } else { "s" };
     if let Some(max_memory_mb) = max_memory_mb {
         eprintln!(
@@ -3556,11 +3626,24 @@ async fn report_progress(
     let mut completed = 0;
     let mut outcomes = Vec::with_capacity(expected);
     let mut failed = 0;
+    let mut expected_updates_open = true;
     while completed < expected {
-        let event = events
-            .recv()
-            .await?
-            .ok_or_else(|| eyre!("event stream closed after {completed} of {expected} attempts"))?;
+        let event = if expected_updates_open {
+            tokio::select! {
+                update = expected_attempts.changed() => {
+                    if update.is_ok() {
+                        expected = *expected_attempts.borrow_and_update();
+                    } else {
+                        expected_updates_open = false;
+                    }
+                    continue;
+                }
+                event = events.recv() => event?,
+            }
+        } else {
+            events.recv().await?
+        }
+        .ok_or_else(|| eyre!("event stream closed after {completed} of {expected} attempts"))?;
         match &event.kind {
             EvalEventKind::Completed(result) => {
                 completed += 1;
@@ -3655,7 +3738,7 @@ fn format_milliseconds(milliseconds: i64) -> String {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs,
+        fs, future,
         path::{Path, PathBuf},
         process::Command as StdCommand,
         time::Duration,
@@ -3668,16 +3751,39 @@ mod tests {
     use super::{
         CACHED_VERIFIER_SCRIPT, DEFAULT_HOST_UTILIZATION_PERCENT, DEFAULT_TRIALS, HostResources,
         RetainedBuild, RetainedScheduling, Run, RunInvocation, RunMeasurements, RunSummary,
-        VmRetention, cached_verifier_script, load_tasks, recognized_verifier_setup,
-        remove_passed_rootfs, retained_retry_task_names, retained_task_durations,
-        verifier_bootstrap_network_failed, verifier_cache_key, verifier_network_retry_delay,
-        verifier_shell, verifier_timeout_output,
+        VmRetention, cached_verifier_script, finish_or_drain, load_tasks,
+        recognized_verifier_setup, remove_passed_rootfs, retained_retry_task_names,
+        retained_task_durations, verifier_bootstrap_network_failed, verifier_cache_key,
+        verifier_network_retry_delay, verifier_shell, verifier_timeout_output,
     };
 
     #[derive(Parser)]
     struct TestCli {
         #[command(flatten)]
         eval: Run,
+    }
+
+    #[tokio::test]
+    async fn injected_interrupt_closes_admission_then_waits_for_admitted_work() {
+        let (release, released) = tokio::sync::oneshot::channel();
+        let execution = finish_or_drain(
+            async {
+                released.await.unwrap();
+                Ok::<_, &'static str>(17)
+            },
+            future::ready(Ok(())),
+            9,
+            || {
+                release.send(()).unwrap();
+                3
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(execution.result.unwrap(), 17);
+        assert_eq!(execution.terminal_attempts, 3);
+        assert!(execution.interrupted);
     }
 
     #[test]
