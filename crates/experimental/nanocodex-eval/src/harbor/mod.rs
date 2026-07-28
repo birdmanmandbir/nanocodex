@@ -48,7 +48,7 @@ use std::{
 use crate::{
     AgentMetadata, AggregateDataset, AtifBuilder, AtifTrajectory, AttemptFact,
     AttemptFactArtifacts, EvalEnvironment, EvalEventKind, EvalEventStream, EvalEventStreamError,
-    EvalFailure, EvalResult, Evaluator, LatencyBreakdown, PhaseTiming, Task,
+    EvalFailure, EvalResult, Evaluator, LatencyBreakdown, PhaseTiming, Task, TaskLoadError,
     durable::scan_manifest_trials,
     sweep::{RunCoordinate, RunManifest},
 };
@@ -71,9 +71,9 @@ pub enum HarborError {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 
-    /// Task ignore rules could not be compiled.
-    #[error("failed to compile task ignore rules: {0}")]
-    Ignore(#[from] ignore::Error),
+    /// A task package changed or became unreadable before artifact projection.
+    #[error(transparent)]
+    TaskPackage(#[from] TaskLoadError),
 
     /// A task directory contained no packageable files.
     #[error("task directory is empty: {0}")]
@@ -496,6 +496,7 @@ impl HarborArtifacts {
         trajectory: &AtifTrajectory,
     ) -> Result<(), HarborError> {
         let task = result.task();
+        task.validate_package()?;
         let root = &result.artifacts.directory;
         let agent = root.join("agent");
         let input_path = agent.join("input.jsonl");
@@ -620,6 +621,7 @@ impl HarborArtifacts {
         trajectory: &AtifTrajectory,
     ) -> Result<(), HarborError> {
         let task = failure.task();
+        task.validate_package()?;
         let root = &failure.artifacts.directory;
         let agent = root.join("agent");
         let input_path = agent.join("input.jsonl");

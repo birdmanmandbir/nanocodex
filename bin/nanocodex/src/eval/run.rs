@@ -29,8 +29,8 @@ use nanocodex_eval::harbor::{Harbor, HarborJob, HarborRecorder};
 use nanocodex_eval::{
     AttemptAgent, AttemptVerification, AttemptVerifier, EvalAttempt, EvalEnvironment,
     EvalEventKind, EvalEventStream, EvalFailure, EvalFailureKind, EvalResult, EvalStatus,
-    Evaluator, EvaluatorBuilder, NetworkPolicy, Sweep, SweepResults, Task, VerifierEnvironmentMode,
-    VerifierResult,
+    Evaluator, EvaluatorBuilder, NetworkPolicy, Sweep, SweepResults, Task, TaskLoadError,
+    VerifierEnvironmentMode, VerifierResult,
 };
 use nanocodex_vm::image::{CachePolicy, VmImageBuilder, reflink_or_sparse_copy};
 use nanocodex_vm::{BlockDevice, GuestCommand, Network, VmConfig};
@@ -1830,9 +1830,12 @@ async fn prepare_vm_environments(
         if environments.contains_key(task.root()) {
             continue;
         }
+        task.validate_package()?;
         let prepared = prepare_task_image(builder, task, cache, policy).await?;
+        task.validate_package()?;
         let verifier = if task.verifier().environment_mode() == VerifierEnvironmentMode::Separate {
             let verifier = prepare_verifier_image(builder, task, cache, policy).await?;
+            task.validate_package()?;
             info!(
                 target: "nanocodex_eval",
                 task_name = task.name(),
@@ -1898,6 +1901,7 @@ async fn prepare_verifier_caches(
         cache
             .prepare_once(task, environment, vmm, runtime_image, gvproxy)
             .await?;
+        task.validate_package()?;
     }
     Ok(())
 }
@@ -2274,6 +2278,9 @@ enum VmAttemptError {
     Tools(#[from] ToolsBuildError),
 
     #[error(transparent)]
+    TaskPackage(#[from] TaskLoadError),
+
+    #[error(transparent)]
     ParseReward(#[from] ParseFloatError),
 
     #[error(transparent)]
@@ -2358,6 +2365,7 @@ fn vm_attempt_inner(
     host: VmAttemptHost<'_>,
     attempt: EvalAttempt<'_>,
 ) -> Result<VmAttempt, VmAttemptError> {
+    attempt.task().validate_package()?;
     let template = &environment.rootfs;
     let verifier_cache = if environment.verifier.is_some() {
         None
@@ -3099,6 +3107,7 @@ impl VmVerifier {
         task: &Task,
         attempt: EvalAttempt<'_>,
     ) -> Result<AttemptVerification, VmAttemptError> {
+        task.validate_package()?;
         let verifier_directory = attempt.directory().join("verifier");
         fs::create_dir_all(&verifier_directory)?;
         let (verifier_launch, verifier_session) = self.start_verifier_session(task).await?;
@@ -3134,6 +3143,7 @@ impl VmVerifier {
         let reward = String::from_utf8_lossy(&reward_bytes)
             .trim()
             .parse::<f64>()?;
+        task.validate_package()?;
         if reward > 0.0 && !self.retain_passed_rootfs {
             self.remove_passed_root_disks();
         }

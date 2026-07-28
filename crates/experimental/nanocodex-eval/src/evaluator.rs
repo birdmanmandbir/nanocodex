@@ -1,6 +1,9 @@
 use std::{
     error::Error,
+    ffi::OsString,
+    fs,
     future::Future,
+    io,
     num::ParseFloatError,
     path::{Path, PathBuf},
     pin::Pin,
@@ -31,7 +34,7 @@ use uuid::Uuid;
 use crate::{
     AgentId, AgentMetadata, AgentResult, EvalArtifacts, EvalEnvironment, EvalEvent, EvalEventKind,
     EvalEvents, EvalFailure, EvalFailureKind, EvalResult, EvalStatus, EvalTiming, PhaseTiming,
-    Sweep, SweepAttemptResult, SweepResults, Task, VerifierResult,
+    Sweep, SweepAttemptResult, SweepResults, Task, TaskLoadError, VerifierResult,
     job::EvalJob,
     native::{NativeAttempt, VerifierExecution},
 };
@@ -200,9 +203,18 @@ pub enum EvalError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
-    /// Native workspace materialization encountered a non-file entry.
-    #[error("unsupported non-file entry in task environment: {0}")]
-    UnsupportedEnvironmentEntry(PathBuf),
+    /// A loaded task package changed before an attempt could use it.
+    #[error(transparent)]
+    TaskPackage(#[from] TaskLoadError),
+
+    /// Retained evaluation output would mutate a hashed task package.
+    #[error("evaluation output {output} must not be nested in task package {task}")]
+    OutputOverlapsTask {
+        /// Prospective canonical output parent.
+        output: PathBuf,
+        /// Canonical task package root.
+        task: PathBuf,
+    },
 
     /// Agent setup or execution failed.
     #[error("Nanocodex failed: {0}")]
@@ -576,6 +588,8 @@ impl Evaluator {
         queue_wait: PhaseTiming,
         emitter: &mut AttemptEmitter<'_>,
     ) -> Result<EvalResult, EvalError> {
+        reject_output_overlap(self.inner.job.parent_directory(), task.root())?;
+        task.validate_package()?;
         let attempt = {
             let span = info_span!(
                 target: "nanocodex_eval",
@@ -605,10 +619,12 @@ impl Evaluator {
             .execute_agent(emitter, &task, &attempt, nanocodex)
             .await?;
 
+        task.validate_package()?;
         emitter.emit(EvalEventKind::VerifierStarted);
         let verifier = self
             .execute_verifier(&task, &attempt, agent.verifier.take())
             .await?;
+        task.validate_package()?;
         emitter.emit(EvalEventKind::VerifierOutput {
             stdout: verifier.stdout.clone(),
             stderr: verifier.stderr.clone(),
@@ -944,6 +960,12 @@ impl EvaluatorBuilder {
         if self.max_memory_mb == Some(0) {
             return Err(EvalError::InvalidMemory);
         }
+        if let Some(run) = &self.finite_run {
+            let output = prospective_canonical_directory(&self.output_directory)?;
+            for task in run.manifest.task_roots() {
+                reject_output_overlap(&output, task)?;
+            }
+        }
         let planned_attempts = self
             .finite_run
             .as_ref()
@@ -1219,7 +1241,8 @@ fn failure_kind(error: &EvalError) -> EvalFailureKind {
         EvalError::Nanocodex(_) | EvalError::AgentEventsClosed => EvalFailureKind::Agent,
         EvalError::AttemptVerifier(_) | EvalError::ParseReward(_) => EvalFailureKind::Verifier,
         EvalError::UnsupportedNativeTask { .. }
-        | EvalError::UnsupportedEnvironmentEntry(_)
+        | EvalError::TaskPackage(_)
+        | EvalError::OutputOverlapsTask { .. }
         | EvalError::AttemptAgent(_) => EvalFailureKind::Environment,
         EvalError::InvalidConcurrency
         | EvalError::InvalidMemory
@@ -1231,6 +1254,63 @@ fn failure_kind(error: &EvalError) -> EvalFailureKind {
         | EvalError::RunActive(_)
         | EvalError::MissingSweepCoordinate => EvalFailureKind::Internal,
     }
+}
+
+fn reject_output_overlap(output: &Path, task: &Path) -> Result<(), EvalError> {
+    if output.starts_with(task) {
+        return Err(EvalError::OutputOverlapsTask {
+            output: output.to_path_buf(),
+            task: task.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+fn prospective_canonical_directory(path: &Path) -> io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut missing = Vec::<OsString>::new();
+    let mut ancestor = absolute.as_path();
+    loop {
+        match fs::metadata(ancestor) {
+            Ok(metadata) if metadata.is_dir() => break,
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    format!("path component is not a directory: {}", ancestor.display()),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing.push(
+                    ancestor
+                        .file_name()
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::NotFound,
+                                format!(
+                                    "directory has no existing ancestor: {}",
+                                    absolute.display()
+                                ),
+                            )
+                        })?
+                        .to_os_string(),
+                );
+                ancestor = ancestor.parent().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("directory has no existing ancestor: {}", absolute.display()),
+                    )
+                })?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let mut canonical = fs::canonicalize(ancestor)?;
+    canonical.extend(missing.into_iter().rev());
+    Ok(canonical)
 }
 
 fn is_safety_refusal(error: &NanocodexError) -> bool {
@@ -1533,7 +1613,9 @@ mod tracing_tests {
         AdmissionController, EvalError, Evaluator, SweepCoordinate, failure_kind, trial_name,
         validate_attempt_environment,
     };
-    use crate::{EvalFailureKind, Sweep, Task, native::NativeAttempt, sweep::AgentId};
+    use crate::{
+        EvalFailureKind, Sweep, Task, TaskLoadError, native::NativeAttempt, sweep::AgentId,
+    };
 
     #[derive(Clone, Default)]
     struct TraceCapture(Arc<Mutex<HashMap<u64, CapturedSpan>>>);
@@ -1839,6 +1921,59 @@ allow_internet = false
         }));
 
         assert_eq!(failure_kind(&error), EvalFailureKind::AgentSafetyRefusal);
+    }
+
+    #[test]
+    fn rejects_a_task_package_mutated_after_load_before_attempt_setup() {
+        let tasks = tempdir().unwrap();
+        let task = write_named_task(tasks.path(), "changed", "terminal-bench/changed");
+        fs::write(task.environment_directory().join("late-input"), "changed\n").unwrap();
+        let output = tempdir().unwrap();
+        let (eval, _) = Evaluator::builder(Nanocodex::builder(OpenAi::new("test").unwrap()))
+            .output_directory(output.path())
+            .build()
+            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let error = runtime.block_on(eval.task(task)).unwrap_err();
+
+        assert!(matches!(
+            error,
+            EvalError::TaskPackage(TaskLoadError::ContentChanged { .. })
+        ));
+        assert!(
+            fs::read_dir(eval.directory())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        );
+    }
+
+    #[test]
+    fn rejects_finite_output_nested_in_a_hashed_task_package_before_creation() {
+        let tasks = tempdir().unwrap();
+        let task = write_named_task(tasks.path(), "overlap", "terminal-bench/overlap");
+        let output = task.environment_directory().join("retained/evals");
+        let sweep = Sweep::builder()
+            .task(task)
+            .agent(
+                "default",
+                Nanocodex::builder(OpenAi::new("test-key").unwrap()),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let result = Evaluator::builder(Nanocodex::builder(OpenAi::new("test-key").unwrap()))
+            .output_directory(&output)
+            .fresh_run(&sweep)
+            .build();
+
+        assert!(matches!(result, Err(EvalError::OutputOverlapsTask { .. })));
+        assert!(!output.exists());
     }
 
     fn write_named_task(parent: &std::path::Path, directory: &str, name: &str) -> Task {

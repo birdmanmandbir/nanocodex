@@ -446,6 +446,15 @@ async fn prepare_tasks(
     let mut failures = Vec::new();
     for task in tasks {
         let task_started = Instant::now();
+        if let Err(error) = task.validate_package() {
+            eprintln!(
+                "{}: task package changed duration={:.3?}\n{error:#}",
+                task.name(),
+                task_started.elapsed()
+            );
+            failures.push(task.name().to_owned());
+            continue;
+        }
         let prepared = match prepare_task_image(&builder, &task, &cache, policy).await {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -458,6 +467,15 @@ async fn prepare_tasks(
                 continue;
             }
         };
+        if let Err(error) = task.validate_package() {
+            eprintln!(
+                "{}: task package changed during image preparation duration={:.3?}\n{error:#}",
+                task.name(),
+                task_started.elapsed()
+            );
+            failures.push(task.name().to_owned());
+            continue;
+        }
         match prepared.disk_status() {
             DiskStatus::Hit => cache_hits += 1,
             DiskStatus::Created => cache_creations += 1,
@@ -485,6 +503,15 @@ async fn prepare_tasks(
                     continue;
                 }
             };
+            if let Err(error) = task.validate_package() {
+                eprintln!(
+                    "{} verifier: task package changed during image preparation duration={:.3?}\n{error:#}",
+                    task.name(),
+                    verifier_started.elapsed()
+                );
+                failures.push(format!("{} verifier", task.name()));
+                continue;
+            }
             match verifier.disk_status() {
                 DiskStatus::Hit => cache_hits += 1,
                 DiskStatus::Created => cache_creations += 1,

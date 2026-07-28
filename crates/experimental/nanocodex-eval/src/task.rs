@@ -7,7 +7,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::digest::task_content_digest;
+use crate::digest::TaskPackage;
 
 const TASK_CONFIG: &str = "task.toml";
 const TASK_INSTRUCTION: &str = "instruction.md";
@@ -148,9 +148,22 @@ pub enum TaskLoadError {
     Fingerprint {
         /// Task root that could not be fingerprinted.
         path: PathBuf,
-        /// Filesystem or ignore-rule failure.
+        /// Filesystem or package-entry failure.
         #[source]
         source: std::io::Error,
+    },
+
+    /// The task package changed after it was loaded.
+    #[error(
+        "task package changed after load at {path}: expected digest {expected}, found {actual}"
+    )]
+    ContentChanged {
+        /// Canonical task root.
+        path: PathBuf,
+        /// Digest captured when the task was loaded.
+        expected: String,
+        /// Digest observed immediately before use.
+        actual: String,
     },
 }
 
@@ -176,8 +189,12 @@ impl Task {
             });
         }
 
+        let package = TaskPackage::load(&root).map_err(|source| TaskLoadError::Fingerprint {
+            path: root.clone(),
+            source,
+        })?;
         let config_path = root.join(TASK_CONFIG);
-        let config_text = read(&config_path)?;
+        let config_text = read_package_file(&package, &root, TASK_CONFIG)?;
         let raw: RawTask = toml::from_str(&config_text).map_err(|source| TaskLoadError::Parse {
             path: config_path.clone(),
             source,
@@ -189,7 +206,7 @@ impl Task {
         }
 
         let instruction_path = root.join(TASK_INSTRUCTION);
-        let prompt = strip_leading_canary(&read(&instruction_path)?);
+        let prompt = strip_leading_canary(&read_package_file(&package, &root, TASK_INSTRUCTION)?);
         if prompt.trim().is_empty() {
             return Err(TaskLoadError::Invalid {
                 path: instruction_path,
@@ -200,7 +217,7 @@ impl Task {
         let verifier_script = root.join(VERIFIER_SCRIPT);
         require_file(&verifier_script)?;
         let environment_directory = root.join(TASK_ENVIRONMENT);
-        if !environment_directory.is_dir() {
+        if !package.contains_directory(Path::new(TASK_ENVIRONMENT)) {
             return Err(TaskLoadError::MissingFile {
                 path: environment_directory,
             });
@@ -211,15 +228,9 @@ impl Task {
             .environment
             .docker_image
             .unwrap_or_else(|| "local-dockerfile".to_owned());
-        let content_digest =
-            task_content_digest(&root).map_err(|source| TaskLoadError::Fingerprint {
-                path: root.clone(),
-                source,
-            })?;
-
-        Ok(Self {
+        let task = Self {
             root,
-            content_digest: content_digest.into_boxed_str(),
+            content_digest: package.digest().to_owned().into_boxed_str(),
             name: name.into_boxed_str(),
             description: raw.task.description.into_boxed_str(),
             prompt: prompt.into_boxed_str(),
@@ -261,7 +272,9 @@ impl Task {
             environment: raw.environment.env,
             requires_compose: raw.metadata.custom_docker_compose
                 || raw.environment.custom_docker_compose,
-        })
+        };
+        task.validate_package()?;
+        Ok(task)
     }
 
     /// Returns the canonical task root.
@@ -272,6 +285,26 @@ impl Task {
 
     pub(crate) fn content_digest(&self) -> &str {
         &self.content_digest
+    }
+
+    /// Re-fingerprints every packaged execution input and rejects mutation
+    /// since this task was loaded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskLoadError::Fingerprint`] when the package cannot be read,
+    /// or [`TaskLoadError::ContentChanged`] when its canonical digest changed.
+    pub fn validate_package(&self) -> Result<(), TaskLoadError> {
+        self.current_package().map(drop)
+    }
+
+    pub(crate) fn materialize_environment(&self, destination: &Path) -> Result<(), TaskLoadError> {
+        self.current_package()?
+            .materialize_directory(Path::new(TASK_ENVIRONMENT), destination)
+            .map_err(|source| TaskLoadError::Fingerprint {
+                path: self.root.clone(),
+                source,
+            })
     }
 
     /// Returns the stable task name.
@@ -344,6 +377,22 @@ impl Task {
     #[must_use]
     pub const fn requires_compose(&self) -> bool {
         self.requires_compose
+    }
+
+    fn current_package(&self) -> Result<TaskPackage, TaskLoadError> {
+        let package =
+            TaskPackage::load(&self.root).map_err(|source| TaskLoadError::Fingerprint {
+                path: self.root.clone(),
+                source,
+            })?;
+        if package.digest() != self.content_digest() {
+            return Err(TaskLoadError::ContentChanged {
+                path: self.root.clone(),
+                expected: self.content_digest().to_owned(),
+                actual: package.digest().to_owned(),
+            });
+        }
+        Ok(package)
     }
 }
 
@@ -518,10 +567,22 @@ const fn enabled() -> bool {
     true
 }
 
-fn read(path: &Path) -> Result<String, TaskLoadError> {
-    fs::read_to_string(path).map_err(|source| TaskLoadError::Read {
-        path: path.to_path_buf(),
-        source,
+fn read_package_file(
+    package: &TaskPackage,
+    root: &Path,
+    relative: &str,
+) -> Result<String, TaskLoadError> {
+    let path = root.join(relative);
+    let bytes = package
+        .read_file(Path::new(relative))
+        .map_err(|source| TaskLoadError::Read {
+            path: path.clone(),
+            source,
+        })?
+        .ok_or_else(|| TaskLoadError::MissingFile { path: path.clone() })?;
+    String::from_utf8(bytes).map_err(|source| TaskLoadError::Read {
+        path,
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
     })
 }
 

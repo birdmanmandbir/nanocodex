@@ -1,118 +1,505 @@
 use std::{
-    fs, io,
-    path::{Path, PathBuf},
+    fs::{self, File, OpenOptions},
+    io::{self, BufReader, Read as _, Write as _},
+    path::{Component, Path, PathBuf},
 };
 
-use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use sha2::{Digest, Sha256};
 
 const PACKAGE_FILES: [&str; 3] = ["task.toml", "instruction.md", "README.md"];
 const PACKAGE_DIRECTORIES: [&str; 4] = ["environment", "tests", "solution", "steps"];
+const PACKAGE_DIGEST_DOMAIN: &[u8] = b"nanocodex-task-package-v1\0";
 
-pub(crate) fn task_content_digest(root: &Path) -> io::Result<String> {
-    let matcher = package_ignore_matcher(root)?;
-    let mut files = Vec::new();
-    for name in PACKAGE_FILES {
-        let path = root.join(name);
-        if path.is_file() && !is_ignored(root, &path, matcher.as_ref()) {
-            files.push(path);
-        }
-    }
-    for name in PACKAGE_DIRECTORIES {
-        let directory = root.join(name);
-        if directory.is_dir() {
-            collect_package_files(root, &directory, matcher.as_ref(), &mut files)?;
-        }
-    }
-    files.sort_by_key(|path| relative_name(root, path));
-
-    let mut outer = Sha256::new();
-    for path in files {
-        let relative = relative_name(root, &path);
-        let file_hash = hex_digest(&fs::read(&path)?);
-        outer.update(relative.as_bytes());
-        outer.update([0]);
-        outer.update(file_hash.as_bytes());
-        outer.update(b"\n");
-    }
-    Ok(hex::encode(outer.finalize()))
+pub(crate) struct TaskPackage {
+    root: PathBuf,
+    entries: Vec<TaskPackageEntry>,
+    digest: String,
 }
 
-fn collect_package_files(
-    root: &Path,
-    directory: &Path,
-    matcher: Option<&Gitignore>,
-    files: &mut Vec<PathBuf>,
-) -> io::Result<()> {
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        if is_ignored(root, &path, matcher) {
-            continue;
+struct TaskPackageEntry {
+    relative: PathBuf,
+    normalized: String,
+    mode: u32,
+    kind: TaskPackageEntryKind,
+}
+
+enum TaskPackageEntryKind {
+    Directory,
+    File {
+        bytes: u64,
+        digest: [u8; 32],
+    },
+    Symlink {
+        target: PathBuf,
+        normalized_target: String,
+    },
+}
+
+impl TaskPackage {
+    pub(crate) fn load(root: &Path) -> io::Result<Self> {
+        let mut entries = Vec::new();
+        for name in PACKAGE_FILES {
+            let path = root.join(name);
+            match fs::symlink_metadata(&path) {
+                Ok(_) => collect_package_entry(root, &path, &mut entries)?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
         }
-        if file_type.is_dir() {
-            collect_package_files(root, &path, matcher, files)?;
-        } else if file_type.is_file() {
-            files.push(path);
+        for name in PACKAGE_DIRECTORIES {
+            let directory = root.join(name);
+            let metadata = match fs::symlink_metadata(&directory) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "task package root must be a directory, not a symlink or file: {}",
+                        directory.display()
+                    ),
+                ));
+            }
+            collect_package_entry(root, &directory, &mut entries)?;
+        }
+        entries.sort_by(|left, right| left.normalized.cmp(&right.normalized));
+        let digest = package_digest(&entries);
+        Ok(Self {
+            root: root.to_path_buf(),
+            entries,
+            digest,
+        })
+    }
+
+    pub(crate) fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    pub(crate) fn read_file(&self, relative: &Path) -> io::Result<Option<Vec<u8>>> {
+        let Some((bytes, digest)) = self
+            .entries
+            .iter()
+            .find(|entry| entry.relative == relative)
+            .and_then(|entry| match &entry.kind {
+                TaskPackageEntryKind::File { bytes, digest } => Some((*bytes, *digest)),
+                TaskPackageEntryKind::Directory | TaskPackageEntryKind::Symlink { .. } => None,
+            })
+        else {
+            return Ok(None);
+        };
+        let source = self.root.join(relative);
+        let contents = fs::read(&source)?;
+        validate_file_contents(&source, bytes, digest, &contents)?;
+        Ok(Some(contents))
+    }
+
+    pub(crate) fn contains_directory(&self, relative: &Path) -> bool {
+        self.entries.iter().any(|entry| {
+            entry.relative == relative && matches!(&entry.kind, TaskPackageEntryKind::Directory)
+        })
+    }
+
+    pub(crate) fn materialize_directory(
+        &self,
+        package_directory: &Path,
+        destination: &Path,
+    ) -> io::Result<()> {
+        let mut found = false;
+        let mut directory_modes = Vec::new();
+        for entry in &self.entries {
+            let Ok(relative) = entry.relative.strip_prefix(package_directory) else {
+                continue;
+            };
+            if relative.as_os_str().is_empty() {
+                found = matches!(&entry.kind, TaskPackageEntryKind::Directory);
+                continue;
+            }
+            let target = destination.join(relative);
+            match &entry.kind {
+                TaskPackageEntryKind::Directory => {
+                    fs::create_dir(&target)?;
+                    directory_modes.push((target, entry.mode));
+                }
+                TaskPackageEntryKind::File { bytes, digest } => {
+                    let mut file = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&target)?;
+                    copy_file_verified(
+                        &self.root.join(&entry.relative),
+                        &mut file,
+                        *bytes,
+                        *digest,
+                    )?;
+                    set_mode(&target, entry.mode)?;
+                }
+                TaskPackageEntryKind::Symlink { target: link, .. } => {
+                    create_symlink(link, &target)?;
+                }
+            }
+        }
+        if !found {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "task package has no directory {}",
+                    package_directory.display()
+                ),
+            ));
+        }
+        for (directory, mode) in directory_modes.into_iter().rev() {
+            set_mode(&directory, mode)?;
+        }
+        Ok(())
+    }
+}
+
+fn collect_package_entry(
+    root: &Path,
+    path: &Path,
+    entries: &mut Vec<TaskPackageEntry>,
+) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
+        .to_path_buf();
+    let normalized = normalized_relative_path(&relative)?;
+    let mode = metadata_mode(&metadata);
+    let kind = if metadata.file_type().is_symlink() {
+        let target = fs::read_link(path)?;
+        let normalized_target = normalized_path(&target)?;
+        TaskPackageEntryKind::Symlink {
+            target,
+            normalized_target,
+        }
+    } else if metadata.is_dir() {
+        TaskPackageEntryKind::Directory
+    } else if metadata.is_file() {
+        let (bytes, digest) = hash_file(path)?;
+        TaskPackageEntryKind::File { bytes, digest }
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported task package entry: {}", path.display()),
+        ));
+    };
+    entries.push(TaskPackageEntry {
+        relative,
+        normalized,
+        mode,
+        kind,
+    });
+
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path)? {
+            collect_package_entry(root, &entry?.path(), entries)?;
         }
     }
     Ok(())
 }
 
-fn package_ignore_matcher(root: &Path) -> io::Result<Option<Gitignore>> {
-    let path = root.join(".gitignore");
-    if !path.is_file() {
-        return Ok(None);
+fn package_digest(entries: &[TaskPackageEntry]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(PACKAGE_DIGEST_DOMAIN);
+    for entry in entries {
+        update_field(&mut digest, entry.normalized.as_bytes());
+        digest.update(entry.mode.to_le_bytes());
+        match &entry.kind {
+            TaskPackageEntryKind::Directory => digest.update(b"d"),
+            TaskPackageEntryKind::File {
+                bytes,
+                digest: file,
+            } => {
+                digest.update(b"f");
+                digest.update(bytes.to_le_bytes());
+                digest.update(file);
+            }
+            TaskPackageEntryKind::Symlink {
+                normalized_target, ..
+            } => {
+                digest.update(b"l");
+                update_field(&mut digest, normalized_target.as_bytes());
+            }
+        }
     }
-    let mut builder = GitignoreBuilder::new(root);
-    builder.add(path);
-    builder.build().map(Some).map_err(io::Error::other)
+    hex::encode(digest.finalize())
 }
 
-fn is_ignored(root: &Path, path: &Path, matcher: Option<&Gitignore>) -> bool {
-    let relative = path.strip_prefix(root).unwrap_or(path);
-    if let Some(matcher) = matcher {
-        return matcher
-            .matched_path_or_any_parents(relative, path.is_dir())
-            .is_ignore();
+fn update_field(digest: &mut Sha256, bytes: &[u8]) {
+    digest.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+    digest.update(bytes);
+}
+
+fn hash_file(path: &Path) -> io::Result<(u64, [u8; 32])> {
+    let mut file = BufReader::new(File::open(path)?);
+    let mut digest = Sha256::new();
+    let mut bytes = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        bytes = bytes.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        digest.update(&buffer[..read]);
     }
-
-    relative.components().any(|component| {
-        let name = component.as_os_str().to_string_lossy();
-        name == "__pycache__"
-            || name == ".DS_Store"
-            || name.ends_with(".pyc")
-            || name.ends_with(".swp")
-            || name.ends_with(".swo")
-            || name.ends_with('~')
-    })
+    Ok((bytes, digest.finalize().into()))
 }
 
-fn relative_name(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace(std::path::MAIN_SEPARATOR, "/")
+fn copy_file_verified(
+    source: &Path,
+    destination: &mut File,
+    expected_bytes: u64,
+    expected_digest: [u8; 32],
+) -> io::Result<()> {
+    let mut source_file = BufReader::new(File::open(source)?);
+    let mut digest = Sha256::new();
+    let mut bytes = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = source_file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        destination.write_all(&buffer[..read])?;
+        bytes = bytes.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        digest.update(&buffer[..read]);
+    }
+    validate_file_identity(
+        source,
+        expected_bytes,
+        expected_digest,
+        bytes,
+        digest.finalize().into(),
+    )
 }
 
-fn hex_digest(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
+fn validate_file_contents(
+    path: &Path,
+    expected_bytes: u64,
+    expected_digest: [u8; 32],
+    contents: &[u8],
+) -> io::Result<()> {
+    validate_file_identity(
+        path,
+        expected_bytes,
+        expected_digest,
+        u64::try_from(contents.len()).unwrap_or(u64::MAX),
+        Sha256::digest(contents).into(),
+    )
+}
+
+fn validate_file_identity(
+    path: &Path,
+    expected_bytes: u64,
+    expected_digest: [u8; 32],
+    actual_bytes: u64,
+    actual_digest: [u8; 32],
+) -> io::Result<()> {
+    if actual_bytes == expected_bytes && actual_digest == expected_digest {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "task package file changed while being read: {}",
+            path.display()
+        ),
+    ))
+}
+
+fn normalized_relative_path(path: &Path) -> io::Result<String> {
+    let mut normalized = String::new();
+    for component in path.components() {
+        let Component::Normal(component) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("task package path is not normalized: {}", path.display()),
+            ));
+        };
+        if !normalized.is_empty() {
+            normalized.push('/');
+        }
+        normalized.push_str(component.to_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("task package path is not UTF-8: {}", path.display()),
+            )
+        })?);
+    }
+    Ok(normalized)
+}
+
+fn normalized_path(path: &Path) -> io::Result<String> {
+    path.to_str()
+        .map(|path| path.replace(std::path::MAIN_SEPARATOR, "/"))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "task package symlink target is not UTF-8: {}",
+                    path.display()
+                ),
+            )
+        })
+}
+
+#[cfg(unix)]
+fn metadata_mode(metadata: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    metadata.permissions().mode() & 0o7777
+}
+
+#[cfg(not(unix))]
+fn metadata_mode(metadata: &fs::Metadata) -> u32 {
+    if metadata.permissions().readonly() {
+        0o444
+    } else {
+        0o644
+    }
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_readonly(mode & 0o222 == 0);
+    fs::set_permissions(path, permissions)
+}
+
+#[cfg(unix)]
+fn create_symlink(target: &Path, link: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(not(unix))]
+fn create_symlink(_target: &Path, link: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!(
+            "task package symlinks are unsupported on this platform: {}",
+            link.display()
+        ),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{fs, path::Path};
 
-    use super::task_content_digest;
+    use tempfile::tempdir;
+
+    use super::TaskPackage;
 
     #[test]
-    fn matches_harbors_package_hash_for_the_fixture() {
+    fn package_digest_is_deterministic_for_the_fixture() {
         let task = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tasks/write-greeting");
+        let first = TaskPackage::load(&task).unwrap();
+        let second = TaskPackage::load(&task).unwrap();
+
+        assert_eq!(first.digest(), second.digest());
+        assert_eq!(first.digest().len(), 64);
+    }
+
+    #[test]
+    fn ignored_files_are_still_execution_inputs() {
+        let task = package();
+        fs::write(task.path().join(".gitignore"), "environment/ignored\n").unwrap();
+        let ignored = task.path().join("environment/ignored");
+        fs::write(&ignored, "first\n").unwrap();
+        let first = TaskPackage::load(task.path()).unwrap();
+
+        fs::write(ignored, "second\n").unwrap();
+        let second = TaskPackage::load(task.path()).unwrap();
+
+        assert_ne!(first.digest(), second.digest());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_targets_are_execution_inputs() {
+        let task = package();
+        let link = task.path().join("environment/current");
+        std::os::unix::fs::symlink("first", &link).unwrap();
+        let first = TaskPackage::load(task.path()).unwrap();
+
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("second", &link).unwrap();
+        let second = TaskPackage::load(task.path()).unwrap();
+
+        assert_ne!(first.digest(), second.digest());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_modes_are_execution_inputs() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let task = package();
+        let executable = task.path().join("environment/run");
+        fs::write(&executable, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o644)).unwrap();
+        let first = TaskPackage::load(task.path()).unwrap();
+
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let second = TaskPackage::load(task.path()).unwrap();
+
+        assert_ne!(first.digest(), second.digest());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_materialization_preserves_files_directories_symlinks_and_modes() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let task = package();
+        let nested = task.path().join("environment/bin");
+        fs::create_dir(&nested).unwrap();
+        let executable = nested.join("run");
+        fs::write(&executable, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("run", nested.join("current")).unwrap();
+        let package = TaskPackage::load(task.path()).unwrap();
+        let destination = tempdir().unwrap();
+
+        package
+            .materialize_directory(Path::new("environment"), destination.path())
+            .unwrap();
 
         assert_eq!(
-            task_content_digest(&task).unwrap(),
-            "e1a05661b2068b6f93e0874941d1fc930604d5c58965eacbc5cc4b4a95882d59"
+            fs::read_to_string(destination.path().join("bin/run")).unwrap(),
+            "#!/bin/sh\n"
         );
+        assert_eq!(
+            fs::metadata(destination.path().join("bin/run"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::read_link(destination.path().join("bin/current")).unwrap(),
+            Path::new("run")
+        );
+    }
+
+    fn package() -> tempfile::TempDir {
+        let task = tempdir().unwrap();
+        fs::create_dir(task.path().join("environment")).unwrap();
+        fs::create_dir(task.path().join("tests")).unwrap();
+        fs::write(task.path().join("task.toml"), "schema_version = \"1.1\"\n").unwrap();
+        fs::write(task.path().join("instruction.md"), "Do the work.\n").unwrap();
+        task
     }
 }
