@@ -12,11 +12,13 @@ use crate::{
     },
 };
 
-use super::super::{ConnectionState, ResponsesService, record_pipeline_stats, required_call_index};
+use super::super::{
+    ResponsesAttemptGuard, ResponsesService, record_pipeline_stats, required_call_index,
+};
 
 pub(crate) async fn run(
     service: &ResponsesService,
-    connection: &mut ConnectionState,
+    attempt: &mut ResponsesAttemptGuard<'_>,
     request: &ResponsesAttempt,
     started_at: Instant,
 ) -> Result<ResponsesServiceResponse, ResponsesServiceError> {
@@ -28,7 +30,7 @@ pub(crate) async fn run(
         ));
     }
     let encode_started_at = Instant::now();
-    let encoded = service.encode_request(connection, request, ResponsesTransport::Https)?;
+    let encoded = service.encode_request(attempt, request, ResponsesTransport::Https)?;
     let encode_duration_ns = elapsed_ns(encode_started_at);
     let request_bytes = encoded.raw().get().len();
     let transport = ResponsesTransport::Https.as_str();
@@ -55,15 +57,18 @@ pub(crate) async fn run(
         },
     )?;
     let send_started_at = Instant::now();
+    let turn_state = attempt.turn_state.clone();
     let (mut response, metadata) = send_with_auth_recovery(
         service,
         request.profile.session_id(),
-        connection.turn_state.as_deref(),
+        turn_state.as_deref(),
         &encoded,
+        attempt.progress_mut(),
     )
     .await
     .map_err(|error| ResponsesServiceError::responses(error, FailurePhase::Send, 0))?;
-    connection.observe_turn_state(metadata.turn_state.as_deref());
+    attempt.progress_mut().mark_provider_accepted();
+    attempt.observe_turn_state(metadata.turn_state.as_deref());
     let send_duration_ns = elapsed_ns(send_started_at);
     span.record("request.send.duration_ns", send_duration_ns);
     let output = match request.kind {
@@ -74,6 +79,7 @@ pub(crate) async fn run(
                 &request.observer,
                 required_call_index(request)?,
                 started_at,
+                attempt.progress_mut(),
             )
             .await?,
         ),
@@ -84,6 +90,7 @@ pub(crate) async fn run(
                 &request.observer,
                 required_call_index(request)?,
                 started_at,
+                attempt.progress_mut(),
             )
             .await?,
         ),
@@ -122,9 +129,11 @@ async fn send_with_auth_recovery(
     session_id: &str,
     turn_state: Option<&str>,
     request: &EncodedRequest,
+    progress: &mut super::super::AttemptProgress,
 ) -> Result<(ResponsesHttpStream, HttpMetadata), ResponsesError> {
     let auth = service.auth_snapshot().await?;
-    match service
+    progress.mark_request_send_started();
+    let first = service
         .platform
         .http()
         .send(
@@ -134,8 +143,11 @@ async fn send_with_auth_recovery(
             turn_state,
             request,
         )
-        .await
-    {
+        .await;
+    if matches!(first, Err(ResponsesError::HttpRejected { .. })) {
+        progress.mark_provider_rejected();
+    }
+    match first {
         Err(ResponsesError::HttpRejected { status: 401, .. })
             if auth.mode() == OpenAiAuthMode::ChatGpt =>
         {
@@ -148,7 +160,8 @@ async fn send_with_auth_recovery(
                     detail: error.to_string(),
                 })?;
             let refreshed = service.auth_snapshot().await?;
-            service
+            progress.mark_request_send_started();
+            let second = service
                 .platform
                 .http()
                 .send(
@@ -158,7 +171,11 @@ async fn send_with_auth_recovery(
                     turn_state,
                     request,
                 )
-                .await
+                .await;
+            if matches!(second, Err(ResponsesError::HttpRejected { .. })) {
+                progress.mark_provider_rejected();
+            }
+            second
         }
         result => result,
     }

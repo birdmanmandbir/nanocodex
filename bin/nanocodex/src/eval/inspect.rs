@@ -9,7 +9,8 @@ use chrono::{DateTime, Utc};
 use clap::Args;
 use eyre::{Result, eyre};
 use nanocodex_eval::{
-    AtifSource, AtifTrajectory, BillingCompleteness, EvalCleanup, EvalOutcome, PhaseTiming,
+    AtifSource, AtifTrajectory, BillingCompleteness, EvalCleanup, EvalOutcome,
+    MeasurementCompleteness, PhaseTiming, UsageTotals, infer_retained_scored,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use uuid::Uuid;
@@ -86,6 +87,7 @@ struct JobInspection {
     total: usize,
     passed: usize,
     failed: usize,
+    unscored: usize,
     refused: usize,
     errored: usize,
     cleanup_failed: usize,
@@ -107,20 +109,18 @@ impl JobInspection {
             .collect::<Result<Vec<_>>>()?;
         let passed = trials
             .iter()
-            .filter(|trial| trial.status == TrialStatus::Passed)
+            .filter(|trial| trial.score_status == TrialScoreStatus::Passed)
             .count();
         let failed = trials
             .iter()
-            .filter(|trial| trial.status == TrialStatus::Failed)
+            .filter(|trial| trial.score_status == TrialScoreStatus::Failed)
             .count();
-        let refused = trials
+        let unscored = trials
             .iter()
-            .filter(|trial| trial.status == TrialStatus::Refused)
+            .filter(|trial| trial.score_status == TrialScoreStatus::Unscored)
             .count();
-        let errored = trials
-            .iter()
-            .filter(|trial| trial.status == TrialStatus::Errored)
-            .count();
+        let refused = trials.iter().filter(|trial| trial.refused).count();
+        let errored = trials.iter().filter(|trial| trial.errored).count();
         let cleanup_failed = trials.iter().filter(|trial| trial.cleanup_failed).count();
         Ok(Self {
             id: result.id,
@@ -128,6 +128,7 @@ impl JobInspection {
             total: result.n_total_trials,
             passed,
             failed,
+            unscored,
             refused,
             errored,
             cleanup_failed,
@@ -160,24 +161,30 @@ impl JobInspection {
     fn write_human(&self, output: &mut impl Write) -> io::Result<()> {
         writeln!(
             output,
-            "Job {}: {} passed, {} failed, {} refused, {} errored, {} cleanup failures ({} retained / {} expected)",
+            "Job {} scores: {} passed, {} failed, {} unscored ({} retained / {} expected)",
             self.id,
             self.passed,
             self.failed,
-            self.refused,
-            self.errored,
-            self.cleanup_failed,
+            self.unscored,
             self.trials.len(),
             self.total
+        )?;
+        writeln!(
+            output,
+            "Lifecycle: {} errored attempts (including {} safety refusals), {} cleanup failures",
+            self.errored, self.refused, self.cleanup_failed
         )?;
         writeln!(output, "{}", self.directory.display())?;
         for trial in &self.trials {
             trial.write_summary(output)?;
-            if trial.status != TrialStatus::Passed || trial.cleanup_failed {
+            if trial.score_status != TrialScoreStatus::Passed
+                || trial.errored
+                || trial.cleanup_failed
+            {
                 trial.write_failure_summary(output)?;
             }
         }
-        if self.failed + self.refused + self.errored > 0 {
+        if self.failed + self.unscored + self.errored > 0 {
             writeln!(
                 output,
                 "\nUse `nanocodex eval inspect {} --trial <name> --full` for complete evidence.",
@@ -193,7 +200,9 @@ struct TrialInspection {
     id: Uuid,
     task_name: String,
     trial_name: String,
-    status: TrialStatus,
+    score_status: TrialScoreStatus,
+    refused: bool,
+    errored: bool,
     cleanup_failed: bool,
     reward: Option<f64>,
     started_at: DateTime<Utc>,
@@ -218,14 +227,14 @@ impl TrialInspection {
             .as_ref()
             .and_then(|verifier| verifier.rewards.get("reward"))
             .copied();
-        let status = trial_status(
+        let classification = trial_classification(
             result.outcome,
             result.scored,
             result
                 .exception_info
                 .as_ref()
                 .map(|exception| exception.exception_type.as_str()),
-            reward,
+            result.verifier_result.as_ref(),
         );
         let cleanup_failed = result.cleanup.is_failed()
             || result
@@ -240,7 +249,9 @@ impl TrialInspection {
             id: result.id,
             task_name: result.task_name,
             trial_name: result.trial_name,
-            status,
+            score_status: classification.score,
+            refused: classification.refused,
+            errored: classification.errored,
             cleanup_failed,
             reward,
             started_at: result.started_at,
@@ -272,17 +283,38 @@ impl TrialInspection {
             format_duration(self.phases.verifier)
         )?;
         if let Some(agent) = &self.agent {
+            let runtime_prefix =
+                if agent.runtime_completeness == MeasurementCompleteness::ObservedLowerBound {
+                    "at least "
+                } else {
+                    ""
+                };
             writeln!(
                 output,
-                "agent: {} model calls, {} tool calls, {} input / {} cached / {} output tokens ({}.{:01}% cache)",
-                agent.model_calls,
-                agent.tool_calls,
-                agent.input_tokens,
-                agent.cached_tokens,
-                agent.output_tokens,
-                agent.cache_percent_tenths / 10,
-                agent.cache_percent_tenths % 10
+                "agent: {runtime_prefix}{} model calls, {runtime_prefix}{} tool calls",
+                agent.model_calls, agent.tool_calls,
             )?;
+            match agent.usage_completeness {
+                Some(completeness) => {
+                    let usage_prefix =
+                        if completeness == MeasurementCompleteness::ObservedLowerBound {
+                            "at least "
+                        } else {
+                            ""
+                        };
+                    writeln!(
+                        output,
+                        "tokens: {usage_prefix}{} input / {usage_prefix}{} cached / \
+                         {usage_prefix}{} output ({}.{:01}% cache)",
+                        agent.input_tokens,
+                        agent.cached_tokens,
+                        agent.output_tokens,
+                        agent.cache_percent_tenths / 10,
+                        agent.cache_percent_tenths % 10
+                    )?;
+                }
+                None => writeln!(output, "tokens: unreported")?,
+            }
             let billing = match agent.billing_completeness {
                 Some(BillingCompleteness::Complete) => "complete",
                 Some(BillingCompleteness::Unknown) => "unknown",
@@ -311,9 +343,11 @@ impl TrialInspection {
             .map_or_else(|| "-".to_owned(), |reward| format!("{reward:.3}"));
         writeln!(
             output,
-            "{} {} reward={reward}{}",
-            self.status.label(),
+            "{} {} reward={reward}{}{}{}",
+            self.score_status.label(),
             self.trial_name,
+            if self.refused { " refusal=true" } else { "" },
+            if self.errored { " error=true" } else { "" },
             if self.cleanup_failed {
                 " cleanup=failed"
             } else {
@@ -385,61 +419,84 @@ impl TrialInspection {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum TrialStatus {
+enum TrialScoreStatus {
     Passed,
     Failed,
-    Refused,
-    Errored,
+    Unscored,
 }
 
-impl TrialStatus {
+impl TrialScoreStatus {
     const fn label(self) -> Painted<&'static str> {
         match self {
             Self::Passed => Painted::new("PASS   ").green(),
             Self::Failed => Painted::new("FAIL   ").red(),
-            Self::Refused => Painted::new("REFUSED").yellow(),
-            Self::Errored => Painted::new("ERROR  ").red(),
+            Self::Unscored => Painted::new("UNSCORED").yellow(),
         }
     }
 }
 
-fn trial_status(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TrialClassification {
+    score: TrialScoreStatus,
+    refused: bool,
+    errored: bool,
+}
+
+fn trial_classification(
+    outcome: Option<EvalOutcome>,
+    scored: Option<bool>,
+    exception_type: Option<&str>,
+    verifier: Option<&HarborVerifierResult>,
+) -> TrialClassification {
+    let scored = infer_retained_scored(
+        scored,
+        outcome,
+        verifier.is_some(),
+        exception_type.is_some(),
+    );
+    let passed = scored
+        && verifier.is_some_and(|verifier| verifier.rewards.values().all(|reward| *reward > 0.0));
+    let (refused, errored) = match exception_type {
+        Some(exception) => (
+            exception == "AgentSafetyRefusalError",
+            exception != "CleanupError",
+        ),
+        None => (
+            outcome == Some(EvalOutcome::SafetyRefusal),
+            outcome.is_some_and(|outcome| {
+                matches!(
+                    outcome,
+                    EvalOutcome::SafetyRefusal
+                        | EvalOutcome::AgentTimeout
+                        | EvalOutcome::InfrastructureError
+                )
+            }),
+        ),
+    };
+    TrialClassification {
+        score: if !scored {
+            TrialScoreStatus::Unscored
+        } else if passed {
+            TrialScoreStatus::Passed
+        } else {
+            TrialScoreStatus::Failed
+        },
+        refused,
+        errored,
+    }
+}
+
+#[cfg(test)]
+fn trial_classification_for_reward(
     outcome: Option<EvalOutcome>,
     scored: Option<bool>,
     exception_type: Option<&str>,
     reward: Option<f64>,
-) -> TrialStatus {
-    match outcome {
-        Some(EvalOutcome::Passed) => return TrialStatus::Passed,
-        Some(EvalOutcome::VerifierFailed) => return TrialStatus::Failed,
-        Some(EvalOutcome::SafetyRefusal) => return TrialStatus::Refused,
-        Some(EvalOutcome::AgentTimeout | EvalOutcome::InfrastructureError) => {
-            return TrialStatus::Errored;
-        }
-        None => {}
-    }
-    if scored == Some(true) {
-        return if reward == Some(1.0) {
-            TrialStatus::Passed
-        } else {
-            TrialStatus::Failed
-        };
-    }
-    if let Some(exception_type) = exception_type {
-        return if exception_type == "AgentSafetyRefusalError" {
-            TrialStatus::Refused
-        } else {
-            TrialStatus::Errored
-        };
-    }
-    if scored == Some(false) {
-        return TrialStatus::Errored;
-    }
-    if reward == Some(1.0) {
-        TrialStatus::Passed
-    } else {
-        TrialStatus::Failed
-    }
+) -> TrialClassification {
+    let verifier = reward.map(|reward| HarborVerifierResult {
+        rewards: BTreeMap::from([("reward".to_owned(), reward)]),
+    });
+    trial_classification(outcome, scored, exception_type, verifier.as_ref())
 }
 
 #[derive(Clone, Serialize)]
@@ -499,12 +556,21 @@ struct AgentInspection {
     cache_percent_tenths: u16,
     model_calls: u32,
     tool_calls: u32,
+    runtime_completeness: MeasurementCompleteness,
+    usage_completeness: Option<MeasurementCompleteness>,
     cost_usd: Option<f64>,
     billing_completeness: Option<BillingCompleteness>,
 }
 
 impl From<HarborAgentResult> for AgentInspection {
     fn from(result: HarborAgentResult) -> Self {
+        let usage_completeness = retained_usage_observed(&result).then_some(
+            if result.billing_completeness == Some(BillingCompleteness::Complete) {
+                MeasurementCompleteness::Complete
+            } else {
+                MeasurementCompleteness::ObservedLowerBound
+            },
+        );
         let cache_percent_tenths = if result.n_input_tokens == 0 {
             0
         } else {
@@ -521,10 +587,35 @@ impl From<HarborAgentResult> for AgentInspection {
             cache_percent_tenths,
             model_calls: result.metadata.model_calls,
             tool_calls: result.metadata.tool_calls,
+            runtime_completeness: result.metadata.runtime_completeness,
+            usage_completeness,
             cost_usd: result.cost_usd,
             billing_completeness: result.billing_completeness,
         }
     }
+}
+
+fn retained_usage_observed(result: &HarborAgentResult) -> bool {
+    result.cost_usd.is_some()
+        || result.metadata.estimated_cost.is_some()
+        || matches!(
+            result.metadata.cost_status.as_str(),
+            "estimated_from_usage" | "estimated_lower_bound"
+        )
+        || result.n_input_tokens != 0
+        || result.n_cache_tokens != 0
+        || result.n_output_tokens != 0
+        || usage_nonzero(&result.metadata.usage)
+        || usage_nonzero(&result.metadata.warmup_usage)
+}
+
+const fn usage_nonzero(usage: &UsageTotals) -> bool {
+    usage.input_tokens != 0
+        || usage.cached_input_tokens != 0
+        || usage.cache_write_input_tokens != 0
+        || usage.output_tokens != 0
+        || usage.reasoning_output_tokens != 0
+        || usage.total_tokens != 0
 }
 
 #[derive(Clone, Serialize)]
@@ -849,43 +940,178 @@ fn read_optional_text(path: &Path) -> io::Result<Option<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{EvalOutcome, TrialStatus, trial_status};
+    use serde_json::json;
+
+    use super::{
+        AgentInspection, EvalOutcome, HarborAgentResult, MeasurementCompleteness,
+        TrialClassification, TrialScoreStatus, trial_classification_for_reward,
+    };
 
     #[test]
-    fn classifies_refusals_separately_from_errors() {
+    fn refusals_overlap_the_error_axis() {
         assert_eq!(
-            trial_status(None, None, Some("AgentSafetyRefusalError"), None),
-            TrialStatus::Refused
+            trial_classification_for_reward(None, None, Some("AgentSafetyRefusalError"), None),
+            TrialClassification {
+                score: TrialScoreStatus::Unscored,
+                refused: true,
+                errored: true,
+            }
         );
         assert_eq!(
-            trial_status(None, None, Some("AgentAuthenticationError"), None),
-            TrialStatus::Errored
+            trial_classification_for_reward(None, None, Some("AgentAuthenticationError"), None),
+            TrialClassification {
+                score: TrialScoreStatus::Unscored,
+                refused: false,
+                errored: true,
+            }
         );
+    }
+
+    #[test]
+    fn explicit_exception_precedes_legacy_outcome_lifecycle_axes() {
+        let cleanup = trial_classification_for_reward(
+            Some(EvalOutcome::InfrastructureError),
+            Some(false),
+            Some("CleanupError"),
+            None,
+        );
+        assert!(!cleanup.refused);
+        assert!(!cleanup.errored);
+
+        let explicit_non_refusal = trial_classification_for_reward(
+            Some(EvalOutcome::SafetyRefusal),
+            Some(false),
+            Some("VerifierError"),
+            None,
+        );
+        assert!(!explicit_non_refusal.refused);
+        assert!(explicit_non_refusal.errored);
+
+        let legacy_refusal = trial_classification_for_reward(
+            Some(EvalOutcome::SafetyRefusal),
+            Some(false),
+            None,
+            None,
+        );
+        assert!(legacy_refusal.refused);
+        assert!(legacy_refusal.errored);
     }
 
     #[test]
     fn classifies_scored_trials_from_reward() {
         assert_eq!(
-            trial_status(None, None, None, Some(1.0)),
-            TrialStatus::Passed
+            trial_classification_for_reward(None, None, None, Some(1.0)).score,
+            TrialScoreStatus::Passed
         );
         assert_eq!(
-            trial_status(None, None, None, Some(0.0)),
-            TrialStatus::Failed
-        );
-        assert_eq!(trial_status(None, None, None, None), TrialStatus::Failed);
-        assert_eq!(
-            trial_status(None, Some(false), None, Some(1.0)),
-            TrialStatus::Errored
+            trial_classification_for_reward(None, None, None, Some(0.0)).score,
+            TrialScoreStatus::Failed
         );
         assert_eq!(
-            trial_status(
+            trial_classification_for_reward(None, None, None, None).score,
+            TrialScoreStatus::Unscored
+        );
+        assert_eq!(
+            trial_classification_for_reward(None, Some(false), None, Some(1.0)).score,
+            TrialScoreStatus::Unscored
+        );
+        assert_eq!(
+            trial_classification_for_reward(
                 Some(EvalOutcome::Passed),
                 Some(true),
                 Some("CleanupError"),
                 Some(1.0),
-            ),
-            TrialStatus::Passed
+            )
+            .score,
+            TrialScoreStatus::Passed
         );
+        let scored_timeout = trial_classification_for_reward(
+            Some(EvalOutcome::AgentTimeout),
+            Some(true),
+            Some("AgentTimeoutError"),
+            Some(1.0),
+        );
+        assert_eq!(scored_timeout.score, TrialScoreStatus::Passed);
+        assert!(scored_timeout.errored);
+
+        assert_eq!(
+            trial_classification_for_reward(
+                Some(EvalOutcome::AgentTimeout),
+                None,
+                None,
+                Some(1.0),
+            )
+            .score,
+            TrialScoreStatus::Unscored
+        );
+        assert_eq!(
+            trial_classification_for_reward(None, None, Some("AgentTimeoutError"), Some(1.0),)
+                .score,
+            TrialScoreStatus::Unscored
+        );
+    }
+
+    #[test]
+    fn inspection_preserves_runtime_lower_bounds_and_missing_usage() {
+        let retained: HarborAgentResult = serde_json::from_value(json!({
+            "n_input_tokens": 0,
+            "n_cache_tokens": 0,
+            "n_output_tokens": 0,
+            "cost_usd": null,
+            "billing_completeness": "unknown",
+            "metadata": {
+                "status": "cancelled",
+                "model": "gpt-5.6-sol",
+                "effort": "medium",
+                "transport": "responses_websocket_v2",
+                "orchestration": "agent",
+                "duration_ms": 1,
+                "duration_ns": 1_000_000,
+                "model_calls": 1,
+                "steers": 0,
+                "compactions": 0,
+                "tool_calls": 0,
+                "connection_attempts": 1,
+                "websocket_reconnects": 0,
+                "response_attempts": 1,
+                "response_retries": 0,
+                "connection_duration_ns": 1,
+                "retry_backoff_duration_ns": 0,
+                "model_duration_ns": 0,
+                "warmup_duration_ns": 0,
+                "tool_work_duration_ns": 0,
+                "tool_wall_duration_ns": 0,
+                "usage": {
+                    "input_tokens": 0,
+                    "cached_input_tokens": 0,
+                    "cache_write_input_tokens": 0,
+                    "output_tokens": 0,
+                    "reasoning_output_tokens": 0,
+                    "total_tokens": 0,
+                },
+                "warmup_usage": {
+                    "input_tokens": 0,
+                    "cached_input_tokens": 0,
+                    "cache_write_input_tokens": 0,
+                    "output_tokens": 0,
+                    "reasoning_output_tokens": 0,
+                    "total_tokens": 0,
+                },
+                "cost_usd": null,
+                "cost_status": "usage_not_reported",
+            },
+        }))
+        .unwrap();
+
+        let inspection = AgentInspection::from(retained);
+
+        assert_eq!(
+            inspection.runtime_completeness,
+            MeasurementCompleteness::ObservedLowerBound
+        );
+        assert_eq!(inspection.usage_completeness, None);
+        let encoded = serde_json::to_value(inspection).unwrap();
+        assert_eq!(encoded["runtime_completeness"], "observed_lower_bound");
+        assert!(encoded["usage_completeness"].is_null());
     }
 }

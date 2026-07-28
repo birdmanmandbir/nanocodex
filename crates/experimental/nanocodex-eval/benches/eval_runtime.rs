@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     hint::black_box,
     path::{Path, PathBuf},
@@ -12,8 +13,10 @@ use nanocodex_agent::{
     events::{AgentEvent, AgentEventKind},
 };
 use nanocodex_eval::{
-    AggregateDataset, AtifBuilder, AttemptFact, AttemptFactArtifacts, BillingCompleteness,
-    EvalOutcome, Evaluator, LatencyBreakdown, Sweep, Task, harbor::Harbor,
+    AggregateDataset, AtifBuilder, AttemptConfigurationIdentity, AttemptFact, AttemptFactArtifacts,
+    AttemptTaskIdentity, AttemptUsage, AttemptVerifierFact, AttemptVerifierIdentity,
+    BillingCompleteness, EvalEnvironment, EvalOutcome, Evaluator, LatencyBreakdown,
+    MeasurementCompleteness, Sweep, Task, UsageTotals, harbor::Harbor,
 };
 use serde_json::{Value, json, value::RawValue};
 use uuid::Uuid;
@@ -194,36 +197,110 @@ fn representative_attempt_facts() -> Vec<AttemptFact> {
             for repetition in 1..=5 {
                 let directory =
                     PathBuf::from(format!("retained/{configuration}/{task}/{repetition}"));
+                let passed = (repetition + u16::from(configuration.starts_with("high"))) % 3 != 0;
                 facts.push(AttemptFact {
                     attempt_id: Uuid::now_v7(),
-                    task_name: task.to_owned(),
-                    configuration: configuration.to_owned(),
+                    task: AttemptTaskIdentity {
+                        dataset: Some("benchmark".to_owned()),
+                        dataset_revision: Some("representative-v1".to_owned()),
+                        name: task.to_owned(),
+                        root: PathBuf::from(task),
+                        package_digest_schema: "benchmark-v1".to_owned(),
+                        package_digest: format!("sha256:{task}"),
+                        harbor_checksum: None,
+                        image_reference: Some("benchmark:latest".to_owned()),
+                        verifier: AttemptVerifierIdentity {
+                            script: Some(PathBuf::from("tests/test.sh")),
+                            environment_mode: Some("same".to_owned()),
+                            timeout_ns: Some(30_000_000_000),
+                            scoring_policy: "all_rewards_positive-v1".to_owned(),
+                        },
+                    },
+                    configuration: AttemptConfigurationIdentity {
+                        id: configuration.to_owned(),
+                        model: "gpt-benchmark".to_owned(),
+                        model_tier: None,
+                        reasoning_effort: if configuration.starts_with("high") {
+                            "high"
+                        } else {
+                            "medium"
+                        }
+                        .to_owned(),
+                        reasoning_mode: Some("adaptive".to_owned()),
+                        service_tier: Some("standard".to_owned()),
+                        transport: Some("responses_websocket_v2".to_owned()),
+                        orchestration: Some("local_code_mode".to_owned()),
+                        tool_profile: Some("benchmark-tools".to_owned()),
+                        seed: None,
+                        agent_topology: "single_agent".to_owned(),
+                        environment: EvalEnvironment::MicroVm,
+                        vm: None,
+                    },
+                    build: None,
                     repetition,
-                    outcome: if (repetition + u16::from(configuration.starts_with("high"))) % 3 != 0
-                    {
+                    outcome: if passed {
                         EvalOutcome::Passed
                     } else {
                         EvalOutcome::VerifierFailed
                     },
                     scored: true,
-                    passed: (repetition + u16::from(configuration.starts_with("high"))) % 3 != 0,
+                    passed,
+                    errored: false,
+                    refused: false,
+                    exception_kind: None,
                     cleanup_failed: false,
+                    verifier: AttemptVerifierFact {
+                        exit_code: Some(i32::from(!passed)),
+                        rewards: BTreeMap::from([(
+                            "reward".to_owned(),
+                            if passed { 1.0 } else { 0.0 },
+                        )]),
+                    },
+                    usage: Some(AttemptUsage {
+                        completeness: MeasurementCompleteness::Complete,
+                        task_execution: UsageTotals {
+                            input_tokens: 100,
+                            cached_input_tokens: 80,
+                            cache_write_input_tokens: 10,
+                            output_tokens: u64::from(repetition),
+                            reasoning_output_tokens: u64::from(repetition),
+                            total_tokens: 100 + u64::from(repetition),
+                        },
+                        warmup: UsageTotals::default(),
+                        combined: UsageTotals {
+                            input_tokens: 100,
+                            cached_input_tokens: 80,
+                            cache_write_input_tokens: 10,
+                            output_tokens: u64::from(repetition),
+                            reasoning_output_tokens: u64::from(repetition),
+                            total_tokens: 100 + u64::from(repetition),
+                        },
+                    }),
+                    runtime: None,
                     cost_usd: Some(0.05 + f64::from(repetition) / 100.0),
+                    estimated_cost: None,
+                    pricing_revision: Some("benchmark-pricing-v1".to_owned()),
                     billing_completeness: Some(BillingCompleteness::Complete),
+                    billing_snapshot_missing: false,
                     latency: LatencyBreakdown {
                         queue_wait_ns: u64::from(repetition) * 10_000_000,
                         vm_bootstrap_ns: 90_000_000,
                         agent_execution_ns: 8_000_000_000,
-                        model_ns: 7_500_000_000,
-                        tool_work_ns: 100_000_000,
-                        tool_wall_ns: 120_000_000,
+                        model_ns: Some(7_500_000_000),
+                        tool_work_ns: Some(100_000_000),
+                        tool_wall_ns: Some(120_000_000),
                         verifier_ns: 40_000_000,
                         total_ns: 8_250_000_000,
                         ..LatencyBreakdown::default()
                     },
                     artifacts: AttemptFactArtifacts {
+                        result: directory.join("result.json"),
+                        input: directory.join("agent/input.jsonl"),
+                        events: directory.join("agent/events.jsonl"),
                         trajectory: directory.join("agent/trajectory.json"),
                         verifier_output: directory.join("verifier/test-stdout.txt"),
+                        workspace: directory.join("workspace"),
+                        lock: directory.join("lock.json"),
                         directory,
                     },
                 });

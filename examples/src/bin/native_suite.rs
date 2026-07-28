@@ -70,11 +70,16 @@ fn print_results(results: impl IntoIterator<Item = EvalAttemptOutcome>) {
         match outcome {
             EvalAttemptOutcome::Scored(result) => println!(
                 "{}: {:?} in {} ms",
-                result.trial_name, result.status, result.agent.metadata.duration_ms,
+                result.trial_name,
+                result.status,
+                result
+                    .agent
+                    .as_ref()
+                    .map_or(0, |agent| agent.metadata.duration_ms),
             ),
             EvalAttemptOutcome::Unscored(failure) => println!(
                 "{}: {:?} ({})",
-                failure.trial_name, failure.outcome, failure.message,
+                failure.trial_name, failure.exception.outcome, failure.exception.message,
             ),
         }
     }
@@ -96,7 +101,10 @@ async fn observe(mut events: EvalEventStream, expected: usize) -> Result<(), Eva
             }
             EvalEventKind::Failed(failure) => {
                 completed += 1;
-                eprintln!("{}: Errored ({:?})", event.trial_name, failure.kind);
+                eprintln!(
+                    "{}: Errored ({:?})",
+                    event.trial_name, failure.exception.kind
+                );
             }
             EvalEventKind::Agent(_)
             | EvalEventKind::VerifierStarted

@@ -71,6 +71,11 @@ pub(crate) struct AttemptFailed<'a> {
     pub(crate) error_class: &'static str,
     pub(crate) retryable: bool,
     pub(crate) connection_generation: u32,
+    pub(crate) request_send_started: bool,
+    pub(crate) provider_accepted: bool,
+    pub(crate) provider_rejected: bool,
+    pub(crate) provider_terminal: bool,
+    pub(crate) billing_uncertain: bool,
     pub(crate) error: &'a str,
 }
 

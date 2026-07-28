@@ -137,7 +137,7 @@ async fn cancellation_preserves_session_scoped_https_fallback() -> Result<()> {
         .websocket_url(websocket_url)
         .api_base_url(api_base_url)
         .build()?;
-    let (agent, events) = Nanocodex::builder(openai)
+    let (agent, mut events) = Nanocodex::builder(openai)
         .thinking(Thinking::Low)
         .workspace(&workspace)
         .session_id(test_session_id())
@@ -167,7 +167,28 @@ async fn cancellation_preserves_session_scoped_https_fallback() -> Result<()> {
         .send(())
         .map_err(|()| eyre!("follow-up completion receiver dropped"))?;
     agent.shutdown().await?;
-    drop((agent, events));
+    drop(agent);
+    let mut cancelled_terminal = None;
+    while let Some(event) = events.recv().await {
+        if matches!(event.kind, AgentEventKind::RunFailed) {
+            let payload = event.decode_payload::<Value>()?;
+            if payload["status"] == "cancelled" {
+                cancelled_terminal = Some(payload);
+            }
+        }
+    }
+    assert_eq!(
+        cancelled_terminal
+            .as_ref()
+            .and_then(|payload| payload["billing_uncertain_response_attempts"].as_u64()),
+        Some(1)
+    );
+    assert_eq!(
+        cancelled_terminal
+            .as_ref()
+            .and_then(|payload| payload["runtime_completeness"].as_str()),
+        Some("observed_lower_bound")
+    );
 
     timeout(std::time::Duration::from_secs(5), websocket_server)
         .await

@@ -11,7 +11,7 @@
 
 **[Install](#install)** · **[Agent API](#minimal-api-example)** ·
 **[Thesis](#thesis)** · **[Components](#components)** ·
-**[Documentation](#documentation)**
+**[Evaluations](#evaluations)** · **[Documentation](#documentation)**
 
 [ci]: https://github.com/gakonst/nanocodex/actions/workflows/ci.yml
 [crates]: https://crates.io/crates/nanocodex
@@ -192,6 +192,21 @@ directly.
 [Observability guide](crates/nanocodex-observability/README.md) ·
 [API documentation](https://docs.rs/nanocodex-observability)
 
+### Experimental systems components
+
+VM and evaluation components live under
+[`crates/experimental/`](crates/experimental/README.md) while their public
+contracts mature:
+
+| Package | Responsibility |
+| --- | --- |
+| `nanocodex-vm` | VM lifecycle and images plus retained guest-backed workspace tools |
+| `nanocodex-eval` | Typed tasks and sweeps, durable results, and Harbor/ATIF projection |
+
+The CLI is a consumer of these crates. VM-backed tools are opt-in for normal
+agent sessions; evaluation remains available through the library and
+`nanocodex eval`.
+
 ### CLI and language bindings
 
 The CLI/TUI, Python package, Node/browser package, React bindings, and examples
@@ -201,12 +216,48 @@ agent protocol.
 [Examples](examples/README.md) · [JavaScript](js/README.md) ·
 [Python](py/README.md) · [Web](web/README.md)
 
+## Evaluations
+
+`nanocodex-eval` runs immutable tasks through fresh agent sessions and
+workspaces. It retains exact task, configuration, timing, token, cost, trace,
+trajectory, verifier, and outcome evidence so sweeps can be resumed, inspected,
+compared, and projected into plot-ready aggregates without making the CLI a
+second result owner.
+
+```sh
+nanocodex eval --task tasks/write-greeting --trials 5 --thinking medium
+nanocodex eval prepare --task /path/to/terminal-bench-task
+nanocodex eval inspect .nanocodex/evals/<job-id>
+nanocodex eval compare terminal-bench/configure-git-webserver
+nanocodex eval cleanup .nanocodex/evals --dry-run
+```
+
+Normal TUI and one-shot sessions keep host workspace tools by default. They can
+instead route `exec_command`, `write_stdin`, `apply_patch`, and `view_image`
+through one retained VM:
+
+```sh
+nanocodex --vm .nanocodex/vm/session-rootfs.ext4 --vm-workspace /app
+nanocodex run "inspect the repository" \
+  --vm .nanocodex/vm/session-rootfs.ext4 --vm-workspace /app
+```
+
+Provider-reported usage and built-in pricing produce estimated USD cost. A
+potentially billable response without terminal usage is retained as an
+observed lower bound, never as a zero-cost completion. Aggregates keep missing
+billing snapshots out of token samples, preserve reported true zeroes, and
+separate terminal-complete metrics from cancellation-recovered evidence.
+
+The current GPT-5.6 comparator inventory and the plot/data completion gate are
+tracked in [`docs/GPT_5_6_EVALS.md`](docs/GPT_5_6_EVALS.md).
+
 ## Documentation
 
 - [Facade API](https://docs.rs/nanocodex)
 - [Migration from 0.2.x](docs/MIGRATING.md)
 - [Examples](examples/README.md)
 - [Benchmarks and retained measurements](benchmarks/)
+- [GPT-5.6 evaluation inventory](docs/GPT_5_6_EVALS.md)
 
 ## License
 

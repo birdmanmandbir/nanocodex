@@ -66,8 +66,11 @@ mod sweep;
 mod task;
 
 pub use aggregate::{
-    AggregateDataset, AggregateRunTiming, AttemptFact, AttemptFactArtifacts,
-    ConfigurationAggregate, LatencyBreakdown, MetricSummary, RateEstimate, TaskAggregate,
+    AggregateDataset, AggregateRunIdentity, AggregateRunTiming, AttemptBuildIdentity,
+    AttemptConfigurationIdentity, AttemptFact, AttemptFactArtifacts, AttemptRuntimeMetrics,
+    AttemptTaskIdentity, AttemptUsage, AttemptVerifierFact, AttemptVerifierIdentity,
+    AttemptVmIdentity, ConfigurationAggregate, CostMetricSummaries, LatencyBreakdown,
+    MetricSummary, RateEstimate, TaskAggregate, TokenMetricSummaries,
 };
 pub use atif::{
     AtifAgent, AtifAgentExtra, AtifBuilder, AtifFinalMetrics, AtifFinalMetricsExtra, AtifMetrics,
@@ -80,11 +83,13 @@ pub use evaluator::{
     EvalError, Evaluator, EvaluatorBuilder,
 };
 pub use event::{EvalEvent, EvalEventKind, EvalEventStream, EvalEventStreamError, EvalEvents};
+#[allow(deprecated)]
 pub use result::{
     AgentMetadata, AgentResult, AgentStatus, BillingCompleteness, CleanupDiagnostic, CleanupPhase,
-    CleanupStatus, EvalArtifacts, EvalAttemptOutcome, EvalCleanup, EvalEnvironment, EvalFailure,
-    EvalFailureKind, EvalFailureTiming, EvalOutcome, EvalResult, EvalStatus, EvalTiming,
-    PhaseTiming, SweepAttemptResult, SweepResults, UsageTotals, VerifierResult,
+    CleanupStatus, EvalArtifacts, EvalAttemptOutcome, EvalCleanup, EvalEnvironment, EvalException,
+    EvalExceptionKind, EvalFailure, EvalFailureKind, EvalFailureTiming, EvalOutcome, EvalResult,
+    EvalStatus, EvalTiming, MeasurementCompleteness, PhaseTiming, SweepAttemptResult, SweepResults,
+    UsageTotals, VerifierResult, infer_retained_scored,
 };
 pub use sweep::{AgentId, AgentIdError, Sweep, SweepBuilder, SweepError};
 pub use task::{

@@ -12,7 +12,7 @@ use nanocodex_eval::harbor::{
     PublishedAgentInfo, PublishedAttempts, PublishedQuery, PublishedResults, PublishedTask,
     PublishedTrajectory, PublishedTrial,
 };
-use nanocodex_eval::{EvalCleanup, EvalOutcome};
+use nanocodex_eval::{EvalCleanup, EvalOutcome, infer_retained_scored};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use tokio::task::JoinSet;
@@ -276,9 +276,11 @@ struct LocalException {
 struct TaskScore {
     task_name: String,
     task_checksum: String,
+    attempts: usize,
     trials: usize,
     passes: usize,
     errors: usize,
+    refusals: usize,
     cleanup_failures: usize,
     trajectories: usize,
 }
@@ -465,19 +467,30 @@ impl LocalJobLoader {
             .as_ref()
             .and_then(|verifier| verifier.rewards.get("reward"))
             .is_some_and(|reward| *reward > 0.0);
-        let scored = trial
-            .outcome
-            .map(EvalOutcome::is_scored)
-            .or(trial.scored)
-            .unwrap_or_else(|| trial.verifier_result.is_some() && trial.exception_info.is_none());
-        let passed = trial
-            .outcome
-            .map_or(scored && verifier_passed, EvalOutcome::is_passed);
+        let scored = infer_retained_scored(
+            trial.scored,
+            trial.outcome,
+            trial.verifier_result.is_some(),
+            trial.exception_info.is_some(),
+        );
+        let parsed_exception = trial
+            .exception_info
+            .as_ref()
+            .and_then(|exception| serde_json::from_str::<LocalException>(exception.get()).ok());
+        let passed = scored && verifier_passed;
+        let errored = local_trial_errored(
+            trial.outcome,
+            parsed_exception.as_ref(),
+            trial.exception_info.is_some(),
+        );
+        let refused = local_trial_refused(
+            trial.outcome,
+            parsed_exception.as_ref(),
+            trial.exception_info.is_some(),
+        );
         let cleanup_failed = trial.cleanup.is_failed()
-            || trial
-                .exception_info
+            || parsed_exception
                 .as_ref()
-                .and_then(|exception| serde_json::from_str::<LocalException>(exception.get()).ok())
                 .is_some_and(|exception| exception.exception_type == "CleanupError");
         let score = self
             .tasks
@@ -485,9 +498,11 @@ impl LocalJobLoader {
             .or_insert_with(|| TaskScore {
                 task_name: trial.task_name.clone(),
                 task_checksum: trial.task_checksum.clone(),
+                attempts: 0,
                 trials: 0,
                 passes: 0,
                 errors: 0,
+                refusals: 0,
                 cleanup_failures: 0,
                 trajectories: 0,
             });
@@ -498,9 +513,11 @@ impl LocalJobLoader {
                 job.display()
             );
         }
+        score.attempts += 1;
         score.trials += usize::from(scored);
         score.passes += usize::from(passed);
-        score.errors += usize::from(!scored);
+        score.errors += usize::from(errored);
+        score.refusals += usize::from(refused);
         score.cleanup_failures += usize::from(cleanup_failed);
         score.trajectories += usize::from(directory.join("agent/trajectory.json").is_file());
         self.trials
@@ -543,6 +560,37 @@ impl LocalJobLoader {
             tasks: self.tasks,
             trials: self.trials,
         })
+    }
+}
+
+fn local_trial_errored(
+    outcome: Option<EvalOutcome>,
+    exception: Option<&LocalException>,
+    retained_exception: bool,
+) -> bool {
+    match (exception, retained_exception) {
+        (Some(exception), _) => exception.exception_type != "CleanupError",
+        (None, true) => true,
+        (None, false) => outcome.is_some_and(|outcome| {
+            matches!(
+                outcome,
+                EvalOutcome::SafetyRefusal
+                    | EvalOutcome::AgentTimeout
+                    | EvalOutcome::InfrastructureError
+            )
+        }),
+    }
+}
+
+fn local_trial_refused(
+    outcome: Option<EvalOutcome>,
+    exception: Option<&LocalException>,
+    retained_exception: bool,
+) -> bool {
+    match (exception, retained_exception) {
+        (Some(exception), _) => exception.exception_type == "AgentSafetyRefusalError",
+        (None, true) => false,
+        (None, false) => matches!(outcome, Some(EvalOutcome::SafetyRefusal)),
     }
 }
 
@@ -868,9 +916,11 @@ struct RunScore {
     tasks: usize,
     k: Option<usize>,
     pass_at_k_tasks: usize,
+    attempts: usize,
     trials: usize,
     passes: usize,
     errors: usize,
+    refusals: usize,
     cleanup_failures: usize,
     trajectories: usize,
     task_scores: Vec<TaskScore>,
@@ -1050,15 +1100,17 @@ impl JobComparison {
             };
             writeln!(
                 output,
-                "{} · {}/{} vs {}/{}",
+                "{} · local {}/{} scored, {} total · published {}/{} scored, {} total",
                 local
                     .task_name
                     .strip_prefix("terminal-bench/")
                     .unwrap_or(&local.task_name),
                 local.passes,
                 local.trials,
+                local.attempts,
                 other.passes,
-                other.trials
+                other.trials,
+                other.attempts
             )?;
         }
         Ok(())
@@ -1090,15 +1142,20 @@ impl PublishedRun {
             .or_insert_with(|| TaskScore {
                 task_name: attempt.task_name,
                 task_checksum: attempt.task_checksum,
+                attempts: 0,
                 trials: 0,
                 passes: 0,
                 errors: 0,
+                refusals: 0,
                 cleanup_failures: 0,
                 trajectories: 0,
             });
-        score.trials += usize::from(!attempt.errored);
+        score.attempts += 1;
+        score.trials += usize::from(attempt.scored);
         score.passes += usize::from(attempt.passed);
         score.errors += usize::from(attempt.errored);
+        score.refusals += usize::from(attempt.refused);
+        score.cleanup_failures += usize::from(attempt.cleanup_failed);
         score.trajectories += usize::from(attempt.trajectory_path.is_some());
     }
 }
@@ -1113,12 +1170,9 @@ impl RunScore {
         thinking_observed_trials: usize,
         task_scores: Vec<TaskScore>,
     ) -> Self {
-        let total_trials = task_scores
-            .iter()
-            .map(|task| task.trials.saturating_add(task.errors))
-            .sum();
+        let total_trials = task_scores.iter().map(|task| task.attempts).sum();
         Self::new(RunScoreInput {
-            submission: "nanoeval".to_owned(),
+            submission: "nanocodex-eval".to_owned(),
             runs: vec!["local".to_owned()],
             agent,
             agent_version,
@@ -1147,11 +1201,7 @@ impl RunScore {
                 (agent.name, agent.version, model)
             },
         );
-        let total_trials = published
-            .tasks
-            .values()
-            .map(|task| task.trials.saturating_add(task.errors))
-            .sum();
+        let total_trials = published.tasks.values().map(|task| task.attempts).sum();
         Self::new(RunScoreInput {
             submission,
             runs: published.runs.into_iter().collect(),
@@ -1185,8 +1235,8 @@ impl RunScore {
         } = input;
         let k = task_scores
             .first()
-            .map(|task| task.trials)
-            .filter(|trials| task_scores.iter().all(|task| task.trials == *trials));
+            .map(|task| task.attempts)
+            .filter(|attempts| task_scores.iter().all(|task| task.attempts == *attempts));
         Self {
             submission,
             runs,
@@ -1199,9 +1249,11 @@ impl RunScore {
             tasks: task_scores.len(),
             k,
             pass_at_k_tasks: task_scores.iter().filter(|task| task.pass_at_k()).count(),
+            attempts: task_scores.iter().map(|task| task.attempts).sum(),
             trials: task_scores.iter().map(|task| task.trials).sum(),
             passes: task_scores.iter().map(|task| task.passes).sum(),
             errors: task_scores.iter().map(|task| task.errors).sum(),
+            refusals: task_scores.iter().map(|task| task.refusals).sum(),
             cleanup_failures: task_scores.iter().map(|task| task.cleanup_failures).sum(),
             trajectories: task_scores.iter().map(|task| task.trajectories).sum(),
             task_scores,
@@ -1215,14 +1267,18 @@ fn write_run_score(output: &mut impl Write, run: &RunScore) -> io::Result<()> {
         .agent_version
         .as_deref()
         .map_or_else(String::new, |version| format!(" {version}"));
-    let attempts = run.trials.saturating_add(run.errors);
     let trajectory = if run.trajectories == 0 {
         "trajectories none".to_owned()
     } else {
-        format!("trajectories {}/{}", run.trajectories, attempts)
+        format!("trajectories {}/{}", run.trajectories, run.attempts)
     };
     let errors = if run.errors > 0 {
         format!(" · errors {}", run.errors)
+    } else {
+        String::new()
+    };
+    let refusals = if run.refusals > 0 {
+        format!(" · refusals {}", run.refusals)
     } else {
         String::new()
     };
@@ -1253,8 +1309,8 @@ fn write_run_score(output: &mut impl Write, run: &RunScore) -> io::Result<()> {
             .map_or_else(|| "pass@k".to_owned(), |k| format!("pass@{k}"));
         return writeln!(
             output,
-            "{} · {}{} · {} · thinking {thinking} · trials {}/{} · {k} {pass_at_k} · {trajectory}{errors}{cleanup}{revision}",
-            run.submission, run.agent, version, run.model, run.passes, run.trials,
+            "{} · {}{} · {} · thinking {thinking} · scored {}/{} · total {} · {k} {pass_at_k} · {trajectory}{errors}{refusals}{cleanup}{revision}",
+            run.submission, run.agent, version, run.model, run.passes, run.trials, run.attempts,
         );
     }
     let pass_at_k = run
@@ -1262,7 +1318,7 @@ fn write_run_score(output: &mut impl Write, run: &RunScore) -> io::Result<()> {
         .map_or_else(|| "task pass".to_owned(), |k| format!("pass@{k}"));
     writeln!(
         output,
-        "{} · {}{} · {} · thinking {thinking} · {pass_at_k} {}/{} · trials {}/{} · {trajectory}{errors}{cleanup}",
+        "{} · {}{} · {} · thinking {thinking} · {pass_at_k} {}/{} · scored {}/{} · total {} · {trajectory}{errors}{refusals}{cleanup}",
         run.submission,
         run.agent,
         version,
@@ -1270,7 +1326,8 @@ fn write_run_score(output: &mut impl Write, run: &RunScore) -> io::Result<()> {
         run.pass_at_k_tasks,
         run.tasks,
         run.passes,
-        run.trials
+        run.trials,
+        run.attempts
     )
 }
 
@@ -1457,6 +1514,164 @@ mod tests {
     }
 
     #[test]
+    fn local_score_and_error_axes_overlap_without_treating_unscored_as_an_error() {
+        let timeout = LocalException {
+            exception_type: "AgentTimeoutError".to_owned(),
+        };
+        let cleanup = LocalException {
+            exception_type: "CleanupError".to_owned(),
+        };
+        let refusal = LocalException {
+            exception_type: "AgentSafetyRefusalError".to_owned(),
+        };
+
+        assert!(local_trial_errored(
+            Some(EvalOutcome::AgentTimeout),
+            Some(&timeout),
+            true
+        ));
+        assert!(local_trial_errored(
+            Some(EvalOutcome::SafetyRefusal),
+            None,
+            false
+        ));
+        assert!(!local_trial_errored(None, None, false));
+        assert!(!local_trial_errored(
+            Some(EvalOutcome::InfrastructureError),
+            Some(&cleanup),
+            true
+        ));
+        assert!(local_trial_errored(
+            Some(EvalOutcome::Passed),
+            Some(&timeout),
+            true
+        ));
+        assert!(local_trial_errored(Some(EvalOutcome::Passed), None, true));
+        assert!(local_trial_refused(
+            Some(EvalOutcome::SafetyRefusal),
+            None,
+            false
+        ));
+        assert!(local_trial_refused(None, Some(&refusal), true));
+        assert!(!local_trial_refused(
+            Some(EvalOutcome::SafetyRefusal),
+            Some(&cleanup),
+            true
+        ));
+    }
+
+    #[test]
+    fn local_loader_uses_backward_compatible_scoring_precedence() {
+        let job = tempfile::tempdir().unwrap();
+        let mut loader = LocalJobLoader::default();
+        let cases = [
+            (
+                "explicit-scored-timeout",
+                serde_json::json!({
+                    "outcome": "agent_timeout",
+                    "scored": true,
+                    "verifier_result": {"rewards": {"reward": 1.0}},
+                    "exception_info": {"exception_type": "AgentTimeoutError"},
+                }),
+            ),
+            (
+                "legacy-timeout",
+                serde_json::json!({
+                    "outcome": "agent_timeout",
+                    "verifier_result": {"rewards": {"reward": 1.0}},
+                    "exception_info": null,
+                }),
+            ),
+            (
+                "verifier-with-exception",
+                serde_json::json!({
+                    "verifier_result": {"rewards": {"reward": 1.0}},
+                    "exception_info": {"exception_type": "AgentTimeoutError"},
+                }),
+            ),
+            (
+                "clean-verifier",
+                serde_json::json!({
+                    "verifier_result": {"rewards": {"reward": 1.0}},
+                    "exception_info": null,
+                }),
+            ),
+            (
+                "explicit-unscored-reward",
+                serde_json::json!({
+                    "outcome": "passed",
+                    "scored": false,
+                    "verifier_result": {"rewards": {"reward": 1.0}},
+                    "exception_info": null,
+                }),
+            ),
+        ];
+
+        for (trial_name, fields) in cases {
+            let directory = job.path().join(trial_name);
+            fs::create_dir(&directory).unwrap();
+            let mut value = serde_json::json!({
+                "trial_name": trial_name,
+                "task_name": "terminal-bench/task",
+                "task_checksum": "checksum",
+                "agent_info": {
+                    "name": "nanocodex",
+                    "version": null,
+                    "model_info": {"name": "gpt-test"},
+                },
+                "config": null,
+                "verifier_result": null,
+                "outcome": null,
+                "scored": null,
+                "exception_info": null,
+            });
+            for (key, field) in fields.as_object().unwrap() {
+                value[key] = field.clone();
+            }
+            let trial: LocalTrial = serde_json::from_value(value).unwrap();
+            loader
+                .record(job.path(), directory, trial)
+                .expect("fixture trial must load");
+        }
+
+        let score = &loader.tasks["terminal-bench/task"];
+        assert_eq!(score.attempts, 5);
+        assert_eq!(score.trials, 2);
+        assert_eq!(score.passes, 2);
+        assert_eq!(score.errors, 3);
+    }
+
+    #[test]
+    fn run_score_prints_scored_and_total_attempt_denominators() {
+        let run = RunScore::local(
+            "nanocodex".to_owned(),
+            None,
+            "gpt".to_owned(),
+            BTreeSet::new(),
+            BTreeSet::new(),
+            0,
+            vec![TaskScore {
+                task_name: "terminal-bench/task".to_owned(),
+                task_checksum: "checksum".to_owned(),
+                attempts: 2,
+                trials: 1,
+                passes: 1,
+                errors: 1,
+                refusals: 0,
+                cleanup_failures: 0,
+                trajectories: 2,
+            }],
+        );
+        let mut output = Vec::new();
+
+        write_run_score(&mut output, &run).unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains("scored 1/1 · total 2"));
+        assert!(output.contains("pass@2 pass"));
+    }
+
+    #[test]
     fn job_comparison_ranks_only_complete_exact_runs() {
         let local = LocalJob {
             agent: "nanocodex".to_owned(),
@@ -1471,9 +1686,11 @@ mod tests {
                     TaskScore {
                         task_name: "terminal-bench/first".to_owned(),
                         task_checksum: "first-checksum".to_owned(),
+                        attempts: 2,
                         trials: 2,
                         passes: 1,
                         errors: 0,
+                        refusals: 0,
                         cleanup_failures: 0,
                         trajectories: 2,
                     },
@@ -1483,9 +1700,11 @@ mod tests {
                     TaskScore {
                         task_name: "terminal-bench/second".to_owned(),
                         task_checksum: "second-checksum".to_owned(),
+                        attempts: 2,
                         trials: 2,
                         passes: 0,
                         errors: 0,
+                        refusals: 0,
                         cleanup_failures: 0,
                         trajectories: 2,
                     },
@@ -1501,32 +1720,44 @@ mod tests {
                 provider: None,
             }),
         };
-        let task = |name: &str, checksum: &str, passed: bool| PublishedAttempts {
-            task: name.to_owned(),
-            requested_checksum: Some(checksum.to_owned()),
-            archive_revision: "revision".to_owned(),
-            attempts: vec![PublishedAttempt {
-                submission: "submission".to_owned(),
-                run: "run".to_owned(),
-                task_name: name.to_owned(),
-                task_checksum: checksum.to_owned(),
-                trial_name: format!("{name}-trial"),
-                passed,
-                errored: false,
-                agent: agent.clone(),
-                thinking: Some("medium".to_owned()),
-                agent_import_path: Some("other.agent:Agent".to_owned()),
-                result_path: format!("{name}/result.json"),
-                trajectory_path: Some(format!("{name}/trajectory.json")),
-            }],
-        };
+        let task =
+            |name: &str, checksum: &str, passed: bool, refused: bool, cleanup_failed: bool| {
+                PublishedAttempts {
+                    task: name.to_owned(),
+                    requested_checksum: Some(checksum.to_owned()),
+                    archive_revision: "revision".to_owned(),
+                    attempts: vec![PublishedAttempt {
+                        submission: "submission".to_owned(),
+                        run: "run".to_owned(),
+                        task_name: name.to_owned(),
+                        task_checksum: checksum.to_owned(),
+                        trial_name: format!("{name}-trial"),
+                        scored: true,
+                        passed,
+                        errored: refused,
+                        refused,
+                        cleanup_failed,
+                        agent: agent.clone(),
+                        thinking: Some("medium".to_owned()),
+                        agent_import_path: Some("other.agent:Agent".to_owned()),
+                        result_path: format!("{name}/result.json"),
+                        trajectory_path: Some(format!("{name}/trajectory.json")),
+                    }],
+                }
+            };
 
         let report = JobComparison::new(
             PathBuf::from("job"),
             local,
             vec![
-                task("terminal-bench/first", "first-checksum", true),
-                task("terminal-bench/second", "second-checksum", false),
+                task("terminal-bench/first", "first-checksum", true, false, false),
+                task(
+                    "terminal-bench/second",
+                    "second-checksum",
+                    false,
+                    true,
+                    true,
+                ),
             ],
             10,
             0.1,
@@ -1538,5 +1769,8 @@ mod tests {
         assert_eq!(report.exact.len(), 1);
         assert_eq!(report.exact[0].pass_at_k_tasks, 1);
         assert_eq!(report.exact[0].tasks, 2);
+        assert_eq!(report.exact[0].errors, 1);
+        assert_eq!(report.exact[0].refusals, 1);
+        assert_eq!(report.exact[0].cleanup_failures, 1);
     }
 }

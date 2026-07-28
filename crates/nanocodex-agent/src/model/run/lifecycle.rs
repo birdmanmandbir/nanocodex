@@ -137,9 +137,6 @@ where
         let duration_ns = elapsed_ns(started_at);
         let (response_id, source, attempt, connection_generation, usage, server_reasoning_included) =
             if let Some(execution) = execution {
-                if let Some(usage) = &execution.usage {
-                    self.stats.warmup_usage.add(usage);
-                }
                 (
                     Some(execution.response_id),
                     "response",
@@ -151,6 +148,9 @@ where
             } else {
                 (None, "shared_prefix", None, None, None, false)
             };
+        if source == "response" {
+            self.stats.observe_warmup_usage(usage.as_ref());
+        }
         span.record("warmup.source", source);
         if let Some(usage) = &usage {
             record_usage(&span, usage, self.fast_mode);
@@ -160,6 +160,11 @@ where
         span.record("duration_ns", duration_ns);
         self.stats.warmup_duration_ns += duration_ns;
         self.stats.last_response_id.clone_from(&response_id);
+        let (estimated_cost, cost_status) = if source == "response" {
+            estimate_event_cost(usage.as_ref(), self.fast_mode)
+        } else {
+            (None, CostStatus::NotApplicable)
+        };
         self.events.emit(
             AgentEventKind::ModelWarmupCompleted,
             WarmupCompleted {
@@ -169,6 +174,10 @@ where
                 connection_generation,
                 duration_ns,
                 usage: usage.as_ref(),
+                cost_usd: estimated_cost.as_ref().map(|cost| cost.amount().as_f64()),
+                estimated_cost: estimated_cost.as_ref(),
+                cost_status,
+                pricing_revision: PRICING_REVISION,
             },
         )?;
         Ok(WarmupOutcome {
@@ -305,9 +314,11 @@ where
         self.stats.compaction_duration_ns += duration_ns;
         if let Some(usage) = &response.usage {
             record_usage(&span, usage, self.fast_mode);
-            self.stats.usage.add(usage);
         }
+        self.stats.observe_usage(response.usage.as_ref());
         self.stats.last_response_id = Some(response.id.clone());
+        let (estimated_cost, cost_status) =
+            estimate_event_cost(response.usage.as_ref(), self.fast_mode);
         self.events.emit(
             AgentEventKind::ModelCompactionCompleted,
             CompactionCompleted {
@@ -320,6 +331,10 @@ where
                 time_to_first_event_ns: response.time_to_first_event_ns,
                 time_to_first_output_ns: response.time_to_first_output_ns,
                 usage: response.usage.as_ref(),
+                cost_usd: estimated_cost.as_ref().map(|cost| cost.amount().as_f64()),
+                estimated_cost: estimated_cost.as_ref(),
+                cost_status,
+                pricing_revision: PRICING_REVISION,
             },
         )?;
         Ok((response.item, response.usage, server_reasoning_included))

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
 use crate::CostStatus;
@@ -175,7 +175,28 @@ pub enum RunStatus {
     Failed,
 }
 
-/// Exact aggregate token counts for a family of Responses operations.
+/// Completeness of runtime counters and durations in a terminal event.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeCompleteness {
+    /// The terminal event includes the complete measurement interval.
+    #[default]
+    Complete,
+    /// Cancellation or failure may have omitted unfinished work.
+    ObservedLowerBound,
+}
+
+impl RuntimeCompleteness {
+    /// Returns whether the terminal event includes the complete runtime
+    /// measurement interval.
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        matches!(self, Self::Complete)
+    }
+}
+
+/// Provider-reported aggregate token counts for a family of Responses
+/// operations.
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
 pub struct EventUsage {
     /// Input tokens.
@@ -211,6 +232,9 @@ pub struct RunMetrics {
     pub response_attempts: u32,
     /// Retried Responses attempts.
     pub response_retries: u32,
+    /// Potentially billable sent attempts whose provider usage was unavailable.
+    #[serde(default, alias = "accepted_abandoned_response_attempts")]
+    pub billing_uncertain_response_attempts: u32,
     /// Nanoseconds spent establishing connections.
     pub connection_duration_ns: u64,
     /// Nanoseconds spent in SDK retry backoff.
@@ -231,8 +255,9 @@ pub struct RunMetrics {
     pub warmup_usage: EventUsage,
 }
 
-/// Complete terminal projection for one accepted turn.
+/// Terminal projection for one accepted turn.
 #[derive(Clone, Debug, Deserialize)]
+#[serde(from = "RunTerminalWire")]
 pub struct RunTerminal {
     /// Terminal outcome.
     pub status: RunStatus,
@@ -246,6 +271,9 @@ pub struct RunTerminal {
     pub transport: String,
     /// Agent orchestration policy.
     pub orchestration: String,
+    /// Whether runtime counters and durations are complete or observed lower
+    /// bounds.
+    pub runtime_completeness: RuntimeCompleteness,
     /// Whole-millisecond turn duration.
     pub duration_ms: u64,
     /// Nanosecond turn duration.
@@ -253,13 +281,68 @@ pub struct RunTerminal {
     /// Runtime, transport, and token measurements.
     #[serde(flatten)]
     pub metrics: RunMetrics,
-    /// Exact estimate using the built-in model and service-tier rates.
+    /// Estimate using the built-in model and service-tier rates.
+    ///
+    /// This can be a lower bound; inspect [`Self::cost_status`].
     pub estimated_cost: Option<EstimatedUsdCost>,
     /// Floating-point compatibility projection for existing JSONL consumers.
     pub cost_usd: Option<f64>,
-    /// Why an exact local estimate is present or unavailable.
+    /// Why a local estimate is present or unavailable.
     #[serde(default)]
     pub cost_status: CostStatus,
+    /// Built-in pricing catalog revision used for the estimate.
+    #[serde(default)]
+    pub pricing_revision: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RunTerminalWire {
+    status: RunStatus,
+    model: String,
+    reasoning_mode: String,
+    effort: String,
+    transport: String,
+    orchestration: String,
+    #[serde(default)]
+    runtime_completeness: Option<RuntimeCompleteness>,
+    duration_ms: u64,
+    duration_ns: u64,
+    #[serde(flatten)]
+    metrics: RunMetrics,
+    estimated_cost: Option<EstimatedUsdCost>,
+    cost_usd: Option<f64>,
+    #[serde(default)]
+    cost_status: CostStatus,
+    #[serde(default)]
+    pricing_revision: Option<String>,
+}
+
+impl From<RunTerminalWire> for RunTerminal {
+    fn from(terminal: RunTerminalWire) -> Self {
+        let runtime_completeness = if terminal.status == RunStatus::Completed {
+            terminal
+                .runtime_completeness
+                .unwrap_or(RuntimeCompleteness::Complete)
+        } else {
+            RuntimeCompleteness::ObservedLowerBound
+        };
+        Self {
+            status: terminal.status,
+            model: terminal.model,
+            reasoning_mode: terminal.reasoning_mode,
+            effort: terminal.effort,
+            transport: terminal.transport,
+            orchestration: terminal.orchestration,
+            runtime_completeness,
+            duration_ms: terminal.duration_ms,
+            duration_ns: terminal.duration_ns,
+            metrics: terminal.metrics,
+            estimated_cost: terminal.estimated_cost,
+            cost_usd: terminal.cost_usd,
+            cost_status: terminal.cost_status,
+            pricing_revision: terminal.pricing_revision,
+        }
+    }
 }
 
 /// Lifecycle state for one model-requested tool call.
@@ -368,6 +451,18 @@ pub struct ModelWarmupCompleted {
     pub duration_ns: u64,
     /// Provider token usage when supplied.
     pub usage: Option<Usage>,
+    /// Exact estimate using the service tier selected for this operation.
+    #[serde(default)]
+    pub estimated_cost: Option<EstimatedUsdCost>,
+    /// Floating-point compatibility projection for existing JSONL consumers.
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
+    /// Why an exact local estimate is present or unavailable.
+    #[serde(default)]
+    pub cost_status: CostStatus,
+    /// Built-in pricing catalog revision used for the estimate.
+    #[serde(default)]
+    pub pricing_revision: Option<String>,
 }
 
 /// Failed persistent-connection warmup.
@@ -415,6 +510,18 @@ pub struct ModelCallCompleted {
     pub tool_calls: usize,
     /// Provider token usage when supplied.
     pub usage: Option<Usage>,
+    /// Exact estimate using the service tier selected for this operation.
+    #[serde(default)]
+    pub estimated_cost: Option<EstimatedUsdCost>,
+    /// Floating-point compatibility projection for existing JSONL consumers.
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
+    /// Why an exact local estimate is present or unavailable.
+    #[serde(default)]
+    pub cost_status: CostStatus,
+    /// Built-in pricing catalog revision used for the estimate.
+    #[serde(default)]
+    pub pricing_revision: Option<String>,
 }
 
 /// Failed logical `response.create` call.
@@ -472,6 +579,18 @@ pub struct CompactionCompleted {
     pub time_to_first_output_ns: Option<u64>,
     /// Provider token usage when supplied.
     pub usage: Option<Usage>,
+    /// Exact estimate using the service tier selected for this operation.
+    #[serde(default)]
+    pub estimated_cost: Option<EstimatedUsdCost>,
+    /// Floating-point compatibility projection for existing JSONL consumers.
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
+    /// Why an exact local estimate is present or unavailable.
+    #[serde(default)]
+    pub cost_status: CostStatus,
+    /// Built-in pricing catalog revision used for the estimate.
+    #[serde(default)]
+    pub pricing_revision: Option<String>,
 }
 
 /// Failed automatic context compaction.
@@ -521,5 +640,85 @@ impl TransportEvent {
     /// Returns an error when the retained payload does not match `T`.
     pub fn decode_payload<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
         serde_json::from_str(self.payload.get())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::{RunTerminal, RuntimeCompleteness};
+
+    #[test]
+    fn terminal_runtime_completeness_is_status_aware_for_legacy_payloads() {
+        let cases = [
+            ("completed", None, RuntimeCompleteness::Complete),
+            ("failed", None, RuntimeCompleteness::ObservedLowerBound),
+            ("cancelled", None, RuntimeCompleteness::ObservedLowerBound),
+            (
+                "completed",
+                Some("observed_lower_bound"),
+                RuntimeCompleteness::ObservedLowerBound,
+            ),
+            (
+                "failed",
+                Some("complete"),
+                RuntimeCompleteness::ObservedLowerBound,
+            ),
+        ];
+
+        for (status, explicit, expected) in cases {
+            let mut encoded = terminal(status);
+            if let Some(explicit) = explicit {
+                encoded["runtime_completeness"] = json!(explicit);
+            }
+            let terminal: RunTerminal = serde_json::from_value(encoded).unwrap();
+            assert_eq!(terminal.runtime_completeness, expected, "{status}");
+        }
+    }
+
+    fn terminal(status: &str) -> Value {
+        json!({
+            "status": status,
+            "model": "gpt-5.6-sol",
+            "reasoning_mode": "summary",
+            "effort": "medium",
+            "transport": "responses_websocket_v2",
+            "orchestration": "agent",
+            "duration_ms": 1,
+            "duration_ns": 1_000_000,
+            "model_calls": 1,
+            "steers": 0,
+            "compactions": 0,
+            "tool_calls": 0,
+            "connection_attempts": 1,
+            "websocket_reconnects": 0,
+            "response_attempts": 1,
+            "response_retries": 0,
+            "connection_duration_ns": 1,
+            "retry_backoff_duration_ns": 0,
+            "model_duration_ns": 1,
+            "compaction_duration_ns": 0,
+            "warmup_duration_ns": 0,
+            "tool_work_duration_ns": 0,
+            "tool_wall_duration_ns": 0,
+            "usage": {
+                "input_tokens": 1,
+                "cached_input_tokens": 0,
+                "cache_write_input_tokens": 0,
+                "output_tokens": 1,
+                "reasoning_output_tokens": 0,
+                "total_tokens": 2,
+            },
+            "warmup_usage": {
+                "input_tokens": 0,
+                "cached_input_tokens": 0,
+                "cache_write_input_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "total_tokens": 0,
+            },
+            "cost_usd": null,
+        })
     }
 }

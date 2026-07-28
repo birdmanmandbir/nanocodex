@@ -25,7 +25,7 @@ use nanocodex_oai_api::{
     },
     CONTEXT_WINDOW_TOKENS, MODEL, Prompt, Thinking,
     events::AgentEventKind,
-    pricing::{ServiceTier, estimate},
+    pricing::{CostStatus, EstimatedUsdCost, PRICING_REVISION, ServiceTier, estimate},
     responses::{ContentItem, MessageRole, RequestProfile, ResponseItem, ToolDefinition, Usage},
     tower::{
         CodeCall, CodeCallKind, GenerationOutput as TurnResult, ResponsesAttempt, ResponsesClient,
@@ -88,6 +88,26 @@ pub(crate) struct ModelRun<S> {
     context_source: ContextSource,
     global_instructions: Option<Arc<str>>,
     force_compaction: bool,
+}
+
+fn estimate_event_cost(
+    usage: Option<&Usage>,
+    fast_mode: bool,
+) -> (Option<EstimatedUsdCost>, CostStatus) {
+    match usage {
+        Some(usage) => (
+            Some(estimate(
+                usage,
+                if fast_mode {
+                    ServiceTier::Priority
+                } else {
+                    ServiceTier::Standard
+                },
+            )),
+            CostStatus::EstimatedFromUsage,
+        ),
+        None => (None, CostStatus::UsageNotReported),
+    }
 }
 
 pub(crate) enum ModelTurnOutcome {
@@ -470,4 +490,50 @@ fn without_response_item_ids(items: &[ResponseItem]) -> Vec<ResponseItem> {
             item
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use nanocodex_oai_api::{
+        pricing::{CostStatus, ServiceTier},
+        responses::{InputTokenDetails, Usage},
+    };
+
+    use super::estimate_event_cost;
+
+    #[test]
+    fn completed_operation_cost_uses_the_active_service_tier() {
+        let usage = Usage {
+            input_tokens: 1_000,
+            input_tokens_details: Some(InputTokenDetails {
+                cached_tokens: 500,
+                cache_write_tokens: 100,
+            }),
+            output_tokens: 50,
+            total_tokens: 1_050,
+            ..Usage::default()
+        };
+
+        let (standard, standard_status) = estimate_event_cost(Some(&usage), false);
+        let (priority, priority_status) = estimate_event_cost(Some(&usage), true);
+        let standard = standard.unwrap();
+        let priority = priority.unwrap();
+
+        assert_eq!(standard_status, CostStatus::EstimatedFromUsage);
+        assert_eq!(priority_status, CostStatus::EstimatedFromUsage);
+        assert_eq!(standard.service_tier(), ServiceTier::Standard);
+        assert_eq!(priority.service_tier(), ServiceTier::Priority);
+        assert_eq!(
+            priority.amount().nano_usd(),
+            standard.amount().nano_usd().saturating_mul(2)
+        );
+    }
+
+    #[test]
+    fn completed_response_without_usage_has_no_estimate() {
+        let (estimated_cost, status) = estimate_event_cost(None, false);
+
+        assert!(estimated_cost.is_none());
+        assert_eq!(status, CostStatus::UsageNotReported);
+    }
 }

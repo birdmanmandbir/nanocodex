@@ -11,6 +11,7 @@ use web_time::Instant;
 use crate::{
     ResponsesError,
     attempt::ResponsesObserver,
+    service::AttemptProgress,
     service_error::ResponsesServiceError,
     socket::{ResponsesSocket, decode_event, parse_raw_json},
     telemetry::{ApiEvent, elapsed_ns},
@@ -233,12 +234,13 @@ impl ResponseEventSource for ResponsesSocket {
     }
 }
 
-pub(crate) async fn receive<S>(
+pub(super) async fn receive<S>(
     source: &mut S,
     transport: &'static str,
     observer: &ResponsesObserver,
     call_index: u32,
     started_at: Instant,
+    progress: &mut AttemptProgress,
 ) -> Result<GenerationOutput, ResponsesServiceError>
 where
     S: ResponseEventSource,
@@ -255,6 +257,7 @@ where
             "generation",
             call_index,
             &mut timing,
+            progress,
         )
         .await?;
         match received.event {
@@ -390,12 +393,13 @@ fn emit_assistant_message(
     Ok(())
 }
 
-pub(crate) async fn receive_compaction<S>(
+pub(super) async fn receive_compaction<S>(
     source: &mut S,
     transport: &'static str,
     observer: &ResponsesObserver,
     call_index: u32,
     started_at: Instant,
+    progress: &mut AttemptProgress,
 ) -> Result<CompactionOutput, ResponsesServiceError>
 where
     S: ResponseEventSource,
@@ -411,6 +415,7 @@ where
             "compaction",
             call_index,
             &mut timing,
+            progress,
         )
         .await?;
         match received.event {
@@ -454,12 +459,14 @@ async fn next_event<S>(
     phase: &'static str,
     call_index: u32,
     timing: &mut StreamTiming,
+    progress: &mut AttemptProgress,
 ) -> Result<ReceivedServerEvent, ResponsesServiceError>
 where
     S: ResponseEventSource,
 {
     let receive_started_at = Instant::now();
     let received = source.next_text_or_idle_timeout().await?;
+    progress.mark_provider_accepted();
     timing.pipeline.receive_wait_duration_ns = timing
         .pipeline
         .receive_wait_duration_ns
@@ -511,6 +518,15 @@ where
 
     let decode_started_at = Instant::now();
     let event = decode_event::<ServerEvent>(raw_event)?;
+    if matches!(
+        event,
+        ServerEvent::Completed { .. }
+            | ServerEvent::Error
+            | ServerEvent::Failed
+            | ServerEvent::Incomplete
+    ) {
+        progress.mark_provider_terminal();
+    }
     if let Some(event) = event.normalized() {
         observer.emit_response(event).await;
     }

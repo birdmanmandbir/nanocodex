@@ -86,9 +86,9 @@ where
             record_usage(&span, usage, self.fast_mode);
         }
         self.stats.model_duration_ns += duration_ns;
-        if let Some(usage) = &response.usage {
-            self.stats.usage.add(usage);
-        }
+        self.stats.observe_usage(response.usage.as_ref());
+        let (estimated_cost, cost_status) =
+            estimate_event_cost(response.usage.as_ref(), self.fast_mode);
         self.stats.last_response_id = Some(response.id.clone());
         self.events.emit(
             AgentEventKind::ModelCallCompleted,
@@ -104,6 +104,10 @@ where
                 time_to_first_output_ns: response.time_to_first_output_ns,
                 tool_calls: response.code_calls.len(),
                 usage: response.usage.as_ref(),
+                cost_usd: estimated_cost.as_ref().map(|cost| cost.amount().as_f64()),
+                estimated_cost: estimated_cost.as_ref(),
+                cost_status,
+                pricing_revision: PRICING_REVISION,
             },
         )?;
         Ok(response)

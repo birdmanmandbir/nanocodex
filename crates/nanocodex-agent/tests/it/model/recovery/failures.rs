@@ -106,6 +106,8 @@ async fn warmup_failure_falls_back_to_a_full_first_request() -> Result<()> {
     assert!(output.contains("\"purpose\":\"warmup_fallback\""));
     assert!(output.contains("\"connection_attempts\":2"));
     assert!(output.contains("\"websocket_reconnects\":1"));
+    assert!(output.contains("\"billing_uncertain_response_attempts\":1"));
+    assert!(output.contains("\"cost_status\":\"estimated_lower_bound\""));
     assert!(output.contains("\"run.completed\""));
     std::fs::remove_dir_all(workspace)?;
     Ok(())
@@ -148,12 +150,11 @@ async fn failed_turn_forces_the_next_turn_to_replay_its_latest_safe_history() ->
     let openai = OpenAi::builder("test-key")
         .websocket_url(endpoint)
         .build()?;
-    let (agent, events) = Nanocodex::builder(openai)
+    let (agent, mut events) = Nanocodex::builder(openai)
         .thinking(Thinking::Low)
         .workspace(&workspace)
         .session_id(test_session_id())
         .build()?;
-    drop(events);
 
     let failed = agent.prompt("failed prompt").await?.await;
     assert!(failed.is_err());
@@ -161,6 +162,32 @@ async fn failed_turn_forces_the_next_turn_to_replay_its_latest_safe_history() ->
     assert_eq!(completed.final_message(), "done");
 
     drop(agent);
+    let mut failed_runtime_completeness = None;
+    let mut completed_runtime_completeness = None;
+    while let Some(event) = events.recv().await {
+        match event.kind {
+            AgentEventKind::RunFailed => {
+                failed_runtime_completeness = event
+                    .decode_payload::<Value>()?
+                    .get("runtime_completeness")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+            AgentEventKind::RunCompleted => {
+                completed_runtime_completeness = event
+                    .decode_payload::<Value>()?
+                    .get("runtime_completeness")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        failed_runtime_completeness.as_deref(),
+        Some("observed_lower_bound")
+    );
+    assert_eq!(completed_runtime_completeness.as_deref(), Some("complete"));
     timeout(std::time::Duration::from_secs(5), server)
         .await
         .map_err(|_| eyre!("mock Responses server did not finish"))???;
@@ -295,6 +322,8 @@ async fn warmup_connection_failure_falls_back_to_a_full_first_request() -> Resul
     assert!(output.contains("\"purpose\":\"warmup_fallback\""));
     assert!(output.contains("\"connection_attempts\":2"));
     assert!(output.contains("\"websocket_reconnects\":1"));
+    assert!(output.contains("\"billing_uncertain_response_attempts\":0"));
+    assert!(output.contains("\"cost_status\":\"estimated_from_usage\""));
     assert!(output.contains("\"run.completed\""));
     std::fs::remove_dir_all(workspace)?;
     Ok(())

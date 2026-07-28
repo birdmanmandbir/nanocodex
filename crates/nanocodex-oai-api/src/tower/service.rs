@@ -100,35 +100,88 @@ impl ConnectionState {
     }
 }
 
-struct WebSocketAttemptGuard<'a> {
+#[derive(Clone, Copy, Default)]
+pub(super) struct AttemptProgress {
+    request_send_started: bool,
+    provider_accepted: bool,
+    provider_rejected: bool,
+    provider_terminal: bool,
+}
+
+impl AttemptProgress {
+    pub(super) const fn mark_request_send_started(&mut self) {
+        self.request_send_started = true;
+        self.provider_accepted = false;
+        self.provider_rejected = false;
+        self.provider_terminal = false;
+    }
+
+    pub(super) const fn mark_provider_accepted(&mut self) {
+        self.provider_accepted = true;
+        self.provider_rejected = false;
+    }
+
+    pub(super) const fn mark_provider_terminal(&mut self) {
+        self.provider_accepted = true;
+        self.provider_rejected = false;
+        self.provider_terminal = true;
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(super) const fn mark_provider_rejected(&mut self) {
+        self.provider_rejected = true;
+    }
+
+    const fn billing_uncertain(self) -> bool {
+        self.request_send_started && !self.provider_rejected
+    }
+}
+
+struct ResponsesAttemptGuard<'a> {
     connection: &'a mut ConnectionState,
     request: &'a ResponsesAttempt,
+    transport: ResponsesTransport,
+    progress: AttemptProgress,
     started_at: Instant,
     span: tracing::Span,
     completed: bool,
 }
 
-impl<'a> WebSocketAttemptGuard<'a> {
+impl<'a> ResponsesAttemptGuard<'a> {
     fn new(
         connection: &'a mut ConnectionState,
         request: &'a ResponsesAttempt,
+        transport: ResponsesTransport,
         started_at: Instant,
     ) -> Self {
         Self {
             connection,
             request,
+            transport,
+            progress: AttemptProgress::default(),
             started_at,
             span: tracing::Span::current(),
             completed: false,
         }
     }
 
-    const fn complete(&mut self) {
+    const fn complete(&mut self) -> AttemptProgress {
         self.completed = true;
+        self.progress
+    }
+
+    const fn progress_mut(&mut self) -> &mut AttemptProgress {
+        &mut self.progress
+    }
+
+    const fn socket_and_progress(
+        &mut self,
+    ) -> (&mut Option<ResponsesSocket>, &mut AttemptProgress) {
+        (&mut self.connection.socket, &mut self.progress)
     }
 }
 
-impl Deref for WebSocketAttemptGuard<'_> {
+impl Deref for ResponsesAttemptGuard<'_> {
     type Target = ConnectionState;
 
     fn deref(&self) -> &Self::Target {
@@ -136,21 +189,31 @@ impl Deref for WebSocketAttemptGuard<'_> {
     }
 }
 
-impl DerefMut for WebSocketAttemptGuard<'_> {
+impl DerefMut for ResponsesAttemptGuard<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.connection
     }
 }
 
-impl Drop for WebSocketAttemptGuard<'_> {
+impl Drop for ResponsesAttemptGuard<'_> {
     fn drop(&mut self) {
         if !self.completed {
             let generation = self.connection.generation;
-            self.connection.cancel_in_flight();
+            if matches!(self.transport, ResponsesTransport::WebSocket) {
+                self.connection.cancel_in_flight();
+            }
+            let billing_uncertain = self.progress.billing_uncertain();
+            if billing_uncertain {
+                self.request
+                    .observer
+                    .stats
+                    .billing_uncertain_response_attempts
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             self.span.record("status", "cancelled");
             self.span.record("otel.status_code", "ERROR");
             self.span.record("duration_ns", elapsed_ns(self.started_at));
-            let message = "Responses WebSocket attempt cancelled before a provider terminal event";
+            let message = "Responses attempt cancelled before a usable provider terminal event";
             if let Err(error) = self.request.observer.emit(
                 AgentEventKind::ModelAttemptFailed,
                 AttemptFailed {
@@ -163,6 +226,11 @@ impl Drop for WebSocketAttemptGuard<'_> {
                     error_class: "cancelled",
                     retryable: false,
                     connection_generation: generation,
+                    request_send_started: self.progress.request_send_started,
+                    provider_accepted: self.progress.provider_accepted,
+                    provider_rejected: self.progress.provider_rejected,
+                    provider_terminal: self.progress.provider_terminal,
+                    billing_uncertain,
                     error: message,
                 },
             ) {
@@ -180,7 +248,7 @@ impl Drop for WebSocketAttemptGuard<'_> {
                 model.call_index = self.request.call_index,
                 attempt = self.request.attempt,
                 connection.generation = generation,
-                "Responses WebSocket attempt cancelled before a provider terminal event"
+                "Responses attempt cancelled before a usable provider terminal event"
             );
         }
     }
@@ -285,16 +353,13 @@ impl ResponsesService {
                 connection_generation: connection.generation,
             },
         )?;
-        let result = if matches!(transport, ResponsesTransport::WebSocket) {
-            let mut guard = WebSocketAttemptGuard::new(connection, request, started_at);
+        let (result, progress) = {
+            let mut guard = ResponsesAttemptGuard::new(connection, request, transport, started_at);
             let result = self
                 .run_inner(&mut guard, request, started_at, transport)
                 .await;
-            guard.complete();
-            result
-        } else {
-            self.run_inner(connection, request, started_at, transport)
-                .await
+            let progress = guard.complete();
+            (result, progress)
         };
         tracing::Span::current().record(
             "status",
@@ -311,6 +376,14 @@ impl ResponsesService {
         tracing::Span::current().record("duration_ns", elapsed_ns(started_at));
         connection.capture_turn_state();
         if let Err(failure) = &result {
+            let billing_uncertain = progress.billing_uncertain();
+            if billing_uncertain {
+                request
+                    .observer
+                    .stats
+                    .billing_uncertain_response_attempts
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             if matches!(request.kind, ResponsesAttemptKind::Warmup) {
                 connection.invalidate(ConnectionPurpose::WarmupFallback);
             } else if failure.retry_advice.is_some() {
@@ -329,6 +402,11 @@ impl ResponsesService {
                     error_class: failure.error_class(),
                     retryable: failure.is_retryable() || failure.is_checkpoint_missing(),
                     connection_generation: failure.connection_generation,
+                    request_send_started: progress.request_send_started,
+                    provider_accepted: progress.provider_accepted,
+                    provider_rejected: progress.provider_rejected,
+                    provider_terminal: progress.provider_terminal,
+                    billing_uncertain,
                     error: &message,
                 },
             )?;
@@ -338,31 +416,29 @@ impl ResponsesService {
 
     async fn run_inner(
         &self,
-        connection: &mut ConnectionState,
+        attempt: &mut ResponsesAttemptGuard<'_>,
         request: &ResponsesAttempt,
         started_at: Instant,
         transport: ResponsesTransport,
     ) -> Result<ResponsesServiceResponse, ResponsesServiceError> {
         match transport {
-            ResponsesTransport::WebSocket => {
-                self.run_websocket(connection, request, started_at).await
-            }
-            ResponsesTransport::Https => https::run(self, connection, request, started_at).await,
+            ResponsesTransport::WebSocket => self.run_websocket(attempt, request, started_at).await,
+            ResponsesTransport::Https => https::run(self, attempt, request, started_at).await,
         }
     }
 
     async fn run_websocket(
         &self,
-        connection: &mut ConnectionState,
+        attempt: &mut ResponsesAttemptGuard<'_>,
         request: &ResponsesAttempt,
         started_at: Instant,
     ) -> Result<ResponsesServiceResponse, ResponsesServiceError> {
-        if connection.socket.is_none() {
-            self.connect(connection, request).await?;
+        if attempt.socket.is_none() {
+            self.connect(attempt, request).await?;
         }
-        let generation = connection.generation;
+        let generation = attempt.generation;
         let encode_started_at = Instant::now();
-        let encoded = self.encode_request(connection, request, ResponsesTransport::WebSocket)?;
+        let encoded = self.encode_request(attempt, request, ResponsesTransport::WebSocket)?;
         let encode_duration_ns = elapsed_ns(encode_started_at);
         let request_bytes = encoded.raw().get().len();
         let span = tracing::Span::current();
@@ -387,7 +463,9 @@ impl ResponsesService {
                 event: encoded.raw(),
             },
         )?;
-        let socket = connection.socket.as_mut().ok_or_else(|| {
+        attempt.progress_mut().mark_request_send_started();
+        let (socket, progress) = attempt.socket_and_progress();
+        let socket = socket.as_mut().ok_or_else(|| {
             ResponsesServiceError::invalid_attempt_state(
                 "connection completed without installing a WebSocket",
                 FailurePhase::Connect,
@@ -403,7 +481,7 @@ impl ResponsesService {
         span.record("request.send.duration_ns", send_duration_ns);
         let output = match request.kind {
             ResponsesAttemptKind::Warmup => ResponsesOutput::Warmup(
-                receive_warmup(socket, request)
+                receive_warmup(socket, request, progress)
                     .await
                     .map_err(|error| error.with_connection_generation(generation))?,
             ),
@@ -414,6 +492,7 @@ impl ResponsesService {
                     &request.observer,
                     required_call_index(request)?,
                     started_at,
+                    progress,
                 )
                 .await
                 .map_err(|error| error.with_connection_generation(generation))?,
@@ -425,6 +504,7 @@ impl ResponsesService {
                     &request.observer,
                     required_call_index(request)?,
                     started_at,
+                    progress,
                 )
                 .await
                 .map_err(|error| error.with_connection_generation(generation))?,
@@ -448,7 +528,7 @@ impl ResponsesService {
             output,
             attempt: request.attempt,
             connection_generation: generation,
-            server_reasoning_included: connection.server_reasoning_included,
+            server_reasoning_included: attempt.server_reasoning_included,
         })
     }
 
@@ -811,9 +891,11 @@ impl Service<ResponsesAttempt> for ResponsesService {
 async fn receive_warmup(
     socket: &mut ResponsesSocket,
     request: &ResponsesAttempt,
+    progress: &mut AttemptProgress,
 ) -> Result<WarmupResponse, ResponsesServiceError> {
     loop {
         let received = socket.next_text_or_idle_timeout().await?;
+        progress.mark_provider_accepted();
         let raw_event = parse_raw_json(received.text.as_str())?;
         tracing::trace!(
             target: "nanocodex_oai_api",
@@ -835,10 +917,14 @@ async fn receive_warmup(
             Some(received.received_ns),
         )?;
         match decode_event::<WarmupServerEvent>(raw_event)? {
-            WarmupServerEvent::Completed { response } => return Ok(response),
+            WarmupServerEvent::Completed { response } => {
+                progress.mark_provider_terminal();
+                return Ok(response);
+            }
             WarmupServerEvent::Error
             | WarmupServerEvent::Failed
             | WarmupServerEvent::Incomplete => {
+                progress.mark_provider_terminal();
                 return Err(ResponsesError::api_event(raw_event.get().to_owned()).into());
             }
             WarmupServerEvent::Created { response } => drop(response.id),
@@ -863,7 +949,7 @@ mod tests {
 
     use web_time::Instant;
 
-    use super::{ConnectionPurpose, ConnectionState, WebSocketAttemptGuard};
+    use super::{ConnectionPurpose, ConnectionState, ResponsesAttemptGuard};
 
     #[test]
     fn logical_turn_boundaries_reset_but_same_turn_calls_reuse_turn_state() {
@@ -899,9 +985,10 @@ mod tests {
         );
         let request = factory.warmup(crate::Thinking::High, false);
 
-        drop(WebSocketAttemptGuard::new(
+        drop(ResponsesAttemptGuard::new(
             &mut connection,
             &request,
+            crate::ResponsesTransport::WebSocket,
             Instant::now(),
         ));
 

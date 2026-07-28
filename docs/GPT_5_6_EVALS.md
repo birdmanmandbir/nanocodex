@@ -316,6 +316,25 @@ aggregate without rerunning a model. It needs:
   and
 - complete artifacts needed to inspect or replay one failed task.
 
+`aggregate.json` schema v4 is the typed boundary for this contract. Every
+attempt row carries structured task/package/image/verifier, model/configuration,
+build, VM, reward, exception, token, pricing, cost, latency, and artifact
+identities. Build-, tool-, seed-, topology-, and VM-specific application
+provenance is attached through `AggregateDataset::with_run_identity`, which
+copies it into each row rather than leaving a non-self-contained sidecar.
+Verifier-conditioned rates with no scored attempts serialize their rate and
+confidence bounds as `null`, not a misleading zero.
+
+Schema v4 makes partial-measurement semantics explicit. Missing billing
+snapshots serialize token usage as `null`; a provider-reported true zero remains
+a zero-valued sample; cancellation-recovered token and runtime measurements are
+tagged `observed_lower_bound`. Terminal-complete token/cost summaries remain
+separate from `observed_*_lower_bound` summaries, and agent-derived latency is
+nullable when no runtime snapshot exists. This is an intentional experimental
+schema break from the last shipped/reviewed v3, whose zero-filled missing
+snapshots were ambiguous. Intermediate revision numbers used only by
+uncommitted development drafts are intentionally not retained.
+
 For multi-agent runs, follow OpenAI's published accounting convention as an
 available view: latency comes from the root agent, while token and API-cost
 totals include all agents. Also retain per-agent timings so alternative
@@ -337,7 +356,8 @@ produce:
 6. cold image/bootstrap, scheduler queue, model, tool, and verifier latency
    decomposition;
 7. token and cost composition, including cache reads and writes rather than
-   treating all input tokens as one price; and
+   treating all input tokens as one price, with missing, exact zero,
+   terminal-complete, and observed-lower-bound samples kept distinct; and
 8. a click-through from every aggregate point to its exact attempts,
    trajectories, tool calls, diffs, verifier output, and artifacts.
 

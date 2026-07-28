@@ -5,14 +5,15 @@ use nanocodex_oai_api::{
 };
 use serde::{Deserialize, Serialize};
 
-/// Exact token accounting for every Responses call in one logical agent turn.
+/// Provider-reported token accounting for one logical agent turn.
 ///
 /// Cache-read and cache-write tokens are subsets of input tokens. Reasoning
 /// tokens are a subset of output tokens. The values are summed from provider
 /// usage records across warmup, generation, tool continuation, steering, and
-/// compaction calls made before the turn reaches its terminal boundary. Check
-/// [`Self::cost_status`] to distinguish a provider-omitted usage record from a
-/// genuine zero-token total.
+/// compaction calls made before the turn reaches its terminal boundary. A
+/// completed response that omits usage is excluded from those totals.
+/// [`Self::cost_status`] distinguishes a complete estimate, a lower bound
+/// whose accepted work was not fully reported, and wholly absent usage.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[allow(clippy::struct_field_names)]
 pub struct TurnUsage {
@@ -36,6 +37,7 @@ pub(crate) struct TurnUsageCounts {
     pub(crate) reasoning_output_tokens: u64,
     pub(crate) total_tokens: u64,
     pub(crate) reported: bool,
+    pub(crate) incomplete: bool,
 }
 
 impl TurnUsage {
@@ -60,7 +62,11 @@ impl TurnUsage {
                         ServiceTier::Standard
                     },
                 ))),
-                CostStatus::EstimatedFromUsage,
+                if counts.incomplete {
+                    CostStatus::EstimatedLowerBound
+                } else {
+                    CostStatus::EstimatedFromUsage
+                },
             )
         } else {
             (None, CostStatus::UsageNotReported)
@@ -116,8 +122,10 @@ impl TurnUsage {
     /// Returns the automatic local USD estimate.
     ///
     /// Nanocodex applies the built-in standard or priority `gpt-5.6-sol`
-    /// rates. `None` means the provider omitted usage; absence is never
-    /// serialized as a misleading zero.
+    /// rates. A returned estimate can be a lower bound when
+    /// [`Self::cost_status`] is [`CostStatus::EstimatedLowerBound`]. `None`
+    /// means no provider usage was reported; absence is never serialized as a
+    /// misleading zero.
     #[must_use]
     pub fn estimated_cost(&self) -> Option<&EstimatedUsdCost> {
         self.estimated_cost.as_deref()
@@ -127,5 +135,47 @@ impl TurnUsage {
     #[must_use]
     pub const fn cost_status(&self) -> CostStatus {
         self.cost_status
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CostStatus, TurnUsage, TurnUsageCounts};
+
+    fn counts(reported: bool, incomplete: bool) -> TurnUsageCounts {
+        TurnUsageCounts {
+            input_tokens: u64::from(reported),
+            cached_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            output_tokens: u64::from(reported),
+            reasoning_output_tokens: 0,
+            total_tokens: 2 * u64::from(reported),
+            reported,
+            incomplete,
+        }
+    }
+
+    #[test]
+    fn complete_reported_usage_has_a_full_estimate() {
+        let usage = TurnUsage::from_counts(counts(true, false), false);
+
+        assert!(usage.estimated_cost().is_some());
+        assert_eq!(usage.cost_status(), CostStatus::EstimatedFromUsage);
+    }
+
+    #[test]
+    fn mixed_reported_and_unreported_usage_retains_a_lower_bound() {
+        let usage = TurnUsage::from_counts(counts(true, true), false);
+
+        assert!(usage.estimated_cost().is_some());
+        assert_eq!(usage.cost_status(), CostStatus::EstimatedLowerBound);
+    }
+
+    #[test]
+    fn wholly_unreported_usage_has_no_estimate() {
+        let usage = TurnUsage::from_counts(counts(false, true), false);
+
+        assert!(usage.estimated_cost().is_none());
+        assert_eq!(usage.cost_status(), CostStatus::UsageNotReported);
     }
 }

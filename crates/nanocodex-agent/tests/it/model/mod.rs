@@ -28,7 +28,7 @@ use nanocodex_oai_api::{
         OpenAiAuthSource,
     },
     events::AgentEventKind,
-    pricing::CostStatus,
+    pricing::{CostStatus, PRICING_REVISION},
     session::SessionId,
 };
 

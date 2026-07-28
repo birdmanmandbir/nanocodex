@@ -5,10 +5,12 @@ use nanocodex_oai_api::{MODEL, responses::Usage};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
-use crate::{AgentMetadata, AgentResult, Task, UsageTotals};
+use crate::{
+    AgentMetadata, AgentResult, BillingCompleteness, MeasurementCompleteness, Task, UsageTotals,
+};
 
 /// A complete ATIF-v1.7 projection of one agent attempt.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct AtifTrajectory {
     /// Schema revision used to encode this trajectory.
     pub schema_version: AtifSchemaVersion,
@@ -20,6 +22,89 @@ pub struct AtifTrajectory {
     pub steps: Vec<AtifStep>,
     /// Aggregate attempt metrics.
     pub final_metrics: AtifFinalMetrics,
+}
+
+#[derive(Deserialize)]
+struct AtifTrajectoryWire {
+    schema_version: AtifSchemaVersion,
+    session_id: String,
+    agent: AtifAgent,
+    steps: Vec<AtifStep>,
+    final_metrics: AtifFinalMetricsWire,
+}
+
+#[derive(Deserialize)]
+struct AtifFinalMetricsWire {
+    total_prompt_tokens: u64,
+    total_completion_tokens: u64,
+    total_cached_tokens: u64,
+    total_cost_usd: Option<f64>,
+    total_steps: u32,
+    extra: AtifFinalMetricsExtraWire,
+}
+
+#[derive(Deserialize)]
+struct AtifFinalMetricsExtraWire {
+    model_calls: u32,
+    tool_calls: u32,
+    duration_ns: u64,
+    #[serde(default)]
+    billing_completeness: Option<BillingCompleteness>,
+    #[serde(default)]
+    pricing_revision: Option<String>,
+    #[serde(default)]
+    usage_completeness: Option<MeasurementCompleteness>,
+    #[serde(default)]
+    runtime_completeness: Option<MeasurementCompleteness>,
+    #[serde(flatten)]
+    runtime: AtifRuntimeMetrics,
+}
+
+impl From<AtifTrajectoryWire> for AtifTrajectory {
+    fn from(trajectory: AtifTrajectoryWire) -> Self {
+        let terminal_runtime_completeness = trajectory.steps.iter().rev().find_map(|step| {
+            step.extra
+                .as_ref()
+                .map(|extra| extra.terminal_payload.runtime_completeness)
+        });
+        let extra = trajectory.final_metrics.extra;
+        let runtime_completeness = extra
+            .runtime_completeness
+            .or(terminal_runtime_completeness)
+            .unwrap_or(MeasurementCompleteness::ObservedLowerBound);
+        Self {
+            schema_version: trajectory.schema_version,
+            session_id: trajectory.session_id,
+            agent: trajectory.agent,
+            steps: trajectory.steps,
+            final_metrics: AtifFinalMetrics {
+                total_prompt_tokens: trajectory.final_metrics.total_prompt_tokens,
+                total_completion_tokens: trajectory.final_metrics.total_completion_tokens,
+                total_cached_tokens: trajectory.final_metrics.total_cached_tokens,
+                total_cost_usd: trajectory.final_metrics.total_cost_usd,
+                total_steps: trajectory.final_metrics.total_steps,
+                extra: AtifFinalMetricsExtra {
+                    model_calls: extra.model_calls,
+                    tool_calls: extra.tool_calls,
+                    duration_ns: extra.duration_ns,
+                    billing_completeness: extra.billing_completeness,
+                    pricing_revision: extra.pricing_revision,
+                    usage_completeness: extra.usage_completeness,
+                    runtime_completeness,
+                    runtime: extra.runtime,
+                },
+            },
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AtifTrajectory {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        AtifTrajectoryWire::deserialize(deserializer).map(Self::from)
+    }
 }
 
 impl AtifTrajectory {
@@ -224,6 +309,10 @@ pub struct AtifFinalMetrics {
     /// Total cached input tokens.
     pub total_cached_tokens: u64,
     /// Aggregate estimated USD cost when provider usage can be priced.
+    ///
+    /// This is a lower bound when
+    /// [`AtifFinalMetricsExtra::billing_completeness`] is
+    /// [`Some(BillingCompleteness::Unknown)`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_cost_usd: Option<f64>,
     /// Number of user and agent steps.
@@ -241,6 +330,21 @@ pub struct AtifFinalMetricsExtra {
     pub tool_calls: u32,
     /// Complete attempt duration in nanoseconds.
     pub duration_ns: u64,
+    /// Whether every potentially billable model operation reached a terminal
+    /// provider usage event.
+    #[serde(default)]
+    pub billing_completeness: Option<BillingCompleteness>,
+    /// Built-in pricing catalog revision used for the estimate.
+    #[serde(default)]
+    pub pricing_revision: Option<String>,
+    /// Whether aggregate token counts are complete, observed lower bounds, or
+    /// absent (`None`).
+    #[serde(default)]
+    pub usage_completeness: Option<MeasurementCompleteness>,
+    /// Whether runtime counters and durations are exact or observed lower
+    /// bounds.
+    #[serde(default = "legacy_runtime_completeness")]
+    pub runtime_completeness: MeasurementCompleteness,
     /// Detailed transport and runtime metrics.
     #[serde(flatten)]
     pub runtime: AtifRuntimeMetrics,
@@ -253,8 +357,20 @@ pub struct AtifRuntimeMetrics {
     pub connection_attempts: u32,
     /// Successful WebSocket replacements.
     pub websocket_reconnects: u32,
+    /// Complete Responses transport attempts.
+    #[serde(default)]
+    pub response_attempts: u32,
+    /// Retried Responses attempts.
+    #[serde(default)]
+    pub response_retries: u32,
+    /// Potentially billable sent attempts whose provider usage was unavailable.
+    #[serde(default, alias = "accepted_abandoned_response_attempts")]
+    pub billing_uncertain_response_attempts: u32,
     /// Time spent establishing Responses connections.
     pub connection_duration_ns: u64,
+    /// Time spent inside owned retry backoff.
+    #[serde(default)]
+    pub retry_backoff_duration_ns: u64,
     /// Time spent inside model calls.
     pub model_duration_ns: u64,
     /// Time spent priming the prompt cache.
@@ -269,6 +385,10 @@ pub struct AtifRuntimeMetrics {
     pub cache_write_input_tokens: u64,
     /// Provider-reported reasoning output tokens.
     pub reasoning_output_tokens: u64,
+}
+
+const fn legacy_runtime_completeness() -> MeasurementCompleteness {
+    MeasurementCompleteness::ObservedLowerBound
 }
 
 /// Explicit streaming projection from typed Nanocodex events into ATIF.
@@ -377,7 +497,7 @@ impl AtifBuilder {
         Ok(())
     }
 
-    /// Finishes a successful attempt using its typed terminal result.
+    /// Finishes an attempt that retained typed terminal agent output.
     ///
     /// The trajectory begins with the complete task prompt and attaches the
     /// terminal agent payload to the final agent step.
@@ -399,7 +519,11 @@ impl AtifBuilder {
                 last.message.clone_from(&result.final_message);
             }
             last.extra = Some(AtifStepExtra {
-                terminal_event_type: "run.completed".to_owned(),
+                terminal_event_type: match result.metadata.status {
+                    crate::AgentStatus::Completed => "run.completed",
+                    crate::AgentStatus::Failed | crate::AgentStatus::Cancelled => "run.failed",
+                }
+                .to_owned(),
                 terminal_payload: result.metadata.clone(),
             });
         }
@@ -427,6 +551,10 @@ impl AtifBuilder {
                     model_calls: result.model_calls,
                     tool_calls: result.tool_calls,
                     duration_ns: result.metadata.duration_ns,
+                    billing_completeness: Some(result.billing_completeness),
+                    pricing_revision: result.metadata.pricing_revision.clone(),
+                    usage_completeness: atif_usage_completeness(result),
+                    runtime_completeness: result.metadata.runtime_completeness,
                     runtime,
                 },
             },
@@ -436,6 +564,10 @@ impl AtifBuilder {
     /// Finishes the partial trajectory observed before an attempt error.
     #[must_use]
     pub fn finish_failure(self, task: &Task) -> AtifTrajectory {
+        let usage_observed = self
+            .turns
+            .values()
+            .any(|turn| turn.metrics.as_ref().is_some());
         let model_name = self
             .turns
             .values()
@@ -501,6 +633,11 @@ impl AtifBuilder {
                     model_calls,
                     tool_calls: u32::try_from(tool_calls).unwrap_or(u32::MAX),
                     duration_ns,
+                    billing_completeness: None,
+                    pricing_revision: None,
+                    usage_completeness: usage_observed
+                        .then_some(MeasurementCompleteness::ObservedLowerBound),
+                    runtime_completeness: MeasurementCompleteness::ObservedLowerBound,
                     runtime: AtifRuntimeMetrics::default(),
                 },
             },
@@ -605,7 +742,11 @@ impl From<&AgentMetadata> for AtifRuntimeMetrics {
         Self {
             connection_attempts: metadata.connection_attempts,
             websocket_reconnects: metadata.websocket_reconnects,
+            response_attempts: metadata.response_attempts,
+            response_retries: metadata.response_retries,
+            billing_uncertain_response_attempts: metadata.billing_uncertain_response_attempts,
             connection_duration_ns: metadata.connection_duration_ns,
+            retry_backoff_duration_ns: metadata.retry_backoff_duration_ns,
             model_duration_ns: metadata.model_duration_ns,
             warmup_duration_ns: metadata.warmup_duration_ns,
             tool_work_duration_ns: metadata.tool_work_duration_ns,
@@ -615,6 +756,16 @@ impl From<&AgentMetadata> for AtifRuntimeMetrics {
             reasoning_output_tokens: metadata.usage.reasoning_output_tokens,
         }
     }
+}
+
+fn atif_usage_completeness(result: &AgentResult) -> Option<MeasurementCompleteness> {
+    result.has_observed_usage().then_some(
+        if result.billing_completeness == BillingCompleteness::Complete {
+            MeasurementCompleteness::Complete
+        } else {
+            MeasurementCompleteness::ObservedLowerBound
+        },
+    )
 }
 
 fn append_message(message: &mut String, next: &str) {
@@ -684,8 +835,12 @@ mod tests {
     use std::path::Path;
 
     use nanocodex_agent::events::AgentEvent;
+    use serde_json::Value;
 
-    use crate::{AgentMetadata, AgentResult, AtifSource, BillingCompleteness, Task};
+    use crate::{
+        AgentMetadata, AgentResult, AgentStatus, AtifSource, BillingCompleteness,
+        MeasurementCompleteness, Task,
+    };
 
     use super::AtifBuilder;
 
@@ -779,11 +934,138 @@ mod tests {
             trajectory.steps[2].reasoning_content.as_deref(),
             Some("Done")
         );
+        assert_eq!(
+            trajectory.steps[2]
+                .extra
+                .as_ref()
+                .map(|extra| extra.terminal_event_type.as_str()),
+            Some("run.completed")
+        );
         assert_eq!(trajectory.final_metrics.total_steps, 3);
         let encoded = serde_json::to_string(&trajectory).unwrap();
         let decoded: crate::AtifTrajectory = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded.tool_call_count(), 1);
         assert_eq!(decoded.observation_count(), 1);
+        assert_eq!(
+            decoded.final_metrics.extra.runtime_completeness,
+            MeasurementCompleteness::Complete
+        );
+        assert_eq!(
+            decoded.final_metrics.extra.usage_completeness,
+            Some(MeasurementCompleteness::Complete)
+        );
+        assert_eq!(
+            decode_legacy_runtime(serde_json::to_value(&trajectory).unwrap())
+                .final_metrics
+                .extra
+                .runtime_completeness,
+            MeasurementCompleteness::Complete
+        );
+
+        let mut partial_builder = AtifBuilder::default();
+        for event in &events {
+            partial_builder.apply(event).unwrap();
+        }
+        let partial = partial_builder.finish_failure(&task);
+        assert_eq!(
+            partial.final_metrics.extra.runtime_completeness,
+            MeasurementCompleteness::ObservedLowerBound
+        );
+        assert_eq!(
+            partial.final_metrics.extra.usage_completeness,
+            Some(MeasurementCompleteness::ObservedLowerBound)
+        );
+        assert_eq!(
+            decode_legacy_runtime(serde_json::to_value(&partial).unwrap())
+                .final_metrics
+                .extra
+                .runtime_completeness,
+            MeasurementCompleteness::ObservedLowerBound
+        );
+
+        let mut failed = result.clone();
+        failed.metadata.status = AgentStatus::Failed;
+        failed.metadata.runtime_completeness = MeasurementCompleteness::ObservedLowerBound;
+        failed.metadata.pricing_revision = Some("test-pricing-v1".to_owned());
+        failed.cost_usd = Some(0.125);
+        failed.billing_completeness = BillingCompleteness::Unknown;
+        let mut builder = AtifBuilder::default();
+        for event in &events {
+            builder.apply(event).unwrap();
+        }
+        let trajectory = builder.finish(&task, &failed);
+        assert_eq!(trajectory.final_metrics.total_prompt_tokens, 22);
+        assert_eq!(trajectory.final_metrics.total_completion_tokens, 5);
+        assert_eq!(trajectory.final_metrics.total_cost_usd, Some(0.125));
+        assert_eq!(
+            trajectory.final_metrics.extra.billing_completeness,
+            Some(BillingCompleteness::Unknown)
+        );
+        assert_eq!(
+            trajectory.final_metrics.extra.usage_completeness,
+            Some(crate::MeasurementCompleteness::ObservedLowerBound)
+        );
+        assert_eq!(
+            trajectory.final_metrics.extra.pricing_revision.as_deref(),
+            Some("test-pricing-v1")
+        );
+        assert_eq!(
+            trajectory.steps[2]
+                .extra
+                .as_ref()
+                .map(|extra| extra.terminal_event_type.as_str()),
+            Some("run.failed")
+        );
+        let legacy_failed = decode_legacy_runtime(serde_json::to_value(&trajectory).unwrap());
+        assert_eq!(
+            legacy_failed.final_metrics.extra.runtime_completeness,
+            MeasurementCompleteness::ObservedLowerBound
+        );
+        assert_eq!(
+            legacy_failed.steps[2]
+                .extra
+                .as_ref()
+                .map(|extra| extra.terminal_payload.runtime_completeness),
+            Some(MeasurementCompleteness::ObservedLowerBound)
+        );
+
+        let mut cancelled = result;
+        cancelled.metadata.status = AgentStatus::Cancelled;
+        cancelled.metadata.runtime_completeness = MeasurementCompleteness::ObservedLowerBound;
+        let mut builder = AtifBuilder::default();
+        builder.apply(&events[0]).unwrap();
+        let trajectory = builder.finish(&task, &cancelled);
+        assert_eq!(
+            trajectory.steps[1]
+                .extra
+                .as_ref()
+                .map(|extra| extra.terminal_event_type.as_str()),
+            Some("run.failed")
+        );
+        assert_eq!(
+            decode_legacy_runtime(serde_json::to_value(&trajectory).unwrap())
+                .final_metrics
+                .extra
+                .runtime_completeness,
+            MeasurementCompleteness::ObservedLowerBound
+        );
+    }
+
+    fn decode_legacy_runtime(mut trajectory: Value) -> crate::AtifTrajectory {
+        trajectory["final_metrics"]["extra"]
+            .as_object_mut()
+            .unwrap()
+            .remove("runtime_completeness");
+        for step in trajectory["steps"].as_array_mut().unwrap() {
+            if let Some(terminal) = step
+                .get_mut("extra")
+                .and_then(|extra| extra.get_mut("terminal_payload"))
+                .and_then(Value::as_object_mut)
+            {
+                terminal.remove("runtime_completeness");
+            }
+        }
+        serde_json::from_value(trajectory).unwrap()
     }
 
     fn event(seq: u64, kind: &str, payload: &str) -> AgentEvent {

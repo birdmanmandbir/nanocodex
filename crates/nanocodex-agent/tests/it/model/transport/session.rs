@@ -43,7 +43,10 @@ async fn a_turn_stream_mirrors_one_turn_and_await_retains_its_result() -> Result
         .estimated_cost()
         .expect("provider usage should produce an estimate");
     assert_eq!(estimated_cost.amount().decimal(), "0.0000875");
-    assert_eq!(result.usage().cost_status(), CostStatus::EstimatedFromUsage);
+    assert_eq!(
+        result.usage().cost_status(),
+        CostStatus::EstimatedLowerBound
+    );
 
     drop(agent);
     let mut session = Vec::new();
@@ -64,6 +67,28 @@ async fn a_turn_stream_mirrors_one_turn_and_await_retains_its_result() -> Result
         streamed.last().map(|event| event.kind),
         Some(AgentEventKind::RunCompleted)
     );
+    let warmup = streamed
+        .iter()
+        .find(|event| event.kind == AgentEventKind::ModelWarmupCompleted)
+        .expect("the turn should retain its completed warmup")
+        .decode_payload::<nanocodex_agent::events::ModelWarmupCompleted>()?;
+    let call = streamed
+        .iter()
+        .find(|event| event.kind == AgentEventKind::ModelCallCompleted)
+        .expect("the turn should retain its completed generation")
+        .decode_payload::<nanocodex_agent::events::ModelCallCompleted>()?;
+    assert!(warmup.estimated_cost.is_none());
+    assert_eq!(warmup.cost_status, CostStatus::UsageNotReported);
+    assert_eq!(
+        call.estimated_cost
+            .as_ref()
+            .expect("completed generation usage should be priced")
+            .service_tier(),
+        nanocodex_agent::ServiceTier::Standard
+    );
+    assert_eq!(call.cost_status, CostStatus::EstimatedFromUsage);
+    assert_eq!(warmup.pricing_revision.as_deref(), Some(PRICING_REVISION));
+    assert_eq!(call.pricing_revision.as_deref(), Some(PRICING_REVISION));
     let terminal = streamed
         .last()
         .expect("the turn should have a terminal event");
@@ -81,6 +106,7 @@ async fn a_turn_stream_mirrors_one_turn_and_await_retains_its_result() -> Result
             .decimal(),
         "0.0000875"
     );
+    assert_eq!(typed_terminal.cost_status, CostStatus::EstimatedLowerBound);
     let terminal_payload = terminal.decode_payload::<Value>()?;
     assert_eq!(
         terminal_payload["estimated_cost"]["usd"],
@@ -92,7 +118,11 @@ async fn a_turn_stream_mirrors_one_turn_and_await_retains_its_result() -> Result
     );
     assert_eq!(
         terminal_payload["cost_status"],
-        json!("estimated_from_usage")
+        json!("estimated_lower_bound")
+    );
+    assert_eq!(
+        terminal_payload["pricing_revision"],
+        json!(PRICING_REVISION)
     );
 
     timeout(std::time::Duration::from_secs(5), server)

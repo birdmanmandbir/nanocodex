@@ -16,6 +16,96 @@ use nanocodex_oai_api::{
 use tower::Service;
 
 #[tokio::test]
+async fn cancellation_after_reported_usage_keeps_cost_as_a_lower_bound() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let (continuation_seen, continuation_seen_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut socket = accept_async(stream).await?;
+        assert_warmup(&next_json(&mut socket).await?);
+        send_json(
+            &mut socket,
+            completed_response_with_usage("resp-warmup", &[], 1),
+        )
+        .await?;
+
+        let generation = next_json(&mut socket).await?;
+        assert_eq!(generation["previous_response_id"], "resp-warmup");
+        send_json(
+            &mut socket,
+            completed_response(
+                "resp-tool",
+                &[json!({
+                    "type": "custom_tool_call",
+                    "call_id": "call-exec",
+                    "name": "exec",
+                    "input": "text(\"continue\")"
+                })],
+            ),
+        )
+        .await?;
+
+        let continuation = next_json(&mut socket).await?;
+        assert_eq!(continuation["previous_response_id"], "resp-tool");
+        send_json(
+            &mut socket,
+            json!({
+                "type": "response.created",
+                "response": { "id": "resp-cancelled" }
+            }),
+        )
+        .await?;
+        continuation_seen
+            .send(())
+            .map_err(|()| eyre!("continuation signal receiver dropped"))?;
+        while socket.next().await.is_some() {}
+        Ok::<_, eyre::Report>(())
+    });
+
+    let workspace = temporary_workspace("cancel-cost-lower-bound")?;
+    let openai = OpenAi::builder("test-key")
+        .websocket_url(endpoint)
+        .build()?;
+    let (agent, mut events) = Nanocodex::builder(openai)
+        .thinking(Thinking::Low)
+        .workspace(&workspace)
+        .session_id(test_session_id())
+        .build()?;
+
+    let turn = agent.prompt("report usage before cancellation").await?;
+    continuation_seen_rx
+        .await
+        .map_err(|_| eyre!("continuation request was not observed"))?;
+    turn.cancel().await?;
+    assert!(matches!(
+        turn.result().await,
+        Err(NanocodexError::TurnCancelled)
+    ));
+    agent.shutdown().await?;
+    drop(agent);
+
+    let mut terminal = None;
+    while let Some(event) = events.recv().await {
+        if matches!(event.kind, AgentEventKind::RunFailed) {
+            terminal = Some(event.decode_payload::<Value>()?);
+        }
+    }
+    let terminal = terminal.ok_or_else(|| eyre!("cancelled turn omitted its terminal event"))?;
+    assert_eq!(terminal["status"], "cancelled");
+    assert_eq!(terminal["runtime_completeness"], "observed_lower_bound");
+    assert_eq!(terminal["billing_uncertain_response_attempts"], 1);
+    assert_eq!(terminal["cost_status"], "estimated_lower_bound");
+    assert!(terminal["cost_usd"].as_f64().is_some_and(|cost| cost > 0.0));
+
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock Responses server did not finish"))???;
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn cancellation_retains_interrupted_prompt_and_resumes_from_the_abort_boundary() -> Result<()>
 {
     let listener = TcpListener::bind("127.0.0.1:0").await?;

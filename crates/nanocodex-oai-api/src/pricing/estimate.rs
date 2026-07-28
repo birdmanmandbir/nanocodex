@@ -79,6 +79,25 @@ pub struct EstimatedUsdCost {
 }
 
 impl EstimatedUsdCost {
+    /// Combines two estimates produced for the same service tier.
+    ///
+    /// Every exact component is added independently with saturation. `None`
+    /// denotes estimates from different service tiers, which cannot be
+    /// represented truthfully by one aggregate [`EstimatedUsdCost`].
+    #[must_use]
+    pub fn combined(&self, other: &Self) -> Option<Self> {
+        (self.service_tier == other.service_tier).then(|| Self {
+            amount: self.amount.saturating_add(other.amount),
+            input: self.input.saturating_add(other.input),
+            cached_input: self.cached_input.saturating_add(other.cached_input),
+            cache_write_input: self
+                .cache_write_input
+                .saturating_add(other.cache_write_input),
+            output: self.output.saturating_add(other.output),
+            service_tier: self.service_tier,
+        })
+    }
+
     /// Returns the exact aggregate estimate.
     #[must_use]
     pub const fn amount(&self) -> UsdAmount {
@@ -242,5 +261,52 @@ mod tests {
         assert_eq!(estimate.input().nano_usd(), 0);
         assert_eq!(estimate.cached_input().nano_usd(), 4_000);
         assert_eq!(estimate.cache_write_input().nano_usd(), 12_500);
+    }
+
+    #[test]
+    fn combines_exact_components_only_within_one_service_tier() {
+        let first = estimate_tokens(10, 2, 1, 3, ServiceTier::Standard);
+        let second = estimate_tokens(20, 4, 2, 6, ServiceTier::Standard);
+        let combined = first.combined(&second).unwrap();
+
+        assert_eq!(
+            combined.amount().nano_usd(),
+            first
+                .amount()
+                .nano_usd()
+                .saturating_add(second.amount().nano_usd())
+        );
+        assert_eq!(
+            combined.input().nano_usd(),
+            first
+                .input()
+                .nano_usd()
+                .saturating_add(second.input().nano_usd())
+        );
+        assert_eq!(
+            combined.cached_input().nano_usd(),
+            first
+                .cached_input()
+                .nano_usd()
+                .saturating_add(second.cached_input().nano_usd())
+        );
+        assert_eq!(
+            combined.cache_write_input().nano_usd(),
+            first
+                .cache_write_input()
+                .nano_usd()
+                .saturating_add(second.cache_write_input().nano_usd())
+        );
+        assert_eq!(
+            combined.output().nano_usd(),
+            first
+                .output()
+                .nano_usd()
+                .saturating_add(second.output().nano_usd())
+        );
+        assert_eq!(combined.service_tier(), ServiceTier::Standard);
+
+        let priority = estimate_tokens(1, 0, 0, 0, ServiceTier::Priority);
+        assert!(combined.combined(&priority).is_none());
     }
 }

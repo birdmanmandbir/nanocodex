@@ -13,6 +13,8 @@ use sha2::{Digest, Sha256};
 use tokio::{fs, process::Command};
 use uuid::Uuid;
 
+use crate::{EvalCleanup, EvalOutcome, infer_retained_scored};
+
 const DEFAULT_REPOSITORY: &str =
     "https://huggingface.co/datasets/harborframework/terminal-bench-2-leaderboard";
 const DEFAULT_DOWNLOAD_BASE: &str =
@@ -162,7 +164,7 @@ impl PublishedResults {
         for record in records {
             let PublishedRecord { candidate, result } = record;
             let reward = result.reward();
-            if reward <= 0.0 || result.exception_info.is_some() {
+            if reward <= 0.0 || !result.is_scored() {
                 continue;
             }
             if !query.agent_matches(&candidate.submission, &result) {
@@ -274,8 +276,11 @@ impl PublishedResults {
             .filter(|record| query.agent_matches(&record.candidate.submission, &record.result))
             .map(|record| {
                 let PublishedRecord { candidate, result } = record;
-                let passed = result.exception_info.is_none() && result.reward() > 0.0;
-                let errored = result.exception_info.is_some();
+                let scored = result.is_scored();
+                let passed = scored && result.reward() > 0.0;
+                let errored = result.is_errored();
+                let refused = result.is_refused();
+                let cleanup_failed = result.is_cleanup_failed();
                 let thinking = result
                     .config
                     .as_ref()
@@ -291,8 +296,11 @@ impl PublishedResults {
                     task_name: result.task_name,
                     task_checksum: result.task_checksum,
                     trial_name: result.trial_name,
+                    scored,
                     passed,
                     errored,
+                    refused,
+                    cleanup_failed,
                     agent,
                     thinking,
                     agent_import_path,
@@ -647,10 +655,16 @@ pub struct PublishedAttempt {
     pub task_checksum: String,
     /// The trial name reported by Harbor.
     pub trial_name: String,
-    /// Whether the verifier awarded a positive reward without an exception.
+    /// Whether the attempt retained verifier evidence.
+    pub scored: bool,
+    /// Whether the verifier awarded a positive reward.
     pub passed: bool,
-    /// Whether Harbor recorded an exception for the trial.
+    /// Whether the trial retained a non-cleanup lifecycle exception.
     pub errored: bool,
+    /// Whether the agent refused the task for a provider safety policy.
+    pub refused: bool,
+    /// Whether a retained agent or verifier cleanup boundary failed.
+    pub cleanup_failed: bool,
     /// The published agent and model identity.
     pub agent: PublishedAgentInfo,
     /// The configured reasoning effort, when recorded.
@@ -722,8 +736,19 @@ struct PublishedResult {
     agent_info: PublishedAgentInfo,
     #[serde(default)]
     config: Option<PublishedTrialConfig>,
+    #[serde(default)]
+    outcome: Option<EvalOutcome>,
+    #[serde(default)]
+    scored: Option<bool>,
     verifier_result: Option<PublishedVerifierResult>,
     exception_info: Option<Box<RawValue>>,
+    #[serde(default)]
+    cleanup: EvalCleanup,
+}
+
+#[derive(Deserialize)]
+struct PublishedException {
+    exception_type: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -774,6 +799,46 @@ struct PublishedAgentKwargs {
 }
 
 impl PublishedResult {
+    const fn is_scored(&self) -> bool {
+        infer_retained_scored(
+            self.scored,
+            self.outcome,
+            self.verifier_result.is_some(),
+            self.exception_info.is_some(),
+        )
+    }
+
+    fn is_errored(&self) -> bool {
+        match self.exception_info.as_ref() {
+            Some(exception) => serde_json::from_str::<PublishedException>(exception.get())
+                .map_or(true, |exception| exception.exception_type != "CleanupError"),
+            None => self.outcome.is_some_and(|outcome| {
+                matches!(
+                    outcome,
+                    EvalOutcome::SafetyRefusal
+                        | EvalOutcome::AgentTimeout
+                        | EvalOutcome::InfrastructureError
+                )
+            }),
+        }
+    }
+
+    fn is_refused(&self) -> bool {
+        match self.exception_info.as_ref() {
+            Some(exception) => serde_json::from_str::<PublishedException>(exception.get())
+                .is_ok_and(|exception| exception.exception_type == "AgentSafetyRefusalError"),
+            None => matches!(self.outcome, Some(EvalOutcome::SafetyRefusal)),
+        }
+    }
+
+    fn is_cleanup_failed(&self) -> bool {
+        self.cleanup.is_failed()
+            || self.exception_info.as_ref().is_some_and(|exception| {
+                serde_json::from_str::<PublishedException>(exception.get())
+                    .is_ok_and(|exception| exception.exception_type == "CleanupError")
+            })
+    }
+
     fn reward(&self) -> f64 {
         self.verifier_result
             .as_ref()
@@ -1023,5 +1088,83 @@ mod tests {
     fn query_normalizes_package_prefix() {
         let query = PublishedQuery::new("terminal-bench/task");
         assert_eq!(query.task, "task");
+    }
+
+    #[test]
+    fn legacy_scores_and_lifecycle_errors_remain_independent() {
+        let mut result = PublishedResult {
+            task_name: "task".to_owned(),
+            task_checksum: "checksum".to_owned(),
+            trial_name: "task__trial".to_owned(),
+            agent_info: PublishedAgentInfo {
+                name: "agent".to_owned(),
+                version: None,
+                model_info: None,
+            },
+            config: None,
+            outcome: None,
+            scored: None,
+            verifier_result: Some(PublishedVerifierResult {
+                rewards: BTreeMap::from([("reward".to_owned(), 1.0)]),
+            }),
+            exception_info: None,
+            cleanup: EvalCleanup::default(),
+        };
+
+        assert!(result.is_scored());
+        assert!(!result.is_errored());
+        assert!(!result.is_refused());
+        assert!(!result.is_cleanup_failed());
+
+        result.outcome = Some(EvalOutcome::AgentTimeout);
+        assert!(!result.is_scored());
+
+        result.scored = Some(true);
+        result.exception_info = Some(
+            RawValue::from_string(r#"{"exception_type":"AgentTimeoutError"}"#.to_owned()).unwrap(),
+        );
+        assert!(result.is_scored());
+
+        result.scored = None;
+        result.outcome = None;
+        assert!(!result.is_scored());
+
+        result.scored = Some(false);
+        assert!(!result.is_scored());
+
+        result.verifier_result = None;
+        assert!(!result.is_scored());
+        assert!(result.is_errored());
+        assert!(!result.is_refused());
+        assert!(!result.is_cleanup_failed());
+
+        result.exception_info =
+            Some(RawValue::from_string(r#"{"exception_type":"CleanupError"}"#.to_owned()).unwrap());
+        assert!(!result.is_scored());
+        assert!(!result.is_errored());
+        assert!(!result.is_refused());
+        assert!(result.is_cleanup_failed());
+
+        result.outcome = Some(EvalOutcome::SafetyRefusal);
+        assert!(!result.is_errored());
+        assert!(!result.is_refused());
+
+        result.exception_info = None;
+        assert!(result.is_errored());
+        assert!(result.is_refused());
+
+        result.exception_info = Some(
+            RawValue::from_string(r#"{"exception_type":"AgentSafetyRefusalError"}"#.to_owned())
+                .unwrap(),
+        );
+        result.outcome = None;
+        assert!(result.is_errored());
+        assert!(result.is_refused());
+
+        result.exception_info = None;
+        result.cleanup.agent.status = crate::CleanupStatus::Failed;
+        assert!(!result.is_errored());
+        assert!(!result.is_refused());
+        assert!(result.is_cleanup_failed());
     }
 }

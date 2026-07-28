@@ -40,6 +40,95 @@ where
 }
 
 #[tokio::test]
+async fn incomplete_compaction_retry_keeps_reported_cost_as_a_lower_bound() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut first = accept_async(stream).await?;
+        assert_warmup(&next_json(&mut first).await?);
+        send_json(
+            &mut first,
+            completed_response_with_usage("resp-warmup", &[], 1),
+        )
+        .await?;
+
+        let generation = next_json(&mut first).await?;
+        assert_eq!(generation["previous_response_id"], "resp-warmup");
+        send_json(
+            &mut first,
+            completed_response_with_usage(
+                "resp-tool",
+                &[json!({
+                    "type": "custom_tool_call",
+                    "call_id": "call-exec",
+                    "name": "exec",
+                    "input": "text(\"continue\")"
+                })],
+                372_001,
+            ),
+        )
+        .await?;
+
+        let compact = next_json(&mut first).await?;
+        assert_eq!(compact["previous_response_id"], "resp-tool");
+        assert_eq!(
+            compact["input"].as_array().and_then(|input| input.last()),
+            Some(&json!({ "type": "compaction_trigger" }))
+        );
+        send_json(
+            &mut first,
+            json!({
+                "type": "response.incomplete",
+                "response": {
+                    "id": "resp-incomplete-compaction",
+                    "status": "incomplete",
+                    "incomplete_details": { "reason": "max_output_tokens" }
+                }
+            }),
+        )
+        .await?;
+        drop(first);
+
+        let (stream, _) = listener.accept().await?;
+        let mut second = accept_async(stream).await?;
+        let replay = next_json(&mut second).await?;
+        assert!(replay.get("previous_response_id").is_none());
+        assert_eq!(
+            replay["input"].as_array().and_then(|input| input.last()),
+            Some(&json!({ "type": "compaction_trigger" }))
+        );
+        send_compaction(&mut second, "resp-compact").await?;
+
+        let continuation = next_json(&mut second).await?;
+        assert!(continuation.get("previous_response_id").is_none());
+        assert!(
+            continuation["input"]
+                .as_array()
+                .is_some_and(|input| input.iter().any(|item| item["type"] == "compaction"))
+        );
+        send_final(&mut second, "resp-final").await
+    });
+
+    let workspace = temporary_workspace("incomplete-compaction-cost")?;
+    let output = run_model(
+        &endpoint,
+        &workspace,
+        "retry an incomplete automatic compaction",
+    )
+    .await?;
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock Responses server did not finish"))???;
+    assert!(output.contains("\"model.compaction.completed\""));
+    assert!(output.contains("\"billing_uncertain_response_attempts\":1"));
+    assert!(output.contains("\"cost_status\":\"estimated_lower_bound\""));
+    assert!(output.contains("\"run.completed\""));
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn manual_compaction_before_first_prompt_reinjects_cached_context_and_persists_boundary()
 -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;

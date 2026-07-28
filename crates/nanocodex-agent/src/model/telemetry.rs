@@ -1,7 +1,12 @@
 use std::time::Duration;
 
 use nanocodex_oai_api::{
-    __private::ModelConfig, Thinking, responses::Usage, transport::TransportStatsDelta,
+    __private::ModelConfig,
+    Thinking,
+    events::RuntimeCompleteness,
+    pricing::{CostStatus, EstimatedUsdCost},
+    responses::Usage,
+    transport::TransportStatsDelta,
 };
 use serde::Serialize;
 use serde_json::value::RawValue;
@@ -38,6 +43,11 @@ pub(super) struct WarmupCompleted<'a> {
     pub(super) connection_generation: Option<u32>,
     pub(super) duration_ns: u64,
     pub(super) usage: Option<&'a Usage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) estimated_cost: Option<&'a EstimatedUsdCost>,
+    pub(super) cost_usd: Option<f64>,
+    pub(super) cost_status: CostStatus,
+    pub(super) pricing_revision: &'static str,
 }
 
 #[derive(Serialize)]
@@ -59,6 +69,11 @@ pub(super) struct ModelCallCompleted<'a> {
     pub(super) time_to_first_output_ns: Option<u64>,
     pub(super) tool_calls: usize,
     pub(super) usage: Option<&'a Usage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) estimated_cost: Option<&'a EstimatedUsdCost>,
+    pub(super) cost_usd: Option<f64>,
+    pub(super) cost_status: CostStatus,
+    pub(super) pricing_revision: &'static str,
 }
 
 #[derive(Serialize)]
@@ -88,6 +103,11 @@ pub(super) struct CompactionCompleted<'a> {
     pub(super) time_to_first_event_ns: u64,
     pub(super) time_to_first_output_ns: Option<u64>,
     pub(super) usage: Option<&'a Usage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) estimated_cost: Option<&'a EstimatedUsdCost>,
+    pub(super) cost_usd: Option<f64>,
+    pub(super) cost_status: CostStatus,
+    pub(super) pricing_revision: &'static str,
 }
 
 #[derive(Serialize)]
@@ -169,6 +189,8 @@ pub(super) struct RunStats {
     pub(super) websocket_reconnects: u32,
     pub(super) response_attempts: u32,
     pub(super) response_retries: u32,
+    /// Potentially billable sent attempts whose provider usage was unavailable.
+    pub(super) billing_uncertain_response_attempts: u32,
     pub(super) connection_duration_ns: u64,
     pub(super) retry_backoff_duration_ns: u64,
     pub(super) model_duration_ns: u64,
@@ -179,6 +201,8 @@ pub(super) struct RunStats {
     pub(super) usage: UsageTotals,
     pub(super) warmup_usage: UsageTotals,
     pub(super) last_response_id: Option<String>,
+    #[serde(skip)]
+    pub(super) billing_incomplete: bool,
 }
 
 impl RunStats {
@@ -187,6 +211,10 @@ impl RunStats {
         self.websocket_reconnects = delta.websocket_reconnects;
         self.response_attempts = delta.response_attempts;
         self.response_retries = delta.response_retries;
+        self.billing_uncertain_response_attempts = delta.billing_uncertain_response_attempts;
+        if delta.billing_uncertain_response_attempts > 0 {
+            self.billing_incomplete = true;
+        }
         self.connection_duration_ns = delta.connection_duration_ns;
         self.retry_backoff_duration_ns = delta.retry_backoff_duration_ns;
     }
@@ -204,9 +232,28 @@ impl RunStats {
                     + self.warmup_usage.reasoning_output_tokens,
                 total_tokens: self.usage.total_tokens + self.warmup_usage.total_tokens,
                 reported: self.usage.reported || self.warmup_usage.reported,
+                incomplete: self.billing_incomplete,
             },
             fast_mode,
         )
+    }
+
+    pub(super) fn observe_usage(&mut self, usage: Option<&Usage>) {
+        match usage {
+            Some(usage) => self.usage.add(usage),
+            None => self.mark_billing_incomplete(),
+        }
+    }
+
+    pub(super) fn observe_warmup_usage(&mut self, usage: Option<&Usage>) {
+        match usage {
+            Some(usage) => self.warmup_usage.add(usage),
+            None => self.mark_billing_incomplete(),
+        }
+    }
+
+    pub(super) const fn mark_billing_incomplete(&mut self) {
+        self.billing_incomplete = true;
     }
 }
 
@@ -225,12 +272,18 @@ pub(super) fn terminal_payload<'a>(
         effort: thinking.as_str(),
         transport: config.responses_transport.as_str(),
         orchestration: ModelConfig::orchestration(),
+        runtime_completeness: if terminal_status == "completed" {
+            RuntimeCompleteness::Complete
+        } else {
+            RuntimeCompleteness::ObservedLowerBound
+        },
         duration_ms: duration_ms(elapsed),
         duration_ns: duration_ns(elapsed),
         stats,
         estimated_cost: usage.estimated_cost(),
         cost_usd: usage.estimated_cost().map(|cost| cost.amount().as_f64()),
         cost_status: usage.cost_status(),
+        pricing_revision: nanocodex_oai_api::pricing::PRICING_REVISION,
     }
 }
 
@@ -266,6 +319,7 @@ pub(super) struct TerminalPayload<'a> {
     effort: &'static str,
     transport: &'static str,
     orchestration: &'static str,
+    runtime_completeness: RuntimeCompleteness,
     duration_ms: u64,
     duration_ns: u64,
     #[serde(flatten)]
@@ -274,6 +328,7 @@ pub(super) struct TerminalPayload<'a> {
     estimated_cost: Option<&'a nanocodex_oai_api::pricing::EstimatedUsdCost>,
     cost_usd: Option<f64>,
     cost_status: nanocodex_oai_api::pricing::CostStatus,
+    pricing_revision: &'static str,
 }
 
 fn duration_ms(duration: Duration) -> u64 {

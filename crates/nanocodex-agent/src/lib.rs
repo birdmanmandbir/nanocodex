@@ -42,8 +42,8 @@ pub mod events {
         ContextEvent, EventUsage, ModelCallCompleted, ModelCallFailed, ModelCallStarted,
         ModelEvent, ModelWarmupCompleted, ModelWarmupFailed, ModelWarmupStarted, OpenAiEvent,
         ReasoningEvent, ReasoningSummaryDelta, RunError, RunEvent, RunMetrics, RunStarted,
-        RunStatus, RunSteered, RunTerminal, TimedAgentEvent, ToolCall, ToolEvent, ToolResultEvent,
-        ToolStatus, TransportEvent, monotonic_now_ns,
+        RunStatus, RunSteered, RunTerminal, RuntimeCompleteness, TimedAgentEvent, ToolCall,
+        ToolEvent, ToolResultEvent, ToolStatus, TransportEvent, monotonic_now_ns,
     };
     pub use nanocodex_oai_api::responses::AgentMessageContent;
 }

@@ -30,11 +30,13 @@ use nanocodex::{
 };
 use nanocodex_eval::harbor::{Harbor, HarborJob, HarborRecorder};
 use nanocodex_eval::{
-    AggregateRunTiming, AttemptAgent, AttemptVerification, AttemptVerificationFailure,
-    AttemptVerifier, BillingCompleteness, CleanupPhase, EvalAttempt, EvalAttemptOutcome,
-    EvalEnvironment, EvalEventKind, EvalEventStream, EvalFailure, EvalOutcome, EvalResult,
-    EvalStatus, Evaluator, EvaluatorBuilder, NetworkPolicy, PhaseTiming, Sweep, SweepResults, Task,
-    TaskLoadError, VerifierEnvironmentMode, VerifierResult,
+    AggregateRunIdentity, AggregateRunTiming, AttemptAgent, AttemptBuildIdentity,
+    AttemptVerification, AttemptVerificationFailure, AttemptVerifier, AttemptVmIdentity,
+    BillingCompleteness, CleanupPhase, EvalAttempt, EvalAttemptOutcome, EvalEnvironment,
+    EvalEventKind, EvalEventStream, EvalExceptionKind, EvalFailure, EvalOutcome, EvalResult,
+    EvalStatus, Evaluator, EvaluatorBuilder, MeasurementCompleteness, NetworkPolicy, PhaseTiming,
+    Sweep, SweepResults, Task, TaskLoadError, VerifierEnvironmentMode, VerifierResult,
+    infer_retained_scored,
 };
 use nanocodex_vm::image::{CachePolicy, VmImageBuilder, reflink_or_sparse_copy};
 use nanocodex_vm::{BlockDevice, GuestCommand, Network, VmConfig};
@@ -62,7 +64,6 @@ const INVOCATION_FILE: &str = "invocation.json";
 const LAST_RUN_FILE: &str = ".nanocodex/eval/last-run.json";
 const LEGACY_LAST_RUN_FILE: &str = ".nanoeval/last-run.json";
 const INVOCATION_VERSION: u32 = 2;
-const PRICING_REVISION: &str = "gpt-5.6-sol-standard-priority-v1";
 const SCHEDULING_POLICY: &str = "bounded_fifo_work_conserving-v1";
 const DEFAULT_TRIALS: u16 = 5;
 const DEFAULT_HOST_UTILIZATION_PERCENT: u8 = 80;
@@ -424,12 +425,12 @@ const fn percentage(value: u64, percent: u8) -> u64 {
     value.saturating_mul(percent as u64) / 100
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RetainedTrialStatus {
-    Passed,
-    Failed,
-    Refused,
-    Errored,
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RetainedTrialStatus {
+    passed: bool,
+    failed: bool,
+    refused: bool,
+    errored: bool,
 }
 
 impl Run {
@@ -800,16 +801,19 @@ impl Run {
 
     fn write_summary(report: &RunReport) {
         println!(
-            "\nResult: {} passed; {} failed; {} refused; {} errored; {} total",
+            "\nScores: {} passed; {} failed; {} scored; {} unscored; {} total",
             Painted::new(report.summary.passed).green(),
             Painted::new(report.summary.failed).red(),
-            Painted::new(report.summary.refused).yellow(),
-            Painted::new(report.summary.errored).red(),
+            report.summary.scored,
+            report.summary.unscored,
             report.summary.total
         );
         println!(
-            "Scoring: {} scored; {} unscored",
-            report.summary.scored, report.summary.unscored
+            "Lifecycle: {} errored attempt{} (including {} safety refusal{})",
+            Painted::new(report.summary.errored).red(),
+            if report.summary.errored == 1 { "" } else { "s" },
+            Painted::new(report.summary.refused).yellow(),
+            if report.summary.refused == 1 { "" } else { "s" },
         );
         if report.summary.cleanup_failed > 0 {
             println!(
@@ -824,9 +828,20 @@ impl Run {
         }
         if report.summary.billing_unknown > 0 {
             println!(
-                "Billing coverage: {} attempt{} unknown and excluded from known cost",
+                "Billing coverage: {} attempt{} unknown and excluded from exact cost",
                 Painted::new(report.summary.billing_unknown).yellow(),
                 if report.summary.billing_unknown == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            );
+        }
+        if report.summary.billing_missing > 0 {
+            println!(
+                "Billing coverage: {} attempt{} did not retain a billing snapshot",
+                Painted::new(report.summary.billing_missing).yellow(),
+                if report.summary.billing_missing == 1 {
                     ""
                 } else {
                     "s"
@@ -849,6 +864,16 @@ impl Run {
                 println!("Estimated cost: unavailable (provider usage was unavailable or unpriced)")
             }
         }
+        if report.summary.observed_priced_attempts > report.summary.priced_attempts
+            && let Some(cost) = report.summary.observed_estimated_cost_lower_bound_usd
+        {
+            println!(
+                "Observed cost lower bound: ${cost:.6} ({} of {} attempt{} reported usage)",
+                report.summary.observed_priced_attempts,
+                report.summary.total,
+                if report.summary.total == 1 { "" } else { "s" }
+            );
+        }
         if report.skipped > 0 {
             println!(
                 "Resumed: {} previously completed attempt{} retained",
@@ -866,13 +891,52 @@ impl Run {
 }
 
 fn persist_aggregate(job: &HarborJob, cold_image_and_cache: Duration) -> Result<()> {
+    let mut aggregate = job.aggregate_dataset()?;
+    if let Some(invocation) = load_invocation(job.directory())? {
+        aggregate = aggregate.with_run_identity(aggregate_run_identity(&invocation));
+    }
     write_json_atomic(
         &job.directory().join("aggregate.json"),
-        &job.aggregate_dataset()?
-            .with_run_timing(AggregateRunTiming {
-                cold_image_and_cache_ns: duration_ns(cold_image_and_cache),
-            }),
+        &aggregate.with_run_timing(AggregateRunTiming {
+            cold_image_and_cache_ns: duration_ns(cold_image_and_cache),
+        }),
     )
+}
+
+fn aggregate_run_identity(invocation: &RunInvocation) -> AggregateRunIdentity {
+    let vm = (invocation.vm || invocation.vm_rootfs.is_some()).then(|| AttemptVmIdentity {
+        rootfs: invocation.vm_rootfs.clone(),
+        guest_runtime_target: invocation
+            .guest_runtime
+            .as_ref()
+            .map(|runtime| runtime.target.clone()),
+        guest_runtime_sha256: invocation
+            .guest_runtime
+            .as_ref()
+            .map(|runtime| runtime.binary_sha256.clone()),
+        runtime_disk_digest: invocation
+            .guest_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.runtime_disk_digest.clone()),
+    });
+    AggregateRunIdentity {
+        build: AttemptBuildIdentity {
+            version: invocation.nanocodex_build.version.clone(),
+            git_sha: Some(invocation.nanocodex_build.git_sha.clone()),
+            built_at: Some(invocation.nanocodex_build.built_at.clone()),
+            executable_sha256: Some(invocation.nanocodex_build.executable_sha256.clone()),
+        },
+        dataset_revision: None,
+        model: invocation.model.clone(),
+        model_tier: None,
+        reasoning_effort: invocation.thinking.clone(),
+        service_tier: Some("standard".to_owned()),
+        pricing_revision: invocation.pricing_revision.clone(),
+        tool_profile: invocation.tool_profile.clone(),
+        seed: invocation.seed,
+        agent_topology: "single_agent".to_owned(),
+        vm,
+    }
 }
 
 impl ResolvedRun {
@@ -928,7 +992,7 @@ impl ResolvedRun {
                 executable_sha256,
             },
             model: nanocodex::oai::MODEL.to_owned(),
-            pricing_revision: PRICING_REVISION.to_owned(),
+            pricing_revision: nanocodex::oai::pricing::PRICING_REVISION.to_owned(),
             tool_profile: if self.vm || self.vm_rootfs.is_some() {
                 "microvm_workspace".to_owned()
             } else {
@@ -1189,12 +1253,13 @@ fn retained_retry_task_names(
     let retryable_names = statuses
         .into_iter()
         .filter_map(|(task_name, status)| {
-            let retryable = match status {
-                RetainedTrialStatus::Failed => true,
-                RetainedTrialStatus::Refused => include_refused,
-                RetainedTrialStatus::Errored => include_errored,
-                RetainedTrialStatus::Passed => false,
-            };
+            // A pass at any repetition resolves the task. Otherwise, verifier
+            // failures are retried by default and the opt-in lifecycle axes
+            // independently select refusals and errors.
+            let retryable = !status.passed
+                && (status.failed
+                    || (include_refused && status.refused)
+                    || (include_errored && status.errored));
             retryable.then_some(task_name)
         })
         .collect::<BTreeSet<_>>();
@@ -1289,55 +1354,54 @@ fn retained_task_statuses(job: &Path) -> Result<BTreeMap<String, RetainedTrialSt
 
 impl RetainedTrialResult {
     fn status(&self) -> RetainedTrialStatus {
-        match self.outcome {
-            Some(EvalOutcome::Passed) => return RetainedTrialStatus::Passed,
-            Some(EvalOutcome::VerifierFailed) => return RetainedTrialStatus::Failed,
-            Some(EvalOutcome::SafetyRefusal) => return RetainedTrialStatus::Refused,
-            Some(EvalOutcome::AgentTimeout | EvalOutcome::InfrastructureError) => {
-                return RetainedTrialStatus::Errored;
-            }
-            None => {}
-        }
-        if self.scored == Some(true) {
-            return if self
+        let scored = infer_retained_scored(
+            self.scored,
+            self.outcome,
+            self.verifier_result.is_some(),
+            self.exception_info.is_some(),
+        );
+        let passed = scored
+            && self
                 .verifier_result
                 .as_ref()
-                .is_some_and(|verifier| verifier.rewards.values().all(|reward| *reward > 0.0))
-            {
-                RetainedTrialStatus::Passed
-            } else {
-                RetainedTrialStatus::Failed
-            };
-        }
-        if let Some(exception) = &self.exception_info {
-            return if exception.exception_type == "AgentSafetyRefusalError" {
-                RetainedTrialStatus::Refused
-            } else {
-                RetainedTrialStatus::Errored
-            };
-        }
-        if self.scored == Some(false) {
-            return RetainedTrialStatus::Errored;
-        }
-        if self
-            .verifier_result
+                .is_some_and(|verifier| verifier.rewards.values().all(|reward| *reward > 0.0));
+        let exception_type = self
+            .exception_info
             .as_ref()
-            .is_some_and(|verifier| verifier.rewards.values().all(|reward| *reward > 0.0))
-        {
-            RetainedTrialStatus::Passed
-        } else {
-            RetainedTrialStatus::Failed
+            .map(|exception| exception.exception_type.as_str());
+        let (refused, errored) = match exception_type {
+            Some(exception) => (
+                exception == "AgentSafetyRefusalError",
+                exception != "CleanupError",
+            ),
+            None => (
+                self.outcome == Some(EvalOutcome::SafetyRefusal),
+                self.outcome.is_some_and(|outcome| {
+                    matches!(
+                        outcome,
+                        EvalOutcome::SafetyRefusal
+                            | EvalOutcome::AgentTimeout
+                            | EvalOutcome::InfrastructureError
+                    )
+                }),
+            ),
+        };
+        RetainedTrialStatus {
+            passed,
+            failed: scored && !passed,
+            refused,
+            errored,
         }
     }
 }
 
 impl RetainedTrialStatus {
     const fn merge(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Passed, _) | (_, Self::Passed) => Self::Passed,
-            (Self::Failed, _) | (_, Self::Failed) => Self::Failed,
-            (Self::Refused, _) | (_, Self::Refused) => Self::Refused,
-            (Self::Errored, Self::Errored) => Self::Errored,
+        Self {
+            passed: self.passed || other.passed,
+            failed: self.failed || other.failed,
+            refused: self.refused || other.refused,
+            errored: self.errored || other.errored,
         }
     }
 }
@@ -1659,12 +1723,7 @@ async fn finish_evaluation(
                 .collect::<Vec<_>>();
             let failed = outcomes
                 .iter()
-                .filter(|outcome| {
-                    matches!(
-                        outcome,
-                        AttemptOutcome::Refused(_) | AttemptOutcome::Errored(_)
-                    )
-                })
+                .filter(|outcome| outcome.has_lifecycle_error())
                 .count();
             let results = scored_results(&outcomes);
             (outcomes, results, None, failed)
@@ -1927,6 +1986,105 @@ struct RunMeasurements {
     total: Duration,
 }
 
+#[derive(Default)]
+struct AttemptMeasurementTotals {
+    runtime_complete_attempts: usize,
+    runtime_lower_bound_attempts: usize,
+    runtime_missing_attempts: usize,
+    usage_complete_attempts: usize,
+    usage_lower_bound_attempts: usize,
+    usage_missing_attempts: usize,
+    exact_model_ns: u64,
+    exact_warmup_ns: u64,
+    exact_tool_work_ns: u64,
+    exact_tool_wall_ns: u64,
+    exact_response_retries: u64,
+    exact_input_tokens: u64,
+    exact_cached_input_tokens: u64,
+    observed_model_ns: u64,
+    observed_warmup_ns: u64,
+    observed_tool_work_ns: u64,
+    observed_tool_wall_ns: u64,
+    observed_response_retries: u64,
+    observed_input_tokens: u64,
+    observed_cached_input_tokens: u64,
+}
+
+impl AttemptMeasurementTotals {
+    fn from_results(results: &[EvalResult]) -> Self {
+        let mut totals = Self::default();
+        for result in results {
+            let Some(agent) = result.agent.as_ref() else {
+                totals.runtime_missing_attempts = totals.runtime_missing_attempts.saturating_add(1);
+                totals.usage_missing_attempts = totals.usage_missing_attempts.saturating_add(1);
+                continue;
+            };
+            let metadata = &agent.metadata;
+            totals.observed_model_ns = totals
+                .observed_model_ns
+                .saturating_add(metadata.model_duration_ns);
+            totals.observed_warmup_ns = totals
+                .observed_warmup_ns
+                .saturating_add(metadata.warmup_duration_ns);
+            totals.observed_tool_work_ns = totals
+                .observed_tool_work_ns
+                .saturating_add(metadata.tool_work_duration_ns);
+            totals.observed_tool_wall_ns = totals
+                .observed_tool_wall_ns
+                .saturating_add(metadata.tool_wall_duration_ns);
+            totals.observed_response_retries = totals
+                .observed_response_retries
+                .saturating_add(u64::from(metadata.response_retries));
+            if metadata.runtime_completeness == MeasurementCompleteness::Complete {
+                totals.runtime_complete_attempts =
+                    totals.runtime_complete_attempts.saturating_add(1);
+                totals.exact_model_ns = totals
+                    .exact_model_ns
+                    .saturating_add(metadata.model_duration_ns);
+                totals.exact_warmup_ns = totals
+                    .exact_warmup_ns
+                    .saturating_add(metadata.warmup_duration_ns);
+                totals.exact_tool_work_ns = totals
+                    .exact_tool_work_ns
+                    .saturating_add(metadata.tool_work_duration_ns);
+                totals.exact_tool_wall_ns = totals
+                    .exact_tool_wall_ns
+                    .saturating_add(metadata.tool_wall_duration_ns);
+                totals.exact_response_retries = totals
+                    .exact_response_retries
+                    .saturating_add(u64::from(metadata.response_retries));
+            } else {
+                totals.runtime_lower_bound_attempts =
+                    totals.runtime_lower_bound_attempts.saturating_add(1);
+            }
+
+            if !agent.has_observed_usage() {
+                totals.usage_missing_attempts = totals.usage_missing_attempts.saturating_add(1);
+                continue;
+            }
+            totals.observed_input_tokens = totals
+                .observed_input_tokens
+                .saturating_add(agent.usage.input_tokens);
+            totals.observed_cached_input_tokens = totals
+                .observed_cached_input_tokens
+                .saturating_add(agent.usage.cached_input_tokens);
+            if agent.billing_completeness == BillingCompleteness::Complete {
+                totals.usage_complete_attempts = totals.usage_complete_attempts.saturating_add(1);
+                totals.exact_input_tokens = totals
+                    .exact_input_tokens
+                    .saturating_add(agent.usage.input_tokens);
+                totals.exact_cached_input_tokens = totals
+                    .exact_cached_input_tokens
+                    .saturating_add(agent.usage.cached_input_tokens);
+            } else {
+                totals.usage_lower_bound_attempts =
+                    totals.usage_lower_bound_attempts.saturating_add(1);
+            }
+        }
+        totals
+    }
+}
+
 #[derive(Serialize)]
 struct RetainedRunMeasurements {
     schema_version: u32,
@@ -1961,22 +2119,7 @@ impl RunMeasurements {
     }
 
     fn record(&self, results: &[EvalResult], attempt_count: usize, errored_attempt_count: usize) {
-        let model_ns = results
-            .iter()
-            .map(|result| result.agent.metadata.model_duration_ns)
-            .sum::<u64>();
-        let warmup_ns = results
-            .iter()
-            .map(|result| result.agent.metadata.warmup_duration_ns)
-            .sum::<u64>();
-        let tool_work_ns = results
-            .iter()
-            .map(|result| result.agent.metadata.tool_work_duration_ns)
-            .sum::<u64>();
-        let tool_wall_ns = results
-            .iter()
-            .map(|result| result.agent.metadata.tool_wall_duration_ns)
-            .sum::<u64>();
+        let measurements = AttemptMeasurementTotals::from_results(results);
         let verifier_ns = results
             .iter()
             .map(|result| {
@@ -1989,18 +2132,6 @@ impl RunMeasurements {
                     .and_then(|duration| u64::try_from(duration).ok())
                     .unwrap_or_default()
             })
-            .sum::<u64>();
-        let response_retries = results
-            .iter()
-            .map(|result| u64::from(result.agent.metadata.response_retries))
-            .sum::<u64>();
-        let cached_input_tokens = results
-            .iter()
-            .map(|result| result.agent.usage.cached_input_tokens)
-            .sum::<u64>();
-        let input_tokens = results
-            .iter()
-            .map(|result| result.agent.usage.input_tokens)
             .sum::<u64>();
         info!(
             target: "nanocodex_eval",
@@ -2016,14 +2147,30 @@ impl RunMeasurements {
             attempt_count,
             scored_attempt_count = results.len(),
             errored_attempt_count,
-            attempts_model_duration_ns = model_ns,
-            attempts_warmup_duration_ns = warmup_ns,
-            attempts_tool_work_duration_ns = tool_work_ns,
-            attempts_tool_wall_duration_ns = tool_wall_ns,
+            runtime_complete_attempt_count = measurements.runtime_complete_attempts,
+            runtime_lower_bound_attempt_count = measurements.runtime_lower_bound_attempts,
+            runtime_missing_attempt_count = measurements.runtime_missing_attempts,
+            usage_complete_attempt_count = measurements.usage_complete_attempts,
+            usage_lower_bound_attempt_count = measurements.usage_lower_bound_attempts,
+            usage_missing_attempt_count = measurements.usage_missing_attempts,
+            attempts_model_duration_ns = measurements.exact_model_ns,
+            attempts_warmup_duration_ns = measurements.exact_warmup_ns,
+            attempts_tool_work_duration_ns = measurements.exact_tool_work_ns,
+            attempts_tool_wall_duration_ns = measurements.exact_tool_wall_ns,
+            attempts_observed_model_duration_lower_bound_ns = measurements.observed_model_ns,
+            attempts_observed_warmup_duration_lower_bound_ns = measurements.observed_warmup_ns,
+            attempts_observed_tool_work_duration_lower_bound_ns =
+                measurements.observed_tool_work_ns,
+            attempts_observed_tool_wall_duration_lower_bound_ns =
+                measurements.observed_tool_wall_ns,
             attempts_verifier_duration_ns = verifier_ns,
-            response_retries,
-            input_tokens,
-            cached_input_tokens,
+            response_retries = measurements.exact_response_retries,
+            observed_response_retries_lower_bound = measurements.observed_response_retries,
+            input_tokens = measurements.exact_input_tokens,
+            cached_input_tokens = measurements.exact_cached_input_tokens,
+            observed_input_tokens_lower_bound = measurements.observed_input_tokens,
+            observed_cached_input_tokens_lower_bound =
+                measurements.observed_cached_input_tokens,
             "evaluation run completed"
         );
     }
@@ -3950,13 +4097,23 @@ impl VmVerifier {
         attempt: EvalAttempt<'_>,
     ) -> Result<AttemptVerification, AttemptVerificationFailure> {
         if let Err(error) = task.validate_package() {
+            let occurred_at = Utc::now();
             let cleanup = self.shutdown_before_verification().await;
-            return Err(AttemptVerificationFailure::new(error, cleanup));
+            return Err(AttemptVerificationFailure::observed_at(
+                error,
+                occurred_at,
+                cleanup,
+            ));
         }
         let verifier_directory = attempt.directory().join("verifier");
         if let Err(error) = fs::create_dir_all(&verifier_directory) {
+            let occurred_at = Utc::now();
             let cleanup = self.shutdown_before_verification().await;
-            return Err(AttemptVerificationFailure::new(error, cleanup));
+            return Err(AttemptVerificationFailure::observed_at(
+                error,
+                occurred_at,
+                cleanup,
+            ));
         }
         let (verifier_launch, verifier_session) = self.start_verifier_session(task).await?;
         let verification = async {
@@ -3995,13 +4152,18 @@ impl VmVerifier {
             Ok::<_, VmAttemptError>((output, stdout, stderr, reward))
         }
         .await;
+        let verification_error_at = verification.as_ref().err().map(|_| Utc::now());
         let cleanup_started = Utc::now();
         let shutdown = verifier_session.shutdown().await;
         let (output, stdout, stderr, reward) = match verification {
             Ok(verification) => verification,
             Err(primary) => {
                 let cleanup = self.cleanup_after_shutdown(cleanup_started, shutdown, false);
-                return Err(AttemptVerificationFailure::new(primary, cleanup));
+                return Err(AttemptVerificationFailure::observed_at(
+                    primary,
+                    verification_error_at.unwrap_or(cleanup_started),
+                    cleanup,
+                ));
             }
         };
         let cleanup = match shutdown {
@@ -4059,12 +4221,18 @@ impl VmVerifier {
             {
                 Ok(artifacts) => artifacts,
                 Err(primary) => {
+                    let occurred_at = Utc::now();
                     let cleanup = self.cleanup_session(Some(&agent_session)).await;
-                    return Err(AttemptVerificationFailure::new(primary, cleanup));
+                    return Err(AttemptVerificationFailure::observed_at(
+                        primary,
+                        occurred_at,
+                        cleanup,
+                    ));
                 }
             };
             let cleanup_started = Utc::now();
             if let Err(primary) = agent_session.shutdown().await {
+                let occurred_at = Utc::now();
                 if let Err(cache_error) = self.try_remove_attempt_cache() {
                     warn!(
                         target: "nanocodex_eval",
@@ -4074,18 +4242,32 @@ impl VmVerifier {
                     );
                 }
                 let cleanup = CleanupPhase::failed(cleanup_started, &primary);
-                return Err(AttemptVerificationFailure::new(primary, cleanup));
+                return Err(AttemptVerificationFailure::observed_at(
+                    primary,
+                    occurred_at,
+                    cleanup,
+                ));
             }
             let session = match launch.spawn(None, VmProcessGroup::Isolated) {
                 Ok(session) => session,
                 Err(primary) => {
+                    let occurred_at = Utc::now();
                     let cleanup = self.cleanup_after_shutdown(cleanup_started, Ok(()), false);
-                    return Err(AttemptVerificationFailure::new(primary, cleanup));
+                    return Err(AttemptVerificationFailure::observed_at(
+                        primary,
+                        occurred_at,
+                        cleanup,
+                    ));
                 }
             };
             if let Err(primary) = Self::stage_artifacts(&session, artifacts).await {
+                let occurred_at = Utc::now();
                 let cleanup = self.cleanup_session(Some(&session)).await;
-                return Err(AttemptVerificationFailure::new(primary, cleanup));
+                return Err(AttemptVerificationFailure::observed_at(
+                    primary,
+                    occurred_at,
+                    cleanup,
+                ));
             }
             session
         } else {
@@ -4102,8 +4284,13 @@ impl VmVerifier {
             }
             .await;
             if let Err(primary) = setup {
+                let occurred_at = Utc::now();
                 let cleanup = self.cleanup_session(Some(&agent_session)).await;
-                return Err(AttemptVerificationFailure::new(primary, cleanup));
+                return Err(AttemptVerificationFailure::observed_at(
+                    primary,
+                    occurred_at,
+                    cleanup,
+                ));
             }
             agent_session
         };
@@ -4118,8 +4305,13 @@ impl VmVerifier {
         }
         .await;
         if let Err(primary) = setup {
+            let occurred_at = Utc::now();
             let cleanup = self.cleanup_session(Some(&session)).await;
-            return Err(AttemptVerificationFailure::new(primary, cleanup));
+            return Err(AttemptVerificationFailure::observed_at(
+                primary,
+                occurred_at,
+                cleanup,
+            ));
         }
         Ok((launch, session))
     }
@@ -4637,8 +4829,11 @@ struct RunSummary {
     errored: usize,
     cleanup_failed: usize,
     billing_unknown: usize,
+    billing_missing: usize,
     known_estimated_cost_usd: Option<f64>,
     priced_attempts: usize,
+    observed_estimated_cost_lower_bound_usd: Option<f64>,
+    observed_priced_attempts: usize,
 }
 
 impl RunSummary {
@@ -4652,29 +4847,34 @@ impl RunSummary {
                 AttemptOutcome::Passed(result) => {
                     summary.scored += 1;
                     summary.passed += 1;
-                    summary.record_agent(&result.agent);
+                    summary.record_exception(result.exception.as_ref().map(|error| error.kind));
+                    summary.record_agent_snapshot(result.agent.as_ref(), true);
                     summary.record_cleanup(result.cleanup.is_failed());
                 }
                 AttemptOutcome::Failed(result) => {
                     summary.scored += 1;
                     summary.failed += 1;
-                    summary.record_agent(&result.agent);
+                    summary.record_exception(result.exception.as_ref().map(|error| error.kind));
+                    summary.record_agent_snapshot(result.agent.as_ref(), true);
                     summary.record_cleanup(result.cleanup.is_failed());
                 }
                 AttemptOutcome::Refused(failure) => {
                     summary.unscored += 1;
                     summary.refused += 1;
-                    if let Some(agent) = &failure.agent {
-                        summary.record_agent(agent);
-                    }
+                    summary.errored += 1;
+                    summary.record_agent_snapshot(
+                        failure.agent.as_ref(),
+                        failure.timing.agent_execution.is_some(),
+                    );
                     summary.record_cleanup(failure.cleanup.is_failed());
                 }
                 AttemptOutcome::Errored(failure) => {
                     summary.unscored += 1;
                     summary.errored += 1;
-                    if let Some(agent) = &failure.agent {
-                        summary.record_agent(agent);
-                    }
+                    summary.record_agent_snapshot(
+                        failure.agent.as_ref(),
+                        failure.timing.agent_execution.is_some(),
+                    );
                     summary.record_cleanup(failure.cleanup.is_failed());
                 }
             }
@@ -4686,11 +4886,39 @@ impl RunSummary {
         self.record_estimated_cost(agent.cost_usd, agent.billing_completeness);
     }
 
+    fn record_exception(&mut self, kind: Option<EvalExceptionKind>) {
+        self.errored += usize::from(kind.is_some());
+        self.refused += usize::from(kind == Some(EvalExceptionKind::AgentSafetyRefusal));
+    }
+
+    fn record_agent_snapshot(
+        &mut self,
+        agent: Option<&nanocodex_eval::AgentResult>,
+        expected: bool,
+    ) {
+        match agent {
+            Some(agent) => {
+                self.record_agent(agent);
+                self.billing_missing += usize::from(expected && !agent.has_observed_usage());
+            }
+            None if expected => self.billing_missing += 1,
+            None => {}
+        }
+    }
+
     fn record_estimated_cost(
         &mut self,
         cost_usd: Option<f64>,
         billing_completeness: BillingCompleteness,
     ) {
+        if let Some(cost_usd) = cost_usd {
+            self.observed_estimated_cost_lower_bound_usd = Some(
+                self.observed_estimated_cost_lower_bound_usd
+                    .unwrap_or_default()
+                    + cost_usd,
+            );
+            self.observed_priced_attempts += 1;
+        }
         if billing_completeness == BillingCompleteness::Unknown {
             self.billing_unknown += 1;
             return;
@@ -4740,10 +4968,17 @@ impl AttemptOutcome {
     }
 
     fn from_failure(failure: EvalFailure) -> Self {
-        if failure.outcome == EvalOutcome::SafetyRefusal {
+        if failure.exception.kind == EvalExceptionKind::AgentSafetyRefusal {
             Self::Refused(failure)
         } else {
             Self::Errored(failure)
+        }
+    }
+
+    const fn has_lifecycle_error(&self) -> bool {
+        match self {
+            Self::Passed(result) | Self::Failed(result) => result.exception.is_some(),
+            Self::Refused(_) | Self::Errored(_) => true,
         }
     }
 }
@@ -4809,6 +5044,7 @@ async fn report_progress(
         match &event.kind {
             EvalEventKind::Completed(result) => {
                 completed += 1;
+                failed += usize::from(result.exception.is_some());
                 let outcome = AttemptOutcome::from_result(result.as_ref().clone());
                 write_progress_line(&outcome, completed, expected);
                 outcomes.push(outcome);
@@ -4833,26 +5069,36 @@ async fn report_progress(
 fn write_progress_line(outcome: &AttemptOutcome, completed: usize, expected: usize) {
     match outcome {
         AttemptOutcome::Passed(result) => {
-            let status = Painted::new(format!("[PASS {completed}/{expected}]")).green();
+            let status = if result.exception.is_some() {
+                Painted::new(format!("[PASS+ERROR {completed}/{expected}]")).yellow()
+            } else {
+                Painted::new(format!("[PASS {completed}/{expected}]")).green()
+            };
             eprintln!(
-                "{status} {} ({}){}",
+                "{status} {} ({}){}{}",
                 result.trial_name,
                 result_duration(result),
+                result_exception_suffix(result),
                 cleanup_suffix(result.cleanup.is_failed()),
             );
         }
         AttemptOutcome::Failed(result) => {
-            let status = Painted::new(format!("[FAIL {completed}/{expected}]")).red();
+            let status = if result.exception.is_some() {
+                Painted::new(format!("[FAIL+ERROR {completed}/{expected}]")).red()
+            } else {
+                Painted::new(format!("[FAIL {completed}/{expected}]")).red()
+            };
             eprintln!(
-                "{status} {} ({}, reward={:.3}){}",
+                "{status} {} ({}, reward={:.3}){}{}",
                 result.trial_name,
                 result_duration(result),
                 result.verifier.rewards.values().sum::<f64>(),
+                result_exception_suffix(result),
                 cleanup_suffix(result.cleanup.is_failed()),
             );
         }
         AttemptOutcome::Refused(failure) => {
-            let message = failure.message.lines().next().unwrap_or_default();
+            let message = failure.exception.message.lines().next().unwrap_or_default();
             let status = Painted::new(format!("[REFUSED {completed}/{expected}]")).yellow();
             eprintln!(
                 "{status} {} ({}): {message}{}",
@@ -4862,17 +5108,26 @@ fn write_progress_line(outcome: &AttemptOutcome, completed: usize, expected: usi
             );
         }
         AttemptOutcome::Errored(failure) => {
-            let message = failure.message.lines().next().unwrap_or_default();
+            let message = failure.exception.message.lines().next().unwrap_or_default();
             let status = Painted::new(format!("[ERROR {completed}/{expected}]")).red();
             eprintln!(
                 "{status} {} ({:?}, {}): {message}{}",
                 failure.trial_name,
-                failure.kind,
+                failure.exception.kind,
                 failure_duration(failure),
                 cleanup_suffix(failure.cleanup.is_failed()),
             );
         }
     }
+}
+
+fn result_exception_suffix(result: &EvalResult) -> String {
+    result
+        .exception
+        .as_ref()
+        .map_or_else(String::new, |exception| {
+            format!(", agent error={:?}", exception.kind)
+        })
 }
 
 fn result_duration(result: &EvalResult) -> String {
@@ -4932,19 +5187,34 @@ mod tests {
     use std::{
         cell::Cell,
         collections::BTreeMap,
-        fs, future,
+        convert::Infallible,
+        fs,
+        future::{self, Future},
+        io,
         os::unix::fs::PermissionsExt as _,
         path::{Path, PathBuf},
+        pin::Pin,
         process::Command as StdCommand,
         time::{Duration, Instant},
     };
 
+    use chrono::Utc;
     use clap::Parser;
+    use futures_util::{SinkExt, StreamExt};
     use nanocodex::{Nanocodex, OpenAi, Thinking};
-    use nanocodex_eval::{BillingCompleteness, Evaluator, Sweep, Task};
-    use nanocodex_vm::{VmCommandOutput, VmCommandPartialOutput, VmToolSession};
+    use nanocodex_eval::{
+        AttemptAgent, AttemptVerification, AttemptVerificationFailure, AttemptVerifier,
+        BillingCompleteness, CleanupPhase, CleanupStatus, EvalAttempt, EvalOutcome, Evaluator,
+        Sweep, Task, VerifierResult,
+    };
+    use nanocodex_vm::{
+        VmCommandOutput, VmCommandPartialOutput, VmToolSession, VmToolSessionError,
+    };
     use nix::unistd::getpgrp;
+    use serde_json::json;
     use sha2::Digest as _;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
 
     use super::{
         CACHED_VERIFIER_SCRIPT, DEFAULT_HOST_UTILIZATION_PERCENT, DEFAULT_TRIALS,
@@ -4960,6 +5230,73 @@ mod tests {
     struct TestCli {
         #[command(flatten)]
         eval: Run,
+    }
+
+    struct VmCapabilityVerifier {
+        session: Option<VmToolSession>,
+    }
+
+    impl AttemptVerifier for VmCapabilityVerifier {
+        fn verify<'a>(
+            &'a mut self,
+            _task: &'a Task,
+            attempt: EvalAttempt<'a>,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<AttemptVerification, AttemptVerificationFailure>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                let session = self.session.take().ok_or_else(|| {
+                    AttemptVerificationFailure::new(
+                        io::Error::other("VM capability verifier session was already consumed"),
+                        CleanupPhase::not_required(),
+                    )
+                })?;
+                let cleanup_started = Utc::now();
+                let shutdown = session.shutdown().await;
+                assert!(
+                    !matches!(shutdown, Err(VmToolSessionError::ActiveCapabilities(_))),
+                    "the timed-out driver must release every VM capability before verification"
+                );
+                if let Err(error) = shutdown {
+                    let cleanup = CleanupPhase::failed(cleanup_started, &error);
+                    return Err(AttemptVerificationFailure::new(error, cleanup));
+                }
+                fs::write(attempt.directory().join("verifier/test-stdout.txt"), []).map_err(
+                    |error| {
+                        AttemptVerificationFailure::new(
+                            error,
+                            CleanupPhase::completed(cleanup_started),
+                        )
+                    },
+                )?;
+                Ok(AttemptVerification {
+                    result: VerifierResult {
+                        exit_code: 0,
+                        rewards: BTreeMap::from([("reward".to_owned(), 1.0)]),
+                    },
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    cleanup: CleanupPhase::completed(cleanup_started),
+                })
+            })
+        }
+
+        fn shutdown(&mut self) -> Pin<Box<dyn Future<Output = CleanupPhase> + Send + '_>> {
+            Box::pin(async move {
+                let Some(session) = self.session.take() else {
+                    return CleanupPhase::not_required();
+                };
+                let cleanup_started = Utc::now();
+                match session.shutdown().await {
+                    Ok(()) => CleanupPhase::completed(cleanup_started),
+                    Err(error) => CleanupPhase::failed(cleanup_started, &error),
+                }
+            })
+        }
     }
 
     #[tokio::test]
@@ -5595,7 +5932,30 @@ mod tests {
 
         assert_eq!(summary.known_estimated_cost_usd, Some(0.5));
         assert_eq!(summary.priced_attempts, 2);
+        assert_eq!(
+            summary.observed_estimated_cost_lower_bound_usd,
+            Some(4.804_052)
+        );
+        assert_eq!(summary.observed_priced_attempts, 3);
         assert_eq!(summary.billing_unknown, 1);
+    }
+
+    #[test]
+    fn scored_safety_refusal_overlaps_refusal_and_error_axes() {
+        let mut summary = RunSummary {
+            total: 1,
+            scored: 1,
+            failed: 1,
+            ..RunSummary::default()
+        };
+
+        summary.record_exception(Some(nanocodex_eval::EvalExceptionKind::AgentSafetyRefusal));
+
+        assert_eq!(summary.scored, 1);
+        assert_eq!(summary.unscored, 0);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.refused, 1);
+        assert_eq!(summary.errored, 1);
     }
 
     #[test]
@@ -5683,6 +6043,21 @@ mod tests {
             web_search: false,
             rerun_from: None,
         };
+        let aggregate_identity = super::aggregate_run_identity(&retained);
+        assert_eq!(aggregate_identity.model, "gpt-5.6-sol");
+        assert_eq!(aggregate_identity.reasoning_effort, "xhigh");
+        assert_eq!(aggregate_identity.tool_profile, "microvm_workspace");
+        assert_eq!(
+            aggregate_identity.build.executable_sha256.as_deref(),
+            Some("abc123")
+        );
+        assert_eq!(
+            aggregate_identity
+                .vm
+                .as_ref()
+                .and_then(|vm| vm.guest_runtime_sha256.as_deref()),
+            Some("guest123")
+        );
         let mut resumed = retained.clone();
         resumed.concurrency = 30;
         resumed.max_memory_mb = Some(58_000);
@@ -5823,6 +6198,10 @@ mod tests {
                 r#"{"task_name":"terminal-bench/passed-with-cleanup-failure","outcome":"passed","scored":true,"verifier_result":{"rewards":{"reward":1.0}},"exception_info":{"exception_type":"CleanupError"}}"#,
             ),
             (
+                "cleanup-only",
+                r#"{"task_name":"terminal-bench/cleanup-only","outcome":"infrastructure_error","scored":false,"verifier_result":null,"exception_info":{"exception_type":"CleanupError"}}"#,
+            ),
+            (
                 "partially-failed",
                 r#"{"task_name":"terminal-bench/partially-failed","verifier_result":{"rewards":{"first":1.0,"second":0.0}},"exception_info":null}"#,
             ),
@@ -5835,12 +6214,36 @@ mod tests {
                 r#"{"task_name":"terminal-bench/refused","verifier_result":null,"exception_info":{"exception_type":"AgentSafetyRefusalError"}}"#,
             ),
             (
+                "legacy-refused",
+                r#"{"task_name":"terminal-bench/legacy-refused","outcome":"safety_refusal","verifier_result":null,"exception_info":null}"#,
+            ),
+            (
+                "explicit-non-refusal",
+                r#"{"task_name":"terminal-bench/explicit-non-refusal","outcome":"safety_refusal","verifier_result":null,"exception_info":{"exception_type":"VerifierError"}}"#,
+            ),
+            (
                 "errored",
                 r#"{"task_name":"terminal-bench/errored","verifier_result":null,"exception_info":{"exception_type":"VerifierError"}}"#,
             ),
             (
+                "scored-timeout-pass",
+                r#"{"task_name":"terminal-bench/scored-timeout-pass","outcome":"agent_timeout","scored":true,"verifier_result":{"rewards":{"reward":1.0}},"exception_info":{"exception_type":"AgentTimeoutError"}}"#,
+            ),
+            (
+                "scored-timeout-fail",
+                r#"{"task_name":"terminal-bench/scored-timeout-fail","outcome":"agent_timeout","scored":true,"verifier_result":{"rewards":{"reward":0.0}},"exception_info":{"exception_type":"AgentTimeoutError"}}"#,
+            ),
+            (
                 "unscored-with-reward",
                 r#"{"task_name":"terminal-bench/unscored-with-reward","scored":false,"verifier_result":{"rewards":{"reward":1.0}},"exception_info":null}"#,
+            ),
+            (
+                "legacy-timeout-pass",
+                r#"{"task_name":"terminal-bench/legacy-timeout-pass","outcome":"agent_timeout","verifier_result":{"rewards":{"reward":1.0}},"exception_info":null}"#,
+            ),
+            (
+                "verifier-exception-pass",
+                r#"{"task_name":"terminal-bench/verifier-exception-pass","verifier_result":{"rewards":{"reward":1.0}},"exception_info":{"exception_type":"AgentTimeoutError"}}"#,
             ),
         ] {
             let directory = job.path().join(trial);
@@ -5853,21 +6256,71 @@ mod tests {
             failed.task_names,
             [
                 "terminal-bench/partially-failed".to_owned(),
+                "terminal-bench/scored-timeout-fail".to_owned(),
                 "terminal-bench/torch-failed".to_owned()
             ]
             .into()
         );
 
-        let matcher = regex::RegexSet::new(["torch|errored|unscored"]).unwrap();
+        let matcher =
+            regex::RegexSet::new(["torch|errored|scored-timeout|refused|unscored"]).unwrap();
         let selected = retained_retry_task_names(job.path(), true, true, Some(&matcher)).unwrap();
         assert_eq!(
             selected.task_names,
             [
                 "terminal-bench/errored".to_owned(),
+                "terminal-bench/legacy-refused".to_owned(),
+                "terminal-bench/refused".to_owned(),
+                "terminal-bench/scored-timeout-fail".to_owned(),
                 "terminal-bench/torch-failed".to_owned(),
-                "terminal-bench/unscored-with-reward".to_owned(),
             ]
             .into()
+        );
+
+        let errors_only = retained_retry_task_names(job.path(), false, true, None).unwrap();
+        assert!(errors_only.task_names.contains("terminal-bench/refused"));
+        assert!(
+            errors_only
+                .task_names
+                .contains("terminal-bench/legacy-timeout-pass")
+        );
+        assert!(
+            errors_only
+                .task_names
+                .contains("terminal-bench/verifier-exception-pass")
+        );
+        assert!(
+            errors_only
+                .task_names
+                .contains("terminal-bench/explicit-non-refusal")
+        );
+        assert!(
+            !errors_only
+                .task_names
+                .contains("terminal-bench/cleanup-only")
+        );
+        assert!(
+            !errors_only
+                .task_names
+                .contains("terminal-bench/scored-timeout-pass")
+        );
+
+        let refusals_only = retained_retry_task_names(job.path(), true, false, None).unwrap();
+        assert!(refusals_only.task_names.contains("terminal-bench/refused"));
+        assert!(
+            refusals_only
+                .task_names
+                .contains("terminal-bench/legacy-refused")
+        );
+        assert!(
+            !refusals_only
+                .task_names
+                .contains("terminal-bench/explicit-non-refusal")
+        );
+        assert!(
+            !refusals_only
+                .task_names
+                .contains("terminal-bench/cleanup-only")
         );
     }
 
@@ -6158,6 +6611,86 @@ source $HOME/.local/bin/env
     }
 
     #[tokio::test]
+    async fn timed_out_driver_releases_vm_capabilities_before_verification() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let warmup = socket.next().await.unwrap().unwrap();
+            assert!(warmup.is_text());
+            socket
+                .send(Message::Text(
+                    json!({
+                        "type": "response.completed",
+                        "response": { "id": "resp-warmup", "usage": null }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let generation = socket.next().await.unwrap().unwrap();
+            assert!(generation.is_text());
+            while socket.next().await.is_some() {}
+        });
+        let openai = OpenAi::builder("test")
+            .websocket_url(endpoint)
+            .build()
+            .unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let task_directory = tempfile::tempdir().unwrap();
+        let task = write_timeout_task(task_directory.path(), 1.0);
+        let (evaluator, _events) = Evaluator::builder(Nanocodex::builder(openai))
+            .output_directory(output.path())
+            .attempt_agent(|_attempt, builder| {
+                let script = r#"
+IFS= read -r request
+case "$request" in
+    *'"kind":"shutdown"'*)
+        printf '%s\n' '{"kind":"shutdown","payload":{"id":0,"error":null}}'
+        ;;
+    *)
+        exit 91
+        ;;
+esac
+"#;
+                let mut command = tokio::process::Command::new("/bin/sh");
+                command.arg("-c").arg(script).arg("nanocodex-timeout-vm");
+                let session = VmToolSession::spawn(&mut command).unwrap();
+                let tools = session.tools().tools_builder().build().unwrap();
+                Ok::<_, Infallible>(AttemptAgent::new(builder.tools(tools)).verifier(
+                    VmCapabilityVerifier {
+                        session: Some(session),
+                    },
+                ))
+            })
+            .build()
+            .unwrap();
+
+        let outcome = evaluator.task(task).await.unwrap();
+        let result = outcome
+            .scored()
+            .expect("the VM verifier must run after the timed-out driver joins");
+
+        assert_eq!(result.outcome, EvalOutcome::AgentTimeout);
+        assert_eq!(result.cleanup.agent.status, CleanupStatus::Completed);
+        assert_eq!(result.cleanup.verifier.status, CleanupStatus::Completed);
+        let measurements =
+            super::AttemptMeasurementTotals::from_results(std::slice::from_ref(result));
+        assert_eq!(measurements.runtime_complete_attempts, 0);
+        assert_eq!(measurements.runtime_lower_bound_attempts, 1);
+        assert_eq!(measurements.runtime_missing_attempts, 0);
+        assert_eq!(measurements.usage_complete_attempts, 0);
+        assert_eq!(measurements.usage_lower_bound_attempts, 0);
+        assert_eq!(measurements.usage_missing_attempts, 1);
+        let summary =
+            RunSummary::from_attempts(&[super::AttemptOutcome::from_result(result.clone())]);
+        assert_eq!(summary.billing_missing, 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn same_vm_verifier_staging_normalizes_file_and_directory_mtimes() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -6267,6 +6800,37 @@ done
         bytes[18..20].copy_from_slice(&machine.to_le_bytes());
         bytes[20..24].copy_from_slice(&1_u32.to_le_bytes());
         bytes
+    }
+
+    fn write_timeout_task(root: &Path, timeout_seconds: f64) -> Task {
+        fs::create_dir_all(root.join("environment")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(root.join("instruction.md"), "Complete the task.\n").unwrap();
+        fs::write(root.join("tests/test.sh"), "exit 0\n").unwrap();
+        fs::write(
+            root.join("task.toml"),
+            format!(
+                r#"
+schema_version = "1.1"
+[task]
+name = "terminal-bench/timeout-vm-capability"
+description = "timeout VM capability fixture"
+[agent]
+timeout_sec = {timeout_seconds}
+[verifier]
+timeout_sec = 1.0
+[environment]
+docker_image = "alpine:3.21"
+cpus = 1
+memory_mb = 128
+storage_mb = 128
+gpus = 0
+allow_internet = false
+"#
+            ),
+        )
+        .unwrap();
+        Task::load(root).unwrap()
     }
 
     fn write_test_task(root: &Path) -> Task {

@@ -196,6 +196,7 @@ async fn cancellation_retains_completed_nested_progress_in_terminal_metrics() ->
         .ok_or_else(|| eyre!("completed nested tool result was not emitted"))?;
     let terminal = terminal.ok_or_else(|| eyre!("cancelled terminal event was not emitted"))?;
     assert_eq!(terminal["status"], "cancelled");
+    assert_eq!(terminal["runtime_completeness"], "observed_lower_bound");
     assert_eq!(terminal["tool_calls"], 3);
     let work = terminal["tool_work_duration_ns"]
         .as_u64()

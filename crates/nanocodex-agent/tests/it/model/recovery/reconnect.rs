@@ -136,7 +136,59 @@ async fn receive_reset_reconnects_without_replaying_completed_tools() -> Result<
     assert!(output.contains("\"connection_attempts\":2"));
     assert!(output.contains("\"websocket_reconnects\":1"));
     assert!(output.contains("\"model_calls\":2"));
+    assert!(output.contains("\"billing_uncertain_response_attempts\":1"));
+    assert!(output.contains("\"cost_status\":\"estimated_lower_bound\""));
     assert!(!output.contains("\"model.call.failed\""));
+    assert!(output.contains("\"run.completed\""));
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn incomplete_response_retry_keeps_reported_cost_as_a_lower_bound() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut first = accept_async(stream).await?;
+        assert_warmup(&next_json(&mut first).await?);
+        send_json(
+            &mut first,
+            completed_response_with_usage("resp-warmup", &[], 1),
+        )
+        .await?;
+
+        let generation = next_json(&mut first).await?;
+        assert_eq!(generation["previous_response_id"], "resp-warmup");
+        send_json(
+            &mut first,
+            json!({
+                "type": "response.incomplete",
+                "response": {
+                    "id": "resp-incomplete",
+                    "status": "incomplete",
+                    "incomplete_details": { "reason": "max_output_tokens" }
+                }
+            }),
+        )
+        .await?;
+        drop(first);
+
+        let (stream, _) = listener.accept().await?;
+        let mut second = accept_async(stream).await?;
+        let replay = next_json(&mut second).await?;
+        assert!(replay.get("previous_response_id").is_none());
+        send_final(&mut second, "resp-final").await
+    });
+
+    let workspace = temporary_workspace("incomplete-retry-cost")?;
+    let output = run_model(&endpoint, &workspace, "retry an incomplete response").await?;
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock Responses server did not finish"))???;
+    assert!(output.contains("\"error_class\":\"api_incomplete\""));
+    assert!(output.contains("\"billing_uncertain_response_attempts\":1"));
+    assert!(output.contains("\"cost_status\":\"estimated_lower_bound\""));
     assert!(output.contains("\"run.completed\""));
     std::fs::remove_dir_all(workspace)?;
     Ok(())
