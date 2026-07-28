@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use nanocodex_agent::{
     Nanocodex, OpenAi, Thinking,
     events::{AgentEvent, AgentEventKind},
@@ -134,6 +134,31 @@ fn benchmark_eval_runtime(criterion: &mut Criterion) {
     group.bench_function("aggregate_60_plot_facts", |bencher| {
         bencher.iter(|| black_box(AggregateDataset::new(black_box(facts.clone()))));
     });
+
+    let per_attempt_boot = task_vm_boot_scenario(&facts, false);
+    let grouped_boot = task_vm_boot_scenario(&facts, true);
+    let baseline_boot_ns = task_environment_boot_total(&per_attempt_boot);
+    let grouped_boot_ns = task_environment_boot_total(&grouped_boot);
+    let task_count = facts
+        .iter()
+        .map(|fact| fact.task_name.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len() as u64;
+    assert_eq!(baseline_boot_ns, facts.len() as u64 * 250_000_000);
+    assert_eq!(grouped_boot_ns, task_count * 250_000_000);
+    assert!(grouped_boot_ns < baseline_boot_ns);
+    for (scenario, facts) in [
+        ("per_attempt_baseline", per_attempt_boot),
+        ("one_boot_per_task", grouped_boot),
+    ] {
+        group.bench_with_input(
+            BenchmarkId::new("aggregate_task_vm_boot_attribution", scenario),
+            &facts,
+            |bencher, facts| {
+                bencher.iter(|| black_box(AggregateDataset::new(black_box(facts.clone()))));
+            },
+        );
+    }
     group.finish();
 }
 
@@ -199,6 +224,7 @@ fn representative_attempt_facts() -> Vec<AttemptFact> {
                     task_name: task.to_owned(),
                     configuration: configuration.to_owned(),
                     repetition,
+                    schedule_ordinal: u64::from(repetition),
                     outcome: if (repetition + u16::from(configuration.starts_with("high"))) % 3 != 0
                     {
                         EvalOutcome::Passed
@@ -231,6 +257,35 @@ fn representative_attempt_facts() -> Vec<AttemptFact> {
         }
     }
     facts
+}
+
+fn task_vm_boot_scenario(facts: &[AttemptFact], grouped: bool) -> Vec<AttemptFact> {
+    let first_configuration = facts
+        .first()
+        .map(|fact| fact.configuration.as_str())
+        .expect("representative attempt facts");
+    facts
+        .iter()
+        .cloned()
+        .map(|mut fact| {
+            let attribute_boot =
+                !grouped || fact.configuration == first_configuration && fact.repetition == 1;
+            if attribute_boot {
+                fact.latency.task_environment_boot_ns = 250_000_000;
+                fact.latency.vm_bootstrap_ns =
+                    fact.latency.vm_bootstrap_ns.saturating_add(250_000_000);
+                fact.latency.total_ns = fact.latency.total_ns.saturating_add(250_000_000);
+            }
+            fact
+        })
+        .collect()
+}
+
+fn task_environment_boot_total(facts: &[AttemptFact]) -> u64 {
+    facts
+        .iter()
+        .map(|fact| fact.latency.task_environment_boot_ns)
+        .sum()
 }
 
 fn build_sweep(tasks: &[Task], agent: &nanocodex_agent::NanocodexBuilder) -> nanocodex_eval::Sweep {

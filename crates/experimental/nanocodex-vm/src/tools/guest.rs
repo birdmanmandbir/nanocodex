@@ -28,8 +28,8 @@ use tokio::{
 
 use super::protocol::{
     CancelRequest, ControlResponse, CreateDirectoryRequest, ExecuteRequest, ExecuteResponse,
-    ReadFileRequest, ReadFileResponse, SessionRequest, SessionResponse, ShutdownRequest,
-    ToolResponse, WriteFileRequest,
+    ReadFileRequest, ReadFileResponse, ScopedResponse, SessionRequest, SessionResponse,
+    ShutdownRequest, ToolResponse, WriteFileRequest,
 };
 
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
@@ -62,6 +62,11 @@ pub enum VmGuestError {
     /// The host reused an identifier while its earlier request was active.
     #[error("VM tool protocol reused active request ID {0}")]
     DuplicateRequestId(u64),
+
+    /// Task-VM sandbox setup, routing, or teardown failed.
+    #[cfg(target_os = "linux")]
+    #[error("task VM sandbox failed: {0}")]
+    Sandbox(String),
 }
 
 #[cfg(feature = "guest-runtime")]
@@ -69,24 +74,42 @@ pub(crate) async fn serve(workspace: &Path) -> Result<(), VmGuestError> {
     serve_io(workspace, tokio::io::stdin(), tokio::io::stdout()).await
 }
 
-async fn serve_io(
+pub(super) async fn serve_io(
     workspace: &Path,
     input: impl AsyncRead + Unpin,
     output: impl AsyncWrite + Unpin,
 ) -> Result<(), VmGuestError> {
-    serve_io_with_frame_limit(workspace, input, output, MAX_FRAME_BYTES).await
+    serve_io_with_environment(workspace, Vec::new(), input, output).await
+}
+
+pub(super) async fn serve_io_with_environment(
+    workspace: &Path,
+    environment: Vec<(String, String)>,
+    input: impl AsyncRead + Unpin,
+    output: impl AsyncWrite + Unpin,
+) -> Result<(), VmGuestError> {
+    serve_io_with_frame_limit(workspace, environment, input, output, MAX_FRAME_BYTES).await
 }
 
 async fn serve_io_with_frame_limit(
     workspace: &Path,
+    environment: Vec<(String, String)>,
     input: impl AsyncRead + Unpin,
     mut output: impl AsyncWrite + Unpin,
     max_frame_bytes: usize,
 ) -> Result<(), VmGuestError> {
-    let runtime = Arc::new(WorkspaceToolRuntime::with_view_image_wire_limit(
-        workspace.to_path_buf(),
-        u64::try_from(max_frame_bytes).unwrap_or(u64::MAX),
-    ));
+    let runtime = Arc::new(
+        WorkspaceToolRuntime::with_environment_and_view_image_wire_limit(
+            workspace.to_path_buf(),
+            environment
+                .iter()
+                .cloned()
+                .map(|(name, value)| (name.into(), value.into()))
+                .collect(),
+            u64::try_from(max_frame_bytes).unwrap_or(u64::MAX),
+        ),
+    );
+    let environment = Arc::new(environment);
     let mut input = BufReader::new(input);
     let mut requests = JoinSet::<SessionResponse>::new();
     let mut active = HashMap::<u64, tokio::task::AbortHandle>::new();
@@ -138,8 +161,10 @@ async fn serve_io_with_frame_limit(
                                 return Err(VmGuestError::DuplicateRequestId(id));
                             }
                             let runtime = Arc::clone(&runtime);
-                            let task =
-                                requests.spawn(async move { execute_request(runtime, request).await });
+                            let environment = Arc::clone(&environment);
+                            let task = requests.spawn(async move {
+                                execute_request(runtime, environment, request).await
+                            });
                             active.insert(id, task);
                         }
                     }
@@ -160,12 +185,27 @@ async fn serve_io_with_frame_limit(
 
 async fn execute_request(
     runtime: Arc<WorkspaceToolRuntime>,
+    environment: Arc<Vec<(String, String)>>,
     request: SessionRequest,
 ) -> SessionResponse {
     match request {
         SessionRequest::Ready(request) => SessionResponse::Ready(ControlResponse {
             id: request.id,
             error: None,
+        }),
+        SessionRequest::BeginAttempt(request) => SessionResponse::BeginAttempt(ControlResponse {
+            id: request.id,
+            error: Some("this VM guest is not a task supervisor".to_owned()),
+        }),
+        SessionRequest::Scoped(request) => SessionResponse::Scoped(ScopedResponse {
+            id: request.id,
+            generation: request.generation,
+            response: None,
+            error: Some("this VM guest has no active task attempt".to_owned()),
+        }),
+        SessionRequest::FinishAttempt(request) => SessionResponse::FinishAttempt(ControlResponse {
+            id: request.id,
+            error: Some("this VM guest is not a task supervisor".to_owned()),
         }),
         SessionRequest::Tool(request) => {
             let context = ToolContext::new(
@@ -189,7 +229,7 @@ async fn execute_request(
         }
         SessionRequest::ReadFile(request) => SessionResponse::ReadFile(read_file(request).await),
         SessionRequest::Execute(request) => {
-            SessionResponse::Execute(execute_command(request).await)
+            SessionResponse::Execute(execute_command(request, &environment).await)
         }
         SessionRequest::Cancel(CancelRequest { id, .. }) => {
             SessionResponse::Cancel(ControlResponse {
@@ -204,7 +244,7 @@ async fn execute_request(
     }
 }
 
-async fn write_response(
+pub(super) async fn write_response(
     output: &mut (impl AsyncWrite + Unpin),
     response: &SessionResponse,
     max_frame_bytes: usize,
@@ -287,7 +327,7 @@ impl std::io::Write for BoundedFrameWriter {
     }
 }
 
-async fn read_frame(
+pub(super) async fn read_frame(
     reader: &mut (impl AsyncBufRead + Unpin),
 ) -> Result<Option<Vec<u8>>, VmGuestError> {
     let mut frame = Vec::new();
@@ -469,12 +509,16 @@ async fn read_file(request: ReadFileRequest) -> ReadFileResponse {
     }
 }
 
-async fn execute_command(request: ExecuteRequest) -> ExecuteResponse {
+async fn execute_command(
+    request: ExecuteRequest,
+    base_environment: &[(String, String)],
+) -> ExecuteResponse {
     let mut command = Command::new(&request.program);
     command
         .args(&request.arguments)
         .current_dir(&request.current_directory)
         .env_clear()
+        .envs(base_environment.iter().cloned())
         .envs(request.environment.iter().cloned())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -718,18 +762,22 @@ mod tests {
     #[tokio::test]
     async fn timeout_kills_descendants_holding_output_pipes() {
         let started_at = Instant::now();
-        let response = execute_command(ExecuteRequest {
-            id: 1,
-            program: "/bin/sh".to_owned(),
-            arguments: vec![
-                "-c".to_owned(),
-                "printf 'partial stdout'; printf 'partial stderr' >&2; sleep 30 & wait".to_owned(),
-            ],
-            current_directory: "/".to_owned(),
-            environment: Vec::new(),
-            timeout_millis: 100,
-            max_output_bytes: DEFAULT_OUTPUT_BYTES,
-        })
+        let response = execute_command(
+            ExecuteRequest {
+                id: 1,
+                program: "/bin/sh".to_owned(),
+                arguments: vec![
+                    "-c".to_owned(),
+                    "printf 'partial stdout'; printf 'partial stderr' >&2; sleep 30 & wait"
+                        .to_owned(),
+                ],
+                current_directory: "/".to_owned(),
+                environment: Vec::new(),
+                timeout_millis: 100,
+                max_output_bytes: DEFAULT_OUTPUT_BYTES,
+            },
+            &[],
+        )
         .await;
 
         assert!(response.timed_out);
@@ -747,15 +795,18 @@ mod tests {
 
     #[tokio::test]
     async fn command_output_is_bounded_while_it_is_produced() {
-        let response = execute_command(ExecuteRequest {
-            id: 1,
-            program: "/usr/bin/yes".to_owned(),
-            arguments: vec!["bounded".to_owned()],
-            current_directory: "/".to_owned(),
-            environment: Vec::new(),
-            timeout_millis: 5_000,
-            max_output_bytes: 8,
-        })
+        let response = execute_command(
+            ExecuteRequest {
+                id: 1,
+                program: "/usr/bin/yes".to_owned(),
+                arguments: vec!["bounded".to_owned()],
+                current_directory: "/".to_owned(),
+                environment: Vec::new(),
+                timeout_millis: 5_000,
+                max_output_bytes: 8,
+            },
+            &[],
+        )
         .await;
 
         assert!(response.output_limit_exceeded);
@@ -919,6 +970,7 @@ mod tests {
             SessionRequest::Cancel(CancelRequest {
                 id: 1,
                 target_id: 0,
+                generation: None,
             }),
             SessionRequest::Execute(ExecuteRequest {
                 id: 2,
@@ -984,8 +1036,14 @@ mod tests {
         let guest_task = tokio::spawn({
             let workspace = workspace.path().to_owned();
             async move {
-                serve_io_with_frame_limit(&workspace, guest_read, guest_write, TEST_FRAME_BYTES)
-                    .await
+                serve_io_with_frame_limit(
+                    &workspace,
+                    Vec::new(),
+                    guest_read,
+                    guest_write,
+                    TEST_FRAME_BYTES,
+                )
+                .await
             }
         });
         let oversized = SessionRequest::Tool(ToolRequest {
@@ -1112,6 +1170,7 @@ mod tests {
             SessionRequest::Cancel(CancelRequest {
                 id: 1,
                 target_id: 0,
+                generation: None,
             }),
             SessionRequest::Execute(ExecuteRequest {
                 id: 2,

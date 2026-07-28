@@ -569,6 +569,7 @@ impl HarborArtifacts {
             id: result.attempt_id,
             task_name: &result.task_name,
             trial_name: &result.trial_name,
+            schedule_ordinal: result.schedule_ordinal,
             trial_uri,
             task_id: HarborTaskId { path: task_path },
             source: "nanocodex/local",
@@ -600,6 +601,7 @@ impl HarborArtifacts {
             started_at: result.timing.started_at,
             finished_at: result.timing.finished_at,
             queue_wait: Some(&result.timing.queue_wait),
+            task_environment_boot: result.timing.task_environment_boot.as_ref(),
             environment_setup: Some(&result.timing.environment_setup),
             environment_readiness: Some(&result.timing.environment_readiness),
             agent_setup: Some(&result.timing.agent_setup),
@@ -708,6 +710,7 @@ impl HarborArtifacts {
             id: failure.attempt_id,
             task_name: &failure.task_name,
             trial_name: &failure.trial_name,
+            schedule_ordinal: failure.schedule_ordinal,
             trial_uri,
             task_id: HarborTaskId { path: task_path },
             source: "nanocodex/local",
@@ -742,6 +745,7 @@ impl HarborArtifacts {
             started_at: failure.started_at,
             finished_at: failure.occurred_at,
             queue_wait: Some(&failure.timing.queue_wait),
+            task_environment_boot: failure.timing.task_environment_boot.as_ref(),
             environment_setup: failure.timing.environment_setup.as_ref(),
             environment_readiness: failure.timing.environment_readiness.as_ref(),
             agent_setup: failure.timing.agent_setup.as_ref(),
@@ -1348,6 +1352,7 @@ struct HarborTrialResult<'a> {
     id: Uuid,
     task_name: &'a str,
     trial_name: &'a str,
+    schedule_ordinal: u64,
     trial_uri: String,
     task_id: HarborTaskId,
     source: &'static str,
@@ -1362,6 +1367,7 @@ struct HarborTrialResult<'a> {
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
     queue_wait: Option<&'a PhaseTiming>,
+    task_environment_boot: Option<&'a PhaseTiming>,
     environment_setup: Option<&'a PhaseTiming>,
     environment_readiness: Option<&'a PhaseTiming>,
     agent_setup: Option<&'a PhaseTiming>,
@@ -1449,6 +1455,8 @@ struct RetainedHarborTrialResult {
     id: Uuid,
     task_name: String,
     trial_name: String,
+    #[serde(default)]
+    schedule_ordinal: u64,
     source: Option<String>,
     outcome: Option<EvalOutcome>,
     scored: Option<bool>,
@@ -1458,7 +1466,12 @@ struct RetainedHarborTrialResult {
     agent_info: RetainedHarborAgentInfo,
     agent_result: Option<RetainedHarborAgentResult>,
     verifier_result: Option<RetainedHarborVerifierResult>,
+    #[serde(default)]
+    started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    finished_at: Option<DateTime<Utc>>,
     queue_wait: Option<RetainedPhaseTiming>,
+    task_environment_boot: Option<RetainedPhaseTiming>,
     environment_setup: Option<RetainedPhaseTiming>,
     environment_readiness: Option<RetainedPhaseTiming>,
     agent_setup: Option<RetainedPhaseTiming>,
@@ -1589,12 +1602,26 @@ impl DurableHarborTrial {
                 .as_ref()
                 .is_some_and(|exception| exception.exception_type == "CleanupError");
         let queue_wait_ns = retained_phase_duration_ns(self.result.queue_wait.as_ref());
+        let task_environment_boot_ns =
+            retained_phase_duration_ns(self.result.task_environment_boot.as_ref());
+        let task_environment_admission_ns = self
+            .result
+            .started_at
+            .zip(
+                self.result
+                    .task_environment_boot
+                    .as_ref()
+                    .map(|boot| boot.started_at),
+            )
+            .map_or(0, |(started_at, boot_started_at)| {
+                retained_duration_ns(started_at, boot_started_at)
+            });
         let environment_setup_ns =
             retained_phase_duration_ns(self.result.environment_setup.as_ref());
         let environment_readiness_ns =
             retained_phase_duration_ns(self.result.environment_readiness.as_ref());
         let vm_bootstrap_ns = if self.result.config.environment.kwargs.backend == "microvm" {
-            environment_readiness_ns
+            task_environment_boot_ns.saturating_add(environment_readiness_ns)
         } else {
             0
         };
@@ -1607,7 +1634,9 @@ impl DurableHarborTrial {
             .map(phase_duration_ns)
             .fold(0_u64, u64::saturating_add);
         let total_ns = [
+            task_environment_admission_ns,
             queue_wait_ns,
+            task_environment_boot_ns,
             environment_setup_ns,
             environment_readiness_ns,
             agent_setup_ns,
@@ -1617,11 +1646,23 @@ impl DurableHarborTrial {
         ]
         .into_iter()
         .fold(0_u64, u64::saturating_add);
+        let observed_wall_ns = self
+            .result
+            .started_at
+            .zip(self.result.finished_at)
+            .map_or(total_ns, |(started_at, finished_at)| {
+                retained_duration_ns(started_at, finished_at)
+            });
         AttemptFact {
             attempt_id: self.result.id,
             task_name: self.result.task_name,
             configuration,
             repetition,
+            schedule_ordinal: if self.result.schedule_ordinal == 0 {
+                u64::from(repetition)
+            } else {
+                self.result.schedule_ordinal
+            },
             outcome,
             scored,
             passed,
@@ -1633,7 +1674,9 @@ impl DurableHarborTrial {
                     .unwrap_or(BillingCompleteness::Unknown)
             }),
             latency: LatencyBreakdown {
+                task_environment_admission_ns,
                 queue_wait_ns,
+                task_environment_boot_ns,
                 environment_setup_ns,
                 environment_readiness_ns,
                 vm_bootstrap_ns,
@@ -1645,6 +1688,7 @@ impl DurableHarborTrial {
                 verifier_ns,
                 cleanup_ns,
                 total_ns,
+                observed_wall_ns,
                 ..LatencyBreakdown::default()
             },
             artifacts: AttemptFactArtifacts {

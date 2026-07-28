@@ -68,6 +68,8 @@ mod guest;
 mod protocol;
 #[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
 mod runtime_disk;
+#[cfg(all(target_os = "linux", any(feature = "guest-runtime", test)))]
+mod sandbox;
 #[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
 mod session;
 
@@ -215,6 +217,57 @@ impl Tool for VmTool {
 #[cfg(feature = "guest-runtime")]
 pub async fn serve_guest(workspace: impl AsRef<Path>) -> Result<(), VmGuestError> {
     guest::serve(workspace.as_ref()).await
+}
+
+/// Serves one persistent offline task VM whose attempts execute sequentially.
+///
+/// The immutable task filesystem is mounted once by the trusted supervisor.
+/// Each Begin/Finish protocol generation receives a fresh overlay and Linux
+/// namespace set. This entry point is intended for the companion guest binary.
+///
+/// # Errors
+///
+/// Returns an error when the lower filesystem cannot be mounted or the
+/// supervisor protocol/sandbox lifecycle fails.
+#[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+pub async fn serve_task_guest(
+    lower_device: impl Into<std::path::PathBuf>,
+    lower_mount: impl Into<std::path::PathBuf>,
+    attempts_root: impl Into<std::path::PathBuf>,
+) -> Result<(), VmGuestError> {
+    sandbox::serve_task_supervisor(sandbox::TaskSupervisorConfig {
+        lower_device: lower_device.into(),
+        lower_mount: lower_mount.into(),
+        attempts_root: attempts_root.into(),
+    })
+    .await
+}
+
+/// Runs the trusted intermediate process that constructs one attempt sandbox.
+///
+/// This is an internal process mode of `nanocodex-vm-guest`; applications
+/// should use [`serve_task_guest`] through [`crate::TaskVm`].
+///
+/// # Errors
+///
+/// Returns an error when namespace, overlay, cgroup, or child setup fails.
+#[doc(hidden)]
+#[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+pub async fn run_task_attempt_helper(arguments: &[std::ffi::OsString]) -> Result<(), VmGuestError> {
+    sandbox::run_attempt_helper(arguments).await
+}
+
+/// Runs the attempt-local workspace runtime after entering its prepared root.
+///
+/// This is an internal process mode of `nanocodex-vm-guest`.
+///
+/// # Errors
+///
+/// Returns an error when final pivot/proc setup or the tool protocol fails.
+#[doc(hidden)]
+#[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+pub async fn run_task_attempt_child(arguments: &[std::ffi::OsString]) -> Result<(), VmGuestError> {
+    sandbox::run_attempt_child(arguments).await
 }
 
 #[cfg(all(test, feature = "host", any(target_os = "linux", target_os = "macos")))]

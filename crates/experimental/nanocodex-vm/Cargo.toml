@@ -34,7 +34,13 @@ host = [
     "dep:zstd",
     "nanocodex-tools/native",
 ]
-guest-runtime = ["dep:nix", "nanocodex-tools/workspace-runtime"]
+guest-runtime = [
+    "dep:caps",
+    "dep:futures-util",
+    "dep:nix",
+    "dep:rtnetlink",
+    "nanocodex-tools/workspace-runtime",
+]
 
 [dependencies]
 base64.workspace = true
@@ -63,6 +69,10 @@ tar = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 zstd = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+caps = { workspace = true, optional = true }
+rtnetlink = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion.workspace = true

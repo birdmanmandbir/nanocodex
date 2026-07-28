@@ -33,15 +33,16 @@ use nanocodex_eval::{
     AggregateRunTiming, AttemptAgent, AttemptVerification, AttemptVerificationFailure,
     AttemptVerifier, BillingCompleteness, CleanupPhase, EvalAttempt, EvalAttemptOutcome,
     EvalEnvironment, EvalEventKind, EvalEventStream, EvalFailure, EvalOutcome, EvalResult,
-    EvalStatus, Evaluator, EvaluatorBuilder, NetworkPolicy, PhaseTiming, Sweep, SweepResults, Task,
+    EvalStatus, EvalTask, Evaluator, EvaluatorBuilder, NetworkPolicy, PhaseTiming, Sweep,
+    SweepResults, Task, TaskEnvironment, TaskEnvironmentError, TaskEnvironmentFactory,
     TaskLoadError, VerifierEnvironmentMode, VerifierResult,
 };
 use nanocodex_vm::image::{CachePolicy, VmImageBuilder, reflink_or_sparse_copy};
-use nanocodex_vm::{BlockDevice, GuestCommand, Network, VmConfig};
 use nanocodex_vm::{
-    GuestRuntimeDisk, GuestRuntimeDiskStatus, VmCommand, VmCommandOutput, VmCommandPartialOutput,
-    VmToolSession, VmToolSessionError,
+    AttemptRetention, GuestRuntimeDisk, GuestRuntimeDiskStatus, TaskVm, TaskVmAttempt, TaskVmError,
+    VmCommand, VmCommandOutput, VmCommandPartialOutput, VmToolSession, VmToolSessionError,
 };
+use nanocodex_vm::{BlockDevice, GuestCommand, Network, VmConfig};
 use regex::RegexSet;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -61,9 +62,9 @@ const DEFAULT_OUTPUT_DIRECTORY: &str = ".nanocodex/evals";
 const INVOCATION_FILE: &str = "invocation.json";
 const LAST_RUN_FILE: &str = ".nanocodex/eval/last-run.json";
 const LEGACY_LAST_RUN_FILE: &str = ".nanoeval/last-run.json";
-const INVOCATION_VERSION: u32 = 2;
+const INVOCATION_VERSION: u32 = 3;
 const PRICING_REVISION: &str = "gpt-5.6-sol-standard-priority-v1";
-const SCHEDULING_POLICY: &str = "bounded_fifo_work_conserving-v1";
+const SCHEDULING_POLICY: &str = "hybrid_task_group_counterbalanced-v1";
 const DEFAULT_TRIALS: u16 = 5;
 const DEFAULT_HOST_UTILIZATION_PERCENT: u8 = 80;
 const BYTES_PER_MIB: u64 = 1024 * 1024;
@@ -597,11 +598,15 @@ impl Run {
         let vm_backend = resolved.vm || resolved.vm_rootfs.is_some();
         let vm_resources = vm_backend.then(|| Arc::new(OnceLock::<VmRunResources>::new()));
         if let Some(resources) = &vm_resources {
-            let resources = Arc::clone(resources);
+            let attempt_resources = Arc::clone(resources);
+            let task_resources = Arc::clone(resources);
             evaluator = evaluator
                 .attempt_environment(EvalEnvironment::MicroVm)
+                .task_environment(VmTaskEnvironmentFactory {
+                    resources: task_resources,
+                })
                 .attempt_agent(move |attempt, builder| {
-                    let resources = resources
+                    let resources = attempt_resources
                         .get()
                         .ok_or(VmAttemptError::RunResourcesNotPrepared)?;
                     let environment = resources
@@ -2277,6 +2282,36 @@ struct VmRunResources {
     web_search: bool,
 }
 
+struct VmTaskEnvironmentFactory {
+    resources: Arc<OnceLock<VmRunResources>>,
+}
+
+#[derive(Clone)]
+struct TaskVmLaunchSpec {
+    environment: VmEnvironment,
+    runtime_image: PathBuf,
+    vmm: PathBuf,
+    directory: PathBuf,
+    cpus: u8,
+    memory_mib: u32,
+    retain_passed_rootfs: bool,
+    web_search: bool,
+}
+
+struct VmTaskEnvironment {
+    spec: TaskVmLaunchSpec,
+    vm: Option<TaskVm>,
+    boot_timing: Option<PhaseTiming>,
+    boot_index: u64,
+}
+
+struct TaskVmVerifier {
+    attempt: Option<TaskVmAttempt>,
+    workspace: String,
+    shell: String,
+    retain_passed_rootfs: bool,
+}
+
 #[derive(Clone, Copy)]
 struct VmAttemptHost<'a> {
     runtime_image: &'a Path,
@@ -3072,6 +3107,9 @@ enum VmAttemptError {
     Session(#[from] VmToolSessionError),
 
     #[error(transparent)]
+    TaskVm(#[from] TaskVmError),
+
+    #[error(transparent)]
     Tools(#[from] ToolsBuildError),
 
     #[error(transparent)]
@@ -3781,6 +3819,361 @@ fn verifier_bootstrap_network_failed(output: &VmCommandOutput) -> bool {
             || contains("archive.ubuntu.com")
             || contains("security.ubuntu.com"));
     apt_bootstrap_failed || dependency_runner_missing && network_failed
+}
+
+#[async_trait::async_trait]
+impl TaskEnvironmentFactory for VmTaskEnvironmentFactory {
+    fn supports(&self, task: &Task) -> bool {
+        if task.network() != NetworkPolicy::Disabled
+            || task.verifier().environment_mode() != VerifierEnvironmentMode::Same
+        {
+            return false;
+        }
+        let Some(resources) = self.resources.get() else {
+            return false;
+        };
+        let Some(environment) = resources.environments.get(task.root()) else {
+            return false;
+        };
+        if !environment.rootfs.is_file() || environment.verifier.is_some() {
+            return false;
+        }
+        task.verifier_script_bytes()
+            .ok()
+            .is_some_and(|script| recognized_verifier_setup(&script).is_none())
+    }
+
+    async fn create(
+        &self,
+        task: EvalTask<'_>,
+    ) -> Result<Box<dyn TaskEnvironment>, TaskEnvironmentError> {
+        let resources = self
+            .resources
+            .get()
+            .ok_or(VmAttemptError::RunResourcesNotPrepared)?;
+        let environment = resources
+            .environments
+            .get(task.task().root())
+            .ok_or_else(|| {
+                VmAttemptError::MissingPreparedEnvironment(task.task().root().to_path_buf())
+            })?
+            .clone();
+        let spec = TaskVmLaunchSpec {
+            environment,
+            runtime_image: resources.runtime_image.clone(),
+            vmm: resources.vmm.clone(),
+            directory: task.directory().to_path_buf(),
+            cpus: u8::try_from(task.task().resources().cpus).unwrap_or(u8::MAX),
+            memory_mib: u32::try_from(task.task().resources().memory_mb).unwrap_or(u32::MAX),
+            retain_passed_rootfs: resources.retain_passed_rootfs,
+            web_search: resources.web_search,
+        };
+        let environment = VmTaskEnvironment::launch(spec).await?;
+        Ok(Box::new(environment))
+    }
+}
+
+impl TaskVmLaunchSpec {
+    async fn launch(&self, boot_index: u64) -> Result<TaskVm, VmAttemptError> {
+        let supervisor_rootfs = self
+            .directory
+            .join(format!("supervisor-{boot_index:04}.ext4"));
+        let mut builder =
+            TaskVm::private_from(&self.environment.rootfs, supervisor_rootfs, &self.vmm)?
+                .vmm_argument("eval")
+                .vmm_argument("vm")
+                .vmm_argument("run-config")
+                .vmm_argument("--config")
+                .guest_runtime_disk(&self.runtime_image)
+                .guest_workspace(self.environment.workspace.clone())
+                .shell(self.environment.shell.clone())
+                .cpus(self.cpus)
+                .memory_mib(self.memory_mib)
+                .environment(
+                    self.environment
+                        .environment
+                        .iter()
+                        .map(|(name, value)| (name.clone(), value.clone())),
+                );
+        let firmware = Path::new(DEFAULT_KRUNFW_DIRECTORY);
+        if firmware.join(KRUNFW_LIBRARY_FILENAME).is_file() {
+            builder = builder.firmware_directory(firmware);
+        }
+        builder.launch().await.map_err(Into::into)
+    }
+}
+
+impl VmTaskEnvironment {
+    async fn launch(spec: TaskVmLaunchSpec) -> Result<Self, VmAttemptError> {
+        let started_at = Utc::now();
+        let vm = spec.launch(0).await?;
+        Ok(Self {
+            spec,
+            vm: Some(vm),
+            boot_timing: Some(PhaseTiming::finished(started_at)),
+            boot_index: 0,
+        })
+    }
+
+    async fn recycle(&mut self, primary: &TaskVmError) -> Result<(), VmAttemptError> {
+        if let Some(vm) = self.vm.take()
+            && let Err(error) = vm.shutdown().await
+        {
+            warn!(
+                target: "nanocodex_eval",
+                error = %error,
+                primary_error = %primary,
+                "failed to gracefully stop poisoned task VM; dropping its final capability"
+            );
+        }
+        self.boot_index = self.boot_index.saturating_add(1);
+        self.vm = Some(self.spec.launch(self.boot_index).await?);
+        Ok(())
+    }
+
+    async fn begin_attempt(&mut self) -> Result<TaskVmAttempt, VmAttemptError> {
+        let first = self
+            .vm
+            .as_ref()
+            .ok_or_else(|| io::Error::other("task VM is unavailable"))?
+            .begin_attempt()
+            .await;
+        match first {
+            Ok(attempt) => Ok(attempt),
+            Err(primary) => {
+                warn!(
+                    target: "nanocodex_eval",
+                    error = %primary,
+                    "task VM attempt setup failed; recycling before retrying the coordinate"
+                );
+                self.recycle(&primary).await?;
+                self.vm
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("recycled task VM is unavailable"))?
+                    .begin_attempt()
+                    .await
+                    .map_err(Into::into)
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl TaskEnvironment for VmTaskEnvironment {
+    async fn attempt(
+        &mut self,
+        _attempt: EvalAttempt<'_>,
+        builder: NanocodexBuilder,
+    ) -> Result<AttemptAgent, TaskEnvironmentError> {
+        let attempt = self.begin_attempt().await?;
+        let tools = attempt
+            .tools_builder()
+            .web_search(self.spec.web_search)
+            .image_generation(true)
+            .build()?;
+        let verifier = TaskVmVerifier {
+            attempt: Some(attempt),
+            workspace: self.spec.environment.workspace.clone(),
+            shell: self.spec.environment.shell.clone(),
+            retain_passed_rootfs: self.spec.retain_passed_rootfs,
+        };
+        Ok(AttemptAgent::new(builder.tools(tools)).verifier(verifier))
+    }
+
+    fn boot_timing(&self) -> Option<PhaseTiming> {
+        self.boot_timing.clone()
+    }
+
+    async fn shutdown(&mut self) -> Result<(), TaskEnvironmentError> {
+        let Some(vm) = self.vm.take() else {
+            return Ok(());
+        };
+        vm.shutdown().await?;
+        Ok(())
+    }
+}
+
+impl AttemptVerifier for TaskVmVerifier {
+    fn verify<'a>(
+        &'a mut self,
+        task: &'a Task,
+        attempt: EvalAttempt<'a>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<AttemptVerification, AttemptVerificationFailure>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move { self.verify_inner(task, attempt).await })
+    }
+
+    fn shutdown(&mut self) -> Pin<Box<dyn Future<Output = CleanupPhase> + Send + '_>> {
+        Box::pin(async move { self.finish(AttemptRetention::Retain).await })
+    }
+}
+
+impl TaskVmVerifier {
+    async fn verify_inner(
+        &mut self,
+        task: &Task,
+        attempt: EvalAttempt<'_>,
+    ) -> Result<AttemptVerification, AttemptVerificationFailure> {
+        let setup = async {
+            task.validate_package()?;
+            let tests = tempfile::tempdir()?;
+            task.materialize_verifier_files(tests.path())?;
+            let vm_attempt = self
+                .attempt
+                .as_ref()
+                .ok_or_else(|| io::Error::other("task VM attempt was already finished"))?;
+            Self::copy_directory(vm_attempt, tests.path(), tests.path(), Path::new("/tests"))
+                .await?;
+            vm_attempt
+                .create_directory("/logs/verifier", 0o755, Some(0))
+                .await?;
+            vm_attempt
+                .write_file("/logs/verifier/.nanoeval", Vec::new(), 0o600)
+                .await?;
+            Ok::<_, VmAttemptError>(())
+        }
+        .await;
+        if let Err(primary) = setup {
+            let cleanup = self.finish(AttemptRetention::Retain).await;
+            return Err(AttemptVerificationFailure::new(primary, cleanup));
+        }
+
+        let verification = async {
+            let vm_attempt = self
+                .attempt
+                .as_ref()
+                .ok_or_else(|| io::Error::other("task VM attempt was already finished"))?;
+            let command = VmCommand::new(verifier_shell(&self.shell, false))
+                .arg("/tests/test.sh")
+                .current_directory(&self.workspace)
+                .environment(base_guest_environment(task, &self.workspace))
+                .timeout(task.verifier().timeout());
+            let (output, verifier_timed_out) =
+                Self::execute_verifier_command(vm_attempt, command).await?;
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            let combined = match (stdout.is_empty(), stderr.is_empty()) {
+                (_, true) => stdout.clone(),
+                (true, false) => stderr.clone(),
+                (false, false) => format!("{stdout}\n{stderr}"),
+            };
+            let verifier_directory = attempt.directory().join("verifier");
+            fs::create_dir_all(&verifier_directory)?;
+            fs::write(verifier_directory.join("test-stdout.txt"), combined)?;
+            let reward_bytes = if verifier_timed_out {
+                b"0\n".to_vec()
+            } else {
+                vm_attempt.read_file("/logs/verifier/reward.txt").await?
+            };
+            fs::write(verifier_directory.join("reward.txt"), &reward_bytes)?;
+            if let Ok(ctrf) = vm_attempt.read_file("/logs/verifier/ctrf.json").await {
+                fs::write(verifier_directory.join("ctrf.json"), ctrf)?;
+            }
+            let answer_path = format!("{}/answer.txt", self.workspace);
+            if let Ok(answer) = vm_attempt.read_file(answer_path).await {
+                fs::write(attempt.workspace().join("answer.txt"), answer)?;
+            }
+            let reward = String::from_utf8_lossy(&reward_bytes)
+                .trim()
+                .parse::<f64>()?;
+            task.validate_package()?;
+            Ok::<_, VmAttemptError>((output, stdout, stderr, reward))
+        }
+        .await;
+
+        let (output, stdout, stderr, reward) = match verification {
+            Ok(verification) => verification,
+            Err(primary) => {
+                let cleanup = self.finish(AttemptRetention::Retain).await;
+                return Err(AttemptVerificationFailure::new(primary, cleanup));
+            }
+        };
+        let retention = if reward > 0.0 && !self.retain_passed_rootfs {
+            AttemptRetention::Discard
+        } else {
+            AttemptRetention::Retain
+        };
+        let cleanup = self.finish(retention).await;
+        Ok(AttemptVerification {
+            result: VerifierResult {
+                exit_code: output.exit_code,
+                rewards: BTreeMap::from([("reward".to_owned(), reward)]),
+            },
+            stdout,
+            stderr,
+            cleanup,
+        })
+    }
+
+    async fn finish(&mut self, retention: AttemptRetention) -> CleanupPhase {
+        let Some(attempt) = self.attempt.take() else {
+            return CleanupPhase::not_required();
+        };
+        let started_at = Utc::now();
+        match attempt.finish(retention).await {
+            Ok(()) => CleanupPhase::completed(started_at),
+            Err(error) => CleanupPhase::failed(started_at, &error),
+        }
+    }
+
+    async fn execute_verifier_command(
+        attempt: &TaskVmAttempt,
+        command: VmCommand,
+    ) -> Result<(VmCommandOutput, bool), VmAttemptError> {
+        match attempt.command(command).await {
+            Ok(output) => Ok((output, false)),
+            Err(TaskVmError::Session(VmToolSessionError::GuestTimeout { timeout, output })) => {
+                Ok((verifier_timeout_output(timeout, output), true))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn copy_directory<'a>(
+        attempt: &'a TaskVmAttempt,
+        root: &'a Path,
+        directory: &'a Path,
+        destination: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<(), VmAttemptError>> + Send + 'a>> {
+        Box::pin(async move {
+            let relative = directory.strip_prefix(root).map_err(io::Error::other)?;
+            let guest_directory = destination.join(relative).to_string_lossy().into_owned();
+            let directory_mode =
+                std::os::unix::fs::PermissionsExt::mode(&fs::metadata(directory)?.permissions())
+                    & 0o7777;
+            attempt
+                .create_directory(&guest_directory, 0o700, None)
+                .await?;
+            for entry in fs::read_dir(directory)? {
+                let entry = entry?;
+                let path = entry.path();
+                let relative = path.strip_prefix(root).map_err(io::Error::other)?;
+                let guest = destination.join(relative).to_string_lossy().into_owned();
+                let file_type = entry.file_type()?;
+                if file_type.is_dir() {
+                    Self::copy_directory(attempt, root, &path, destination).await?;
+                } else if file_type.is_file() {
+                    let mode =
+                        std::os::unix::fs::PermissionsExt::mode(&entry.metadata()?.permissions())
+                            & 0o7777;
+                    attempt
+                        .write_file_with_mtime(guest, fs::read(path)?, mode, 0)
+                        .await?;
+                } else {
+                    return Err(VmAttemptError::Collision(path));
+                }
+            }
+            attempt
+                .create_directory(&guest_directory, directory_mode, Some(0))
+                .await?;
+            Ok(())
+        })
+    }
 }
 
 impl AttemptVerifier for VmVerifier {
@@ -4905,26 +5298,40 @@ fn format_milliseconds(milliseconds: i64) -> String {
 mod tests {
     use std::{
         cell::Cell,
+        collections::BTreeMap,
         fs, future,
         path::{Path, PathBuf},
         process::Command as StdCommand,
+        sync::{
+            Arc, OnceLock,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::Duration,
     };
 
     use clap::Parser;
+    use futures_util::{SinkExt, StreamExt};
     use nanocodex::{Nanocodex, OpenAi, Thinking};
-    use nanocodex_eval::{BillingCompleteness, Evaluator, Sweep, Task};
-    use nanocodex_vm::{VmCommandOutput, VmCommandPartialOutput, VmToolSession};
+    use nanocodex_eval::harbor::Harbor;
+    use nanocodex_eval::{
+        AttemptAgent, BillingCompleteness, EvalEnvironment, EvalFailureKind, EvalOutcome,
+        Evaluator, Sweep, Task,
+    };
+    use nanocodex_vm::{GuestRuntimeDisk, VmCommandOutput, VmCommandPartialOutput, VmToolSession};
+    use serde_json::{Value, json};
     use sha2::Digest as _;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
 
     use super::{
         CACHED_VERIFIER_SCRIPT, DEFAULT_HOST_UTILIZATION_PERCENT, DEFAULT_TRIALS,
         EvalInterruptError, HostResources, InterruptListener, RetainedBuild, RetainedScheduling,
-        Run, RunInvocation, RunMeasurements, RunSummary, VmRetention, VmVerifier,
-        cached_verifier_script, finish_or_drain, finish_or_interrupt, load_tasks,
-        recognized_verifier_setup, remove_passed_rootfs, retained_retry_task_names,
-        retained_task_durations, verifier_bootstrap_network_failed, verifier_cache_key,
-        verifier_network_retry_delay, verifier_shell, verifier_timeout_output,
+        Run, RunInvocation, RunMeasurements, RunSummary, VmEnvironment, VmRetention,
+        VmRunResources, VmTaskEnvironmentFactory, VmVerifier, cached_verifier_script,
+        finish_or_drain, finish_or_interrupt, load_tasks, recognized_verifier_setup,
+        remove_passed_rootfs, retained_retry_task_names, retained_task_durations,
+        verifier_bootstrap_network_failed, verifier_cache_key, verifier_network_retry_delay,
+        verifier_shell, verifier_timeout_output,
     };
 
     #[derive(Parser)]
@@ -5605,6 +6012,14 @@ mod tests {
         let mut changed_guest = retained.clone();
         changed_guest.guest_runtime.as_mut().unwrap().binary_sha256 = "different".to_owned();
         assert!(!retained.same_workload(&changed_guest));
+
+        let mut old_scheduler = retained.clone();
+        old_scheduler.scheduling.policy = "bounded_unordered-v1".to_owned();
+        assert!(!retained.same_workload(&old_scheduler));
+
+        let mut old_invocation_schema = retained.clone();
+        old_invocation_schema.version = super::INVOCATION_VERSION - 1;
+        assert!(!retained.same_workload(&old_invocation_schema));
     }
 
     #[test]
@@ -6014,6 +6429,265 @@ source $HOME/.local/bin/env
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unsupported_vm_tasks_use_the_existing_per_attempt_adapter() {
+        let public_root = tempfile::tempdir().unwrap();
+        let separate_root = tempfile::tempdir().unwrap();
+        let cached_root = tempfile::tempdir().unwrap();
+        let public = write_routing_task(
+            public_root.path(),
+            "terminal-bench/public-routing",
+            true,
+            "same",
+            "#!/bin/sh\nprintf '1\\n' > /logs/verifier/reward.txt\n",
+        );
+        let separate = write_routing_task(
+            separate_root.path(),
+            "terminal-bench/separate-routing",
+            false,
+            "separate",
+            "#!/bin/sh\nprintf '1\\n' > /logs/verifier/reward.txt\n",
+        );
+        let cached = write_routing_task(
+            cached_root.path(),
+            "terminal-bench/canonical-cache-routing",
+            false,
+            "same",
+            r#"#!/bin/bash
+apt-get update
+apt-get install -y curl
+curl -LsSf https://astral.sh/uv/0.9.5/install.sh | sh
+source $HOME/.local/bin/env
+# Check if we're in a valid working directory
+printf '1\n' > /logs/verifier/reward.txt
+"#,
+        );
+
+        let files = tempfile::tempdir().unwrap();
+        let rootfs = files.path().join("rootfs.ext4");
+        let runtime_image = files.path().join("runtime.ext4");
+        let vmm = files.path().join("vmm");
+        for path in [&rootfs, &runtime_image, &vmm] {
+            fs::write(path, b"routing sentinel").unwrap();
+        }
+        let environments = [&public, &separate, &cached]
+            .into_iter()
+            .map(|task| {
+                (
+                    task.root().to_path_buf(),
+                    VmEnvironment {
+                        rootfs: rootfs.clone(),
+                        workspace: "/workspace".to_owned(),
+                        environment: BTreeMap::new(),
+                        shell: "/bin/sh".to_owned(),
+                        verifier: None,
+                    },
+                )
+            })
+            .collect();
+        let resources = Arc::new(OnceLock::new());
+        assert!(
+            resources
+                .set(VmRunResources {
+                    environments,
+                    runtime_image,
+                    vmm,
+                    gvproxy: None,
+                    retain_passed_rootfs: false,
+                    web_search: false,
+                })
+                .is_ok()
+        );
+
+        let fallback_attempts = Arc::new(AtomicUsize::new(0));
+        let fallback_probe = Arc::clone(&fallback_attempts);
+        let output = tempfile::tempdir().unwrap();
+        let (evaluator, _) = Evaluator::builder(Nanocodex::builder(OpenAi::new("test").unwrap()))
+            .output_directory(output.path())
+            .max_concurrency(3)
+            .attempt_environment(EvalEnvironment::MicroVm)
+            .task_environment(VmTaskEnvironmentFactory {
+                resources: Arc::clone(&resources),
+            })
+            .attempt_agent(move |_attempt, builder| {
+                fallback_probe.fetch_add(1, Ordering::AcqRel);
+                Ok::<_, std::io::Error>(AttemptAgent::new(builder).ready(async {
+                    Err::<(), _>(std::io::Error::other(
+                        "per-attempt routing probe stopped before model execution",
+                    ))
+                }))
+            })
+            .build()
+            .unwrap();
+
+        let outcomes = evaluator
+            .tasks(vec![public, separate, cached])
+            .await
+            .unwrap();
+
+        assert_eq!(fallback_attempts.load(Ordering::Acquire), 3);
+        assert_eq!(outcomes.len(), 3);
+        assert!(outcomes.iter().all(|outcome| {
+            outcome.unscored().is_some_and(|failure| {
+                failure.kind == EvalFailureKind::Environment
+                    && failure.outcome == EvalOutcome::InfrastructureError
+                    && failure.environment == EvalEnvironment::MicroVm
+                    && failure
+                        .message
+                        .contains("per-attempt routing probe stopped")
+            })
+        }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn live_task_vm_adapter_runs_a_counterbalanced_sweep_and_retains_harbor_evidence() {
+        let Some(vmm) = std::env::var_os("NANOCODEX_EVAL_TASK_VM_VMM").map(PathBuf::from) else {
+            eprintln!("live eval TaskVm adapter test skipped; NANOCODEX_EVAL_TASK_VM_VMM is unset");
+            return;
+        };
+        let Some(rootfs) = std::env::var_os("NANOCODEX_VM_ROOTFS").map(PathBuf::from) else {
+            eprintln!("live eval TaskVm adapter test skipped; NANOCODEX_VM_ROOTFS is unset");
+            return;
+        };
+        let Some(runtime_binary) = std::env::var_os("NANOCODEX_VM_RUNTIME").map(PathBuf::from)
+        else {
+            eprintln!("live eval TaskVm adapter test skipped; NANOCODEX_VM_RUNTIME is unset");
+            return;
+        };
+
+        let task_root = tempfile::tempdir().unwrap();
+        let task = write_routing_task(
+            task_root.path(),
+            "terminal-bench/live-task-vm-adapter",
+            false,
+            "same",
+            r#"#!/bin/sh
+set -eu
+mkdir -p /logs/verifier
+if test -e /workspace/previous-attempt; then
+    printf '0\n' > /logs/verifier/reward.txt
+    exit 1
+fi
+printf 'fresh\n' > /workspace/previous-attempt
+printf '1\n' > /logs/verifier/reward.txt
+"#,
+        );
+        let runtime_cache = tempfile::tempdir().unwrap();
+        let runtime = GuestRuntimeDisk::prepare(&runtime_binary, runtime_cache.path()).unwrap();
+        let resources = Arc::new(OnceLock::new());
+        assert!(
+            resources
+                .set(VmRunResources {
+                    environments: BTreeMap::from([(
+                        task.root().to_path_buf(),
+                        VmEnvironment {
+                            rootfs,
+                            workspace: "/workspace".to_owned(),
+                            environment: BTreeMap::new(),
+                            shell: "/bin/sh".to_owned(),
+                            verifier: None,
+                        },
+                    )]),
+                    runtime_image: runtime.path().to_path_buf(),
+                    vmm,
+                    gvproxy: None,
+                    retain_passed_rootfs: false,
+                    web_search: false,
+                })
+                .is_ok()
+        );
+
+        let (endpoint, model_server) = spawn_success_model().await;
+        let openai = OpenAi::builder("live-task-vm-adapter")
+            .websocket_url(endpoint)
+            .build()
+            .unwrap();
+        let agent = Nanocodex::builder(openai);
+        let sweep = Sweep::builder()
+            .task(task)
+            .trials(2)
+            .agent("a", agent.clone())
+            .unwrap()
+            .agent("b", agent.clone())
+            .unwrap()
+            .build()
+            .unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let (evaluator, events) = Evaluator::builder(agent)
+            .output_directory(output.path())
+            .fresh_run(&sweep)
+            .max_concurrency(4)
+            .attempt_environment(EvalEnvironment::MicroVm)
+            .task_environment(VmTaskEnvironmentFactory { resources })
+            .build()
+            .unwrap();
+        let recorder = Harbor::new(&evaluator)
+            .unwrap()
+            .record(events.subscribe())
+            .unwrap();
+
+        let results = evaluator.sweep(sweep).await.unwrap();
+
+        assert_eq!(results.attempts().len(), 4);
+        assert!(results.attempts().iter().all(|attempt| {
+            attempt
+                .result()
+                .is_some_and(|result| result.outcome == EvalOutcome::Passed)
+        }));
+        assert_eq!(
+            results
+                .attempts()
+                .iter()
+                .map(|attempt| attempt.result().unwrap().schedule_ordinal)
+                .collect::<Vec<_>>(),
+            [1, 2, 4, 3]
+        );
+        assert_eq!(
+            results
+                .attempts()
+                .iter()
+                .filter(|attempt| {
+                    attempt
+                        .result()
+                        .unwrap()
+                        .timing
+                        .task_environment_boot
+                        .is_some()
+                })
+                .count(),
+            1
+        );
+        let supervisor_disks =
+            find_files_named(evaluator.directory(), "supervisor-0000.ext4").unwrap();
+        assert_eq!(supervisor_disks.len(), 1);
+        assert!(
+            find_files_named(evaluator.directory(), "supervisor-0001.ext4")
+                .unwrap()
+                .is_empty(),
+            "the healthy grouped sweep unexpectedly recycled its task VM"
+        );
+
+        let job = recorder
+            .finish(results.clone().into_outcomes())
+            .await
+            .unwrap();
+        let retained_results = find_files_named(job.directory(), "result.json")
+            .unwrap()
+            .into_iter()
+            .map(|path| serde_json::from_slice::<Value>(&fs::read(path).unwrap()).unwrap())
+            .filter(|result| result["verifier_result"].is_object())
+            .collect::<Vec<_>>();
+        assert_eq!(retained_results.len(), 4);
+        for result in retained_results {
+            assert_eq!(result["verifier_result"]["rewards"]["reward"], 1.0);
+            assert_eq!(
+                result["config"]["environment"]["kwargs"]["backend"],
+                "microvm"
+            );
+        }
+        model_server.abort();
+    }
+
     #[test]
     fn retries_only_dependency_bootstrap_network_failures() {
         let dns_failure = VmCommandOutput {
@@ -6179,6 +6853,88 @@ done
         bytes
     }
 
+    async fn spawn_success_model() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let next_response = Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let next_response = Arc::clone(&next_response);
+                tokio::spawn(async move {
+                    let mut socket = accept_async(stream).await.unwrap();
+                    while let Some(message) = socket.next().await {
+                        let Ok(message) = message else {
+                            break;
+                        };
+                        let Message::Text(request) = message else {
+                            continue;
+                        };
+                        let request: Value = serde_json::from_str(&request).unwrap();
+                        let id = next_response.fetch_add(1, Ordering::AcqRel);
+                        let response = if request["generate"] == false {
+                            json!({
+                                "type": "response.completed",
+                                "response": {
+                                    "id": format!("resp-warmup-{id}"),
+                                    "usage": null
+                                }
+                            })
+                        } else {
+                            json!({
+                                "type": "response.completed",
+                                "response": {
+                                    "id": format!("resp-generation-{id}"),
+                                    "status": "completed",
+                                    "output": [{
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "content": [{
+                                            "type": "output_text",
+                                            "text": "done"
+                                        }]
+                                    }],
+                                    "usage": {
+                                        "input_tokens": 1,
+                                        "input_tokens_details": { "cached_tokens": 0 },
+                                        "output_tokens": 1,
+                                        "output_tokens_details": { "reasoning_tokens": 0 },
+                                        "total_tokens": 2
+                                    }
+                                }
+                            })
+                        };
+                        if socket
+                            .send(Message::Text(response.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        (endpoint, server)
+    }
+
+    fn find_files_named(root: &Path, name: &str) -> std::io::Result<Vec<PathBuf>> {
+        let mut found = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(directory)? {
+                let entry = entry?;
+                let file_type = entry.file_type()?;
+                if file_type.is_dir() {
+                    pending.push(entry.path());
+                } else if file_type.is_file() && entry.file_name() == name {
+                    found.push(entry.path());
+                }
+            }
+        }
+        Ok(found)
+    }
+
     fn write_test_task(root: &Path) -> Task {
         fs::create_dir_all(root.join("environment")).unwrap();
         fs::create_dir_all(root.join("tests")).unwrap();
@@ -6203,6 +6959,45 @@ storage_mb = 128
 gpus = 0
 allow_internet = false
 "#,
+        )
+        .unwrap();
+        Task::load(root).unwrap()
+    }
+
+    fn write_routing_task(
+        root: &Path,
+        name: &str,
+        allow_internet: bool,
+        verifier_environment: &str,
+        verifier: &str,
+    ) -> Task {
+        fs::create_dir_all(root.join("environment")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(root.join("instruction.md"), "Complete the routing probe.\n").unwrap();
+        fs::write(root.join("tests/test.sh"), verifier).unwrap();
+        fs::write(root.join("tests/Dockerfile"), "FROM scratch\n").unwrap();
+        fs::write(
+            root.join("task.toml"),
+            format!(
+                r#"
+schema_version = "1.1"
+[task]
+name = "{name}"
+description = "VM adapter routing fixture"
+[agent]
+timeout_sec = 1.0
+[verifier]
+timeout_sec = 1.0
+environment_mode = "{verifier_environment}"
+[environment]
+docker_image = "alpine:3.21"
+cpus = 1
+memory_mb = 128
+storage_mb = 128
+gpus = 0
+allow_internet = {allow_internet}
+"#
+            ),
         )
         .unwrap();
         Task::load(root).unwrap()

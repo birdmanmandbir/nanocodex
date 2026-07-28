@@ -22,6 +22,8 @@ pub struct AttemptFact {
     pub configuration: String,
     /// One-based repetition number.
     pub repetition: u16,
+    /// One-based deterministic execution position within this task's sweep.
+    pub schedule_ordinal: u64,
     /// Semantic attempt outcome.
     pub outcome: EvalOutcome,
     /// Whether this row contributes to score denominators.
@@ -43,8 +45,14 @@ pub struct AttemptFact {
 /// Plot-relevant latency phases in nanoseconds.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct LatencyBreakdown {
-    /// Time waiting for scheduler admission.
+    /// One-time task-group scheduler admission, attributed to its first
+    /// executed coordinate.
+    pub task_environment_admission_ns: u64,
+    /// Coordinate wait after task-environment boot.
     pub queue_wait_ns: u64,
+    /// One-time retained task-environment factory boot, attributed to its first
+    /// executed coordinate.
+    pub task_environment_boot_ns: u64,
     /// Cold image resolution and construction attributed to this attempt.
     pub cold_image_ns: u64,
     /// Disposable environment materialization.
@@ -69,6 +77,8 @@ pub struct LatencyBreakdown {
     pub cleanup_ns: u64,
     /// Sum of disjoint measured phases.
     pub total_ns: u64,
+    /// End-to-end wall time containing every attributed phase.
+    pub observed_wall_ns: u64,
 }
 
 /// Paths that connect one plot point back to exact evidence.
@@ -221,6 +231,7 @@ impl AttemptFact {
             task_name: result.task_name.clone(),
             configuration: configuration.to_owned(),
             repetition,
+            schedule_ordinal: result.schedule_ordinal,
             outcome: result.outcome,
             scored: result.outcome.is_scored(),
             passed: result.outcome.is_passed(),
@@ -228,10 +239,22 @@ impl AttemptFact {
             cost_usd: result.agent.cost_usd,
             billing_completeness: Some(result.agent.billing_completeness),
             latency: LatencyBreakdown {
+                task_environment_admission_ns: result
+                    .timing
+                    .task_environment_boot
+                    .as_ref()
+                    .map_or(0, |boot| {
+                        duration(result.timing.started_at, boot.started_at)
+                    }),
                 queue_wait_ns: duration(
                     result.timing.queue_wait.started_at,
                     result.timing.queue_wait.finished_at,
                 ),
+                task_environment_boot_ns: result
+                    .timing
+                    .task_environment_boot
+                    .as_ref()
+                    .map_or(0, |timing| duration(timing.started_at, timing.finished_at)),
                 environment_setup_ns: duration(
                     result.timing.environment_setup.started_at,
                     result.timing.environment_setup.finished_at,
@@ -241,10 +264,15 @@ impl AttemptFact {
                     result.timing.environment_readiness.finished_at,
                 ),
                 vm_bootstrap_ns: if result.environment == crate::EvalEnvironment::MicroVm {
-                    duration(
-                        result.timing.environment_readiness.started_at,
-                        result.timing.environment_readiness.finished_at,
-                    )
+                    result
+                        .timing
+                        .task_environment_boot
+                        .as_ref()
+                        .map_or(0, |timing| duration(timing.started_at, timing.finished_at))
+                        .saturating_add(duration(
+                            result.timing.environment_readiness.started_at,
+                            result.timing.environment_readiness.finished_at,
+                        ))
                 } else {
                     0
                 },
@@ -268,6 +296,7 @@ impl AttemptFact {
                     .filter_map(|cleanup| cleanup.timing.as_ref())
                     .map(|timing| duration(timing.started_at, timing.finished_at))
                     .sum(),
+                observed_wall_ns: duration(result.timing.started_at, result.timing.finished_at),
                 ..LatencyBreakdown::default()
             },
             artifacts: AttemptFactArtifacts {
@@ -282,17 +311,19 @@ impl AttemptFact {
     /// Builds a plot fact from one typed unscored terminal failure.
     #[must_use]
     pub fn from_failure(configuration: &str, repetition: u16, failure: &EvalFailure) -> Self {
+        let duration_between = |started: DateTime<Utc>, finished: DateTime<Utc>| {
+            u64::try_from(
+                finished
+                    .signed_duration_since(started)
+                    .num_nanoseconds()
+                    .unwrap_or_default()
+                    .max(0),
+            )
+            .unwrap_or(u64::MAX)
+        };
         let duration = |timing: Option<&crate::PhaseTiming>| {
             timing.map_or(0, |timing| {
-                u64::try_from(
-                    timing
-                        .finished_at
-                        .signed_duration_since(timing.started_at)
-                        .num_nanoseconds()
-                        .unwrap_or_default()
-                        .max(0),
-                )
-                .unwrap_or(u64::MAX)
+                duration_between(timing.started_at, timing.finished_at)
             })
         };
         let agent = failure.agent.as_ref();
@@ -301,6 +332,7 @@ impl AttemptFact {
             task_name: failure.task_name.clone(),
             configuration: configuration.to_owned(),
             repetition,
+            schedule_ordinal: failure.schedule_ordinal,
             outcome: failure.outcome,
             scored: false,
             passed: false,
@@ -308,11 +340,20 @@ impl AttemptFact {
             cost_usd: agent.and_then(|agent| agent.cost_usd),
             billing_completeness: agent.map(|agent| agent.billing_completeness),
             latency: LatencyBreakdown {
+                task_environment_admission_ns: failure
+                    .timing
+                    .task_environment_boot
+                    .as_ref()
+                    .map_or(0, |boot| {
+                        duration_between(failure.started_at, boot.started_at)
+                    }),
                 queue_wait_ns: duration(Some(&failure.timing.queue_wait)),
+                task_environment_boot_ns: duration(failure.timing.task_environment_boot.as_ref()),
                 environment_setup_ns: duration(failure.timing.environment_setup.as_ref()),
                 environment_readiness_ns: duration(failure.timing.environment_readiness.as_ref()),
                 vm_bootstrap_ns: if failure.environment == crate::EvalEnvironment::MicroVm {
-                    duration(failure.timing.environment_readiness.as_ref())
+                    duration(failure.timing.task_environment_boot.as_ref())
+                        .saturating_add(duration(failure.timing.environment_readiness.as_ref()))
                 } else {
                     0
                 },
@@ -327,6 +368,7 @@ impl AttemptFact {
                     .filter_map(|cleanup| cleanup.timing.as_ref())
                     .map(|timing| duration(Some(timing)))
                     .sum(),
+                observed_wall_ns: duration_between(failure.started_at, failure.occurred_at),
                 ..LatencyBreakdown::default()
             },
             artifacts: AttemptFactArtifacts {
@@ -341,7 +383,9 @@ impl AttemptFact {
     const fn with_total(mut self) -> Self {
         let latency = &self.latency;
         self.latency.total_ns = latency
-            .queue_wait_ns
+            .task_environment_admission_ns
+            .saturating_add(latency.queue_wait_ns)
+            .saturating_add(latency.task_environment_boot_ns)
             .saturating_add(latency.cold_image_ns)
             .saturating_add(latency.environment_setup_ns)
             .saturating_add(latency.environment_readiness_ns)
@@ -369,7 +413,7 @@ impl AggregateDataset {
             .map(|(configuration, attempts)| ConfigurationAggregate::new(configuration, &attempts))
             .collect();
         Self {
-            schema_version: 3,
+            schema_version: 4,
             attempts,
             run_timing: None,
             configurations,
@@ -564,6 +608,7 @@ mod tests {
             task_name: task.to_owned(),
             configuration: configuration.to_owned(),
             repetition,
+            schedule_ordinal: u64::from(repetition),
             outcome: if passed {
                 EvalOutcome::Passed
             } else {

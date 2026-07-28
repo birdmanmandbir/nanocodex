@@ -52,6 +52,8 @@ pub mod image;
 mod krun;
 #[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
 mod process;
+#[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
+mod task;
 pub mod tools;
 #[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
 mod workspace;
@@ -73,12 +75,18 @@ pub use krun::{KrunVm, KrunVmControl, VmError};
 #[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
 pub use process::{PrivateVmProcessConfig, VmProcessConfig, VmProcessError};
 #[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
+pub use task::{AttemptRetention, TaskVm, TaskVmAttempt, TaskVmBuilder, TaskVmError};
+#[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
 pub use tools::{
     GuestRuntimeDisk, GuestRuntimeDiskError, GuestRuntimeDiskStatus, VmCommand, VmCommandOutput,
     VmCommandPartialOutput, VmTool, VmToolClient, VmToolSession, VmToolSessionError,
     VmToolSessionHandle, VmTools,
 };
-#[cfg(feature = "guest-runtime")]
+#[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+pub use tools::{
+    VmGuestError, run_task_attempt_child, run_task_attempt_helper, serve_guest, serve_task_guest,
+};
+#[cfg(all(feature = "guest-runtime", not(target_os = "linux")))]
 pub use tools::{VmGuestError, serve_guest};
 #[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
 pub use workspace::{VmWorkspace, VmWorkspaceBuilder, VmWorkspaceError};

@@ -204,6 +204,8 @@ pub struct EvalFailure {
     pub task_name: String,
     /// Filesystem-safe unique trial name.
     pub trial_name: String,
+    /// One-based deterministic execution position within this task's sweep.
+    pub schedule_ordinal: u64,
     /// Stable failure classification.
     pub kind: EvalFailureKind,
     /// Stable semantic outcome used by retry and aggregate policy.
@@ -259,6 +261,8 @@ pub struct EvalResult {
     pub task_name: String,
     /// Filesystem-safe unique trial name.
     pub trial_name: String,
+    /// One-based deterministic execution position within this task's sweep.
+    pub schedule_ordinal: u64,
     /// Verifier-derived pass/fail classification.
     pub status: EvalStatus,
     /// Stable semantic outcome used by aggregate policy.
@@ -599,6 +603,9 @@ pub struct EvalTiming {
     pub finished_at: DateTime<Utc>,
     /// Interval spent waiting for scheduler admission.
     pub queue_wait: PhaseTiming,
+    /// One-time task environment boot interval, retained on its first executed
+    /// coordinate.
+    pub task_environment_boot: Option<PhaseTiming>,
     /// Disposable environment preparation interval.
     pub environment_setup: PhaseTiming,
     /// Attempt backend readiness interval, including VM boot and guest handshake.
@@ -616,6 +623,9 @@ pub struct EvalTiming {
 pub struct EvalFailureTiming {
     /// Time waiting for scheduler admission, from queued to admitted.
     pub queue_wait: PhaseTiming,
+    /// One-time task environment boot interval, when attributed to this
+    /// coordinate.
+    pub task_environment_boot: Option<PhaseTiming>,
     /// Disposable environment preparation interval, when it completed.
     pub environment_setup: Option<PhaseTiming>,
     /// Backend readiness interval, when it completed.

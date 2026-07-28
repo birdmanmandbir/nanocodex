@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     error::Error,
     ffi::OsString,
     fmt, fs,
@@ -14,6 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
 use nanocodex_agent::{
@@ -61,6 +63,7 @@ pub struct EvaluatorBuilder {
     max_memory_mb: Option<u64>,
     attempt_environment: EvalEnvironment,
     attempt_agent: Option<AttemptAgentFactory>,
+    task_environment: Option<Arc<dyn TaskEnvironmentFactory>>,
     finite_run: Option<FiniteRun>,
 }
 
@@ -75,6 +78,7 @@ struct EvaluatorInner {
     next_prompt_cache_attempt: AtomicU64,
     events: broadcast::Sender<Arc<EvalEvent>>,
     attempt_agent: Option<AttemptAgentFactory>,
+    task_environment: Option<Arc<dyn TaskEnvironmentFactory>>,
 }
 
 struct AdmissionController {
@@ -128,6 +132,46 @@ pub struct AttemptAgent {
     nanocodex: NanocodexBuilder,
     readiness: Option<AttemptReadinessFuture>,
     verifier: Option<Box<dyn AttemptVerifier>>,
+}
+
+/// Boxed error returned by a task-scoped environment adapter.
+pub type TaskEnvironmentError = Box<dyn Error + Send + Sync + 'static>;
+
+/// Creates one retained execution environment for all eligible coordinates of
+/// an immutable task.
+///
+/// Eligibility is explicit so mixed sweeps can preserve their existing
+/// per-attempt backend for unsupported task modes.
+#[async_trait]
+pub trait TaskEnvironmentFactory: Send + Sync {
+    /// Returns whether this factory can safely execute `task`.
+    fn supports(&self, task: &Task) -> bool;
+
+    /// Boots one environment after the task receives scheduler admission.
+    async fn create(
+        &self,
+        task: EvalTask<'_>,
+    ) -> Result<Box<dyn TaskEnvironment>, TaskEnvironmentError>;
+}
+
+/// A retained task environment that produces fresh, sequential attempt
+/// sandboxes.
+#[async_trait]
+pub trait TaskEnvironment: Send {
+    /// Configures one fresh attempt inside this task environment.
+    async fn attempt(
+        &mut self,
+        attempt: EvalAttempt<'_>,
+        nanocodex: NanocodexBuilder,
+    ) -> Result<AttemptAgent, TaskEnvironmentError>;
+
+    /// Returns the one-time environment boot interval, when measured.
+    fn boot_timing(&self) -> Option<PhaseTiming> {
+        None
+    }
+
+    /// Explicitly joins and tears down the retained task environment.
+    async fn shutdown(&mut self) -> Result<(), TaskEnvironmentError>;
 }
 
 /// A verifier that runs against the same retained environment as the agent.
@@ -192,12 +236,53 @@ struct AttemptInput {
     task: Task,
     nanocodex: NanocodexBuilder,
     coordinate: Option<SweepCoordinate>,
+    task_order: usize,
+    schedule_rank: usize,
+    schedule_ordinal: u64,
     queued_at: DateTime<Utc>,
+}
+
+struct IndexedAttempt {
+    index: usize,
+    input: AttemptInput,
+}
+
+enum WorkItem {
+    Attempt(IndexedAttempt),
+    Task(TaskWork),
+}
+
+struct TaskWork {
+    task: Task,
+    task_order: usize,
+    attempts: Vec<IndexedAttempt>,
+}
+
+enum AttemptBackend<'a> {
+    PerAttempt,
+    Task(&'a mut dyn TaskEnvironment),
+    Unavailable(Arc<str>),
+}
+
+impl AttemptBackend<'_> {
+    const fn is_custom(&self) -> bool {
+        !matches!(self, Self::PerAttempt)
+    }
 }
 
 struct AttemptOutput {
     outcome: EvalAttemptOutcome,
     coordinate: Option<SweepCoordinate>,
+}
+
+#[derive(Clone)]
+struct AttemptRunContext {
+    attempt_id: Uuid,
+    trial_name: String,
+    observed_started_at: DateTime<Utc>,
+    queue_wait: PhaseTiming,
+    schedule_ordinal: u64,
+    task_environment_boot: Option<PhaseTiming>,
 }
 
 #[derive(Clone)]
@@ -212,6 +297,14 @@ pub struct EvalAttempt<'a> {
     task: &'a Task,
     directory: &'a Path,
     workspace: &'a Path,
+}
+
+/// Immutable metadata and retained paths available while booting one
+/// task-scoped environment.
+#[derive(Clone, Copy)]
+pub struct EvalTask<'a> {
+    task: &'a Task,
+    directory: &'a Path,
 }
 
 /// Failure to configure, execute, verify, or durably retain an attempt.
@@ -266,6 +359,18 @@ pub enum EvalError {
     /// The attempt backend factory failed.
     #[error("failed to configure attempt agent: {0}")]
     AttemptAgent(#[source] AttemptError),
+
+    /// A task-scoped environment was unavailable for this coordinate.
+    #[error("task environment is unavailable: {0}")]
+    TaskEnvironmentUnavailable(Arc<str>),
+
+    /// A task-scoped environment could not be shut down cleanly.
+    #[error("failed to shut down task environment: {0}")]
+    TaskEnvironmentShutdown(#[source] TaskEnvironmentError),
+
+    /// A private scheduler invariant was violated.
+    #[error("evaluation scheduler invariant failed: {0}")]
+    SchedulerInvariant(&'static str),
 
     /// An attempt-owned verifier failed.
     #[error("attempt verifier failed: {0}")]
@@ -336,6 +441,7 @@ impl Evaluator {
             max_memory_mb: None,
             attempt_environment: EvalEnvironment::Native,
             attempt_agent: None,
+            task_environment: None,
             finite_run: None,
         }
     }
@@ -348,21 +454,21 @@ impl Evaluator {
     /// Accepted setup, agent, and verifier failures are returned as typed
     /// [`EvalAttemptOutcome::Unscored`] values.
     pub async fn task(&self, task: Task) -> Result<EvalAttemptOutcome, EvalError> {
-        let queued_at = Utc::now();
-        let _permit = self
-            .inner
-            .admission
-            .acquire(task.resources().memory_mb)
-            .await
-            .ok_or(EvalError::Draining)?;
-        self.run_task(AttemptInput {
-            task,
-            nanocodex: self.inner.nanocodex.clone(),
-            coordinate: None,
-            queued_at,
-        })
-        .await
-        .map(|output| output.outcome)
+        let mut outputs = self
+            .run_tasks(vec![AttemptInput {
+                task,
+                nanocodex: self.inner.nanocodex.clone(),
+                coordinate: None,
+                task_order: 0,
+                schedule_rank: 0,
+                schedule_ordinal: 1,
+                queued_at: Utc::now(),
+            }])
+            .await?;
+        outputs
+            .pop()
+            .map(|output| output.outcome)
+            .ok_or(EvalError::Draining)
     }
 
     /// Runs `count` fresh attempts of the same immutable task.
@@ -388,15 +494,23 @@ impl Evaluator {
     /// Returns an operational error when the batch cannot be scheduled or
     /// retained. Attempt failures remain in their original positions.
     pub async fn tasks(&self, tasks: Vec<Task>) -> Result<Vec<EvalAttemptOutcome>, EvalError> {
-        let inputs = tasks
-            .into_iter()
-            .map(|task| AttemptInput {
+        let mut identities = HashMap::<PathBuf, (usize, u64)>::new();
+        let mut inputs = Vec::with_capacity(tasks.len());
+        for (index, task) in tasks.into_iter().enumerate() {
+            let identity = identities
+                .entry(task.root().to_path_buf())
+                .or_insert((index, 0));
+            identity.1 = identity.1.saturating_add(1);
+            inputs.push(AttemptInput {
                 task,
                 nanocodex: self.inner.nanocodex.clone(),
                 coordinate: None,
+                task_order: identity.0,
+                schedule_rank: usize::try_from(identity.1.saturating_sub(1)).unwrap_or(usize::MAX),
+                schedule_ordinal: identity.1,
                 queued_at: Utc::now(),
-            })
-            .collect();
+            });
+        }
         Ok(self
             .run_tasks(inputs)
             .await?
@@ -438,9 +552,41 @@ impl Evaluator {
         let manifest = sweep.manifest();
         self.inner.job.bind_run(&manifest)?;
         let completed = self.inner.job.completed_coordinates(&manifest)?;
+        let task_indices = sweep
+            .tasks()
+            .iter()
+            .enumerate()
+            .map(|(index, task)| (task.root().to_path_buf(), index))
+            .collect::<HashMap<_, _>>();
+        let agent_indices = sweep
+            .agents()
+            .enumerate()
+            .map(|(index, agent)| (agent.clone(), index))
+            .collect::<HashMap<_, _>>();
+        let agent_count = agent_indices.len();
+        if agent_count == 0 {
+            return Err(EvalError::SchedulerInvariant(
+                "finite sweep contained no agent configurations",
+            ));
+        }
         let mut skipped = 0;
         let mut inputs = Vec::new();
         for attempt in sweep.attempts() {
+            let task_order = task_indices.get(attempt.task().root()).copied().ok_or(
+                EvalError::SchedulerInvariant("sweep attempt referenced an unknown task"),
+            )?;
+            let agent_index = agent_indices.get(attempt.agent_id()).copied().ok_or(
+                EvalError::SchedulerInvariant(
+                    "sweep attempt referenced an unknown agent configuration",
+                ),
+            )?;
+            let trial_index = usize::from(attempt.trial().saturating_sub(1));
+            let offset = (task_order + trial_index) % agent_count;
+            let schedule_rank = (agent_index + agent_count - offset) % agent_count;
+            let schedule_ordinal = trial_index
+                .saturating_mul(agent_count)
+                .saturating_add(schedule_rank)
+                .saturating_add(1) as u64;
             if completed.contains(&attempt.coordinate()) {
                 skipped += 1;
                 continue;
@@ -452,6 +598,9 @@ impl Evaluator {
                     agent: attempt.agent_id().clone(),
                     trial: attempt.trial(),
                 }),
+                task_order,
+                schedule_rank,
+                schedule_ordinal,
                 queued_at: Utc::now(),
             });
         }
@@ -492,34 +641,200 @@ impl Evaluator {
     }
 
     async fn run_tasks(&self, tasks: Vec<AttemptInput>) -> Result<Vec<AttemptOutput>, EvalError> {
-        let scheduling_window = tasks
+        let mut work = Vec::<WorkItem>::new();
+        let mut task_groups = HashMap::<PathBuf, usize>::new();
+        for (index, input) in tasks.into_iter().enumerate() {
+            let grouped = self
+                .inner
+                .task_environment
+                .as_ref()
+                .is_some_and(|factory| factory.supports(&input.task));
+            if grouped {
+                if let Some(position) = task_groups.get(input.task.root()).copied() {
+                    match &mut work[position] {
+                        WorkItem::Task(group) => {
+                            group.attempts.push(IndexedAttempt { index, input });
+                        }
+                        WorkItem::Attempt(_) => {
+                            return Err(EvalError::SchedulerInvariant(
+                                "task group index addressed a standalone attempt",
+                            ));
+                        }
+                    }
+                } else {
+                    let position = work.len();
+                    task_groups.insert(input.task.root().to_path_buf(), position);
+                    work.push(WorkItem::Task(TaskWork {
+                        task: input.task.clone(),
+                        task_order: input.task_order,
+                        attempts: vec![IndexedAttempt { index, input }],
+                    }));
+                }
+            } else {
+                work.push(WorkItem::Attempt(IndexedAttempt { index, input }));
+            }
+        }
+        for item in &mut work {
+            if let WorkItem::Task(group) = item {
+                group.attempts.sort_by_key(|attempt| {
+                    (
+                        attempt
+                            .input
+                            .coordinate
+                            .as_ref()
+                            .map_or(0, |coordinate| coordinate.trial),
+                        attempt.input.schedule_rank,
+                        attempt.index,
+                    )
+                });
+            }
+        }
+
+        let scheduling_window = work
             .len()
             .min(self.inner.max_concurrency.saturating_mul(4))
             .max(1);
         let evaluator = self.clone();
-        let mut completed = stream::iter(tasks.into_iter().enumerate())
-            .map(move |(index, input)| {
+        let mut completed = stream::iter(work)
+            .map(move |item| {
                 let evaluator = evaluator.clone();
-                async move {
-                    let _permit = evaluator
-                        .inner
-                        .admission
-                        .acquire(input.task.resources().memory_mb)
-                        .await?;
-                    let result = evaluator.run_task(input).await;
-                    Some((index, result))
-                }
+                async move { evaluator.run_work_item(item).await }
             })
             .buffer_unordered(scheduling_window);
         let mut results = Vec::new();
         while let Some(output) = completed.next().await {
-            let Some((index, result)) = output else {
-                continue;
-            };
-            results.push((index, result?));
+            results.extend(output?);
         }
         results.sort_unstable_by_key(|(index, _)| *index);
         Ok(results.into_iter().map(|(_, result)| result).collect())
+    }
+
+    async fn run_work_item(
+        &self,
+        work: WorkItem,
+    ) -> Result<Vec<(usize, AttemptOutput)>, EvalError> {
+        match work {
+            WorkItem::Attempt(attempt) => {
+                let Some(_permit) = self
+                    .inner
+                    .admission
+                    .acquire(attempt.input.task.resources().memory_mb)
+                    .await
+                else {
+                    return Ok(Vec::new());
+                };
+                let output = self
+                    .run_task(attempt.input, AttemptBackend::PerAttempt, None, None)
+                    .await?;
+                Ok(vec![(attempt.index, output)])
+            }
+            WorkItem::Task(mut group) => {
+                let group_queued_at = group
+                    .attempts
+                    .iter()
+                    .map(|attempt| attempt.input.queued_at)
+                    .min()
+                    .ok_or(EvalError::SchedulerInvariant(
+                        "task group contained no attempts",
+                    ))?;
+                let Some(permit) = self
+                    .inner
+                    .admission
+                    .acquire(group.task.resources().memory_mb)
+                    .await
+                else {
+                    return Ok(Vec::new());
+                };
+                let factory = Arc::clone(self.inner.task_environment.as_ref().ok_or(
+                    EvalError::SchedulerInvariant("grouped work had no task environment factory"),
+                )?);
+                let boot_started_at = Utc::now();
+                let boot_directory = self
+                    .directory()
+                    .join("task-environments")
+                    .join(format!(
+                        "{:04}-{}",
+                        group.task_order,
+                        Uuid::now_v7().simple()
+                    ))
+                    .join("boot-0000");
+                let boot = match fs::create_dir_all(&boot_directory) {
+                    Ok(()) => factory
+                        .create(EvalTask {
+                            task: &group.task,
+                            directory: &boot_directory,
+                        })
+                        .await
+                        .map_err(|error| Arc::<str>::from(error.to_string())),
+                    Err(error) => Err(Arc::<str>::from(error.to_string())),
+                };
+                let boot_timing = PhaseTiming::finished(boot_started_at);
+                let coordinate_queued_at = boot_timing.finished_at;
+                let (mut environment, unavailable) = match boot {
+                    Ok(environment) => (Some(environment), None),
+                    Err(error) => (None, Some(error)),
+                };
+                let mut results = Vec::with_capacity(group.attempts.len());
+                let mut primary_error = None;
+                for (position, mut attempt) in group.attempts.drain(..).enumerate() {
+                    if position != 0 && !permit.admit_next() {
+                        break;
+                    }
+                    attempt.input.queued_at = coordinate_queued_at;
+                    let attributed_boot = (position == 0).then(|| boot_timing.clone());
+                    let observed_started_at = (position == 0).then_some(group_queued_at);
+                    let result = if let Some(error) = &unavailable {
+                        self.run_task(
+                            attempt.input,
+                            AttemptBackend::Unavailable(Arc::clone(error)),
+                            attributed_boot,
+                            observed_started_at,
+                        )
+                        .await
+                    } else {
+                        let Some(active) = environment.as_deref_mut() else {
+                            return Err(EvalError::SchedulerInvariant(
+                                "successful task environment creation retained no environment",
+                            ));
+                        };
+                        self.run_task(
+                            attempt.input,
+                            AttemptBackend::Task(active),
+                            attributed_boot,
+                            observed_started_at,
+                        )
+                        .await
+                    };
+                    match result {
+                        Ok(output) => results.push((attempt.index, output)),
+                        Err(error) => {
+                            primary_error = Some(error);
+                            break;
+                        }
+                    }
+                }
+                let shutdown = if let Some(environment) = environment.as_deref_mut() {
+                    environment
+                        .shutdown()
+                        .await
+                        .map_err(EvalError::TaskEnvironmentShutdown)
+                } else {
+                    Ok(())
+                };
+                if let Some(error) = primary_error {
+                    if let Err(shutdown_error) = shutdown {
+                        tracing::error!(
+                            error = %shutdown_error,
+                            primary_error = %error,
+                            "task environment shutdown also failed"
+                        );
+                    }
+                    return Err(error);
+                }
+                shutdown?;
+                Ok(results)
+            }
+        }
     }
 
     /// Returns the stable identifier shared by this evaluator's attempts.
@@ -586,11 +901,20 @@ impl Evaluator {
         self.inner.attempt_environment
     }
 
-    async fn run_task(&self, input: AttemptInput) -> Result<AttemptOutput, EvalError> {
+    async fn run_task(
+        &self,
+        input: AttemptInput,
+        backend: AttemptBackend<'_>,
+        task_environment_boot: Option<PhaseTiming>,
+        observed_started_at: Option<DateTime<Utc>>,
+    ) -> Result<AttemptOutput, EvalError> {
         let AttemptInput {
             task,
             nanocodex,
             coordinate,
+            task_order: _,
+            schedule_rank: _,
+            schedule_ordinal,
             queued_at,
         } = input;
         let session_id = SessionId::new();
@@ -606,37 +930,53 @@ impl Evaluator {
             started_at: queued_at,
             finished_at: admitted_at,
         };
-        let started_at = queued_at;
-        let mut emitter =
-            AttemptEmitter::new(self, session_id, prompt_cache_cohort, &task, &trial_name);
+        let context = AttemptRunContext {
+            attempt_id,
+            trial_name,
+            observed_started_at: observed_started_at.unwrap_or(queued_at),
+            queue_wait,
+            schedule_ordinal,
+            task_environment_boot,
+        };
+        let mut emitter = AttemptEmitter::new(
+            self,
+            session_id,
+            prompt_cache_cohort,
+            &task,
+            &context.trial_name,
+        );
         let span = attempt_span(
             self,
             &task,
             attempt_id,
-            &trial_name,
+            &context.trial_name,
             prompt_cache_cohort,
             coordinate.as_ref(),
         );
         record_content(&span, "task.prompt", task.prompt());
         let trace_started = Instant::now();
-        let result = self
-            .run_task_inner(
-                task.clone(),
-                nanocodex,
-                attempt_id,
-                trial_name.clone(),
-                queue_wait.clone(),
-                &mut emitter,
-            )
-            .instrument(span.clone())
-            .await;
+        let result = match backend {
+            AttemptBackend::Unavailable(error) => Err(AttemptRunFailure::new(
+                EvalError::TaskEnvironmentUnavailable(error),
+            )),
+            backend => {
+                self.run_task_inner(
+                    task.clone(),
+                    nanocodex,
+                    context.clone(),
+                    backend,
+                    &mut emitter,
+                )
+                .instrument(span.clone())
+                .await
+            }
+        };
         record_attempt_result(&span, trace_started, &result);
         let outcome = match result {
             Ok(result) => EvalAttemptOutcome::Scored(result),
             Err(failure) => {
-                let failure = attempt_failure(
-                    self, attempt_id, task, trial_name, started_at, queue_wait, &failure,
-                );
+                let failure =
+                    attempt_failure(self, task, context.observed_started_at, context, &failure);
                 emitter.emit(EvalEventKind::Failed(Box::new(failure.clone())));
                 EvalAttemptOutcome::Unscored(failure)
             }
@@ -651,9 +991,8 @@ impl Evaluator {
         &self,
         task: Task,
         nanocodex: NanocodexBuilder,
-        attempt_id: Uuid,
-        trial_name: String,
-        queue_wait: PhaseTiming,
+        context: AttemptRunContext,
+        backend: AttemptBackend<'_>,
         emitter: &mut AttemptEmitter<'_>,
     ) -> Result<EvalResult, AttemptRunFailure> {
         reject_output_overlap(self.inner.job.parent_directory(), task.root())
@@ -667,7 +1006,7 @@ impl Evaluator {
                 otel.kind = "internal",
                 otel.status_code = tracing::field::Empty,
                 eval.task.name = task.name(),
-                eval.trial.name = trial_name.as_str(),
+                eval.trial.name = context.trial_name.as_str(),
                 output.directory = %self.inner.job.directory().display(),
                 status = tracing::field::Empty,
                 error.message = tracing::field::Empty,
@@ -675,8 +1014,11 @@ impl Evaluator {
             );
             let trace_started = Instant::now();
             let result = span.in_scope(|| {
-                validate_attempt_environment(&task, self.inner.attempt_agent.is_some())?;
-                NativeAttempt::prepare(self.inner.job.directory(), &trial_name, &task)
+                validate_attempt_environment(
+                    &task,
+                    backend.is_custom() || self.inner.attempt_agent.is_some(),
+                )?;
+                NativeAttempt::prepare(self.inner.job.directory(), &context.trial_name, &task)
             });
             record_span_result(&span, trace_started, &result);
             result.map_err(AttemptRunFailure::new)?
@@ -686,7 +1028,7 @@ impl Evaluator {
             workspace: attempt.paths.workspace.clone(),
         });
         let mut agent = self
-            .execute_agent(emitter, &task, &attempt, nanocodex)
+            .execute_agent(emitter, &task, &attempt, nanocodex, backend)
             .await
             .map_err(|failure| AttemptRunFailure::from_agent(&attempt, failure))?;
 
@@ -727,9 +1069,10 @@ impl Evaluator {
 
         let status = verifier_status(&verifier.result);
         let result = EvalResult {
-            attempt_id,
+            attempt_id: context.attempt_id,
             task_name: task.name().to_owned(),
-            trial_name,
+            trial_name: context.trial_name,
+            schedule_ordinal: context.schedule_ordinal,
             status,
             outcome: match status {
                 EvalStatus::Passed => EvalOutcome::Passed,
@@ -739,9 +1082,10 @@ impl Evaluator {
             agent: agent.result,
             verifier: verifier.result,
             timing: EvalTiming {
-                started_at: queue_wait.started_at,
+                started_at: context.observed_started_at,
                 finished_at: Utc::now(),
-                queue_wait,
+                queue_wait: context.queue_wait,
+                task_environment_boot: context.task_environment_boot,
                 environment_setup: attempt.setup_timing.clone(),
                 environment_readiness: agent.readiness_timing,
                 agent_setup: agent.setup_timing,
@@ -869,6 +1213,7 @@ impl Evaluator {
         task: &Task,
         attempt: &NativeAttempt,
         nanocodex: NanocodexBuilder,
+        backend: AttemptBackend<'_>,
     ) -> Result<AgentExecution, AgentExecutionFailure> {
         let AgentSetup {
             agent,
@@ -876,7 +1221,9 @@ impl Evaluator {
             mut verifier,
             readiness_timing,
             timing: setup_timing,
-        } = self.setup_agent(emitter, task, attempt, nanocodex).await?;
+        } = self
+            .setup_agent(emitter, task, attempt, nanocodex, backend)
+            .await?;
         let execution_started = Utc::now();
         let span = info_span!(
             target: "nanocodex_eval",
@@ -1031,6 +1378,7 @@ impl Evaluator {
         task: &Task,
         attempt: &NativeAttempt,
         nanocodex: NanocodexBuilder,
+        backend: AttemptBackend<'_>,
     ) -> Result<AgentSetup, AgentExecutionFailure> {
         let readiness_started = Utc::now();
         let span = info_span!(
@@ -1055,26 +1403,47 @@ impl Evaluator {
                     self.id().simple(),
                     emitter.prompt_cache_cohort
                 ));
-            let configured = if let Some(factory) = &self.inner.attempt_agent {
-                match factory(
-                    EvalAttempt {
-                        task,
-                        directory: &attempt.paths.root,
-                        workspace: &attempt.paths.workspace,
-                    },
-                    builder,
-                ) {
-                    Ok(configured) => configured,
-                    Err(error) => {
-                        return Err(AgentExecutionFailure::setup(
-                            EvalError::AttemptAgent(error),
-                            CleanupPhase::not_required(),
-                            None,
-                        ));
+            let eval_attempt = EvalAttempt {
+                task,
+                directory: &attempt.paths.root,
+                workspace: &attempt.paths.workspace,
+            };
+            let configured = match backend {
+                AttemptBackend::Task(environment) => {
+                    match environment.attempt(eval_attempt, builder).await {
+                        Ok(configured) => configured,
+                        Err(error) => {
+                            return Err(AgentExecutionFailure::setup(
+                                EvalError::AttemptAgent(error),
+                                CleanupPhase::not_required(),
+                                None,
+                            ));
+                        }
                     }
                 }
-            } else {
-                AttemptAgent::new(builder)
+                AttemptBackend::Unavailable(error) => {
+                    return Err(AgentExecutionFailure::setup(
+                        EvalError::TaskEnvironmentUnavailable(error),
+                        CleanupPhase::not_required(),
+                        None,
+                    ));
+                }
+                AttemptBackend::PerAttempt => {
+                    if let Some(factory) = &self.inner.attempt_agent {
+                        match factory(eval_attempt, builder) {
+                            Ok(configured) => configured,
+                            Err(error) => {
+                                return Err(AgentExecutionFailure::setup(
+                                    EvalError::AttemptAgent(error),
+                                    CleanupPhase::not_required(),
+                                    None,
+                                ));
+                            }
+                        }
+                    } else {
+                        AttemptAgent::new(builder)
+                    }
+                }
             };
             let (builder, readiness, mut verifier) = configured.into_parts();
             if let Some(readiness) = readiness
@@ -1455,6 +1824,18 @@ impl EvaluatorBuilder {
         self
     }
 
+    /// Installs a task-scoped environment factory.
+    ///
+    /// Eligible coordinates for the same immutable task share one admitted
+    /// environment and execute sequentially in fresh attempt sandboxes. Tasks
+    /// rejected by [`TaskEnvironmentFactory::supports`] continue through the
+    /// configured per-attempt backend.
+    #[must_use]
+    pub fn task_environment(mut self, factory: impl TaskEnvironmentFactory + 'static) -> Self {
+        self.task_environment = Some(Arc::new(factory));
+        self
+    }
+
     /// Builds a reusable evaluator and a source of independent event streams.
     ///
     /// # Errors
@@ -1507,6 +1888,7 @@ impl EvaluatorBuilder {
                     next_prompt_cache_attempt: AtomicU64::new(0),
                     events: event_sender.clone(),
                     attempt_agent: self.attempt_agent,
+                    task_environment: self.task_environment,
                 }),
             },
             EvalEvents::new(event_sender),
@@ -1580,6 +1962,21 @@ impl Drop for AdmissionPermit {
     }
 }
 
+impl AdmissionPermit {
+    fn admit_next(&self) -> bool {
+        let mut state = self
+            .controller
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if state.draining {
+            return false;
+        }
+        state.admitted = state.admitted.saturating_add(1);
+        true
+    }
+}
+
 impl AttemptAgent {
     /// Uses `nanocodex` for one attempt with the default native verifier.
     #[must_use]
@@ -1649,6 +2046,20 @@ impl EvalAttempt<'_> {
     }
 }
 
+impl EvalTask<'_> {
+    /// Returns the immutable task definition shared by the environment.
+    #[must_use]
+    pub const fn task(&self) -> &Task {
+        self.task
+    }
+
+    /// Returns the retained directory reserved for this environment instance.
+    #[must_use]
+    pub const fn directory(&self) -> &Path {
+        self.directory
+    }
+}
+
 struct AttemptEmitter<'a> {
     eval: &'a Evaluator,
     attempt_id: Uuid,
@@ -1709,14 +2120,12 @@ struct ResponsesApiError {
 
 fn attempt_failure(
     eval: &Evaluator,
-    attempt_id: Uuid,
     task: Task,
-    trial_name: String,
     started_at: DateTime<Utc>,
-    queue_wait: PhaseTiming,
+    context: AttemptRunContext,
     failure: &AttemptRunFailure,
 ) -> EvalFailure {
-    let root = eval.directory().join(&trial_name);
+    let root = eval.directory().join(&context.trial_name);
     let model = failure
         .agent
         .as_ref()
@@ -1726,9 +2135,10 @@ fn attempt_failure(
         .as_ref()
         .map_or_else(|| "unknown".to_owned(), |agent| agent.effort.clone());
     EvalFailure {
-        attempt_id,
+        attempt_id: context.attempt_id,
         task_name: task.name().to_owned(),
-        trial_name,
+        trial_name: context.trial_name,
+        schedule_ordinal: context.schedule_ordinal,
         kind: failure_kind(&failure.error),
         outcome: failure_outcome(&failure.error),
         message: failure.error.to_string(),
@@ -1739,7 +2149,8 @@ fn attempt_failure(
         started_at,
         occurred_at: Utc::now(),
         timing: EvalFailureTiming {
-            queue_wait,
+            queue_wait: context.queue_wait,
+            task_environment_boot: context.task_environment_boot,
             environment_setup: failure.environment_setup.clone(),
             environment_readiness: failure.environment_readiness.clone(),
             agent_setup: failure.agent_setup.clone(),
@@ -1786,7 +2197,8 @@ fn failure_kind(error: &EvalError) -> EvalFailureKind {
         EvalError::UnsupportedNativeTask { .. }
         | EvalError::TaskPackage(_)
         | EvalError::OutputOverlapsTask { .. }
-        | EvalError::AttemptAgent(_) => EvalFailureKind::Environment,
+        | EvalError::AttemptAgent(_)
+        | EvalError::TaskEnvironmentUnavailable(_) => EvalFailureKind::Environment,
         EvalError::InvalidConcurrency
         | EvalError::InvalidMemory
         | EvalError::Draining
@@ -1796,6 +2208,8 @@ fn failure_kind(error: &EvalError) -> EvalFailureKind {
         | EvalError::RunConflict(_)
         | EvalError::RunDigestSchemaIncompatible { .. }
         | EvalError::RunActive(_)
+        | EvalError::TaskEnvironmentShutdown(_)
+        | EvalError::SchedulerInvariant(_)
         | EvalError::MissingSweepCoordinate => EvalFailureKind::Internal,
     }
 }
@@ -2261,7 +2675,7 @@ mod lifecycle_tests {
         fs,
         path::{Path, PathBuf},
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
     };
@@ -2277,11 +2691,12 @@ mod lifecycle_tests {
 
     use super::{
         AgentEventKind, AgentObservation, AttemptAgent, AttemptVerification, AttemptVerifier,
-        AttemptVerifierCleanupFuture, AttemptVerifierFuture, EvalAttempt, Evaluator,
+        AttemptVerifierCleanupFuture, AttemptVerifierFuture, EvalAttempt, EvalTask, Evaluator,
+        TaskEnvironment, TaskEnvironmentError, TaskEnvironmentFactory,
     };
     use crate::{
-        AgentStatus, BillingCompleteness, CleanupPhase, CleanupStatus, EvalOutcome, EvalStatus,
-        Task, VerifierResult,
+        AgentStatus, AggregateDataset, AttemptFact, BillingCompleteness, CleanupPhase,
+        CleanupStatus, EvalOutcome, EvalStatus, Sweep, Task, VerifierResult, harbor::Harbor,
     };
 
     struct AttemptResourceProvider {
@@ -2357,6 +2772,207 @@ mod lifecycle_tests {
     }
 
     struct FailingCleanupVerifier;
+
+    #[derive(Default)]
+    struct TaskEnvironmentProbe {
+        creates: AtomicUsize,
+        shutdowns: AtomicUsize,
+        attempts: Mutex<Vec<String>>,
+    }
+
+    struct ProbeTaskEnvironmentFactory {
+        probe: Arc<TaskEnvironmentProbe>,
+    }
+
+    struct LatchedTaskEnvironmentFactory {
+        probe: Arc<TaskEnvironmentProbe>,
+        boot_started: Arc<tokio::sync::Notify>,
+        boot_release: Arc<tokio::sync::Notify>,
+    }
+
+    struct FailingTaskEnvironmentFactory {
+        creates: Arc<AtomicUsize>,
+    }
+
+    struct BlockingTaskEnvironmentFactory {
+        creates: Arc<AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    struct BlockingTaskEnvironment {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    struct ProbeTaskEnvironment {
+        probe: Arc<TaskEnvironmentProbe>,
+        active: Arc<AtomicUsize>,
+    }
+
+    struct ProbeTaskVerifier {
+        active: Arc<AtomicUsize>,
+        finished: bool,
+    }
+
+    #[async_trait]
+    impl TaskEnvironmentFactory for ProbeTaskEnvironmentFactory {
+        fn supports(&self, task: &Task) -> bool {
+            task.network() == crate::NetworkPolicy::Disabled
+                && task.verifier().environment_mode() == crate::VerifierEnvironmentMode::Same
+        }
+
+        async fn create(
+            &self,
+            _task: EvalTask<'_>,
+        ) -> Result<Box<dyn TaskEnvironment>, TaskEnvironmentError> {
+            self.probe.creates.fetch_add(1, Ordering::AcqRel);
+            Ok(Box::new(ProbeTaskEnvironment {
+                probe: Arc::clone(&self.probe),
+                active: Arc::new(AtomicUsize::new(0)),
+            }))
+        }
+    }
+
+    #[async_trait]
+    impl TaskEnvironmentFactory for LatchedTaskEnvironmentFactory {
+        fn supports(&self, task: &Task) -> bool {
+            task.network() == crate::NetworkPolicy::Disabled
+                && task.verifier().environment_mode() == crate::VerifierEnvironmentMode::Same
+        }
+
+        async fn create(
+            &self,
+            _task: EvalTask<'_>,
+        ) -> Result<Box<dyn TaskEnvironment>, TaskEnvironmentError> {
+            self.probe.creates.fetch_add(1, Ordering::AcqRel);
+            self.boot_started.notify_one();
+            self.boot_release.notified().await;
+            Ok(Box::new(ProbeTaskEnvironment {
+                probe: Arc::clone(&self.probe),
+                active: Arc::new(AtomicUsize::new(0)),
+            }))
+        }
+    }
+
+    #[async_trait]
+    impl TaskEnvironmentFactory for FailingTaskEnvironmentFactory {
+        fn supports(&self, _task: &Task) -> bool {
+            true
+        }
+
+        async fn create(
+            &self,
+            _task: EvalTask<'_>,
+        ) -> Result<Box<dyn TaskEnvironment>, TaskEnvironmentError> {
+            self.creates.fetch_add(1, Ordering::AcqRel);
+            Err(Box::new(std::io::Error::other(
+                "deterministic task environment boot failure",
+            )))
+        }
+    }
+
+    #[async_trait]
+    impl TaskEnvironmentFactory for BlockingTaskEnvironmentFactory {
+        fn supports(&self, _task: &Task) -> bool {
+            true
+        }
+
+        async fn create(
+            &self,
+            _task: EvalTask<'_>,
+        ) -> Result<Box<dyn TaskEnvironment>, TaskEnvironmentError> {
+            self.creates.fetch_add(1, Ordering::AcqRel);
+            Ok(Box::new(BlockingTaskEnvironment {
+                started: Arc::clone(&self.started),
+                release: Arc::clone(&self.release),
+            }))
+        }
+    }
+
+    #[async_trait]
+    impl TaskEnvironment for BlockingTaskEnvironment {
+        async fn attempt(
+            &mut self,
+            _attempt: EvalAttempt<'_>,
+            _builder: nanocodex_agent::NanocodexBuilder,
+        ) -> Result<AttemptAgent, TaskEnvironmentError> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Err(Box::new(std::io::Error::other(
+                "released blocked task environment attempt",
+            )))
+        }
+
+        async fn shutdown(&mut self) -> Result<(), TaskEnvironmentError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl TaskEnvironment for ProbeTaskEnvironment {
+        async fn attempt(
+            &mut self,
+            attempt: EvalAttempt<'_>,
+            builder: nanocodex_agent::NanocodexBuilder,
+        ) -> Result<AttemptAgent, TaskEnvironmentError> {
+            assert_eq!(
+                self.active.swap(1, Ordering::AcqRel),
+                0,
+                "coordinates in one task environment must never overlap"
+            );
+            self.probe
+                .attempts
+                .lock()
+                .unwrap()
+                .push(attempt.directory().display().to_string());
+            Ok(AttemptAgent::new(builder).verifier(ProbeTaskVerifier {
+                active: Arc::clone(&self.active),
+                finished: false,
+            }))
+        }
+
+        async fn shutdown(&mut self) -> Result<(), TaskEnvironmentError> {
+            assert_eq!(self.active.load(Ordering::Acquire), 0);
+            self.probe.shutdowns.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+    }
+
+    impl AttemptVerifier for ProbeTaskVerifier {
+        fn verify<'a>(
+            &'a mut self,
+            _task: &'a Task,
+            attempt: EvalAttempt<'a>,
+        ) -> AttemptVerifierFuture<'a> {
+            Box::pin(async move {
+                self.finished = true;
+                assert_eq!(self.active.swap(0, Ordering::AcqRel), 1);
+                let verifier = attempt.directory().join("verifier");
+                fs::create_dir_all(&verifier).unwrap();
+                fs::write(verifier.join("test-stdout.txt"), []).unwrap();
+                Ok(AttemptVerification {
+                    result: VerifierResult {
+                        exit_code: 0,
+                        rewards: BTreeMap::from([("reward".to_owned(), 1.0)]),
+                    },
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    cleanup: CleanupPhase::completed(chrono::Utc::now()),
+                })
+            })
+        }
+
+        fn shutdown(&mut self) -> AttemptVerifierCleanupFuture<'_> {
+            Box::pin(async move {
+                if !self.finished {
+                    assert_eq!(self.active.swap(0, Ordering::AcqRel), 1);
+                    self.finished = true;
+                }
+                CleanupPhase::completed(chrono::Utc::now())
+            })
+        }
+    }
 
     impl AttemptVerifier for ShutdownProbeVerifier {
         fn verify<'a>(
@@ -2930,6 +3546,669 @@ mod lifecycle_tests {
             observation.billing_completeness(),
             BillingCompleteness::Unknown
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn task_environment_runs_counterbalanced_sweep_sequentially_and_retains_harbor_rows() {
+        let (endpoint, server) = spawn_success_model().await;
+        let (_task_directory, task) = offline_task("terminal-bench/grouped");
+        let openai = OpenAi::builder("test")
+            .websocket_url(endpoint)
+            .build()
+            .unwrap();
+        let nanocodex = Nanocodex::builder(openai);
+        let sweep = Sweep::builder()
+            .task(task)
+            .trials(2)
+            .agent("a", nanocodex.clone())
+            .unwrap()
+            .agent("b", nanocodex.clone())
+            .unwrap()
+            .build()
+            .unwrap();
+        let output = tempdir().unwrap();
+        let probe = Arc::new(TaskEnvironmentProbe::default());
+        let boot_started = Arc::new(tokio::sync::Notify::new());
+        let boot_release = Arc::new(tokio::sync::Notify::new());
+        let (evaluator, events) = Evaluator::builder(nanocodex)
+            .output_directory(output.path())
+            .max_concurrency(4)
+            .fresh_run(&sweep)
+            .task_environment(LatchedTaskEnvironmentFactory {
+                probe: Arc::clone(&probe),
+                boot_started: Arc::clone(&boot_started),
+                boot_release: Arc::clone(&boot_release),
+            })
+            .build()
+            .unwrap();
+        let recorder = Harbor::new(&evaluator)
+            .unwrap()
+            .record(events.subscribe())
+            .unwrap();
+
+        let running = {
+            let evaluator = evaluator.clone();
+            tokio::spawn(async move { evaluator.sweep(sweep).await })
+        };
+        boot_started.notified().await;
+        assert_eq!(probe.creates.load(Ordering::Acquire), 1);
+        assert!(
+            probe.attempts.lock().unwrap().is_empty(),
+            "no coordinate may start before the one-time factory boot completes"
+        );
+        boot_release.notify_one();
+        let results = running.await.unwrap().unwrap();
+        assert_eq!(results.attempts().len(), 4);
+        assert_eq!(probe.creates.load(Ordering::Acquire), 1);
+        assert_eq!(probe.shutdowns.load(Ordering::Acquire), 1);
+        let execution = probe.attempts.lock().unwrap().clone();
+        assert_eq!(execution.len(), 4);
+        for (path, coordinate) in
+            execution
+                .iter()
+                .zip(["__a__001__", "__b__001__", "__b__002__", "__a__002__"])
+        {
+            assert!(
+                path.contains(coordinate),
+                "expected {coordinate} in grouped execution path {path}"
+            );
+        }
+        let ordinals = results
+            .attempts()
+            .iter()
+            .map(|attempt| attempt.result().unwrap().schedule_ordinal)
+            .collect::<Vec<_>>();
+        assert_eq!(ordinals, [1, 2, 4, 3]);
+        let first = results.attempts()[0].result().unwrap();
+        let boot = first
+            .timing
+            .task_environment_boot
+            .as_ref()
+            .expect("the first executed coordinate owns task boot attribution");
+        assert!(first.timing.started_at <= boot.started_at);
+        assert!(boot.finished_at <= first.timing.queue_wait.started_at);
+        assert!(results.attempts()[1..].iter().all(|attempt| {
+            attempt
+                .result()
+                .unwrap()
+                .timing
+                .task_environment_boot
+                .is_none()
+        }));
+        for attempt in results.attempts() {
+            let result = attempt.result().unwrap();
+            let timing = &result.timing;
+            assert!(boot.finished_at <= timing.queue_wait.started_at);
+            assert!(timing.queue_wait.finished_at <= timing.environment_setup.started_at);
+            assert!(
+                timing.environment_setup.finished_at <= timing.environment_readiness.started_at
+            );
+            assert!(timing.environment_readiness.finished_at <= timing.agent_setup.started_at);
+            assert!(timing.agent_setup.finished_at <= timing.agent_execution.started_at);
+            let agent_cleanup = result
+                .cleanup
+                .agent
+                .timing
+                .as_ref()
+                .expect("successful agent shutdown must be timed");
+            assert!(timing.agent_execution.finished_at <= agent_cleanup.started_at);
+            assert!(agent_cleanup.finished_at <= timing.verifier.started_at);
+            let verifier_cleanup = result
+                .cleanup
+                .verifier
+                .timing
+                .as_ref()
+                .expect("task verifier teardown must be timed");
+            assert!(timing.verifier.finished_at <= verifier_cleanup.started_at);
+            assert!(verifier_cleanup.finished_at <= timing.finished_at);
+        }
+        let facts = results
+            .attempts()
+            .iter()
+            .map(AttemptFact::from_sweep_attempt)
+            .collect::<Vec<_>>();
+        let task_boots = facts
+            .iter()
+            .map(|fact| fact.latency.task_environment_boot_ns)
+            .collect::<Vec<_>>();
+        assert_eq!(task_boots[1..], [0, 0, 0]);
+        let task_boot_total = task_boots.iter().copied().sum::<u64>();
+        assert_eq!(task_boot_total, task_boots[0]);
+        for fact in &facts {
+            let latency = &fact.latency;
+            assert_eq!(
+                latency.total_ns,
+                latency
+                    .task_environment_admission_ns
+                    .saturating_add(latency.queue_wait_ns)
+                    .saturating_add(latency.task_environment_boot_ns)
+                    .saturating_add(latency.cold_image_ns)
+                    .saturating_add(latency.environment_setup_ns)
+                    .saturating_add(latency.environment_readiness_ns)
+                    .saturating_add(latency.agent_setup_ns)
+                    .saturating_add(latency.agent_execution_ns)
+                    .saturating_add(latency.verifier_ns)
+                    .saturating_add(latency.cleanup_ns)
+            );
+            assert!(
+                latency.total_ns <= latency.observed_wall_ns,
+                "disjoint phase sum {} exceeded observed wall {}",
+                latency.total_ns,
+                latency.observed_wall_ns
+            );
+        }
+        let dataset = AggregateDataset::new(facts);
+        assert_eq!(
+            dataset
+                .attempts
+                .iter()
+                .map(|fact| fact.latency.task_environment_boot_ns)
+                .sum::<u64>(),
+            task_boot_total
+        );
+
+        let job = recorder
+            .finish(results.clone().into_outcomes())
+            .await
+            .unwrap();
+        let mut retained = fs::read_dir(job.directory())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join("result.json"))
+            .filter(|path| path.is_file())
+            .map(|path| serde_json::from_slice::<Value>(&fs::read(path).unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        retained.sort_by_key(|result| result["schedule_ordinal"].as_u64().unwrap());
+        assert_eq!(retained.len(), 4);
+        assert_eq!(
+            retained
+                .iter()
+                .map(|result| result["schedule_ordinal"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4]
+        );
+        assert_eq!(
+            retained
+                .iter()
+                .filter(|result| !result["task_environment_boot"].is_null())
+                .count(),
+            1
+        );
+        let reloaded = job.aggregate_dataset().unwrap();
+        assert_eq!(reloaded.attempts.len(), dataset.attempts.len());
+        for expected in &dataset.attempts {
+            let actual = reloaded
+                .attempts
+                .iter()
+                .find(|attempt| attempt.attempt_id == expected.attempt_id)
+                .expect("every live aggregate row must survive durable Harbor reload");
+            assert_eq!(
+                actual.latency.task_environment_admission_ns,
+                expected.latency.task_environment_admission_ns
+            );
+            assert_eq!(
+                actual.latency.task_environment_boot_ns,
+                expected.latency.task_environment_boot_ns
+            );
+            assert_eq!(
+                actual.latency.observed_wall_ns,
+                expected.latency.observed_wall_ns
+            );
+            assert_eq!(actual.latency.total_ns, expected.latency.total_ns);
+            assert!(actual.latency.total_ns <= actual.latency.observed_wall_ns);
+        }
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn task_environment_boot_failures_preserve_task_batch_and_sweep_cardinality() {
+        let (_task_directory, task) = offline_task("terminal-bench/cardinality");
+        let nanocodex = Nanocodex::builder(OpenAi::new("test").unwrap());
+
+        let single_creates = Arc::new(AtomicUsize::new(0));
+        let single_output = tempdir().unwrap();
+        let (single, _) = Evaluator::builder(nanocodex.clone())
+            .output_directory(single_output.path())
+            .task_environment(FailingTaskEnvironmentFactory {
+                creates: Arc::clone(&single_creates),
+            })
+            .build()
+            .unwrap();
+        let outcome = single.task(task.clone()).await.unwrap();
+        let single_failure = outcome
+            .unscored()
+            .expect("a failed task boot must produce a terminal failure");
+        assert!(
+            single_failure
+                .message
+                .contains("deterministic task environment boot failure")
+        );
+        assert_boot_failure_has_no_coordinate_work(single_failure);
+        assert!(single_failure.timing.task_environment_boot.is_some());
+        assert_eq!(single_creates.load(Ordering::Acquire), 1);
+
+        let batch_creates = Arc::new(AtomicUsize::new(0));
+        let batch_output = tempdir().unwrap();
+        let (batch, _) = Evaluator::builder(nanocodex.clone())
+            .output_directory(batch_output.path())
+            .task_environment(FailingTaskEnvironmentFactory {
+                creates: Arc::clone(&batch_creates),
+            })
+            .build()
+            .unwrap();
+        let outcomes = batch
+            .tasks(vec![task.clone(), task.clone(), task.clone()])
+            .await
+            .unwrap();
+        assert_eq!(outcomes.len(), 3);
+        let batch_failures = outcomes
+            .iter()
+            .map(|outcome| {
+                outcome
+                    .unscored()
+                    .expect("every coordinate behind a failed boot must terminate")
+            })
+            .collect::<Vec<_>>();
+        assert!(batch_failures[0].timing.task_environment_boot.is_some());
+        assert!(
+            batch_failures[1..]
+                .iter()
+                .all(|failure| failure.timing.task_environment_boot.is_none())
+        );
+        let batch_boot_finished = batch_failures[0]
+            .timing
+            .task_environment_boot
+            .as_ref()
+            .unwrap()
+            .finished_at;
+        for failure in batch_failures {
+            assert_boot_failure_has_no_coordinate_work(failure);
+            assert!(batch_boot_finished <= failure.timing.queue_wait.started_at);
+        }
+        assert_eq!(batch_creates.load(Ordering::Acquire), 1);
+
+        let sweep = Sweep::builder()
+            .task(task)
+            .trials(2)
+            .agent("a", nanocodex.clone())
+            .unwrap()
+            .agent("b", nanocodex.clone())
+            .unwrap()
+            .build()
+            .unwrap();
+        let sweep_creates = Arc::new(AtomicUsize::new(0));
+        let sweep_output = tempdir().unwrap();
+        let (evaluator, _) = Evaluator::builder(nanocodex)
+            .output_directory(sweep_output.path())
+            .fresh_run(&sweep)
+            .task_environment(FailingTaskEnvironmentFactory {
+                creates: Arc::clone(&sweep_creates),
+            })
+            .build()
+            .unwrap();
+        let results = evaluator.sweep(sweep).await.unwrap();
+        assert_eq!(results.attempts().len(), 4);
+        assert!(
+            results
+                .attempts()
+                .iter()
+                .all(|attempt| attempt.failure().is_some())
+        );
+        assert_eq!(sweep_creates.load(Ordering::Acquire), 1);
+        assert_eq!(
+            results
+                .attempts()
+                .iter()
+                .map(|attempt| attempt.failure().unwrap().schedule_ordinal)
+                .collect::<Vec<_>>(),
+            [1, 2, 4, 3]
+        );
+        let failures = results
+            .attempts()
+            .iter()
+            .map(|attempt| attempt.failure().unwrap())
+            .collect::<Vec<_>>();
+        assert!(failures[0].timing.task_environment_boot.is_some());
+        assert!(
+            failures[1..]
+                .iter()
+                .all(|failure| failure.timing.task_environment_boot.is_none())
+        );
+        let boot_finished = failures[0]
+            .timing
+            .task_environment_boot
+            .as_ref()
+            .unwrap()
+            .finished_at;
+        for failure in failures {
+            assert_boot_failure_has_no_coordinate_work(failure);
+            assert!(boot_finished <= failure.timing.queue_wait.started_at);
+            let latency = AttemptFact::from_failure("failed-boot", 1, failure).latency;
+            assert!(latency.total_ns <= latency.observed_wall_ns);
+        }
+    }
+
+    fn assert_boot_failure_has_no_coordinate_work(failure: &crate::EvalFailure) {
+        assert!(failure.timing.environment_setup.is_none());
+        assert!(failure.timing.environment_readiness.is_none());
+        assert!(failure.timing.agent_setup.is_none());
+        assert!(failure.timing.agent_execution.is_none());
+        assert!(failure.timing.verifier.is_none());
+        assert_eq!(failure.cleanup.agent.status, CleanupStatus::NotRequired);
+        assert_eq!(failure.cleanup.verifier.status, CleanupStatus::NotRequired);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn task_group_admission_finishes_before_boot_and_coordinate_queueing() {
+        let (_first_directory, first_task) = offline_task("terminal-bench/admission-first");
+        let (_second_directory, second_task) = offline_task("terminal-bench/admission-second");
+        let output = tempdir().unwrap();
+        let creates = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (evaluator, _) = Evaluator::builder(Nanocodex::builder(OpenAi::new("test").unwrap()))
+            .output_directory(output.path())
+            .max_concurrency(1)
+            .task_environment(BlockingTaskEnvironmentFactory {
+                creates: Arc::clone(&creates),
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            })
+            .build()
+            .unwrap();
+        let running = {
+            let evaluator = evaluator.clone();
+            tokio::spawn(async move { evaluator.tasks(vec![first_task, second_task]).await })
+        };
+
+        started.notified().await;
+        assert_eq!(
+            creates.load(Ordering::Acquire),
+            1,
+            "the second task factory must wait for group admission"
+        );
+        release.notify_one();
+        started.notified().await;
+        assert_eq!(creates.load(Ordering::Acquire), 2);
+        release.notify_one();
+
+        let outcomes = running.await.unwrap().unwrap();
+        assert_eq!(outcomes.len(), 2);
+        for outcome in &outcomes {
+            let failure = outcome
+                .unscored()
+                .expect("the latch environment intentionally rejects its coordinate");
+            let boot = failure
+                .timing
+                .task_environment_boot
+                .as_ref()
+                .expect("each one-coordinate task group owns one boot");
+            assert!(failure.started_at <= boot.started_at);
+            assert!(boot.finished_at <= failure.timing.queue_wait.started_at);
+            let environment_setup = failure
+                .timing
+                .environment_setup
+                .as_ref()
+                .expect("coordinate workspace preparation must be timed");
+            assert!(failure.timing.queue_wait.finished_at <= environment_setup.started_at);
+            assert!(failure.timing.environment_readiness.is_none());
+            assert!(failure.timing.agent_setup.is_none());
+            assert!(failure.timing.agent_execution.is_none());
+            assert!(failure.timing.verifier.is_none());
+        }
+        let second = outcomes[1].unscored().unwrap();
+        let second_latency = AttemptFact::from_failure("second", 1, second).latency;
+        assert!(
+            second_latency.task_environment_admission_ns > 0,
+            "the held first group must produce a distinct second-group admission wait"
+        );
+        assert!(second_latency.total_ns <= second_latency.observed_wall_ns);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn draining_a_task_environment_leaves_unstarted_coordinates_resumable() {
+        let (_task_directory, task) = offline_task("terminal-bench/drain");
+        let output = tempdir().unwrap();
+        let creates = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (evaluator, _) = Evaluator::builder(Nanocodex::builder(OpenAi::new("test").unwrap()))
+            .output_directory(output.path())
+            .task_environment(BlockingTaskEnvironmentFactory {
+                creates: Arc::clone(&creates),
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            })
+            .build()
+            .unwrap();
+        let running = {
+            let evaluator = evaluator.clone();
+            tokio::spawn(async move { evaluator.task_n(task, 3).await })
+        };
+
+        started.notified().await;
+        assert_eq!(evaluator.begin_drain(), 1);
+        release.notify_one();
+        let outcomes = running.await.unwrap().unwrap();
+
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].unscored().is_some());
+        assert_eq!(creates.load(Ordering::Acquire), 1);
+        assert_eq!(evaluator.begin_drain(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn resumed_task_sweep_preserves_counterbalanced_ordinals_and_execution_order() {
+        let (endpoint, server) = spawn_success_model().await;
+        let (_task_directory, task) = offline_task("terminal-bench/resumed-group");
+        let openai = OpenAi::builder("test")
+            .websocket_url(endpoint)
+            .build()
+            .unwrap();
+        let nanocodex = Nanocodex::builder(openai);
+        let sweep = Sweep::builder()
+            .task(task)
+            .trials(2)
+            .agent("a", nanocodex.clone())
+            .unwrap()
+            .agent("b", nanocodex.clone())
+            .unwrap()
+            .build()
+            .unwrap();
+        let output = tempdir().unwrap();
+
+        let creates = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (first, first_events) = Evaluator::builder(nanocodex.clone())
+            .output_directory(output.path())
+            .fresh_run(&sweep)
+            .task_environment(BlockingTaskEnvironmentFactory {
+                creates: Arc::clone(&creates),
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            })
+            .build()
+            .unwrap();
+        let first_recorder = Harbor::new(&first)
+            .unwrap()
+            .record(first_events.subscribe())
+            .unwrap();
+        let first_run = {
+            let first = first.clone();
+            let sweep = sweep.clone();
+            tokio::spawn(async move { first.sweep(sweep).await })
+        };
+        started.notified().await;
+        assert_eq!(first.begin_drain(), 1);
+        release.notify_one();
+        let first_results = first_run.await.unwrap().unwrap();
+        assert_eq!(first_results.attempts().len(), 1);
+        assert_eq!(
+            first_results.attempts()[0]
+                .failure()
+                .unwrap()
+                .schedule_ordinal,
+            1
+        );
+        first_recorder.finish_all(1).await.unwrap();
+        drop(first);
+
+        let probe = Arc::new(TaskEnvironmentProbe::default());
+        let (resumed, resumed_events) = Evaluator::builder(nanocodex)
+            .output_directory(output.path())
+            .resume_incomplete(&sweep)
+            .task_environment(ProbeTaskEnvironmentFactory {
+                probe: Arc::clone(&probe),
+            })
+            .build()
+            .unwrap();
+        assert!(resumed.resumed());
+        assert_eq!(resumed.remaining_attempts(&sweep).unwrap(), 3);
+        let resumed_recorder = Harbor::new(&resumed)
+            .unwrap()
+            .record(resumed_events.subscribe())
+            .unwrap();
+        let resumed_results = resumed.sweep(sweep).await.unwrap();
+
+        assert_eq!(resumed_results.skipped(), 1);
+        assert_eq!(
+            resumed_results
+                .attempts()
+                .iter()
+                .map(|attempt| attempt.result().unwrap().schedule_ordinal)
+                .collect::<Vec<_>>(),
+            [2, 4, 3]
+        );
+        let execution = probe.attempts.lock().unwrap().clone();
+        assert_eq!(execution.len(), 3);
+        for (path, coordinate) in execution
+            .iter()
+            .zip(["__b__001__", "__b__002__", "__a__002__"])
+        {
+            assert!(
+                path.contains(coordinate),
+                "expected {coordinate} in resumed execution path {path}"
+            );
+        }
+
+        let job = resumed_recorder
+            .finish(resumed_results.into_outcomes())
+            .await
+            .unwrap();
+        let mut retained_ordinals = job
+            .aggregate_dataset()
+            .unwrap()
+            .attempts
+            .iter()
+            .map(|attempt| attempt.schedule_ordinal)
+            .collect::<Vec<_>>();
+        retained_ordinals.sort_unstable();
+        assert_eq!(retained_ordinals, [1, 2, 3, 4]);
+        server.abort();
+    }
+
+    async fn spawn_success_model() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let next_response = Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let next_response = Arc::clone(&next_response);
+                tokio::spawn(async move {
+                    let mut socket = accept_async(stream).await.unwrap();
+                    while let Some(message) = socket.next().await {
+                        let Ok(message) = message else {
+                            break;
+                        };
+                        let Message::Text(request) = message else {
+                            continue;
+                        };
+                        let request: Value = serde_json::from_str(&request).unwrap();
+                        let id = next_response.fetch_add(1, Ordering::AcqRel);
+                        let response = if request["generate"] == false {
+                            json!({
+                                "type": "response.completed",
+                                "response": {
+                                    "id": format!("resp-warmup-{id}"),
+                                    "usage": null
+                                }
+                            })
+                        } else {
+                            json!({
+                                "type": "response.completed",
+                                "response": {
+                                    "id": format!("resp-generation-{id}"),
+                                    "status": "completed",
+                                    "output": [{
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "content": [{
+                                            "type": "output_text",
+                                            "text": "done"
+                                        }]
+                                    }],
+                                    "usage": {
+                                        "input_tokens": 1,
+                                        "input_tokens_details": { "cached_tokens": 0 },
+                                        "output_tokens": 1,
+                                        "output_tokens_details": { "reasoning_tokens": 0 },
+                                        "total_tokens": 2
+                                    }
+                                }
+                            })
+                        };
+                        if socket
+                            .send(Message::Text(response.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        (endpoint, server)
+    }
+
+    fn offline_task(name: &str) -> (tempfile::TempDir, Task) {
+        let directory = tempdir().unwrap();
+        fs::create_dir(directory.path().join("environment")).unwrap();
+        fs::create_dir(directory.path().join("tests")).unwrap();
+        fs::write(directory.path().join("instruction.md"), "Do the work.\n").unwrap();
+        fs::write(
+            directory.path().join("tests/test.sh"),
+            "#!/bin/sh\nmkdir -p /logs/verifier\nprintf '1\\n' > /logs/verifier/reward.txt\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("task.toml"),
+            format!(
+                r#"
+schema_version = "1.1"
+[task]
+name = "{name}"
+description = "grouped task environment fixture"
+[agent]
+timeout_sec = 5.0
+[verifier]
+timeout_sec = 5.0
+environment_mode = "same"
+[environment]
+docker_image = "alpine:3.21"
+cpus = 1
+memory_mb = 128
+storage_mb = 128
+gpus = 0
+allow_internet = false
+"#
+            ),
+        )
+        .unwrap();
+        let task = Task::load(directory.path()).unwrap();
+        (directory, task)
     }
 
     fn task_with_agent_timeout(timeout_seconds: f64) -> (tempfile::TempDir, Task) {

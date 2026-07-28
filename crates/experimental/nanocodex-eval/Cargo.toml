@@ -14,6 +14,7 @@ categories.workspace = true
 description = "Typed, durable evaluation and Harbor artifacts for Nanocodex agents"
 
 [dependencies]
+async-trait.workspace = true
 chrono.workspace = true
 filetime.workspace = true
 futures-util.workspace = true
@@ -35,7 +36,6 @@ url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-async-trait.workspace = true
 criterion.workspace = true
 nanocodex-tools.workspace = true
 tempfile.workspace = true

@@ -77,7 +77,8 @@ pub use atif::{
 };
 pub use evaluator::{
     AttemptAgent, AttemptVerification, AttemptVerificationFailure, AttemptVerifier, EvalAttempt,
-    EvalError, Evaluator, EvaluatorBuilder,
+    EvalError, EvalTask, Evaluator, EvaluatorBuilder, TaskEnvironment, TaskEnvironmentError,
+    TaskEnvironmentFactory,
 };
 pub use event::{EvalEvent, EvalEventKind, EvalEventStream, EvalEventStreamError, EvalEvents};
 pub use result::{

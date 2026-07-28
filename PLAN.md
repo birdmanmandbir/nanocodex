@@ -110,22 +110,32 @@ sweep scheduler already implements it:
   vary. Retained aggregate data must support OpenAI-style comparison plots whose
   primary axes are success rate, estimated cost, and latency, with drilldown to
   every task/configuration attempt.
-- Turbo runs execute configurations concurrently with explicit, configurable
-  bounds. Queueing, concurrency, and cancellation policy remain visible in the
-  retained run configuration.
+- Turbo runs execute different task VMs concurrently with explicit,
+  configurable bounds. Coordinates for one task execute strictly sequentially
+  inside its retained VM; queueing, counterbalanced order, concurrency, drain,
+  and cancellation policy remain visible in the retained run configuration.
 - The allocation invariant is one retained VM per task across a parameter
-  sweep, never one VM per configuration. Configurations run concurrently in
-  isolated directories inside that task VM; only the immutable task
-  image/bootstrap state and VM lifetime are shared.
-- Every configuration starts from an identically seeded private workspace and
-  process group, receives collision-free ports and temporary paths, writes
-  independent verifier output, and cannot observe mutable state from another
-  configuration.
+  sweep, never one VM per configuration. Each coordinate receives a fresh
+  overlay, cgroup, process tree, and user, mount, PID, IPC, UTS, and network
+  namespace. Only the immutable task lower image and retained VM lifetime are
+  shared, and an attempt must drain completely before the next begins.
+- Every configuration starts from an identically seeded private workspace,
+  writes independent verifier output, and cannot observe mutable state or
+  processes from another configuration. Public-network tasks, separate
+  verifier environments, and canonical verifier-cache tasks continue through
+  the proven per-attempt VM path until their shared-task isolation requirements
+  are implemented.
 - Every attempt retains its exact inputs, ordered outputs and events,
   trajectory, verifier artifacts and output, resolved configuration, token and
   cost accounting, and latency breakdown. Cold image/bootstrap time is
-  attributed separately from scheduler queue wait and warm agent, model, tool,
-  and verifier work.
+  attributed once to the first executed coordinate in a task environment,
+  separately from scheduler queue wait and warm agent, model, tool, and
+  verifier work.
+- The retained facts can reproduce the comparison plots in
+  [`docs/GPT_5_6_EVALS.md`](docs/GPT_5_6_EVALS.md), including success against
+  estimated cost and latency, and every plotted point drills down to its exact
+  task/configuration attempts, trajectories, verifier evidence, and phase
+  timings.
 - `nanocodex eval ...` can run the full configured suite against a selected
   local or PR build through the consolidated Rust/library path, and comparison
   records remain useful without rerunning the benchmark.
@@ -137,17 +147,19 @@ Current Part 2 status (2026-07-28): the two crate boundaries, high-level
 retained VM workspace API, native and per-attempt KVM execution, Harbor/ATIF
 projection, durable resume, plot-ready aggregates, explicit host/VM selection,
 Linux musl host build, lean guest build, and focused live native/KVM evidence
-are implemented. New jobs retain the exact executable digest, Git/build
-identity, model, tool profile, pricing revision, seed status, scheduling
-policy, task-package digest, ordered evidence, and separate queue, readiness,
-cold image/cache, and warm-attempt timing. The allocation gate above is not
-yet implemented: the current eval adapter owns one agent VM and, where needed,
-one verifier VM per attempt. Its single guest RPC runtime has no tenant
-namespace boundary, so sharing it concurrently would let one configuration
-address another configuration's paths. Completion requires a task-scoped
-environment lifecycle plus tenant-scoped guest filesystem/process namespaces,
-then full configured-suite and bounded representative sweep evidence. Do not
-describe the current per-attempt adapter as one-VM-per-task isolation.
+are implemented. Offline tasks with same-environment verifiers and without the
+canonical verifier dependency cache now use one retained task VM with strictly
+sequential generation-scoped Linux sandboxes. The scheduler counterbalances
+configuration order, persists its policy and stable per-task schedule ordinal,
+keeps ordinals stable across resume, and attributes task boot once. Focused
+fake-model tests cover a two-configuration-by-two-trial sweep, fallback routing,
+drain/cardinality, resume order, and aggregate timing; an opt-in signed-libkrun
+gate covers the concrete adapter, fresh-attempt isolation, same-sandbox
+verification, and Harbor evidence. The benchmark gate compares per-attempt
+boot attribution with one boot per task. Completion still requires the
+plot-rendering/drilldown gate and full configured-suite plus bounded
+representative sweep evidence; public-network, separate-verifier, and canonical
+verifier-cache tasks intentionally retain the existing per-attempt VM path.
 
 ### PR 3 — Experimental managed-agent components
 

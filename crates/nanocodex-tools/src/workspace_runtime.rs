@@ -47,15 +47,50 @@ impl WorkspaceToolRuntime {
     #[doc(hidden)]
     #[must_use]
     pub fn with_view_image_wire_limit(workspace: PathBuf, max_wire_bytes: u64) -> Self {
-        Self::with_optional_view_image_wire_limit(workspace, Some(max_wire_bytes))
+        Self::with_environment_and_optional_view_image_wire_limit(
+            workspace,
+            Vec::new(),
+            Some(max_wire_bytes),
+        )
+    }
+
+    /// Creates a constrained process-boundary runtime whose child processes
+    /// receive the supplied base environment.
+    ///
+    /// The environment is retained as data by this process and is applied only
+    /// when a workspace command is spawned.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_environment_and_view_image_wire_limit(
+        workspace: PathBuf,
+        environment: Vec<(OsString, OsString)>,
+        max_wire_bytes: u64,
+    ) -> Self {
+        Self::with_environment_and_optional_view_image_wire_limit(
+            workspace,
+            environment,
+            Some(max_wire_bytes),
+        )
     }
 
     fn with_optional_view_image_wire_limit(
         workspace: PathBuf,
         max_wire_bytes: Option<u64>,
     ) -> Self {
+        Self::with_environment_and_optional_view_image_wire_limit(
+            workspace,
+            Vec::new(),
+            max_wire_bytes,
+        )
+    }
+
+    fn with_environment_and_optional_view_image_wire_limit(
+        workspace: PathBuf,
+        environment: Vec<(OsString, OsString)>,
+        max_wire_bytes: Option<u64>,
+    ) -> Self {
         let sessions = Arc::new(ShellSessions::with_environment_and_turn(
-            Arc::<Vec<(OsString, OsString)>>::default(),
+            Arc::new(environment),
             Arc::new(AtomicU64::new(0)),
         ));
         Self {

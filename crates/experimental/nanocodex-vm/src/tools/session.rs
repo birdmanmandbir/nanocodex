@@ -24,8 +24,9 @@ use tracing::{Instrument, Span, info, info_span};
 use super::{
     VmToolClient,
     protocol::{
-        CancelRequest, ControlResponse, CreateDirectoryRequest, ExecuteRequest, ExecuteResponse,
-        ReadFileRequest, ReadFileResponse, ReadyRequest, SessionRequest, SessionResponse,
+        BeginAttemptRequest, CancelRequest, ControlResponse, CreateDirectoryRequest,
+        ExecuteRequest, ExecuteResponse, FinishAttemptRequest, ReadFileRequest, ReadFileResponse,
+        ReadyRequest, ScopedRequest, ScopedResponse, SessionRequest, SessionResponse,
         ShutdownRequest, ToolRequest, WireToolContext, WireToolInput, WriteFileRequest,
     },
 };
@@ -222,6 +223,7 @@ pub struct VmToolSession {
 #[derive(Clone)]
 pub struct VmToolSessionHandle {
     inner: Arc<VmToolSessionInner>,
+    generation: Option<u64>,
 }
 
 struct VmToolSessionInner {
@@ -260,6 +262,7 @@ struct TerminalDiagnostics {
 struct PendingRequestGuard {
     inner: Weak<VmToolSessionInner>,
     id: u64,
+    generation: Option<u64>,
     armed: bool,
 }
 
@@ -399,7 +402,10 @@ impl VmToolSession {
             ));
             runtime.spawn(capture_terminal_stderr(stderr, Arc::downgrade(&inner)));
             Ok(Self {
-                handle: VmToolSessionHandle { inner },
+                handle: VmToolSessionHandle {
+                    inner,
+                    generation: None,
+                },
             })
         });
         record_vm_result(&span, started_at, &result);
@@ -583,6 +589,23 @@ impl VmToolSession {
         }
         Ok(())
     }
+
+    pub(crate) async fn force_shutdown(&self) -> Result<(), VmToolSessionError> {
+        self.handle.inner.closing.store(true, Ordering::Release);
+        close_pending(&self.handle.inner, "VM session forcibly shut down");
+
+        let child = lock_unpoisoned(&self.handle.inner.child).take();
+        let Some(mut child) = child else {
+            return Ok(());
+        };
+        if child.try_wait()?.is_none()
+            && let Err(error) = child.kill().await
+            && child.try_wait()?.is_none()
+        {
+            return Err(VmToolSessionError::Io(error));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for VmToolSessionInner {
@@ -596,6 +619,69 @@ impl Drop for VmToolSessionInner {
 }
 
 impl VmToolSessionHandle {
+    pub(crate) fn scoped(&self, generation: u64) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            generation: Some(generation),
+        }
+    }
+
+    pub(crate) async fn begin_attempt(
+        &self,
+        generation: u64,
+        workspace: String,
+        environment: Vec<(String, String)>,
+    ) -> Result<(), VmToolSessionError> {
+        if self.generation.is_some() {
+            return Err(VmToolSessionError::Protocol(
+                "attempt lifecycle requires an unscoped VM session",
+            ));
+        }
+        let response = self
+            .control_request(|id| {
+                SessionRequest::BeginAttempt(BeginAttemptRequest {
+                    id,
+                    generation,
+                    workspace,
+                    environment,
+                })
+            })
+            .await?;
+        let SessionResponse::BeginAttempt(response) = response else {
+            return Err(VmToolSessionError::Protocol(
+                "expected a begin-attempt response",
+            ));
+        };
+        control_result(response)
+    }
+
+    pub(crate) async fn finish_attempt(
+        &self,
+        generation: u64,
+        retain: bool,
+    ) -> Result<(), VmToolSessionError> {
+        if self.generation.is_some() {
+            return Err(VmToolSessionError::Protocol(
+                "attempt lifecycle requires an unscoped VM session",
+            ));
+        }
+        let response = self
+            .control_request(|id| {
+                SessionRequest::FinishAttempt(FinishAttemptRequest {
+                    id,
+                    generation,
+                    retain,
+                })
+            })
+            .await?;
+        let SessionResponse::FinishAttempt(response) = response else {
+            return Err(VmToolSessionError::Protocol(
+                "expected a finish-attempt response",
+            ));
+        };
+        control_result(response)
+    }
+
     /// Waits until the guest tool server answers a typed readiness request.
     ///
     /// # Errors
@@ -943,6 +1029,13 @@ impl VmToolSessionHandle {
         };
         self.ensure_reader().await?;
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
+        if let Some(generation) = self.generation {
+            request = SessionRequest::Scoped(ScopedRequest {
+                id,
+                generation,
+                request: Box::new(request),
+            });
+        }
         set_request_id(&mut request, id);
         span.record("rpc.request.id", id);
         span.record("vm.session.first_call", id == 0);
@@ -970,6 +1063,7 @@ impl VmToolSessionHandle {
         let mut guard = PendingRequestGuard {
             inner: Arc::downgrade(&self.inner),
             id,
+            generation: self.generation,
             armed: true,
         };
         let queued_at = Instant::now();
@@ -983,7 +1077,34 @@ impl VmToolSessionHandle {
         span.record("rpc.queue.duration_ns", elapsed_ns(queued_at));
         let response = receiver.await.map_err(|_| VmToolSessionError::Closed)?;
         guard.armed = false;
-        response.map_err(VmToolSessionError::Router)
+        let (response, bytes) = response.map_err(VmToolSessionError::Router)?;
+        match (self.generation, response) {
+            (
+                Some(expected_generation),
+                SessionResponse::Scoped(ScopedResponse {
+                    generation,
+                    response: Some(response),
+                    error: None,
+                    ..
+                }),
+            ) if generation == expected_generation => Ok((*response, bytes)),
+            (
+                Some(expected_generation),
+                SessionResponse::Scoped(ScopedResponse {
+                    generation,
+                    response: None,
+                    error: Some(error),
+                    ..
+                }),
+            ) if generation == expected_generation => Err(VmToolSessionError::Guest(error)),
+            (Some(_), SessionResponse::Scoped(_)) => Err(VmToolSessionError::Protocol(
+                "attempt response generation did not match its request",
+            )),
+            (Some(_), _) => Err(VmToolSessionError::Protocol(
+                "expected an attempt-scoped response",
+            )),
+            (None, response) => Ok((response, bytes)),
+        }
     }
 
     async fn ensure_reader(&self) -> Result<(), VmToolSessionError> {
@@ -1009,17 +1130,21 @@ impl Drop for PendingRequestGuard {
             && let Some(inner) = self.inner.upgrade()
         {
             lock_unpoisoned(&inner.pending).requests.remove(&self.id);
-            queue_cancel(&inner, self.id);
+            queue_cancel(&inner, self.id, self.generation);
         }
     }
 }
 
-fn queue_cancel(inner: &Arc<VmToolSessionInner>, target_id: u64) {
+fn queue_cancel(inner: &Arc<VmToolSessionInner>, target_id: u64, generation: Option<u64>) {
     if inner.closing.load(Ordering::Acquire) {
         return;
     }
     let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
-    let request = SessionRequest::Cancel(CancelRequest { id, target_id });
+    let request = SessionRequest::Cancel(CancelRequest {
+        id,
+        target_id,
+        generation,
+    });
     let Ok(mut frame) = serde_json::to_vec(&request) else {
         return;
     };
@@ -1232,6 +1357,12 @@ async fn read_frame(
 const fn set_request_id(request: &mut SessionRequest, id: u64) {
     match request {
         SessionRequest::Ready(request) => request.id = id,
+        SessionRequest::BeginAttempt(request) => request.id = id,
+        SessionRequest::Scoped(request) => {
+            request.id = id;
+            set_request_id(&mut request.request, id);
+        }
+        SessionRequest::FinishAttempt(request) => request.id = id,
         SessionRequest::Tool(request) => request.id = id,
         SessionRequest::WriteFile(request) => request.id = id,
         SessionRequest::CreateDirectory(request) => request.id = id,

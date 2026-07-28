@@ -6,6 +6,9 @@ use serde_json::value::RawValue;
 #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
 pub(crate) enum SessionRequest {
     Ready(ReadyRequest),
+    BeginAttempt(BeginAttemptRequest),
+    Scoped(ScopedRequest),
+    FinishAttempt(FinishAttemptRequest),
     Tool(ToolRequest),
     WriteFile(WriteFileRequest),
     CreateDirectory(CreateDirectoryRequest),
@@ -20,6 +23,9 @@ impl SessionRequest {
     pub const fn id(&self) -> u64 {
         match self {
             Self::Ready(request) => request.id,
+            Self::BeginAttempt(request) => request.id,
+            Self::Scoped(request) => request.id,
+            Self::FinishAttempt(request) => request.id,
             Self::Tool(request) => request.id,
             Self::WriteFile(request) => request.id,
             Self::CreateDirectory(request) => request.id,
@@ -35,6 +41,9 @@ impl SessionRequest {
 #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
 pub(crate) enum SessionResponse {
     Ready(ControlResponse),
+    BeginAttempt(ControlResponse),
+    Scoped(ScopedResponse),
+    FinishAttempt(ControlResponse),
     Tool(ToolResponse),
     WriteFile(ControlResponse),
     CreateDirectory(ControlResponse),
@@ -48,6 +57,9 @@ impl SessionResponse {
     pub const fn id(&self) -> u64 {
         match self {
             Self::Ready(response) => response.id,
+            Self::BeginAttempt(response) => response.id,
+            Self::Scoped(response) => response.id,
+            Self::FinishAttempt(response) => response.id,
             Self::Tool(response) => response.id,
             Self::WriteFile(response)
             | Self::CreateDirectory(response)
@@ -63,6 +75,31 @@ impl SessionResponse {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReadyRequest {
     pub id: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BeginAttemptRequest {
+    pub id: u64,
+    pub generation: u64,
+    pub workspace: String,
+    pub environment: Vec<(String, String)>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ScopedRequest {
+    pub id: u64,
+    pub generation: u64,
+    pub request: Box<SessionRequest>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FinishAttemptRequest {
+    pub id: u64,
+    pub generation: u64,
+    pub retain: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -117,12 +154,23 @@ pub(crate) struct ExecuteRequest {
 pub(crate) struct CancelRequest {
     pub id: u64,
     pub target_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ControlResponse {
     pub id: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ScopedResponse {
+    pub id: u64,
+    pub generation: u64,
+    pub response: Option<Box<SessionResponse>>,
     pub error: Option<String>,
 }
 
@@ -219,8 +267,9 @@ mod tests {
     use serde_json::{json, value::to_raw_value};
 
     use super::{
-        CreateDirectoryRequest, ReadyRequest, SessionRequest, ShutdownRequest, ToolRequest,
-        ToolResponse, WireToolContext, WireToolInput, WriteFileRequest,
+        BeginAttemptRequest, CreateDirectoryRequest, FinishAttemptRequest, ReadyRequest,
+        ScopedRequest, SessionRequest, ShutdownRequest, ToolRequest, ToolResponse, WireToolContext,
+        WireToolInput, WriteFileRequest,
     };
 
     #[test]
@@ -237,6 +286,45 @@ mod tests {
         let encoded = serde_json::to_string(&request).unwrap();
 
         assert_eq!(encoded, r#"{"kind":"shutdown","payload":{"id":9}}"#);
+    }
+
+    #[test]
+    fn attempt_scope_has_a_stable_typed_shape() {
+        let request = SessionRequest::Scoped(ScopedRequest {
+            id: 8,
+            generation: 12,
+            request: Box::new(SessionRequest::Ready(ReadyRequest { id: 8 })),
+        });
+        let encoded = serde_json::to_string(&request).unwrap();
+
+        assert_eq!(
+            encoded,
+            r#"{"kind":"scoped","payload":{"id":8,"generation":12,"request":{"kind":"ready","payload":{"id":8}}}}"#
+        );
+    }
+
+    #[test]
+    fn attempt_lifecycle_requests_have_stable_typed_shapes() {
+        let begin = SessionRequest::BeginAttempt(BeginAttemptRequest {
+            id: 3,
+            generation: 7,
+            workspace: "/workspace".to_owned(),
+            environment: vec![("TASK_MODE".to_owned(), "test".to_owned())],
+        });
+        let finish = SessionRequest::FinishAttempt(FinishAttemptRequest {
+            id: 4,
+            generation: 7,
+            retain: false,
+        });
+
+        assert_eq!(
+            serde_json::to_string(&begin).unwrap(),
+            r#"{"kind":"begin_attempt","payload":{"id":3,"generation":7,"workspace":"/workspace","environment":[["TASK_MODE","test"]]}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&finish).unwrap(),
+            r#"{"kind":"finish_attempt","payload":{"id":4,"generation":7,"retain":false}}"#
+        );
     }
 
     #[test]
