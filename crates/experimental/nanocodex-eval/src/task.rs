@@ -2,7 +2,8 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    time::Duration,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,7 @@ const VERIFIER_SCRIPT: &str = "tests/test.sh";
 pub struct Task {
     root: PathBuf,
     content_digest: Box<str>,
+    package: Arc<TaskPackage>,
     name: Box<str>,
     description: Box<str>,
     prompt: Box<str>,
@@ -228,9 +230,11 @@ impl Task {
             .environment
             .docker_image
             .unwrap_or_else(|| "local-dockerfile".to_owned());
+        let content_digest = package.digest().to_owned().into_boxed_str();
         let task = Self {
             root,
-            content_digest: package.digest().to_owned().into_boxed_str(),
+            content_digest,
+            package: Arc::new(package),
             name: name.into_boxed_str(),
             description: raw.task.description.into_boxed_str(),
             prompt: prompt.into_boxed_str(),
@@ -295,16 +299,77 @@ impl Task {
     /// Returns [`TaskLoadError::Fingerprint`] when the package cannot be read,
     /// or [`TaskLoadError::ContentChanged`] when its canonical digest changed.
     pub fn validate_package(&self) -> Result<(), TaskLoadError> {
-        self.current_package().map(drop)
+        let started = Instant::now();
+        let package = self.current_package();
+        let duration_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        match &package {
+            Ok(package) => tracing::info!(
+                target: "nanocodex_eval",
+                task_name = self.name(),
+                task_package_entries = package.entry_count(),
+                task_package_file_bytes = package.file_bytes(),
+                duration_ns,
+                status = "unchanged",
+                "validated task package identity"
+            ),
+            Err(error) => tracing::info!(
+                target: "nanocodex_eval",
+                task_name = self.name(),
+                duration_ns,
+                status = "changed",
+                error = %error,
+                "task package validation failed"
+            ),
+        }
+        package.map(drop)
     }
 
-    pub(crate) fn materialize_environment(&self, destination: &Path) -> Result<(), TaskLoadError> {
-        self.current_package()?
-            .materialize_directory(Path::new(TASK_ENVIRONMENT), destination)
-            .map_err(|source| TaskLoadError::Fingerprint {
-                path: self.root.clone(),
+    /// Materializes the environment tree captured when this task was loaded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskLoadError`] when a captured file changed, materialization
+    /// failed, or the package mutated during the copy.
+    #[doc(hidden)]
+    pub fn materialize_environment(&self, destination: &Path) -> Result<(), TaskLoadError> {
+        self.materialize_package_directory(Path::new(TASK_ENVIRONMENT), destination)
+    }
+
+    /// Materializes the verifier tree captured when this task was loaded.
+    ///
+    /// Files, directories, and Unix modes are reproduced from the same
+    /// manifest used for task identity. The source package is revalidated
+    /// after materialization.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskLoadError`] when a captured file changed, materialization
+    /// failed, or the package mutated during the copy.
+    #[doc(hidden)]
+    pub fn materialize_verifier_files(&self, destination: &Path) -> Result<(), TaskLoadError> {
+        self.materialize_package_directory(Path::new("tests"), destination)
+    }
+
+    /// Reads the verifier script captured when this task was loaded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskLoadError`] when the captured script changed, became
+    /// unreadable, or the package mutated during the read.
+    #[doc(hidden)]
+    pub fn verifier_script_bytes(&self) -> Result<Vec<u8>, TaskLoadError> {
+        let script = self
+            .package
+            .read_file(Path::new(VERIFIER_SCRIPT))
+            .map_err(|source| TaskLoadError::Read {
+                path: self.verifier.script.clone(),
                 source,
-            })
+            })?
+            .ok_or_else(|| TaskLoadError::MissingFile {
+                path: self.verifier.script.clone(),
+            })?;
+        self.validate_package()?;
+        Ok(script)
     }
 
     /// Returns the stable task name.
@@ -393,6 +458,20 @@ impl Task {
             });
         }
         Ok(package)
+    }
+
+    fn materialize_package_directory(
+        &self,
+        package_directory: &Path,
+        destination: &Path,
+    ) -> Result<(), TaskLoadError> {
+        self.package
+            .materialize_directory(package_directory, destination)
+            .map_err(|source| TaskLoadError::Fingerprint {
+                path: self.root.clone(),
+                source,
+            })?;
+        self.validate_package()
     }
 }
 
@@ -743,6 +822,42 @@ storage_mb = 1
 
         let error = Task::load(directory.path()).unwrap_err();
         assert!(error.to_string().contains("tests/test.sh"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinks_in_execution_inputs() {
+        let directory = tempdir().unwrap();
+        fs::create_dir(directory.path().join("tests")).unwrap();
+        fs::create_dir(directory.path().join("environment")).unwrap();
+        fs::write(
+            directory.path().join("task.toml"),
+            r#"
+schema_version = "1.1"
+[task]
+name = "terminal-bench/symlink"
+[agent]
+timeout_sec = 1.0
+[verifier]
+timeout_sec = 1.0
+[environment]
+docker_image = "example/task:latest"
+cpus = 1
+memory_mb = 1
+storage_mb = 1
+"#,
+        )
+        .unwrap();
+        fs::write(directory.path().join("instruction.md"), "Do it.").unwrap();
+        fs::write(directory.path().join("tests/test.sh"), "exit 0\n").unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", directory.path().join("environment/escape"))
+            .unwrap();
+
+        let error = Task::load(directory.path()).unwrap_err();
+
+        assert!(matches!(error, super::TaskLoadError::Fingerprint { .. }));
+        assert!(error.to_string().contains("symlinks are unsupported"));
+        assert!(error.to_string().contains("/etc/passwd"));
     }
 
     #[test]

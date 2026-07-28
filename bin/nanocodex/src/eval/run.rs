@@ -2619,7 +2619,7 @@ fn shell_word_without_double_quotes(value: &str) -> String {
 
 impl VerifierCache {
     fn prepare(template: &Path, task: &Task, cache: &Path) -> Result<Option<Self>, VmAttemptError> {
-        let script = fs::read(task.verifier().script())?;
+        let script = task.verifier_script_bytes()?;
         let Some(setup) = recognized_verifier_setup(&script) else {
             info!(
                 target: "nanocodex_eval",
@@ -2778,7 +2778,7 @@ impl VerifierCache {
         format_verifier_cache_disk(&attempt_cache.disk, self.disk_bytes)?;
         let session = launch.spawn(Some(&attempt_cache))?;
         mount_verifier_cache(&session).await?;
-        let script = fs::read(task.verifier().script())?;
+        let script = task.verifier_script_bytes()?;
         session
             .write_file(
                 VERIFIER_CACHE_PREPARE_SCRIPT,
@@ -3176,12 +3176,15 @@ impl VmVerifier {
             Self::stage_artifacts(&session, artifacts).await?;
             session
         } else {
-            let tests = task
-                .verifier()
-                .script()
-                .parent()
-                .ok_or_else(|| io::Error::other("verifier script has no parent directory"))?;
-            Self::copy_directory(&agent_session, tests, tests, Path::new("/tests")).await?;
+            let tests = tempfile::tempdir()?;
+            task.materialize_verifier_files(tests.path())?;
+            Self::copy_directory(
+                &agent_session,
+                tests.path(),
+                tests.path(),
+                Path::new("/tests"),
+            )
+            .await?;
             agent_session
         };
         session
@@ -3314,7 +3317,7 @@ impl VmVerifier {
             .cache
             .as_ref()
             .ok_or_else(|| io::Error::other("verifier cache metadata is missing"))?;
-        let script = fs::read(task.verifier().script())?;
+        let script = task.verifier_script_bytes()?;
         let cached = cached_verifier_script(
             &script,
             RecognizedVerifierSetup {
@@ -3370,6 +3373,11 @@ impl VmVerifier {
         destination: &'a Path,
     ) -> Pin<Box<dyn Future<Output = Result<(), VmAttemptError>> + Send + 'a>> {
         Box::pin(async move {
+            let relative = directory.strip_prefix(root).map_err(io::Error::other)?;
+            let guest_directory = destination.join(relative).to_string_lossy().into_owned();
+            let directory_mode =
+                std::os::unix::fs::PermissionsExt::mode(&fs::metadata(directory)?.permissions());
+            Self::create_guest_directory(session, &guest_directory, directory_mode).await?;
             for entry in fs::read_dir(directory)? {
                 let entry = entry?;
                 let path = entry.path();
@@ -3388,6 +3396,32 @@ impl VmVerifier {
             }
             Ok(())
         })
+    }
+
+    async fn create_guest_directory(
+        session: &VmToolSession,
+        directory: &str,
+        mode: u32,
+    ) -> Result<(), VmAttemptError> {
+        for command in [
+            VmCommand::new("/bin/mkdir")
+                .arg("-p")
+                .arg(directory.to_owned()),
+            VmCommand::new("/bin/chmod")
+                .arg(format!("{:o}", mode & 0o7777))
+                .arg(directory.to_owned()),
+        ] {
+            let output = session.command(command).await?;
+            if output.exit_code != 0 {
+                return Err(io::Error::other(format!(
+                    "staging verifier directory {directory} exited {}: {}",
+                    output.exit_code,
+                    String::from_utf8_lossy(&output.stderr)
+                ))
+                .into());
+            }
+        }
+        Ok(())
     }
 }
 

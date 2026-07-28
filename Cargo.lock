@@ -4455,6 +4455,7 @@ version = "0.2.0"
 dependencies = [
  "chrono",
  "criterion",
+ "filetime",
  "fs2",
  "futures-util",
  "hex",

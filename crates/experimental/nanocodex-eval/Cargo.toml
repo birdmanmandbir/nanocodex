@@ -15,6 +15,7 @@ description = "Typed, durable evaluation and Harbor artifacts for Nanocodex agen
 
 [dependencies]
 chrono.workspace = true
+filetime.workspace = true
 futures-util.workspace = true
 fs2.workspace = true
 hex.workspace = true

@@ -54,7 +54,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs::{self, File},
-    io::{self, BufReader, Read, Seek, SeekFrom},
+    io::{self, BufReader, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     time::Duration,
 };
@@ -1216,6 +1216,7 @@ fn prepare_context_disk(
     let mut archive_file = tempfile::NamedTempFile::new_in(&contexts)?;
     {
         let mut archive = tar::Builder::new(archive_file.as_file_mut());
+        append_normalized_context_entry(&mut archive, environment, Path::new("context"))?;
         let mut walker = WalkBuilder::new(environment);
         walker
             .hidden(false)
@@ -1235,7 +1236,11 @@ fn prepare_context_disk(
             if relative.as_os_str().is_empty() {
                 continue;
             }
-            archive.append_path_with_name(entry.path(), Path::new("context").join(relative))?;
+            append_normalized_context_entry(
+                &mut archive,
+                entry.path(),
+                &Path::new("context").join(relative),
+            )?;
         }
         archive.finish()?;
     }
@@ -1269,6 +1274,64 @@ fn prepare_context_disk(
     }
     validate_ext4_disk(&path)?;
     Ok((path, digest))
+}
+
+fn append_normalized_context_entry<W>(
+    archive: &mut tar::Builder<W>,
+    source: &Path,
+    archive_path: &Path,
+) -> Result<(), ImageError>
+where
+    W: Write,
+{
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.file_type().is_symlink() {
+        return Err(ImageError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "VM build-context symlinks are unsupported: {}",
+                source.display()
+            ),
+        )));
+    }
+    let (entry_type, size) = if metadata.is_dir() {
+        (tar::EntryType::Directory, 0)
+    } else if metadata.is_file() {
+        (tar::EntryType::Regular, metadata.len())
+    } else {
+        return Err(ImageError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported VM build-context entry: {}", source.display()),
+        )));
+    };
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(entry_type);
+    header.set_size(size);
+    #[cfg(unix)]
+    header.set_mode(metadata.permissions().mode() & 0o7777);
+    #[cfg(not(unix))]
+    header.set_mode(if metadata.permissions().readonly() {
+        0o444
+    } else {
+        0o644
+    });
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mtime(0);
+    header.set_cksum();
+    if metadata.is_file() {
+        archive.append_data(
+            &mut header,
+            archive_path,
+            BufReader::new(File::open(source)?),
+        )?;
+    } else {
+        archive.append_data(&mut header, archive_path, io::empty())?;
+    }
+    Ok(())
 }
 
 struct BuildMount {
@@ -2175,10 +2238,10 @@ mod tests {
         CACHE_RECORD_VERSION, CONTEXT_DISK_BYTES, COPY_SCRIPT, CachePolicy, DiskStatus,
         DockerfileRecipe, FIRMWARE_LIBRARY_FILENAME, FIRMWARE_LIBRARY_PATH_ENVIRONMENT, ImageError,
         ImageRuntimeConfig, LayerRecord, ManifestSource, PulledImage, PulledLayer, Reader,
-        ReferenceRecord, VmImageBuilder, blob_path, build_guest_bootstrap_script,
-        configure_firmware_library_path, disk_cache_key, docker_process_environment, output_tail,
-        prepare_copy_source_disk, prepare_flattened_disk, reference_cache_key,
-        resolver_configuration, write_cache_record,
+        ReferenceRecord, VmImageBuilder, append_normalized_context_entry, blob_path,
+        build_guest_bootstrap_script, configure_firmware_library_path, disk_cache_key,
+        docker_process_environment, output_tail, prepare_copy_source_disk, prepare_flattened_disk,
+        reference_cache_key, resolver_configuration, write_cache_record,
     };
     use flate2::{Compression, write::GzEncoder};
     use tracing::{
@@ -2196,6 +2259,48 @@ mod tests {
     const FIXTURE_LAYER: &str =
         "sha256:bd89d118a7a5c5bcefe7129975d406284981f597340a222b5df50f7044157ff0";
     static IMAGE_PREPARE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(unix)]
+    #[test]
+    fn build_context_headers_preserve_modes_and_normalize_host_metadata() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("run");
+        fs::write(&source, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o751)).unwrap();
+        let mut encoded = Vec::new();
+        {
+            let mut archive = tar::Builder::new(&mut encoded);
+            append_normalized_context_entry(&mut archive, &source, Path::new("context/run"))
+                .unwrap();
+            archive.finish().unwrap();
+        }
+
+        let mut archive = tar::Archive::new(std::io::Cursor::new(encoded));
+        let entry = archive.entries().unwrap().next().unwrap().unwrap();
+        let header = entry.header();
+        assert_eq!(header.mode().unwrap(), 0o751);
+        assert_eq!(header.uid().unwrap(), 0);
+        assert_eq!(header.gid().unwrap(), 0);
+        assert_eq!(header.mtime().unwrap(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_context_rejects_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("escape");
+        std::os::unix::fs::symlink("/etc/passwd", &source).unwrap();
+        let mut encoded = Vec::new();
+        let mut archive = tar::Builder::new(&mut encoded);
+
+        let error =
+            append_normalized_context_entry(&mut archive, &source, Path::new("context/escape"))
+                .unwrap_err();
+
+        assert!(error.to_string().contains("symlinks are unsupported"));
+    }
 
     struct LocalImageFixture {
         root: tempfile::TempDir,

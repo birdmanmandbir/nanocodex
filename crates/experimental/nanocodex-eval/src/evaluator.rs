@@ -248,6 +248,20 @@ pub enum EvalError {
     #[error("evaluation job is already bound to a different run: {0}")]
     RunConflict(PathBuf),
 
+    /// A resumable job uses an incompatible task digest algorithm.
+    #[error(
+        "evaluation job {path} uses task digest schema `{found}`; expected `{expected}`; \
+         start an explicit fresh run to cross this recovery boundary"
+    )]
+    RunDigestSchemaIncompatible {
+        /// Retained job whose task identity cannot be compared safely.
+        path: PathBuf,
+        /// Retained schema label.
+        found: String,
+        /// Current schema label.
+        expected: String,
+    },
+
     /// A retained terminal result did not belong to its finite run.
     #[error("invalid durable evaluation trial: {0}")]
     InvalidDurableTrial(String),
@@ -1251,19 +1265,90 @@ fn failure_kind(error: &EvalError) -> EvalFailureKind {
         | EvalError::Io(_)
         | EvalError::Json(_)
         | EvalError::RunConflict(_)
+        | EvalError::RunDigestSchemaIncompatible { .. }
         | EvalError::RunActive(_)
         | EvalError::MissingSweepCoordinate => EvalFailureKind::Internal,
     }
 }
 
 fn reject_output_overlap(output: &Path, task: &Path) -> Result<(), EvalError> {
-    if output.starts_with(task) {
+    if output.starts_with(task) || output_aliases_task_package(output, task)? {
         return Err(EvalError::OutputOverlapsTask {
             output: output.to_path_buf(),
             task: task.to_path_buf(),
         });
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn output_aliases_task_package(output: &Path, task: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    const PACKAGE_DIRECTORIES: [&str; 4] = ["environment", "tests", "solution", "steps"];
+
+    // The output ancestry is application-owned and non-adversarial. Comparing
+    // existing directory identities also catches accidental bind-mount aliases;
+    // it is not intended to defend against a concurrent hostile path swap.
+    let mut identities = std::collections::HashSet::<(u64, u64)>::new();
+    let mut pending = vec![task.to_path_buf()];
+    pending.extend(PACKAGE_DIRECTORIES.into_iter().map(|name| task.join(name)));
+    while let Some(directory) = pending.pop() {
+        let metadata = match fs::symlink_metadata(&directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "task package symlinks are unsupported while checking output ancestry: {}",
+                    directory.display()
+                ),
+            ));
+        }
+        if !metadata.is_dir() || !identities.insert((metadata.dev(), metadata.ino())) {
+            continue;
+        }
+        if directory != task {
+            for entry in fs::read_dir(&directory)? {
+                let entry = entry?;
+                let metadata = fs::symlink_metadata(entry.path())?;
+                if metadata.file_type().is_symlink() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "task package symlinks are unsupported while checking output ancestry: {}",
+                            entry.path().display()
+                        ),
+                    ));
+                }
+                if metadata.is_dir() {
+                    pending.push(entry.path());
+                }
+            }
+        }
+    }
+
+    for ancestor in output.ancestors() {
+        match fs::metadata(ancestor) {
+            Ok(metadata)
+                if metadata.is_dir() && identities.contains(&(metadata.dev(), metadata.ino())) =>
+            {
+                return Ok(true);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(not(unix))]
+fn output_aliases_task_package(_output: &Path, _task: &Path) -> io::Result<bool> {
+    Ok(false)
 }
 
 fn prospective_canonical_directory(path: &Path) -> io::Result<PathBuf> {
@@ -1597,7 +1682,7 @@ mod tracing_tests {
     use std::{
         collections::HashMap,
         fs,
-        sync::{Arc, Mutex},
+        sync::{Arc, Mutex, Once, OnceLock},
         time::Duration,
     };
 
@@ -1610,8 +1695,8 @@ mod tracing_tests {
     use uuid::Uuid;
 
     use super::{
-        AdmissionController, EvalError, Evaluator, SweepCoordinate, failure_kind, trial_name,
-        validate_attempt_environment,
+        AdmissionController, EvalError, Evaluator, SweepCoordinate, failure_kind,
+        output_aliases_task_package, trial_name, validate_attempt_environment,
     };
     use crate::{
         EvalFailureKind, Sweep, Task, TaskLoadError, native::NativeAttempt, sweep::AgentId,
@@ -1619,6 +1704,8 @@ mod tracing_tests {
 
     #[derive(Clone, Default)]
     struct TraceCapture(Arc<Mutex<HashMap<u64, CapturedSpan>>>);
+    static TRACE_CAPTURE: OnceLock<TraceCapture> = OnceLock::new();
+    static TRACE_SUBSCRIBER: Once = Once::new();
 
     struct CapturedSpan {
         name: &'static str,
@@ -1627,6 +1714,18 @@ mod tracing_tests {
     }
 
     struct FieldCapture<'a>(&'a mut HashMap<String, String>);
+
+    fn install_trace_capture() -> TraceCapture {
+        let capture = TRACE_CAPTURE.get_or_init(TraceCapture::default).clone();
+        TRACE_SUBSCRIBER.call_once(|| {
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::registry().with(capture.clone()),
+            )
+            .expect("test process has no pre-existing global tracing subscriber");
+            tracing::callsite::rebuild_interest_cache();
+        });
+        capture
+    }
 
     #[test]
     fn fresh_finite_run_is_bound_before_execution() {
@@ -1817,6 +1916,7 @@ mod tracing_tests {
 
     #[test]
     fn failed_attempt_does_not_cancel_pending_batch_work() {
+        let capture = install_trace_capture();
         let task_root = tempdir().unwrap();
         fs::create_dir(task_root.path().join("tests")).unwrap();
         fs::create_dir(task_root.path().join("environment")).unwrap();
@@ -1856,35 +1956,36 @@ allow_internet = false
         ));
         assert!(validate_attempt_environment(&task, true).is_ok());
         let output = tempdir().unwrap();
-        let capture = TraceCapture::default();
-        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(capture.clone()));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
 
-        tracing::dispatcher::with_default(&dispatch, || {
-            runtime.block_on(async {
-                let (eval, _events) =
-                    Evaluator::builder(Nanocodex::builder(OpenAi::new("test").unwrap()))
-                        .output_directory(output.path())
-                        .build()
-                        .unwrap();
-                let result = eval
-                    .tasks(vec![task.clone(), task])
-                    .instrument(tracing::info_span!("test.parent"))
-                    .await;
-                assert!(matches!(
-                    result,
-                    Err(EvalError::UnsupportedNativeTask { .. })
-                ));
-            });
+        let eval_id = runtime.block_on(async {
+            let (eval, _events) =
+                Evaluator::builder(Nanocodex::builder(OpenAi::new("test").unwrap()))
+                    .output_directory(output.path())
+                    .build()
+                    .unwrap();
+            let eval_id = eval.id().to_string();
+            let result = eval
+                .tasks(vec![task.clone(), task])
+                .instrument(tracing::info_span!("test.parent"))
+                .await;
+            assert!(matches!(
+                result,
+                Err(EvalError::UnsupportedNativeTask { .. })
+            ));
+            eval_id
         });
 
         let spans = capture.0.lock().unwrap();
         let attempts = spans
             .iter()
-            .filter(|(_, span)| span.name == "eval.attempt")
+            .filter(|(_, span)| {
+                span.name == "eval.attempt"
+                    && span.fields.get("eval.id").is_some_and(|id| id == &eval_id)
+            })
             .collect::<Vec<_>>();
         assert_eq!(attempts.len(), 2);
         for (_, attempt) in &attempts {
@@ -1897,7 +1998,12 @@ allow_internet = false
         }
         let setups = spans
             .values()
-            .filter(|span| span.name == "eval.environment.setup")
+            .filter(|span| {
+                span.name == "eval.environment.setup"
+                    && attempts
+                        .iter()
+                        .any(|(attempt_id, _)| span.parent == Some(**attempt_id))
+            })
             .collect::<Vec<_>>();
         assert_eq!(setups.len(), 2);
         for setup in setups {
@@ -1974,6 +2080,18 @@ allow_internet = false
 
         assert!(matches!(result, Err(EvalError::OutputOverlapsTask { .. })));
         assert!(!output.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detects_an_output_directory_reached_through_a_filesystem_alias() {
+        let tasks = tempdir().unwrap();
+        let task = write_named_task(tasks.path(), "alias", "terminal-bench/alias");
+        let aliases = tempdir().unwrap();
+        let alias = aliases.path().join("environment");
+        std::os::unix::fs::symlink(task.environment_directory(), &alias).unwrap();
+
+        assert!(output_aliases_task_package(&alias.join("retained/evals"), task.root()).unwrap());
     }
 
     fn write_named_task(parent: &std::path::Path, directory: &str, name: &str) -> Task {
