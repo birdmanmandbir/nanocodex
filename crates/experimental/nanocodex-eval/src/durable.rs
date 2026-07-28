@@ -422,10 +422,7 @@ mod tests {
             let task = &self.tasks[task];
             let short_name = task.name().rsplit('/').next().unwrap_or(task.name());
             let compact_id = id.simple().to_string();
-            let trial_name = format!(
-                "{short_name}__{agent}__{repetition:03}__{}",
-                &compact_id[..8]
-            );
+            let trial_name = format!("{short_name}__{agent}__{repetition:03}__{compact_id}");
             let result = json!({
                 "id": id,
                 "task_name": task.name(),

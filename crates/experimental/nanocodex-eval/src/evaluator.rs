@@ -1478,11 +1478,9 @@ fn trial_name(task: &Task, attempt_id: Uuid, coordinate: Option<&SweepCoordinate
     match coordinate {
         Some(coordinate) => format!(
             "{short_name}__{}__{:03}__{}",
-            coordinate.agent,
-            coordinate.trial,
-            &compact_id[..8]
+            coordinate.agent, coordinate.trial, compact_id
         ),
-        None => format!("{short_name}__{}", &compact_id[..8]),
+        None => format!("{short_name}__{compact_id}"),
     }
 }
 
@@ -1529,11 +1527,13 @@ mod tracing_tests {
     use tracing_subscriber::{
         Layer, layer::Context as LayerContext, prelude::*, registry::LookupSpan,
     };
+    use uuid::Uuid;
 
     use super::{
-        AdmissionController, EvalError, Evaluator, failure_kind, validate_attempt_environment,
+        AdmissionController, EvalError, Evaluator, SweepCoordinate, failure_kind, trial_name,
+        validate_attempt_environment,
     };
-    use crate::{EvalFailureKind, Sweep, Task};
+    use crate::{EvalFailureKind, Sweep, Task, native::NativeAttempt, sweep::AgentId};
 
     #[derive(Clone, Default)]
     struct TraceCapture(Arc<Mutex<HashMap<u64, CapturedSpan>>>);
@@ -1574,6 +1574,55 @@ mod tracing_tests {
         assert_eq!(eval.planned_attempts(), Some(2));
         assert_eq!(eval.remaining_attempts(&sweep).unwrap(), 2);
         assert!(eval.directory().join("run.json").is_file());
+    }
+
+    #[test]
+    fn colliding_task_names_and_immediate_retries_get_distinct_attempt_paths() {
+        let tasks = tempdir().unwrap();
+        let first = write_named_task(tasks.path(), "first", "one/shared");
+        let second = write_named_task(tasks.path(), "second", "two/shared");
+        let coordinate = SweepCoordinate {
+            agent: AgentId::new("default").unwrap(),
+            trial: 1,
+        };
+        let ids = [
+            Uuid::from_u128(0x1234_5678_0000_0000_0000_0000_0000_0001),
+            Uuid::from_u128(0x1234_5678_0000_0000_0000_0000_0000_0002),
+            Uuid::from_u128(0x1234_5678_0000_0000_0000_0000_0000_0003),
+        ];
+        let first_name = trial_name(&first, ids[0], Some(&coordinate));
+        let second_name = trial_name(&second, ids[1], Some(&coordinate));
+        let retry_name = trial_name(&first, ids[2], Some(&coordinate));
+
+        let compact_ids = ids.map(|id| id.simple().to_string());
+        assert_eq!(&compact_ids[0][..8], &compact_ids[1][..8]);
+        assert_eq!(&compact_ids[0][..8], &compact_ids[2][..8]);
+        assert_ne!(first_name, second_name);
+        assert_ne!(first_name, retry_name);
+        assert_ne!(second_name, retry_name);
+        assert!(first_name.ends_with(&compact_ids[0]));
+        assert!(second_name.ends_with(&compact_ids[1]));
+        assert!(retry_name.ends_with(&compact_ids[2]));
+
+        let output = tempdir().unwrap();
+        let first_attempt = NativeAttempt::prepare(output.path(), &first_name, &first).unwrap();
+        fs::write(
+            first_attempt.paths.workspace.join("abandoned-partial"),
+            "partial\n",
+        )
+        .unwrap();
+        let second_attempt = NativeAttempt::prepare(output.path(), &second_name, &second).unwrap();
+        let retry_attempt = NativeAttempt::prepare(output.path(), &retry_name, &first).unwrap();
+
+        assert_ne!(first_attempt.paths.root, second_attempt.paths.root);
+        assert_ne!(first_attempt.paths.root, retry_attempt.paths.root);
+        assert!(
+            !retry_attempt
+                .paths
+                .workspace
+                .join("abandoned-partial")
+                .exists()
+        );
     }
 
     #[test]
@@ -1790,5 +1839,38 @@ allow_internet = false
         }));
 
         assert_eq!(failure_kind(&error), EvalFailureKind::AgentSafetyRefusal);
+    }
+
+    fn write_named_task(parent: &std::path::Path, directory: &str, name: &str) -> Task {
+        let root = parent.join(directory);
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("environment")).unwrap();
+        fs::create_dir(root.join("tests")).unwrap();
+        fs::write(root.join("instruction.md"), "Do the work.\n").unwrap();
+        fs::write(root.join("tests/test.sh"), "exit 0\n").unwrap();
+        fs::write(
+            root.join("task.toml"),
+            format!(
+                r#"
+schema_version = "1.1"
+[task]
+name = "{name}"
+description = "attempt identity fixture"
+[agent]
+timeout_sec = 1.0
+[verifier]
+timeout_sec = 1.0
+[environment]
+docker_image = "alpine:3.21"
+cpus = 1
+memory_mb = 128
+storage_mb = 128
+gpus = 0
+allow_internet = false
+"#
+            ),
+        )
+        .unwrap();
+        Task::load(root).unwrap()
     }
 }
