@@ -50,6 +50,15 @@ cargo bench -p nanocodex-eval --bench eval_runtime -- plan_3x4x5_sweep
 cargo bench -p nanocodex-eval --bench eval_runtime -- aggregate_60_plot_facts
 ```
 
+The final current-head rerun after schema v2 (`0b4b073`) used one combined
+Criterion filter and reported:
+
+| Operation | x86_64 Linux estimate |
+| --- | ---: |
+| 60-attempt sweep plan | 720.34–721.68 ns |
+| durable incomplete-job resume | 26.553–26.662 µs |
+| aggregate 60 plot facts | 9.1239–9.1543 µs |
+
 ## Regression contract
 
 Machine-local investigation budgets:
@@ -205,6 +214,13 @@ VMM spawn, the typed readiness exchange (89.801 ms), model-visible tool calls,
 guest RPC mutation, in-guest verifier execution, reward-file collection, and
 an acknowledged shutdown.
 
+These two retained jobs predate the typed environment-label correction in
+`9eceb54`, so the VM trial's Harbor `config.json` incorrectly spells its
+backend as `native`; the separate trace and private root are the executable VM
+evidence. Deterministic projection tests now require `microvm` consistently in
+job config, trial config, locks, successful results, and failures. A new paid
+model attempt was not launched solely to rewrite historical metadata.
+
 The separate normal headless consumer is retained under
 `.nanocodex/evidence/run-vm`: 254 stdout JSONL records end in exactly one
 `run.completed`, while `trace.jsonl` separately proves VMM spawn/readiness,
@@ -212,6 +228,14 @@ The separate normal headless consumer is retained under
 acknowledged graceful shutdown. Its run completed in 6.778 s at an estimated
 $0.084523. These paths are intentionally ignored development evidence and are
 not source-controlled.
+
+Later focused schema gates retain `timing.json` with cold image/cache and warm
+attempt wall time, plus per-attempt scheduler queue and VM readiness phases.
+Invocation schema v2 retains the exact executable SHA-256, Git/build identity,
+model, tool profile, pricing revision, explicit absence of a seed, and
+scheduling policy/source. These additions passed deterministic CLI and
+projection tests; the paid live jobs above use the preceding schema and are
+not presented as evidence for the new fields.
 
 ## Public GPT-5.6 Sol Terminal-Bench 2.1 comparator
 
@@ -297,7 +321,7 @@ drift means this is not a controlled reasoning-effort ablation.
 | typed events and results | `EvalEvents`, `EvalEventStream`, `EvalResult`, `EvalFailure`, `SweepResults`; independent subscription, lag, and ordering tests |
 | Harbor job and ATIF projection | `nanocodex_eval::harbor`; canonical package/checksum/result/trajectory tests and warnings-denied public rustdoc examples |
 | published Harbor reader | typed cached reader with bounded downloads, immutable revision selection, task/checksum/agent filters, and compatibility decoding |
-| USD accounting | the same versioned `PricingSnapshot` accepted by the agent and CLI flows into per-attempt result, ATIF, Harbor, JSON report, tracing, and an honest known-cost human summary |
+| USD accounting | the agent's built-in pricing catalog flows into per-attempt result, ATIF, Harbor, JSON report, tracing, and an honest known-cost human summary; invocation schema v2 retains its explicit revision |
 
 The complete CLI remains available under one executable:
 
@@ -323,3 +347,16 @@ byte-compatible so existing jobs and prepared images stay valid.
 The four imported task/verifier fixtures are byte-identical to the source
 checkpoint. No benchmark prompt, task configuration, environment, or verifier
 was edited to improve a result.
+
+## Open completion gate
+
+The current VM eval adapter launches an agent VM per attempt and may launch a
+second verifier VM. It does not satisfy the planned one-retained-VM-per-task
+allocation invariant. The guest tool server exposes one workspace root and
+does not create tenant filesystem or process namespaces; merely assigning
+different working directories would not prevent one concurrent configuration
+from reading or mutating another. The remaining implementation must add a
+task-scoped evaluator environment lifecycle and guest-enforced tenant roots,
+process groups, ports, temporary paths, cancellation, and verifier output
+before VM sharing can be claimed. Full-suite and representative paid sweep
+claims remain gated on that isolation work and an explicit run budget.

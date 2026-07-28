@@ -133,6 +133,22 @@ sweep scheduler already implements it:
 PR 2 is complete when `nanocodex eval ...` can run the full configured suite
 against a selected local or PR build using the consolidated Rust/library path.
 
+Current Part 2 status (2026-07-28): the two crate boundaries, high-level
+retained VM workspace API, native and per-attempt KVM execution, Harbor/ATIF
+projection, durable resume, plot-ready aggregates, explicit host/VM selection,
+Linux musl host build, lean guest build, and focused live native/KVM evidence
+are implemented. New jobs retain the exact executable digest, Git/build
+identity, model, tool profile, pricing revision, seed status, scheduling
+policy, task-package digest, ordered evidence, and separate queue, readiness,
+cold image/cache, and warm-attempt timing. The allocation gate above is not
+yet implemented: the current eval adapter owns one agent VM and, where needed,
+one verifier VM per attempt. Its single guest RPC runtime has no tenant
+namespace boundary, so sharing it concurrently would let one configuration
+address another configuration's paths. Completion requires a task-scoped
+environment lifecycle plus tenant-scoped guest filesystem/process namespaces,
+then full configured-suite and bounded representative sweep evidence. Do not
+describe the current per-attempt adapter as one-VM-per-task isolation.
+
 ### PR 3 — Experimental managed-agent components
 
 1. Add experimental browser-on-VM, Centaur durability/managed-agent work, and
