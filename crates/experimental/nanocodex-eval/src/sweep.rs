@@ -235,6 +235,27 @@ impl RunManifest {
         self.tasks.iter().any(|task| task.root == task_root)
     }
 
+    pub(crate) fn is_compatible_with(&self, other: &Self) -> bool {
+        if self.trials != other.trials
+            || self.agents != other.agents
+            || self.tasks.len() != other.tasks.len()
+        {
+            return false;
+        }
+
+        let mut tasks = self.tasks.iter().collect::<Vec<_>>();
+        let mut other_tasks = other.tasks.iter().collect::<Vec<_>>();
+        tasks.sort_unstable_by(|left, right| left.root.cmp(&right.root));
+        other_tasks.sort_unstable_by(|left, right| left.root.cmp(&right.root));
+        tasks.into_iter().zip(other_tasks).all(|(left, right)| {
+            left.root == right.root
+                && match (&left.name, &right.name) {
+                    (Some(left), Some(right)) => left == right,
+                    (None, _) | (_, None) => true,
+                }
+        })
+    }
+
     pub(crate) fn coordinate_for_trial(
         &self,
         task_root: &Path,
@@ -291,12 +312,8 @@ impl PartialEq for RunManifest {
             return false;
         }
 
-        let mut tasks = self.tasks.iter().map(|task| &task.root).collect::<Vec<_>>();
-        let mut other_tasks = other
-            .tasks
-            .iter()
-            .map(|task| &task.root)
-            .collect::<Vec<_>>();
+        let mut tasks = self.tasks.iter().collect::<Vec<_>>();
+        let mut other_tasks = other.tasks.iter().collect::<Vec<_>>();
         tasks.sort_unstable();
         other_tasks.sort_unstable();
         tasks == other_tasks
@@ -520,13 +537,58 @@ mod tests {
         let id = Uuid::from_u128(0x1234_5678_0000_0000_0000_0000_0000_0001);
         let trial_name = "write-greeting__default__001__12345678";
 
-        assert_eq!(legacy, current);
+        assert_ne!(legacy, current);
+        assert!(legacy.is_compatible_with(&current));
         let coordinate = legacy
             .coordinate_for_trial(task.root(), task.name(), trial_name, id)
             .unwrap();
         assert_eq!(coordinate.task_root(), task.root());
         assert_eq!(coordinate.agent().as_str(), "default");
         assert_eq!(coordinate.repetition(), 1);
+    }
+
+    #[test]
+    fn manifest_identity_rejects_a_renamed_task_at_the_same_root() {
+        let sweep = Sweep::builder()
+            .task(load_task("write-greeting"))
+            .agent(
+                "default",
+                Nanocodex::builder(OpenAi::new("test-key").unwrap()),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let current = sweep.manifest();
+        let mut retained = current.clone();
+        retained.tasks[0].name = Some("nanoeval/renamed-task".to_owned());
+
+        assert_ne!(retained, current);
+        assert!(!retained.is_compatible_with(&current));
+    }
+
+    #[test]
+    fn legacy_name_wildcard_does_not_break_manifest_equality_transitivity() {
+        let sweep = Sweep::builder()
+            .task(load_task("write-greeting"))
+            .agent(
+                "default",
+                Nanocodex::builder(OpenAi::new("test-key").unwrap()),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let named = sweep.manifest();
+        let mut legacy = named.clone();
+        legacy.tasks[0].name = None;
+        let mut renamed = named.clone();
+        renamed.tasks[0].name = Some("nanoeval/renamed-task".to_owned());
+
+        assert_ne!(named, legacy);
+        assert_ne!(legacy, renamed);
+        assert_ne!(named, renamed);
+        assert!(named.is_compatible_with(&legacy));
+        assert!(legacy.is_compatible_with(&renamed));
+        assert!(!named.is_compatible_with(&renamed));
     }
 
     #[test]

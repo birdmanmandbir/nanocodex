@@ -88,7 +88,7 @@ impl EvalJob {
             let Ok(retained) = Self::read_json::<RunManifest>(&directory.join(RUN_FILE)) else {
                 continue;
             };
-            if retained != *run {
+            if !retained.is_compatible_with(run) {
                 continue;
             }
             let completed = scan_manifest_trials(&directory, identity.id, run)
@@ -180,7 +180,7 @@ impl EvalJob {
 
     fn verify_run(path: &Path, expected: &RunManifest) -> Result<(), EvalError> {
         let retained: RunManifest = serde_json::from_slice(&fs::read(path)?)?;
-        if retained == *expected {
+        if retained.is_compatible_with(expected) {
             Ok(())
         } else {
             Err(EvalError::RunConflict(path.to_path_buf()))
@@ -264,6 +264,37 @@ mod tests {
     }
 
     #[test]
+    fn resumes_a_legacy_manifest_without_task_names() {
+        let output = tempdir().unwrap();
+        let run = sweep(2).manifest();
+        let legacy = manifest_with_task_name(&run, None);
+        let first = EvalJob::create(output.path()).unwrap();
+        first.bind_run(&legacy).unwrap();
+        let first_id = first.id();
+        drop(first);
+
+        let resumed = EvalJob::resume_or_create(output.path(), &run).unwrap();
+        assert!(resumed.resumed());
+        assert_eq!(resumed.id(), first_id);
+        resumed.bind_run(&run).unwrap();
+    }
+
+    #[test]
+    fn does_not_resume_a_task_renamed_at_the_same_root() {
+        let output = tempdir().unwrap();
+        let run = sweep(2).manifest();
+        let renamed = manifest_with_task_name(&run, Some("nanoeval/renamed-task"));
+        let first = EvalJob::create(output.path()).unwrap();
+        first.bind_run(&run).unwrap();
+        let first_id = first.id();
+        drop(first);
+
+        let fresh = EvalJob::resume_or_create(output.path(), &renamed).unwrap();
+        assert!(!fresh.resumed());
+        assert_ne!(fresh.id(), first_id);
+    }
+
+    #[test]
     fn refuses_to_open_an_incomplete_job_that_is_still_active() {
         let output = tempdir().unwrap();
         let run = sweep(2).manifest();
@@ -337,5 +368,16 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
+    }
+
+    fn manifest_with_task_name(run: &RunManifest, name: Option<&str>) -> RunManifest {
+        let mut retained = serde_json::to_value(run).unwrap();
+        let task = retained["tasks"][0].as_object_mut().unwrap();
+        if let Some(name) = name {
+            task.insert("name".to_owned(), serde_json::json!(name));
+        } else {
+            task.remove("name");
+        }
+        serde_json::from_value(retained).unwrap()
     }
 }
