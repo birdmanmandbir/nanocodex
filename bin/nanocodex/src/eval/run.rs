@@ -27,10 +27,10 @@ use nanocodex::{
 };
 use nanocodex_eval::harbor::{Harbor, HarborJob, HarborRecorder};
 use nanocodex_eval::{
-    AggregateDataset, AttemptAgent, AttemptFact, AttemptVerification, AttemptVerifier, EvalAttempt,
-    EvalEnvironment, EvalEventKind, EvalEventStream, EvalFailure, EvalFailureKind, EvalResult,
-    EvalStatus, Evaluator, EvaluatorBuilder, NetworkPolicy, Sweep, SweepResults, Task,
-    VerifierEnvironmentMode, VerifierResult,
+    AttemptAgent, AttemptVerification, AttemptVerifier, EvalAttempt, EvalEnvironment,
+    EvalEventKind, EvalEventStream, EvalFailure, EvalFailureKind, EvalResult, EvalStatus,
+    Evaluator, EvaluatorBuilder, NetworkPolicy, Sweep, SweepResults, Task, VerifierEnvironmentMode,
+    VerifierResult,
 };
 use nanocodex_vm::image::{CachePolicy, VmImageBuilder, reflink_or_sparse_copy};
 use nanocodex_vm::{BlockDevice, GuestCommand, Network, VmConfig};
@@ -635,7 +635,7 @@ impl Run {
         )
         .await?;
         let output_started = Instant::now();
-        persist_aggregate(finished.job.directory(), &finished.results)?;
+        persist_aggregate(&finished.job)?;
         Self::write_report(
             &finished.job,
             finished.outcomes,
@@ -743,22 +743,10 @@ impl Run {
     }
 }
 
-fn persist_aggregate(job: &Path, results: &[EvalResult]) -> Result<()> {
-    let attempts = results
-        .iter()
-        .map(|result| {
-            let repetition = result
-                .trial_name
-                .rsplit("__")
-                .nth(1)
-                .and_then(|trial| trial.parse().ok())
-                .unwrap_or(1);
-            AttemptFact::from_result("default", repetition, result)
-        })
-        .collect();
+fn persist_aggregate(job: &HarborJob) -> Result<()> {
     write_json_atomic(
-        &job.join("aggregate.json"),
-        &AggregateDataset::new(attempts),
+        &job.directory().join("aggregate.json"),
+        &job.aggregate_dataset()?,
     )
 }
 

@@ -47,8 +47,9 @@ use std::{
 };
 
 use crate::{
-    AgentMetadata, AtifBuilder, AtifTrajectory, EvalEnvironment, EvalEventKind, EvalEventStream,
-    EvalEventStreamError, EvalFailure, EvalResult, Evaluator, PhaseTiming, Task,
+    AgentMetadata, AggregateDataset, AtifBuilder, AtifTrajectory, AttemptFact,
+    AttemptFactArtifacts, EvalEnvironment, EvalEventKind, EvalEventStream, EvalEventStreamError,
+    EvalFailure, EvalResult, Evaluator, LatencyBreakdown, PhaseTiming, Task, sweep::RunManifest,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -84,6 +85,10 @@ pub enum HarborError {
     /// A trial path could not be represented as a `file:` URL.
     #[error("trial directory cannot be represented as a file URL: {0}")]
     InvalidTrialPath(PathBuf),
+
+    /// A retained sweep trial could not be matched to its original coordinate.
+    #[error("retained trial `{0}` does not match any coordinate in run.json")]
+    InvalidTrialCoordinate(String),
 
     /// The evaluator event subscription lagged or otherwise failed.
     #[error(transparent)]
@@ -226,6 +231,57 @@ impl HarborJob {
     pub fn directory(&self) -> &Path {
         &self.directory
     }
+
+    /// Reconstructs the stable aggregate dataset from every durable trial.
+    ///
+    /// This includes trials completed by an earlier process and skipped when a
+    /// finite run resumes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when retained JSON cannot be read or a retained sweep
+    /// trial does not match its original run coordinate.
+    pub fn aggregate_dataset(&self) -> Result<AggregateDataset, HarborError> {
+        let manifest =
+            HarborArtifacts::read_json_if_exists::<RunManifest>(&self.directory.join("run.json"))?;
+        let mut attempts = HarborArtifacts::durable_trials(&self.directory)?
+            .into_iter()
+            .map(|trial| {
+                let (configuration, repetition) = match &manifest {
+                    Some(manifest) => manifest
+                        .coordinate_for_trial(
+                            &trial.result.task_name,
+                            &trial.result.trial_name,
+                            trial.result.id,
+                        )
+                        .map(|(agent, repetition)| (agent.as_str().to_owned(), repetition))
+                        .ok_or_else(|| {
+                            HarborError::InvalidTrialCoordinate(trial.result.trial_name.clone())
+                        })?,
+                    None => (
+                        "default".to_owned(),
+                        fallback_repetition(&trial.result.trial_name),
+                    ),
+                };
+                Ok(trial.attempt_fact(configuration, repetition))
+            })
+            .collect::<Result<Vec<_>, HarborError>>()?;
+        attempts.sort_by(|left, right| {
+            (
+                left.task_name.as_str(),
+                left.configuration.as_str(),
+                left.repetition,
+                left.attempt_id,
+            )
+                .cmp(&(
+                    right.task_name.as_str(),
+                    right.configuration.as_str(),
+                    right.repetition,
+                    right.attempt_id,
+                ))
+        });
+        Ok(AggregateDataset::new(attempts))
+    }
 }
 
 struct AttemptRecording {
@@ -262,13 +318,11 @@ async fn record(
 ) -> Result<HarborJob, HarborError> {
     let mut attempts = HashMap::<Uuid, AttemptRecording>::new();
     let mut completed = HashSet::<Uuid>::new();
-    let mut recorded_results = Vec::<EvalResult>::new();
-    let mut recorded_failures = Vec::<EvalFailure>::new();
     let mut finish_request = None::<FinishRequest>;
 
     loop {
         if let Some(n_total_trials) = finished_attempt_count(finish_request.as_ref(), &completed) {
-            artifacts.write_job(&recorded_results, &recorded_failures, n_total_trials)?;
+            artifacts.write_job(n_total_trials)?;
             return Ok(HarborJob {
                 id: artifacts.job_id,
                 directory: artifacts.root.clone(),
@@ -313,12 +367,7 @@ async fn record(
                         let trajectory = attempt.atif.finish(result.task(), &result.agent);
                         artifacts.write_trial(&result, &trajectory)?;
                         completed.insert(result.attempt_id);
-                        recorded_results.push(result);
-                        artifacts.write_job(
-                            &recorded_results,
-                            &recorded_failures,
-                            recorded_results.len() + recorded_failures.len(),
-                        )?;
+                        artifacts.write_job(completed.len())?;
                     }
                     EvalEventKind::Failed(failure) => {
                         let trajectory = if let Some(mut attempt) = attempts.remove(&event.attempt_id) {
@@ -336,12 +385,7 @@ async fn record(
                         let failure = failure.as_ref().clone();
                         artifacts.write_failure(&failure, &trajectory)?;
                         completed.insert(failure.attempt_id);
-                        recorded_failures.push(failure);
-                        artifacts.write_job(
-                            &recorded_results,
-                            &recorded_failures,
-                            recorded_results.len() + recorded_failures.len(),
-                        )?;
+                        artifacts.write_job(completed.len())?;
                     }
                     EvalEventKind::VerifierStarted
                     | EvalEventKind::VerifierOutput { .. }
@@ -368,20 +412,7 @@ impl HarborArtifacts {
     fn attach(eval: &Evaluator) -> Result<Self, HarborError> {
         let root = eval.directory().to_path_buf();
         let baseline = Self::read_json_if_exists(&root.join("result.json"))?;
-        let recorded_trials = Self::read_json_if_exists::<HarborJobLock>(&root.join("lock.json"))?
-            .map_or_else(Vec::new, |lock| {
-                lock.trials
-                    .into_iter()
-                    .map(|lock| HarborRecordedTrial {
-                        task: HarborTaskConfig {
-                            path: lock.task.path.clone(),
-                            source: lock.task.source.clone(),
-                        },
-                        agent: lock.agent.clone(),
-                        lock,
-                    })
-                    .collect()
-            });
+        let recorded_trials = Self::recorded_trials(&root)?;
         let artifacts = Self {
             job_id: eval.id(),
             started_at: eval.started_at(),
@@ -395,8 +426,58 @@ impl HarborArtifacts {
         };
         Self::write_file(&artifacts.root.join("job.log"), [])?;
         artifacts.write_job_metadata()?;
-        artifacts.write_job(&[], &[], artifacts.planned_attempts.unwrap_or(0))?;
+        artifacts.write_job(artifacts.planned_attempts.unwrap_or(0))?;
         Ok(artifacts)
+    }
+
+    fn recorded_trials(root: &Path) -> Result<Vec<HarborRecordedTrial>, HarborError> {
+        let retained = Self::read_json_if_exists::<HarborJobLock>(&root.join("lock.json"))?
+            .map_or_else(Vec::new, |lock| lock.trials);
+        let mut unmatched_retained = retained
+            .iter()
+            .map(serde_json::to_vec)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut recorded = retained
+            .into_iter()
+            .map(Self::recorded_trial)
+            .collect::<Vec<_>>();
+
+        let mut durable_directories = Vec::new();
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() && entry.path().join("result.json").is_file() {
+                durable_directories.push(entry.path());
+            }
+        }
+        durable_directories.sort_unstable();
+        for directory in durable_directories {
+            let Some(lock) =
+                Self::read_json_if_exists::<HarborTrialLock>(&directory.join("lock.json"))?
+            else {
+                continue;
+            };
+            let fingerprint = serde_json::to_vec(&lock)?;
+            if let Some(index) = unmatched_retained
+                .iter()
+                .position(|retained| *retained == fingerprint)
+            {
+                unmatched_retained.remove(index);
+            } else {
+                recorded.push(Self::recorded_trial(lock));
+            }
+        }
+        Ok(recorded)
+    }
+
+    fn recorded_trial(lock: HarborTrialLock) -> HarborRecordedTrial {
+        HarborRecordedTrial {
+            task: HarborTaskConfig {
+                path: lock.task.path.clone(),
+                source: lock.task.source.clone(),
+            },
+            agent: lock.agent.clone(),
+            lock,
+        }
     }
 
     fn write_input(
@@ -496,7 +577,6 @@ impl HarborArtifacts {
             exception_info: None,
             step_results: None,
         };
-        Self::write_json(&root.join("result.json"), &trial_result)?;
         Self::write_file(&root.join("trial.log"), [])?;
         Self::write_file(&agent.join("stderr.log"), [])?;
 
@@ -522,6 +602,7 @@ impl HarborArtifacts {
                 lock,
             });
         }
+        Self::write_json(&root.join("result.json"), &trial_result)?;
         self.write_job_metadata()
     }
 
@@ -601,7 +682,6 @@ impl HarborArtifacts {
             }),
             step_results: None,
         };
-        Self::write_json(&root.join("result.json"), &trial_result)?;
         Self::write_file(&root.join("trial.log"), failure.traceback.as_bytes())?;
         Self::write_file(&agent.join("stderr.log"), failure.traceback.as_bytes())?;
 
@@ -621,24 +701,39 @@ impl HarborArtifacts {
                 lock,
             });
         }
+        Self::write_json(&root.join("result.json"), &trial_result)?;
         self.write_job_metadata()
     }
 
-    fn write_job(
-        &self,
-        results: &[EvalResult],
-        failures: &[EvalFailure],
-        n_total_trials: usize,
-    ) -> Result<(), HarborError> {
-        let now = Utc::now();
-        let mut stats = self
-            .baseline
-            .as_ref()
-            .map_or_else(HarborJobStats::default, |baseline| baseline.stats.clone());
-        HarborJobDelta::new(results, failures).apply(&mut stats);
-        for eval in stats.evals.values_mut() {
-            eval.pass_at_k.clear();
+    fn durable_trials(root: &Path) -> Result<Vec<DurableHarborTrial>, HarborError> {
+        let mut result_paths = Vec::new();
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let result = entry.path().join("result.json");
+            if result.is_file() {
+                result_paths.push(result);
+            }
         }
+        result_paths.sort_unstable();
+        result_paths
+            .into_iter()
+            .map(|path| {
+                let result = serde_json::from_slice(&fs::read(&path)?)?;
+                let directory = path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .ok_or_else(|| HarborError::InvalidTrialPath(path.clone()))?;
+                Ok(DurableHarborTrial { directory, result })
+            })
+            .collect()
+    }
+
+    fn write_job(&self, n_total_trials: usize) -> Result<(), HarborError> {
+        let now = Utc::now();
+        let mut stats = HarborJobStats::from_trials(&Self::durable_trials(&self.root)?);
         for (eval_key, pass_at_k) in compute_harbor_pass_at_k(&self.root)? {
             stats.evals.entry(eval_key).or_default().pass_at_k = pass_at_k;
         }
@@ -1090,88 +1185,171 @@ struct HarborJobResult {
     stats: HarborJobStats,
 }
 
-struct HarborJobDelta {
-    eval_key: Option<String>,
-    eval_stats: HarborAgentDatasetStats,
-    input_tokens: u64,
-    cached_tokens: u64,
-    output_tokens: u64,
-    cost_usd: Option<f64>,
+struct DurableHarborTrial {
+    directory: PathBuf,
+    result: RetainedHarborTrialResult,
 }
 
-impl HarborJobDelta {
-    fn new(results: &[EvalResult], failures: &[EvalFailure]) -> Self {
-        let mut reward_stats = BTreeMap::<String, BTreeMap<String, Vec<String>>>::new();
-        for result in results {
-            for (name, reward) in &result.verifier.rewards {
-                reward_stats
-                    .entry(name.clone())
-                    .or_default()
-                    .entry(harbor_float_key(*reward))
-                    .or_default()
-                    .push(result.trial_name.clone());
-            }
-        }
-        let mut exception_stats = BTreeMap::<String, Vec<String>>::new();
-        for failure in failures {
-            exception_stats
-                .entry(failure.kind.harbor_exception_type().to_owned())
-                .or_default()
-                .push(failure.trial_name.clone());
-        }
-        let eval_key = results
-            .first()
-            .map(|result| result.agent.model.as_str())
-            .or_else(|| failures.first().map(|failure| failure.model.as_str()))
-            .map(|model| format!("nanocodex__{model}__nanocodex/local"));
-        Self {
-            eval_key,
-            eval_stats: HarborAgentDatasetStats {
-                n_trials: results.len(),
-                n_errors: failures.len(),
-                reward_stats,
-                exception_stats,
-                ..HarborAgentDatasetStats::default()
-            },
-            input_tokens: results
-                .iter()
-                .map(|result| result.agent.usage.input_tokens)
-                .sum(),
-            cached_tokens: results
-                .iter()
-                .map(|result| result.agent.usage.cached_input_tokens)
-                .sum(),
-            output_tokens: results
-                .iter()
-                .map(|result| result.agent.usage.output_tokens)
-                .sum(),
-            cost_usd: results
-                .iter()
-                .filter_map(|result| result.agent.cost_usd)
-                .reduce(|total, cost| total + cost),
-        }
+#[derive(Deserialize)]
+struct RetainedHarborTrialResult {
+    id: Uuid,
+    task_name: String,
+    trial_name: String,
+    source: Option<String>,
+    config: RetainedHarborTrialConfig,
+    agent_info: RetainedHarborAgentInfo,
+    agent_result: Option<RetainedHarborAgentResult>,
+    verifier_result: Option<RetainedHarborVerifierResult>,
+    started_at: DateTime<Utc>,
+    finished_at: DateTime<Utc>,
+    queue_wait: Option<RetainedPhaseTiming>,
+    environment_readiness: Option<RetainedPhaseTiming>,
+    agent_setup: Option<RetainedPhaseTiming>,
+    agent_execution: Option<RetainedPhaseTiming>,
+    verifier: Option<RetainedPhaseTiming>,
+    exception_info: Option<RetainedHarborExceptionInfo>,
+}
+
+#[derive(Deserialize)]
+struct RetainedHarborTrialConfig {
+    environment: RetainedHarborEnvironment,
+}
+
+#[derive(Deserialize)]
+struct RetainedHarborEnvironment {
+    kwargs: RetainedHarborEnvironmentKwargs,
+}
+
+#[derive(Deserialize)]
+struct RetainedHarborEnvironmentKwargs {
+    backend: String,
+}
+
+#[derive(Deserialize)]
+struct RetainedHarborAgentInfo {
+    name: String,
+    model_info: RetainedHarborModelInfo,
+}
+
+#[derive(Deserialize)]
+struct RetainedHarborModelInfo {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct RetainedHarborAgentResult {
+    #[serde(default)]
+    n_input_tokens: u64,
+    #[serde(default)]
+    n_cache_tokens: u64,
+    #[serde(default)]
+    n_output_tokens: u64,
+    cost_usd: Option<f64>,
+    #[serde(default)]
+    metadata: RetainedAgentMetadata,
+}
+
+#[derive(Default, Deserialize)]
+struct RetainedAgentMetadata {
+    #[serde(default)]
+    model_duration_ns: u64,
+    #[serde(default)]
+    tool_work_duration_ns: u64,
+    #[serde(default)]
+    tool_wall_duration_ns: u64,
+}
+
+#[derive(Deserialize)]
+struct RetainedHarborVerifierResult {
+    rewards: BTreeMap<String, f64>,
+}
+
+#[derive(Deserialize)]
+struct RetainedHarborExceptionInfo {
+    exception_type: String,
+}
+
+#[derive(Deserialize)]
+struct RetainedPhaseTiming {
+    started_at: DateTime<Utc>,
+    finished_at: DateTime<Utc>,
+}
+
+impl DurableHarborTrial {
+    fn eval_key(&self) -> String {
+        let source = self.result.source.as_deref().unwrap_or("adhoc");
+        format!(
+            "{}__{}__{source}",
+            self.result.agent_info.name, self.result.agent_info.model_info.name
+        )
     }
 
-    fn apply(self, stats: &mut HarborJobStats) {
-        let completed = self.eval_stats.n_trials + self.eval_stats.n_errors;
-        let errors = self.eval_stats.n_errors;
-        if let Some(eval_key) = self.eval_key {
-            self.eval_stats
-                .merge_into(stats.evals.entry(eval_key).or_default());
-        } else if stats.evals.is_empty() {
-            stats
-                .evals
-                .insert("nanocodex__nanocodex/local".to_owned(), self.eval_stats);
-        }
-        stats.n_completed_trials += completed;
-        stats.n_errored_trials += errors;
-        stats.n_input_tokens += self.input_tokens;
-        stats.n_cache_tokens += self.cached_tokens;
-        stats.n_output_tokens += self.output_tokens;
-        if let Some(cost) = self.cost_usd {
-            stats.cost_usd = Some(stats.cost_usd.unwrap_or_default() + cost);
+    fn attempt_fact(self, configuration: String, repetition: u16) -> AttemptFact {
+        let agent = self.result.agent_result.as_ref();
+        let metadata = agent.map(|agent| &agent.metadata);
+        let passed = self
+            .result
+            .verifier_result
+            .as_ref()
+            .is_some_and(|verifier| verifier.rewards.values().all(|reward| *reward > 0.0))
+            && self.result.exception_info.is_none();
+        AttemptFact {
+            attempt_id: self.result.id,
+            task_name: self.result.task_name,
+            configuration,
+            repetition,
+            passed,
+            cost_usd: agent.and_then(|agent| agent.cost_usd),
+            latency: LatencyBreakdown {
+                queue_wait_ns: retained_phase_duration_ns(self.result.queue_wait.as_ref()),
+                vm_bootstrap_ns: if self.result.config.environment.kwargs.backend == "microvm" {
+                    retained_phase_duration_ns(self.result.environment_readiness.as_ref())
+                } else {
+                    0
+                },
+                agent_setup_ns: retained_phase_duration_ns(self.result.agent_setup.as_ref()),
+                agent_execution_ns: retained_phase_duration_ns(
+                    self.result.agent_execution.as_ref(),
+                ),
+                model_ns: metadata.map_or(0, |metadata| metadata.model_duration_ns),
+                tool_work_ns: metadata.map_or(0, |metadata| metadata.tool_work_duration_ns),
+                tool_wall_ns: metadata.map_or(0, |metadata| metadata.tool_wall_duration_ns),
+                verifier_ns: retained_phase_duration_ns(self.result.verifier.as_ref()),
+                total_ns: retained_duration_ns(self.result.started_at, self.result.finished_at),
+                ..LatencyBreakdown::default()
+            },
+            artifacts: AttemptFactArtifacts {
+                trajectory: self.directory.join("agent/trajectory.json"),
+                verifier_output: self.directory.join("verifier/test-stdout.txt"),
+                directory: self.directory,
+            },
         }
     }
+}
+
+fn fallback_repetition(trial_name: &str) -> u16 {
+    trial_name
+        .rsplit("__")
+        .nth(1)
+        .and_then(|trial| trial.parse().ok())
+        .unwrap_or(1)
+}
+
+fn retained_phase_duration_ns(timing: Option<&RetainedPhaseTiming>) -> u64 {
+    timing.map_or(0, |timing| {
+        retained_duration_ns(timing.started_at, timing.finished_at)
+    })
+}
+
+fn retained_duration_ns(started_at: DateTime<Utc>, finished_at: DateTime<Utc>) -> u64 {
+    u64::try_from(
+        finished_at
+            .signed_duration_since(started_at)
+            .num_nanoseconds()
+            .unwrap_or_default()
+            .max(0),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -1187,6 +1365,48 @@ struct HarborJobStats {
     n_cache_tokens: u64,
     n_output_tokens: u64,
     cost_usd: Option<f64>,
+}
+
+impl HarborJobStats {
+    fn from_trials(trials: &[DurableHarborTrial]) -> Self {
+        let mut stats = Self {
+            n_completed_trials: trials.len(),
+            ..Self::default()
+        };
+        for trial in trials {
+            if let Some(agent) = &trial.result.agent_result {
+                stats.n_input_tokens = stats.n_input_tokens.saturating_add(agent.n_input_tokens);
+                stats.n_cache_tokens = stats.n_cache_tokens.saturating_add(agent.n_cache_tokens);
+                stats.n_output_tokens = stats.n_output_tokens.saturating_add(agent.n_output_tokens);
+                if let Some(cost) = agent.cost_usd {
+                    stats.cost_usd = Some(stats.cost_usd.unwrap_or_default() + cost);
+                }
+            }
+
+            let eval = stats.evals.entry(trial.eval_key()).or_default();
+            if let Some(exception) = &trial.result.exception_info {
+                stats.n_errored_trials = stats.n_errored_trials.saturating_add(1);
+                eval.n_errors = eval.n_errors.saturating_add(1);
+                eval.exception_stats
+                    .entry(exception.exception_type.clone())
+                    .or_default()
+                    .push(trial.result.trial_name.clone());
+            } else {
+                eval.n_trials = eval.n_trials.saturating_add(1);
+                if let Some(verifier) = &trial.result.verifier_result {
+                    for (name, reward) in &verifier.rewards {
+                        eval.reward_stats
+                            .entry(name.clone())
+                            .or_default()
+                            .entry(harbor_float_key(*reward))
+                            .or_default()
+                            .push(trial.result.trial_name.clone());
+                    }
+                }
+            }
+        }
+        stats
+    }
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -1326,39 +1546,22 @@ fn pass_at_k_for_task(n: u32, correct: u32, k: u32) -> f64 {
     1.0 - failure_probability
 }
 
-impl HarborAgentDatasetStats {
-    fn merge_into(self, retained: &mut Self) {
-        retained.n_trials += self.n_trials;
-        retained.n_errors += self.n_errors;
-        for (metric, rewards) in self.reward_stats {
-            let retained_rewards = retained.reward_stats.entry(metric).or_default();
-            for (reward, trials) in rewards {
-                retained_rewards.entry(reward).or_default().extend(trials);
-            }
-        }
-        for (exception, trials) in self.exception_stats {
-            retained
-                .exception_stats
-                .entry(exception)
-                .or_default()
-                .extend(trials);
-        }
-    }
-}
-
 #[derive(Clone, Deserialize, Serialize)]
 struct HarborMetric {}
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs};
+    use std::{collections::BTreeMap, fs, path::Path};
 
     use crate::{AtifTrajectory, EvalEnvironment, Evaluator, Sweep, Task};
+    use chrono::Utc;
     use nanocodex_agent::{Nanocodex, OpenAi};
     use serde::Deserialize;
+    use serde_json::json;
     use tempfile::tempdir;
+    use uuid::Uuid;
 
-    use super::{Harbor, compute_pass_at_k_for_tasks, pass_at_k_for_task};
+    use super::{Harbor, HarborJob, compute_pass_at_k_for_tasks, pass_at_k_for_task};
 
     #[derive(Deserialize)]
     struct TrialResult {
@@ -1385,6 +1588,105 @@ mod tests {
         errored: usize,
         #[serde(rename = "n_pending_trials")]
         pending: usize,
+    }
+
+    #[test]
+    fn attach_rebuilds_stale_job_stats_from_durable_trials() {
+        let output = tempdir().unwrap();
+        let task = write_greeting_task();
+        let sweep = Sweep::builder()
+            .task(task.clone())
+            .trials(2)
+            .agent(
+                "default",
+                Nanocodex::builder(OpenAi::new("test-key").unwrap()),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let (eval, _) = Evaluator::builder(Nanocodex::builder(OpenAi::new("test-key").unwrap()))
+            .output_directory(output.path())
+            .fresh_run(&sweep)
+            .build()
+            .unwrap();
+
+        Harbor::new(&eval).unwrap();
+        let stale: JobResult =
+            serde_json::from_slice(&fs::read(eval.directory().join("result.json")).unwrap())
+                .unwrap();
+        assert_eq!(stale.stats.completed, 0);
+        write_retained_trial(eval.directory(), &task, "default", 1, Some(1.0));
+
+        Harbor::new(&eval).unwrap();
+        let rebuilt: serde_json::Value =
+            serde_json::from_slice(&fs::read(eval.directory().join("result.json")).unwrap())
+                .unwrap();
+        assert_eq!(rebuilt["n_total_trials"], 2);
+        assert_eq!(rebuilt["stats"]["n_completed_trials"], 1);
+        assert_eq!(rebuilt["stats"]["n_pending_trials"], 1);
+        assert_eq!(rebuilt["stats"]["n_input_tokens"], 10);
+        assert_eq!(rebuilt["stats"]["n_cache_tokens"], 4);
+        assert_eq!(rebuilt["stats"]["n_output_tokens"], 3);
+        assert_eq!(rebuilt["stats"]["cost_usd"], 0.25);
+        assert_eq!(
+            rebuilt["stats"]["evals"]["nanocodex__gpt-test__nanocodex/local"]["n_trials"],
+            1
+        );
+        assert_eq!(
+            rebuilt["stats"]["evals"]["nanocodex__gpt-test__nanocodex/local"]["reward_stats"]
+                ["reward"]["1.0"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let rebuilt_lock: serde_json::Value =
+            serde_json::from_slice(&fs::read(eval.directory().join("lock.json")).unwrap()).unwrap();
+        assert_eq!(rebuilt_lock["trials"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn aggregate_reconstructs_every_durable_trial_with_sweep_provenance() {
+        let output = tempdir().unwrap();
+        let task = write_greeting_task();
+        let sweep = Sweep::builder()
+            .task(task.clone())
+            .trials(2)
+            .agent(
+                "recipe__variant",
+                Nanocodex::builder(OpenAi::new("test-key").unwrap()),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let (eval, _) = Evaluator::builder(Nanocodex::builder(OpenAi::new("test-key").unwrap()))
+            .output_directory(output.path())
+            .fresh_run(&sweep)
+            .build()
+            .unwrap();
+        let first = write_retained_trial(eval.directory(), &task, "recipe__variant", 1, Some(1.0));
+        let second = write_retained_trial(eval.directory(), &task, "recipe__variant", 2, None);
+        let job = HarborJob {
+            id: eval.id(),
+            directory: eval.directory().to_path_buf(),
+        };
+
+        let aggregate = job.aggregate_dataset().unwrap();
+
+        assert_eq!(aggregate.attempts.len(), 2);
+        assert_eq!(aggregate.attempts[0].attempt_id, first);
+        assert_eq!(aggregate.attempts[0].configuration, "recipe__variant");
+        assert_eq!(aggregate.attempts[0].repetition, 1);
+        assert!(aggregate.attempts[0].passed);
+        assert_eq!(aggregate.attempts[0].cost_usd, Some(0.25));
+        assert_eq!(aggregate.attempts[1].attempt_id, second);
+        assert_eq!(aggregate.attempts[1].configuration, "recipe__variant");
+        assert_eq!(aggregate.attempts[1].repetition, 2);
+        assert!(!aggregate.attempts[1].passed);
+        assert_eq!(aggregate.attempts[1].cost_usd, None);
+        assert_eq!(aggregate.configurations.len(), 1);
+        assert_eq!(aggregate.configurations[0].success.samples, 2);
+        assert_eq!(aggregate.configurations[0].success.successes, 1);
     }
 
     #[test]
@@ -1526,5 +1828,112 @@ allow_internet = false
         assert_eq!(result.stats.completed, 1);
         assert_eq!(result.stats.errored, 1);
         assert_eq!(result.stats.pending, 0);
+    }
+
+    fn write_greeting_task() -> Task {
+        Task::load(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../tasks/write-greeting"),
+        )
+        .unwrap()
+    }
+
+    fn write_retained_trial(
+        job: &Path,
+        task: &Task,
+        configuration: &str,
+        repetition: u16,
+        reward: Option<f64>,
+    ) -> Uuid {
+        let id = Uuid::now_v7();
+        let compact_id = id.simple().to_string();
+        let trial_name = format!(
+            "write-greeting__{configuration}__{repetition:03}__{}",
+            &compact_id[..8]
+        );
+        let directory = job.join(&trial_name);
+        fs::create_dir_all(directory.join("agent")).unwrap();
+        fs::create_dir_all(directory.join("verifier")).unwrap();
+        fs::write(directory.join("agent/trajectory.json"), "{}\n").unwrap();
+        fs::write(directory.join("verifier/test-stdout.txt"), "fixture\n").unwrap();
+
+        let started_at = Utc::now();
+        let finished_at = started_at + chrono::Duration::milliseconds(10);
+        let phase = json!({
+            "started_at": started_at,
+            "finished_at": finished_at,
+        });
+        let agent_result = reward.map(|_| {
+            json!({
+                "n_input_tokens": 10,
+                "n_cache_tokens": 4,
+                "n_output_tokens": 3,
+                "cost_usd": 0.25,
+                "metadata": {
+                    "model_duration_ns": 5,
+                    "tool_work_duration_ns": 6,
+                    "tool_wall_duration_ns": 7,
+                },
+            })
+        });
+        let verifier_result = reward.map(|reward| {
+            json!({
+                "rewards": {
+                    "reward": reward,
+                },
+            })
+        });
+        let exception_info = reward.is_none().then(|| {
+            json!({
+                "exception_type": "AgentError",
+            })
+        });
+        let timing = reward.map(|_| phase);
+        let result = json!({
+            "id": id,
+            "task_name": "nanoeval/write-greeting",
+            "trial_name": trial_name,
+            "source": "nanocodex/local",
+            "config": {
+                "environment": {
+                    "kwargs": {
+                        "backend": "native",
+                    },
+                },
+            },
+            "agent_info": {
+                "name": "nanocodex",
+                "model_info": {
+                    "name": "gpt-test",
+                },
+            },
+            "agent_result": agent_result,
+            "verifier_result": verifier_result,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "queue_wait": timing,
+            "environment_readiness": timing,
+            "agent_setup": timing,
+            "agent_execution": timing,
+            "verifier": timing,
+            "exception_info": exception_info,
+        });
+        super::HarborArtifacts::write_json(
+            &directory.join("lock.json"),
+            &super::HarborTrialLock::new(
+                task,
+                "gpt-test",
+                "high",
+                "fixture",
+                EvalEnvironment::Native,
+            ),
+        )
+        .unwrap();
+        fs::write(
+            directory.join("result.json"),
+            serde_json::to_vec_pretty(&result).unwrap(),
+        )
+        .unwrap();
+        id
     }
 }

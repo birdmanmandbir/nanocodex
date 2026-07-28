@@ -2,6 +2,7 @@ use std::{fmt, num::NonZeroU16, path::PathBuf};
 
 use nanocodex_agent::NanocodexBuilder;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+use uuid::Uuid;
 
 use crate::Task;
 
@@ -214,6 +215,28 @@ impl Sweep {
 impl RunManifest {
     pub(crate) fn attempt_count(&self) -> usize {
         self.tasks.len() * self.agents.len() * usize::from(self.trials.get())
+    }
+
+    pub(crate) fn coordinate_for_trial(
+        &self,
+        task_name: &str,
+        trial_name: &str,
+        attempt_id: Uuid,
+    ) -> Option<(&AgentId, u16)> {
+        let short_name = task_name.rsplit('/').next().unwrap_or(task_name);
+        let compact_id = attempt_id.simple().to_string();
+        for agent in &self.agents {
+            for repetition in 1..=self.trials.get() {
+                let expected = format!(
+                    "{short_name}__{agent}__{repetition:03}__{}",
+                    &compact_id[..8]
+                );
+                if trial_name == expected {
+                    return Some((agent, repetition));
+                }
+            }
+        }
+        None
     }
 }
 
