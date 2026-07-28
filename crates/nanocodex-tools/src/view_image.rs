@@ -12,11 +12,22 @@ use super::{
 
 pub(crate) struct ViewImageHandler {
     workspace: PathBuf,
+    max_wire_bytes: Option<u64>,
 }
 
 impl ViewImageHandler {
     pub(crate) const fn new(workspace: PathBuf) -> Self {
-        Self { workspace }
+        Self {
+            workspace,
+            max_wire_bytes: None,
+        }
+    }
+
+    pub(crate) const fn with_wire_limit(workspace: PathBuf, max_wire_bytes: u64) -> Self {
+        Self {
+            workspace,
+            max_wire_bytes: Some(max_wire_bytes),
+        }
     }
 }
 
@@ -42,8 +53,8 @@ impl Tool for ViewImageHandler {
             }
         };
         let path = resolve(&self.workspace, Path::new(&arguments.path));
-        match tokio::fs::metadata(&path).await {
-            Ok(metadata) if metadata.is_file() => {}
+        let metadata = match tokio::fs::metadata(&path).await {
+            Ok(metadata) if metadata.is_file() => metadata,
             Ok(_) => {
                 return Ok(ToolOutput::error(format!(
                     "image path `{}` is not a file",
@@ -54,6 +65,20 @@ impl Tool for ViewImageHandler {
                 return Ok(ToolOutput::error(format!(
                     "unable to locate image at `{}`: {error}",
                     path.display()
+                )));
+            }
+        };
+        if let Some(max_wire_bytes) = self.max_wire_bytes {
+            let estimated_wire_bytes = estimated_wire_bytes(metadata.len());
+            if estimated_wire_bytes > max_wire_bytes {
+                return Ok(ToolOutput::error(format!(
+                    "image at `{}` is {} bytes and its VM transfer would require at least \
+                     {estimated_wire_bytes} bytes, exceeding the {max_wire_bytes}-byte VM tool \
+                     frame limit; resize or convert it to a compact PNG, JPEG, or WebP inside the \
+                     VM (for example with ffmpeg or ImageMagick), then call view_image on the \
+                     smaller file",
+                    path.display(),
+                    metadata.len(),
                 )));
             }
         }
@@ -82,6 +107,20 @@ impl Tool for ViewImageHandler {
     }
 }
 
+const DATA_URL_PREFIX_BYTES: u64 = 37;
+const VIEW_IMAGE_WIRE_COPIES: u64 = 2;
+const VIEW_IMAGE_WIRE_HEADROOM_BYTES: u64 = 4 * 1024;
+
+fn estimated_wire_bytes(raw_bytes: u64) -> u64 {
+    raw_bytes
+        .div_ceil(3)
+        .checked_mul(4)
+        .and_then(|encoded| encoded.checked_add(DATA_URL_PREFIX_BYTES))
+        .and_then(|data_url| data_url.checked_mul(VIEW_IMAGE_WIRE_COPIES))
+        .and_then(|duplicated| duplicated.checked_add(VIEW_IMAGE_WIRE_HEADROOM_BYTES))
+        .unwrap_or(u64::MAX)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ViewImageArguments {
@@ -95,5 +134,59 @@ fn resolve(workspace: &Path, path: &Path) -> PathBuf {
         path.to_owned()
     } else {
         workspace.join(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::File;
+
+    use nanocodex_oai_api::tools::{ToolInput, ToolOutputBody};
+    use serde_json::{json, value::to_raw_value};
+    use tempfile::tempdir;
+
+    use super::*;
+
+    const VM_FRAME_BYTES: u64 = 64 * 1024 * 1024;
+    const PATH_TRACING_IMAGE_BYTES: u64 = 48_262_737;
+
+    #[tokio::test]
+    async fn vm_wire_limit_rejects_the_path_tracing_image_before_reading_it() {
+        let workspace = tempdir().unwrap();
+        let image = workspace.path().join("image.ppm");
+        File::create(&image)
+            .unwrap()
+            .set_len(PATH_TRACING_IMAGE_BYTES)
+            .unwrap();
+        let handler =
+            ViewImageHandler::with_wire_limit(workspace.path().to_owned(), VM_FRAME_BYTES);
+        let output = handler
+            .execute(
+                ToolInput::Function(
+                    to_raw_value(&json!({
+                        "path": image,
+                        "detail": "original",
+                    }))
+                    .unwrap(),
+                ),
+                ToolContext::new("model", "session", "call", &[], 10_000),
+            )
+            .await
+            .unwrap();
+
+        assert!(!output.success);
+        let ToolOutputBody::Text(error) = output.output else {
+            panic!("oversized VM image should return a bounded text error");
+        };
+        assert!(error.contains("48262737 bytes"));
+        assert!(error.contains("VM tool frame limit"));
+        assert!(error.contains("resize or convert"));
+        assert!(error.contains("PNG, JPEG, or WebP"));
+    }
+
+    #[test]
+    fn wire_estimate_accounts_for_both_data_url_copies() {
+        assert_eq!(estimated_wire_bytes(PATH_TRACING_IMAGE_BYTES), 128_704_802);
+        assert!(estimated_wire_bytes(PATH_TRACING_IMAGE_BYTES) > VM_FRAME_BYTES);
     }
 }

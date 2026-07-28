@@ -72,9 +72,21 @@ pub(crate) async fn serve(workspace: &Path) -> Result<(), VmGuestError> {
 async fn serve_io(
     workspace: &Path,
     input: impl AsyncRead + Unpin,
-    mut output: impl AsyncWrite + Unpin,
+    output: impl AsyncWrite + Unpin,
 ) -> Result<(), VmGuestError> {
-    let runtime = Arc::new(WorkspaceToolRuntime::new(workspace.to_path_buf()));
+    serve_io_with_frame_limit(workspace, input, output, MAX_FRAME_BYTES).await
+}
+
+async fn serve_io_with_frame_limit(
+    workspace: &Path,
+    input: impl AsyncRead + Unpin,
+    mut output: impl AsyncWrite + Unpin,
+    max_frame_bytes: usize,
+) -> Result<(), VmGuestError> {
+    let runtime = Arc::new(WorkspaceToolRuntime::with_view_image_wire_limit(
+        workspace.to_path_buf(),
+        u64::try_from(max_frame_bytes).unwrap_or(u64::MAX),
+    ));
     let mut input = BufReader::new(input);
     let mut requests = JoinSet::<SessionResponse>::new();
     let mut active = HashMap::<u64, tokio::task::AbortHandle>::new();
@@ -88,7 +100,7 @@ async fn serve_io(
                     match joined.ok_or(VmGuestError::Closed)? {
                         Ok(response) => {
                             active.remove(&response.id());
-                            write_response(&mut output, &response).await?;
+                            write_response(&mut output, &response, max_frame_bytes).await?;
                         }
                         Err(error) if error.is_cancelled() => {}
                         Err(error) => return Err(VmGuestError::Task(error.to_string())),
@@ -118,7 +130,7 @@ async fn serve_io(
                                 id: request.id,
                                 error: None,
                             });
-                            write_response(&mut output, &response).await?;
+                            write_response(&mut output, &response, max_frame_bytes).await?;
                         }
                         request => {
                             let id = request.id();
@@ -141,7 +153,7 @@ async fn serve_io(
     runtime.control().cancel().await;
     if let Some(request) = result? {
         let response = SessionResponse::Shutdown(sync_filesystems(request).await);
-        write_response(&mut output, &response).await?;
+        write_response(&mut output, &response, max_frame_bytes).await?;
     }
     Ok(())
 }
@@ -192,15 +204,84 @@ async fn execute_request(
 async fn write_response(
     output: &mut (impl AsyncWrite + Unpin),
     response: &SessionResponse,
+    max_frame_bytes: usize,
 ) -> Result<(), VmGuestError> {
-    let mut encoded = serde_json::to_vec(response)?;
-    if encoded.len() > MAX_FRAME_BYTES {
-        return Err(VmGuestError::FrameTooLarge);
-    }
+    let mut encoded = match encode_frame(response, max_frame_bytes)? {
+        EncodedFrame::Complete(encoded) => encoded,
+        EncodedFrame::TooLarge => {
+            let SessionResponse::Tool(response) = response else {
+                return Err(VmGuestError::FrameTooLarge);
+            };
+            let fallback = SessionResponse::Tool(ToolResponse::failed(
+                response.id,
+                format!(
+                    "VM tool response exceeded the {max_frame_bytes}-byte protocol frame limit"
+                ),
+            ));
+            match encode_frame(&fallback, max_frame_bytes)? {
+                EncodedFrame::Complete(encoded) => encoded,
+                EncodedFrame::TooLarge => return Err(VmGuestError::FrameTooLarge),
+            }
+        }
+    };
     encoded.push(b'\n');
     output.write_all(&encoded).await?;
     output.flush().await?;
     Ok(())
+}
+
+enum EncodedFrame {
+    Complete(Vec<u8>),
+    TooLarge,
+}
+
+fn encode_frame(
+    response: &SessionResponse,
+    max_frame_bytes: usize,
+) -> Result<EncodedFrame, serde_json::Error> {
+    let mut output = BoundedFrameWriter::new(max_frame_bytes);
+    match serde_json::to_writer(&mut output, response) {
+        Ok(()) => Ok(EncodedFrame::Complete(output.into_inner())),
+        Err(_) if output.limit_exceeded => Ok(EncodedFrame::TooLarge),
+        Err(error) => Err(error),
+    }
+}
+
+struct BoundedFrameWriter {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+    limit_exceeded: bool,
+}
+
+impl BoundedFrameWriter {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(max_bytes.min(8 * 1024)),
+            max_bytes,
+            limit_exceeded: false,
+        }
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl std::io::Write for BoundedFrameWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if buffer.len() > self.max_bytes.saturating_sub(self.bytes.len()) {
+            self.limit_exceeded = true;
+            return Err(std::io::Error::other(
+                "VM tool protocol frame limit exceeded",
+            ));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 async fn read_frame(
@@ -540,17 +621,23 @@ async fn read_bounded(
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::{
+        fs::File,
+        time::{Duration, Instant},
+    };
 
+    use nanocodex_tools::{ToolInput, contract::ToolOutputBody, standard::StandardTool};
+    use serde_json::{json, value::to_raw_value};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     use super::super::protocol::{
-        CancelRequest, ExecuteRequest, ReadFileRequest, SessionRequest, SessionResponse,
-        ShutdownRequest,
+        CancelRequest, ExecuteRequest, ReadFileRequest, ReadyRequest, SessionRequest,
+        SessionResponse, ShutdownRequest, ToolRequest, WireToolContext, WireToolInput,
     };
-    use super::{execute_command, read_file, serve_io};
+    use super::{execute_command, read_file, serve_io, serve_io_with_frame_limit};
 
     const DEFAULT_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+    const PATH_TRACING_IMAGE_BYTES: u64 = 48_262_737;
 
     #[tokio::test]
     async fn timeout_kills_descendants_holding_output_pipes() {
@@ -789,6 +876,201 @@ mod tests {
                     assert!(response.error.is_none());
                     assert!(!response.timed_out);
                     follow_up = true;
+                }
+                response => panic!("unexpected response ID {}", response.id()),
+            }
+        }
+
+        host_write
+            .write_all(
+                &serde_json::to_vec(&SessionRequest::Shutdown(ShutdownRequest { id: 3 })).unwrap(),
+            )
+            .await
+            .unwrap();
+        host_write.write_all(b"\n").await.unwrap();
+        drop(host_write);
+        let shutdown = responses.next_line().await.unwrap().unwrap();
+        assert!(matches!(
+            serde_json::from_str::<SessionResponse>(&shutdown).unwrap(),
+            SessionResponse::Shutdown(response) if response.id == 3 && response.error.is_none()
+        ));
+        guest_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_tool_response_becomes_a_scoped_failure_and_guest_stays_ready() {
+        const TEST_FRAME_BYTES: usize = 1_024;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let (host, guest) = tokio::io::duplex(64 * 1024);
+        let (host_read, mut host_write) = tokio::io::split(host);
+        let (guest_read, guest_write) = tokio::io::split(guest);
+        let guest_task = tokio::spawn({
+            let workspace = workspace.path().to_owned();
+            async move {
+                serve_io_with_frame_limit(&workspace, guest_read, guest_write, TEST_FRAME_BYTES)
+                    .await
+            }
+        });
+        let oversized = SessionRequest::Tool(ToolRequest {
+            id: 0,
+            tool: StandardTool::ExecCommand,
+            input: WireToolInput::from(ToolInput::Function(
+                to_raw_value(&json!({
+                    "cmd": "/usr/bin/yes x | /usr/bin/head -c 4096",
+                    "max_output_tokens": 10_000,
+                }))
+                .unwrap(),
+            )),
+            context: WireToolContext {
+                model: "model".to_owned(),
+                session_id: "session".to_owned(),
+                call_id: "oversized".to_owned(),
+                output_token_budget: 10_000,
+            },
+        });
+        host_write
+            .write_all(&serde_json::to_vec(&oversized).unwrap())
+            .await
+            .unwrap();
+        host_write.write_all(b"\n").await.unwrap();
+
+        let mut responses = BufReader::new(host_read).lines();
+        let line = responses.next_line().await.unwrap().unwrap();
+        let SessionResponse::Tool(response) =
+            serde_json::from_str::<SessionResponse>(&line).unwrap()
+        else {
+            panic!("expected a tool response");
+        };
+        assert_eq!(response.id, 0);
+        assert!(response.execution.is_none());
+        assert!(
+            response
+                .error
+                .is_some_and(|error| error.contains("1024-byte protocol frame limit"))
+        );
+
+        host_write
+            .write_all(&serde_json::to_vec(&SessionRequest::Ready(ReadyRequest { id: 1 })).unwrap())
+            .await
+            .unwrap();
+        host_write.write_all(b"\n").await.unwrap();
+        let line = responses.next_line().await.unwrap().unwrap();
+        assert!(matches!(
+            serde_json::from_str::<SessionResponse>(&line).unwrap(),
+            SessionResponse::Ready(response) if response.id == 1 && response.error.is_none()
+        ));
+
+        host_write
+            .write_all(
+                &serde_json::to_vec(&SessionRequest::Shutdown(ShutdownRequest { id: 2 })).unwrap(),
+            )
+            .await
+            .unwrap();
+        host_write.write_all(b"\n").await.unwrap();
+        drop(host_write);
+        let shutdown = responses.next_line().await.unwrap().unwrap();
+        assert!(matches!(
+            serde_json::from_str::<SessionResponse>(&shutdown).unwrap(),
+            SessionResponse::Shutdown(response) if response.id == 2 && response.error.is_none()
+        ));
+        guest_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_path_tracing_image_is_rejected_before_encoding_and_session_remains_usable() {
+        let workspace = tempfile::tempdir().unwrap();
+        let image = workspace.path().join("image.ppm");
+        File::create(&image)
+            .unwrap()
+            .set_len(PATH_TRACING_IMAGE_BYTES)
+            .unwrap();
+        let (host, guest) = tokio::io::duplex(64 * 1024);
+        let (host_read, mut host_write) = tokio::io::split(host);
+        let (guest_read, guest_write) = tokio::io::split(guest);
+        let guest_task = tokio::spawn({
+            let workspace = workspace.path().to_owned();
+            async move { serve_io(&workspace, guest_read, guest_write).await }
+        });
+        let view_image = SessionRequest::Tool(ToolRequest {
+            id: 0,
+            tool: StandardTool::ViewImage,
+            input: WireToolInput::from(ToolInput::Function(
+                to_raw_value(&json!({
+                    "path": image,
+                    "detail": "original",
+                }))
+                .unwrap(),
+            )),
+            context: WireToolContext {
+                model: "model".to_owned(),
+                session_id: "session".to_owned(),
+                call_id: "view-image".to_owned(),
+                output_token_budget: 10_000,
+            },
+        });
+        host_write
+            .write_all(&serde_json::to_vec(&view_image).unwrap())
+            .await
+            .unwrap();
+        host_write.write_all(b"\n").await.unwrap();
+
+        let mut responses = BufReader::new(host_read).lines();
+        let line = responses.next_line().await.unwrap().unwrap();
+        let SessionResponse::Tool(response) =
+            serde_json::from_str::<SessionResponse>(&line).unwrap()
+        else {
+            panic!("expected a tool response");
+        };
+        assert_eq!(response.id, 0);
+        assert!(response.error.is_none());
+        let execution = response.execution.unwrap();
+        assert!(!execution.success);
+        let ToolOutputBody::Text(error) = execution.output else {
+            panic!("oversized image should return a bounded text error");
+        };
+        assert!(error.contains("48262737 bytes"));
+        assert!(error.contains("resize or convert"));
+
+        for request in [
+            SessionRequest::Cancel(CancelRequest {
+                id: 1,
+                target_id: 0,
+            }),
+            SessionRequest::Execute(ExecuteRequest {
+                id: 2,
+                program: "/usr/bin/true".to_owned(),
+                arguments: Vec::new(),
+                current_directory: workspace.path().to_string_lossy().into_owned(),
+                environment: Vec::new(),
+                timeout_millis: 5_000,
+                max_output_bytes: DEFAULT_OUTPUT_BYTES,
+            }),
+        ] {
+            host_write
+                .write_all(&serde_json::to_vec(&request).unwrap())
+                .await
+                .unwrap();
+            host_write.write_all(b"\n").await.unwrap();
+        }
+
+        let mut cancel_completed = false;
+        let mut command_completed = false;
+        while !cancel_completed || !command_completed {
+            let line = tokio::time::timeout(Duration::from_secs(2), responses.next_line())
+                .await
+                .expect("late cancellation and follow-up command must complete")
+                .unwrap()
+                .unwrap();
+            match serde_json::from_str::<SessionResponse>(&line).unwrap() {
+                SessionResponse::Cancel(response) if response.id == 1 => {
+                    assert!(response.error.is_none());
+                    cancel_completed = true;
+                }
+                SessionResponse::Execute(response) if response.id == 2 => {
+                    assert!(response.error.is_none());
+                    assert!(!response.timed_out);
+                    command_completed = true;
                 }
                 response => panic!("unexpected response ID {}", response.id()),
             }

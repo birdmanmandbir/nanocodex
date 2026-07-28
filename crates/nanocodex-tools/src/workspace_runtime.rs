@@ -36,6 +36,24 @@ impl WorkspaceToolRuntime {
     /// environment.
     #[must_use]
     pub fn new(workspace: PathBuf) -> Self {
+        Self::with_optional_view_image_wire_limit(workspace, None)
+    }
+
+    /// Creates a retained runtime whose `view_image` responses must fit one
+    /// bounded process-transport frame.
+    ///
+    /// This is an internal process-boundary policy. Normal in-process callers
+    /// should use [`Self::new`].
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_view_image_wire_limit(workspace: PathBuf, max_wire_bytes: u64) -> Self {
+        Self::with_optional_view_image_wire_limit(workspace, Some(max_wire_bytes))
+    }
+
+    fn with_optional_view_image_wire_limit(
+        workspace: PathBuf,
+        max_wire_bytes: Option<u64>,
+    ) -> Self {
         let sessions = Arc::new(ShellSessions::with_environment_and_turn(
             Arc::<Vec<(OsString, OsString)>>::default(),
             Arc::new(AtomicU64::new(0)),
@@ -43,7 +61,12 @@ impl WorkspaceToolRuntime {
         Self {
             apply_patch: ApplyPatchHandler::new(workspace.clone()),
             exec_command: ExecCommandHandler::new(workspace.clone(), Arc::clone(&sessions)),
-            view_image: ViewImageHandler::new(workspace),
+            view_image: max_wire_bytes.map_or_else(
+                || ViewImageHandler::new(workspace.clone()),
+                |max_wire_bytes| {
+                    ViewImageHandler::with_wire_limit(workspace.clone(), max_wire_bytes)
+                },
+            ),
             write_stdin: WriteStdinHandler::new(Arc::clone(&sessions)),
             sessions,
         }
