@@ -8,7 +8,9 @@ use std::{
 use chrono::{DateTime, Utc};
 use clap::Args;
 use eyre::{Result, eyre};
-use nanocodex_eval::{AtifSource, AtifTrajectory};
+use nanocodex_eval::{
+    AtifSource, AtifTrajectory, BillingCompleteness, EvalCleanup, EvalOutcome, PhaseTiming,
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 use yansi::Painted;
@@ -86,6 +88,7 @@ struct JobInspection {
     failed: usize,
     refused: usize,
     errored: usize,
+    cleanup_failed: usize,
     trials: Vec<TrialInspection>,
 }
 
@@ -118,6 +121,7 @@ impl JobInspection {
             .iter()
             .filter(|trial| trial.status == TrialStatus::Errored)
             .count();
+        let cleanup_failed = trials.iter().filter(|trial| trial.cleanup_failed).count();
         Ok(Self {
             id: result.id,
             directory: directory.to_path_buf(),
@@ -126,6 +130,7 @@ impl JobInspection {
             failed,
             refused,
             errored,
+            cleanup_failed,
             trials,
         })
     }
@@ -155,19 +160,20 @@ impl JobInspection {
     fn write_human(&self, output: &mut impl Write) -> io::Result<()> {
         writeln!(
             output,
-            "Job {}: {} passed, {} failed, {} refused, {} errored ({} retained / {} expected)",
+            "Job {}: {} passed, {} failed, {} refused, {} errored, {} cleanup failures ({} retained / {} expected)",
             self.id,
             self.passed,
             self.failed,
             self.refused,
             self.errored,
+            self.cleanup_failed,
             self.trials.len(),
             self.total
         )?;
         writeln!(output, "{}", self.directory.display())?;
         for trial in &self.trials {
             trial.write_summary(output)?;
-            if trial.status != TrialStatus::Passed {
+            if trial.status != TrialStatus::Passed || trial.cleanup_failed {
                 trial.write_failure_summary(output)?;
             }
         }
@@ -188,6 +194,7 @@ struct TrialInspection {
     task_name: String,
     trial_name: String,
     status: TrialStatus,
+    cleanup_failed: bool,
     reward: Option<f64>,
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
@@ -212,29 +219,33 @@ impl TrialInspection {
             .and_then(|verifier| verifier.rewards.get("reward"))
             .copied();
         let status = trial_status(
+            result.outcome,
+            result.scored,
             result
                 .exception_info
                 .as_ref()
                 .map(|exception| exception.exception_type.as_str()),
             reward,
         );
+        let cleanup_failed = result.cleanup.is_failed()
+            || result
+                .exception_info
+                .as_ref()
+                .is_some_and(|exception| exception.exception_type == "CleanupError");
         let artifacts = ArtifactPaths::new(directory);
         let full_output = full.then(|| FullOutput::load(&artifacts)).transpose()?;
         let phases = PhaseInspection::from_result(&result);
+        let duration = disjoint_duration(&result);
         Ok(Self {
             id: result.id,
             task_name: result.task_name,
             trial_name: result.trial_name,
             status,
+            cleanup_failed,
             reward,
             started_at: result.started_at,
             finished_at: result.finished_at,
-            duration: DurationMillis(
-                result
-                    .finished_at
-                    .signed_duration_since(result.started_at)
-                    .num_milliseconds(),
-            ),
+            duration,
             phases,
             agent: result.agent_result.map(Into::into),
             exception: result.exception_info.map(Into::into),
@@ -291,9 +302,14 @@ impl TrialInspection {
             .map_or_else(|| "-".to_owned(), |reward| format!("{reward:.3}"));
         writeln!(
             output,
-            "{} {} reward={reward}",
+            "{} {} reward={reward}{}",
             self.status.label(),
-            self.trial_name
+            self.trial_name,
+            if self.cleanup_failed {
+                " cleanup=failed"
+            } else {
+                ""
+            }
         )
     }
 
@@ -378,21 +394,55 @@ impl TrialStatus {
     }
 }
 
-fn trial_status(exception_type: Option<&str>, reward: Option<f64>) -> TrialStatus {
-    match (exception_type, reward) {
-        (Some("AgentSafetyRefusalError"), _) => TrialStatus::Refused,
-        (Some(_), _) => TrialStatus::Errored,
-        (None, Some(1.0)) => TrialStatus::Passed,
-        (None, _) => TrialStatus::Failed,
+fn trial_status(
+    outcome: Option<EvalOutcome>,
+    scored: Option<bool>,
+    exception_type: Option<&str>,
+    reward: Option<f64>,
+) -> TrialStatus {
+    match outcome {
+        Some(EvalOutcome::Passed) => return TrialStatus::Passed,
+        Some(EvalOutcome::VerifierFailed) => return TrialStatus::Failed,
+        Some(EvalOutcome::SafetyRefusal) => return TrialStatus::Refused,
+        Some(EvalOutcome::AgentTimeout | EvalOutcome::InfrastructureError) => {
+            return TrialStatus::Errored;
+        }
+        None => {}
+    }
+    if scored == Some(true) {
+        return if reward == Some(1.0) {
+            TrialStatus::Passed
+        } else {
+            TrialStatus::Failed
+        };
+    }
+    if let Some(exception_type) = exception_type {
+        return if exception_type == "AgentSafetyRefusalError" {
+            TrialStatus::Refused
+        } else {
+            TrialStatus::Errored
+        };
+    }
+    if scored == Some(false) {
+        return TrialStatus::Errored;
+    }
+    if reward == Some(1.0) {
+        TrialStatus::Passed
+    } else {
+        TrialStatus::Failed
     }
 }
 
 #[derive(Clone, Serialize)]
 struct PhaseInspection {
+    queue_wait: Option<DurationMillis>,
     environment_setup: Option<DurationMillis>,
+    environment_readiness: Option<DurationMillis>,
     agent_setup: Option<DurationMillis>,
     agent_execution: Option<DurationMillis>,
     verifier: Option<DurationMillis>,
+    agent_cleanup: Option<DurationMillis>,
+    verifier_cleanup: Option<DurationMillis>,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -410,10 +460,24 @@ impl std::fmt::Display for DurationMillis {
 impl PhaseInspection {
     fn from_result(result: &HarborTrialResult) -> Self {
         Self {
+            queue_wait: phase_duration(result.queue_wait.as_ref()),
             environment_setup: phase_duration(result.environment_setup.as_ref()),
+            environment_readiness: phase_duration(result.environment_readiness.as_ref()),
             agent_setup: phase_duration(result.agent_setup.as_ref()),
             agent_execution: phase_duration(result.agent_execution.as_ref()),
             verifier: phase_duration(result.verifier.as_ref()),
+            agent_cleanup: result
+                .cleanup
+                .agent
+                .timing
+                .as_ref()
+                .map(phase_duration_exact),
+            verifier_cleanup: result
+                .cleanup
+                .verifier
+                .timing
+                .as_ref()
+                .map(phase_duration_exact),
         }
     }
 }
@@ -426,6 +490,7 @@ struct AgentInspection {
     cache_percent_tenths: u16,
     model_calls: u32,
     tool_calls: u32,
+    billing_completeness: Option<BillingCompleteness>,
 }
 
 impl From<HarborAgentResult> for AgentInspection {
@@ -446,6 +511,7 @@ impl From<HarborAgentResult> for AgentInspection {
             cache_percent_tenths,
             model_calls: result.metadata.model_calls,
             tool_calls: result.metadata.tool_calls,
+            billing_completeness: result.billing_completeness,
         }
     }
 }
@@ -606,9 +672,15 @@ struct HarborTrialResult {
     trial_name: String,
     agent_result: Option<HarborAgentResult>,
     verifier_result: Option<HarborVerifierResult>,
+    outcome: Option<EvalOutcome>,
+    scored: Option<bool>,
+    #[serde(default)]
+    cleanup: EvalCleanup,
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
+    queue_wait: Option<HarborPhaseTiming>,
     environment_setup: Option<HarborPhaseTiming>,
+    environment_readiness: Option<HarborPhaseTiming>,
     agent_setup: Option<HarborPhaseTiming>,
     agent_execution: Option<HarborPhaseTiming>,
     verifier: Option<HarborPhaseTiming>,
@@ -620,6 +692,7 @@ struct HarborAgentResult {
     n_input_tokens: u64,
     n_cache_tokens: u64,
     n_output_tokens: u64,
+    billing_completeness: Option<BillingCompleteness>,
     metadata: nanocodex_eval::AgentMetadata,
 }
 
@@ -703,6 +776,38 @@ fn phase_duration(timing: Option<&HarborPhaseTiming>) -> Option<DurationMillis> 
     })
 }
 
+fn phase_duration_exact(timing: &PhaseTiming) -> DurationMillis {
+    DurationMillis(
+        timing
+            .finished_at
+            .signed_duration_since(timing.started_at)
+            .num_milliseconds()
+            .max(0),
+    )
+}
+
+fn disjoint_duration(result: &HarborTrialResult) -> DurationMillis {
+    let retained = [
+        result.queue_wait.as_ref(),
+        result.environment_setup.as_ref(),
+        result.environment_readiness.as_ref(),
+        result.agent_setup.as_ref(),
+        result.agent_execution.as_ref(),
+        result.verifier.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|timing| phase_duration(Some(timing)).map_or(0, |duration| duration.0));
+    let cleanup = [
+        result.cleanup.agent.timing.as_ref(),
+        result.cleanup.verifier.timing.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|timing| phase_duration_exact(timing).0);
+    DurationMillis(retained.chain(cleanup).fold(0_i64, i64::saturating_add))
+}
+
 fn format_duration(duration: Option<DurationMillis>) -> String {
     duration.map_or_else(|| "-".to_owned(), |duration| duration.to_string())
 }
@@ -732,24 +837,43 @@ fn read_optional_text(path: &Path) -> io::Result<Option<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TrialStatus, trial_status};
+    use super::{EvalOutcome, TrialStatus, trial_status};
 
     #[test]
     fn classifies_refusals_separately_from_errors() {
         assert_eq!(
-            trial_status(Some("AgentSafetyRefusalError"), None),
+            trial_status(None, None, Some("AgentSafetyRefusalError"), None),
             TrialStatus::Refused
         );
         assert_eq!(
-            trial_status(Some("AgentAuthenticationError"), None),
+            trial_status(None, None, Some("AgentAuthenticationError"), None),
             TrialStatus::Errored
         );
     }
 
     #[test]
     fn classifies_scored_trials_from_reward() {
-        assert_eq!(trial_status(None, Some(1.0)), TrialStatus::Passed);
-        assert_eq!(trial_status(None, Some(0.0)), TrialStatus::Failed);
-        assert_eq!(trial_status(None, None), TrialStatus::Failed);
+        assert_eq!(
+            trial_status(None, None, None, Some(1.0)),
+            TrialStatus::Passed
+        );
+        assert_eq!(
+            trial_status(None, None, None, Some(0.0)),
+            TrialStatus::Failed
+        );
+        assert_eq!(trial_status(None, None, None, None), TrialStatus::Failed);
+        assert_eq!(
+            trial_status(None, Some(false), None, Some(1.0)),
+            TrialStatus::Errored
+        );
+        assert_eq!(
+            trial_status(
+                Some(EvalOutcome::Passed),
+                Some(true),
+                Some("CleanupError"),
+                Some(1.0),
+            ),
+            TrialStatus::Passed
+        );
     }
 }

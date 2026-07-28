@@ -27,10 +27,10 @@ use nanocodex::{
 };
 use nanocodex_eval::harbor::{Harbor, HarborJob, HarborRecorder};
 use nanocodex_eval::{
-    AttemptAgent, AttemptVerification, AttemptVerifier, EvalAttempt, EvalEnvironment,
-    EvalEventKind, EvalEventStream, EvalFailure, EvalFailureKind, EvalResult, EvalStatus,
-    Evaluator, EvaluatorBuilder, NetworkPolicy, Sweep, SweepResults, Task, TaskLoadError,
-    VerifierEnvironmentMode, VerifierResult,
+    AttemptAgent, AttemptVerification, AttemptVerifier, BillingCompleteness, CleanupPhase,
+    EvalAttempt, EvalEnvironment, EvalEventKind, EvalEventStream, EvalFailure, EvalOutcome,
+    EvalResult, EvalStatus, Evaluator, EvaluatorBuilder, NetworkPolicy, PhaseTiming, Sweep,
+    SweepResults, Task, TaskLoadError, VerifierEnvironmentMode, VerifierResult,
 };
 use nanocodex_vm::image::{CachePolicy, VmImageBuilder, reflink_or_sparse_copy};
 use nanocodex_vm::{BlockDevice, GuestCommand, Network, VmConfig};
@@ -318,6 +318,8 @@ struct RetainedJobIdentity {
 #[derive(Debug, Deserialize)]
 struct RetainedTrialResult {
     task_name: String,
+    outcome: Option<EvalOutcome>,
+    scored: Option<bool>,
     verifier_result: Option<RetainedVerifierResult>,
     exception_info: Option<RetainedTrialException>,
 }
@@ -1167,12 +1169,35 @@ fn retained_task_statuses(job: &Path) -> Result<BTreeMap<String, RetainedTrialSt
 
 impl RetainedTrialResult {
     fn status(&self) -> RetainedTrialStatus {
+        match self.outcome {
+            Some(EvalOutcome::Passed) => return RetainedTrialStatus::Passed,
+            Some(EvalOutcome::VerifierFailed) => return RetainedTrialStatus::Failed,
+            Some(EvalOutcome::SafetyRefusal) => return RetainedTrialStatus::Refused,
+            Some(EvalOutcome::AgentTimeout | EvalOutcome::InfrastructureError) => {
+                return RetainedTrialStatus::Errored;
+            }
+            None => {}
+        }
+        if self.scored == Some(true) {
+            return if self
+                .verifier_result
+                .as_ref()
+                .is_some_and(|verifier| verifier.rewards.values().all(|reward| *reward > 0.0))
+            {
+                RetainedTrialStatus::Passed
+            } else {
+                RetainedTrialStatus::Failed
+            };
+        }
         if let Some(exception) = &self.exception_info {
             return if exception.exception_type == "AgentSafetyRefusalError" {
                 RetainedTrialStatus::Refused
             } else {
                 RetainedTrialStatus::Errored
             };
+        }
+        if self.scored == Some(false) {
+            return RetainedTrialStatus::Errored;
         }
         if self
             .verifier_result
@@ -3111,42 +3136,77 @@ impl VmVerifier {
         let verifier_directory = attempt.directory().join("verifier");
         fs::create_dir_all(&verifier_directory)?;
         let (verifier_launch, verifier_session) = self.start_verifier_session(task).await?;
-        let command = self.verifier_command(task, &verifier_launch, self.attempt_cache.as_ref())?;
-        let (output, verifier_timed_out) = self
-            .execute_verifier_with_network_retries(&verifier_session, &verifier_launch, command)
-            .await?;
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        let combined = match (stdout.is_empty(), stderr.is_empty()) {
-            (_, true) => stdout.clone(),
-            (true, false) => stderr.clone(),
-            (false, false) => format!("{stdout}\n{stderr}"),
+        let verification = async {
+            let command =
+                self.verifier_command(task, &verifier_launch, self.attempt_cache.as_ref())?;
+            let (output, verifier_timed_out) = self
+                .execute_verifier_with_network_retries(&verifier_session, &verifier_launch, command)
+                .await?;
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            let combined = match (stdout.is_empty(), stderr.is_empty()) {
+                (_, true) => stdout.clone(),
+                (true, false) => stderr.clone(),
+                (false, false) => format!("{stdout}\n{stderr}"),
+            };
+            fs::write(verifier_directory.join("test-stdout.txt"), combined)?;
+            let reward_bytes = if verifier_timed_out {
+                b"0\n".to_vec()
+            } else {
+                verifier_session
+                    .read_file("/logs/verifier/reward.txt")
+                    .await?
+            };
+            fs::write(verifier_directory.join("reward.txt"), &reward_bytes)?;
+            if let Ok(ctrf) = verifier_session.read_file("/logs/verifier/ctrf.json").await {
+                fs::write(verifier_directory.join("ctrf.json"), ctrf)?;
+            }
+            let answer_path = format!("{}/answer.txt", verifier_launch.workspace);
+            if let Ok(answer) = verifier_session.read_file(answer_path).await {
+                fs::write(attempt.workspace().join("answer.txt"), answer)?;
+            }
+            let reward = String::from_utf8_lossy(&reward_bytes)
+                .trim()
+                .parse::<f64>()?;
+            task.validate_package()?;
+            Ok::<_, VmAttemptError>((output, stdout, stderr, reward))
+        }
+        .await;
+        let cleanup_started = Utc::now();
+        let shutdown = verifier_session.shutdown().await;
+        let (output, stdout, stderr, reward) = match verification {
+            Ok(verification) => verification,
+            Err(primary) => {
+                if let Err(cleanup) = shutdown {
+                    warn!(
+                        target: "nanocodex_eval",
+                        error = %cleanup,
+                        primary_error = %primary,
+                        "verifier cleanup also failed; preserving the verification error"
+                    );
+                }
+                self.remove_attempt_cache();
+                return Err(primary);
+            }
         };
-        fs::write(verifier_directory.join("test-stdout.txt"), combined)?;
-        let reward_bytes = if verifier_timed_out {
-            b"0\n".to_vec()
-        } else {
-            verifier_session
-                .read_file("/logs/verifier/reward.txt")
-                .await?
+        let cleanup = match shutdown {
+            Ok(()) => {
+                let cache_cleanup = self.finish_verifier_cache();
+                let disk_cleanup = if reward > 0.0 && !self.retain_passed_rootfs {
+                    self.remove_passed_root_disks()
+                } else {
+                    Ok(())
+                };
+                match cache_cleanup.and(disk_cleanup) {
+                    Ok(()) => CleanupPhase::completed(cleanup_started),
+                    Err(error) => CleanupPhase::failed(cleanup_started, &error),
+                }
+            }
+            Err(error) => {
+                self.remove_attempt_cache();
+                CleanupPhase::failed(cleanup_started, &error)
+            }
         };
-        fs::write(verifier_directory.join("reward.txt"), &reward_bytes)?;
-        if let Ok(ctrf) = verifier_session.read_file("/logs/verifier/ctrf.json").await {
-            fs::write(verifier_directory.join("ctrf.json"), ctrf)?;
-        }
-        let answer_path = format!("{}/answer.txt", verifier_launch.workspace);
-        if let Ok(answer) = verifier_session.read_file(answer_path).await {
-            fs::write(attempt.workspace().join("answer.txt"), answer)?;
-        }
-        verifier_session.shutdown().await?;
-        self.finish_verifier_cache()?;
-        let reward = String::from_utf8_lossy(&reward_bytes)
-            .trim()
-            .parse::<f64>()?;
-        task.validate_package()?;
-        if reward > 0.0 && !self.retain_passed_rootfs {
-            self.remove_passed_root_disks();
-        }
         Ok(AttemptVerification {
             result: VerifierResult {
                 exit_code: output.exit_code,
@@ -3154,6 +3214,7 @@ impl VmVerifier {
             },
             stdout,
             stderr,
+            cleanup,
         })
     }
 
@@ -3170,31 +3231,69 @@ impl VmVerifier {
             .clone()
             .unwrap_or_else(|| self.launch.clone());
         let session = if self.separate_launch.is_some() {
-            let artifacts = Self::collect_artifacts(&agent_session, task, &self.launch).await?;
+            let artifacts = match Self::collect_artifacts(&agent_session, task, &self.launch).await
+            {
+                Ok(artifacts) => artifacts,
+                Err(primary) => {
+                    Self::shutdown_verifier_session_after_error(&agent_session, &primary).await;
+                    return Err(primary);
+                }
+            };
             agent_session.shutdown().await?;
             let session = launch.spawn(None)?;
-            Self::stage_artifacts(&session, artifacts).await?;
+            if let Err(primary) = Self::stage_artifacts(&session, artifacts).await {
+                Self::shutdown_verifier_session_after_error(&session, &primary).await;
+                return Err(primary);
+            }
             session
         } else {
-            let tests = tempfile::tempdir()?;
-            task.materialize_verifier_files(tests.path())?;
-            Self::copy_directory(
-                &agent_session,
-                tests.path(),
-                tests.path(),
-                Path::new("/tests"),
-            )
-            .await?;
+            let setup = async {
+                let tests = tempfile::tempdir()?;
+                task.materialize_verifier_files(tests.path())?;
+                Self::copy_directory(
+                    &agent_session,
+                    tests.path(),
+                    tests.path(),
+                    Path::new("/tests"),
+                )
+                .await
+            }
+            .await;
+            if let Err(primary) = setup {
+                Self::shutdown_verifier_session_after_error(&agent_session, &primary).await;
+                return Err(primary);
+            }
             agent_session
         };
-        session
-            .write_file("/logs/verifier/.nanoeval", Vec::new(), 0o600)
-            .await?;
-        if self.attempt_cache.is_some() {
-            self.mount_verifier_cache(&session).await?;
+        let setup = async {
+            session
+                .write_file("/logs/verifier/.nanoeval", Vec::new(), 0o600)
+                .await?;
+            if self.attempt_cache.is_some() {
+                self.mount_verifier_cache(&session).await?;
+            }
+            self.stage_cached_verifier(&session, task).await
         }
-        self.stage_cached_verifier(&session, task).await?;
+        .await;
+        if let Err(primary) = setup {
+            Self::shutdown_verifier_session_after_error(&session, &primary).await;
+            return Err(primary);
+        }
         Ok((launch, session))
+    }
+
+    async fn shutdown_verifier_session_after_error(
+        session: &VmToolSession,
+        primary: &VmAttemptError,
+    ) {
+        if let Err(cleanup) = session.shutdown().await {
+            warn!(
+                target: "nanocodex_eval",
+                error = %cleanup,
+                primary_error = %primary,
+                "verifier cleanup also failed; preserving the setup error"
+            );
+        }
     }
 
     fn finish_verifier_cache(&mut self) -> Result<(), VmAttemptError> {
@@ -3238,7 +3337,8 @@ impl VmVerifier {
         }
     }
 
-    fn remove_passed_root_disks(&self) {
+    fn remove_passed_root_disks(&self) -> Result<(), VmAttemptError> {
+        let mut failures = Vec::new();
         for launch in std::iter::once(&self.launch).chain(self.separate_launch.as_ref()) {
             if !launch.ext4 {
                 continue;
@@ -3250,13 +3350,25 @@ impl VmVerifier {
                     "removed passed attempt VM root disk"
                 ),
                 Ok(false) => {}
-                Err(error) => warn!(
-                    target: "nanocodex_eval",
-                    vm_rootfs_path = %launch.root.display(),
-                    %error,
-                    "failed to remove passed attempt VM root disk"
-                ),
+                Err(error) => {
+                    warn!(
+                        target: "nanocodex_eval",
+                        vm_rootfs_path = %launch.root.display(),
+                        %error,
+                        "failed to remove passed attempt VM root disk"
+                    );
+                    failures.push(format!("{}: {error}", launch.root.display()));
+                }
             }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "failed to remove passed attempt VM root disks: {}",
+                failures.join("; ")
+            ))
+            .into())
         }
     }
 
@@ -3625,10 +3737,14 @@ impl RunReport {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
 struct RunSummary {
     total: usize,
+    scored: usize,
+    unscored: usize,
     passed: usize,
     failed: usize,
     refused: usize,
     errored: usize,
+    cleanup_failed: usize,
+    billing_unknown: usize,
     known_estimated_cost_usd: Option<f64>,
     priced_attempts: usize,
 }
@@ -3642,18 +3758,47 @@ impl RunSummary {
         for attempt in attempts {
             match attempt {
                 AttemptOutcome::Passed(result) => {
+                    summary.scored += 1;
                     summary.passed += 1;
-                    summary.record_estimated_cost(result.agent.cost_usd);
+                    summary.record_agent(&result.agent);
+                    summary.record_cleanup(result.cleanup.is_failed());
                 }
                 AttemptOutcome::Failed(result) => {
+                    summary.scored += 1;
                     summary.failed += 1;
-                    summary.record_estimated_cost(result.agent.cost_usd);
+                    summary.record_agent(&result.agent);
+                    summary.record_cleanup(result.cleanup.is_failed());
                 }
-                AttemptOutcome::Refused(_) => summary.refused += 1,
-                AttemptOutcome::Errored(_) => summary.errored += 1,
+                AttemptOutcome::Refused(failure) => {
+                    summary.unscored += 1;
+                    summary.refused += 1;
+                    if let Some(agent) = &failure.agent {
+                        summary.record_agent(agent);
+                    }
+                    summary.record_cleanup(failure.cleanup.is_failed());
+                }
+                AttemptOutcome::Errored(failure) => {
+                    summary.unscored += 1;
+                    summary.errored += 1;
+                    if let Some(agent) = &failure.agent {
+                        summary.record_agent(agent);
+                    }
+                    summary.record_cleanup(failure.cleanup.is_failed());
+                }
             }
         }
         summary
+    }
+
+    fn record_agent(&mut self, agent: &nanocodex_eval::AgentResult) {
+        self.record_estimated_cost(agent.cost_usd);
+        if agent.billing_completeness == BillingCompleteness::Unknown {
+            self.billing_unknown += 1;
+        }
+    }
+
+    fn record_cleanup(&mut self, failed: bool) {
+        self.cleanup_failed += usize::from(failed);
     }
 
     fn record_estimated_cost(&mut self, cost_usd: Option<f64>) {
@@ -3691,7 +3836,7 @@ impl AttemptOutcome {
     }
 
     fn from_failure(failure: EvalFailure) -> Self {
-        if failure.kind == EvalFailureKind::AgentSafetyRefusal {
+        if failure.outcome == EvalOutcome::SafetyRefusal {
             Self::Refused(failure)
         } else {
             Self::Errored(failure)
@@ -3784,60 +3929,90 @@ fn write_progress_line(outcome: &AttemptOutcome, completed: usize, expected: usi
         AttemptOutcome::Passed(result) => {
             let status = Painted::new(format!("[PASS {completed}/{expected}]")).green();
             eprintln!(
-                "{status} {} ({})",
+                "{status} {} ({}){}",
                 result.trial_name,
-                result_duration(result)
+                result_duration(result),
+                cleanup_suffix(result.cleanup.is_failed()),
             );
         }
         AttemptOutcome::Failed(result) => {
             let status = Painted::new(format!("[FAIL {completed}/{expected}]")).red();
             eprintln!(
-                "{status} {} ({}, reward={:.3})",
+                "{status} {} ({}, reward={:.3}){}",
                 result.trial_name,
                 result_duration(result),
-                result.verifier.rewards.values().sum::<f64>()
+                result.verifier.rewards.values().sum::<f64>(),
+                cleanup_suffix(result.cleanup.is_failed()),
             );
         }
         AttemptOutcome::Refused(failure) => {
             let message = failure.message.lines().next().unwrap_or_default();
             let status = Painted::new(format!("[REFUSED {completed}/{expected}]")).yellow();
             eprintln!(
-                "{status} {} ({}): {message}",
+                "{status} {} ({}): {message}{}",
                 failure.trial_name,
-                format_milliseconds(
-                    failure
-                        .occurred_at
-                        .signed_duration_since(failure.started_at)
-                        .num_milliseconds()
-                )
+                failure_duration(failure),
+                cleanup_suffix(failure.cleanup.is_failed()),
             );
         }
         AttemptOutcome::Errored(failure) => {
             let message = failure.message.lines().next().unwrap_or_default();
             let status = Painted::new(format!("[ERROR {completed}/{expected}]")).red();
             eprintln!(
-                "{status} {} ({:?}, {}): {message}",
+                "{status} {} ({:?}, {}): {message}{}",
                 failure.trial_name,
                 failure.kind,
-                format_milliseconds(
-                    failure
-                        .occurred_at
-                        .signed_duration_since(failure.started_at)
-                        .num_milliseconds()
-                )
+                failure_duration(failure),
+                cleanup_suffix(failure.cleanup.is_failed()),
             );
         }
     }
 }
 
 fn result_duration(result: &EvalResult) -> String {
-    format_milliseconds(
-        result
-            .timing
-            .finished_at
-            .signed_duration_since(result.timing.started_at)
-            .num_milliseconds(),
-    )
+    let phases = [
+        Some(&result.timing.queue_wait),
+        Some(&result.timing.environment_setup),
+        Some(&result.timing.environment_readiness),
+        Some(&result.timing.agent_setup),
+        Some(&result.timing.agent_execution),
+        Some(&result.timing.verifier),
+        result.cleanup.agent.timing.as_ref(),
+        result.cleanup.verifier.timing.as_ref(),
+    ];
+    format_milliseconds(sum_phase_milliseconds(phases))
+}
+
+fn failure_duration(failure: &EvalFailure) -> String {
+    let phases = [
+        Some(&failure.timing.queue_wait),
+        failure.timing.environment_setup.as_ref(),
+        failure.timing.environment_readiness.as_ref(),
+        failure.timing.agent_setup.as_ref(),
+        failure.timing.agent_execution.as_ref(),
+        failure.timing.verifier.as_ref(),
+        failure.cleanup.agent.timing.as_ref(),
+        failure.cleanup.verifier.timing.as_ref(),
+    ];
+    format_milliseconds(sum_phase_milliseconds(phases))
+}
+
+fn sum_phase_milliseconds<'a>(phases: impl IntoIterator<Item = Option<&'a PhaseTiming>>) -> i64 {
+    phases
+        .into_iter()
+        .flatten()
+        .map(|phase| {
+            phase
+                .finished_at
+                .signed_duration_since(phase.started_at)
+                .num_milliseconds()
+                .max(0)
+        })
+        .fold(0_i64, i64::saturating_add)
+}
+
+const fn cleanup_suffix(failed: bool) -> &'static str {
+    if failed { " [cleanup failed]" } else { "" }
 }
 
 fn format_milliseconds(milliseconds: i64) -> String {
@@ -4390,6 +4565,10 @@ mod tests {
                 r#"{"task_name":"terminal-bench/passed","verifier_result":{"rewards":{"reward":1.0}},"exception_info":null}"#,
             ),
             (
+                "passed-with-cleanup-failure",
+                r#"{"task_name":"terminal-bench/passed-with-cleanup-failure","outcome":"passed","scored":true,"verifier_result":{"rewards":{"reward":1.0}},"exception_info":{"exception_type":"CleanupError"}}"#,
+            ),
+            (
                 "partially-failed",
                 r#"{"task_name":"terminal-bench/partially-failed","verifier_result":{"rewards":{"first":1.0,"second":0.0}},"exception_info":null}"#,
             ),
@@ -4404,6 +4583,10 @@ mod tests {
             (
                 "errored",
                 r#"{"task_name":"terminal-bench/errored","verifier_result":null,"exception_info":{"exception_type":"VerifierError"}}"#,
+            ),
+            (
+                "unscored-with-reward",
+                r#"{"task_name":"terminal-bench/unscored-with-reward","scored":false,"verifier_result":{"rewards":{"reward":1.0}},"exception_info":null}"#,
             ),
         ] {
             let directory = job.path().join(trial);
@@ -4421,13 +4604,14 @@ mod tests {
             .into()
         );
 
-        let matcher = regex::RegexSet::new(["torch|errored"]).unwrap();
+        let matcher = regex::RegexSet::new(["torch|errored|unscored"]).unwrap();
         let selected = retained_retry_task_names(job.path(), true, true, Some(&matcher)).unwrap();
         assert_eq!(
             selected.task_names,
             [
                 "terminal-bench/errored".to_owned(),
-                "terminal-bench/torch-failed".to_owned()
+                "terminal-bench/torch-failed".to_owned(),
+                "terminal-bench/unscored-with-reward".to_owned(),
             ]
             .into()
         );

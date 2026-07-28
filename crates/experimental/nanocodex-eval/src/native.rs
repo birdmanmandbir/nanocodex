@@ -8,7 +8,7 @@ use std::{
 use chrono::Utc;
 use tokio::{process::Command, time::timeout};
 
-use crate::{EvalError, PhaseTiming, Task, VerifierResult};
+use crate::{CleanupPhase, EvalError, PhaseTiming, Task, VerifierResult};
 
 pub(crate) struct AttemptPaths {
     pub root: PathBuf,
@@ -29,6 +29,7 @@ pub(crate) struct VerifierExecution {
     pub timing: PhaseTiming,
     pub stdout: String,
     pub stderr: String,
+    pub cleanup: CleanupPhase,
 }
 
 impl NativeAttempt {
@@ -110,6 +111,7 @@ impl NativeAttempt {
             },
             stdout,
             stderr,
+            cleanup: CleanupPhase::not_required(),
         })
     }
 

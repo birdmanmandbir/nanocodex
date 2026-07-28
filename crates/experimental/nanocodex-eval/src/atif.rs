@@ -685,7 +685,7 @@ mod tests {
 
     use nanocodex_agent::events::AgentEvent;
 
-    use crate::{AgentMetadata, AgentResult, AtifSource, Task};
+    use crate::{AgentMetadata, AgentResult, AtifSource, BillingCompleteness, Task};
 
     use super::AtifBuilder;
 
@@ -754,6 +754,7 @@ mod tests {
             tool_calls: metadata.tool_calls,
             usage: metadata.usage.clone(),
             cost_usd: metadata.cost_usd,
+            billing_completeness: BillingCompleteness::Complete,
             metadata,
         };
 
