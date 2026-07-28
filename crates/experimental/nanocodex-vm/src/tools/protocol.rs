@@ -8,6 +8,7 @@ pub(crate) enum SessionRequest {
     Ready(ReadyRequest),
     Tool(ToolRequest),
     WriteFile(WriteFileRequest),
+    CreateDirectory(CreateDirectoryRequest),
     ReadFile(ReadFileRequest),
     Execute(ExecuteRequest),
     Cancel(CancelRequest),
@@ -21,6 +22,7 @@ impl SessionRequest {
             Self::Ready(request) => request.id,
             Self::Tool(request) => request.id,
             Self::WriteFile(request) => request.id,
+            Self::CreateDirectory(request) => request.id,
             Self::ReadFile(request) => request.id,
             Self::Execute(request) => request.id,
             Self::Cancel(request) => request.id,
@@ -35,6 +37,7 @@ pub(crate) enum SessionResponse {
     Ready(ControlResponse),
     Tool(ToolResponse),
     WriteFile(ControlResponse),
+    CreateDirectory(ControlResponse),
     ReadFile(ReadFileResponse),
     Execute(ExecuteResponse),
     Cancel(ControlResponse),
@@ -46,9 +49,10 @@ impl SessionResponse {
         match self {
             Self::Ready(response) => response.id,
             Self::Tool(response) => response.id,
-            Self::WriteFile(response) | Self::Cancel(response) | Self::Shutdown(response) => {
-                response.id
-            }
+            Self::WriteFile(response)
+            | Self::CreateDirectory(response)
+            | Self::Cancel(response)
+            | Self::Shutdown(response) => response.id,
             Self::ReadFile(response) => response.id,
             Self::Execute(response) => response.id,
         }
@@ -75,6 +79,18 @@ pub(crate) struct WriteFileRequest {
     #[serde(with = "wire_bytes")]
     pub contents: Vec<u8>,
     pub mode: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_unix_seconds: Option<i64>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CreateDirectoryRequest {
+    pub id: u64,
+    pub path: String,
+    pub mode: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_unix_seconds: Option<i64>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -203,8 +219,8 @@ mod tests {
     use serde_json::{json, value::to_raw_value};
 
     use super::{
-        ReadyRequest, SessionRequest, ShutdownRequest, ToolRequest, ToolResponse, WireToolContext,
-        WireToolInput, WriteFileRequest,
+        CreateDirectoryRequest, ReadyRequest, SessionRequest, ShutdownRequest, ToolRequest,
+        ToolResponse, WireToolContext, WireToolInput, WriteFileRequest,
     };
 
     #[test]
@@ -269,16 +285,52 @@ mod tests {
             path: "/tmp/output".to_owned(),
             contents: vec![0, 127, 128, 255],
             mode: 0o600,
+            modified_unix_seconds: None,
         });
         let encoded = serde_json::to_string(&request).unwrap();
 
         assert!(encoded.contains(r#""contents":"AH+A/w==""#));
         assert!(!encoded.contains(r#""contents":[0,127,128,255]"#));
+        assert!(!encoded.contains("modified_unix_seconds"));
         let decoded = serde_json::from_str::<SessionRequest>(&encoded).unwrap();
         let SessionRequest::WriteFile(decoded) = decoded else {
             panic!("write-file request changed variants");
         };
         assert_eq!(decoded.contents, [0, 127, 128, 255]);
+        assert_eq!(decoded.modified_unix_seconds, None);
+    }
+
+    #[test]
+    fn filesystem_metadata_requests_have_stable_typed_shapes() {
+        let write = SessionRequest::WriteFile(WriteFileRequest {
+            id: 4,
+            path: "/tmp/output".to_owned(),
+            contents: Vec::new(),
+            mode: 0o640,
+            modified_unix_seconds: Some(0),
+        });
+        assert_eq!(
+            serde_json::to_string(&write).unwrap(),
+            r#"{"kind":"write_file","payload":{"id":4,"path":"/tmp/output","contents":"","mode":416,"modified_unix_seconds":0}}"#
+        );
+
+        let directory = SessionRequest::CreateDirectory(CreateDirectoryRequest {
+            id: 5,
+            path: "/tmp/output-dir".to_owned(),
+            mode: 0o750,
+            modified_unix_seconds: Some(0),
+        });
+        let encoded = serde_json::to_string(&directory).unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"kind":"create_directory","payload":{"id":5,"path":"/tmp/output-dir","mode":488,"modified_unix_seconds":0}}"#
+        );
+        let decoded = serde_json::from_str::<SessionRequest>(&encoded).unwrap();
+        let SessionRequest::CreateDirectory(decoded) = decoded else {
+            panic!("create-directory request changed variants");
+        };
+        assert_eq!(decoded.mode, 0o750);
+        assert_eq!(decoded.modified_unix_seconds, Some(0));
     }
 }
 

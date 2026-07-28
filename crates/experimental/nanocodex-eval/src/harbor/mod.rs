@@ -59,7 +59,7 @@ use tokio::{sync::oneshot, task::JoinHandle};
 use url::Url;
 use uuid::Uuid;
 
-use checksum::directory_hash;
+use checksum::{directory_hash, packager_content_hash};
 
 #[derive(Debug, thiserror::Error)]
 /// An error produced while recording or publishing Harbor-compatible artifacts.
@@ -79,6 +79,10 @@ pub enum HarborError {
     /// A task directory contained no packageable files.
     #[error("task directory is empty: {0}")]
     EmptyTask(PathBuf),
+
+    /// Harbor's gitignore-compatible task packaging rules could not be parsed.
+    #[error(transparent)]
+    PackageIgnore(#[from] ignore::Error),
 
     /// Following a symbolic link would make task packaging cyclic.
     #[error("task directory contains a cyclic symbolic link: {0}")]
@@ -144,6 +148,23 @@ pub struct HarborJob {
 }
 
 impl Harbor {
+    /// Validates that a task is stable and readable under every task identity
+    /// algorithm emitted by the Harbor adapter.
+    ///
+    /// This performs Nanocodex package validation before and after computing
+    /// Harbor's trial checksum and publisher content hash, matching the
+    /// complete identity-read stack used while committing a terminal trial.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the task changed since loading, cannot be read,
+    /// or cannot be hashed using Harbor's compatibility rules.
+    pub fn validate_task_package(task: &Task) -> Result<(), HarborError> {
+        let _ = validated_task_identity(task)?;
+        task.validate_package()?;
+        Ok(())
+    }
+
     /// Attaches the adapter to a reusable evaluator and its artifact directory.
     ///
     /// # Errors
@@ -413,6 +434,14 @@ struct HarborArtifacts {
     recorded_trials: Mutex<Vec<HarborRecordedTrial>>,
 }
 
+fn validated_task_identity(task: &Task) -> Result<(String, String), HarborError> {
+    task.validate_package()?;
+    Ok((
+        directory_hash(task.root())?,
+        packager_content_hash(task.root())?,
+    ))
+}
+
 impl HarborArtifacts {
     fn attach(eval: &Evaluator) -> Result<Self, HarborError> {
         let root = eval.directory().to_path_buf();
@@ -497,7 +526,7 @@ impl HarborArtifacts {
         trajectory: &AtifTrajectory,
     ) -> Result<(), HarborError> {
         let task = result.task();
-        task.validate_package()?;
+        let (task_checksum, task_content_hash) = validated_task_identity(task)?;
         let root = &result.artifacts.directory;
         let agent = root.join("agent");
         let input_path = agent.join("input.jsonl");
@@ -510,7 +539,6 @@ impl HarborArtifacts {
         let lock_path = root.join("lock.json");
         let result_path = root.join("result.json");
         let task_path = task.root().to_path_buf();
-        let task_checksum = directory_hash(task.root())?;
         let task_digest = task.content_digest();
         let config = HarborTrialConfig {
             task: HarborTaskConfig {
@@ -540,7 +568,7 @@ impl HarborArtifacts {
             trial_uri,
             task_id: HarborTaskId { path: task_path },
             source: "nanocodex/local",
-            task_checksum: task_checksum.clone(),
+            task_checksum,
             config,
             agent_info: HarborAgentInfo {
                 name: "nanocodex",
@@ -579,7 +607,7 @@ impl HarborArtifacts {
             task,
             &result.agent.model,
             &result.agent.effort,
-            &task_checksum,
+            &task_content_hash,
             task_digest,
             result.environment,
         );
@@ -624,7 +652,7 @@ impl HarborArtifacts {
         trajectory: &AtifTrajectory,
     ) -> Result<(), HarborError> {
         let task = failure.task();
-        task.validate_package()?;
+        let (task_checksum, task_content_hash) = validated_task_identity(task)?;
         let root = &failure.artifacts.directory;
         let agent = root.join("agent");
         let input_path = agent.join("input.jsonl");
@@ -637,7 +665,6 @@ impl HarborArtifacts {
         let lock_path = root.join("lock.json");
         let result_path = root.join("result.json");
         let task_path = task.root().to_path_buf();
-        let task_checksum = directory_hash(task.root())?;
         let task_digest = task.content_digest();
         let model = trajectory.agent.model_name.as_str();
         let effort = trajectory
@@ -673,7 +700,7 @@ impl HarborArtifacts {
             trial_uri,
             task_id: HarborTaskId { path: task_path },
             source: "nanocodex/local",
-            task_checksum: task_checksum.clone(),
+            task_checksum,
             config,
             agent_info: HarborAgentInfo {
                 name: "nanocodex",
@@ -708,7 +735,7 @@ impl HarborArtifacts {
             task,
             model,
             effort,
-            &task_checksum,
+            &task_content_hash,
             task_digest,
             failure.environment,
         );
@@ -1136,7 +1163,7 @@ impl HarborTrialLock {
         task: &Task,
         model: &str,
         effort: &str,
-        harbor_digest: &str,
+        task_content_hash: &str,
         materialization_digest: &str,
         environment: EvalEnvironment,
     ) -> Self {
@@ -1150,7 +1177,7 @@ impl HarborTrialLock {
                     .unwrap_or(task.name())
                     .to_owned(),
                 kind: HarborTaskLockKind::Local,
-                digest: format!("sha256:{harbor_digest}"),
+                digest: format!("sha256:{task_content_hash}"),
                 source: Some("nanocodex/local".to_owned()),
                 path: task.root().to_path_buf(),
             },
@@ -1950,12 +1977,13 @@ mod tests {
     #[test]
     fn trial_lock_keeps_harbors_hash_separate_from_internal_materialization_identity() {
         let task = write_greeting_task();
-        let harbor_digest = super::directory_hash(task.root()).unwrap();
+        let task_checksum = super::directory_hash(task.root()).unwrap();
+        let task_content_hash = super::packager_content_hash(task.root()).unwrap();
         let lock = super::HarborTrialLock::new(
             &task,
             "gpt-test",
             "high",
-            &harbor_digest,
+            &task_content_hash,
             task.content_digest(),
             EvalEnvironment::Native,
         );
@@ -1963,8 +1991,9 @@ mod tests {
         let mut retained = serde_json::to_value(&lock).unwrap();
         assert_eq!(
             retained["task"]["digest"],
-            format!("sha256:{harbor_digest}")
+            format!("sha256:{task_content_hash}")
         );
+        assert_ne!(task_checksum, task_content_hash);
         assert_eq!(
             retained["nanocodex"]["materialization_digest"],
             format!("sha256:{}", task.content_digest())
@@ -2213,7 +2242,7 @@ allow_internet = false
                 task,
                 "gpt-test",
                 "high",
-                &super::directory_hash(task.root()).unwrap(),
+                &super::packager_content_hash(task.root()).unwrap(),
                 task.content_digest(),
                 EvalEnvironment::Native,
             ),

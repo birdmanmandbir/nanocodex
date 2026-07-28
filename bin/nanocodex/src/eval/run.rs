@@ -3376,8 +3376,11 @@ impl VmVerifier {
             let relative = directory.strip_prefix(root).map_err(io::Error::other)?;
             let guest_directory = destination.join(relative).to_string_lossy().into_owned();
             let directory_mode =
-                std::os::unix::fs::PermissionsExt::mode(&fs::metadata(directory)?.permissions());
-            Self::create_guest_directory(session, &guest_directory, directory_mode).await?;
+                std::os::unix::fs::PermissionsExt::mode(&fs::metadata(directory)?.permissions())
+                    & 0o7777;
+            session
+                .create_directory(&guest_directory, 0o700, None)
+                .await?;
             for entry in fs::read_dir(directory)? {
                 let entry = entry?;
                 let path = entry.path();
@@ -3388,40 +3391,20 @@ impl VmVerifier {
                     Self::copy_directory(session, root, &path, destination).await?;
                 } else if file_type.is_file() {
                     let mode =
-                        std::os::unix::fs::PermissionsExt::mode(&entry.metadata()?.permissions());
-                    session.write_file(guest, fs::read(path)?, mode).await?;
+                        std::os::unix::fs::PermissionsExt::mode(&entry.metadata()?.permissions())
+                            & 0o7777;
+                    session
+                        .write_file_with_mtime(guest.as_str(), fs::read(path)?, mode, 0)
+                        .await?;
                 } else {
                     return Err(VmAttemptError::Collision(path));
                 }
             }
+            session
+                .create_directory(&guest_directory, directory_mode, Some(0))
+                .await?;
             Ok(())
         })
-    }
-
-    async fn create_guest_directory(
-        session: &VmToolSession,
-        directory: &str,
-        mode: u32,
-    ) -> Result<(), VmAttemptError> {
-        for command in [
-            VmCommand::new("/bin/mkdir")
-                .arg("-p")
-                .arg(directory.to_owned()),
-            VmCommand::new("/bin/chmod")
-                .arg(format!("{:o}", mode & 0o7777))
-                .arg(directory.to_owned()),
-        ] {
-            let output = session.command(command).await?;
-            if output.exit_code != 0 {
-                return Err(io::Error::other(format!(
-                    "staging verifier directory {directory} exited {}: {}",
-                    output.exit_code,
-                    String::from_utf8_lossy(&output.stderr)
-                ))
-                .into());
-            }
-        }
-        Ok(())
     }
 }
 
@@ -3875,16 +3858,16 @@ mod tests {
 
     use clap::Parser;
     use nanocodex_eval::Task;
-    use nanocodex_vm::{VmCommandOutput, VmCommandPartialOutput};
+    use nanocodex_vm::{VmCommandOutput, VmCommandPartialOutput, VmToolSession};
 
     use super::{
         CACHED_VERIFIER_SCRIPT, DEFAULT_HOST_UTILIZATION_PERCENT, DEFAULT_TRIALS,
         EvalInterruptError, HostResources, InterruptListener, RetainedBuild, RetainedScheduling,
-        Run, RunInvocation, RunMeasurements, RunSummary, VmRetention, cached_verifier_script,
-        finish_or_drain, finish_or_interrupt, load_tasks, recognized_verifier_setup,
-        remove_passed_rootfs, retained_retry_task_names, retained_task_durations,
-        verifier_bootstrap_network_failed, verifier_cache_key, verifier_network_retry_delay,
-        verifier_shell, verifier_timeout_output,
+        Run, RunInvocation, RunMeasurements, RunSummary, VmRetention, VmVerifier,
+        cached_verifier_script, finish_or_drain, finish_or_interrupt, load_tasks,
+        recognized_verifier_setup, remove_passed_rootfs, retained_retry_task_names,
+        retained_task_durations, verifier_bootstrap_network_failed, verifier_cache_key,
+        verifier_network_retry_delay, verifier_shell, verifier_timeout_output,
     };
 
     #[derive(Parser)]
@@ -4733,6 +4716,83 @@ source $HOME/.local/bin/env
                 .collect::<Vec<_>>(),
             [2, 4, 8, 16, 32].map(std::time::Duration::from_secs)
         );
+    }
+
+    #[tokio::test]
+    async fn same_vm_verifier_staging_normalizes_file_and_directory_mtimes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = tempfile::tempdir().unwrap();
+        let nested = source.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        let file = source.path().join("test.sh");
+        fs::write(&file, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(source.path(), fs::Permissions::from_mode(0o751)).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o711)).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
+
+        let control = tempfile::tempdir().unwrap();
+        let journal = control.path().join("requests.jsonl");
+        let script = r#"
+request_id=0
+while IFS= read -r request; do
+    printf '%s\n' "$request" >> "$1"
+    case "$request" in
+        *'"kind":"create_directory"'*) kind=create_directory ;;
+        *'"kind":"write_file"'*) kind=write_file ;;
+        *'"kind":"shutdown"'*) kind=shutdown ;;
+        *) exit 91 ;;
+    esac
+    printf '{"kind":"%s","payload":{"id":%s,"error":null}}\n' "$kind" "$request_id"
+    if [ "$kind" = shutdown ]; then
+        exit 0
+    fi
+    request_id=$((request_id + 1))
+done
+"#;
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .arg("nanocodex-verifier-staging")
+            .arg(&journal);
+        let session = VmToolSession::spawn(&mut command).unwrap();
+
+        VmVerifier::copy_directory(&session, source.path(), source.path(), Path::new("/tests"))
+            .await
+            .unwrap();
+        session.shutdown().await.unwrap();
+
+        let requests = fs::read_to_string(&journal)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let writes = requests
+            .iter()
+            .filter(|request| request["kind"] == "write_file")
+            .collect::<Vec<_>>();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0]["payload"]["path"], "/tests/test.sh");
+        assert_eq!(writes[0]["payload"]["mode"], 0o640);
+        assert_eq!(writes[0]["payload"]["modified_unix_seconds"], 0);
+
+        for (path, final_mode) in [("/tests", 0o751), ("/tests/nested", 0o711)] {
+            let creates = requests
+                .iter()
+                .filter(|request| {
+                    request["kind"] == "create_directory"
+                        && request["payload"]["path"]
+                            .as_str()
+                            .is_some_and(|actual| Path::new(actual) == Path::new(path))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(creates.len(), 2, "{path} must be opened then finalized");
+            assert_eq!(creates[0]["payload"]["mode"], 0o700);
+            assert!(creates[0]["payload"].get("modified_unix_seconds").is_none());
+            assert_eq!(creates[1]["payload"]["mode"], final_mode);
+            assert_eq!(creates[1]["payload"]["modified_unix_seconds"], 0);
+        }
     }
 
     #[test]
