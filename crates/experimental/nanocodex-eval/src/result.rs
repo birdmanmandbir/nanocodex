@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, error::Error, path::PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,36 @@ pub enum EvalStatus {
     Failed,
 }
 
+/// Stable semantic outcome for score and retry policy.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvalOutcome {
+    /// Verification completed with every reward positive.
+    Passed,
+    /// Verification completed with at least one non-positive reward.
+    VerifierFailed,
+    /// The model provider rejected the attempt for a safety policy.
+    SafetyRefusal,
+    /// Agent execution exceeded its task deadline.
+    AgentTimeout,
+    /// The attempt did not produce trustworthy verifier evidence.
+    InfrastructureError,
+}
+
+impl EvalOutcome {
+    /// Returns whether this outcome contributes to score denominators.
+    #[must_use]
+    pub const fn is_scored(self) -> bool {
+        matches!(self, Self::Passed | Self::VerifierFailed)
+    }
+
+    /// Returns whether this outcome is a scored pass.
+    #[must_use]
+    pub const fn is_passed(self) -> bool {
+        matches!(self, Self::Passed)
+    }
+}
+
 /// Stable classification for an attempt that could not produce a score.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -43,10 +73,126 @@ pub enum EvalFailureKind {
     Agent,
     /// Verifier setup or execution failed.
     Verifier,
+    /// Explicit agent or verifier resource cleanup failed.
+    Cleanup,
     /// Attempt workspace or environment setup failed.
     Environment,
     /// The evaluation runtime violated an internal invariant.
     Internal,
+}
+
+/// Whether all potentially billable model operations reached a terminal event.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BillingCompleteness {
+    /// Every operation that could incur provider usage reached a terminal event.
+    Complete,
+    /// Cancellation interrupted a potentially billable operation in flight.
+    Unknown,
+}
+
+/// Terminal health for one explicit cleanup boundary.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupStatus {
+    /// This attempt did not own a cleanup boundary for the phase.
+    NotRequired,
+    /// Cleanup completed and all owned resources were joined.
+    Completed,
+    /// Cleanup failed after it was attempted.
+    Failed,
+}
+
+/// Complete error information for a failed cleanup boundary.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CleanupDiagnostic {
+    /// Human-readable cleanup error.
+    pub message: String,
+    /// Complete formatted cleanup error chain.
+    pub traceback: String,
+}
+
+/// Health and disjoint timing for one cleanup boundary.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CleanupPhase {
+    /// Terminal cleanup health.
+    pub status: CleanupStatus,
+    /// Exact cleanup interval when cleanup was attempted.
+    pub timing: Option<PhaseTiming>,
+    /// Complete error information when cleanup failed.
+    pub diagnostic: Option<CleanupDiagnostic>,
+}
+
+impl CleanupPhase {
+    /// Constructs a phase for which no cleanup boundary exists.
+    #[must_use]
+    pub const fn not_required() -> Self {
+        Self {
+            status: CleanupStatus::NotRequired,
+            timing: None,
+            diagnostic: None,
+        }
+    }
+
+    /// Records cleanup that completed after `started_at`.
+    #[must_use]
+    pub fn completed(started_at: DateTime<Utc>) -> Self {
+        Self {
+            status: CleanupStatus::Completed,
+            timing: Some(PhaseTiming::finished(started_at)),
+            diagnostic: None,
+        }
+    }
+
+    /// Records failed cleanup and its complete error chain.
+    #[must_use]
+    pub fn failed(started_at: DateTime<Utc>, error: &(dyn Error + 'static)) -> Self {
+        Self {
+            status: CleanupStatus::Failed,
+            timing: Some(PhaseTiming::finished(started_at)),
+            diagnostic: Some(CleanupDiagnostic {
+                message: error.to_string(),
+                traceback: format_error_chain(error),
+            }),
+        }
+    }
+
+    /// Returns whether cleanup was attempted and failed.
+    #[must_use]
+    pub const fn is_failed(&self) -> bool {
+        matches!(self.status, CleanupStatus::Failed)
+    }
+}
+
+impl Default for CleanupPhase {
+    fn default() -> Self {
+        Self::not_required()
+    }
+}
+
+/// Cleanup health kept orthogonal to the attempt's score outcome.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct EvalCleanup {
+    /// Agent driver and all model/tool resources.
+    pub agent: CleanupPhase,
+    /// Attempt-owned verifier environment.
+    pub verifier: CleanupPhase,
+}
+
+impl EvalCleanup {
+    /// Returns whether either cleanup boundary failed.
+    #[must_use]
+    pub const fn is_failed(&self) -> bool {
+        self.agent.is_failed() || self.verifier.is_failed()
+    }
+
+    /// Returns the first cleanup diagnostic in lifecycle order.
+    #[must_use]
+    pub fn first_failure(&self) -> Option<(&CleanupDiagnostic, &PhaseTiming)> {
+        [&self.agent, &self.verifier]
+            .into_iter()
+            .find_map(|phase| phase.diagnostic.as_ref().zip(phase.timing.as_ref()))
+    }
 }
 
 /// Typed terminal output for an errored or refused attempt.
@@ -60,6 +206,8 @@ pub struct EvalFailure {
     pub trial_name: String,
     /// Stable failure classification.
     pub kind: EvalFailureKind,
+    /// Stable semantic outcome used by retry and aggregate policy.
+    pub outcome: EvalOutcome,
     /// Human-readable error message.
     pub message: String,
     /// Complete formatted error chain.
@@ -74,6 +222,14 @@ pub struct EvalFailure {
     pub started_at: DateTime<Utc>,
     /// Time at which the failure was classified.
     pub occurred_at: DateTime<Utc>,
+    /// Completed phase intervals retained before the failure.
+    pub timing: EvalFailureTiming,
+    /// Partial terminal agent metrics when the agent lifecycle emitted them.
+    pub agent: Option<AgentResult>,
+    /// Verifier evidence observed before an unscored infrastructure failure.
+    pub verifier: Option<VerifierResult>,
+    /// Explicit cleanup health independent from score classification.
+    pub cleanup: EvalCleanup,
     /// Retained attempt artifact paths.
     pub artifacts: EvalArtifacts,
     #[serde(skip)]
@@ -91,6 +247,8 @@ pub struct EvalResult {
     pub trial_name: String,
     /// Verifier-derived pass/fail classification.
     pub status: EvalStatus,
+    /// Stable semantic outcome used by aggregate policy.
+    pub outcome: EvalOutcome,
     /// Execution environment used by this attempt.
     pub environment: EvalEnvironment,
     /// Typed terminal agent output and usage.
@@ -99,6 +257,8 @@ pub struct EvalResult {
     pub verifier: VerifierResult,
     /// Attempt phase timestamps.
     pub timing: EvalTiming,
+    /// Explicit cleanup health independent from the verifier score.
+    pub cleanup: EvalCleanup,
     /// Retained attempt artifact paths.
     pub artifacts: EvalArtifacts,
     #[serde(skip)]
@@ -214,6 +374,7 @@ impl EvalFailureKind {
             Self::VerifierTimeout => "VerifierTimeoutError",
             Self::Agent => "AgentError",
             Self::Verifier => "VerifierError",
+            Self::Cleanup => "CleanupError",
             Self::Environment => "EnvironmentError",
             Self::Internal => "NanocodexEvalError",
         }
@@ -237,6 +398,8 @@ pub struct AgentResult {
     pub usage: UsageTotals,
     /// Estimated aggregate USD cost when provider usage can be priced.
     pub cost_usd: Option<f64>,
+    /// Whether the provider billing snapshot is known to be terminal.
+    pub billing_completeness: BillingCompleteness,
     /// Complete typed terminal event metadata.
     pub metadata: AgentMetadata,
 }
@@ -357,13 +520,41 @@ pub struct EvalTiming {
     pub verifier: PhaseTiming,
 }
 
-/// UTC start and finish timestamps for one attempt phase.
+/// Completed attempt phases retained for an unscored terminal failure.
 #[derive(Clone, Debug, Serialize)]
+pub struct EvalFailureTiming {
+    /// Time waiting for scheduler admission, from queued to admitted.
+    pub queue_wait: PhaseTiming,
+    /// Disposable environment preparation interval, when it completed.
+    pub environment_setup: Option<PhaseTiming>,
+    /// Backend readiness interval, when it completed.
+    pub environment_readiness: Option<PhaseTiming>,
+    /// Agent construction interval, when it completed.
+    pub agent_setup: Option<PhaseTiming>,
+    /// Agent execution interval, ending before agent cleanup.
+    pub agent_execution: Option<PhaseTiming>,
+    /// Verifier execution interval, ending before verifier cleanup.
+    pub verifier: Option<PhaseTiming>,
+}
+
+/// UTC start and finish timestamps for one attempt phase.
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PhaseTiming {
     /// Phase start.
     pub started_at: DateTime<Utc>,
     /// Phase finish.
     pub finished_at: DateTime<Utc>,
+}
+
+impl PhaseTiming {
+    /// Records a phase that began at `started_at` and finished now.
+    #[must_use]
+    pub fn finished(started_at: DateTime<Utc>) -> Self {
+        Self {
+            started_at,
+            finished_at: Utc::now(),
+        }
+    }
 }
 
 /// Durable paths retained for an attempt.
@@ -375,4 +566,15 @@ pub struct EvalArtifacts {
     pub workspace: PathBuf,
     /// Captured verifier output file.
     pub verifier_output: PathBuf,
+}
+
+fn format_error_chain(error: &(dyn Error + 'static)) -> String {
+    let mut traceback = error.to_string();
+    let mut source = error.source();
+    while let Some(error) = source {
+        traceback.push_str("\ncaused by: ");
+        traceback.push_str(&error.to_string());
+        source = error.source();
+    }
+    traceback
 }

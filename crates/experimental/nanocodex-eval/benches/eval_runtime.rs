@@ -12,8 +12,8 @@ use nanocodex_agent::{
     events::{AgentEvent, AgentEventKind},
 };
 use nanocodex_eval::{
-    AggregateDataset, AtifBuilder, AttemptFact, AttemptFactArtifacts, Evaluator, LatencyBreakdown,
-    Sweep, Task, harbor::Harbor,
+    AggregateDataset, AtifBuilder, AttemptFact, AttemptFactArtifacts, BillingCompleteness,
+    EvalOutcome, Evaluator, LatencyBreakdown, Sweep, Task, harbor::Harbor,
 };
 use serde_json::{Value, json, value::RawValue};
 use uuid::Uuid;
@@ -199,8 +199,17 @@ fn representative_attempt_facts() -> Vec<AttemptFact> {
                     task_name: task.to_owned(),
                     configuration: configuration.to_owned(),
                     repetition,
+                    outcome: if (repetition + u16::from(configuration.starts_with("high"))) % 3 != 0
+                    {
+                        EvalOutcome::Passed
+                    } else {
+                        EvalOutcome::VerifierFailed
+                    },
+                    scored: true,
                     passed: (repetition + u16::from(configuration.starts_with("high"))) % 3 != 0,
+                    cleanup_failed: false,
                     cost_usd: Some(0.05 + f64::from(repetition) / 100.0),
+                    billing_completeness: Some(BillingCompleteness::Complete),
                     latency: LatencyBreakdown {
                         queue_wait_ns: u64::from(repetition) * 10_000_000,
                         vm_bootstrap_ns: 90_000_000,

@@ -12,6 +12,7 @@ use nanocodex_eval::harbor::{
     PublishedAgentInfo, PublishedAttempts, PublishedQuery, PublishedResults, PublishedTask,
     PublishedTrajectory, PublishedTrial,
 };
+use nanocodex_eval::{EvalCleanup, EvalOutcome};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use tokio::task::JoinSet;
@@ -224,6 +225,10 @@ struct LocalTrial {
     agent_info: LocalAgentInfo,
     config: Option<LocalTrialConfig>,
     verifier_result: Option<LocalVerifierResult>,
+    outcome: Option<EvalOutcome>,
+    scored: Option<bool>,
+    #[serde(default)]
+    cleanup: EvalCleanup,
     exception_info: Option<Box<RawValue>>,
 }
 
@@ -262,6 +267,11 @@ struct LocalVerifierResult {
     rewards: BTreeMap<String, f64>,
 }
 
+#[derive(Deserialize)]
+struct LocalException {
+    exception_type: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct TaskScore {
     task_name: String,
@@ -269,6 +279,7 @@ struct TaskScore {
     trials: usize,
     passes: usize,
     errors: usize,
+    cleanup_failures: usize,
     trajectories: usize,
 }
 
@@ -449,12 +460,25 @@ impl LocalJobLoader {
                 .model_info
                 .map_or_else(|| "unknown".to_owned(), |model| model.name),
         ));
-        let passed = trial.exception_info.is_none()
-            && trial
-                .verifier_result
+        let verifier_passed = trial
+            .verifier_result
+            .as_ref()
+            .and_then(|verifier| verifier.rewards.get("reward"))
+            .is_some_and(|reward| *reward > 0.0);
+        let scored = trial
+            .outcome
+            .map(EvalOutcome::is_scored)
+            .or(trial.scored)
+            .unwrap_or_else(|| trial.verifier_result.is_some() && trial.exception_info.is_none());
+        let passed = trial
+            .outcome
+            .map_or(scored && verifier_passed, EvalOutcome::is_passed);
+        let cleanup_failed = trial.cleanup.is_failed()
+            || trial
+                .exception_info
                 .as_ref()
-                .and_then(|verifier| verifier.rewards.get("reward"))
-                .is_some_and(|reward| *reward > 0.0);
+                .and_then(|exception| serde_json::from_str::<LocalException>(exception.get()).ok())
+                .is_some_and(|exception| exception.exception_type == "CleanupError");
         let score = self
             .tasks
             .entry(trial.task_name.clone())
@@ -464,6 +488,7 @@ impl LocalJobLoader {
                 trials: 0,
                 passes: 0,
                 errors: 0,
+                cleanup_failures: 0,
                 trajectories: 0,
             });
         if score.task_checksum != trial.task_checksum {
@@ -473,9 +498,10 @@ impl LocalJobLoader {
                 job.display()
             );
         }
-        score.trials += 1;
+        score.trials += usize::from(scored);
         score.passes += usize::from(passed);
-        score.errors += usize::from(trial.exception_info.is_some());
+        score.errors += usize::from(!scored);
+        score.cleanup_failures += usize::from(cleanup_failed);
         score.trajectories += usize::from(directory.join("agent/trajectory.json").is_file());
         self.trials
             .entry(trial.task_name)
@@ -845,6 +871,7 @@ struct RunScore {
     trials: usize,
     passes: usize,
     errors: usize,
+    cleanup_failures: usize,
     trajectories: usize,
     task_scores: Vec<TaskScore>,
 }
@@ -1066,9 +1093,10 @@ impl PublishedRun {
                 trials: 0,
                 passes: 0,
                 errors: 0,
+                cleanup_failures: 0,
                 trajectories: 0,
             });
-        score.trials += 1;
+        score.trials += usize::from(!attempt.errored);
         score.passes += usize::from(attempt.passed);
         score.errors += usize::from(attempt.errored);
         score.trajectories += usize::from(attempt.trajectory_path.is_some());
@@ -1085,7 +1113,10 @@ impl RunScore {
         thinking_observed_trials: usize,
         task_scores: Vec<TaskScore>,
     ) -> Self {
-        let total_trials = task_scores.iter().map(|task| task.trials).sum();
+        let total_trials = task_scores
+            .iter()
+            .map(|task| task.trials.saturating_add(task.errors))
+            .sum();
         Self::new(RunScoreInput {
             submission: "nanoeval".to_owned(),
             runs: vec!["local".to_owned()],
@@ -1116,7 +1147,11 @@ impl RunScore {
                 (agent.name, agent.version, model)
             },
         );
-        let total_trials = published.tasks.values().map(|task| task.trials).sum();
+        let total_trials = published
+            .tasks
+            .values()
+            .map(|task| task.trials.saturating_add(task.errors))
+            .sum();
         Self::new(RunScoreInput {
             submission,
             runs: published.runs.into_iter().collect(),
@@ -1167,6 +1202,7 @@ impl RunScore {
             trials: task_scores.iter().map(|task| task.trials).sum(),
             passes: task_scores.iter().map(|task| task.passes).sum(),
             errors: task_scores.iter().map(|task| task.errors).sum(),
+            cleanup_failures: task_scores.iter().map(|task| task.cleanup_failures).sum(),
             trajectories: task_scores.iter().map(|task| task.trajectories).sum(),
             task_scores,
         }
@@ -1179,13 +1215,19 @@ fn write_run_score(output: &mut impl Write, run: &RunScore) -> io::Result<()> {
         .agent_version
         .as_deref()
         .map_or_else(String::new, |version| format!(" {version}"));
+    let attempts = run.trials.saturating_add(run.errors);
     let trajectory = if run.trajectories == 0 {
         "trajectories none".to_owned()
     } else {
-        format!("trajectories {}/{}", run.trajectories, run.trials)
+        format!("trajectories {}/{}", run.trajectories, attempts)
     };
     let errors = if run.errors > 0 {
         format!(" · errors {}", run.errors)
+    } else {
+        String::new()
+    };
+    let cleanup = if run.cleanup_failures > 0 {
+        format!(" · cleanup failures {}", run.cleanup_failures)
     } else {
         String::new()
     };
@@ -1211,7 +1253,7 @@ fn write_run_score(output: &mut impl Write, run: &RunScore) -> io::Result<()> {
             .map_or_else(|| "pass@k".to_owned(), |k| format!("pass@{k}"));
         return writeln!(
             output,
-            "{} · {}{} · {} · thinking {thinking} · trials {}/{} · {k} {pass_at_k} · {trajectory}{errors}{revision}",
+            "{} · {}{} · {} · thinking {thinking} · trials {}/{} · {k} {pass_at_k} · {trajectory}{errors}{cleanup}{revision}",
             run.submission, run.agent, version, run.model, run.passes, run.trials,
         );
     }
@@ -1220,7 +1262,7 @@ fn write_run_score(output: &mut impl Write, run: &RunScore) -> io::Result<()> {
         .map_or_else(|| "task pass".to_owned(), |k| format!("pass@{k}"));
     writeln!(
         output,
-        "{} · {}{} · {} · thinking {thinking} · {pass_at_k} {}/{} · trials {}/{} · {trajectory}{errors}",
+        "{} · {}{} · {} · thinking {thinking} · {pass_at_k} {}/{} · trials {}/{} · {trajectory}{errors}{cleanup}",
         run.submission,
         run.agent,
         version,
@@ -1432,6 +1474,7 @@ mod tests {
                         trials: 2,
                         passes: 1,
                         errors: 0,
+                        cleanup_failures: 0,
                         trajectories: 2,
                     },
                 ),
@@ -1443,6 +1486,7 @@ mod tests {
                         trials: 2,
                         passes: 0,
                         errors: 0,
+                        cleanup_failures: 0,
                         trajectories: 2,
                     },
                 ),

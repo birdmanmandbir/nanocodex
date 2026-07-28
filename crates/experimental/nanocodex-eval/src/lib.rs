@@ -81,9 +81,10 @@ pub use evaluator::{
 };
 pub use event::{EvalEvent, EvalEventKind, EvalEventStream, EvalEventStreamError, EvalEvents};
 pub use result::{
-    AgentMetadata, AgentResult, AgentStatus, EvalArtifacts, EvalEnvironment, EvalFailure,
-    EvalFailureKind, EvalResult, EvalStatus, EvalTiming, PhaseTiming, SweepAttemptResult,
-    SweepResults, UsageTotals, VerifierResult,
+    AgentMetadata, AgentResult, AgentStatus, BillingCompleteness, CleanupDiagnostic, CleanupPhase,
+    CleanupStatus, EvalArtifacts, EvalCleanup, EvalEnvironment, EvalFailure, EvalFailureKind,
+    EvalFailureTiming, EvalOutcome, EvalResult, EvalStatus, EvalTiming, PhaseTiming,
+    SweepAttemptResult, SweepResults, UsageTotals, VerifierResult,
 };
 pub use sweep::{AgentId, AgentIdError, Sweep, SweepBuilder, SweepError};
 pub use task::{

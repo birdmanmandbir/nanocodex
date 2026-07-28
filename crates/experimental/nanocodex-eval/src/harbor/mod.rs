@@ -47,8 +47,9 @@ use std::{
 
 use crate::{
     AgentMetadata, AggregateDataset, AtifBuilder, AtifTrajectory, AttemptFact,
-    AttemptFactArtifacts, EvalEnvironment, EvalEventKind, EvalEventStream, EvalEventStreamError,
-    EvalFailure, EvalResult, Evaluator, LatencyBreakdown, PhaseTiming, Task, TaskLoadError,
+    AttemptFactArtifacts, BillingCompleteness, EvalCleanup, EvalEnvironment, EvalEventKind,
+    EvalEventStream, EvalEventStreamError, EvalFailure, EvalOutcome, EvalResult, Evaluator,
+    LatencyBreakdown, PhaseTiming, Task, TaskLoadError,
     digest::PACKAGE_DIGEST_SCHEMA,
     durable::scan_manifest_trials,
     sweep::{RunCoordinate, RunManifest},
@@ -561,6 +562,16 @@ impl HarborArtifacts {
         let trial_uri = Url::from_directory_path(root)
             .map_err(|()| HarborError::InvalidTrialPath(root.clone()))?
             .to_string();
+        let cleanup_exception =
+            result
+                .cleanup
+                .first_failure()
+                .map(|(diagnostic, timing)| HarborExceptionInfo {
+                    exception_type: "CleanupError",
+                    exception_message: &diagnostic.message,
+                    exception_traceback: &diagnostic.traceback,
+                    occurred_at: timing.finished_at,
+                });
         let trial_result = HarborTrialResult {
             id: result.attempt_id,
             task_name: &result.task_name,
@@ -569,6 +580,9 @@ impl HarborArtifacts {
             task_id: HarborTaskId { path: task_path },
             source: "nanocodex/local",
             task_checksum,
+            outcome: result.outcome,
+            scored: result.outcome.is_scored(),
+            cleanup: &result.cleanup,
             config,
             agent_info: HarborAgentInfo {
                 name: "nanocodex",
@@ -583,6 +597,7 @@ impl HarborArtifacts {
                 n_cache_tokens: result.agent.usage.cached_input_tokens,
                 n_output_tokens: result.agent.usage.output_tokens,
                 cost_usd: result.agent.cost_usd,
+                billing_completeness: result.agent.billing_completeness,
                 rollout_details: None,
                 metadata: &result.agent.metadata,
             }),
@@ -597,7 +612,7 @@ impl HarborArtifacts {
             agent_setup: Some(&result.timing.agent_setup),
             agent_execution: Some(&result.timing.agent_execution),
             verifier: Some(&result.timing.verifier),
-            exception_info: None,
+            exception_info: cleanup_exception,
             step_results: None,
         };
         Self::write_file(&trial_log_path, [])?;
@@ -701,6 +716,9 @@ impl HarborArtifacts {
             task_id: HarborTaskId { path: task_path },
             source: "nanocodex/local",
             task_checksum,
+            outcome: failure.outcome,
+            scored: failure.outcome.is_scored(),
+            cleanup: &failure.cleanup,
             config,
             agent_info: HarborAgentInfo {
                 name: "nanocodex",
@@ -710,16 +728,29 @@ impl HarborArtifacts {
                     provider: "openai",
                 },
             },
-            agent_result: None,
-            verifier_result: None,
+            agent_result: failure.agent.as_ref().map(|agent| HarborAgentResult {
+                n_input_tokens: agent.usage.input_tokens,
+                n_cache_tokens: agent.usage.cached_input_tokens,
+                n_output_tokens: agent.usage.output_tokens,
+                cost_usd: agent.cost_usd,
+                billing_completeness: agent.billing_completeness,
+                rollout_details: None,
+                metadata: &agent.metadata,
+            }),
+            verifier_result: failure
+                .verifier
+                .as_ref()
+                .map(|verifier| HarborVerifierResult {
+                    rewards: &verifier.rewards,
+                }),
             started_at: failure.started_at,
             finished_at: failure.occurred_at,
-            queue_wait: None,
-            environment_setup: None,
-            environment_readiness: None,
-            agent_setup: None,
-            agent_execution: None,
-            verifier: None,
+            queue_wait: Some(&failure.timing.queue_wait),
+            environment_setup: failure.timing.environment_setup.as_ref(),
+            environment_readiness: failure.timing.environment_readiness.as_ref(),
+            agent_setup: failure.timing.agent_setup.as_ref(),
+            agent_execution: failure.timing.agent_execution.as_ref(),
+            verifier: failure.timing.verifier.as_ref(),
             exception_info: Some(HarborExceptionInfo {
                 exception_type: failure.kind.harbor_exception_type(),
                 exception_message: &failure.message,
@@ -1325,6 +1356,9 @@ struct HarborTrialResult<'a> {
     task_id: HarborTaskId,
     source: &'static str,
     task_checksum: String,
+    outcome: EvalOutcome,
+    scored: bool,
+    cleanup: &'a EvalCleanup,
     config: HarborTrialConfig<'a>,
     agent_info: HarborAgentInfo<'a>,
     agent_result: Option<HarborAgentResult<'a>>,
@@ -1376,6 +1410,7 @@ struct HarborAgentResult<'a> {
     n_cache_tokens: u64,
     n_output_tokens: u64,
     cost_usd: Option<f64>,
+    billing_completeness: BillingCompleteness,
     rollout_details: Option<Vec<HarborRolloutDetail>>,
     metadata: &'a AgentMetadata,
 }
@@ -1419,13 +1454,16 @@ struct RetainedHarborTrialResult {
     task_name: String,
     trial_name: String,
     source: Option<String>,
+    outcome: Option<EvalOutcome>,
+    scored: Option<bool>,
+    #[serde(default)]
+    cleanup: EvalCleanup,
     config: RetainedHarborTrialConfig,
     agent_info: RetainedHarborAgentInfo,
     agent_result: Option<RetainedHarborAgentResult>,
     verifier_result: Option<RetainedHarborVerifierResult>,
-    started_at: DateTime<Utc>,
-    finished_at: DateTime<Utc>,
     queue_wait: Option<RetainedPhaseTiming>,
+    environment_setup: Option<RetainedPhaseTiming>,
     environment_readiness: Option<RetainedPhaseTiming>,
     agent_setup: Option<RetainedPhaseTiming>,
     agent_execution: Option<RetainedPhaseTiming>,
@@ -1468,6 +1506,7 @@ struct RetainedHarborAgentResult {
     #[serde(default)]
     n_output_tokens: u64,
     cost_usd: Option<f64>,
+    billing_completeness: Option<BillingCompleteness>,
     #[serde(default)]
     metadata: RetainedAgentMetadata,
 }
@@ -1510,35 +1549,102 @@ impl DurableHarborTrial {
     fn attempt_fact(self, configuration: String, repetition: u16) -> AttemptFact {
         let agent = self.result.agent_result.as_ref();
         let metadata = agent.map(|agent| &agent.metadata);
-        let passed = self
+        let legacy_scored =
+            self.result.verifier_result.is_some() && self.result.exception_info.is_none();
+        let scored = self
+            .result
+            .outcome
+            .map(EvalOutcome::is_scored)
+            .or(self.result.scored)
+            .unwrap_or(legacy_scored);
+        let verifier_passed = self
             .result
             .verifier_result
             .as_ref()
-            .is_some_and(|verifier| verifier.rewards.values().all(|reward| *reward > 0.0))
-            && self.result.exception_info.is_none();
+            .is_some_and(|verifier| verifier.rewards.values().all(|reward| *reward > 0.0));
+        let outcome = self.result.outcome.unwrap_or({
+            if scored && verifier_passed {
+                EvalOutcome::Passed
+            } else if scored {
+                EvalOutcome::VerifierFailed
+            } else if self
+                .result
+                .exception_info
+                .as_ref()
+                .is_some_and(|exception| exception.exception_type == "AgentSafetyRefusalError")
+            {
+                EvalOutcome::SafetyRefusal
+            } else if self
+                .result
+                .exception_info
+                .as_ref()
+                .is_some_and(|exception| exception.exception_type == "AgentTimeoutError")
+            {
+                EvalOutcome::AgentTimeout
+            } else {
+                EvalOutcome::InfrastructureError
+            }
+        });
+        let passed = outcome.is_passed();
+        let cleanup_failed = self.result.cleanup.is_failed()
+            || self
+                .result
+                .exception_info
+                .as_ref()
+                .is_some_and(|exception| exception.exception_type == "CleanupError");
+        let queue_wait_ns = retained_phase_duration_ns(self.result.queue_wait.as_ref());
+        let environment_setup_ns =
+            retained_phase_duration_ns(self.result.environment_setup.as_ref());
+        let environment_readiness_ns =
+            retained_phase_duration_ns(self.result.environment_readiness.as_ref());
+        let vm_bootstrap_ns = if self.result.config.environment.kwargs.backend == "microvm" {
+            environment_readiness_ns
+        } else {
+            0
+        };
+        let agent_setup_ns = retained_phase_duration_ns(self.result.agent_setup.as_ref());
+        let agent_execution_ns = retained_phase_duration_ns(self.result.agent_execution.as_ref());
+        let verifier_ns = retained_phase_duration_ns(self.result.verifier.as_ref());
+        let cleanup_ns = [&self.result.cleanup.agent, &self.result.cleanup.verifier]
+            .into_iter()
+            .filter_map(|cleanup| cleanup.timing.as_ref())
+            .map(phase_duration_ns)
+            .fold(0_u64, u64::saturating_add);
+        let total_ns = [
+            queue_wait_ns,
+            environment_setup_ns,
+            environment_readiness_ns,
+            agent_setup_ns,
+            agent_execution_ns,
+            verifier_ns,
+            cleanup_ns,
+        ]
+        .into_iter()
+        .fold(0_u64, u64::saturating_add);
         AttemptFact {
             attempt_id: self.result.id,
             task_name: self.result.task_name,
             configuration,
             repetition,
+            outcome,
+            scored,
             passed,
+            cleanup_failed,
             cost_usd: agent.and_then(|agent| agent.cost_usd),
+            billing_completeness: agent.and_then(|agent| agent.billing_completeness),
             latency: LatencyBreakdown {
-                queue_wait_ns: retained_phase_duration_ns(self.result.queue_wait.as_ref()),
-                vm_bootstrap_ns: if self.result.config.environment.kwargs.backend == "microvm" {
-                    retained_phase_duration_ns(self.result.environment_readiness.as_ref())
-                } else {
-                    0
-                },
-                agent_setup_ns: retained_phase_duration_ns(self.result.agent_setup.as_ref()),
-                agent_execution_ns: retained_phase_duration_ns(
-                    self.result.agent_execution.as_ref(),
-                ),
+                queue_wait_ns,
+                environment_setup_ns,
+                environment_readiness_ns,
+                vm_bootstrap_ns,
+                agent_setup_ns,
+                agent_execution_ns,
                 model_ns: metadata.map_or(0, |metadata| metadata.model_duration_ns),
                 tool_work_ns: metadata.map_or(0, |metadata| metadata.tool_work_duration_ns),
                 tool_wall_ns: metadata.map_or(0, |metadata| metadata.tool_wall_duration_ns),
-                verifier_ns: retained_phase_duration_ns(self.result.verifier.as_ref()),
-                total_ns: retained_duration_ns(self.result.started_at, self.result.finished_at),
+                verifier_ns,
+                cleanup_ns,
+                total_ns,
                 ..LatencyBreakdown::default()
             },
             artifacts: AttemptFactArtifacts {
@@ -1564,6 +1670,10 @@ fn retained_phase_duration_ns(timing: Option<&RetainedPhaseTiming>) -> u64 {
     })
 }
 
+fn phase_duration_ns(timing: &PhaseTiming) -> u64 {
+    retained_duration_ns(timing.started_at, timing.finished_at)
+}
+
 fn retained_duration_ns(started_at: DateTime<Utc>, finished_at: DateTime<Utc>) -> u64 {
     u64::try_from(
         finished_at
@@ -1579,6 +1689,7 @@ fn retained_duration_ns(started_at: DateTime<Utc>, finished_at: DateTime<Utc>) -
 struct HarborJobStats {
     n_completed_trials: usize,
     n_errored_trials: usize,
+    n_cleanup_failed_trials: usize,
     n_running_trials: usize,
     n_pending_trials: usize,
     n_cancelled_trials: usize,
@@ -1607,13 +1718,21 @@ impl HarborJobStats {
             }
 
             let eval = stats.evals.entry(trial.eval_key()).or_default();
-            if let Some(exception) = &trial.result.exception_info {
+            let scored = retained_trial_scored(&trial.result);
+            let cleanup_failed = retained_cleanup_failed(&trial.result);
+            if cleanup_failed {
+                stats.n_cleanup_failed_trials = stats.n_cleanup_failed_trials.saturating_add(1);
+                eval.n_cleanup_failures = eval.n_cleanup_failures.saturating_add(1);
+            }
+            if !scored {
                 stats.n_errored_trials = stats.n_errored_trials.saturating_add(1);
                 eval.n_errors = eval.n_errors.saturating_add(1);
-                eval.exception_stats
-                    .entry(exception.exception_type.clone())
-                    .or_default()
-                    .push(trial.result.trial_name.clone());
+                if let Some(exception) = &trial.result.exception_info {
+                    eval.exception_stats
+                        .entry(exception.exception_type.clone())
+                        .or_default()
+                        .push(trial.result.trial_name.clone());
+                }
             } else {
                 eval.n_trials = eval.n_trials.saturating_add(1);
                 if let Some(verifier) = &trial.result.verifier_result {
@@ -1636,6 +1755,7 @@ impl HarborJobStats {
 struct HarborAgentDatasetStats {
     n_trials: usize,
     n_errors: usize,
+    n_cleanup_failures: usize,
     metrics: Vec<HarborMetric>,
     pass_at_k: BTreeMap<usize, f64>,
     reward_stats: BTreeMap<String, BTreeMap<String, Vec<String>>>,
@@ -1647,6 +1767,9 @@ fn compute_harbor_pass_at_k(
 ) -> BTreeMap<String, BTreeMap<usize, f64>> {
     let mut groups = BTreeMap::<String, Option<BTreeMap<String, Vec<u8>>>>::new();
     for trial in trials {
+        if !retained_trial_scored(&trial.result) {
+            continue;
+        }
         let success = match &trial.result.verifier_result {
             None => Some(0),
             Some(verifier) if verifier.rewards.len() == 1 => {
@@ -1684,6 +1807,22 @@ fn compute_harbor_pass_at_k(
             compute_pass_at_k_for_tasks(&tasks?).map(|pass_at_k| (eval_key, pass_at_k))
         })
         .collect()
+}
+
+fn retained_trial_scored(result: &RetainedHarborTrialResult) -> bool {
+    result
+        .outcome
+        .map(EvalOutcome::is_scored)
+        .or(result.scored)
+        .unwrap_or_else(|| result.verifier_result.is_some() && result.exception_info.is_none())
+}
+
+fn retained_cleanup_failed(result: &RetainedHarborTrialResult) -> bool {
+    result.cleanup.is_failed()
+        || result
+            .exception_info
+            .as_ref()
+            .is_some_and(|exception| exception.exception_type == "CleanupError")
 }
 
 fn compute_pass_at_k_for_tasks(tasks: &BTreeMap<String, Vec<u8>>) -> Option<BTreeMap<usize, f64>> {
@@ -1735,7 +1874,7 @@ struct HarborMetric {}
 mod tests {
     use std::{collections::BTreeMap, fs, path::Path};
 
-    use crate::{AtifTrajectory, EvalEnvironment, Evaluator, Sweep, Task};
+    use crate::{AtifTrajectory, EvalEnvironment, EvalOutcome, Evaluator, Sweep, Task};
     use chrono::Utc;
     use nanocodex_agent::{Nanocodex, OpenAi};
     use serde::Deserialize;
@@ -1870,7 +2009,15 @@ mod tests {
             serde_json::from_slice(&fs::read(eval.directory().join("result.json")).unwrap())
                 .unwrap();
         assert_eq!(stale.stats.completed, 0);
-        write_retained_trial(eval.directory(), eval.id(), &task, "default", 1, Some(1.0));
+        write_retained_trial(
+            eval.directory(),
+            eval.id(),
+            &task,
+            "default",
+            1,
+            Some(1.0),
+            false,
+        );
 
         Harbor::new(&eval).unwrap();
         let rebuilt: serde_json::Value =
@@ -1926,6 +2073,7 @@ mod tests {
             "recipe__variant",
             1,
             Some(1.0),
+            false,
         );
         let second = write_retained_trial(
             eval.directory(),
@@ -1934,6 +2082,7 @@ mod tests {
             "recipe__variant",
             2,
             None,
+            false,
         );
         let job = HarborJob {
             id: eval.id(),
@@ -1952,10 +2101,68 @@ mod tests {
         assert_eq!(aggregate.attempts[1].configuration, "recipe__variant");
         assert_eq!(aggregate.attempts[1].repetition, 2);
         assert!(!aggregate.attempts[1].passed);
+        assert!(!aggregate.attempts[1].scored);
+        assert_eq!(
+            aggregate.attempts[1].outcome,
+            EvalOutcome::InfrastructureError
+        );
         assert_eq!(aggregate.attempts[1].cost_usd, None);
         assert_eq!(aggregate.configurations.len(), 1);
-        assert_eq!(aggregate.configurations[0].success.samples, 2);
+        assert_eq!(aggregate.configurations[0].success.samples, 1);
         assert_eq!(aggregate.configurations[0].success.successes, 1);
+        assert_eq!(aggregate.configurations[0].unscored_attempts, 1);
+    }
+
+    #[test]
+    fn scored_cleanup_failure_stays_in_harbor_denominators() {
+        let output = tempdir().unwrap();
+        let task = write_greeting_task();
+        let sweep = Sweep::builder()
+            .task(task.clone())
+            .agent(
+                "default",
+                Nanocodex::builder(OpenAi::new("test-key").unwrap()),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let (eval, _) = Evaluator::builder(Nanocodex::builder(OpenAi::new("test-key").unwrap()))
+            .output_directory(output.path())
+            .fresh_run(&sweep)
+            .build()
+            .unwrap();
+        write_retained_trial(
+            eval.directory(),
+            eval.id(),
+            &task,
+            "default",
+            1,
+            Some(1.0),
+            true,
+        );
+
+        Harbor::new(&eval).unwrap();
+        let rebuilt: serde_json::Value =
+            serde_json::from_slice(&fs::read(eval.directory().join("result.json")).unwrap())
+                .unwrap();
+        let eval_stats = &rebuilt["stats"]["evals"]["nanocodex__gpt-test__nanocodex/local"];
+        assert_eq!(rebuilt["stats"]["n_errored_trials"], 0);
+        assert_eq!(rebuilt["stats"]["n_cleanup_failed_trials"], 1);
+        assert_eq!(eval_stats["n_trials"], 1);
+        assert_eq!(eval_stats["n_errors"], 0);
+        assert_eq!(eval_stats["n_cleanup_failures"], 1);
+
+        let aggregate = HarborJob {
+            id: eval.id(),
+            directory: eval.directory().to_path_buf(),
+        }
+        .aggregate_dataset()
+        .unwrap();
+        assert_eq!(aggregate.configurations[0].success.samples, 1);
+        assert_eq!(aggregate.configurations[0].success.successes, 1);
+        assert_eq!(aggregate.configurations[0].cleanup_failures, 1);
+        assert!(aggregate.attempts[0].passed);
+        assert!(aggregate.attempts[0].cleanup_failed);
     }
 
     #[test]
@@ -2153,6 +2360,7 @@ allow_internet = false
         configuration: &str,
         repetition: u16,
         reward: Option<f64>,
+        cleanup_failed: bool,
     ) -> Uuid {
         let id = Uuid::now_v7();
         let compact_id = id.simple().to_string();
@@ -2197,8 +2405,8 @@ allow_internet = false
                 "exception_type": "AgentError",
             })
         });
-        let timing = reward.map(|_| phase);
-        let result = json!({
+        let timing = reward.map(|_| phase.clone());
+        let mut result = json!({
             "id": id,
             "task_name": "nanoeval/write-greeting",
             "trial_name": trial_name,
@@ -2236,6 +2444,28 @@ allow_internet = false
             "verifier": timing,
             "exception_info": exception_info,
         });
+        if cleanup_failed {
+            result["outcome"] = json!("passed");
+            result["scored"] = json!(true);
+            result["cleanup"] = json!({
+                "agent": {
+                    "status": "completed",
+                    "timing": phase,
+                    "diagnostic": null,
+                },
+                "verifier": {
+                    "status": "failed",
+                    "timing": phase,
+                    "diagnostic": {
+                        "message": "deterministic cleanup failure",
+                        "traceback": "deterministic cleanup failure",
+                    },
+                },
+            });
+            result["exception_info"] = json!({
+                "exception_type": "CleanupError",
+            });
+        }
         super::HarborArtifacts::write_json(
             &directory.join("lock.json"),
             &super::HarborTrialLock::new(

@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::{EvalResult, EvalStatus, SweepAttemptResult};
+use crate::{BillingCompleteness, EvalOutcome, EvalResult, SweepAttemptResult};
 
 /// One self-contained attempt row used by aggregate and plotting consumers.
 #[derive(Clone, Debug, Serialize)]
@@ -19,10 +19,18 @@ pub struct AttemptFact {
     pub configuration: String,
     /// One-based repetition number.
     pub repetition: u16,
+    /// Semantic attempt outcome.
+    pub outcome: EvalOutcome,
+    /// Whether this row contributes to score denominators.
+    pub scored: bool,
     /// Verifier-derived success state.
     pub passed: bool,
+    /// Whether score retention was accompanied by a cleanup failure.
+    pub cleanup_failed: bool,
     /// Estimated total USD cost, including warmup when reported.
     pub cost_usd: Option<f64>,
+    /// Whether provider billing is known to be terminal.
+    pub billing_completeness: Option<BillingCompleteness>,
     /// Exact phase measurements available for this attempt.
     pub latency: LatencyBreakdown,
     /// Retained attempt and trajectory locations.
@@ -36,6 +44,10 @@ pub struct LatencyBreakdown {
     pub queue_wait_ns: u64,
     /// Cold image resolution and construction attributed to this attempt.
     pub cold_image_ns: u64,
+    /// Disposable environment materialization.
+    pub environment_setup_ns: u64,
+    /// Attempt backend construction, boot, and readiness.
+    pub environment_readiness_ns: u64,
     /// VM materialization, boot, and readiness.
     pub vm_bootstrap_ns: u64,
     /// Agent setup.
@@ -50,7 +62,9 @@ pub struct LatencyBreakdown {
     pub tool_wall_ns: u64,
     /// Verifier execution.
     pub verifier_ns: u64,
-    /// Attempt wall time.
+    /// Explicit agent and verifier cleanup.
+    pub cleanup_ns: u64,
+    /// Sum of disjoint measured phases.
     pub total_ns: u64,
 }
 
@@ -91,6 +105,10 @@ pub struct ConfigurationAggregate {
     pub latency_seconds: MetricSummary,
     /// Unbiased pass-at-k estimates supported by every task.
     pub pass_at_k: BTreeMap<u16, f64>,
+    /// Attempts excluded from score denominators.
+    pub unscored_attempts: usize,
+    /// Attempts with an explicit cleanup failure.
+    pub cleanup_failures: usize,
     /// Per-task distributions for deeper drilldown.
     pub tasks: Vec<TaskAggregate>,
 }
@@ -104,6 +122,10 @@ pub struct TaskAggregate {
     pub attempt_ids: Vec<Uuid>,
     /// Pass-rate estimate and Wilson interval.
     pub success: RateEstimate,
+    /// Attempts excluded from score denominators.
+    pub unscored_attempts: usize,
+    /// Attempts with an explicit cleanup failure.
+    pub cleanup_failures: usize,
     /// Estimated cost distribution.
     pub cost_usd: MetricSummary,
     /// Total latency distribution in seconds.
@@ -165,12 +187,24 @@ impl AttemptFact {
             task_name: result.task_name.clone(),
             configuration: configuration.to_owned(),
             repetition,
-            passed: result.status == EvalStatus::Passed,
+            outcome: result.outcome,
+            scored: result.outcome.is_scored(),
+            passed: result.outcome.is_passed(),
+            cleanup_failed: result.cleanup.is_failed(),
             cost_usd: result.agent.cost_usd,
+            billing_completeness: Some(result.agent.billing_completeness),
             latency: LatencyBreakdown {
                 queue_wait_ns: duration(
                     result.timing.queue_wait.started_at,
                     result.timing.queue_wait.finished_at,
+                ),
+                environment_setup_ns: duration(
+                    result.timing.environment_setup.started_at,
+                    result.timing.environment_setup.finished_at,
+                ),
+                environment_readiness_ns: duration(
+                    result.timing.environment_readiness.started_at,
+                    result.timing.environment_readiness.finished_at,
                 ),
                 vm_bootstrap_ns: if result.environment == crate::EvalEnvironment::MicroVm {
                     duration(
@@ -195,7 +229,11 @@ impl AttemptFact {
                     result.timing.verifier.started_at,
                     result.timing.verifier.finished_at,
                 ),
-                total_ns: duration(result.timing.started_at, result.timing.finished_at),
+                cleanup_ns: [&result.cleanup.agent, &result.cleanup.verifier]
+                    .into_iter()
+                    .filter_map(|cleanup| cleanup.timing.as_ref())
+                    .map(|timing| duration(timing.started_at, timing.finished_at))
+                    .sum(),
                 ..LatencyBreakdown::default()
             },
             artifacts: AttemptFactArtifacts {
@@ -204,6 +242,21 @@ impl AttemptFact {
                 verifier_output: result.artifacts.verifier_output.clone(),
             },
         }
+        .with_total()
+    }
+
+    const fn with_total(mut self) -> Self {
+        let latency = &self.latency;
+        self.latency.total_ns = latency
+            .queue_wait_ns
+            .saturating_add(latency.cold_image_ns)
+            .saturating_add(latency.environment_setup_ns)
+            .saturating_add(latency.environment_readiness_ns)
+            .saturating_add(latency.agent_setup_ns)
+            .saturating_add(latency.agent_execution_ns)
+            .saturating_add(latency.verifier_ns)
+            .saturating_add(latency.cleanup_ns);
+        self
     }
 }
 
@@ -223,7 +276,7 @@ impl AggregateDataset {
             .map(|(configuration, attempts)| ConfigurationAggregate::new(configuration, &attempts))
             .collect();
         Self {
-            schema_version: 1,
+            schema_version: 2,
             attempts,
             configurations,
         }
@@ -262,12 +315,22 @@ impl ConfigurationAggregate {
                     .map(|attempt| attempt.latency.total_ns as f64 / 1_000_000_000.0),
             ),
             pass_at_k,
+            unscored_attempts: attempts.iter().filter(|attempt| !attempt.scored).count(),
+            cleanup_failures: attempts
+                .iter()
+                .filter(|attempt| attempt.cleanup_failed)
+                .count(),
             tasks: tasks
                 .into_iter()
                 .map(|(task_name, attempts)| TaskAggregate {
                     task_name,
                     attempt_ids: attempts.iter().map(|attempt| attempt.attempt_id).collect(),
                     success: RateEstimate::new(&attempts),
+                    unscored_attempts: attempts.iter().filter(|attempt| !attempt.scored).count(),
+                    cleanup_failures: attempts
+                        .iter()
+                        .filter(|attempt| attempt.cleanup_failed)
+                        .count(),
                     cost_usd: MetricSummary::new(
                         attempts.iter().filter_map(|attempt| attempt.cost_usd),
                     ),
@@ -284,8 +347,11 @@ impl ConfigurationAggregate {
 
 impl RateEstimate {
     fn new(attempts: &[&AttemptFact]) -> Self {
-        let samples = attempts.len();
-        let successes = attempts.iter().filter(|attempt| attempt.passed).count();
+        let samples = attempts.iter().filter(|attempt| attempt.scored).count();
+        let successes = attempts
+            .iter()
+            .filter(|attempt| attempt.scored && attempt.passed)
+            .count();
         if samples == 0 {
             return Self {
                 successes,
@@ -338,7 +404,11 @@ impl MetricSummary {
 }
 
 fn pass_at_k(tasks: &BTreeMap<String, Vec<&AttemptFact>>) -> BTreeMap<u16, f64> {
-    let Some(minimum) = tasks.values().map(Vec::len).min() else {
+    let Some(minimum) = tasks
+        .values()
+        .map(|attempts| attempts.iter().filter(|attempt| attempt.scored).count())
+        .min()
+    else {
         return BTreeMap::new();
     };
     (1..=u16::try_from(minimum).unwrap_or(u16::MAX))
@@ -346,8 +416,11 @@ fn pass_at_k(tasks: &BTreeMap<String, Vec<&AttemptFact>>) -> BTreeMap<u16, f64> 
             let estimate = tasks
                 .values()
                 .map(|attempts| {
-                    let n = attempts.len() as u64;
-                    let correct = attempts.iter().filter(|attempt| attempt.passed).count() as u64;
+                    let n = attempts.iter().filter(|attempt| attempt.scored).count() as u64;
+                    let correct = attempts
+                        .iter()
+                        .filter(|attempt| attempt.scored && attempt.passed)
+                        .count() as u64;
                     if n - correct < u64::from(k) {
                         return 1.0;
                     }
@@ -372,8 +445,16 @@ mod tests {
             task_name: task.to_owned(),
             configuration: configuration.to_owned(),
             repetition,
+            outcome: if passed {
+                EvalOutcome::Passed
+            } else {
+                EvalOutcome::VerifierFailed
+            },
+            scored: true,
             passed,
+            cleanup_failed: false,
             cost_usd: Some(f64::from(repetition)),
+            billing_completeness: Some(BillingCompleteness::Complete),
             latency: LatencyBreakdown {
                 total_ns: u64::from(repetition) * 1_000_000_000,
                 ..LatencyBreakdown::default()
@@ -403,5 +484,24 @@ mod tests {
         assert_eq!(point.tasks.len(), 2);
         assert!((point.pass_at_k[&1] - 0.25).abs() < f64::EPSILON);
         assert!((point.pass_at_k[&2] - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn excludes_infrastructure_errors_without_hiding_cleanup_failures() {
+        let passed = fact("medium", "a", 1, true);
+        let mut infrastructure = fact("medium", "a", 2, false);
+        infrastructure.outcome = EvalOutcome::InfrastructureError;
+        infrastructure.scored = false;
+        infrastructure.cleanup_failed = true;
+
+        let dataset = AggregateDataset::new(vec![passed, infrastructure]);
+        let point = &dataset.configurations[0];
+
+        assert_eq!(point.success.samples, 1);
+        assert_eq!(point.success.successes, 1);
+        assert_eq!(point.unscored_attempts, 1);
+        assert_eq!(point.cleanup_failures, 1);
+        assert_eq!(point.tasks[0].success.samples, 1);
+        assert_eq!(point.tasks[0].cleanup_failures, 1);
     }
 }

@@ -32,9 +32,10 @@ use tracing::{Instrument, Span, info, info_span};
 use uuid::Uuid;
 
 use crate::{
-    AgentId, AgentMetadata, AgentResult, EvalArtifacts, EvalEnvironment, EvalEvent, EvalEventKind,
-    EvalEvents, EvalFailure, EvalFailureKind, EvalResult, EvalStatus, EvalTiming, PhaseTiming,
-    Sweep, SweepAttemptResult, SweepResults, Task, TaskLoadError, VerifierResult,
+    AgentId, AgentMetadata, AgentResult, BillingCompleteness, CleanupPhase, EvalArtifacts,
+    EvalCleanup, EvalEnvironment, EvalEvent, EvalEventKind, EvalEvents, EvalFailure,
+    EvalFailureKind, EvalFailureTiming, EvalOutcome, EvalResult, EvalStatus, EvalTiming,
+    PhaseTiming, Sweep, SweepAttemptResult, SweepResults, Task, TaskLoadError, VerifierResult,
     job::EvalJob,
     native::{NativeAttempt, VerifierExecution},
 };
@@ -147,6 +148,8 @@ pub struct AttemptVerification {
     pub stdout: String,
     /// Complete captured verifier standard error.
     pub stderr: String,
+    /// Attempt-owned verifier cleanup health and timing.
+    pub cleanup: CleanupPhase,
 }
 
 struct AttemptInput {
@@ -219,6 +222,10 @@ pub enum EvalError {
     /// Agent setup or execution failed.
     #[error("Nanocodex failed: {0}")]
     Nanocodex(#[from] NanocodexError),
+
+    /// Agent execution completed but explicit resource cleanup failed.
+    #[error("Nanocodex cleanup failed: {0}")]
+    AgentCleanup(#[source] NanocodexError),
 
     /// The attempt backend factory failed.
     #[error("failed to configure attempt agent: {0}")]
@@ -579,18 +586,21 @@ impl Evaluator {
                 nanocodex,
                 attempt_id,
                 trial_name.clone(),
-                queue_wait,
+                queue_wait.clone(),
                 &mut emitter,
             )
             .instrument(span.clone())
             .await;
         record_attempt_result(&span, trace_started, &result);
-        if let Err(error) = &result {
-            emitter.emit(EvalEventKind::Failed(Box::new(attempt_failure(
-                self, attempt_id, task, trial_name, started_at, error,
-            ))));
+        match result {
+            Ok(result) => Ok(AttemptOutput { result, coordinate }),
+            Err(failure) => {
+                emitter.emit(EvalEventKind::Failed(Box::new(attempt_failure(
+                    self, attempt_id, task, trial_name, started_at, queue_wait, &failure,
+                ))));
+                Err(failure.error)
+            }
         }
-        result.map(|result| AttemptOutput { result, coordinate })
     }
 
     async fn run_task_inner(
@@ -601,9 +611,11 @@ impl Evaluator {
         trial_name: String,
         queue_wait: PhaseTiming,
         emitter: &mut AttemptEmitter<'_>,
-    ) -> Result<EvalResult, EvalError> {
-        reject_output_overlap(self.inner.job.parent_directory(), task.root())?;
-        task.validate_package()?;
+    ) -> Result<EvalResult, AttemptRunFailure> {
+        reject_output_overlap(self.inner.job.parent_directory(), task.root())
+            .map_err(AttemptRunFailure::new)?;
+        task.validate_package()
+            .map_err(|error| AttemptRunFailure::new(EvalError::TaskPackage(error)))?;
         let attempt = {
             let span = info_span!(
                 target: "nanocodex_eval",
@@ -623,7 +635,7 @@ impl Evaluator {
                 NativeAttempt::prepare(self.inner.job.directory(), &trial_name, &task)
             });
             record_span_result(&span, trace_started, &result);
-            result?
+            result.map_err(AttemptRunFailure::new)?
         };
         emitter.emit(EvalEventKind::AttemptStarted {
             prompt: task.prompt().to_owned(),
@@ -631,25 +643,41 @@ impl Evaluator {
         });
         let mut agent = self
             .execute_agent(emitter, &task, &attempt, nanocodex)
-            .await?;
+            .await
+            .map_err(|failure| AttemptRunFailure::from_agent(&attempt, failure))?;
 
-        task.validate_package()?;
+        task.validate_package().map_err(|error| {
+            AttemptRunFailure::after_agent(&attempt, &agent, EvalError::TaskPackage(error))
+        })?;
         emitter.emit(EvalEventKind::VerifierStarted);
         let verifier = self
             .execute_verifier(&task, &attempt, agent.verifier.take())
-            .await?;
-        task.validate_package()?;
+            .await
+            .map_err(|error| AttemptRunFailure::after_agent(&attempt, &agent, error))?;
+        task.validate_package().map_err(|error| {
+            AttemptRunFailure::after_verifier(
+                &attempt,
+                &agent,
+                &verifier,
+                EvalError::TaskPackage(error),
+            )
+        })?;
         emitter.emit(EvalEventKind::VerifierOutput {
             stdout: verifier.stdout.clone(),
             stderr: verifier.stderr.clone(),
         });
         emitter.emit(EvalEventKind::VerifierCompleted(verifier.result.clone()));
 
+        let status = verifier_status(&verifier.result);
         let result = EvalResult {
             attempt_id,
             task_name: task.name().to_owned(),
             trial_name,
-            status: verifier_status(&verifier.result),
+            status,
+            outcome: match status {
+                EvalStatus::Passed => EvalOutcome::Passed,
+                EvalStatus::Failed => EvalOutcome::VerifierFailed,
+            },
             environment: self.inner.attempt_environment,
             agent: agent.result,
             verifier: verifier.result,
@@ -662,6 +690,10 @@ impl Evaluator {
                 agent_setup: agent.setup_timing,
                 agent_execution: agent.execution_timing,
                 verifier: verifier.timing,
+            },
+            cleanup: EvalCleanup {
+                agent: agent.cleanup,
+                verifier: verifier.cleanup,
             },
             artifacts: EvalArtifacts {
                 directory: attempt.paths.root.clone(),
@@ -714,9 +746,17 @@ impl Evaluator {
                     .map_err(EvalError::AttemptVerifier)?;
                 Ok(VerifierExecution {
                     result: execution.result,
-                    timing: PhaseTiming::finished(started_at),
+                    timing: PhaseTiming {
+                        started_at,
+                        finished_at: execution
+                            .cleanup
+                            .timing
+                            .as_ref()
+                            .map_or_else(Utc::now, |timing| timing.started_at),
+                    },
                     stdout: execution.stdout,
                     stderr: execution.stderr,
+                    cleanup: execution.cleanup,
                 })
             } else {
                 attempt.verify(task).await
@@ -747,14 +787,17 @@ impl Evaluator {
         task: &Task,
         attempt: &NativeAttempt,
         nanocodex: NanocodexBuilder,
-    ) -> Result<AgentExecution, EvalError> {
+    ) -> Result<AgentExecution, AgentExecutionFailure> {
         let AgentSetup {
             agent,
             mut events,
             verifier,
             readiness_timing,
             timing: setup_timing,
-        } = self.setup_agent(emitter, task, attempt, nanocodex).await?;
+        } = self
+            .setup_agent(emitter, task, attempt, nanocodex)
+            .await
+            .map_err(AgentExecutionFailure::setup)?;
         let execution_started = Utc::now();
         let span = info_span!(
             target: "nanocodex_eval",
@@ -772,53 +815,136 @@ impl Evaluator {
         let result = async {
             let turn = agent.prompt(task.prompt()).await?;
             let control = turn.control();
-            let event_result = timeout(task.agent_timeout(), async {
-                loop {
-                    let event = events.recv().await.ok_or(EvalError::AgentEventsClosed)?;
-                    let terminal = event.kind.is_terminal();
-                    emitter.emit(EvalEventKind::Agent(event.clone()));
-                    if terminal {
-                        let result = turn.result().await?;
-                        return Ok::<_, EvalError>((result, event));
+            let mut observation = AgentObservation::default();
+            let event_result = timeout(
+                task.agent_timeout(),
+                receive_agent_terminal(&mut events, emitter, &mut observation),
+            )
+            .await;
+            match event_result {
+                Ok(Ok(terminal)) => {
+                    let (primary, final_message) = match turn.result().await {
+                        Ok(result) => (None, result.into_final_message()),
+                        Err(error) => (
+                            Some(EvalError::Nanocodex(error)),
+                            observation.final_message.clone(),
+                        ),
+                    };
+                    let completeness = if observation.billable_in_flight == 0 {
+                        BillingCompleteness::Complete
+                    } else {
+                        BillingCompleteness::Unknown
+                    };
+                    let result = AgentResult::from_terminal(final_message, &terminal, completeness);
+                    match (primary, result) {
+                        (Some(primary), Ok(result)) => Ok(AgentTurnOutcome {
+                            primary: Some(primary),
+                            result: Some(result),
+                        }),
+                        (Some(primary), Err(parse_error)) => {
+                            tracing::warn!(
+                                target: "nanocodex_eval",
+                                error = %parse_error,
+                                primary_error = %primary,
+                                "failed to decode partial terminal agent metrics"
+                            );
+                            Ok(AgentTurnOutcome {
+                                primary: Some(primary),
+                                result: None,
+                            })
+                        }
+                        (None, Ok(result)) => Ok(AgentTurnOutcome {
+                            primary: None,
+                            result: Some(result),
+                        }),
+                        (None, Err(error)) => Err(error),
                     }
                 }
-            })
-            .await;
-            if let Ok(result) = event_result {
-                result
-            } else {
-                let _ = control.cancel().await;
-                Err(EvalError::AgentTimeout(task.agent_timeout()))
+                Ok(Err(error)) => Err(error),
+                Err(_) => {
+                    let completeness = if observation.billable_in_flight == 0 {
+                        BillingCompleteness::Complete
+                    } else {
+                        BillingCompleteness::Unknown
+                    };
+                    let primary = EvalError::AgentTimeout(task.agent_timeout());
+                    let _ = control.cancel().await;
+                    let result = receive_agent_terminal(&mut events, emitter, &mut observation)
+                        .await
+                        .and_then(|terminal| {
+                            AgentResult::from_terminal(
+                                observation.final_message,
+                                &terminal,
+                                completeness,
+                            )
+                        });
+                    match result {
+                        Ok(result) => Ok(AgentTurnOutcome {
+                            primary: Some(primary),
+                            result: Some(result),
+                        }),
+                        Err(error) => {
+                            tracing::warn!(
+                                target: "nanocodex_eval",
+                                error = %error,
+                                primary_error = %primary,
+                                "failed to retain terminal metrics after agent timeout"
+                            );
+                            Ok(AgentTurnOutcome {
+                                primary: Some(primary),
+                                result: None,
+                            })
+                        }
+                    }
+                }
             }
         };
         let result = result.instrument(span.clone()).await;
         record_span_result(&span, trace_started, &result);
-        let shutdown = agent.shutdown().await.map_err(EvalError::Nanocodex);
-        let (turn_result, terminal_event) = match result {
-            Ok(result) => {
-                shutdown?;
-                result
-            }
-            Err(primary) => {
-                if let Err(cleanup) = shutdown {
-                    span.in_scope(|| {
-                        tracing::warn!(
-                            target: "nanocodex_eval",
-                            error = %cleanup,
-                            primary_error = %primary,
-                            "agent cleanup also failed; preserving the execution error"
-                        );
-                    });
-                }
-                return Err(primary);
+        let execution_timing = PhaseTiming::finished(execution_started);
+        let cleanup_started = Utc::now();
+        let (cleanup, cleanup_error) = match agent.shutdown().await {
+            Ok(()) => (CleanupPhase::completed(cleanup_started), None),
+            Err(error) => {
+                let cleanup = CleanupPhase::failed(cleanup_started, &error);
+                (cleanup, Some(error))
             }
         };
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(error) => AgentTurnOutcome {
+                primary: Some(error),
+                result: None,
+            },
+        };
+        let primary = outcome
+            .primary
+            .or_else(|| cleanup_error.map(EvalError::AgentCleanup));
+        if let Some(error) = primary {
+            return Err(AgentExecutionFailure {
+                error,
+                result: outcome.result,
+                cleanup,
+                readiness_timing: Some(readiness_timing),
+                setup_timing: Some(setup_timing),
+                execution_timing: Some(execution_timing),
+            });
+        }
+        let result = outcome.result.ok_or_else(|| AgentExecutionFailure {
+            error: EvalError::AgentEventsClosed,
+            result: None,
+            cleanup: cleanup.clone(),
+            readiness_timing: Some(readiness_timing.clone()),
+            setup_timing: Some(setup_timing.clone()),
+            execution_timing: Some(execution_timing.clone()),
+        })?;
         Ok(AgentExecution {
-            result: AgentResult::from_terminal(turn_result.into_final_message(), &terminal_event)?,
+            result,
             verifier,
             readiness_timing,
             setup_timing,
-            execution_timing: PhaseTiming::finished(execution_started),
+            execution_timing,
+            cleanup,
         })
     }
 
@@ -829,7 +955,7 @@ impl Evaluator {
         attempt: &NativeAttempt,
         nanocodex: NanocodexBuilder,
     ) -> Result<AgentSetup, EvalError> {
-        let setup_started = Utc::now();
+        let readiness_started = Utc::now();
         let span = info_span!(
             target: "nanocodex_eval",
             "eval.agent.setup",
@@ -866,24 +992,30 @@ impl Evaluator {
                 AttemptAgent::new(builder)
             };
             let (builder, readiness, verifier) = configured.into_parts();
-            let readiness_started = Utc::now();
             if let Some(readiness) = readiness {
                 readiness.await.map_err(EvalError::AttemptAgent)?;
             }
             let readiness_timing = PhaseTiming::finished(readiness_started);
+            let setup_started = Utc::now();
             let (agent, events) = builder.build()?;
-            Ok::<_, EvalError>((agent, events, verifier, readiness_timing))
+            Ok::<_, EvalError>((
+                agent,
+                events,
+                verifier,
+                readiness_timing,
+                PhaseTiming::finished(setup_started),
+            ))
         }
         .instrument(span.clone())
         .await;
         record_span_result(&span, trace_started, &result);
-        let (agent, events, verifier, readiness_timing) = result?;
+        let (agent, events, verifier, readiness_timing, timing) = result?;
         Ok(AgentSetup {
             agent,
             events,
             verifier,
             readiness_timing,
-            timing: PhaseTiming::finished(setup_started),
+            timing,
         })
     }
 }
@@ -894,6 +1026,170 @@ struct AgentExecution {
     readiness_timing: PhaseTiming,
     setup_timing: PhaseTiming,
     execution_timing: PhaseTiming,
+    cleanup: CleanupPhase,
+}
+
+struct AgentExecutionFailure {
+    error: EvalError,
+    result: Option<AgentResult>,
+    cleanup: CleanupPhase,
+    readiness_timing: Option<PhaseTiming>,
+    setup_timing: Option<PhaseTiming>,
+    execution_timing: Option<PhaseTiming>,
+}
+
+impl AgentExecutionFailure {
+    const fn setup(error: EvalError) -> Self {
+        Self {
+            error,
+            result: None,
+            cleanup: CleanupPhase::not_required(),
+            readiness_timing: None,
+            setup_timing: None,
+            execution_timing: None,
+        }
+    }
+}
+
+struct AgentTurnOutcome {
+    primary: Option<EvalError>,
+    result: Option<AgentResult>,
+}
+
+#[derive(Default)]
+struct AgentObservation {
+    billable_in_flight: u32,
+    final_message: String,
+}
+
+struct AttemptRunFailure {
+    error: EvalError,
+    agent: Option<AgentResult>,
+    verifier: Option<VerifierResult>,
+    cleanup: EvalCleanup,
+    environment_setup: Option<PhaseTiming>,
+    environment_readiness: Option<PhaseTiming>,
+    agent_setup: Option<PhaseTiming>,
+    agent_execution: Option<PhaseTiming>,
+    verifier_timing: Option<PhaseTiming>,
+}
+
+impl AttemptRunFailure {
+    fn new(error: EvalError) -> Self {
+        Self {
+            error,
+            agent: None,
+            verifier: None,
+            cleanup: EvalCleanup::default(),
+            environment_setup: None,
+            environment_readiness: None,
+            agent_setup: None,
+            agent_execution: None,
+            verifier_timing: None,
+        }
+    }
+
+    fn from_agent(attempt: &NativeAttempt, failure: AgentExecutionFailure) -> Self {
+        Self {
+            error: failure.error,
+            agent: failure.result,
+            verifier: None,
+            cleanup: EvalCleanup {
+                agent: failure.cleanup,
+                verifier: CleanupPhase::not_required(),
+            },
+            environment_setup: Some(attempt.setup_timing.clone()),
+            environment_readiness: failure.readiness_timing,
+            agent_setup: failure.setup_timing,
+            agent_execution: failure.execution_timing,
+            verifier_timing: None,
+        }
+    }
+
+    fn after_agent(attempt: &NativeAttempt, agent: &AgentExecution, error: EvalError) -> Self {
+        Self {
+            error,
+            agent: Some(agent.result.clone()),
+            verifier: None,
+            cleanup: EvalCleanup {
+                agent: agent.cleanup.clone(),
+                verifier: CleanupPhase::not_required(),
+            },
+            environment_setup: Some(attempt.setup_timing.clone()),
+            environment_readiness: Some(agent.readiness_timing.clone()),
+            agent_setup: Some(agent.setup_timing.clone()),
+            agent_execution: Some(agent.execution_timing.clone()),
+            verifier_timing: None,
+        }
+    }
+
+    fn after_verifier(
+        attempt: &NativeAttempt,
+        agent: &AgentExecution,
+        verifier: &VerifierExecution,
+        error: EvalError,
+    ) -> Self {
+        Self {
+            error,
+            agent: Some(agent.result.clone()),
+            verifier: Some(verifier.result.clone()),
+            cleanup: EvalCleanup {
+                agent: agent.cleanup.clone(),
+                verifier: verifier.cleanup.clone(),
+            },
+            environment_setup: Some(attempt.setup_timing.clone()),
+            environment_readiness: Some(agent.readiness_timing.clone()),
+            agent_setup: Some(agent.setup_timing.clone()),
+            agent_execution: Some(agent.execution_timing.clone()),
+            verifier_timing: Some(verifier.timing.clone()),
+        }
+    }
+}
+
+async fn receive_agent_terminal(
+    events: &mut AgentEvents,
+    emitter: &mut AttemptEmitter<'_>,
+    observation: &mut AgentObservation,
+) -> Result<AgentEvent, EvalError> {
+    loop {
+        let event = events.recv().await.ok_or(EvalError::AgentEventsClosed)?;
+        observation.observe(&event)?;
+        let terminal = event.kind.is_terminal();
+        emitter.emit(EvalEventKind::Agent(event.clone()));
+        if terminal {
+            return Ok(event);
+        }
+    }
+}
+
+impl AgentObservation {
+    fn observe(&mut self, event: &AgentEvent) -> Result<(), EvalError> {
+        self.observe_lifecycle(event.kind);
+        if event.kind == AgentEventKind::AssistantMessage {
+            let message: nanocodex_agent::events::AssistantMessage = event.decode_payload()?;
+            self.final_message = message.text;
+        }
+        Ok(())
+    }
+
+    const fn observe_lifecycle(&mut self, kind: AgentEventKind) {
+        match kind {
+            AgentEventKind::ModelWarmupStarted
+            | AgentEventKind::ModelCallStarted
+            | AgentEventKind::ModelCompactionStarted => {
+                self.billable_in_flight = self.billable_in_flight.saturating_add(1);
+            }
+            AgentEventKind::ModelWarmupCompleted
+            | AgentEventKind::ModelWarmupFailed
+            | AgentEventKind::ModelCallCompleted
+            | AgentEventKind::ModelCallFailed
+            | AgentEventKind::ModelCompactionCompleted
+            | AgentEventKind::ModelCompactionFailed => {
+                self.billable_in_flight = self.billable_in_flight.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
 }
 
 struct AgentSetup {
@@ -1218,7 +1514,13 @@ impl<'a> AttemptEmitter<'a> {
 
 #[derive(Deserialize)]
 struct ResponsesApiErrorEnvelope {
-    error: ResponsesApiError,
+    error: Option<ResponsesApiError>,
+    response: Option<ResponsesApiErrorResponse>,
+}
+
+#[derive(Deserialize)]
+struct ResponsesApiErrorResponse {
+    error: Option<ResponsesApiError>,
 }
 
 #[derive(Deserialize)]
@@ -1232,27 +1534,56 @@ fn attempt_failure(
     task: Task,
     trial_name: String,
     started_at: DateTime<Utc>,
-    error: &EvalError,
+    queue_wait: PhaseTiming,
+    failure: &AttemptRunFailure,
 ) -> EvalFailure {
     let root = eval.directory().join(&trial_name);
+    let model = failure
+        .agent
+        .as_ref()
+        .map_or_else(|| MODEL.to_owned(), |agent| agent.model.clone());
+    let effort = failure
+        .agent
+        .as_ref()
+        .map_or_else(|| "unknown".to_owned(), |agent| agent.effort.clone());
     EvalFailure {
         attempt_id,
         task_name: task.name().to_owned(),
         trial_name,
-        kind: failure_kind(error),
-        message: error.to_string(),
-        traceback: error_traceback(error),
-        model: MODEL.to_owned(),
-        effort: "unknown".to_owned(),
+        kind: failure_kind(&failure.error),
+        outcome: failure_outcome(&failure.error),
+        message: failure.error.to_string(),
+        traceback: error_traceback(&failure.error),
+        model,
+        effort,
         environment: eval.attempt_environment(),
         started_at,
         occurred_at: Utc::now(),
+        timing: EvalFailureTiming {
+            queue_wait,
+            environment_setup: failure.environment_setup.clone(),
+            environment_readiness: failure.environment_readiness.clone(),
+            agent_setup: failure.agent_setup.clone(),
+            agent_execution: failure.agent_execution.clone(),
+            verifier: failure.verifier_timing.clone(),
+        },
+        agent: failure.agent.clone(),
+        verifier: failure.verifier.clone(),
+        cleanup: failure.cleanup.clone(),
         artifacts: EvalArtifacts {
             workspace: root.join("workspace"),
             verifier_output: root.join("verifier/test-stdout.txt"),
             directory: root,
         },
         task,
+    }
+}
+
+fn failure_outcome(error: &EvalError) -> EvalOutcome {
+    match error {
+        EvalError::Nanocodex(error) if is_safety_refusal(error) => EvalOutcome::SafetyRefusal,
+        EvalError::AgentTimeout(_) => EvalOutcome::AgentTimeout,
+        _ => EvalOutcome::InfrastructureError,
     }
 }
 
@@ -1270,6 +1601,7 @@ fn failure_kind(error: &EvalError) -> EvalFailureKind {
         }
         EvalError::AgentTimeout(_) => EvalFailureKind::AgentTimeout,
         EvalError::VerifierTimeout(_) => EvalFailureKind::VerifierTimeout,
+        EvalError::AgentCleanup(_) => EvalFailureKind::Cleanup,
         EvalError::Nanocodex(_) | EvalError::AgentEventsClosed => EvalFailureKind::Agent,
         EvalError::AttemptVerifier(_) | EvalError::ParseReward(_) => EvalFailureKind::Verifier,
         EvalError::UnsupportedNativeTask { .. }
@@ -1422,7 +1754,12 @@ fn is_safety_refusal(error: &NanocodexError) -> bool {
     };
     serde_json::from_str::<ResponsesApiErrorEnvelope>(event)
         .ok()
-        .and_then(|event| event.error.code)
+        .and_then(|event| {
+            event
+                .error
+                .or_else(|| event.response.and_then(|response| response.error))
+                .and_then(|error| error.code)
+        })
         .is_some_and(|code| code == "cyber_policy")
 }
 
@@ -1482,6 +1819,11 @@ fn attempt_span(
         agent.warmup.output_tokens = tracing::field::Empty,
         agent.warmup.total_tokens = tracing::field::Empty,
         cost.usd = tracing::field::Empty,
+        eval.cleanup.failed = tracing::field::Empty,
+        agent.cleanup.status = tracing::field::Empty,
+        agent.cleanup.duration_ns = tracing::field::Empty,
+        verifier.cleanup.status = tracing::field::Empty,
+        verifier.cleanup.duration_ns = tracing::field::Empty,
         status = tracing::field::Empty,
         error.message = tracing::field::Empty,
         duration_ns = tracing::field::Empty,
@@ -1493,7 +1835,11 @@ fn attempt_span(
     span
 }
 
-fn record_attempt_result(span: &Span, started_at: Instant, result: &Result<EvalResult, EvalError>) {
+fn record_attempt_result(
+    span: &Span,
+    started_at: Instant,
+    result: &Result<EvalResult, AttemptRunFailure>,
+) {
     let duration_ns = elapsed_ns(started_at);
     span.record("duration_ns", duration_ns);
     match result {
@@ -1508,15 +1854,19 @@ fn record_attempt_result(span: &Span, started_at: Instant, result: &Result<EvalR
                 );
             });
         }
-        Err(error) => {
+        Err(failure) => {
+            record_cleanup(span, &failure.cleanup);
+            if let Some(agent) = &failure.agent {
+                record_agent_metrics(span, agent);
+            }
             span.record("status", "failed");
             span.record("otel.status_code", "ERROR");
-            span.record("error.message", tracing::field::display(error));
+            span.record("error.message", tracing::field::display(&failure.error));
             span.in_scope(|| {
                 info!(
                     target: "nanocodex_eval",
                     duration_ns,
-                    error = %error,
+                    error = %failure.error,
                     "evaluation attempt failed"
                 );
             });
@@ -1525,8 +1875,8 @@ fn record_attempt_result(span: &Span, started_at: Instant, result: &Result<EvalR
 }
 
 fn record_attempt_success(span: &Span, result: &EvalResult) {
-    let usage = &result.agent.usage;
-    let warmup = &result.agent.metadata.warmup_usage;
+    record_cleanup(span, &result.cleanup);
+    record_agent_metrics(span, &result.agent);
     span.record("status", "completed");
     span.record("otel.status_code", "OK");
     span.record("eval.score.status", eval_status(result.status));
@@ -1534,16 +1884,15 @@ fn record_attempt_success(span: &Span, result: &EvalResult) {
         "eval.reward.total",
         result.verifier.rewards.values().sum::<f64>(),
     );
-    span.record("agent.model_calls", result.agent.model_calls);
-    span.record("agent.tool_calls", result.agent.tool_calls);
-    span.record(
-        "agent.response_attempts",
-        result.agent.metadata.response_attempts,
-    );
-    span.record(
-        "agent.response_retries",
-        result.agent.metadata.response_retries,
-    );
+}
+
+fn record_agent_metrics(span: &Span, agent: &AgentResult) {
+    let usage = &agent.usage;
+    let warmup = &agent.metadata.warmup_usage;
+    span.record("agent.model_calls", agent.model_calls);
+    span.record("agent.tool_calls", agent.tool_calls);
+    span.record("agent.response_attempts", agent.metadata.response_attempts);
+    span.record("agent.response_retries", agent.metadata.response_retries);
     span.record("gen_ai.usage.input_tokens", usage.input_tokens);
     span.record(
         "gen_ai.usage.cached_input_tokens",
@@ -1557,7 +1906,7 @@ fn record_attempt_success(span: &Span, result: &EvalResult) {
     span.record("gen_ai.usage.total_tokens", usage.total_tokens);
     span.record(
         "agent.warmup.duration_ns",
-        result.agent.metadata.warmup_duration_ns,
+        agent.metadata.warmup_duration_ns,
     );
     span.record("agent.warmup.input_tokens", warmup.input_tokens);
     span.record(
@@ -1570,9 +1919,43 @@ fn record_attempt_success(span: &Span, result: &EvalResult) {
     );
     span.record("agent.warmup.output_tokens", warmup.output_tokens);
     span.record("agent.warmup.total_tokens", warmup.total_tokens);
-    if let Some(cost_usd) = result.agent.cost_usd {
+    if let Some(cost_usd) = agent.cost_usd {
         span.record("cost.usd", cost_usd);
     }
+}
+
+fn record_cleanup(span: &Span, cleanup: &EvalCleanup) {
+    span.record("eval.cleanup.failed", cleanup.is_failed());
+    span.record("agent.cleanup.status", cleanup_status(&cleanup.agent));
+    span.record(
+        "agent.cleanup.duration_ns",
+        cleanup.agent.timing.as_ref().map_or(0, phase_timing_ns),
+    );
+    span.record("verifier.cleanup.status", cleanup_status(&cleanup.verifier));
+    span.record(
+        "verifier.cleanup.duration_ns",
+        cleanup.verifier.timing.as_ref().map_or(0, phase_timing_ns),
+    );
+}
+
+const fn cleanup_status(cleanup: &CleanupPhase) -> &'static str {
+    match cleanup.status {
+        crate::CleanupStatus::NotRequired => "not_required",
+        crate::CleanupStatus::Completed => "completed",
+        crate::CleanupStatus::Failed => "failed",
+    }
+}
+
+fn phase_timing_ns(timing: &PhaseTiming) -> u64 {
+    u64::try_from(
+        timing
+            .finished_at
+            .signed_duration_since(timing.started_at)
+            .num_nanoseconds()
+            .unwrap_or_default()
+            .max(0),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 const fn eval_status(status: EvalStatus) -> &'static str {
@@ -1668,8 +2051,12 @@ fn trial_name(task: &Task, attempt_id: Uuid, coordinate: Option<&SweepCoordinate
 }
 
 impl AgentResult {
-    fn from_terminal(final_message: String, event: &AgentEvent) -> Result<Self, EvalError> {
-        if event.kind != AgentEventKind::RunCompleted {
+    fn from_terminal(
+        final_message: String,
+        event: &AgentEvent,
+        billing_completeness: BillingCompleteness,
+    ) -> Result<Self, EvalError> {
+        if !event.kind.is_terminal() {
             return Err(EvalError::AgentEventsClosed);
         }
         let metadata: AgentMetadata = serde_json::from_str(event.payload.get())?;
@@ -1681,17 +2068,9 @@ impl AgentResult {
             tool_calls: metadata.tool_calls,
             usage: metadata.usage.clone(),
             cost_usd: metadata.cost_usd,
+            billing_completeness,
             metadata,
         })
-    }
-}
-
-impl PhaseTiming {
-    fn finished(started_at: DateTime<Utc>) -> Self {
-        Self {
-            started_at,
-            finished_at: Utc::now(),
-        }
     }
 }
 
@@ -1700,6 +2079,8 @@ mod lifecycle_tests {
     use std::{
         collections::BTreeMap,
         convert::Infallible,
+        fs,
+        path::Path,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -1716,10 +2097,13 @@ mod lifecycle_tests {
     use tokio_tungstenite::{accept_async, tungstenite::Message};
 
     use super::{
-        AttemptAgent, AttemptVerification, AttemptVerifier, AttemptVerifierFuture, EvalAttempt,
-        Evaluator,
+        AgentEventKind, AgentObservation, AttemptAgent, AttemptVerification, AttemptVerifier,
+        AttemptVerifierFuture, EvalAttempt, Evaluator,
     };
-    use crate::{EvalStatus, Task, VerifierResult};
+    use crate::{
+        AgentStatus, BillingCompleteness, CleanupPhase, CleanupStatus, EvalEventKind, EvalOutcome,
+        EvalStatus, Task, VerifierResult,
+    };
 
     struct AttemptResourceProvider {
         live_resources: Arc<AtomicUsize>,
@@ -1769,6 +2153,8 @@ mod lifecycle_tests {
                 "attempt-owned agent resources must be joined before verification starts"
             );
             Box::pin(async {
+                let cleanup_started = chrono::Utc::now();
+                let cleanup_error = std::io::Error::other("deterministic verifier cleanup failure");
                 Ok(AttemptVerification {
                     result: VerifierResult {
                         exit_code: 0,
@@ -1776,6 +2162,7 @@ mod lifecycle_tests {
                     },
                     stdout: String::new(),
                     stderr: String::new(),
+                    cleanup: CleanupPhase::failed(cleanup_started, &cleanup_error),
                 })
             })
         }
@@ -1865,6 +2252,9 @@ mod lifecycle_tests {
         let result = evaluator.task(task).await.unwrap();
 
         assert_eq!(result.status, EvalStatus::Passed);
+        assert_eq!(result.outcome, EvalOutcome::Passed);
+        assert_eq!(result.cleanup.agent.status, CleanupStatus::Completed);
+        assert_eq!(result.cleanup.verifier.status, CleanupStatus::Failed);
         assert_eq!(live_resources.load(Ordering::Acquire), 0);
         server.await.unwrap();
     }
@@ -1899,8 +2289,8 @@ mod lifecycle_tests {
                             "id": "resp-failed",
                             "status": "failed",
                             "error": {
-                                "code": "invalid_image",
-                                "message": "deterministic model failure"
+                                "code": "cyber_policy",
+                                "message": "deterministic safety refusal"
                             }
                         }
                     })
@@ -1927,10 +2317,11 @@ mod lifecycle_tests {
                 .build()
         });
         let output = tempdir().unwrap();
-        let (evaluator, _events) = Evaluator::builder(nanocodex)
+        let (evaluator, events) = Evaluator::builder(nanocodex)
             .output_directory(output.path())
             .build()
             .unwrap();
+        let mut events = events.subscribe();
         let task = Task::load(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tasks/write-greeting"),
         )
@@ -1943,7 +2334,130 @@ mod lifecycle_tests {
 
         assert!(matches!(error, super::EvalError::Nanocodex(_)));
         assert_eq!(live_resources.load(Ordering::Acquire), 0);
+        let failure = loop {
+            let event = events.recv().await.unwrap().unwrap();
+            if let EvalEventKind::Failed(failure) = &event.kind {
+                break failure.clone();
+            }
+        };
+        assert_eq!(failure.outcome, EvalOutcome::SafetyRefusal);
+        assert_eq!(failure.kind, crate::EvalFailureKind::AgentSafetyRefusal);
+        assert_eq!(failure.cleanup.agent.status, CleanupStatus::Completed);
+        assert!(failure.cleanup.agent.timing.is_some());
+        assert!(failure.timing.agent_execution.is_some());
+        assert!(failure.timing.queue_wait.finished_at >= failure.timing.queue_wait.started_at);
+        let agent = failure
+            .agent
+            .as_ref()
+            .expect("terminal run metrics must survive the provider failure");
+        assert_eq!(agent.metadata.status, AgentStatus::Failed);
+        assert_eq!(agent.billing_completeness, BillingCompleteness::Complete);
         server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn model_in_flight_timeout_retains_unknown_billing_snapshot() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let warmup = socket.next().await.unwrap().unwrap();
+            assert!(warmup.is_text());
+            socket
+                .send(Message::Text(
+                    json!({
+                        "type": "response.completed",
+                        "response": { "id": "resp-warmup", "usage": null }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let generation = socket.next().await.unwrap().unwrap();
+            assert!(generation.is_text());
+            while socket.next().await.is_some() {}
+        });
+        let live_resources = Arc::new(AtomicUsize::new(0));
+        let openai = OpenAi::builder("test")
+            .websocket_url(endpoint)
+            .build()
+            .unwrap();
+        let tool_resources = Arc::clone(&live_resources);
+        let nanocodex = Nanocodex::builder(openai).tools_factory(move |_agent| {
+            tool_resources.fetch_add(1, Ordering::AcqRel);
+            Tools::builder()
+                .without_defaults()
+                .provider(AttemptResourceProvider {
+                    live_resources: Arc::clone(&tool_resources),
+                })
+                .build()
+        });
+        let output = tempdir().unwrap();
+        let (evaluator, events) = Evaluator::builder(nanocodex)
+            .output_directory(output.path())
+            .build()
+            .unwrap();
+        let mut events = events.subscribe();
+        let (_task_directory, task) = task_with_agent_timeout(0.05);
+
+        let error = evaluator
+            .task(task)
+            .await
+            .expect_err("the pending model call must reach the task timeout");
+
+        assert!(matches!(error, super::EvalError::AgentTimeout(_)));
+        assert_eq!(live_resources.load(Ordering::Acquire), 0);
+        let failure = loop {
+            let event = events.recv().await.unwrap().unwrap();
+            if let EvalEventKind::Failed(failure) = &event.kind {
+                break failure.clone();
+            }
+        };
+        assert_eq!(failure.outcome, EvalOutcome::AgentTimeout);
+        assert_eq!(failure.cleanup.agent.status, CleanupStatus::Completed);
+        let agent = failure
+            .agent
+            .as_ref()
+            .expect("cancellation must emit a partial terminal snapshot");
+        assert_eq!(agent.metadata.status, AgentStatus::Cancelled);
+        assert_eq!(agent.billing_completeness, BillingCompleteness::Unknown);
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn completed_model_call_leaves_idle_tool_timeout_billing_complete() {
+        let mut observation = AgentObservation::default();
+        observation.observe_lifecycle(AgentEventKind::ModelCallStarted);
+        observation.observe_lifecycle(AgentEventKind::ModelCallCompleted);
+
+        assert_eq!(observation.billable_in_flight, 0);
+    }
+
+    fn task_with_agent_timeout(timeout_seconds: f64) -> (tempfile::TempDir, Task) {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tasks/write-greeting");
+        let destination = tempdir().unwrap();
+        for directory in ["environment", "tests"] {
+            fs::create_dir_all(destination.path().join(directory)).unwrap();
+        }
+        for file in [
+            "instruction.md",
+            "environment/Dockerfile",
+            "environment/README.md",
+            "tests/test.sh",
+        ] {
+            fs::copy(source.join(file), destination.path().join(file)).unwrap();
+        }
+        let manifest = fs::read_to_string(source.join("task.toml"))
+            .unwrap()
+            .replace(
+                "timeout_sec = 300.0",
+                &format!("timeout_sec = {timeout_seconds}"),
+            );
+        fs::write(destination.path().join("task.toml"), manifest).unwrap();
+        let task = Task::load(destination.path()).unwrap();
+        (destination, task)
     }
 }
 
