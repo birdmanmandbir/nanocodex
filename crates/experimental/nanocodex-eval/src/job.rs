@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
-    io::Write as _,
+    io::{self, Write as _},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -51,11 +51,10 @@ impl Drop for JobLease {
 
 impl EvalJob {
     pub(crate) fn create(parent_directory: &Path) -> Result<Self, EvalError> {
-        fs::create_dir_all(parent_directory)?;
-        let parent_directory = fs::canonicalize(parent_directory)?;
+        let parent_directory = prepare_parent_directory(parent_directory)?;
         let id = Uuid::now_v7();
         let directory = parent_directory.join(id.to_string());
-        fs::create_dir_all(&directory)?;
+        create_durable_directory_all(&directory)?;
         let lease = Self::lease(&directory)?;
         let started_at = Utc::now();
         Self::write_json(&directory, JOB_FILE, &JobIdentity { id, started_at })?;
@@ -73,8 +72,7 @@ impl EvalJob {
         parent_directory: &Path,
         run: &RunManifest,
     ) -> Result<Self, EvalError> {
-        fs::create_dir_all(parent_directory)?;
-        let parent_directory = fs::canonicalize(parent_directory)?;
+        let parent_directory = prepare_parent_directory(parent_directory)?;
         let mut candidates = Vec::new();
         for entry in fs::read_dir(&parent_directory)? {
             let entry = entry?;
@@ -145,10 +143,23 @@ impl EvalJob {
     }
 
     pub fn bind_run(&self, run: &RunManifest) -> Result<(), EvalError> {
+        self.bind_run_with_sync(run, sync_directory)
+    }
+
+    fn bind_run_with_sync<F>(
+        &self,
+        run: &RunManifest,
+        mut sync_directory: F,
+    ) -> Result<(), EvalError>
+    where
+        F: FnMut(&Path) -> io::Result<()>,
+    {
         let path = self.directory.join(RUN_FILE);
         let encoded = serde_json::to_vec_pretty(run)?;
         if path.exists() {
-            return Self::verify_run(&path, run);
+            Self::verify_run(&path, run)?;
+            sync_directory(&self.directory)?;
+            return Ok(());
         }
 
         let mut temporary = tempfile::NamedTempFile::new_in(&self.directory)?;
@@ -156,9 +167,14 @@ impl EvalJob {
         temporary.write_all(b"\n")?;
         temporary.as_file().sync_all()?;
         match temporary.persist_noclobber(&path) {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                sync_directory(&self.directory)?;
+                Ok(())
+            }
             Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-                Self::verify_run(&path, run)
+                Self::verify_run(&path, run)?;
+                sync_directory(&self.directory)?;
+                Ok(())
             }
             Err(error) => Err(error.error.into()),
         }
@@ -217,11 +233,133 @@ impl EvalJob {
         temporary
             .persist_noclobber(directory.join(filename))
             .map_err(|error| error.error)?;
+        sync_directory(directory)?;
         Ok(())
     }
 }
 
-#[cfg(test)]
+fn prepare_parent_directory(path: &Path) -> io::Result<PathBuf> {
+    require_durable_directory_sync()?;
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    create_durable_directory_all(&absolute)?;
+    fs::canonicalize(absolute)
+}
+
+fn create_durable_directory_all(path: &Path) -> io::Result<()> {
+    create_durable_directory_all_with_sync(path, sync_directory)
+}
+
+fn create_durable_directory_all_with_sync<F>(path: &Path, mut sync_directory: F) -> io::Result<()>
+where
+    F: FnMut(&Path) -> io::Result<()>,
+{
+    let mut missing = Vec::new();
+    let mut ancestor = path;
+    loop {
+        match fs::symlink_metadata(ancestor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "durable evaluation output ancestry must be symlink-free: {}",
+                        ancestor.display()
+                    ),
+                ));
+            }
+            Ok(metadata) if metadata.is_dir() => break,
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    format!("path component is not a directory: {}", ancestor.display()),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing.push(ancestor.to_path_buf());
+                ancestor = ancestor.parent().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("directory has no existing ancestor: {}", path.display()),
+                    )
+                })?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    for directory in missing.into_iter().rev() {
+        match fs::create_dir(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let metadata = fs::symlink_metadata(&directory)?;
+                if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "durable evaluation output ancestry must be symlink-free: {}",
+                            directory.display()
+                        ),
+                    ));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    // Retrying after a failed fsync must not trust directory existence: a
+    // prior call may have created an entry without durably committing it.
+    // Revalidate the symlink-free contract and sync every parent to the root.
+    for directory in path.ancestors() {
+        let metadata = fs::symlink_metadata(directory)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "durable evaluation output ancestry must be symlink-free: {}",
+                    directory.display()
+                ),
+            ));
+        }
+        if let Some(parent) = directory.parent() {
+            sync_directory(parent)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!(
+            "durable evaluation jobs require directory fsync support: {}",
+            path.display()
+        ),
+    ))
+}
+
+#[cfg(unix)]
+const fn require_durable_directory_sync() -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn require_durable_directory_sync() -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "durable evaluation jobs require directory fsync support",
+    ))
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use std::path::PathBuf;
 
@@ -230,6 +368,62 @@ mod tests {
 
     use super::*;
     use crate::{Sweep, Task};
+
+    #[test]
+    fn creates_and_syncs_each_missing_output_directory_component() {
+        let output = tempdir().unwrap();
+        let first = output.path().join("one");
+        let second = first.join("two");
+        let nested = second.join("three");
+        let mut synced = Vec::new();
+
+        create_durable_directory_all_with_sync(&nested, |directory| {
+            synced.push(directory.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(nested.is_dir());
+        assert_eq!(&synced[..3], &[second, first, output.path().to_path_buf()]);
+        let job = EvalJob::create(&nested).unwrap();
+        assert_eq!(job.parent_directory(), fs::canonicalize(&nested).unwrap());
+        assert!(job.directory().is_dir());
+    }
+
+    #[test]
+    fn retries_parent_sync_for_an_existing_but_uncommitted_directory() {
+        let output = tempdir().unwrap();
+        let target = output.path().join("created-before-sync-failure");
+        let error = create_durable_directory_all_with_sync(&target, |_| {
+            Err(io::Error::other("injected sync failure"))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(target.is_dir());
+
+        let mut retried_syncs = Vec::new();
+        create_durable_directory_all_with_sync(&target, |directory| {
+            retried_syncs.push(directory.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(retried_syncs.first(), Some(&output.path().to_path_buf()));
+    }
+
+    #[test]
+    fn rejects_symlinks_in_the_output_ancestry_without_following_them() {
+        let output = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let redirect = output.path().join("redirect");
+        std::os::unix::fs::symlink(outside.path(), &redirect).unwrap();
+
+        let error = create_durable_directory_all_with_sync(&redirect.join("nested"), |_| Ok(()))
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!outside.path().join("nested").exists());
+    }
 
     #[test]
     fn atomically_binds_one_finite_run() {
@@ -247,6 +441,28 @@ mod tests {
 
         let error = job.bind_run(&sweep(2).manifest()).unwrap_err();
         assert!(matches!(error, EvalError::RunConflict(_)));
+    }
+
+    #[test]
+    fn binding_retry_syncs_an_existing_manifest_after_a_sync_failure() {
+        let output = tempdir().unwrap();
+        let job = EvalJob::create(output.path()).unwrap();
+        let run = sweep(1).manifest();
+
+        let error = job
+            .bind_run_with_sync(&run, |_| Err(io::Error::other("injected sync failure")))
+            .unwrap_err();
+        assert!(matches!(error, EvalError::Io(error) if error.kind() == io::ErrorKind::Other));
+        assert!(job.directory().join(RUN_FILE).is_file());
+
+        let mut synced = Vec::new();
+        job.bind_run_with_sync(&run, |directory| {
+            synced.push(directory.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(synced, [job.directory().to_path_buf()]);
     }
 
     #[test]
@@ -379,5 +595,26 @@ mod tests {
             task.remove("name");
         }
         serde_json::from_value(retained).unwrap()
+    }
+}
+
+#[cfg(all(test, not(unix)))]
+mod unsupported_platform_tests {
+    use tempfile::tempdir;
+
+    use super::EvalJob;
+    use crate::EvalError;
+
+    #[test]
+    fn job_creation_fails_closed_without_durable_directory_sync() {
+        let output = tempdir().unwrap();
+        let target = output.path().join("new-output");
+
+        let error = EvalJob::create(&target).unwrap_err();
+
+        assert!(
+            matches!(error, EvalError::Io(error) if error.kind() == std::io::ErrorKind::Unsupported)
+        );
+        assert!(!target.exists());
     }
 }
