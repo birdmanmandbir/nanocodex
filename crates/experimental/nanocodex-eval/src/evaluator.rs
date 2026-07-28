@@ -793,8 +793,26 @@ impl Evaluator {
         };
         let result = result.instrument(span.clone()).await;
         record_span_result(&span, trace_started, &result);
-        let (turn_result, terminal_event) = result?;
-        agent.shutdown().await?;
+        let shutdown = agent.shutdown().await.map_err(EvalError::Nanocodex);
+        let (turn_result, terminal_event) = match result {
+            Ok(result) => {
+                shutdown?;
+                result
+            }
+            Err(primary) => {
+                if let Err(cleanup) = shutdown {
+                    span.in_scope(|| {
+                        tracing::warn!(
+                            target: "nanocodex_eval",
+                            error = %cleanup,
+                            primary_error = %primary,
+                            "agent cleanup also failed; preserving the execution error"
+                        );
+                    });
+                }
+                return Err(primary);
+            }
+        };
         Ok(AgentExecution {
             result: AgentResult::from_terminal(turn_result.into_final_message(), &terminal_event)?,
             verifier,
@@ -1847,6 +1865,83 @@ mod lifecycle_tests {
         let result = evaluator.task(task).await.unwrap();
 
         assert_eq!(result.status, EvalStatus::Passed);
+        assert_eq!(live_resources.load(Ordering::Acquire), 0);
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_resources_are_joined_after_execution_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let warmup = socket.next().await.unwrap().unwrap();
+            assert!(warmup.is_text());
+            socket
+                .send(Message::Text(
+                    json!({
+                        "type": "response.completed",
+                        "response": { "id": "resp-warmup", "usage": null }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let generation = socket.next().await.unwrap().unwrap();
+            assert!(generation.is_text());
+            socket
+                .send(Message::Text(
+                    json!({
+                        "type": "response.failed",
+                        "response": {
+                            "id": "resp-failed",
+                            "status": "failed",
+                            "error": {
+                                "code": "invalid_image",
+                                "message": "deterministic model failure"
+                            }
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            while socket.next().await.is_some() {}
+        });
+        let live_resources = Arc::new(AtomicUsize::new(0));
+        let openai = OpenAi::builder("test")
+            .websocket_url(endpoint)
+            .build()
+            .unwrap();
+        let tool_resources = Arc::clone(&live_resources);
+        let nanocodex = Nanocodex::builder(openai).tools_factory(move |_agent| {
+            tool_resources.fetch_add(1, Ordering::AcqRel);
+            Tools::builder()
+                .without_defaults()
+                .provider(AttemptResourceProvider {
+                    live_resources: Arc::clone(&tool_resources),
+                })
+                .build()
+        });
+        let output = tempdir().unwrap();
+        let (evaluator, _events) = Evaluator::builder(nanocodex)
+            .output_directory(output.path())
+            .build()
+            .unwrap();
+        let task = Task::load(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tasks/write-greeting"),
+        )
+        .unwrap();
+
+        let error = evaluator
+            .task(task)
+            .await
+            .expect_err("the provider failure must fail the attempt");
+
+        assert!(matches!(error, super::EvalError::Nanocodex(_)));
         assert_eq!(live_resources.load(Ordering::Acquire), 0);
         server.await.unwrap();
     }
