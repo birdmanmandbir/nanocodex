@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs::{self, File, OpenOptions},
     io::Write as _,
     path::{Path, PathBuf},
@@ -10,7 +11,11 @@ use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{EvalError, sweep::RunManifest};
+use crate::{
+    EvalError,
+    durable::scan_manifest_trials,
+    sweep::{RunCoordinate, RunManifest},
+};
 
 const JOB_FILE: &str = "job.json";
 const LOCK_FILE: &str = ".nanoeval.lock";
@@ -70,21 +75,29 @@ impl EvalJob {
     ) -> Result<Self, EvalError> {
         fs::create_dir_all(parent_directory)?;
         let parent_directory = fs::canonicalize(parent_directory)?;
-        let mut candidates = fs::read_dir(&parent_directory)?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.is_dir())
-            .filter_map(|directory| {
-                let identity = Self::read_json::<JobIdentity>(&directory.join(JOB_FILE)).ok()?;
-                let retained = Self::read_json::<RunManifest>(&directory.join(RUN_FILE)).ok()?;
-                let completed = Self::completed_trial_count(&directory).ok()?;
-                (retained == *run && completed < run.attempt_count()).then_some((
-                    identity.started_at,
-                    identity,
-                    directory,
-                ))
-            })
-            .collect::<Vec<_>>();
+        let mut candidates = Vec::new();
+        for entry in fs::read_dir(&parent_directory)? {
+            let entry = entry?;
+            let directory = entry.path();
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let Ok(identity) = Self::read_json::<JobIdentity>(&directory.join(JOB_FILE)) else {
+                continue;
+            };
+            let Ok(retained) = Self::read_json::<RunManifest>(&directory.join(RUN_FILE)) else {
+                continue;
+            };
+            if retained != *run {
+                continue;
+            }
+            let completed = scan_manifest_trials(&directory, identity.id, run)
+                .map_err(|error| EvalError::InvalidDurableTrial(error.to_string()))?
+                .len();
+            if completed < run.attempt_count() {
+                candidates.push((identity.started_at, identity, directory));
+            }
+        }
         candidates.sort_unstable_by_key(|(started_at, _, _)| *started_at);
 
         let Some((_, identity, directory)) = candidates.pop() else {
@@ -151,25 +164,18 @@ impl EvalJob {
         }
     }
 
-    pub fn completed_attempt(&self, trial_prefix: &str) -> Result<bool, EvalError> {
-        for entry in fs::read_dir(&self.directory)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            if name
-                .strip_prefix(trial_prefix)
-                .is_some_and(|suffix| suffix.starts_with("__"))
-                && entry.path().join("result.json").is_file()
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+    pub fn completed_coordinates(
+        &self,
+        run: &RunManifest,
+    ) -> Result<BTreeSet<RunCoordinate>, EvalError> {
+        scan_manifest_trials(&self.directory, self.id, run)
+            .map(|trials| {
+                trials
+                    .into_iter()
+                    .map(|trial| trial.coordinate().clone())
+                    .collect()
+            })
+            .map_err(|error| EvalError::InvalidDurableTrial(error.to_string()))
     }
 
     fn verify_run(path: &Path, expected: &RunManifest) -> Result<(), EvalError> {
@@ -179,17 +185,6 @@ impl EvalJob {
         } else {
             Err(EvalError::RunConflict(path.to_path_buf()))
         }
-    }
-
-    fn completed_trial_count(directory: &Path) -> Result<usize, EvalError> {
-        let mut completed = 0;
-        for entry in fs::read_dir(directory)? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() && entry.path().join("result.json").is_file() {
-                completed += 1;
-            }
-        }
-        Ok(completed)
     }
 
     fn lease(directory: &Path) -> Result<JobLease, EvalError> {
@@ -285,13 +280,45 @@ mod tests {
     fn recognizes_only_a_durable_terminal_trial_for_a_coordinate() {
         let output = tempdir().unwrap();
         let job = EvalJob::create(output.path()).unwrap();
-        let abandoned = job.directory().join("task__agent__001__abandoned");
+        let sweep = sweep(2);
+        let run = sweep.manifest();
+        job.bind_run(&run).unwrap();
+        let coordinate = sweep.attempts().next().unwrap().coordinate();
+        let abandoned = job.directory().join("write-greeting__test__001__abandoned");
         fs::create_dir_all(&abandoned).unwrap();
-        assert!(!job.completed_attempt("task__agent__001").unwrap());
+        assert!(job.completed_coordinates(&run).unwrap().is_empty());
 
-        fs::write(abandoned.join("result.json"), "{}").unwrap();
-        assert!(job.completed_attempt("task__agent__001").unwrap());
-        assert!(!job.completed_attempt("task__agent__002").unwrap());
+        let id = Uuid::now_v7();
+        let compact_id = id.simple().to_string();
+        let trial_name = format!("write-greeting__test__001__{}", &compact_id[..8]);
+        let directory = job.directory().join(&trial_name);
+        fs::create_dir(&directory).unwrap();
+        let task = &sweep.tasks()[0];
+        fs::write(
+            directory.join("result.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "id": id,
+                "task_name": task.name(),
+                "trial_name": trial_name,
+                "task_id": {
+                    "path": task.root(),
+                },
+                "config": {
+                    "task": {
+                        "path": task.root(),
+                    },
+                    "trial_name": trial_name,
+                    "trials_dir": job.directory(),
+                    "job_id": job.id(),
+                },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let completed = job.completed_coordinates(&run).unwrap();
+        assert_eq!(completed.len(), 1);
+        assert!(completed.contains(&coordinate));
     }
 
     fn sweep(trials: u16) -> Sweep {

@@ -236,6 +236,10 @@ pub enum EvalError {
     #[error("evaluation job is already bound to a different run: {0}")]
     RunConflict(PathBuf),
 
+    /// A retained terminal result did not belong to its finite run.
+    #[error("invalid durable evaluation trial: {0}")]
+    InvalidDurableTrial(String),
+
     /// Another process still owns the matching resumable job.
     #[error("matching incomplete evaluation job is already active: {0}")]
     RunActive(PathBuf),
@@ -351,11 +355,13 @@ impl Evaluator {
     ///
     /// Returns the first setup, agent, or verifier error.
     pub async fn sweep(&self, sweep: Sweep) -> Result<SweepResults, EvalError> {
-        self.inner.job.bind_run(&sweep.manifest())?;
+        let manifest = sweep.manifest();
+        self.inner.job.bind_run(&manifest)?;
+        let completed = self.inner.job.completed_coordinates(&manifest)?;
         let mut skipped = 0;
         let mut inputs = Vec::new();
         for attempt in sweep.attempts() {
-            if self.inner.job.completed_attempt(&attempt.trial_prefix())? {
+            if completed.contains(&attempt.coordinate()) {
                 skipped += 1;
                 continue;
             }
@@ -393,10 +399,12 @@ impl Evaluator {
     /// Returns an error when the job is bound to another sweep or its retained
     /// artifacts cannot be inspected.
     pub fn remaining_attempts(&self, sweep: &Sweep) -> Result<usize, EvalError> {
-        self.inner.job.bind_run(&sweep.manifest())?;
+        let manifest = sweep.manifest();
+        self.inner.job.bind_run(&manifest)?;
+        let completed = self.inner.job.completed_coordinates(&manifest)?;
         let mut remaining = 0;
         for attempt in sweep.attempts() {
-            if !self.inner.job.completed_attempt(&attempt.trial_prefix())? {
+            if !completed.contains(&attempt.coordinate()) {
                 remaining += 1;
             }
         }
@@ -1216,6 +1224,7 @@ fn failure_kind(error: &EvalError) -> EvalFailureKind {
         EvalError::InvalidConcurrency
         | EvalError::InvalidMemory
         | EvalError::Draining
+        | EvalError::InvalidDurableTrial(_)
         | EvalError::Io(_)
         | EvalError::Json(_)
         | EvalError::RunConflict(_)

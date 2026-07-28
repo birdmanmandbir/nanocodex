@@ -1,4 +1,8 @@
-use std::{fmt, num::NonZeroU16, path::PathBuf};
+use std::{
+    fmt,
+    num::NonZeroU16,
+    path::{Path, PathBuf},
+};
 
 use nanocodex_agent::NanocodexBuilder;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
@@ -50,6 +54,15 @@ pub(crate) struct RunManifest {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
 struct RunTask {
     root: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct RunCoordinate {
+    task_root: PathBuf,
+    agent: AgentId,
+    repetition: u16,
 }
 
 /// Failure to construct a filesystem-safe agent recipe identity.
@@ -204,6 +217,7 @@ impl Sweep {
                 .iter()
                 .map(|task| RunTask {
                     root: task.root().to_path_buf(),
+                    name: Some(task.name().to_owned()),
                 })
                 .collect(),
             agents: self.agents.iter().map(|agent| agent.id.clone()).collect(),
@@ -217,13 +231,23 @@ impl RunManifest {
         self.tasks.len() * self.agents.len() * usize::from(self.trials.get())
     }
 
+    pub(crate) fn contains_task_root(&self, task_root: &Path) -> bool {
+        self.tasks.iter().any(|task| task.root == task_root)
+    }
+
     pub(crate) fn coordinate_for_trial(
         &self,
+        task_root: &Path,
         task_name: &str,
         trial_name: &str,
         attempt_id: Uuid,
-    ) -> Option<(&AgentId, u16)> {
-        let short_name = task_name.rsplit('/').next().unwrap_or(task_name);
+    ) -> Option<RunCoordinate> {
+        let task = self.tasks.iter().find(|task| task.root == task_root)?;
+        if task.name.as_deref().is_some_and(|name| name != task_name) {
+            return None;
+        }
+        let retained_name = task.name.as_deref().unwrap_or(task_name);
+        let short_name = retained_name.rsplit('/').next().unwrap_or(retained_name);
         let compact_id = attempt_id.simple().to_string();
         for agent in &self.agents {
             for repetition in 1..=self.trials.get() {
@@ -232,11 +256,29 @@ impl RunManifest {
                     &compact_id[..8]
                 );
                 if trial_name == expected {
-                    return Some((agent, repetition));
+                    return Some(RunCoordinate {
+                        task_root: task.root.clone(),
+                        agent: agent.clone(),
+                        repetition,
+                    });
                 }
             }
         }
         None
+    }
+}
+
+impl RunCoordinate {
+    pub(crate) fn task_root(&self) -> &Path {
+        &self.task_root
+    }
+
+    pub(crate) const fn agent(&self) -> &AgentId {
+        &self.agent
+    }
+
+    pub(crate) const fn repetition(&self) -> u16 {
+        self.repetition
     }
 }
 
@@ -249,8 +291,12 @@ impl PartialEq for RunManifest {
             return false;
         }
 
-        let mut tasks = self.tasks.iter().collect::<Vec<_>>();
-        let mut other_tasks = other.tasks.iter().collect::<Vec<_>>();
+        let mut tasks = self.tasks.iter().map(|task| &task.root).collect::<Vec<_>>();
+        let mut other_tasks = other
+            .tasks
+            .iter()
+            .map(|task| &task.root)
+            .collect::<Vec<_>>();
         tasks.sort_unstable();
         other_tasks.sort_unstable();
         tasks == other_tasks
@@ -369,14 +415,12 @@ impl SweepAttempt<'_> {
         self.trial
     }
 
-    pub(crate) fn trial_prefix(&self) -> String {
-        let short_name = self
-            .task
-            .name()
-            .rsplit('/')
-            .next()
-            .unwrap_or_else(|| self.task.name());
-        format!("{short_name}__{}__{:03}", self.agent.id, self.trial)
+    pub(crate) fn coordinate(&self) -> RunCoordinate {
+        RunCoordinate {
+            task_root: self.task.root().to_path_buf(),
+            agent: self.agent.id.clone(),
+            repetition: self.trial,
+        }
     }
 }
 
@@ -455,6 +499,34 @@ mod tests {
                 .map(|attempt| attempt.task().name().to_owned())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn legacy_manifest_without_task_names_keeps_full_root_coordinates() {
+        let sweep = Sweep::builder()
+            .task(load_task("write-greeting"))
+            .agent(
+                "default",
+                Nanocodex::builder(OpenAi::new("test-key").unwrap()),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let current = sweep.manifest();
+        let mut retained = serde_json::to_value(&current).unwrap();
+        retained["tasks"][0].as_object_mut().unwrap().remove("name");
+        let legacy: RunManifest = serde_json::from_value(retained).unwrap();
+        let task = &sweep.tasks()[0];
+        let id = Uuid::from_u128(0x1234_5678_0000_0000_0000_0000_0000_0001);
+        let trial_name = "write-greeting__default__001__12345678";
+
+        assert_eq!(legacy, current);
+        let coordinate = legacy
+            .coordinate_for_trial(task.root(), task.name(), trial_name, id)
+            .unwrap();
+        assert_eq!(coordinate.task_root(), task.root());
+        assert_eq!(coordinate.agent().as_str(), "default");
+        assert_eq!(coordinate.repetition(), 1);
     }
 
     #[test]
