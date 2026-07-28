@@ -15,9 +15,9 @@ use crate::{
 use nanocodex_tools::{ToolContext, ToolInput, ToolOutput, ToolResult, standard::StandardTool};
 use thiserror::Error;
 use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, ChildStdout, Command},
-    sync::{Mutex, Semaphore, mpsc, oneshot},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
+    sync::{Mutex, Notify, Semaphore, mpsc, oneshot},
 };
 use tracing::{Instrument, Span, info, info_span};
 
@@ -36,6 +36,8 @@ const DEFAULT_COMMAND_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_GUEST_IN_FLIGHT_REQUESTS: usize = 64;
 const MAX_HOST_IN_FLIGHT_REQUESTS: usize = MAX_GUEST_IN_FLIGHT_REQUESTS - 1;
 const REQUEST_QUEUE_CAPACITY: usize = MAX_GUEST_IN_FLIGHT_REQUESTS;
+const MAX_TERMINAL_STDERR_BYTES: usize = 64 * 1024;
+const TERMINAL_STDERR_DRAIN_GRACE: Duration = Duration::from_millis(250);
 
 /// One trusted command executed by the evaluation harness inside the guest.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -223,6 +225,8 @@ struct VmToolSessionInner {
     request_slots: Semaphore,
     output: Mutex<Option<ChildStdout>>,
     pending: StdMutex<PendingState>,
+    terminal: StdMutex<TerminalDiagnostics>,
+    terminal_closed: Notify,
     child: StdMutex<Option<Child>>,
     egress: StdMutex<Option<EgressLease>>,
     process_config: StdMutex<Option<PrivateVmProcessConfig>>,
@@ -237,6 +241,13 @@ struct PendingState {
 struct PendingResponse {
     span: Span,
     response: oneshot::Sender<Result<(SessionResponse, usize), String>>,
+}
+
+#[derive(Default)]
+struct TerminalDiagnostics {
+    stderr_tail: Vec<u8>,
+    stderr_error: Option<String>,
+    closed: bool,
 }
 
 struct PendingRequestGuard {
@@ -305,7 +316,8 @@ impl VmToolSession {
     /// Spawns a VMM command whose guest process runs the companion guest server.
     ///
     /// The command's stdin and stdout are reserved for the typed protocol;
-    /// stderr remains available for VMM and guest diagnostics.
+    /// stderr is passed through while a bounded tail is retained for terminal
+    /// protocol failures.
     ///
     /// # Errors
     ///
@@ -339,7 +351,7 @@ impl VmToolSession {
             let mut child = command
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::inherit())
+                .stderr(Stdio::piped())
                 .kill_on_drop(true)
                 .spawn()
                 .map_err(VmToolSessionError::Spawn)?;
@@ -354,6 +366,10 @@ impl VmToolSession {
                 .stdout
                 .take()
                 .ok_or(VmToolSessionError::MissingPipe("stdout"))?;
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or(VmToolSessionError::MissingPipe("stderr"))?;
             let (input_sender, input_receiver) = mpsc::channel(REQUEST_QUEUE_CAPACITY);
             let inner = Arc::new(VmToolSessionInner {
                 spawned_at: Instant::now(),
@@ -363,6 +379,8 @@ impl VmToolSession {
                 request_slots: Semaphore::new(MAX_HOST_IN_FLIGHT_REQUESTS),
                 output: Mutex::new(Some(output)),
                 pending: StdMutex::new(PendingState::default()),
+                terminal: StdMutex::new(TerminalDiagnostics::default()),
+                terminal_closed: Notify::new(),
                 child: StdMutex::new(Some(child)),
                 egress: StdMutex::new(None),
                 process_config: StdMutex::new(None),
@@ -372,6 +390,7 @@ impl VmToolSession {
                 input_receiver,
                 Arc::downgrade(&inner),
             ));
+            runtime.spawn(capture_terminal_stderr(stderr, Arc::downgrade(&inner)));
             Ok(Self {
                 handle: VmToolSessionHandle { inner },
             })
@@ -924,11 +943,60 @@ async fn write_requests(
         .await;
         if let Err(error) = result {
             if let Some(inner) = inner.upgrade() {
-                close_pending(&inner, &format!("VM tool console write failed: {error}"));
+                let message = terminal_router_message(
+                    &inner,
+                    &format!("VM tool console write failed: {error}"),
+                )
+                .await;
+                close_pending(&inner, &message);
             }
             return;
         }
     }
+}
+
+async fn capture_terminal_stderr(mut stderr: ChildStderr, inner: Weak<VmToolSessionInner>) {
+    let mut passthrough = tokio::io::stderr();
+    let mut buffer = [0_u8; 8 * 1024];
+    let stderr_error = loop {
+        match stderr.read(&mut buffer).await {
+            Ok(0) => break None,
+            Ok(read) => {
+                let _ = passthrough.write_all(&buffer[..read]).await;
+                if let Some(inner) = inner.upgrade() {
+                    append_terminal_stderr(&mut lock_unpoisoned(&inner.terminal), &buffer[..read]);
+                }
+            }
+            Err(error) => break Some(error.to_string()),
+        }
+    };
+    let _ = passthrough.flush().await;
+    if let Some(inner) = inner.upgrade() {
+        let mut terminal = lock_unpoisoned(&inner.terminal);
+        terminal.stderr_error = stderr_error;
+        terminal.closed = true;
+        drop(terminal);
+        inner.terminal_closed.notify_waiters();
+    }
+}
+
+fn append_terminal_stderr(terminal: &mut TerminalDiagnostics, bytes: &[u8]) {
+    if bytes.len() >= MAX_TERMINAL_STDERR_BYTES {
+        terminal.stderr_tail.clear();
+        terminal
+            .stderr_tail
+            .extend_from_slice(&bytes[bytes.len() - MAX_TERMINAL_STDERR_BYTES..]);
+        return;
+    }
+    let overflow = terminal
+        .stderr_tail
+        .len()
+        .saturating_add(bytes.len())
+        .saturating_sub(MAX_TERMINAL_STDERR_BYTES);
+    if overflow != 0 {
+        terminal.stderr_tail.drain(..overflow);
+    }
+    terminal.stderr_tail.extend_from_slice(bytes);
 }
 
 async fn route_responses(output: ChildStdout, inner: Weak<VmToolSessionInner>) {
@@ -938,13 +1006,19 @@ async fn route_responses(output: ChildStdout, inner: Weak<VmToolSessionInner>) {
             Ok(Some(line)) => line,
             Ok(None) => {
                 if let Some(inner) = inner.upgrade() {
-                    close_pending(&inner, "VM tool console closed");
+                    let message = terminal_router_message(&inner, "VM tool console closed").await;
+                    close_pending(&inner, &message);
                 }
                 return;
             }
             Err(error) => {
                 if let Some(inner) = inner.upgrade() {
-                    close_pending(&inner, &format!("VM tool console read failed: {error}"));
+                    let message = terminal_router_message(
+                        &inner,
+                        &format!("VM tool console read failed: {error}"),
+                    )
+                    .await;
+                    close_pending(&inner, &message);
                 }
                 return;
             }
@@ -977,6 +1051,41 @@ async fn route_responses(output: ChildStdout, inner: Weak<VmToolSessionInner>) {
                 "discarded response for a cancelled VM request"
             );
         }
+    }
+}
+
+async fn terminal_router_message(inner: &Arc<VmToolSessionInner>, base: &str) -> String {
+    let wait_for_stderr = async {
+        loop {
+            let closed = inner.terminal_closed.notified();
+            if lock_unpoisoned(&inner.terminal).closed {
+                return;
+            }
+            closed.await;
+        }
+    };
+    let _ = tokio::time::timeout(TERMINAL_STDERR_DRAIN_GRACE, wait_for_stderr).await;
+
+    let status = lock_unpoisoned(&inner.child)
+        .as_mut()
+        .and_then(|child| child.try_wait().ok().flatten());
+    let terminal = lock_unpoisoned(&inner.terminal);
+    let stderr = String::from_utf8_lossy(&terminal.stderr_tail);
+    let stderr = stderr.trim();
+    let mut details = Vec::new();
+    if let Some(status) = status {
+        details.push(format!("VMM exited with {status}"));
+    }
+    if !stderr.is_empty() {
+        details.push(format!("VMM stderr: {stderr}"));
+    }
+    if let Some(error) = &terminal.stderr_error {
+        details.push(format!("reading VMM stderr failed: {error}"));
+    }
+    if details.is_empty() {
+        base.to_owned()
+    } else {
+        format!("{base}; {}", details.join("; "))
     }
 }
 
@@ -1288,6 +1397,31 @@ mod tracing_tests {
         runtime.block_on(async {
             let session = VmToolSession::spawn(&mut command).unwrap();
             session.ready().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn terminal_router_failure_preserves_vmm_stderr_cause() {
+        let _test_guard = TRACE_TEST_LOCK.lock().unwrap();
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.arg("-c").arg(
+            "IFS= read -r request\n\
+             printf '%s\\n' 'guest runtime failed: FrameTooLarge' >&2\n\
+             exit 23",
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let session = VmToolSession::spawn(&mut command).unwrap();
+            let error = session.ready().await.unwrap_err();
+            let VmToolSessionError::Router(message) = error else {
+                panic!("expected a terminal router failure");
+            };
+            assert!(message.contains("VM tool console closed"));
+            assert!(message.contains("guest runtime failed: FrameTooLarge"));
         });
     }
 
