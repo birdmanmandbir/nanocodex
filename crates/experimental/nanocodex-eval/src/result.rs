@@ -6,6 +6,17 @@ use uuid::Uuid;
 
 use crate::{AgentId, Task};
 
+/// Execution environment used for one evaluation attempt.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvalEnvironment {
+    /// Disposable workspace and verifier processes run directly on the host.
+    #[default]
+    Native,
+    /// Agent tools and verification run in a retained libkrun microVM.
+    MicroVm,
+}
+
 /// Terminal score classification for one attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -57,6 +68,8 @@ pub struct EvalFailure {
     pub model: String,
     /// Reasoning effort selected for the failed attempt.
     pub effort: String,
+    /// Execution environment selected for the failed attempt.
+    pub environment: EvalEnvironment,
     /// Time at which the attempt began.
     pub started_at: DateTime<Utc>,
     /// Time at which the failure was classified.
@@ -78,6 +91,8 @@ pub struct EvalResult {
     pub trial_name: String,
     /// Verifier-derived pass/fail classification.
     pub status: EvalStatus,
+    /// Execution environment used by this attempt.
+    pub environment: EvalEnvironment,
     /// Typed terminal agent output and usage.
     pub agent: AgentResult,
     /// Verifier exit code and component rewards.

@@ -28,9 +28,9 @@ use nanocodex::{
 use nanocodex_eval::harbor::{Harbor, HarborJob, HarborRecorder};
 use nanocodex_eval::{
     AggregateDataset, AttemptAgent, AttemptFact, AttemptVerification, AttemptVerifier, EvalAttempt,
-    EvalEventKind, EvalEventStream, EvalFailure, EvalFailureKind, EvalResult, EvalStatus,
-    Evaluator, EvaluatorBuilder, NetworkPolicy, Sweep, SweepResults, Task, VerifierEnvironmentMode,
-    VerifierResult,
+    EvalEnvironment, EvalEventKind, EvalEventStream, EvalFailure, EvalFailureKind, EvalResult,
+    EvalStatus, Evaluator, EvaluatorBuilder, NetworkPolicy, Sweep, SweepResults, Task,
+    VerifierEnvironmentMode, VerifierResult,
 };
 use nanocodex_vm::image::{CachePolicy, VmImageBuilder, reflink_or_sparse_copy};
 use nanocodex_vm::{BlockDevice, GuestCommand, Network, VmConfig};
@@ -531,33 +531,37 @@ impl Run {
         let (mut evaluator, sweep, attempt_count) =
             Self::build_evaluator(&resolved, tasks, nanocodex, new_job)?;
         if let Some(environments) = vm_environments {
-            evaluator = evaluator.attempt_agent(move |attempt, builder| {
-                let environment = environments.get(attempt.task().root()).ok_or_else(|| {
-                    VmAttemptError::MissingPreparedEnvironment(attempt.task().root().to_path_buf())
-                })?;
-                let runtime = vm_attempt(
-                    environment,
-                    VmAttemptHost {
-                        runtime_image: &runtime_image,
-                        vmm: &vmm,
-                        gvproxy: gvproxy.as_deref(),
-                        retain_passed_rootfs: resolved.vm_retention.retains_passes(),
-                        web_search: resolved.web_search,
-                    },
-                    attempt,
-                )?;
-                let readiness = runtime
-                    .verifier
-                    .agent_session
-                    .as_ref()
-                    .ok_or(VmAttemptError::AgentSessionAlreadyFinished)?
-                    .handle();
-                Ok::<_, VmAttemptError>(
-                    AttemptAgent::new(builder.tools(runtime.tools))
-                        .ready(async move { readiness.ready().await })
-                        .verifier(runtime.verifier),
-                )
-            });
+            evaluator = evaluator
+                .attempt_environment(EvalEnvironment::MicroVm)
+                .attempt_agent(move |attempt, builder| {
+                    let environment = environments.get(attempt.task().root()).ok_or_else(|| {
+                        VmAttemptError::MissingPreparedEnvironment(
+                            attempt.task().root().to_path_buf(),
+                        )
+                    })?;
+                    let runtime = vm_attempt(
+                        environment,
+                        VmAttemptHost {
+                            runtime_image: &runtime_image,
+                            vmm: &vmm,
+                            gvproxy: gvproxy.as_deref(),
+                            retain_passed_rootfs: resolved.vm_retention.retains_passes(),
+                            web_search: resolved.web_search,
+                        },
+                        attempt,
+                    )?;
+                    let readiness = runtime
+                        .verifier
+                        .agent_session
+                        .as_ref()
+                        .ok_or(VmAttemptError::AgentSessionAlreadyFinished)?
+                        .handle();
+                    Ok::<_, VmAttemptError>(
+                        AttemptAgent::new(builder.tools(runtime.tools))
+                            .ready(async move { readiness.ready().await })
+                            .verifier(runtime.verifier),
+                    )
+                });
         }
         let (eval, events) = evaluator.build()?;
         persist_invocation(eval.directory(), &resolved.invocation())?;

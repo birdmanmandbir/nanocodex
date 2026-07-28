@@ -29,9 +29,9 @@ use tracing::{Instrument, Span, info, info_span};
 use uuid::Uuid;
 
 use crate::{
-    AgentId, AgentMetadata, AgentResult, EvalArtifacts, EvalEvent, EvalEventKind, EvalEvents,
-    EvalFailure, EvalFailureKind, EvalResult, EvalStatus, EvalTiming, PhaseTiming, Sweep,
-    SweepAttemptResult, SweepResults, Task, VerifierResult,
+    AgentId, AgentMetadata, AgentResult, EvalArtifacts, EvalEnvironment, EvalEvent, EvalEventKind,
+    EvalEvents, EvalFailure, EvalFailureKind, EvalResult, EvalStatus, EvalTiming, PhaseTiming,
+    Sweep, SweepAttemptResult, SweepResults, Task, VerifierResult,
     job::EvalJob,
     native::{NativeAttempt, VerifierExecution},
 };
@@ -54,6 +54,7 @@ pub struct EvaluatorBuilder {
     output_directory: PathBuf,
     max_concurrency: usize,
     max_memory_mb: Option<u64>,
+    attempt_environment: EvalEnvironment,
     attempt_agent: Option<AttemptAgentFactory>,
     finite_run: Option<FiniteRun>,
 }
@@ -65,6 +66,7 @@ struct EvaluatorInner {
     admission: Arc<AdmissionController>,
     max_concurrency: usize,
     max_memory_mb: Option<u64>,
+    attempt_environment: EvalEnvironment,
     next_prompt_cache_attempt: AtomicU64,
     events: broadcast::Sender<Arc<EvalEvent>>,
     attempt_agent: Option<AttemptAgentFactory>,
@@ -252,6 +254,7 @@ impl Evaluator {
             output_directory: PathBuf::from(".nanocodex/evals"),
             max_concurrency: 1,
             max_memory_mb: None,
+            attempt_environment: EvalEnvironment::Native,
             attempt_agent: None,
             finite_run: None,
         }
@@ -473,6 +476,12 @@ impl Evaluator {
         self.inner.max_memory_mb
     }
 
+    /// Returns the execution environment selected for every attempt.
+    #[must_use]
+    pub fn attempt_environment(&self) -> EvalEnvironment {
+        self.inner.attempt_environment
+    }
+
     async fn run_task(&self, input: AttemptInput) -> Result<AttemptOutput, EvalError> {
         let AttemptInput {
             task,
@@ -573,6 +582,7 @@ impl Evaluator {
             task_name: task.name().to_owned(),
             trial_name,
             status: verifier_status(&verifier.result),
+            environment: self.inner.attempt_environment,
             agent: agent.result,
             verifier: verifier.result,
             timing: EvalTiming {
@@ -847,6 +857,14 @@ impl EvaluatorBuilder {
         self
     }
 
+    /// Records the execution environment used by the configured attempt
+    /// backend in results and durable Harbor artifacts.
+    #[must_use]
+    pub const fn attempt_environment(mut self, environment: EvalEnvironment) -> Self {
+        self.attempt_environment = environment;
+        self
+    }
+
     /// Configures the fresh Nanocodex builder for each attempt.
     ///
     /// The factory runs after the disposable workspace is populated and before
@@ -909,6 +927,7 @@ impl EvaluatorBuilder {
                     )),
                     max_concurrency: self.max_concurrency,
                     max_memory_mb: self.max_memory_mb,
+                    attempt_environment: self.attempt_environment,
                     next_prompt_cache_attempt: AtomicU64::new(0),
                     events: event_sender.clone(),
                     attempt_agent: self.attempt_agent,
@@ -1111,6 +1130,7 @@ fn attempt_failure(
         traceback: error_traceback(error),
         model: MODEL.to_owned(),
         effort: "unknown".to_owned(),
+        environment: eval.attempt_environment(),
         started_at,
         occurred_at: Utc::now(),
         artifacts: EvalArtifacts {
