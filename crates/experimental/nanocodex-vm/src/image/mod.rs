@@ -1074,6 +1074,43 @@ async fn prepare_flattened_disk(
     Ok((path, DiskStatus::Created, shell))
 }
 
+async fn prepare_copy_source_disk(
+    cache: &Path,
+    image: &PulledImage,
+    disk_bytes: u64,
+) -> Result<PathBuf, ImageError> {
+    let key = disk_cache_key(&image.manifest_digest, disk_bytes);
+    let path = cache.join("images").join(format!("{key}.ext4"));
+    if valid_cached_ext4_disk(&path) {
+        return Ok(path);
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("prepared copy source disk cache path has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let _lock = acquire_cache_lock(cache, "images", &key).await?;
+    if valid_cached_ext4_disk(&path) {
+        return Ok(path);
+    }
+    let temporary = temporary_path(parent, &format!(".{key}."))?;
+    let temporary_for_task = temporary.to_path_buf();
+    let layers = image.layers.clone();
+    let span = info_span!(
+        target: "nanocodex_vm",
+        "vm.image.format",
+        otel.kind = "internal",
+        image.disk.bytes = disk_bytes,
+        image.layer.count = layers.len(),
+    );
+    tokio::task::spawn_blocking(move || {
+        span.in_scope(|| format_root_disk(&temporary_for_task, disk_bytes, &layers))
+    })
+    .await??;
+    validate_ext4_disk(&temporary)?;
+    publish(temporary, &path)?;
+    Ok(path)
+}
+
 async fn prepare_built_disk(
     context_directory: &Path,
     dockerfile: &str,
@@ -1270,7 +1307,7 @@ async fn execute_stage(
             let image = images
                 .get(from)
                 .ok_or_else(|| ImageError::UnknownCopySource(from.to_owned()))?;
-            prepare_flattened_disk(cache, image, disk_bytes).await?.0
+            prepare_copy_source_disk(cache, image, disk_bytes).await?
         };
         let source_number = mounts.len();
         let mount = format!("/mnt/nanoeval-source-{source_number}");
@@ -2107,11 +2144,12 @@ mod tests {
     use crate::{EgressLease, Network};
 
     use super::{
-        CACHE_RECORD_VERSION, COPY_SCRIPT, CachePolicy, DiskStatus, DockerfileRecipe,
-        FIRMWARE_LIBRARY_FILENAME, FIRMWARE_LIBRARY_PATH_ENVIRONMENT, ImageRuntimeConfig,
-        LayerRecord, ReferenceRecord, VmImageBuilder, blob_path, configure_firmware_library_path,
-        disk_cache_key, docker_process_environment, output_tail, reference_cache_key,
-        resolver_configuration, write_cache_record,
+        CACHE_RECORD_VERSION, CONTEXT_DISK_BYTES, COPY_SCRIPT, CachePolicy, DiskStatus,
+        DockerfileRecipe, FIRMWARE_LIBRARY_FILENAME, FIRMWARE_LIBRARY_PATH_ENVIRONMENT, ImageError,
+        ImageRuntimeConfig, LayerRecord, ManifestSource, PulledImage, PulledLayer, Reader,
+        ReferenceRecord, VmImageBuilder, blob_path, configure_firmware_library_path,
+        disk_cache_key, docker_process_environment, output_tail, prepare_copy_source_disk,
+        prepare_flattened_disk, reference_cache_key, resolver_configuration, write_cache_record,
     };
     use flate2::{Compression, write::GzEncoder};
     use tracing::{
@@ -2280,6 +2318,24 @@ mod tests {
         shell.set_cksum();
         archive
             .append_data(&mut shell, "bin/sh", contents.as_slice())
+            .unwrap();
+        let encoder = archive.into_inner().unwrap();
+        drop(encoder.finish().unwrap());
+    }
+
+    fn write_copy_source_layer(path: &Path) {
+        let output = File::create(path).unwrap();
+        let encoder = GzEncoder::new(output, Compression::fast());
+        let mut archive = tar::Builder::new(encoder);
+
+        let contents = b"uv fixture\n";
+        let mut executable = tar::Header::new_gnu();
+        executable.set_entry_type(tar::EntryType::Regular);
+        executable.set_mode(0o755);
+        executable.set_size(contents.len() as u64);
+        executable.set_cksum();
+        archive
+            .append_data(&mut executable, "uv", contents.as_slice())
             .unwrap();
         let encoder = archive.into_inner().unwrap();
         drop(encoder.finish().unwrap());
@@ -2493,6 +2549,43 @@ CMD ["/bin/sh"]
 
         assert_eq!(retained.chars().count(), 8_192);
         assert!(retained.ends_with("final compiler error"));
+    }
+
+    #[test]
+    fn copy_only_external_image_does_not_require_a_shell() {
+        let _test_guard = IMAGE_PREPARE_TEST_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let layer = root.path().join("copy-source.tar.gz");
+        write_copy_source_layer(&layer);
+        let image = PulledImage {
+            manifest_digest: "sha256:copy-source".to_owned(),
+            layers: vec![PulledLayer {
+                digest: "sha256:copy-source-layer".to_owned(),
+                path: layer,
+                media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_owned(),
+            }],
+            source: ManifestSource::Local,
+            config: ImageRuntimeConfig::default(),
+        };
+        let cache = root.path().join("cache");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let path = prepare_copy_source_disk(&cache, &image, CONTEXT_DISK_BYTES)
+                .await
+                .unwrap();
+            let mut reader = Reader::new(&path).unwrap();
+            assert!(reader.exists("/uv"));
+            assert!(!reader.exists("/bin/sh"));
+
+            let error = prepare_flattened_disk(&cache, &image, CONTEXT_DISK_BYTES)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ImageError::MissingPreparedPath("/bin/sh")));
+        });
     }
 
     #[test]
