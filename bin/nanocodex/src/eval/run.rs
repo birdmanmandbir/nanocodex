@@ -3132,6 +3132,12 @@ struct AttemptVerifierCache {
     skip_setup: bool,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum VmProcessGroup {
+    Inherited,
+    Isolated,
+}
+
 fn vm_attempt(
     environment: &VmEnvironment,
     host: VmAttemptHost<'_>,
@@ -3203,7 +3209,7 @@ fn vm_attempt_inner(
         .as_ref()
         .map(|cache| cache.materialize(&verifier_directory))
         .transpose()?;
-    let session = launch.spawn(attempt_cache.as_ref())?;
+    let session = launch.spawn(attempt_cache.as_ref(), VmProcessGroup::Isolated)?;
     let vm = session.tools();
     let tools = Tools::builder()
         .without_defaults()
@@ -3351,12 +3357,32 @@ fn spawn_attempt_network(
     }
 }
 
+fn spawn_preparation_network(
+    policy: NetworkPolicy,
+    gvproxy: Option<&Path>,
+    log: &Path,
+) -> Result<Option<Gvproxy>, VmAttemptError> {
+    match policy {
+        NetworkPolicy::Public => {
+            let binary = gvproxy.ok_or(VmAttemptError::NetworkBackendNotPrepared)?;
+            Gvproxy::spawn_inherited(binary, log)
+                .map(Some)
+                .map_err(Into::into)
+        }
+        NetworkPolicy::Disabled => Ok(None),
+    }
+}
+
 impl VmLaunch {
     fn spawn(
         &self,
         verifier_cache: Option<&AttemptVerifierCache>,
+        process_group: VmProcessGroup,
     ) -> Result<VmToolSession, VmAttemptError> {
         let mut command = Command::new(&self.vmm);
+        if process_group == VmProcessGroup::Isolated {
+            command.process_group(0);
+        }
         let firmware = Path::new(DEFAULT_KRUNFW_DIRECTORY);
         if firmware.join(KRUNFW_LIBRARY_FILENAME).is_file() {
             command.env(KRUNFW_LIBRARY_PATH_ENVIRONMENT, firmware.canonicalize()?);
@@ -3563,7 +3589,7 @@ impl VerifierCache {
     ) -> Result<(), VmAttemptError> {
         let temporary = tempfile::tempdir_in(&self.root)?;
         let root = materialize_attempt_root(&environment.rootfs, runtime_image, temporary.path())?;
-        let network = spawn_attempt_network(
+        let network = spawn_preparation_network(
             task.network(),
             gvproxy,
             &temporary.path().join("gvproxy.log"),
@@ -3592,7 +3618,7 @@ impl VerifierCache {
             skip_setup: false,
         };
         format_verifier_cache_disk(&attempt_cache.disk, self.disk_bytes)?;
-        let session = launch.spawn(Some(&attempt_cache))?;
+        let session = launch.spawn(Some(&attempt_cache), VmProcessGroup::Inherited)?;
         mount_verifier_cache(&session).await?;
         let script = task.verifier_script_bytes()?;
         session
@@ -4050,7 +4076,7 @@ impl VmVerifier {
                 let cleanup = CleanupPhase::failed(cleanup_started, &primary);
                 return Err(AttemptVerificationFailure::new(primary, cleanup));
             }
-            let session = match launch.spawn(None) {
+            let session = match launch.spawn(None, VmProcessGroup::Isolated) {
                 Ok(session) => session,
                 Err(primary) => {
                     let cleanup = self.cleanup_after_shutdown(cleanup_started, Ok(()), false);
@@ -4905,23 +4931,26 @@ fn format_milliseconds(milliseconds: i64) -> String {
 mod tests {
     use std::{
         cell::Cell,
+        collections::BTreeMap,
         fs, future,
+        os::unix::fs::PermissionsExt as _,
         path::{Path, PathBuf},
         process::Command as StdCommand,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use clap::Parser;
     use nanocodex::{Nanocodex, OpenAi, Thinking};
     use nanocodex_eval::{BillingCompleteness, Evaluator, Sweep, Task};
     use nanocodex_vm::{VmCommandOutput, VmCommandPartialOutput, VmToolSession};
+    use nix::unistd::getpgrp;
     use sha2::Digest as _;
 
     use super::{
         CACHED_VERIFIER_SCRIPT, DEFAULT_HOST_UTILIZATION_PERCENT, DEFAULT_TRIALS,
         EvalInterruptError, HostResources, InterruptListener, RetainedBuild, RetainedScheduling,
-        Run, RunInvocation, RunMeasurements, RunSummary, VmRetention, VmVerifier,
-        cached_verifier_script, finish_or_drain, finish_or_interrupt, load_tasks,
+        Run, RunInvocation, RunMeasurements, RunSummary, VmLaunch, VmProcessGroup, VmRetention,
+        VmVerifier, cached_verifier_script, finish_or_drain, finish_or_interrupt, load_tasks,
         recognized_verifier_setup, remove_passed_rootfs, retained_retry_task_names,
         retained_task_durations, verifier_bootstrap_network_failed, verifier_cache_key,
         verifier_network_retry_delay, verifier_shell, verifier_timeout_output,
@@ -4931,6 +4960,67 @@ mod tests {
     struct TestCli {
         #[command(flatten)]
         eval: Run,
+    }
+
+    #[tokio::test]
+    async fn attempt_vmm_isolated_while_preparation_vmm_inherits_terminal_group() {
+        let inherited = recorded_vm_process_group(VmProcessGroup::Inherited).await;
+        let isolated = recorded_vm_process_group(VmProcessGroup::Isolated).await;
+        let parent_group = getpgrp().as_raw();
+
+        assert_eq!(inherited.1, parent_group);
+        assert_ne!(inherited.0, inherited.1);
+        assert_eq!(isolated.0, isolated.1);
+        assert_ne!(isolated.1, parent_group);
+    }
+
+    async fn recorded_vm_process_group(process_group: VmProcessGroup) -> (i32, i32) {
+        let directory = tempfile::tempdir().unwrap();
+        let vmm = directory.path().join("fake-vmm");
+        let record = directory.path().join("process-group");
+        fs::write(
+            &vmm,
+            "#!/bin/sh\n\
+             directory=$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\n\
+             pid=$$\n\
+             pgid=$(ps -o pgid= -p \"$pid\" | tr -d ' ')\n\
+             printf '%s %s\\n' \"$pid\" \"$pgid\" > \"$directory/process-group\"\n\
+             exec /bin/sleep 30\n",
+        )
+        .unwrap();
+        fs::set_permissions(&vmm, fs::Permissions::from_mode(0o700)).unwrap();
+        let launch = VmLaunch {
+            root: directory.path().join("root"),
+            workspace: "/workspace".to_owned(),
+            shell: "/bin/sh".to_owned(),
+            runtime_image: directory.path().join("runtime"),
+            vmm,
+            cpus: 1,
+            memory_mib: 128,
+            ext4: false,
+            resolver_configuration: String::new(),
+            environment: BTreeMap::new(),
+            network_socket: None,
+        };
+
+        let session = launch.spawn(None, process_group).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !record.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "{} was not created",
+                record.display()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let values = fs::read_to_string(record)
+            .unwrap()
+            .split_whitespace()
+            .map(|value| value.parse::<i32>().unwrap())
+            .collect::<Vec<_>>();
+        drop(session);
+        assert_eq!(values.len(), 2);
+        (values[0], values[1])
     }
 
     #[tokio::test]

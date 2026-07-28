@@ -2,7 +2,7 @@ use std::{
     fs,
     io::{self, Read, Write},
     net::SocketAddr,
-    os::unix::net::UnixStream,
+    os::unix::{net::UnixStream, process::CommandExt as _},
     path::{Path, PathBuf},
     process::{Child, Stdio},
     thread,
@@ -86,6 +86,32 @@ impl Gvproxy {
     /// gvproxy cannot start, or its network and services sockets do not become
     /// ready before the startup deadline.
     pub fn spawn(binary: &Path, state_directory: &Path, log: &Path) -> Result<Self, GvproxyError> {
+        Self::spawn_with_process_group(binary, state_directory, log, ProcessGroup::Inherited)
+    }
+
+    /// Starts gvproxy in a new process group and waits for its sockets.
+    ///
+    /// This is useful when an application handles terminal interrupts itself
+    /// and must keep owned VM work alive long enough to drain it. Dropping the
+    /// returned owner still terminates and reaps gvproxy.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors documented by [`Self::spawn`].
+    pub fn spawn_isolated(
+        binary: &Path,
+        state_directory: &Path,
+        log: &Path,
+    ) -> Result<Self, GvproxyError> {
+        Self::spawn_with_process_group(binary, state_directory, log, ProcessGroup::Isolated)
+    }
+
+    fn spawn_with_process_group(
+        binary: &Path,
+        state_directory: &Path,
+        log: &Path,
+        process_group: ProcessGroup,
+    ) -> Result<Self, GvproxyError> {
         fs::create_dir_all(state_directory)?;
         if let Some(parent) = log.parent() {
             fs::create_dir_all(parent)?;
@@ -96,7 +122,8 @@ impl Gvproxy {
         remove_stale_socket(&services_socket)?;
 
         let log = fs::File::create(log)?;
-        let mut child = std::process::Command::new(binary)
+        let mut command = std::process::Command::new(binary);
+        command
             .arg("--listen-vfkit")
             .arg(format!("unixgram:{}", network_socket.display()))
             .arg("--services")
@@ -105,8 +132,11 @@ impl Gvproxy {
             .arg("-1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(log)
-            .spawn()?;
+            .stderr(log);
+        if process_group == ProcessGroup::Isolated {
+            command.process_group(0);
+        }
+        let mut child = command.spawn()?;
 
         let started_at = Instant::now();
         while !network_socket.exists() || !services_socket.exists() {
@@ -183,6 +213,12 @@ impl Gvproxy {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ProcessGroup {
+    Inherited,
+    Isolated,
+}
+
 impl Drop for Gvproxy {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -254,11 +290,60 @@ fn services_request(socket: &Path, path: &str, body: &[u8]) -> Result<(), Gvprox
 #[cfg(test)]
 mod tests {
     use std::{
+        fs,
         net::{Ipv4Addr, SocketAddrV4},
-        os::unix::net::UnixListener,
+        os::unix::{fs::PermissionsExt as _, net::UnixListener},
     };
 
+    use nix::unistd::getpgrp;
+
     use super::*;
+
+    #[test]
+    fn caller_selects_inherited_or_isolated_process_group() {
+        let inherited = recorded_process_group(Gvproxy::spawn);
+        let isolated = recorded_process_group(Gvproxy::spawn_isolated);
+        let parent_group = getpgrp().as_raw();
+
+        assert_eq!(inherited.1, parent_group);
+        assert_ne!(inherited.0, inherited.1);
+        assert_eq!(isolated.0, isolated.1);
+        assert_ne!(isolated.1, parent_group);
+    }
+
+    fn recorded_process_group(
+        spawn: fn(&Path, &Path, &Path) -> Result<Gvproxy, GvproxyError>,
+    ) -> (i32, i32) {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("fake-gvproxy");
+        let record = directory.path().join("process-group");
+        fs::write(
+            &binary,
+            "#!/bin/sh\n\
+             directory=$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\n\
+             pid=$$\n\
+             pgid=$(ps -o pgid= -p \"$pid\" | tr -d ' ')\n\
+             printf '%s %s\\n' \"$pid\" \"$pgid\" > \"$directory/process-group\"\n\
+             exit 7\n",
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let result = spawn(
+            &binary,
+            &directory.path().join("state"),
+            &directory.path().join("gvproxy.log"),
+        );
+        assert!(matches!(result, Err(GvproxyError::EarlyExit(_))));
+
+        let values = fs::read_to_string(record)
+            .unwrap()
+            .split_whitespace()
+            .map(|value| value.parse::<i32>().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(values.len(), 2);
+        (values[0], values[1])
+    }
 
     #[test]
     fn refuses_non_loopback_forwards_before_contacting_gvproxy() {
