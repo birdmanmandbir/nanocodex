@@ -132,12 +132,19 @@ struct RetainedTaskPath {
 #[derive(Deserialize)]
 struct RetainedTrialLock {
     task: RetainedTaskLock,
+    #[serde(default)]
+    nanocodex: Option<RetainedNanocodexTrialLock>,
 }
 
 #[derive(Deserialize)]
 struct RetainedTaskLock {
     path: PathBuf,
     digest: String,
+}
+
+#[derive(Deserialize)]
+struct RetainedNanocodexTrialLock {
+    materialization_digest: String,
 }
 
 impl DurableTrial {
@@ -237,12 +244,18 @@ pub(crate) fn scan_manifest_trials(
         }
         if let Some(expected) = manifest.task_content_digest(&result.task_id.path) {
             let expected = format!("sha256:{expected}");
-            if lock.task.digest != expected {
+            let found = lock
+                .nanocodex
+                .as_ref()
+                .map_or(lock.task.digest.as_str(), |identity| {
+                    identity.materialization_digest.as_str()
+                });
+            if found != expected {
                 return Err(DurableTrialError::TaskContentDigestMismatch {
                     trial_name: result.trial_name,
                     task_root: result.task_id.path,
                     expected,
-                    found: lock.task.digest,
+                    found: found.to_owned(),
                 });
             }
         }
@@ -436,6 +449,26 @@ mod tests {
             DurableTrialError::TaskContentDigestMismatch { found, .. }
                 if found == "sha256:stale"
         ));
+    }
+
+    #[test]
+    fn internal_identity_is_read_separately_from_harbors_canonical_task_hash() {
+        let fixture = Fixture::new(&[("task", "suite/task")], 1);
+        let directory = fixture.write_trial(0, "default", 1, Uuid::now_v7());
+        let lock = directory.join("lock.json");
+        let mut retained: Value = serde_json::from_slice(&fs::read(&lock).unwrap()).unwrap();
+        retained["task"]["digest"] = json!("sha256:harbor-canonical-fixture");
+        retained["nanocodex"] = json!({
+            "materialization_digest": format!(
+                "sha256:{}",
+                fixture.tasks[0].content_digest()
+            ),
+        });
+        fs::write(lock, serde_json::to_vec_pretty(&retained).unwrap()).unwrap();
+
+        let trials = scan_manifest_trials(&fixture.job, fixture.job_id, &fixture.manifest).unwrap();
+
+        assert_eq!(trials.len(), 1);
     }
 
     #[test]

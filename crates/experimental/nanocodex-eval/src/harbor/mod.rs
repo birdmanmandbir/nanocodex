@@ -539,7 +539,7 @@ impl HarborArtifacts {
             trial_uri,
             task_id: HarborTaskId { path: task_path },
             source: "nanocodex/local",
-            task_checksum,
+            task_checksum: task_checksum.clone(),
             config,
             agent_info: HarborAgentInfo {
                 name: "nanocodex",
@@ -578,6 +578,7 @@ impl HarborArtifacts {
             task,
             &result.agent.model,
             &result.agent.effort,
+            &task_checksum,
             task_digest,
             result.environment,
         );
@@ -670,7 +671,7 @@ impl HarborArtifacts {
             trial_uri,
             task_id: HarborTaskId { path: task_path },
             source: "nanocodex/local",
-            task_checksum,
+            task_checksum: task_checksum.clone(),
             config,
             agent_info: HarborAgentInfo {
                 name: "nanocodex",
@@ -701,7 +702,14 @@ impl HarborArtifacts {
         Self::write_file(&trial_log_path, failure.traceback.as_bytes())?;
         Self::write_file(&stderr_path, failure.traceback.as_bytes())?;
 
-        let lock = HarborTrialLock::new(task, model, effort, task_digest, failure.environment);
+        let lock = HarborTrialLock::new(
+            task,
+            model,
+            effort,
+            &task_checksum,
+            task_digest,
+            failure.environment,
+        );
         Self::write_json(&lock_path, &lock)?;
         Self::write_terminal_json(
             &result_path,
@@ -1110,6 +1118,8 @@ impl Default for HarborRetryConfig {
 struct HarborTrialLock {
     schema_version: u32,
     task: HarborTaskLock,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nanocodex: Option<NanocodexTrialLock>,
     install_only: bool,
     timeout_multiplier: f64,
     agent: HarborAgentConfig,
@@ -1123,7 +1133,8 @@ impl HarborTrialLock {
         task: &Task,
         model: &str,
         effort: &str,
-        digest: &str,
+        harbor_digest: &str,
+        materialization_digest: &str,
         environment: EvalEnvironment,
     ) -> Self {
         Self {
@@ -1136,10 +1147,13 @@ impl HarborTrialLock {
                     .unwrap_or(task.name())
                     .to_owned(),
                 kind: HarborTaskLockKind::Local,
-                digest: format!("sha256:{digest}"),
+                digest: format!("sha256:{harbor_digest}"),
                 source: Some("nanocodex/local".to_owned()),
                 path: task.root().to_path_buf(),
             },
+            nanocodex: Some(NanocodexTrialLock {
+                materialization_digest: format!("sha256:{materialization_digest}"),
+            }),
             install_only: false,
             timeout_multiplier: 1.0,
             agent: HarborAgentConfig {
@@ -1154,6 +1168,11 @@ impl HarborTrialLock {
             verifier: HarborVerifierConfig::native(),
         }
     }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct NanocodexTrialLock {
+    materialization_digest: String,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -1924,6 +1943,39 @@ mod tests {
     }
 
     #[test]
+    fn trial_lock_keeps_harbors_hash_separate_from_internal_materialization_identity() {
+        let task = write_greeting_task();
+        let harbor_digest = super::directory_hash(task.root()).unwrap();
+        let lock = super::HarborTrialLock::new(
+            &task,
+            "gpt-test",
+            "high",
+            &harbor_digest,
+            task.content_digest(),
+            EvalEnvironment::Native,
+        );
+
+        let mut retained = serde_json::to_value(&lock).unwrap();
+        assert_eq!(
+            retained["task"]["digest"],
+            format!("sha256:{harbor_digest}")
+        );
+        assert_eq!(
+            retained["nanocodex"]["materialization_digest"],
+            format!("sha256:{}", task.content_digest())
+        );
+        assert_ne!(
+            retained["task"]["digest"],
+            retained["nanocodex"]["materialization_digest"]
+        );
+        serde_json::from_value::<super::HarborTrialLock>(retained.clone()).unwrap();
+
+        retained.as_object_mut().unwrap().remove("nanocodex");
+        let legacy = serde_json::from_value::<super::HarborTrialLock>(retained).unwrap();
+        assert!(legacy.nanocodex.is_none());
+    }
+
+    #[test]
     fn finite_job_records_pending_trials_before_execution() {
         let output = tempdir().unwrap();
         let task = Task::load(
@@ -2152,6 +2204,7 @@ allow_internet = false
                 task,
                 "gpt-test",
                 "high",
+                &super::directory_hash(task.root()).unwrap(),
                 task.content_digest(),
                 EvalEnvironment::Native,
             ),
