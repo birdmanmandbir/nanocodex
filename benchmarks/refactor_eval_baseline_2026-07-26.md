@@ -171,6 +171,69 @@ overrides, atomic terminal publication, and failure retention. Together with
 the deliberate authentication failure and live Harbor viewer proof above, this
 closes the native, VM, Frontier artifact, resume, failure, and viewer gates.
 
+## Public GPT-5.6 Sol Terminal-Bench 2.1 comparator
+
+[Leaderboard submission PR #174](https://github.com/harbor-framework/terminal-bench-2-1/pull/174)
+is an open, provisional GPT-5.6 Sol high result. It has not been merged or
+adjudicated, and its submitted leaderboard record still has null metrics. It is
+useful as public debugging evidence, not as an official score or a Nanocodex
+target.
+
+The exact run identity is:
+
+- dataset revision
+  `sha256:7d7bdc1cbedad549fc1140404bd4dc45e5fd0ea7c4186773687d177ad3a0699`;
+- `openai/gpt-5.6-sol`, high reasoning, fast-agent 0.9.24;
+- `k = 5` and `llm_retries = 4`; and
+- [84 Daytona tasks × 5 trials](https://hub.harborframework.com/jobs/3bf916e7-c459-5538-a3d1-cf93421455db)
+  (420 trials, concurrency 6) plus
+  [5 local tasks × 5 trials](https://hub.harborframework.com/jobs/a5d5b93c-cfa2-45f8-84e9-1545eefc77b1)
+  (25 trials, concurrency 1).
+
+Taken directly from those two source jobs, before leaderboard normalization,
+the verifier rewarded 393/445 trials (88.31%; the PR reports ±1.18%). There
+were 9 `AgentTimeoutError` records and 63/89 tasks scored 5/5. The jobs report
+about $270.14 in estimated cost, 122,319,808 input tokens, 3,545,874 output
+tokens, and 99,520,000 cache-read tokens; cache-read tokens are a subset of
+input tokens, not an additional token category.
+
+The hardest raw per-task distributions were:
+
+| Raw reward | Tasks |
+| --- | --- |
+| 1/5 | `configure-git-webserver`, `dna-insert`, `filter-js-from-html`, `gcode-to-text`, `make-doom-for-mips`, `pytorch-model-recovery`, `torch-pipeline-parallelism` |
+| 2/5 | `extract-moves-from-video`, `raman-fitting` |
+| 3/5 | `video-processing` |
+
+Public trial pages and APIs expose the task digest, resolved config and lock,
+phase timings, verifier reward, exact ATIF trajectory, and logs and artifacts.
+The ATIF includes the ordered system, user, agent, and tool stream, reasoning
+content, per-call usage and timings, and final metrics, so failures can be
+inspected below the aggregate.
+
+Raw verifier reward and leaderboard-policy reward must remain separate.
+Harbor can retain both an error and a positive verifier reward for one trial:
+notably, all five `extract-moves-from-video` trials recorded
+`AgentTimeoutError`, while two also retained reward 1. Promoted submission
+reports explicitly state that
+[errored trials count as reward 0](https://github.com/harbor-framework/terminal-bench-2-1/pull/163).
+A comparator must therefore show the source reward and the normalized
+leaderboard-policy reward independently instead of treating 393/445 as an
+adjudicated leaderboard result.
+
+Comparisons must align task digest and dataset revision plus agent, model,
+reasoning effort, agent version, and resolved configuration. Infrastructure
+errors belong in a separate class from reward failures, and the primary view
+is the per-task `k` distribution rather than only aggregate accuracy. Because
+fast-agent is a different harness, this evidence should help diagnose tasks,
+tool behavior, cost, and latency; it is not a pass-rate target for Nanocodex.
+
+For directional context only,
+[PR #170](https://github.com/harbor-framework/terminal-bench-2-1/pull/170)
+used the same dataset revision with medium reasoning and fast-agent 0.9.21. Its
+raw jobs rewarded 365/445 trials (82.02%) at about $211.32. The agent-version
+drift means this is not a controlled reasoning-effort ablation.
+
 ## Nanoeval feature-parity ledger
 
 | Temporary surface | Nanocodex owner and executable evidence |
