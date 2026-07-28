@@ -162,12 +162,12 @@ use nanovm::{EgressFile, EgressLease, EgressMount};
 use std::sync::Arc;
 
 # fn configure() -> Result<EgressLease, nanovm::EgressError> {
-let mut mpp = EgressLease::internet();
-mpp.insert_environment(
+let mut payment_proxy = EgressLease::internet();
+payment_proxy.insert_environment(
     "HTTPS_PROXY",
     "http://mpp-lease:credential@host.internal:8080",
 )?;
-mpp.insert_file(EgressFile::new(
+payment_proxy.insert_file(EgressFile::new(
     "/tmp/nanocodex/egress/mpp/ca.pem",
     b"public CA bytes".to_vec(),
     0o444,
@@ -186,7 +186,7 @@ secrets.insert_mount(EgressMount::read_only(
 secrets.retain(Arc::new(())); // the real layer retains its proxy lease
 
 EgressLease::internet()
-    .with_layer(mpp)?
+    .with_layer(payment_proxy)?
     .with_layer(secrets)
 # }
 ```
@@ -222,15 +222,13 @@ a process-start race. Lower-level `configure`, `write_private`, `spawn`, and
 `provision_egress` operations remain available for specialized launchers, but
 the application must then preserve the same ownership ordering itself.
 
-### MPP and secret proxy layers
+### Application-owned payment and secret proxy layers
 
-The MPP provider remains a host-owned HTTP(S) proxy. Its layer points the guest
-at that proxy, provisions its public interception CA, and retains the
-wallet/proxy guard. Ordinary guest commands such as `curl` therefore receive a
-`402` through the proxy; the host pays and replays the exact bounded request
-without exposing the wallet to the VM. Enable `nanocodex-vm`'s `mpp` feature
-and pass an `Arc<MppEgress>` to `mpp_egress_layer` to produce that
-configuration.
+Payment providers remain host-owned HTTP(S) proxies. An application-owned
+adapter can point the guest at a proxy, provision its public interception CA,
+and retain the wallet/proxy guard in a provider-neutral `EgressLease`.
+`nanocodex-vm` deliberately has no payment-provider feature or dependency;
+Tempo-specific payment policy stays under `bin/`.
 
 NanoCentaur's Iron/secret egress follows the same contract: its layer carries
 the scoped proxy or gateway route, public CA/configuration files, placeholders,
@@ -277,10 +275,10 @@ provider's credentials.
 - Read-only provider mounts and environment conflicts are explicit.
 - The libkrun unsafe surface stays inside `nanovm`; the rest of Nanocodex
   remains safe Rust.
-- The guest-only build selects the dependency-light OAI/tool contract and local
-  workspace runtime. It does not link the OpenAI client, TLS, MCP, remote
-  tools, or Code Mode. Normal native `nanocodex-tools` builds still include MCP
-  and the complete agreed tool surface by default.
+- The companion guest reuses the canonical `nanocodex-tools` request/result
+  contracts and workspace-tool implementations. VM feature selection does not
+  create an alternate tool runtime or change MCP availability in normal native
+  builds.
 
 See
 `cargo run -p nanocodex-examples --bin vm-tools -- ROOTFS GUEST_RUNTIME_BINARY`

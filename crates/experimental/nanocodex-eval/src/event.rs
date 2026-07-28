@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
-use nanocodex_agent::AgentEvent;
+use nanocodex_agent::events::AgentEvent;
 use serde::Serialize;
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -78,7 +78,7 @@ pub enum EvalEventStreamError {
 }
 
 impl EvalEvents {
-    pub(crate) fn new(sender: broadcast::Sender<Arc<EvalEvent>>) -> Self {
+    pub(crate) const fn new(sender: broadcast::Sender<Arc<EvalEvent>>) -> Self {
         Self { sender }
     }
 

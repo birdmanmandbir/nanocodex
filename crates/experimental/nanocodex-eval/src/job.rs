@@ -298,12 +298,15 @@ mod tests {
         Sweep::builder()
             .task(
                 Task::load(
-                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tasks/write-greeting"),
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../tasks/write-greeting"),
                 )
                 .unwrap(),
             )
             .trials(trials)
-            .agent("test", Nanocodex::builder("test-key"))
+            .agent(
+                "test",
+                Nanocodex::builder(nanocodex_agent::OpenAi::new("test-key").unwrap()),
+            )
             .unwrap()
             .build()
             .unwrap()

@@ -1,6 +1,6 @@
 use std::{env, error::Error, path::PathBuf};
 
-use nanocodex::{Nanocodex, OpenAiAuth, Thinking};
+use nanocodex::{Nanocodex, OpenAi, Thinking, oai::auth::OpenAiAuth};
 use nanocodex_eval::{
     EvalEventKind, EvalEventStream, EvalEventStreamError, EvalResult, Evaluator, Task,
 };
@@ -20,7 +20,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .map_or_else(|| PathBuf::from(".nanocodex/evals"), PathBuf::from);
     let [first, second, third] = TASKS.map(Task::load);
     let (first, second, third) = (first?, second?, third?);
-    let agent = Nanocodex::builder(auth()?).thinking(Thinking::Low);
+    let agent = Nanocodex::builder(OpenAi::new(auth()?)?).thinking(Thinking::Low);
     let (eval, events) = Evaluator::builder(agent)
         .output_directory(output_directory)
         .max_concurrency(TASKS.len() * K)
@@ -59,7 +59,7 @@ fn auth() -> Result<OpenAiAuth, Box<dyn Error>> {
                     env::var_os("HOME").map(|path| PathBuf::from(path).join(".codex/auth.json"))
                 })
                 .ok_or("set OPENAI_API_KEY or NANOCODEX_AUTH_FILE")?;
-            Ok(nanocodex::load_chatgpt_auth(auth_file)?)
+            Ok(nanocodex::oai::auth::load_chatgpt_auth(auth_file)?)
         }
         Err(error) => Err(error.into()),
     }

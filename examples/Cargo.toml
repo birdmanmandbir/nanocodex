@@ -27,7 +27,6 @@ serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-tungstenite.workspace = true
 tower.workspace = true
-axum.workspace = true
 tempfile.workspace = true
 
 [[bin]]

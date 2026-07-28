@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use nanocodex_tools::{ToolContext, ToolRuntime};
+use nanocodex_tools::{ToolContext, runtime::ToolRuntime};
 use nix::{
     errno::Errno,
     sys::signal::{Signal, killpg},
@@ -496,7 +496,7 @@ fn kill_process_group(child: &mut Child, process_group: Option<Pid>) -> std::io:
 struct ProcessGroupGuard(Option<Pid>);
 
 impl ProcessGroupGuard {
-    fn disarm(&mut self) {
+    const fn disarm(&mut self) {
         self.0 = None;
     }
 }

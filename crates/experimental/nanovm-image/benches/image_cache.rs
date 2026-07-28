@@ -136,7 +136,7 @@ fn reference_key(image: &str) -> String {
     hasher.update(b"amd64");
     hasher.update([0]);
     hasher.update(image.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 fn benchmark_image_cache(criterion: &mut Criterion) {

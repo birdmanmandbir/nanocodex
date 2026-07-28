@@ -12,11 +12,14 @@ Every stable crate must be useful independently, documented from its own
 README, tested through its public paths, benchmarked at the boundaries it can
 affect, and observable without adopting the Nanocodex CLI.
 
-## PR #50 delivery boundary
+## Delivery stack
 
-PR #50 is the only active delivery target. It must preserve behavior available
-on `master` unless a removal is explicit and covered by a regression or
-migration, and it must be independently mergeable.
+The refactor ships as three stacked, independently mergeable pull requests.
+Part 1 is the completed PR #50 base for the active Part 2 work. Each PR must
+preserve behavior available on `master` unless a removal is explicit and
+covered by a regression or migration.
+
+### PR 1 — Stable API refactor
 
 1. **Re-establish Codex parity**
    - Treat `openai/codex@35eaf3ffb0bf2001486c68c47a3d946b34d16634`
@@ -74,6 +77,75 @@ migration, and it must be independently mergeable.
    - Fix every real PR #50 CI failure and leave required checks green with no
      known merge blocker.
 
+PR 1 was verified at `c82205d` as mergeable and clean with green required
+checks before Part 2 was rebased onto its completed tip.
+
+### PR 2 — `nanocodex-eval` and required VM machinery
+
+1. Consolidate the temporary Nanoeval evaluator and Harbor/ATIF projection into
+   this workspace as `nanocodex-eval`.
+2. Expose evaluations through `nanocodex eval <...>` with Harbor-compatible
+   task, verifier, artifact, JSONL, ATIF, token, latency, and USD accounting.
+3. Consolidate the complete VM lifecycle, image/cache, guest protocol, and
+   VM-backed workspace tools in one `nanocodex-vm` crate, including
+   Dockerfile-derived pre-snapshotted disks and reusable pre-baked images.
+   Keep host tools as the normal default while allowing `nanocodex run`, the
+   interactive TUI, and resumed TUI sessions to opt into one retained VM tool
+   session explicitly.
+4. Support full Terminal-Bench 2.1 and FrontierBench runs, including Daytona
+   execution where configured. Do not weaken tasks or verifiers.
+5. Produce on-demand PR build artifacts so a run can select a Nanocodex binary
+   built from a pull request without enabling expensive evals on every change.
+6. Separate cold image/bootstrap time from warm agent work and retain exact
+   run artifacts for comparisons.
+
+The following is the planned completion gate for this PR, not a claim that the
+sweep scheduler already implements it:
+
+- Use [`docs/GPT_5_6_EVALS.md`](docs/GPT_5_6_EVALS.md) as the source inventory
+  and plot/drilldown contract for the initial GPT-5.6 tuning loop.
+- A sweep records the exact dataset, task, and verifier revisions; Nanocodex
+  build; model and configuration identifiers; agent, tool, and prompt
+  parameters; seed and repetition; and pricing revision. Any such parameter can
+  vary. Retained aggregate data must support OpenAI-style comparison plots whose
+  primary axes are success rate, estimated cost, and latency, with drilldown to
+  every task/configuration attempt.
+- Turbo runs execute configurations concurrently with explicit, configurable
+  bounds. Queueing, concurrency, and cancellation policy remain visible in the
+  retained run configuration.
+- The allocation invariant is one retained VM per task across a parameter
+  sweep, never one VM per configuration. Configurations run concurrently in
+  isolated directories inside that task VM; only the immutable task
+  image/bootstrap state and VM lifetime are shared.
+- Every configuration starts from an identically seeded private workspace and
+  process group, receives collision-free ports and temporary paths, writes
+  independent verifier output, and cannot observe mutable state from another
+  configuration.
+- Every attempt retains its exact inputs, ordered outputs and events,
+  trajectory, verifier artifacts and output, resolved configuration, token and
+  cost accounting, and latency breakdown. Cold image/bootstrap time is
+  attributed separately from scheduler queue wait and warm agent, model, tool,
+  and verifier work.
+- `nanocodex eval ...` can run the full configured suite against a selected
+  local or PR build through the consolidated Rust/library path, and comparison
+  records remain useful without rerunning the benchmark.
+
+PR 2 is complete when `nanocodex eval ...` can run the full configured suite
+against a selected local or PR build using the consolidated Rust/library path.
+
+### PR 3 — Experimental managed-agent components
+
+1. Add experimental browser-on-VM, Centaur durability/managed-agent work, and
+   related proxy components under `crates/experimental/` where they are
+   reusable libraries.
+2. Keep executables and Tempo-specific integration under `bin/`.
+3. Add the egress-VM boundary that encapsulates MPP payments and secrets egress
+   without adding Tempo dependencies to stable Nanocodex crates.
+4. Reuse the VM and eval foundations from PR 2; do not duplicate their runtime
+   or artifact model.
+5. Require a concrete consumer, focused tests, tracing, and benchmarks before
+   promoting any experimental component into the stable crate graph.
+
 ## Current execution order
 
 1. [x] Complete the [Codex parity ledger](docs/CODEX_PARITY.md) from the pinned
@@ -108,6 +180,6 @@ migration, and it must be independently mergeable.
 - No audio implementation work.
 - No new `.service(...)` transport design without a concrete consumer.
 - No cosmetic CLI/TUI lifecycle rewrite when existing behavior is accepted.
-- No VM, browser, managed-agent, proxy, or experimental-crate work.
+- No browser, managed-agent, proxy, or other Part 3 experimental-crate work.
 - No benchmark, task, or verifier modification made solely to improve an eval
   score.

@@ -220,7 +220,7 @@ pub struct AgentResult {
     pub tool_calls: u32,
     /// Aggregate provider usage, excluding warmup.
     pub usage: UsageTotals,
-    /// Estimated aggregate USD cost when pricing was configured.
+    /// Estimated aggregate USD cost when provider usage can be priced.
     pub cost_usd: Option<f64>,
     /// Complete typed terminal event metadata.
     pub metadata: AgentMetadata,
@@ -277,7 +277,7 @@ pub struct AgentMetadata {
     pub warmup_usage: UsageTotals,
     #[serde(default, rename = "last_response_id", skip_serializing)]
     _last_response_id: Option<String>,
-    /// Estimated USD cost when a pricing snapshot was configured.
+    /// Estimated USD cost from provider usage and the built-in pricing catalog.
     pub cost_usd: Option<f64>,
     /// Stable explanation of whether cost is available.
     pub cost_status: String,

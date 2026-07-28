@@ -1,6 +1,6 @@
 use std::{fmt, num::NonZeroU16, path::PathBuf};
 
-use nanocodex_agent::{NanocodexBuilder, StandardResponses};
+use nanocodex_agent::NanocodexBuilder;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 use crate::Task;
@@ -29,7 +29,7 @@ pub struct SweepBuilder {
 #[derive(Clone)]
 struct SweepAgent {
     id: AgentId,
-    nanocodex: NanocodexBuilder<StandardResponses>,
+    nanocodex: NanocodexBuilder,
 }
 
 #[derive(Clone, Copy)]
@@ -151,7 +151,7 @@ impl<'de> Deserialize<'de> for AgentId {
 impl Sweep {
     /// Starts an empty sweep builder with one trial.
     #[must_use]
-    pub fn builder() -> SweepBuilder {
+    pub const fn builder() -> SweepBuilder {
         SweepBuilder {
             tasks: Vec::new(),
             agents: Vec::new(),
@@ -275,7 +275,7 @@ impl SweepBuilder {
     pub fn agent(
         mut self,
         id: impl Into<String>,
-        nanocodex: NanocodexBuilder<StandardResponses>,
+        nanocodex: NanocodexBuilder,
     ) -> Result<Self, AgentIdError> {
         self.agents.push(SweepAgent {
             id: AgentId::new(id)?,
@@ -338,7 +338,7 @@ impl SweepAttempt<'_> {
         &self.agent.id
     }
 
-    pub(crate) const fn nanocodex(&self) -> &NanocodexBuilder<StandardResponses> {
+    pub(crate) const fn nanocodex(&self) -> &NanocodexBuilder {
         &self.agent.nanocodex
     }
 
@@ -361,7 +361,7 @@ impl SweepAttempt<'_> {
 mod tests {
     use std::path::PathBuf;
 
-    use nanocodex_agent::Nanocodex;
+    use nanocodex_agent::{Nanocodex, OpenAi};
 
     use super::*;
 
@@ -373,9 +373,9 @@ mod tests {
                 load_task("uppercase-message"),
             ])
             .trials(2)
-            .agent("low", Nanocodex::builder("test-key"))
+            .agent("low", Nanocodex::builder(OpenAi::new("test-key").unwrap()))
             .unwrap()
-            .agent("high", Nanocodex::builder("test-key"))
+            .agent("high", Nanocodex::builder(OpenAi::new("test-key").unwrap()))
             .unwrap()
             .build()
             .unwrap();
@@ -404,13 +404,19 @@ mod tests {
         let tasks = vec![load_task("write-greeting"), load_task("uppercase-message")];
         let first = Sweep::builder()
             .tasks(tasks.clone())
-            .agent("default", Nanocodex::builder("test-key"))
+            .agent(
+                "default",
+                Nanocodex::builder(OpenAi::new("test-key").unwrap()),
+            )
             .unwrap()
             .build()
             .unwrap();
         let second = Sweep::builder()
             .tasks(tasks.into_iter().rev().collect())
-            .agent("default", Nanocodex::builder("test-key"))
+            .agent(
+                "default",
+                Nanocodex::builder(OpenAi::new("test-key").unwrap()),
+            )
             .unwrap()
             .build()
             .unwrap();
@@ -436,9 +442,9 @@ mod tests {
         ));
         let error = Sweep::builder()
             .task(load_task("write-greeting"))
-            .agent("same", Nanocodex::builder("test-key"))
+            .agent("same", Nanocodex::builder(OpenAi::new("test-key").unwrap()))
             .unwrap()
-            .agent("same", Nanocodex::builder("test-key"))
+            .agent("same", Nanocodex::builder(OpenAi::new("test-key").unwrap()))
             .unwrap()
             .build()
             .unwrap_err();
@@ -451,7 +457,7 @@ mod tests {
     fn load_task(name: &str) -> Task {
         Task::load(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../tasks")
+                .join("../../../tasks")
                 .join(name),
         )
         .unwrap()

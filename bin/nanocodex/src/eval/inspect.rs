@@ -368,7 +368,7 @@ enum TrialStatus {
 }
 
 impl TrialStatus {
-    fn label(self) -> Painted<&'static str> {
+    const fn label(self) -> Painted<&'static str> {
         match self {
             Self::Passed => Painted::new("PASS   ").green(),
             Self::Failed => Painted::new("FAIL   ").red(),

@@ -9,12 +9,12 @@
 //! # Run a sweep
 //!
 //! ```no_run
-//! use nanocodex_agent::{Nanocodex, Thinking};
+//! use nanocodex_agent::{Nanocodex, OpenAi, Thinking};
 //! use nanocodex_eval::{Evaluator, Sweep, Task};
 //!
 //! # async fn evaluate() -> Result<(), Box<dyn std::error::Error>> {
 //! let task = Task::load("tasks/write-greeting")?;
-//! let agent = Nanocodex::builder(std::env::var("OPENAI_API_KEY")?)
+//! let agent = Nanocodex::builder(OpenAi::new(std::env::var("OPENAI_API_KEY")?)?)
 //!     .instructions(
 //!         "Work directly in the provided workspace. Complete the requested \
 //!          task, verify your changes, and keep the final answer concise.",

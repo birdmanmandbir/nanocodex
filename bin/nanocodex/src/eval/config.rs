@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Args, builder::NonEmptyStringValueParser};
 use eyre::{Result, WrapErr, eyre};
-use nanocodex::{Nanocodex, NanocodexBuilder, OpenAiAuth, Thinking, Tools};
+use nanocodex::{Nanocodex, NanocodexBuilder, OpenAi, Thinking, Tools, oai::auth::OpenAiAuth};
 
 #[derive(Args)]
 pub(crate) struct AgentArgs {
@@ -18,10 +18,6 @@ pub(crate) struct AgentArgs {
     #[arg(long, env = "OPENAI_REASONING_EFFORT")]
     thinking: Option<Thinking>,
 
-    /// JSON pricing snapshot used to estimate USD cost for every attempt.
-    #[arg(long, env = "NANOCODEX_PRICING_FILE")]
-    pricing_file: Option<PathBuf>,
-
     /// Allow the agent to search the public web. Disabled by default for eval integrity.
     #[arg(long, action = clap::ArgAction::SetTrue)]
     web_search: Option<bool>,
@@ -29,14 +25,10 @@ pub(crate) struct AgentArgs {
 
 impl AgentArgs {
     pub(crate) fn builder(self, thinking: Thinking, web_search: bool) -> Result<NanocodexBuilder> {
-        let pricing = crate::config::load_pricing(self.pricing_file.as_deref())?;
         let auth = Self::select_auth(self.api_key, self.auth_file, Self::environment_api_key()?)?;
         let tools = Tools::builder().web_search(web_search).build()?;
-        let mut builder = Nanocodex::builder(auth).thinking(thinking).tools(tools);
-        if let Some(pricing) = pricing {
-            builder = builder.pricing(pricing);
-        }
-        Ok(builder)
+        let openai = OpenAi::new(auth)?;
+        Ok(Nanocodex::builder(openai).thinking(thinking).tools(tools))
     }
 
     pub(crate) const fn thinking(&self) -> Option<Thinking> {
@@ -76,7 +68,7 @@ impl AgentArgs {
     }
 
     fn load_subscription_auth(auth_file: &std::path::Path) -> Result<OpenAiAuth> {
-        nanocodex::load_chatgpt_auth(auth_file).map_err(|error| {
+        nanocodex::oai::auth::load_chatgpt_auth(auth_file).map_err(|error| {
             eyre!(
                 "ChatGPT authorization could not be loaded from {}: {error}. Run `nanocodex auth login`",
                 auth_file.display()

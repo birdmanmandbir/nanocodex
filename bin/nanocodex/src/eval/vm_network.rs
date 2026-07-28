@@ -1,5 +1,6 @@
 use std::{
     env, fs, io,
+    io::Read as _,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
@@ -146,6 +147,13 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
 fn file_digest(path: &Path) -> io::Result<String> {
     let mut file = fs::File::open(path)?;
     let mut digest = Sha256::new();
-    io::copy(&mut file, &mut digest)?;
-    Ok(format!("{:x}", digest.finalize()))
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(hex::encode(digest.finalize()))
 }

@@ -1,6 +1,10 @@
 use std::{env, error::Error, path::PathBuf};
 
-use nanocodex::{Mcp, McpServer, Nanocodex, OpenAiAuth, Thinking, Tools};
+use nanocodex::{
+    Nanocodex, OpenAi, Thinking, Tools,
+    oai::auth::OpenAiAuth,
+    tools::mcp::{Mcp, McpServer},
+};
 use nanocodex_eval::{Evaluator, Sweep, Task};
 
 const K: u16 = 5;
@@ -14,7 +18,7 @@ async fn main() -> Result<(), AnyError> {
             .map_or_else(|| PathBuf::from("tasks/write-greeting"), PathBuf::from),
     )?;
     let auth = auth()?;
-    let nanocodex = Nanocodex::builder(auth);
+    let nanocodex = Nanocodex::builder(OpenAi::new(auth)?);
     let default_tools = Tools::builder().build()?;
     let docs = Mcp::builder()
         .server(
@@ -77,7 +81,7 @@ fn auth() -> Result<OpenAiAuth, AnyError> {
                     env::var_os("HOME").map(|path| PathBuf::from(path).join(".codex/auth.json"))
                 })
                 .ok_or("set OPENAI_API_KEY or NANOCODEX_AUTH_FILE")?;
-            Ok(nanocodex::load_chatgpt_auth(auth_file)?)
+            Ok(nanocodex::oai::auth::load_chatgpt_auth(auth_file)?)
         }
         Err(error) => Err(error.into()),
     }

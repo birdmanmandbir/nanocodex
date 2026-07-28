@@ -1,7 +1,10 @@
 use std::{hint::black_box, path::PathBuf, sync::Arc, time::Duration};
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use nanocodex_agent::{AgentEvent, AgentEventKind, Nanocodex, Thinking};
+use nanocodex_agent::{
+    Nanocodex, OpenAi, Thinking,
+    events::{AgentEvent, AgentEventKind},
+};
 use nanocodex_eval::{AtifBuilder, Evaluator, Sweep, Task};
 use serde_json::{Value, json, value::RawValue};
 
@@ -9,7 +12,7 @@ const TRACE_TURNS: usize = 64;
 const EVENTS_PER_TURN: usize = 6;
 
 fn benchmark_eval_runtime(criterion: &mut Criterion) {
-    let tasks_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tasks");
+    let tasks_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../tasks");
     let task_paths = [
         "browser-runtime",
         "extract-todos",
@@ -22,7 +25,7 @@ fn benchmark_eval_runtime(criterion: &mut Criterion) {
         .map(Task::load)
         .collect::<Result<Vec<_>, _>>()
         .expect("checked-in benchmark tasks");
-    let agent = Nanocodex::builder("benchmark-only")
+    let agent = Nanocodex::builder(OpenAi::new("benchmark-only").expect("static API key"))
         .instructions(
             "Work directly in the provided workspace. Complete the requested task, \
              verify your changes, and keep the final answer concise.",

@@ -313,7 +313,7 @@ impl Task {
 
     /// Returns environment variables supplied to the task process.
     #[must_use]
-    pub fn environment(&self) -> &BTreeMap<String, String> {
+    pub const fn environment(&self) -> &BTreeMap<String, String> {
         &self.environment
     }
 
@@ -358,7 +358,7 @@ impl Verifier {
 
     /// Returns environment variables supplied to the verifier.
     #[must_use]
-    pub fn environment(&self) -> &BTreeMap<String, String> {
+    pub const fn environment(&self) -> &BTreeMap<String, String> {
         &self.environment
     }
 
@@ -718,7 +718,7 @@ storage_mb = 10240
     #[test]
     fn loads_the_native_suite_fixtures() {
         let tasks = ["write-greeting", "uppercase-message", "extract-todos"];
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tasks");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tasks");
 
         for name in tasks {
             let task = Task::load(root.join(name)).unwrap();

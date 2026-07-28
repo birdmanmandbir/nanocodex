@@ -144,7 +144,7 @@ mod tests {
     #[tokio::test]
     async fn prepares_and_verifies_an_independent_native_workspace() {
         let task_directory =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tasks/write-greeting");
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tasks/write-greeting");
         let task = Task::load(task_directory).unwrap();
         let output = tempdir().unwrap();
         let attempt = NativeAttempt::prepare(output.path(), "trial", &task).unwrap();

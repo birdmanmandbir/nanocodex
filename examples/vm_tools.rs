@@ -1,32 +1,15 @@
 use std::{
     error::Error,
     fs, io,
-    net::Ipv4Addr,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
 };
 
-use axum::{
-    Router,
-    extract::Request,
-    http::{StatusCode, header::WWW_AUTHENTICATE},
-    response::IntoResponse,
-    routing::post,
+use nanocodex::{
+    Tool,
+    tools::contract::{ToolContext, ToolInput, ToolOutput, ToolOutputBody, ToolOutputContent},
 };
-use mpp::{
-    Base64UrlJson, MppError, PaymentChallenge, PaymentCredential, PaymentPayload,
-    client::PaymentProvider, format_www_authenticate,
-};
-use mpp_egress::{EgressPolicy, MppEgress};
-use nanocodex::{Tool, ToolContext, ToolExecution, ToolInput, ToolOutputBody, ToolOutputContent};
-use nanocodex_vm::{GuestRuntimeDisk, VmToolSession, mpp_egress_layer};
-use nanovm::{
-    BlockDevice, EgressLease, EgressMount, GUEST_EGRESS_ROOT, GuestCommand, VmConfig,
-    VmProcessConfig,
-};
+use nanocodex_vm::{GuestRuntimeDisk, VmToolSession};
+use nanovm::{BlockDevice, EgressLease, GuestCommand, VmConfig, VmProcessConfig};
 use serde::Deserialize;
 use serde_json::value::to_raw_value;
 use tokio::process::Command;
@@ -44,7 +27,7 @@ struct CommandOutput {
 }
 
 fn main() -> Result<(), AnyError> {
-    let mut arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     if arguments.first().is_some_and(|value| value == "--vmm") {
         let config = arguments
             .get(1)
@@ -54,26 +37,22 @@ fn main() -> Result<(), AnyError> {
         VmProcessConfig::read(config)?.run()?;
         return Ok(());
     }
-    let prove_mpp = arguments.last().is_some_and(|value| value == "--prove-mpp");
-    if prove_mpp {
-        arguments.pop();
-    }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(run_host(arguments, prove_mpp))
+        .block_on(run_host(arguments))
 }
 
 #[allow(
     clippy::too_many_lines,
     reason = "the executable intentionally presents one linear end-to-end VM tool proof"
 )]
-async fn run_host(arguments: Vec<std::ffi::OsString>, prove_mpp: bool) -> Result<(), AnyError> {
+async fn run_host(arguments: Vec<std::ffi::OsString>) -> Result<(), AnyError> {
     let root = arguments
         .first()
         .cloned()
         .map(PathBuf::from)
-        .ok_or("usage: vm-tools ROOTFS [GUEST_RUNTIME_BINARY_OR_EXT4] [--prove-mpp]")?;
+        .ok_or("usage: vm-tools ROOTFS [GUEST_RUNTIME_BINARY_OR_EXT4]")?;
     let (_private_root, root) = if root.is_file() {
         let directory = tempfile::tempdir()?;
         let private = directory.path().join("rootfs.ext4");
@@ -91,19 +70,7 @@ async fn run_host(arguments: Vec<std::ffi::OsString>, prove_mpp: bool) -> Result
         .as_ref()
         .map(|runtime| runtime.path().to_owned())
         .or(runtime_input);
-    let (egress, mpp_proof) = if prove_mpp {
-        let proof = MppProof::start().await?;
-        let mpp = mpp_egress_layer(Arc::clone(&proof.egress))?;
-        let secrets = secret_style_proof_layer()?;
-        (
-            EgressLease::internet()
-                .with_layer(mpp)?
-                .with_layer(secrets)?,
-            Some(proof),
-        )
-    } else {
-        (EgressLease::disabled(), None)
-    };
+    let egress = EgressLease::disabled();
     let (config, guest) = if let Some(runtime) = runtime {
         let config = VmConfig::ext4(root)
             .cpus(2)
@@ -258,53 +225,6 @@ async fn run_host(arguments: Vec<std::ffi::OsString>, prove_mpp: bool) -> Result
         "view_image: detail={detail:?}, data_url_bytes={}",
         image_url.len()
     );
-    if let Some(proof) = &mpp_proof {
-        let execution = vm
-            .exec_command_tool()
-            .execute(
-                function_input(&serde_json::json!({
-                    "cmd": format!(
-                        "test \"$NANOCENTAUR_SECRET_BASE_URL\" = \
-                         https://secret-gateway.invalid/v1; \
-                         if printf tamper 2>/dev/null >> {GUEST_EGRESS_ROOT}/secrets/route.txt; \
-                         then exit 9; fi; \
-                         cat {GUEST_EGRESS_ROOT}/secrets/route.txt"
-                    ),
-                    "workdir": "/workspace",
-                    "login": false
-                }))?,
-                context,
-            )
-            .await?;
-        let output = command_output(execution)?;
-        if output.exit_code != Some(0) || output.output.trim() != "public-route" {
-            return Err(format!("secret-style egress proof failed: {}", output.output).into());
-        }
-        println!("secret egress: independent environment and read-only mount composed");
-
-        let execution = vm
-            .exec_command_tool()
-            .execute(
-                function_input(&serde_json::json!({
-                    "cmd": format!(
-                        "curl --fail --silent --show-error --request POST --data same-body {}",
-                        proof.url
-                    ),
-                    "workdir": "/workspace",
-                    "login": false
-                }))?,
-                context,
-            )
-            .await?;
-        let output = command_output(execution)?;
-        if output.exit_code != Some(0) || output.output.trim() != "paid" {
-            return Err(format!("MPP curl proof failed: {}", output.output).into());
-        }
-        if proof.payments.load(Ordering::SeqCst) != 1 || proof.calls.load(Ordering::SeqCst) != 2 {
-            return Err("MPP curl was not paid and replayed exactly once".into());
-        }
-        println!("mpp egress: guest curl paid and replayed exactly once");
-    }
     println!("all VM-owned tools executed through one retained libkrun VM");
     drop(agent_tools);
     drop(vm);
@@ -351,23 +271,6 @@ fn is_elf(path: &Path) -> io::Result<bool> {
     }
 }
 
-fn secret_style_proof_layer() -> Result<EgressLease, AnyError> {
-    let directory = Arc::new(tempfile::tempdir()?);
-    fs::write(directory.path().join("route.txt"), "public-route\n")?;
-    let mut layer = EgressLease::internet();
-    layer.insert_environment(
-        "NANOCENTAUR_SECRET_BASE_URL",
-        "https://secret-gateway.invalid/v1",
-    )?;
-    layer.insert_mount(EgressMount::read_only(
-        "secret-proof",
-        directory.path(),
-        Path::new(GUEST_EGRESS_ROOT).join("secrets"),
-    ))?;
-    layer.retain(directory);
-    Ok(layer)
-}
-
 fn remove_partial_copy(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -376,102 +279,16 @@ fn remove_partial_copy(path: &Path) -> io::Result<()> {
     }
 }
 
-struct MppProof {
-    egress: Arc<MppEgress>,
-    url: String,
-    payments: Arc<AtomicUsize>,
-    calls: Arc<AtomicUsize>,
-}
-
-impl MppProof {
-    async fn start() -> Result<Self, AnyError> {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let challenge = payment_challenge()?;
-        let app = Router::new().route(
-            "/paid",
-            post({
-                let calls = Arc::clone(&calls);
-                move |request: Request| {
-                    let calls = Arc::clone(&calls);
-                    let challenge = challenge.clone();
-                    async move {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        if request.headers().contains_key("authorization") {
-                            (StatusCode::OK, "paid").into_response()
-                        } else {
-                            (
-                                StatusCode::PAYMENT_REQUIRED,
-                                [(WWW_AUTHENTICATE, challenge)],
-                                "payment required",
-                            )
-                                .into_response()
-                        }
-                    }
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-        let address = listener.local_addr()?;
-        tokio::spawn(async move {
-            if let Err(error) = axum::serve(listener, app).await {
-                eprintln!("MPP proof origin failed: {error}");
-            }
-        });
-        let provider = ProofPaymentProvider::default();
-        let payments = Arc::clone(&provider.payments);
-        let egress = Arc::new(MppEgress::start(provider, EgressPolicy::default()).await?);
-        Ok(Self {
-            egress,
-            url: format!("http://{address}/paid"),
-            payments,
-            calls,
-        })
-    }
-}
-
-#[derive(Clone, Default)]
-struct ProofPaymentProvider {
-    payments: Arc<AtomicUsize>,
-}
-
-impl PaymentProvider for ProofPaymentProvider {
-    fn supports(&self, method: &str, intent: &str) -> bool {
-        method == "test" && intent == "charge"
-    }
-
-    async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
-        self.payments.fetch_add(1, Ordering::SeqCst);
-        Ok(PaymentCredential::new(
-            challenge.to_echo(),
-            PaymentPayload::hash("vm-mpp-proof"),
-        ))
-    }
-}
-
-fn payment_challenge() -> Result<String, AnyError> {
-    let request = Base64UrlJson::from_value(&serde_json::json!({
-        "amount": "1",
-        "currency": "test"
-    }))?;
-    Ok(format_www_authenticate(&PaymentChallenge::new(
-        "vm-proof",
-        "test.local",
-        "test",
-        "charge",
-        request,
-    ))?)
-}
-
 fn function_input(value: &serde_json::Value) -> Result<ToolInput, serde_json::Error> {
     to_raw_value(value).map(ToolInput::Function)
 }
 
-fn command_output(execution: ToolExecution) -> Result<CommandOutput, AnyError> {
+fn command_output(execution: ToolOutput) -> Result<CommandOutput, AnyError> {
     let text = text_output(execution)?;
     serde_json::from_str(&text).map_err(Into::into)
 }
 
-fn text_output(execution: ToolExecution) -> Result<String, AnyError> {
+fn text_output(execution: ToolOutput) -> Result<String, AnyError> {
     if !execution.success {
         return Err("tool execution reported failure".into());
     }

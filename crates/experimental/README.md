@@ -3,8 +3,11 @@
 This directory contains complete Nanocodex components whose APIs are still
 being exercised and revised:
 
-- `nanovm` and `nanovm-image`: embedded VM lifecycle and image preparation; and
-- `nanocodex-vm`: agent tools backed by retained VM sessions.
+- `nanovm` and `nanovm-image`: embedded VM lifecycle and image preparation;
+- `nanocodex-vm`: agent tools backed by retained VM sessions;
+- `nanocodex-eval`: typed tasks, attempts, durable sweeps, and retained results;
+  and
+- `nanocodex-eval-harbor`: canonical Harbor and ATIF artifact projection.
 
 Experimental means API stability, not reduced engineering standards. These
 packages remain workspace members and must pass the normal formatting, Clippy,
