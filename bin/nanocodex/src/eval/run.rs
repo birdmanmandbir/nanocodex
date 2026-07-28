@@ -610,20 +610,15 @@ impl Run {
         ));
         let evaluation_setup = evaluation_setup_started.elapsed();
         let attempts_started = Instant::now();
-        let execution = finish_or_drain(
-            eval.sweep(sweep),
-            ctrl_c_interrupt(),
-            ctrl_c_interrupt(),
-            remaining_attempts,
-            || {
-                let admitted = eval.begin_drain();
-                eprintln!(
-                    "Interrupt received; stopped admitting new trials after {admitted} \
+        let interrupts = ctrl_c_interrupt()?;
+        let execution = finish_or_drain(eval.sweep(sweep), interrupts, remaining_attempts, || {
+            let admitted = eval.begin_drain();
+            eprintln!(
+                "Interrupt received; stopped admitting new trials after {admitted} \
                      attempt(s), draining admitted work; press Ctrl-C again to abort"
-                );
-                admitted
-            },
-        )
+            );
+            admitted
+        })
         .await?;
         let DrainExecution {
             result: sweep_result,
@@ -1332,7 +1327,42 @@ struct DrainExecution<T, E> {
     interrupt: InterruptListener,
 }
 
-type InterruptListener = Pin<Box<dyn Future<Output = io::Result<()>> + Send>>;
+enum InterruptListener {
+    #[cfg(unix)]
+    Unix(tokio::signal::unix::Signal),
+    #[cfg(windows)]
+    Windows(tokio::signal::windows::CtrlC),
+    #[cfg(not(any(unix, windows)))]
+    Fallback,
+    #[cfg(test)]
+    Injected(tokio::sync::mpsc::UnboundedReceiver<io::Result<()>>),
+}
+
+impl InterruptListener {
+    async fn recv(&mut self) -> io::Result<()> {
+        match self {
+            #[cfg(unix)]
+            Self::Unix(signal) => signal
+                .recv()
+                .await
+                .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "Ctrl-C listener closed")),
+            #[cfg(windows)]
+            Self::Windows(signal) => signal
+                .recv()
+                .await
+                .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "Ctrl-C listener closed")),
+            #[cfg(not(any(unix, windows)))]
+            Self::Fallback => tokio::signal::ctrl_c().await,
+            #[cfg(test)]
+            Self::Injected(signals) => signals.recv().await.unwrap_or_else(|| {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected Ctrl-C listener closed",
+                ))
+            }),
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 enum EvalInterruptError {
@@ -1344,14 +1374,25 @@ enum EvalInterruptError {
     Finalization,
 }
 
-fn ctrl_c_interrupt() -> InterruptListener {
-    Box::pin(tokio::signal::ctrl_c())
+fn ctrl_c_interrupt() -> io::Result<InterruptListener> {
+    #[cfg(unix)]
+    {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .map(InterruptListener::Unix)
+    }
+    #[cfg(windows)]
+    {
+        tokio::signal::windows::ctrl_c().map(InterruptListener::Windows)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Ok(InterruptListener::Fallback)
+    }
 }
 
 async fn finish_or_drain<T, E, Work, Drain>(
     work: Work,
     mut interrupt: InterruptListener,
-    mut drain_interrupt: InterruptListener,
     terminal_attempts: usize,
     drain: Drain,
 ) -> Result<DrainExecution<T, E>, EvalInterruptError>
@@ -1362,12 +1403,12 @@ where
     tokio::pin!(work);
     tokio::select! {
         biased;
-        signal = interrupt.as_mut() => {
+        signal = interrupt.recv() => {
             signal.map_err(EvalInterruptError::Listener)?;
             let terminal_attempts = drain();
             tokio::select! {
                 biased;
-                signal = drain_interrupt.as_mut() => {
+                signal = interrupt.recv() => {
                     signal.map_err(EvalInterruptError::Listener)?;
                     Err(EvalInterruptError::Forced)
                 }
@@ -1375,7 +1416,7 @@ where
                     result,
                     terminal_attempts,
                     interrupted: true,
-                    interrupt: drain_interrupt,
+                    interrupt,
                 })
             }
         }
@@ -1398,7 +1439,7 @@ where
     tokio::pin!(work);
     tokio::select! {
         biased;
-        signal = interrupt.as_mut() => {
+        signal = interrupt.recv() => {
             signal.map_err(EvalInterruptError::Listener)?;
             Err(EvalInterruptError::Finalization)
         }
@@ -3794,11 +3835,12 @@ mod tests {
 
     use super::{
         CACHED_VERIFIER_SCRIPT, DEFAULT_HOST_UTILIZATION_PERCENT, DEFAULT_TRIALS,
-        EvalInterruptError, HostResources, RetainedBuild, RetainedScheduling, Run, RunInvocation,
-        RunMeasurements, RunSummary, VmRetention, cached_verifier_script, finish_or_drain,
-        finish_or_interrupt, load_tasks, recognized_verifier_setup, remove_passed_rootfs,
-        retained_retry_task_names, retained_task_durations, verifier_bootstrap_network_failed,
-        verifier_cache_key, verifier_network_retry_delay, verifier_shell, verifier_timeout_output,
+        EvalInterruptError, HostResources, InterruptListener, RetainedBuild, RetainedScheduling,
+        Run, RunInvocation, RunMeasurements, RunSummary, VmRetention, cached_verifier_script,
+        finish_or_drain, finish_or_interrupt, load_tasks, recognized_verifier_setup,
+        remove_passed_rootfs, retained_retry_task_names, retained_task_durations,
+        verifier_bootstrap_network_failed, verifier_cache_key, verifier_network_retry_delay,
+        verifier_shell, verifier_timeout_output,
     };
 
     #[derive(Parser)]
@@ -3810,13 +3852,14 @@ mod tests {
     #[tokio::test]
     async fn injected_interrupt_closes_admission_then_waits_for_admitted_work() {
         let (release, released) = tokio::sync::oneshot::channel();
+        let (signal, interrupts) = injected_interrupts();
+        signal.send(Ok(())).unwrap();
         let execution = finish_or_drain(
             async {
                 released.await.unwrap();
                 Ok::<_, &'static str>(17)
             },
-            Box::pin(future::ready(Ok(()))),
-            Box::pin(future::pending::<std::io::Result<()>>()),
+            interrupts,
             9,
             || {
                 release.send(()).unwrap();
@@ -3832,9 +3875,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn injected_second_interrupt_drops_draining_work() {
+    async fn immediate_second_interrupt_is_not_lost_and_drops_draining_work() {
         let (started_sender, started) = tokio::sync::oneshot::channel();
         let (dropped_sender, dropped) = tokio::sync::oneshot::channel();
+        let (signals, interrupts) = injected_interrupts();
+        let send_signals = tokio::spawn(async move {
+            started.await.unwrap();
+            signals.send(Ok(())).unwrap();
+            signals.send(Ok(())).unwrap();
+        });
         let drain_count = Cell::new(0);
         let result = finish_or_drain(
             async move {
@@ -3842,11 +3891,7 @@ mod tests {
                 started_sender.send(()).unwrap();
                 future::pending::<Result<(), &'static str>>().await
             },
-            Box::pin(async move {
-                started.await.unwrap();
-                Ok(())
-            }),
-            Box::pin(future::ready(Ok(()))),
+            interrupts,
             9,
             || {
                 drain_count.set(drain_count.get() + 1);
@@ -3858,18 +3903,15 @@ mod tests {
         assert!(matches!(result, Err(EvalInterruptError::Forced)));
         assert_eq!(drain_count.get(), 1);
         dropped.await.unwrap();
+        send_signals.await.unwrap();
     }
 
     #[tokio::test]
     async fn pending_interrupt_listener_remains_actionable_during_finalization() {
-        let (interrupt_sender, interrupt) = tokio::sync::oneshot::channel();
+        let (interrupt_sender, interrupts) = injected_interrupts();
         let execution = finish_or_drain(
             future::ready(Ok::<_, &'static str>(17)),
-            Box::pin(async move {
-                interrupt.await.unwrap();
-                Ok(())
-            }),
-            Box::pin(future::pending::<std::io::Result<()>>()),
+            interrupts,
             1,
             || unreachable!(),
         )
@@ -3879,7 +3921,7 @@ mod tests {
         let result = finish_or_interrupt(
             async move {
                 let _drop_signal = DropSignal(Some(dropped_sender));
-                interrupt_sender.send(()).unwrap();
+                interrupt_sender.send(Ok(())).unwrap();
                 future::pending::<()>().await
             },
             execution.interrupt,
@@ -3888,6 +3930,14 @@ mod tests {
 
         assert!(matches!(result, Err(EvalInterruptError::Finalization)));
         dropped.await.unwrap();
+    }
+
+    fn injected_interrupts() -> (
+        tokio::sync::mpsc::UnboundedSender<std::io::Result<()>>,
+        InterruptListener,
+    ) {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        (sender, InterruptListener::Injected(receiver))
     }
 
     struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
