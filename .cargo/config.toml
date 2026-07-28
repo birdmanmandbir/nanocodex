@@ -11,6 +11,12 @@ runner = "scripts/codesign-runner"
 [target.aarch64-unknown-linux-musl]
 linker = "scripts/aarch64-unknown-linux-musl-linker"
 
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-linux-musl-gcc"
+# libc 0.2.189 requires an explicit ABI floor before exposing statx on musl.
+# Nanocodex's supported Linux VM host requires musl >= 1.2.3.
+rustflags = ["--cfg=libc_unstable_musl_v1_2_3"]
+
 [target.x86_64-apple-darwin]
 linker = "/usr/bin/clang"
 runner = "scripts/codesign-runner"

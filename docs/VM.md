@@ -23,6 +23,12 @@ Code Mode/QuickJS, MCP, HTTP clients, and OCI preparation. Normal
 `nanocodex-tools` and `nanocodex-oai-api` builds retain their complete native
 behavior through default features.
 
+The checked-in x86_64 musl target configuration sets the supported ABI floor
+to musl 1.2.3 because the pinned libkrun KVM path requires `statx`. A Linux
+release host build therefore needs `musl-tools` and produces a static PIE with
+the same public host API; VM execution still requires `/dev/kvm` and
+`libkrunfw.so.5` at runtime.
+
 ## Preparing immutable images
 
 `VmImageBuilder` turns a directory containing a concrete `Dockerfile` into one
