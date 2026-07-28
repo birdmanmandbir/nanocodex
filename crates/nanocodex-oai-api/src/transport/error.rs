@@ -74,8 +74,8 @@ pub enum ResponsesError {
         /// Configured timeout in seconds.
         seconds: u64,
     },
-    /// No response event arrived before the idle deadline.
-    #[error("Responses WebSocket produced no event for {seconds} seconds")]
+    /// No platform-observable inbound activity arrived before the idle deadline.
+    #[error("Responses stream produced no observable activity for {seconds} seconds")]
     IdleTimeout {
         /// Configured idle timeout in seconds.
         seconds: u64,

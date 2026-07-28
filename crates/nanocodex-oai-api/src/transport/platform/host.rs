@@ -34,5 +34,13 @@ pub(crate) async fn connect_socket(
         .host
         .as_deref()
         .ok_or(ResponsesError::HostUnavailable)?;
-    ResponsesSocket::connect(host, &config.websocket_url, auth, session_id, turn_state).await
+    ResponsesSocket::connect(
+        host,
+        &config.websocket_url,
+        auth,
+        session_id,
+        turn_state,
+        config.stream_idle_timeout,
+    )
+    .await
 }

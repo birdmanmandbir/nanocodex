@@ -71,6 +71,35 @@ test("Node host preserves structured WebSocket handshake rejection detail", asyn
   }
 });
 
+test("Node host resets a pending idle deadline on observable Ping and Pong frames", async () => {
+  const server = await startServer();
+  const host = createNodeHost();
+
+  try {
+    await host.connect(server.url, "test-key", SESSION_IDS.primary);
+    const socket = await server.connection;
+    const pending = host.next(1, 250);
+
+    await delay(150);
+    const answeredPing = new Promise((resolve) => socket.once("pong", resolve));
+    socket.ping();
+    await answeredPing;
+
+    await delay(150);
+    socket.pong();
+
+    await delay(150);
+    socket.send('{"type":"after-controls"}');
+    assert.deepEqual(JSON.parse(await pending), {
+      kind: "text",
+      text: '{"type":"after-controls"}',
+    });
+  } finally {
+    host.close(1);
+    await server.close();
+  }
+});
+
 test("Node-hosted WASM preserves follow-ons, cache identity, events, and custom tools", async () => {
   const server = await startServer();
   const events = [];
@@ -426,6 +455,10 @@ function messageReader(socket) {
       return new Promise((resolve) => { waiter = resolve; });
     },
   };
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 class ManagedSocket extends EventTarget {

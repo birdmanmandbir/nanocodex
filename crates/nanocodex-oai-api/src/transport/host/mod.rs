@@ -9,7 +9,7 @@
 
 use std::{future::Future, pin::Pin, time::Duration};
 
-#[cfg(target_family = "wasm")]
+#[cfg(any(target_family = "wasm", test))]
 pub(crate) mod socket;
 
 /// Boxed future returned by a native embedding host.
@@ -46,7 +46,15 @@ pub trait HostConnection: Send + 'static {
     /// Sends one complete text frame.
     fn send<'a>(&'a self, message: &'a str) -> HostFuture<'a, Result<(), HostError>>;
 
-    /// Waits for the next data, closure, or timeout result.
+    /// Waits for the next data, closure, or platform-idle timeout result.
+    ///
+    /// Each call starts a fresh deadline when the wait begins. A host whose
+    /// WebSocket API exposes control frames may reset the pending deadline for
+    /// Ping/Pong without returning those frames.
+    /// Browser WebSocket APIs do not expose control frames, so browser hosts
+    /// measure message silence. Activity observed before this call is the
+    /// baseline and must not extend its deadline. The SDK never supplies a
+    /// duration above 2,147,483,647 milliseconds.
     fn next(&mut self, idle_timeout: Duration) -> HostFuture<'_, Result<HostMessage, HostError>>;
 
     /// Releases the environment's connection handle synchronously.
@@ -247,7 +255,7 @@ pub enum HostMessage {
         /// Close code and reason formatted by the host.
         detail: String,
     },
-    /// The idle deadline elapsed without an event.
+    /// The idle deadline elapsed without platform-observable inbound activity.
     Timeout,
     /// A binary frame arrived where the protocol requires JSON text.
     Binary,

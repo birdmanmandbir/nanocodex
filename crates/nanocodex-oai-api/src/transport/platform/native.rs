@@ -20,9 +20,9 @@ impl ServicePlatform {
         Self::with_http_client(config, reqwest::Client::new())
     }
 
-    pub(crate) const fn with_http_client(_config: &ModelConfig, client: reqwest::Client) -> Self {
+    pub(crate) const fn with_http_client(config: &ModelConfig, client: reqwest::Client) -> Self {
         Self {
-            http: ResponsesHttp::new(client),
+            http: ResponsesHttp::new(client, config.stream_idle_timeout),
         }
     }
 
@@ -38,5 +38,12 @@ pub(crate) async fn connect_socket(
     session_id: &str,
     turn_state: Option<&str>,
 ) -> Result<(ResponsesSocket, ConnectionMetadata), ResponsesError> {
-    ResponsesSocket::connect(&config.websocket_url, auth, session_id, turn_state).await
+    ResponsesSocket::connect(
+        &config.websocket_url,
+        auth,
+        session_id,
+        turn_state,
+        config.stream_idle_timeout,
+    )
+    .await
 }

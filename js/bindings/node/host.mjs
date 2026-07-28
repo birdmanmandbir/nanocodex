@@ -85,6 +85,8 @@ export function createNodeHost(options = {}) {
           ? { kind: "binary" }
           : { kind: "text", text: data.toString("utf8") });
       });
+      socket.on("ping", () => observeActivity(connection));
+      socket.on("pong", () => observeActivity(connection));
       socket.on("close", (status, reason) => {
         if (!connection.intentionallyClosed && !connection.overflowed) {
           const suffix = reason.length ? `: ${reason.toString("utf8")}` : "";
@@ -185,15 +187,23 @@ export function createNodeHost(options = {}) {
     }
     if (connection.waiter) return Promise.reject(new Error("concurrent reads are unsupported"));
     return new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        connection.waiter = undefined;
-        resolve(JSON.stringify({ kind: "timeout" }));
-      }, timeoutMs);
-      connection.waiter = (message) => {
+      let timer;
+      let completed = false;
+      const finish = (message) => {
+        if (completed) return;
+        completed = true;
         clearTimeout(timer);
         connection.waiter = undefined;
+        connection.resetIdleTimeout = undefined;
         resolve(JSON.stringify(message));
       };
+      const resetIdleTimeout = () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => finish({ kind: "timeout" }), timeoutMs);
+      };
+      connection.waiter = finish;
+      connection.resetIdleTimeout = resetIdleTimeout;
+      resetIdleTimeout();
     });
   }
 
@@ -249,10 +259,15 @@ function queueState(socket) {
     queue: [],
     queuedBytes: 0,
     waiter: undefined,
+    resetIdleTimeout: undefined,
     intentionallyClosed: false,
     overflowed: false,
     managed: false,
   };
+}
+
+function observeActivity(connection) {
+  connection.resetIdleTimeout?.();
 }
 
 function header(headers, name) {

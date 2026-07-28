@@ -41,6 +41,16 @@ test("browser host carries ordered frames and application tools", async () => {
   assert.deepEqual(events, ["event"]);
 });
 
+test("browser host idle timeout measures message silence", async () => {
+  const host = createBrowserHost({ WebSocketImpl: FakeWebSocket });
+  const connecting = host.connect("ws://example.test", "not-forwarded", "session");
+  FakeWebSocket.instances.at(-1).open();
+  await connecting;
+
+  assert.deepEqual(JSON.parse(await host.next(1, 5)), { kind: "timeout" });
+  host.close(1);
+});
+
 test("browser host opens application sockets through MPP", async () => {
   const socket = new FakeWebSocket("wss://paid.test");
   socket.readyState = FakeWebSocket.OPEN;

@@ -1,4 +1,4 @@
-use std::{num::NonZeroU32, sync::Arc};
+use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
 use ::tower::Layer;
 
@@ -9,6 +9,8 @@ use crate::{
     DefaultResponsesService, OpenAiAuth, OpenAiAuthError, OpenAiAuthMode, ReasoningMode,
     ResponsesHistory, ResponsesRetryPolicy, ResponsesTransport, Thinking, session::SessionBuilder,
 };
+
+use config::MAX_STREAM_IDLE_TIMEOUT;
 
 #[doc(hidden)]
 pub use config::ModelConfig;
@@ -161,6 +163,23 @@ impl<F> OpenAiBuilder<F> {
     #[must_use]
     pub const fn fast_mode(mut self, enabled: bool) -> Self {
         self.config.fast_mode = enabled;
+        self
+    }
+
+    /// Sets the maximum silence allowed between platform-observable inbound
+    /// stream activity.
+    ///
+    /// Native WebSockets and hosts such as Node that expose control frames
+    /// count Ping/Pong activity without producing model events. Browser
+    /// WebSockets do not expose control frames and therefore measure message
+    /// silence. Nonempty HTTPS/SSE body chunks count as activity, including
+    /// comments and partial records. The default is 300 seconds.
+    ///
+    /// [`Self::build`] rejects values above 2,147,483,647 milliseconds so the
+    /// same policy is representable by native and hosted timers.
+    #[must_use]
+    pub const fn stream_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.config.stream_idle_timeout = timeout;
         self
     }
 
@@ -465,6 +484,11 @@ fn validate(config: &ModelConfig) -> Result<(), OpenAiError> {
             detail: "the OpenAI API base URL must not be empty",
         });
     }
+    if config.stream_idle_timeout > MAX_STREAM_IDLE_TIMEOUT {
+        return Err(OpenAiError::InvalidConfiguration {
+            detail: "the stream idle timeout must not exceed 2147483647 milliseconds",
+        });
+    }
     if config.auth.mode() == OpenAiAuthMode::ChatGpt && config.store_responses {
         return Err(OpenAiError::InvalidConfiguration {
             detail: "ChatGPT subscription authentication does not support store: true",
@@ -543,6 +567,45 @@ mod tests {
             apply_mode_defaults(&mut config, mode);
             assert!(!config.store_responses);
         }
+    }
+
+    #[test]
+    fn stream_idle_timeout_defaults_to_exactly_300_seconds() {
+        assert_eq!(
+            ModelConfig::default().stream_idle_timeout,
+            Duration::from_secs(300)
+        );
+    }
+
+    #[test]
+    fn stream_idle_timeout_survives_layer_and_service_builder_changes() {
+        let configured = Duration::from_secs(17);
+        let layered = OpenAi::builder("test-key")
+            .stream_idle_timeout(configured)
+            .service(|| NeverCalled)
+            .layer(TimeoutLayer::new(Duration::from_secs(1)))
+            .build()
+            .unwrap();
+        let replaced = OpenAi::builder("test-key")
+            .stream_idle_timeout(configured)
+            .layer(TimeoutLayer::new(Duration::from_secs(1)))
+            .service(|| NeverCalled)
+            .build()
+            .unwrap();
+
+        assert_eq!(layered.config.stream_idle_timeout, configured);
+        assert_eq!(replaced.config.stream_idle_timeout, configured);
+    }
+
+    #[test]
+    fn stream_idle_timeout_rejects_durations_larger_than_every_platform_timer() {
+        let error = OpenAi::builder("test-key")
+            .stream_idle_timeout(Duration::MAX)
+            .build()
+            .err()
+            .expect("an unrepresentable idle timeout must fail validation");
+
+        assert!(error.to_string().contains("2147483647 milliseconds"));
     }
 
     #[test]

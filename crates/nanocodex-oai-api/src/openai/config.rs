@@ -1,8 +1,10 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use crate::{OpenAiAuth, ReasoningMode, ResponsesHistory, ResponsesTransport, Thinking};
 
 const SYSTEM_PROMPT: &str = include_str!("../../prompts/system.md");
+pub(crate) const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+pub(crate) const MAX_STREAM_IDLE_TIMEOUT: Duration = Duration::from_millis(i32::MAX as u64);
 
 /// Validated, read-only settings passed to a [`ResponsesServiceFactory`].
 ///
@@ -27,6 +29,8 @@ pub struct ModelConfig {
     pub responses_history: ResponsesHistory,
     /// Whether the provider may retain response checkpoints.
     pub store_responses: bool,
+    /// Maximum silence between platform-observable inbound activity.
+    pub stream_idle_timeout: Duration,
     /// Responses WebSocket endpoint.
     pub websocket_url: String,
     /// Base URL used for HTTPS Responses calls and related endpoints.
@@ -68,6 +72,7 @@ impl Default for ModelConfig {
             responses_transport: ResponsesTransport::default(),
             responses_history: ResponsesHistory::default(),
             store_responses: false,
+            stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
             websocket_url: "wss://api.openai.com/v1/responses".to_owned(),
             api_base_url: "https://api.openai.com/v1".to_owned(),
             #[cfg(any(target_family = "wasm", docsrs))]

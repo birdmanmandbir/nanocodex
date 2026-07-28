@@ -395,6 +395,7 @@ impl ResponsesService {
             )
         })?;
         let send_started_at = Instant::now();
+        socket.begin_attempt();
         socket.send(encoded).await.map_err(|error| {
             ResponsesServiceError::responses(error, FailurePhase::Send, generation)
         })?;
