@@ -54,6 +54,7 @@
 
 mod aggregate;
 mod atif;
+mod digest;
 mod durable;
 mod evaluator;
 mod event;

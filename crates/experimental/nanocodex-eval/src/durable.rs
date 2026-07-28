@@ -20,7 +20,7 @@ pub(crate) struct DurableTrial {
 pub(crate) enum DurableTrialError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    #[error("failed to decode durable trial result {}: {source}", path.display())]
+    #[error("failed to decode durable trial artifact {}: {source}", path.display())]
     Decode {
         path: PathBuf,
         #[source]
@@ -48,6 +48,25 @@ pub(crate) enum DurableTrialError {
         trial_name: String,
         result_root: PathBuf,
         config_root: PathBuf,
+    },
+    #[error("durable trial `{trial_name}` has no retained lock at {}", path.display())]
+    MissingLock { trial_name: String, path: PathBuf },
+    #[error(
+        "durable trial `{trial_name}` lock references task root {}; result references {}",
+        lock_root.display(),
+        result_root.display()
+    )]
+    LockTaskRootMismatch {
+        trial_name: String,
+        result_root: PathBuf,
+        lock_root: PathBuf,
+    },
+    #[error("durable trial `{trial_name}` task content digest is `{found}`; expected `{expected}`")]
+    TaskContentDigestMismatch {
+        trial_name: String,
+        task_root: PathBuf,
+        expected: String,
+        found: String,
     },
     #[error(
         "durable trial `{trial_name}` references foreign task root {}",
@@ -108,6 +127,17 @@ struct RetainedTrialConfig {
 #[derive(Deserialize)]
 struct RetainedTaskPath {
     path: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct RetainedTrialLock {
+    task: RetainedTaskLock,
+}
+
+#[derive(Deserialize)]
+struct RetainedTaskLock {
+    path: PathBuf,
+    digest: String,
 }
 
 impl DurableTrial {
@@ -181,6 +211,40 @@ pub(crate) fn scan_manifest_trials(
                 trial_name: result.trial_name,
                 task_root: result.task_id.path,
             });
+        }
+        let lock_path = directory.join("lock.json");
+        let lock_bytes = match fs::read(&lock_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(DurableTrialError::MissingLock {
+                    trial_name: result.trial_name,
+                    path: lock_path,
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let lock: RetainedTrialLock =
+            serde_json::from_slice(&lock_bytes).map_err(|source| DurableTrialError::Decode {
+                path: lock_path,
+                source,
+            })?;
+        if lock.task.path != result.task_id.path {
+            return Err(DurableTrialError::LockTaskRootMismatch {
+                trial_name: result.trial_name,
+                result_root: result.task_id.path,
+                lock_root: lock.task.path,
+            });
+        }
+        if let Some(expected) = manifest.task_content_digest(&result.task_id.path) {
+            let expected = format!("sha256:{expected}");
+            if lock.task.digest != expected {
+                return Err(DurableTrialError::TaskContentDigestMismatch {
+                    trial_name: result.trial_name,
+                    task_root: result.task_id.path,
+                    expected,
+                    found: lock.task.digest,
+                });
+            }
         }
         if result.config.job_id != job_id {
             return Err(DurableTrialError::ForeignJob {
@@ -356,6 +420,25 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_trial_lock_from_another_task_revision() {
+        let fixture = Fixture::new(&[("task", "suite/task")], 1);
+        let directory = fixture.write_trial(0, "default", 1, Uuid::now_v7());
+        let lock = directory.join("lock.json");
+        let mut retained: Value = serde_json::from_slice(&fs::read(&lock).unwrap()).unwrap();
+        retained["task"]["digest"] = json!("sha256:stale");
+        fs::write(lock, serde_json::to_vec_pretty(&retained).unwrap()).unwrap();
+
+        let error =
+            scan_manifest_trials(&fixture.job, fixture.job_id, &fixture.manifest).unwrap_err();
+
+        assert!(matches!(
+            error,
+            DurableTrialError::TaskContentDigestMismatch { found, .. }
+                if found == "sha256:stale"
+        ));
+    }
+
+    #[test]
     fn colliding_short_names_bind_only_to_the_full_task_root() {
         let fixture = Fixture::new(&[("first", "one/shared"), ("second", "two/shared")], 1);
         fixture.write_trial(0, "default", 1, Uuid::now_v7());
@@ -445,6 +528,24 @@ mod tests {
         fn write_result(&self, directory_name: &str, result: &Value) -> PathBuf {
             let directory = self.job.join(directory_name);
             fs::create_dir(&directory).unwrap();
+            let task_root: PathBuf =
+                serde_json::from_value(result["task_id"]["path"].clone()).unwrap();
+            let digest = self
+                .tasks
+                .iter()
+                .find(|task| task.root() == task_root)
+                .map_or("foreign", Task::content_digest);
+            fs::write(
+                directory.join("lock.json"),
+                serde_json::to_vec_pretty(&json!({
+                    "task": {
+                        "path": task_root,
+                        "digest": format!("sha256:{digest}"),
+                    },
+                }))
+                .unwrap(),
+            )
+            .unwrap();
             fs::write(
                 directory.join("result.json"),
                 serde_json::to_vec_pretty(result).unwrap(),

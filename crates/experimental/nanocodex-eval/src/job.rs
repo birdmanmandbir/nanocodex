@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::{
     EvalError,
-    durable::scan_manifest_trials,
+    durable::{DurableTrialError, scan_manifest_trials},
     sweep::{RunCoordinate, RunManifest},
 };
 
@@ -89,9 +89,25 @@ impl EvalJob {
             if !retained.is_compatible_with(run) {
                 continue;
             }
-            let completed = scan_manifest_trials(&directory, identity.id, run)
-                .map_err(|error| EvalError::InvalidDurableTrial(error.to_string()))?
-                .len();
+            let trials = match scan_manifest_trials(&directory, identity.id, run) {
+                Ok(trials) => trials,
+                Err(DurableTrialError::TaskContentDigestMismatch { task_root, .. })
+                    if retained.task_content_digest(&task_root).is_none() =>
+                {
+                    continue;
+                }
+                Err(error) => {
+                    return Err(EvalError::InvalidDurableTrial(error.to_string()));
+                }
+            };
+            if retained.missing_content_digest_roots().any(|task_root| {
+                !trials
+                    .iter()
+                    .any(|trial| trial.coordinate().task_root() == task_root)
+            }) {
+                continue;
+            }
+            let completed = trials.len();
             if completed < run.attempt_count() {
                 candidates.push((identity.started_at, identity, directory));
             }
@@ -196,11 +212,22 @@ impl EvalJob {
 
     fn verify_run(path: &Path, expected: &RunManifest) -> Result<(), EvalError> {
         let retained: RunManifest = serde_json::from_slice(&fs::read(path)?)?;
-        if retained.is_compatible_with(expected) {
-            Ok(())
-        } else {
-            Err(EvalError::RunConflict(path.to_path_buf()))
+        if retained == *expected {
+            return Ok(());
         }
+        if !retained.is_compatible_with(expected) {
+            return Err(EvalError::RunConflict(path.to_path_buf()));
+        }
+
+        let directory = path
+            .parent()
+            .ok_or_else(|| EvalError::RunConflict(path.to_path_buf()))?;
+        let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+        serde_json::to_writer_pretty(&mut temporary, expected)?;
+        temporary.write_all(b"\n")?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(path).map_err(|error| error.error)?;
+        Ok(())
     }
 
     fn lease(directory: &Path) -> Result<JobLease, EvalError> {
@@ -496,6 +523,68 @@ mod tests {
     }
 
     #[test]
+    fn digestless_manifest_without_a_terminal_lock_is_not_resumed() {
+        let output = tempdir().unwrap();
+        let run = sweep(2).manifest();
+        let legacy = manifest_without_task_digest(&run);
+        let first = EvalJob::create(output.path()).unwrap();
+        first.bind_run(&legacy).unwrap();
+        let first_id = first.id();
+        drop(first);
+
+        let fresh = EvalJob::resume_or_create(output.path(), &run).unwrap();
+        assert!(!fresh.resumed());
+        assert_ne!(fresh.id(), first_id);
+    }
+
+    #[test]
+    fn terminal_lock_can_prove_a_digestless_legacy_manifest() {
+        let output = tempdir().unwrap();
+        let sweep = sweep(2);
+        let run = sweep.manifest();
+        let legacy = manifest_without_task_digest(&run);
+        let first = EvalJob::create(output.path()).unwrap();
+        first.bind_run(&legacy).unwrap();
+        write_terminal_trial(&first, &sweep);
+        let first_id = first.id();
+        drop(first);
+
+        let resumed = EvalJob::resume_or_create(output.path(), &run).unwrap();
+        assert!(resumed.resumed());
+        assert_eq!(resumed.id(), first_id);
+        resumed.bind_run(&run).unwrap();
+        let upgraded: RunManifest =
+            serde_json::from_slice(&fs::read(resumed.directory().join(RUN_FILE)).unwrap()).unwrap();
+        assert_eq!(upgraded, run);
+    }
+
+    #[test]
+    fn does_not_resume_changed_task_content_at_the_same_root_and_name() {
+        let task_root = tempdir().unwrap();
+        write_task(task_root.path(), "Original instruction.\n");
+        let original = sweep_for_task(Task::load(task_root.path()).unwrap(), 2);
+        let original_run = original.manifest();
+        let output = tempdir().unwrap();
+        let first = EvalJob::create(output.path()).unwrap();
+        first.bind_run(&original_run).unwrap();
+        let first_id = first.id();
+        drop(first);
+
+        fs::write(
+            task_root.path().join("instruction.md"),
+            "Changed instruction.\n",
+        )
+        .unwrap();
+        let changed = sweep_for_task(Task::load(task_root.path()).unwrap(), 2);
+        let changed_run = changed.manifest();
+        assert!(!original_run.is_compatible_with(&changed_run));
+
+        let fresh = EvalJob::resume_or_create(output.path(), &changed_run).unwrap();
+        assert!(!fresh.resumed());
+        assert_ne!(fresh.id(), first_id);
+    }
+
+    #[test]
     fn does_not_resume_a_task_renamed_at_the_same_root() {
         let output = tempdir().unwrap();
         let run = sweep(2).manifest();
@@ -535,12 +624,80 @@ mod tests {
         fs::create_dir_all(&abandoned).unwrap();
         assert!(job.completed_coordinates(&run).unwrap().is_empty());
 
+        write_terminal_trial(&job, &sweep);
+
+        let completed = job.completed_coordinates(&run).unwrap();
+        assert_eq!(completed.len(), 1);
+        assert!(completed.contains(&coordinate));
+    }
+
+    fn sweep(trials: u16) -> Sweep {
+        sweep_for_task(
+            Task::load(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../tasks/write-greeting"),
+            )
+            .unwrap(),
+            trials,
+        )
+    }
+
+    fn sweep_for_task(task: Task, trials: u16) -> Sweep {
+        Sweep::builder()
+            .task(task)
+            .trials(trials)
+            .agent(
+                "test",
+                Nanocodex::builder(nanocodex_agent::OpenAi::new("test-key").unwrap()),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    fn manifest_with_task_name(run: &RunManifest, name: Option<&str>) -> RunManifest {
+        let mut retained = serde_json::to_value(run).unwrap();
+        let task = retained["tasks"][0].as_object_mut().unwrap();
+        if let Some(name) = name {
+            task.insert("name".to_owned(), serde_json::json!(name));
+        } else {
+            task.remove("name");
+        }
+        serde_json::from_value(retained).unwrap()
+    }
+
+    fn manifest_without_task_digest(run: &RunManifest) -> RunManifest {
+        let mut retained = serde_json::to_value(run).unwrap();
+        retained["tasks"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("content_digest");
+        serde_json::from_value(retained).unwrap()
+    }
+
+    fn write_terminal_trial(job: &EvalJob, sweep: &Sweep) {
         let id = Uuid::now_v7();
         let compact_id = id.simple().to_string();
-        let trial_name = format!("write-greeting__test__001__{}", &compact_id[..8]);
+        let coordinate = sweep.attempts().next().unwrap().coordinate();
+        let task = &sweep.tasks()[0];
+        let short_name = task.name().rsplit('/').next().unwrap_or(task.name());
+        let trial_name = format!(
+            "{short_name}__{}__{:03}__{compact_id}",
+            coordinate.agent(),
+            coordinate.repetition()
+        );
         let directory = job.directory().join(&trial_name);
         fs::create_dir(&directory).unwrap();
-        let task = &sweep.tasks()[0];
+        fs::write(
+            directory.join("lock.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "task": {
+                    "path": task.root(),
+                    "digest": format!("sha256:{}", task.content_digest()),
+                },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         fs::write(
             directory.join("result.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
@@ -562,39 +719,34 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-
-        let completed = job.completed_coordinates(&run).unwrap();
-        assert_eq!(completed.len(), 1);
-        assert!(completed.contains(&coordinate));
     }
 
-    fn sweep(trials: u16) -> Sweep {
-        Sweep::builder()
-            .task(
-                Task::load(
-                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../tasks/write-greeting"),
-                )
-                .unwrap(),
-            )
-            .trials(trials)
-            .agent(
-                "test",
-                Nanocodex::builder(nanocodex_agent::OpenAi::new("test-key").unwrap()),
-            )
-            .unwrap()
-            .build()
-            .unwrap()
-    }
-
-    fn manifest_with_task_name(run: &RunManifest, name: Option<&str>) -> RunManifest {
-        let mut retained = serde_json::to_value(run).unwrap();
-        let task = retained["tasks"][0].as_object_mut().unwrap();
-        if let Some(name) = name {
-            task.insert("name".to_owned(), serde_json::json!(name));
-        } else {
-            task.remove("name");
-        }
-        serde_json::from_value(retained).unwrap()
+    fn write_task(root: &Path, instruction: &str) {
+        fs::create_dir(root.join("environment")).unwrap();
+        fs::create_dir(root.join("tests")).unwrap();
+        fs::write(root.join("instruction.md"), instruction).unwrap();
+        fs::write(root.join("tests/test.sh"), "exit 0\n").unwrap();
+        fs::write(
+            root.join("task.toml"),
+            r#"
+schema_version = "1.1"
+[task]
+name = "suite/stable-name"
+description = "content digest fixture"
+[agent]
+timeout_sec = 1.0
+[verifier]
+timeout_sec = 1.0
+[environment]
+docker_image = "alpine:3.21"
+cpus = 1
+memory_mb = 128
+storage_mb = 128
+gpus = 0
+allow_internet = false
+"#,
+        )
+        .unwrap();
     }
 }
 
