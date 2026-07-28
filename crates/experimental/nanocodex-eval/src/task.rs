@@ -7,6 +7,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::digest::task_content_digest;
+
 const TASK_CONFIG: &str = "task.toml";
 const TASK_INSTRUCTION: &str = "instruction.md";
 const TASK_ENVIRONMENT: &str = "environment";
@@ -16,6 +18,7 @@ const VERIFIER_SCRIPT: &str = "tests/test.sh";
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Task {
     root: PathBuf,
+    content_digest: Box<str>,
     name: Box<str>,
     description: Box<str>,
     prompt: Box<str>,
@@ -139,6 +142,16 @@ pub enum TaskLoadError {
         /// Missing path.
         path: PathBuf,
     },
+
+    /// The immutable task package could not be fingerprinted.
+    #[error("failed to fingerprint task package {path}: {source}")]
+    Fingerprint {
+        /// Task root that could not be fingerprinted.
+        path: PathBuf,
+        /// Filesystem or ignore-rule failure.
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 impl Task {
@@ -198,9 +211,15 @@ impl Task {
             .environment
             .docker_image
             .unwrap_or_else(|| "local-dockerfile".to_owned());
+        let content_digest =
+            task_content_digest(&root).map_err(|source| TaskLoadError::Fingerprint {
+                path: root.clone(),
+                source,
+            })?;
 
         Ok(Self {
             root,
+            content_digest: content_digest.into_boxed_str(),
             name: name.into_boxed_str(),
             description: raw.task.description.into_boxed_str(),
             prompt: prompt.into_boxed_str(),
@@ -249,6 +268,10 @@ impl Task {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub(crate) fn content_digest(&self) -> &str {
+        &self.content_digest
     }
 
     /// Returns the stable task name.

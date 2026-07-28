@@ -58,7 +58,7 @@ use tokio::{sync::oneshot, task::JoinHandle};
 use url::Url;
 use uuid::Uuid;
 
-use checksum::{directory_hash, package_content_hash};
+use checksum::directory_hash;
 
 #[derive(Debug, thiserror::Error)]
 /// An error produced while recording or publishing Harbor-compatible artifacts.
@@ -509,7 +509,7 @@ impl HarborArtifacts {
         let result_path = root.join("result.json");
         let task_path = task.root().to_path_buf();
         let task_checksum = directory_hash(task.root())?;
-        let task_digest = package_content_hash(task.root())?;
+        let task_digest = task.content_digest();
         let config = HarborTrialConfig {
             task: HarborTaskConfig {
                 path: task_path.clone(),
@@ -577,7 +577,7 @@ impl HarborArtifacts {
             task,
             &result.agent.model,
             &result.agent.effort,
-            &task_digest,
+            task_digest,
             result.environment,
         );
         Self::write_json(&lock_path, &lock)?;
@@ -633,7 +633,7 @@ impl HarborArtifacts {
         let result_path = root.join("result.json");
         let task_path = task.root().to_path_buf();
         let task_checksum = directory_hash(task.root())?;
-        let task_digest = package_content_hash(task.root())?;
+        let task_digest = task.content_digest();
         let model = trajectory.agent.model_name.as_str();
         let effort = trajectory
             .steps
@@ -699,7 +699,7 @@ impl HarborArtifacts {
         Self::write_file(&trial_log_path, failure.traceback.as_bytes())?;
         Self::write_file(&stderr_path, failure.traceback.as_bytes())?;
 
-        let lock = HarborTrialLock::new(task, model, effort, &task_digest, failure.environment);
+        let lock = HarborTrialLock::new(task, model, effort, task_digest, failure.environment);
         Self::write_json(&lock_path, &lock)?;
         Self::write_terminal_json(
             &result_path,
@@ -2150,7 +2150,7 @@ allow_internet = false
                 task,
                 "gpt-test",
                 "high",
-                "fixture",
+                task.content_digest(),
                 EvalEnvironment::Native,
             ),
         )

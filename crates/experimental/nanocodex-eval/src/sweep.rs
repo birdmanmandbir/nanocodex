@@ -56,6 +56,8 @@ struct RunTask {
     root: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_digest: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -218,6 +220,7 @@ impl Sweep {
                 .map(|task| RunTask {
                     root: task.root().to_path_buf(),
                     name: Some(task.name().to_owned()),
+                    content_digest: Some(task.content_digest().to_owned()),
                 })
                 .collect(),
             agents: self.agents.iter().map(|agent| agent.id.clone()).collect(),
@@ -235,6 +238,21 @@ impl RunManifest {
         self.tasks.iter().any(|task| task.root == task_root)
     }
 
+    pub(crate) fn task_content_digest(&self, task_root: &Path) -> Option<&str> {
+        self.tasks
+            .iter()
+            .find(|task| task.root == task_root)?
+            .content_digest
+            .as_deref()
+    }
+
+    pub(crate) fn missing_content_digest_roots(&self) -> impl Iterator<Item = &Path> {
+        self.tasks
+            .iter()
+            .filter(|task| task.content_digest.is_none())
+            .map(|task| task.root.as_path())
+    }
+
     pub(crate) fn is_compatible_with(&self, other: &Self) -> bool {
         if self.trials != other.trials
             || self.agents != other.agents
@@ -250,6 +268,10 @@ impl RunManifest {
         tasks.into_iter().zip(other_tasks).all(|(left, right)| {
             left.root == right.root
                 && match (&left.name, &right.name) {
+                    (Some(left), Some(right)) => left == right,
+                    (None, _) | (_, None) => true,
+                }
+                && match (&left.content_digest, &right.content_digest) {
                     (Some(left), Some(right)) => left == right,
                     (None, _) | (_, None) => true,
                 }
@@ -531,7 +553,9 @@ mod tests {
             .unwrap();
         let current = sweep.manifest();
         let mut retained = serde_json::to_value(&current).unwrap();
-        retained["tasks"][0].as_object_mut().unwrap().remove("name");
+        let retained_task = retained["tasks"][0].as_object_mut().unwrap();
+        retained_task.remove("name");
+        retained_task.remove("content_digest");
         let legacy: RunManifest = serde_json::from_value(retained).unwrap();
         let task = &sweep.tasks()[0];
         let id = Uuid::from_u128(0x1234_5678_0000_0000_0000_0000_0000_0001);
