@@ -1,7 +1,7 @@
 use std::{
     fs::{self, File},
     io,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     time::{Instant, UNIX_EPOCH},
 };
 
@@ -80,6 +80,8 @@ impl GuestRuntimeDisk {
     /// binary or opening ext4. A changed source, disk, or record falls back to a
     /// complete byte-for-byte validation. Concurrent callers serialize on a
     /// per-digest filesystem lock and publish through unique temporary files.
+    /// The caller-selected cache root and every managed descendant must be real
+    /// directories or regular files; descendant symlinks are rejected.
     ///
     /// # Errors
     ///
@@ -151,9 +153,11 @@ impl GuestRuntimeDisk {
                 path: binary.to_path_buf(),
                 source,
             })?;
+        let cache = RuntimeCache::open(cache)?;
         let source_snapshot = binary_snapshot(&binary)?;
-        let record_path = runtime_record_path(cache, &binary);
-        if let Some((digest, path)) = recorded_runtime_disk(&record_path, source_snapshot, cache)? {
+        let record_path = runtime_record_path(&cache, &binary)?;
+        if let Some((digest, path)) = recorded_runtime_disk(&record_path, source_snapshot, &cache)?
+        {
             return Ok(Self {
                 path,
                 digest,
@@ -173,7 +177,7 @@ impl GuestRuntimeDisk {
         }
 
         let digest = runtime_digest(&bytes);
-        let directory = cache.join("runtimes").join(&digest);
+        let directory = cache.directory(Path::new("runtimes").join(&digest))?;
         let path = directory.join("runtime.ext4");
         if valid_cached_disk(&path, &bytes)? {
             write_runtime_record(&record_path, source_snapshot, &digest, &path)?;
@@ -184,8 +188,7 @@ impl GuestRuntimeDisk {
             });
         }
 
-        fs::create_dir_all(&directory).map_err(|source| cache_error(directory.clone(), source))?;
-        let _lock = CacheLock::acquire(cache, &digest)?;
+        let _lock = CacheLock::acquire(&cache, &digest)?;
         if valid_cached_disk(&path, &bytes)? {
             write_runtime_record(&record_path, source_snapshot, &digest, &path)?;
             return Ok(Self {
@@ -268,22 +271,116 @@ pub enum GuestRuntimeDiskError {
     },
 }
 
+struct RuntimeCache {
+    root: PathBuf,
+}
+
+impl RuntimeCache {
+    fn open(root: &Path) -> Result<Self, GuestRuntimeDiskError> {
+        fs::create_dir_all(root).map_err(|source| cache_error(root.to_path_buf(), source))?;
+        ensure_cache_directory(root)?;
+        Ok(Self {
+            root: root.to_path_buf(),
+        })
+    }
+
+    fn directory(&self, relative: impl AsRef<Path>) -> Result<PathBuf, GuestRuntimeDiskError> {
+        let relative = relative.as_ref();
+        let mut directory = self.root.clone();
+        for component in relative.components() {
+            let Component::Normal(component) = component else {
+                return Err(cache_error(
+                    self.root.join(relative),
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "runtime cache path contains a non-normal component",
+                    ),
+                ));
+            };
+            directory.push(component);
+            match fs::create_dir(&directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(source) => return Err(cache_error(directory, source)),
+            }
+            ensure_cache_directory(&directory)?;
+        }
+        Ok(directory)
+    }
+}
+
+fn ensure_cache_directory(path: &Path) -> Result<(), GuestRuntimeDiskError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|source| cache_error(path.to_path_buf(), source))?;
+    if metadata.file_type().is_dir() {
+        Ok(())
+    } else {
+        Err(cache_error(
+            path.to_path_buf(),
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "runtime cache path component is not a directory",
+            ),
+        ))
+    }
+}
+
+fn cache_file_metadata(path: &Path) -> Result<Option<fs::Metadata>, GuestRuntimeDiskError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(Some(metadata)),
+        Ok(_) => Err(cache_error(
+            path.to_path_buf(),
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "runtime cache file is not a regular file",
+            ),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(cache_error(path.to_path_buf(), source)),
+    }
+}
+
+fn ensure_cache_file(path: &Path) -> Result<(), GuestRuntimeDiskError> {
+    cache_file_metadata(path)?.map_or_else(
+        || {
+            Err(cache_error(
+                path.to_path_buf(),
+                io::Error::new(io::ErrorKind::NotFound, "runtime cache file does not exist"),
+            ))
+        },
+        |_| Ok(()),
+    )
+}
+
 struct CacheLock(File);
 
 impl CacheLock {
-    fn acquire(cache: &Path, digest: &str) -> Result<Self, GuestRuntimeDiskError> {
-        let directory = cache.join("locks").join("runtimes");
-        fs::create_dir_all(&directory).map_err(|source| cache_error(directory.clone(), source))?;
+    fn acquire(cache: &RuntimeCache, digest: &str) -> Result<Self, GuestRuntimeDiskError> {
+        let directory = cache.directory("locks/runtimes")?;
         let path = directory.join(format!("{digest}.lock"));
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
-            .map_err(|source| cache_error(path.clone(), source))?;
+        let file = open_cache_lock(&path)?;
         fs2::FileExt::lock_exclusive(&file).map_err(|source| cache_error(path.clone(), source))?;
         Ok(Self(file))
+    }
+}
+
+fn open_cache_lock(path: &Path) -> Result<File, GuestRuntimeDiskError> {
+    match fs::OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            ensure_cache_file(path)?;
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .map_err(|source| cache_error(path.to_path_buf(), source))
+        }
+        Err(source) => Err(cache_error(path.to_path_buf(), source)),
     }
 }
 
@@ -347,20 +444,26 @@ fn binary_snapshot(path: &Path) -> Result<FileSnapshot, GuestRuntimeDiskError> {
     })
 }
 
-fn runtime_record_path(cache: &Path, binary: &Path) -> PathBuf {
+fn runtime_record_path(
+    cache: &RuntimeCache,
+    binary: &Path,
+) -> Result<PathBuf, GuestRuntimeDiskError> {
     let mut identity = Sha256::new();
     identity.update(b"nanocodex-vm-runtime-record-v1\0");
     identity.update(binary.as_os_str().as_encoded_bytes());
-    cache
-        .join("runtime-records")
-        .join(format!("{}.json", hex::encode(identity.finalize())))
+    Ok(cache
+        .directory("runtime-records")?
+        .join(format!("{}.json", hex::encode(identity.finalize()))))
 }
 
 fn recorded_runtime_disk(
     record_path: &Path,
     source: FileSnapshot,
-    cache: &Path,
+    cache: &RuntimeCache,
 ) -> Result<Option<(String, PathBuf)>, GuestRuntimeDiskError> {
+    if cache_file_metadata(record_path)?.is_none() {
+        return Ok(None);
+    }
     let contents = match fs::read(record_path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -388,17 +491,11 @@ fn recorded_runtime_disk(
     }
 
     let path = cache
-        .join("runtimes")
-        .join(&record.digest)
+        .directory(Path::new("runtimes").join(&record.digest))?
         .join("runtime.ext4");
-    let metadata = match fs::metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(cache_error(path, source)),
-    };
-    if !metadata.is_file() {
+    let Some(metadata) = cache_file_metadata(&path)? else {
         return Ok(None);
-    }
+    };
     let disk = FileSnapshot::from_metadata(&metadata)
         .map_err(|source| cache_error(path.clone(), source))?;
     if disk.bytes != record.disk_bytes || disk.modified_unix_ns != record.disk_modified_unix_ns {
@@ -434,7 +531,8 @@ fn write_runtime_record(
             )
         })?
         .to_path_buf();
-    fs::create_dir_all(&directory).map_err(|source| cache_error(directory.clone(), source))?;
+    ensure_cache_directory(&directory)?;
+    let _ = cache_file_metadata(record_path)?;
     let mut temporary = tempfile::Builder::new()
         .prefix(".runtime-record.")
         .tempfile_in(&directory)
@@ -456,12 +554,10 @@ fn is_sha256_digest(digest: &str) -> bool {
 }
 
 fn valid_cached_disk(path: &Path, binary: &[u8]) -> Result<bool, GuestRuntimeDiskError> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(source) => return Err(cache_error(path.to_path_buf(), source)),
+    let Some(metadata) = cache_file_metadata(path)? else {
+        return Ok(false);
     };
-    if !metadata.is_file() || metadata.len() != DISK_BYTES {
+    if metadata.len() != DISK_BYTES {
         return Ok(false);
     }
     let Ok(mut reader) = Reader::new(path) else {
@@ -561,6 +657,95 @@ mod tests {
         assert_eq!(reused.status(), GuestRuntimeDiskStatus::Hit);
         assert_eq!(reused.path(), created.path());
         assert_eq!(reused.digest(), created.digest());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_nested_runtime_directory_symlinks_without_external_writes() {
+        let bytes = b"\x7fELF nested runtime cache escape";
+        let digest = runtime_digest(bytes);
+        for relative in [
+            std::path::PathBuf::from("runtimes"),
+            std::path::PathBuf::from("runtimes").join(&digest),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let binary = directory.path().join("nanocodex-vm-guest");
+            let cache = directory.path().join("cache");
+            let outside = directory.path().join("outside");
+            fs::write(&binary, bytes).unwrap();
+            fs::create_dir(&cache).unwrap();
+            fs::create_dir(&outside).unwrap();
+            let link = cache.join(&relative);
+            fs::create_dir_all(link.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+            let error = GuestRuntimeDisk::prepare(&binary, &cache).unwrap_err();
+
+            assert!(error.to_string().contains(&link.display().to_string()));
+            assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_lock_and_record_directory_symlinks_without_external_writes() {
+        let bytes = b"\x7fELF nested lock and record escape";
+        for relative in ["runtime-records", "locks", "locks/runtimes"] {
+            let directory = tempfile::tempdir().unwrap();
+            let binary = directory.path().join("nanocodex-vm-guest");
+            let cache = directory.path().join("cache");
+            let outside = directory.path().join("outside");
+            fs::write(&binary, bytes).unwrap();
+            fs::create_dir(&cache).unwrap();
+            fs::create_dir(&outside).unwrap();
+            let link = cache.join(relative);
+            fs::create_dir_all(link.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+            let error = GuestRuntimeDisk::prepare(&binary, &cache).unwrap_err();
+
+            assert!(error.to_string().contains(&link.display().to_string()));
+            assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_managed_cache_file_symlinks_without_external_writes() {
+        let bytes = b"\x7fELF managed cache file escape";
+        let digest = runtime_digest(bytes);
+        for managed_file in ["record", "runtime", "lock"] {
+            let directory = tempfile::tempdir().unwrap();
+            let binary = directory.path().join("nanocodex-vm-guest");
+            let cache = directory.path().join("cache");
+            let outside = directory.path().join("outside-file");
+            fs::write(&binary, bytes).unwrap();
+            fs::write(&outside, b"outside sentinel").unwrap();
+            let path = match managed_file {
+                "record" => {
+                    let cache = super::RuntimeCache::open(&cache).unwrap();
+                    let binary = fs::canonicalize(&binary).unwrap();
+                    super::runtime_record_path(&cache, &binary).unwrap()
+                }
+                "runtime" => {
+                    let parent = cache.join("runtimes").join(&digest);
+                    fs::create_dir_all(&parent).unwrap();
+                    parent.join("runtime.ext4")
+                }
+                "lock" => {
+                    let parent = cache.join("locks/runtimes");
+                    fs::create_dir_all(&parent).unwrap();
+                    parent.join(format!("{digest}.lock"))
+                }
+                _ => unreachable!(),
+            };
+            std::os::unix::fs::symlink(&outside, &path).unwrap();
+
+            let error = GuestRuntimeDisk::prepare(&binary, &cache).unwrap_err();
+
+            assert!(error.to_string().contains(&path.display().to_string()));
+            assert_eq!(fs::read(&outside).unwrap(), b"outside sentinel");
+        }
     }
 
     #[test]
