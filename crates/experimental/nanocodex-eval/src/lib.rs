@@ -54,6 +54,7 @@
 
 mod aggregate;
 mod atif;
+mod durable;
 mod evaluator;
 mod event;
 pub mod harbor;
