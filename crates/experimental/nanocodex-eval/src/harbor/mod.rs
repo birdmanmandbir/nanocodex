@@ -47,9 +47,9 @@ use std::{
 
 use crate::{
     AgentMetadata, AggregateDataset, AtifBuilder, AtifTrajectory, AttemptFact,
-    AttemptFactArtifacts, BillingCompleteness, EvalCleanup, EvalEnvironment, EvalEventKind,
-    EvalEventStream, EvalEventStreamError, EvalFailure, EvalOutcome, EvalResult, Evaluator,
-    LatencyBreakdown, PhaseTiming, Task, TaskLoadError,
+    AttemptFactArtifacts, BillingCompleteness, EvalAttemptOutcome, EvalCleanup, EvalEnvironment,
+    EvalEventKind, EvalEventStream, EvalEventStreamError, EvalFailure, EvalOutcome, EvalResult,
+    Evaluator, LatencyBreakdown, PhaseTiming, Task, TaskLoadError,
     digest::PACKAGE_DIGEST_SCHEMA,
     durable::scan_manifest_trials,
     sweep::{RunCoordinate, RunManifest},
@@ -198,18 +198,21 @@ impl Harbor {
 }
 
 impl HarborRecorder {
-    /// Waits until every supplied result's terminal event has been recorded,
+    /// Waits until every supplied outcome's terminal event has been recorded,
     /// then commits the final Harbor job result.
     ///
     /// # Errors
     ///
     /// Returns an error on event lag, malformed event payloads, filesystem
     /// failures, or premature recorder termination.
-    pub async fn finish(mut self, results: Vec<EvalResult>) -> Result<HarborJob, HarborError> {
+    pub async fn finish(
+        mut self,
+        outcomes: Vec<EvalAttemptOutcome>,
+    ) -> Result<HarborJob, HarborError> {
         self.finish
             .take()
             .ok_or(HarborError::RecorderStopped)?
-            .send(FinishRequest::Results(results))
+            .send(FinishRequest::Outcomes(outcomes))
             .map_err(|_| HarborError::RecorderStopped)?;
         self.task
             .take()
@@ -313,7 +316,7 @@ struct AttemptRecording {
 }
 
 enum FinishRequest {
-    Results(Vec<EvalResult>),
+    Outcomes(Vec<EvalAttemptOutcome>),
     TerminalCount(usize),
 }
 
@@ -322,15 +325,15 @@ fn finished_attempt_count(
     completed: &HashSet<Uuid>,
 ) -> Option<usize> {
     match request? {
-        FinishRequest::Results(results)
-            if results
+        FinishRequest::Outcomes(outcomes)
+            if outcomes
                 .iter()
-                .all(|result| completed.contains(&result.attempt_id)) =>
+                .all(|outcome| completed.contains(&outcome.attempt_id())) =>
         {
-            Some(results.len())
+            Some(outcomes.len())
         }
         FinishRequest::TerminalCount(expected) if completed.len() == *expected => Some(*expected),
-        FinishRequest::Results(_) | FinishRequest::TerminalCount(_) => None,
+        FinishRequest::Outcomes(_) | FinishRequest::TerminalCount(_) => None,
     }
 }
 
@@ -562,16 +565,6 @@ impl HarborArtifacts {
         let trial_uri = Url::from_directory_path(root)
             .map_err(|()| HarborError::InvalidTrialPath(root.clone()))?
             .to_string();
-        let cleanup_exception =
-            result
-                .cleanup
-                .first_failure()
-                .map(|(diagnostic, timing)| HarborExceptionInfo {
-                    exception_type: "CleanupError",
-                    exception_message: &diagnostic.message,
-                    exception_traceback: &diagnostic.traceback,
-                    occurred_at: timing.finished_at,
-                });
         let trial_result = HarborTrialResult {
             id: result.attempt_id,
             task_name: &result.task_name,
@@ -612,7 +605,10 @@ impl HarborArtifacts {
             agent_setup: Some(&result.timing.agent_setup),
             agent_execution: Some(&result.timing.agent_execution),
             verifier: Some(&result.timing.verifier),
-            exception_info: cleanup_exception,
+            // Cleanup is an orthogonal health signal. Harbor interprets any
+            // exception as an unscored error, so scored attempts retain cleanup
+            // only in the dedicated extension above.
+            exception_info: None,
             step_results: None,
         };
         Self::write_file(&trial_log_path, [])?;
@@ -1631,7 +1627,11 @@ impl DurableHarborTrial {
             passed,
             cleanup_failed,
             cost_usd: agent.and_then(|agent| agent.cost_usd),
-            billing_completeness: agent.and_then(|agent| agent.billing_completeness),
+            billing_completeness: agent.map(|agent| {
+                agent
+                    .billing_completeness
+                    .unwrap_or(BillingCompleteness::Unknown)
+            }),
             latency: LatencyBreakdown {
                 queue_wait_ns,
                 environment_setup_ns,
@@ -1690,6 +1690,7 @@ struct HarborJobStats {
     n_completed_trials: usize,
     n_errored_trials: usize,
     n_cleanup_failed_trials: usize,
+    n_billing_unknown_trials: usize,
     n_running_trials: usize,
     n_pending_trials: usize,
     n_cancelled_trials: usize,
@@ -1712,7 +1713,10 @@ impl HarborJobStats {
                 stats.n_input_tokens = stats.n_input_tokens.saturating_add(agent.n_input_tokens);
                 stats.n_cache_tokens = stats.n_cache_tokens.saturating_add(agent.n_cache_tokens);
                 stats.n_output_tokens = stats.n_output_tokens.saturating_add(agent.n_output_tokens);
-                if let Some(cost) = agent.cost_usd {
+                if agent.billing_completeness != Some(BillingCompleteness::Complete) {
+                    stats.n_billing_unknown_trials =
+                        stats.n_billing_unknown_trials.saturating_add(1);
+                } else if let Some(cost) = agent.cost_usd {
                     stats.cost_usd = Some(stats.cost_usd.unwrap_or_default() + cost);
                 }
             }
@@ -1874,7 +1878,9 @@ struct HarborMetric {}
 mod tests {
     use std::{collections::BTreeMap, fs, path::Path};
 
-    use crate::{AtifTrajectory, EvalEnvironment, EvalOutcome, Evaluator, Sweep, Task};
+    use crate::{
+        AtifTrajectory, BillingCompleteness, EvalEnvironment, EvalOutcome, Evaluator, Sweep, Task,
+    };
     use chrono::Utc;
     use nanocodex_agent::{Nanocodex, OpenAi};
     use serde::Deserialize;
@@ -2166,6 +2172,67 @@ mod tests {
     }
 
     #[test]
+    fn unknown_billing_cost_is_retained_but_excluded_from_job_totals() {
+        let output = tempdir().unwrap();
+        let task = write_greeting_task();
+        let sweep = Sweep::builder()
+            .task(task.clone())
+            .agent(
+                "default",
+                Nanocodex::builder(OpenAi::new("test-key").unwrap()),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let (eval, _) = Evaluator::builder(Nanocodex::builder(OpenAi::new("test-key").unwrap()))
+            .output_directory(output.path())
+            .fresh_run(&sweep)
+            .build()
+            .unwrap();
+        write_retained_trial(
+            eval.directory(),
+            eval.id(),
+            &task,
+            "default",
+            1,
+            Some(1.0),
+            false,
+        );
+        let trial = fs::read_dir(eval.directory())
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .unwrap()
+            .path();
+        let result_path = trial.join("result.json");
+        let mut result: serde_json::Value =
+            serde_json::from_slice(&fs::read(&result_path).unwrap()).unwrap();
+        result["agent_result"]["billing_completeness"] = json!("unknown");
+        HarborArtifacts::write_json(&result_path, &result).unwrap();
+
+        Harbor::new(&eval).unwrap();
+        let rebuilt: serde_json::Value =
+            serde_json::from_slice(&fs::read(eval.directory().join("result.json")).unwrap())
+                .unwrap();
+        assert_eq!(rebuilt["stats"]["n_billing_unknown_trials"], 1);
+        assert!(rebuilt["stats"]["cost_usd"].is_null());
+
+        let aggregate = HarborJob {
+            id: eval.id(),
+            directory: eval.directory().to_path_buf(),
+        }
+        .aggregate_dataset()
+        .unwrap();
+        assert_eq!(aggregate.attempts[0].cost_usd, Some(0.25));
+        assert_eq!(
+            aggregate.attempts[0].billing_completeness,
+            Some(BillingCompleteness::Unknown)
+        );
+        assert_eq!(aggregate.configurations[0].cost_usd.samples, 0);
+        assert_eq!(aggregate.configurations[0].billing_unknown_attempts, 1);
+    }
+
+    #[test]
     fn pass_at_k_matches_harbors_unbiased_estimator() {
         assert!((pass_at_k_for_task(5, 2, 2) - 0.7).abs() < f64::EPSILON);
 
@@ -2314,7 +2381,13 @@ allow_internet = false
             .record(events.subscribe())
             .unwrap();
 
-        assert!(eval.task(task).await.is_err());
+        assert!(
+            eval.task(task)
+                .await
+                .unwrap()
+                .unscored()
+                .is_some_and(|failure| failure.kind == crate::EvalFailureKind::Environment)
+        );
         let job = recorder.finish_all(1).await.unwrap();
         let trial = fs::read_dir(job.directory())
             .unwrap()
@@ -2386,6 +2459,7 @@ allow_internet = false
                 "n_cache_tokens": 4,
                 "n_output_tokens": 3,
                 "cost_usd": 0.25,
+                "billing_completeness": "complete",
                 "metadata": {
                     "model_duration_ns": 5,
                     "tool_work_duration_ns": 6,
@@ -2462,9 +2536,7 @@ allow_internet = false
                     },
                 },
             });
-            result["exception_info"] = json!({
-                "exception_type": "CleanupError",
-            });
+            result["exception_info"] = serde_json::Value::Null;
         }
         super::HarborArtifacts::write_json(
             &directory.join("lock.json"),

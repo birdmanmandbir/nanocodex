@@ -3,7 +3,7 @@ use std::{env, error::Error, path::PathBuf};
 use nanocodex::{Nanocodex, OpenAi, Thinking, oai::auth::OpenAiAuth};
 use nanocodex_eval::harbor::Harbor;
 use nanocodex_eval::{
-    EvalEventKind, EvalEventStream, EvalEventStreamError, EvalResult, Evaluator, Task,
+    EvalAttemptOutcome, EvalEventKind, EvalEventStream, EvalEventStreamError, Evaluator, Task,
 };
 
 const K: usize = 5;
@@ -65,12 +65,18 @@ fn auth() -> Result<OpenAiAuth, Box<dyn Error>> {
     }
 }
 
-fn print_results(results: impl IntoIterator<Item = EvalResult>) {
-    for result in results {
-        println!(
-            "{}: {:?} in {} ms",
-            result.trial_name, result.status, result.agent.metadata.duration_ms,
-        );
+fn print_results(results: impl IntoIterator<Item = EvalAttemptOutcome>) {
+    for outcome in results {
+        match outcome {
+            EvalAttemptOutcome::Scored(result) => println!(
+                "{}: {:?} in {} ms",
+                result.trial_name, result.status, result.agent.metadata.duration_ms,
+            ),
+            EvalAttemptOutcome::Unscored(failure) => println!(
+                "{}: {:?} ({})",
+                failure.trial_name, failure.outcome, failure.message,
+            ),
+        }
     }
 }
 
