@@ -5,8 +5,12 @@ use nanocodex_agent::{
     Nanocodex, OpenAi, Thinking,
     events::{AgentEvent, AgentEventKind},
 };
-use nanocodex_eval::{AtifBuilder, Evaluator, Sweep, Task};
+use nanocodex_eval::{
+    AggregateDataset, AtifBuilder, AttemptFact, AttemptFactArtifacts, Evaluator, LatencyBreakdown,
+    Sweep, Task,
+};
 use serde_json::{Value, json, value::RawValue};
+use uuid::Uuid;
 
 const TRACE_TURNS: usize = 64;
 const EVENTS_PER_TURN: usize = 6;
@@ -78,7 +82,50 @@ fn benchmark_eval_runtime(criterion: &mut Criterion) {
             black_box(builder);
         });
     });
+
+    let facts = representative_attempt_facts();
+    group.throughput(Throughput::Elements(facts.len() as u64));
+    group.bench_function("aggregate_60_plot_facts", |bencher| {
+        bencher.iter(|| black_box(AggregateDataset::new(black_box(facts.clone()))));
+    });
     group.finish();
+}
+
+fn representative_attempt_facts() -> Vec<AttemptFact> {
+    let mut facts = Vec::new();
+    for configuration in ["medium-defaults", "medium-web", "high-defaults", "high-web"] {
+        for task in ["extract-todos", "uppercase-message", "write-greeting"] {
+            for repetition in 1..=5 {
+                let directory =
+                    PathBuf::from(format!("retained/{configuration}/{task}/{repetition}"));
+                facts.push(AttemptFact {
+                    attempt_id: Uuid::now_v7(),
+                    task_name: task.to_owned(),
+                    configuration: configuration.to_owned(),
+                    repetition,
+                    passed: (repetition + u16::from(configuration.starts_with("high"))) % 3 != 0,
+                    cost_usd: Some(0.05 + f64::from(repetition) / 100.0),
+                    latency: LatencyBreakdown {
+                        queue_wait_ns: u64::from(repetition) * 10_000_000,
+                        vm_bootstrap_ns: 90_000_000,
+                        agent_execution_ns: 8_000_000_000,
+                        model_ns: 7_500_000_000,
+                        tool_work_ns: 100_000_000,
+                        tool_wall_ns: 120_000_000,
+                        verifier_ns: 40_000_000,
+                        total_ns: 8_250_000_000,
+                        ..LatencyBreakdown::default()
+                    },
+                    artifacts: AttemptFactArtifacts {
+                        trajectory: directory.join("agent/trajectory.json"),
+                        verifier_output: directory.join("verifier/test-stdout.txt"),
+                        directory,
+                    },
+                });
+            }
+        }
+    }
+    facts
 }
 
 fn build_sweep(tasks: &[Task], agent: &nanocodex_agent::NanocodexBuilder) -> nanocodex_eval::Sweep {

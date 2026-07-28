@@ -30,15 +30,25 @@ workload opens an actual durable finite-sweep job under an advisory lock.
 | Operation | Representative workload | Estimate |
 | --- | --- | ---: |
 | task load | canonicalize and parse one complete checked-in task | 39.826–40.463 µs |
-| sweep plan | 3 tasks × 4 agent recipes × 5 trials (60 attempts) | not yet remeasured |
+| sweep plan | 3 tasks × 4 agent recipes × 5 trials (60 attempts) | 735.76–737.19 ns |
 | durable resume | validate and reopen one matching incomplete job | 145.64–147.51 µs |
 | ATIF projection | 384 ordered full-content typed events | 122.50–122.79 µs |
+| plot facts | aggregate 60 attempts with task drilldown, confidence, cost, latency, and pass@k | 9.2592–9.3042 µs |
 
 The earlier 80-attempt plan measured about 17.6 ns per attempt, but that
 measurement included an out-of-scope browser fixture and is not a current
 claim. ATIF projection measured about 319 ns per event. Task loading, sweep
 planning, and event projection can run independently; attempt execution remains
 bounded only by the explicit CPU and memory admission policy.
+
+The sweep-plan and plot-fact rows were remeasured on 2026-07-28 on
+`dev-georgios` (x86_64 Linux, 32 logical CPUs, rustc 1.97.1), using the same
+optimized Criterion profile and 30 samples:
+
+```sh
+cargo bench -p nanocodex-eval --bench eval_runtime -- plan_3x4x5_sweep
+cargo bench -p nanocodex-eval --bench eval_runtime -- aggregate_60_plot_facts
+```
 
 ## Regression contract
 
@@ -50,6 +60,7 @@ Machine-local investigation budgets:
 | plan the 60-attempt sweep | ≤ 10 µs |
 | reopen the one-job resume fixture | ≤ 500 µs |
 | project the 384-event trajectory | ≤ 500 µs |
+| aggregate 60 plot facts | ≤ 50 µs |
 
 Structural gates:
 
@@ -170,6 +181,37 @@ committed-attempt skipping, active-owner rejection, scheduler-only resume
 overrides, atomic terminal publication, and failure retention. Together with
 the deliberate authentication failure and live Harbor viewer proof above, this
 closes the native, VM, Frontier artifact, resume, failure, and viewer gates.
+
+## 2026-07-28 Linux KVM and focused live evidence
+
+The rebased Part 2 branch was exercised on `dev-georgios`, x86_64 Linux with
+`/dev/kvm` and `libkrunfw.so.5`. `just build-vm-guest` produced the lean
+`x86_64-unknown-linux-musl` guest, and a private reflink of the unchanged
+`write-greeting` Alpine root booted through KVM, wrote `kvm-ready` inside
+`/app`, read it back, and shut down successfully.
+
+Two unchanged one-trial jobs used the local Codex subscription credential:
+
+| Mode | Job | Result | Wall | Cost | Task tokens |
+| --- | --- | --- | ---: | ---: | ---: |
+| native | `.nanocodex/evidence/native-write-greeting/019fa684-3823-7250-9a89-ee618eb35cff` | reward 1.0 | 10.228 s | $0.095630 | 27,933 |
+| Linux KVM | `.nanocodex/evidence/vm-write-greeting/019fa684-9e40-74f1-8a82-49393517f309` | reward 1.0 | 9.272 s | $0.101421 | 27,358 |
+
+Both directories retain the Harbor result, exact input/event JSONL, ATIF
+trajectory, verifier reward and stdout, workspace, and task package. The VM
+job additionally retains its private 512 MiB sparse/reflink root and gvproxy
+log. `.nanocodex/evidence/vm-write-greeting.log` proves root materialization,
+VMM spawn, the typed readiness exchange (89.801 ms), model-visible tool calls,
+guest RPC mutation, in-guest verifier execution, reward-file collection, and
+an acknowledged shutdown.
+
+The separate normal headless consumer is retained under
+`.nanocodex/evidence/run-vm`: 254 stdout JSONL records end in exactly one
+`run.completed`, while `trace.jsonl` separately proves VMM spawn/readiness,
+`apply_patch` and `exec_command` guest RPC, exact 14-byte verification, and
+acknowledged graceful shutdown. Its run completed in 6.778 s at an estimated
+$0.084523. These paths are intentionally ignored development evidence and are
+not source-controlled.
 
 ## Public GPT-5.6 Sol Terminal-Bench 2.1 comparator
 
