@@ -10,12 +10,12 @@ use super::{
     ToolResult,
 };
 
-pub(super) struct ViewImageHandler {
+pub(crate) struct ViewImageHandler {
     workspace: PathBuf,
 }
 
 impl ViewImageHandler {
-    pub(super) const fn new(workspace: PathBuf) -> Self {
+    pub(crate) const fn new(workspace: PathBuf) -> Self {
         Self { workspace }
     }
 }

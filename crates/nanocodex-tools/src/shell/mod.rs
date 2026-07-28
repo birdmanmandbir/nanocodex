@@ -129,6 +129,7 @@ impl ShellSessions {
         }
     }
 
+    #[cfg(feature = "native")]
     pub(crate) const fn default_shell_name(&self) -> &'static str {
         self.default_shell.name()
     }
@@ -259,6 +260,7 @@ impl ShellSessions {
         }
     }
 
+    #[cfg(feature = "native")]
     pub(crate) async fn terminate_turn(&self, turn_id: u64) {
         let sessions = {
             let mut store = self.sessions.lock().await;

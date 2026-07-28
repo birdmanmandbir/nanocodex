@@ -167,6 +167,7 @@ pub enum ResponseEvent {
 }
 
 impl ServerEvent {
+    #[cfg(feature = "client")]
     pub(crate) fn normalized(&self) -> Option<ResponseEvent> {
         match self {
             Self::Created { .. } => Some(ResponseEvent::Created),

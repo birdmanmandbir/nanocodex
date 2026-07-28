@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use nanocodex_tools::{ToolContext, runtime::ToolRuntime};
+use nanocodex_tools::{ToolContext, workspace_runtime::WorkspaceToolRuntime};
 use nix::{
     errno::Errno,
     sys::signal::{Signal, killpg},
@@ -74,7 +74,7 @@ async fn serve_io(
     input: impl AsyncRead + Unpin,
     mut output: impl AsyncWrite + Unpin,
 ) -> Result<(), VmGuestError> {
-    let runtime = Arc::new(ToolRuntime::new(workspace, None, None));
+    let runtime = Arc::new(WorkspaceToolRuntime::new(workspace.to_path_buf()));
     let mut input = BufReader::new(input);
     let mut requests = JoinSet::<SessionResponse>::new();
     let mut active = HashMap::<u64, tokio::task::AbortHandle>::new();
@@ -146,7 +146,10 @@ async fn serve_io(
     Ok(())
 }
 
-async fn execute_request(runtime: Arc<ToolRuntime>, request: SessionRequest) -> SessionResponse {
+async fn execute_request(
+    runtime: Arc<WorkspaceToolRuntime>,
+    request: SessionRequest,
+) -> SessionResponse {
     match request {
         SessionRequest::Ready(request) => SessionResponse::Ready(ControlResponse {
             id: request.id,
