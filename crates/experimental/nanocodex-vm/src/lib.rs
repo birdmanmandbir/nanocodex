@@ -75,7 +75,8 @@ pub use process::{PrivateVmProcessConfig, VmProcessConfig, VmProcessError};
 #[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
 pub use tools::{
     GuestRuntimeDisk, GuestRuntimeDiskError, GuestRuntimeDiskStatus, VmCommand, VmCommandOutput,
-    VmTool, VmToolClient, VmToolSession, VmToolSessionError, VmToolSessionHandle, VmTools,
+    VmCommandPartialOutput, VmTool, VmToolClient, VmToolSession, VmToolSessionError,
+    VmToolSessionHandle, VmTools,
 };
 #[cfg(feature = "guest-runtime")]
 pub use tools::{VmGuestError, serve_guest};

@@ -110,6 +110,15 @@ pub struct VmCommandOutput {
     pub stderr: Vec<u8>,
 }
 
+/// Bounded output captured before a trusted guest command failed to complete.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VmCommandPartialOutput {
+    /// Standard output captured before the command stopped.
+    pub stdout: Vec<u8>,
+    /// Standard error captured before the command stopped.
+    pub stderr: Vec<u8>,
+}
+
 /// Failure to start, use, provision, or stop one retained VM tool session.
 #[derive(Debug, Error)]
 pub enum VmToolSessionError {
@@ -146,8 +155,13 @@ pub enum VmToolSessionError {
     Guest(String),
 
     /// A trusted harness command exceeded its deadline.
-    #[error("guest command exceeded {0:?}")]
-    GuestTimeout(Duration),
+    #[error("guest command exceeded {timeout:?}")]
+    GuestTimeout {
+        /// Configured command deadline.
+        timeout: Duration,
+        /// Bounded output captured before the process group was terminated.
+        output: VmCommandPartialOutput,
+    },
 
     /// A trusted harness command exceeded its combined output limit.
     #[error("guest command output exceeded the {0}-byte limit")]
@@ -743,8 +757,11 @@ impl VmToolSessionHandle {
                     stderr,
                 })
             }
-            (None, None, None, None, true, false) => {
-                Err(VmToolSessionError::GuestTimeout(command_timeout))
+            (None, Some(stdout), Some(stderr), None, true, false) => {
+                Err(VmToolSessionError::GuestTimeout {
+                    timeout: command_timeout,
+                    output: VmCommandPartialOutput { stdout, stderr },
+                })
             }
             (None, None, None, None, false, true) => {
                 Err(VmToolSessionError::GuestOutputLimit(max_output_bytes))
@@ -1115,7 +1132,7 @@ mod tracing_tests {
         Layer, layer::Context as LayerContext, prelude::*, registry::LookupSpan,
     };
 
-    use super::{VmToolSession, VmToolSessionError};
+    use super::{VmCommand, VmCommandPartialOutput, VmToolSession, VmToolSessionError};
 
     static TRACE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1302,6 +1319,38 @@ mod tracing_tests {
                 .write_file("/second", Vec::new(), 0o600)
                 .await
                 .unwrap();
+        });
+    }
+
+    #[test]
+    fn command_timeout_preserves_bounded_guest_output() {
+        let _test_guard = TRACE_TEST_LOCK.lock().unwrap();
+        let response = r#"{"kind":"execute","payload":{"id":0,"exit_code":null,"stdout":"cGFydGlhbCBzdGRvdXQ=","stderr":"cGFydGlhbCBzdGRlcnI=","error":null,"timed_out":true,"output_limit_exceeded":false}}"#;
+        let script = format!("IFS= read -r request\nprintf '%s\\n' '{response}'");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.arg("-c").arg(script);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let session = VmToolSession::spawn(&mut command).unwrap();
+            let error = session
+                .command(VmCommand::new("/bin/true").timeout(Duration::from_secs(17)))
+                .await
+                .unwrap_err();
+            let VmToolSessionError::GuestTimeout { timeout, output } = error else {
+                panic!("expected a typed guest timeout");
+            };
+            assert_eq!(timeout, Duration::from_secs(17));
+            assert_eq!(
+                output,
+                VmCommandPartialOutput {
+                    stdout: b"partial stdout".to_vec(),
+                    stderr: b"partial stderr".to_vec(),
+                }
+            );
         });
     }
 

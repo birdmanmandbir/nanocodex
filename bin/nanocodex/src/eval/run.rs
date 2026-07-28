@@ -35,8 +35,8 @@ use nanocodex_eval::{
 use nanocodex_vm::image::{CachePolicy, VmImageBuilder, reflink_or_sparse_copy};
 use nanocodex_vm::{BlockDevice, GuestCommand, Network, VmConfig};
 use nanocodex_vm::{
-    GuestRuntimeDisk, GuestRuntimeDiskStatus, VmCommand, VmCommandOutput, VmToolSession,
-    VmToolSessionError,
+    GuestRuntimeDisk, GuestRuntimeDiskStatus, VmCommand, VmCommandOutput, VmCommandPartialOutput,
+    VmToolSession, VmToolSessionError,
 };
 use regex::RegexSet;
 use serde::{Deserialize, Serialize};
@@ -3100,18 +3100,9 @@ impl VmVerifier {
     ) -> Result<(VmCommandOutput, bool), VmAttemptError> {
         match session.command(command).await {
             Ok(output) => Ok((output, false)),
-            Err(VmToolSessionError::GuestTimeout(timeout)) => Ok((
-                VmCommandOutput {
-                    exit_code: 124,
-                    stdout: Vec::new(),
-                    stderr: format!(
-                        "canonical verifier exceeded its {timeout:?} deadline; \
-                         the candidate is scored with reward 0\n"
-                    )
-                    .into_bytes(),
-                },
-                true,
-            )),
+            Err(VmToolSessionError::GuestTimeout { timeout, output }) => {
+                Ok((verifier_timeout_output(timeout, output), true))
+            }
             Err(error) => Err(error.into()),
         }
     }
@@ -3305,6 +3296,24 @@ fn remove_passed_rootfs(rootfs: &Path) -> io::Result<bool> {
     }
     fs::remove_file(rootfs)?;
     Ok(true)
+}
+
+fn verifier_timeout_output(
+    timeout: Duration,
+    mut output: VmCommandPartialOutput,
+) -> VmCommandOutput {
+    output.stderr.extend_from_slice(
+        format!(
+            "\ncanonical verifier exceeded its {timeout:?} deadline; \
+             the candidate is scored with reward 0\n"
+        )
+        .as_bytes(),
+    );
+    VmCommandOutput {
+        exit_code: 124,
+        stdout: output.stdout,
+        stderr: output.stderr,
+    }
 }
 
 const fn verifier_shell(configured: &str, skip_setup: bool) -> &str {
@@ -3654,7 +3663,7 @@ mod tests {
 
     use clap::Parser;
     use nanocodex_eval::Task;
-    use nanocodex_vm::VmCommandOutput;
+    use nanocodex_vm::{VmCommandOutput, VmCommandPartialOutput};
 
     use super::{
         CACHED_VERIFIER_SCRIPT, DEFAULT_HOST_UTILIZATION_PERCENT, DEFAULT_TRIALS, HostResources,
@@ -3662,7 +3671,7 @@ mod tests {
         VmRetention, cached_verifier_script, load_tasks, recognized_verifier_setup,
         remove_passed_rootfs, retained_retry_task_names, retained_task_durations,
         verifier_bootstrap_network_failed, verifier_cache_key, verifier_network_retry_delay,
-        verifier_shell,
+        verifier_shell, verifier_timeout_output,
     };
 
     #[derive(Parser)]
@@ -4409,6 +4418,29 @@ source $HOME/.local/bin/env
                 .map(verifier_network_retry_delay)
                 .collect::<Vec<_>>(),
             [2, 4, 8, 16, 32].map(std::time::Duration::from_secs)
+        );
+    }
+
+    #[test]
+    fn verifier_timeout_preserves_partial_output_bytes() {
+        let output = verifier_timeout_output(
+            Duration::from_secs(17),
+            VmCommandPartialOutput {
+                stdout: vec![0, 0xff, b'\n'],
+                stderr: vec![0x80, b'\n'],
+            },
+        );
+
+        assert_eq!(output.exit_code, 124);
+        assert_eq!(output.stdout, [0, 0xff, b'\n']);
+        assert_eq!(
+            output.stderr,
+            [
+                &[0x80, b'\n'][..],
+                b"\ncanonical verifier exceeded its 17s deadline; \
+                  the candidate is scored with reward 0\n",
+            ]
+            .concat()
         );
     }
 }
