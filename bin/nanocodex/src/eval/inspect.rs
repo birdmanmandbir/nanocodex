@@ -283,6 +283,15 @@ impl TrialInspection {
                 agent.cache_percent_tenths / 10,
                 agent.cache_percent_tenths % 10
             )?;
+            let billing = match agent.billing_completeness {
+                Some(BillingCompleteness::Complete) => "complete",
+                Some(BillingCompleteness::Unknown) => "unknown",
+                None => "unreported",
+            };
+            let cost = agent
+                .cost_usd
+                .map_or_else(|| "unavailable".to_owned(), |cost| format!("${cost:.6}"));
+            writeln!(output, "billing: {billing}; estimated cost: {cost}")?;
         }
         self.write_failure_reason(output)?;
         if let Some(response) = &self.final_response {
@@ -490,6 +499,7 @@ struct AgentInspection {
     cache_percent_tenths: u16,
     model_calls: u32,
     tool_calls: u32,
+    cost_usd: Option<f64>,
     billing_completeness: Option<BillingCompleteness>,
 }
 
@@ -511,6 +521,7 @@ impl From<HarborAgentResult> for AgentInspection {
             cache_percent_tenths,
             model_calls: result.metadata.model_calls,
             tool_calls: result.metadata.tool_calls,
+            cost_usd: result.cost_usd,
             billing_completeness: result.billing_completeness,
         }
     }
@@ -692,6 +703,7 @@ struct HarborAgentResult {
     n_input_tokens: u64,
     n_cache_tokens: u64,
     n_output_tokens: u64,
+    cost_usd: Option<f64>,
     billing_completeness: Option<BillingCompleteness>,
     metadata: nanocodex_eval::AgentMetadata,
 }

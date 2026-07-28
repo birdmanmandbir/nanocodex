@@ -37,7 +37,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let job = harbor.finish(vec![result.clone()]).await?;
     let event_count = observer_task.await??;
 
-    println!("{}: {:?}", result.trial_name, result.status);
+    println!("{}: {:?}", result.trial_name(), result.outcome());
     println!("Observed {event_count} typed events independently");
     println!("Harbor job: {}", job.directory().display());
     Ok(())

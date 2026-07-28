@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     });
     let result = eval.task(task).await?;
     let event_count = observer_task.await??;
-    println!("{}: {:?}", result.trial_name, result.status);
+    println!("{}: {:?}", result.trial_name(), result.outcome());
     println!("Observed {event_count} typed events");
     println!("Native evaluation: {}", eval.directory().display());
     Ok(())

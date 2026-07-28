@@ -236,7 +236,21 @@ pub struct EvalFailure {
     pub(crate) task: Task,
 }
 
-/// Typed result returned by [`crate::Evaluator::task`].
+/// Complete terminal output for one accepted evaluation attempt.
+///
+/// Scored verifier results and unscored lifecycle failures are returned through
+/// the same independently awaitable value. Consumers never need the optional
+/// event stream to retain partial usage, cleanup health, or failure evidence.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "score_status", content = "attempt", rename_all = "snake_case")]
+pub enum EvalAttemptOutcome {
+    /// The verifier produced a score.
+    Scored(EvalResult),
+    /// The attempt ended without trustworthy verifier evidence.
+    Unscored(EvalFailure),
+}
+
+/// Typed scored result contained by [`EvalAttemptOutcome::Scored`].
 #[derive(Clone, Debug, Serialize)]
 pub struct EvalResult {
     /// `UUIDv7` identity shared with the attempt's agent session.
@@ -277,7 +291,7 @@ pub struct SweepResults {
 pub struct SweepAttemptResult {
     agent: AgentId,
     trial: u16,
-    result: EvalResult,
+    outcome: EvalAttemptOutcome,
 }
 
 impl SweepResults {
@@ -299,27 +313,27 @@ impl SweepResults {
 
     /// Consumes the sweep and discards its coordinate wrappers.
     #[must_use]
-    pub fn into_results(self) -> Vec<EvalResult> {
+    pub fn into_outcomes(self) -> Vec<EvalAttemptOutcome> {
         self.attempts
             .into_iter()
-            .map(|attempt| attempt.result)
+            .map(|attempt| attempt.outcome)
             .collect()
     }
 }
 
 impl SweepAttemptResult {
-    pub(crate) const fn new(agent: AgentId, trial: u16, result: EvalResult) -> Self {
+    pub(crate) const fn new(agent: AgentId, trial: u16, outcome: EvalAttemptOutcome) -> Self {
         Self {
             agent,
             trial,
-            result,
+            outcome,
         }
     }
 
     /// Returns the task name for this coordinate.
     #[must_use]
     pub fn task_name(&self) -> &str {
-        &self.result.task_name
+        self.outcome.task_name()
     }
 
     /// Returns the caller-defined agent recipe identity.
@@ -334,16 +348,93 @@ impl SweepAttemptResult {
         self.trial
     }
 
-    /// Returns the typed attempt result.
+    /// Returns the complete typed terminal attempt output.
     #[must_use]
-    pub const fn result(&self) -> &EvalResult {
-        &self.result
+    pub const fn outcome(&self) -> &EvalAttemptOutcome {
+        &self.outcome
     }
 
-    /// Consumes the coordinate wrapper and returns its attempt result.
+    /// Returns the scored verifier result, when one exists.
     #[must_use]
-    pub fn into_result(self) -> EvalResult {
-        self.result
+    pub const fn result(&self) -> Option<&EvalResult> {
+        self.outcome.scored()
+    }
+
+    /// Returns the unscored terminal failure, when one exists.
+    #[must_use]
+    pub const fn failure(&self) -> Option<&EvalFailure> {
+        self.outcome.unscored()
+    }
+
+    /// Consumes the coordinate wrapper and returns its terminal attempt output.
+    #[must_use]
+    pub fn into_outcome(self) -> EvalAttemptOutcome {
+        self.outcome
+    }
+}
+
+impl EvalAttemptOutcome {
+    /// Returns the stable semantic outcome.
+    #[must_use]
+    pub const fn outcome(&self) -> EvalOutcome {
+        match self {
+            Self::Scored(result) => result.outcome,
+            Self::Unscored(failure) => failure.outcome,
+        }
+    }
+
+    /// Returns the stable attempt identity.
+    #[must_use]
+    pub const fn attempt_id(&self) -> Uuid {
+        match self {
+            Self::Scored(result) => result.attempt_id,
+            Self::Unscored(failure) => failure.attempt_id,
+        }
+    }
+
+    /// Returns the task name.
+    #[must_use]
+    pub fn task_name(&self) -> &str {
+        match self {
+            Self::Scored(result) => &result.task_name,
+            Self::Unscored(failure) => &failure.task_name,
+        }
+    }
+
+    /// Returns the unique trial name.
+    #[must_use]
+    pub fn trial_name(&self) -> &str {
+        match self {
+            Self::Scored(result) => &result.trial_name,
+            Self::Unscored(failure) => &failure.trial_name,
+        }
+    }
+
+    /// Returns the scored verifier result, when one exists.
+    #[must_use]
+    pub const fn scored(&self) -> Option<&EvalResult> {
+        match self {
+            Self::Scored(result) => Some(result),
+            Self::Unscored(_) => None,
+        }
+    }
+
+    /// Returns the unscored failure, when one exists.
+    #[must_use]
+    pub const fn unscored(&self) -> Option<&EvalFailure> {
+        match self {
+            Self::Scored(_) => None,
+            Self::Unscored(failure) => Some(failure),
+        }
+    }
+
+    /// Consumes this value and returns the scored result, when one exists.
+    #[must_use]
+    pub fn into_scored(self) -> Option<EvalResult> {
+        match self {
+            Self::Scored(result) => Some(result),
+            Self::Unscored(_) => None,
+        }
     }
 }
 

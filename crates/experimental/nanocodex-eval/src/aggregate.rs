@@ -6,7 +6,10 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::{BillingCompleteness, EvalOutcome, EvalResult, SweepAttemptResult};
+use crate::{
+    BillingCompleteness, EvalAttemptOutcome, EvalFailure, EvalOutcome, EvalResult,
+    SweepAttemptResult,
+};
 
 /// One self-contained attempt row used by aggregate and plotting consumers.
 #[derive(Clone, Debug, Serialize)]
@@ -86,8 +89,18 @@ pub struct AggregateDataset {
     pub schema_version: u32,
     /// Complete source rows; aggregates never replace drilldown evidence.
     pub attempts: Vec<AttemptFact>,
+    /// Run-level cold preparation that is shared rather than attributed to an
+    /// arbitrary attempt.
+    pub run_timing: Option<AggregateRunTiming>,
     /// One point per configuration.
     pub configurations: Vec<ConfigurationAggregate>,
+}
+
+/// Run-level latency that cannot be assigned honestly to one attempt.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct AggregateRunTiming {
+    /// Image resolution, rootfs preparation, and shared verifier cache setup.
+    pub cold_image_and_cache_ns: u64,
 }
 
 /// Plot-ready summary for one configuration.
@@ -109,6 +122,8 @@ pub struct ConfigurationAggregate {
     pub unscored_attempts: usize,
     /// Attempts with an explicit cleanup failure.
     pub cleanup_failures: usize,
+    /// Attempts whose potentially billable provider usage is not terminal.
+    pub billing_unknown_attempts: usize,
     /// Per-task distributions for deeper drilldown.
     pub tasks: Vec<TaskAggregate>,
 }
@@ -126,6 +141,8 @@ pub struct TaskAggregate {
     pub unscored_attempts: usize,
     /// Attempts with an explicit cleanup failure.
     pub cleanup_failures: usize,
+    /// Attempts whose potentially billable provider usage is not terminal.
+    pub billing_unknown_attempts: usize,
     /// Estimated cost distribution.
     pub cost_usd: MetricSummary,
     /// Total latency distribution in seconds.
@@ -166,7 +183,24 @@ impl AttemptFact {
     /// Builds a plot fact from one successful or verifier-failed sweep result.
     #[must_use]
     pub fn from_sweep_attempt(attempt: &SweepAttemptResult) -> Self {
-        Self::from_result(attempt.agent().as_str(), attempt.trial(), attempt.result())
+        Self::from_outcome(attempt.agent().as_str(), attempt.trial(), attempt.outcome())
+    }
+
+    /// Builds a plot fact from a complete typed terminal attempt output.
+    #[must_use]
+    pub fn from_outcome(
+        configuration: &str,
+        repetition: u16,
+        outcome: &EvalAttemptOutcome,
+    ) -> Self {
+        match outcome {
+            EvalAttemptOutcome::Scored(result) => {
+                Self::from_result(configuration, repetition, result)
+            }
+            EvalAttemptOutcome::Unscored(failure) => {
+                Self::from_failure(configuration, repetition, failure)
+            }
+        }
     }
 
     /// Builds a plot fact from one typed result and explicit coordinates.
@@ -245,6 +279,65 @@ impl AttemptFact {
         .with_total()
     }
 
+    /// Builds a plot fact from one typed unscored terminal failure.
+    #[must_use]
+    pub fn from_failure(configuration: &str, repetition: u16, failure: &EvalFailure) -> Self {
+        let duration = |timing: Option<&crate::PhaseTiming>| {
+            timing.map_or(0, |timing| {
+                u64::try_from(
+                    timing
+                        .finished_at
+                        .signed_duration_since(timing.started_at)
+                        .num_nanoseconds()
+                        .unwrap_or_default()
+                        .max(0),
+                )
+                .unwrap_or(u64::MAX)
+            })
+        };
+        let agent = failure.agent.as_ref();
+        Self {
+            attempt_id: failure.attempt_id,
+            task_name: failure.task_name.clone(),
+            configuration: configuration.to_owned(),
+            repetition,
+            outcome: failure.outcome,
+            scored: false,
+            passed: false,
+            cleanup_failed: failure.cleanup.is_failed(),
+            cost_usd: agent.and_then(|agent| agent.cost_usd),
+            billing_completeness: agent.map(|agent| agent.billing_completeness),
+            latency: LatencyBreakdown {
+                queue_wait_ns: duration(Some(&failure.timing.queue_wait)),
+                environment_setup_ns: duration(failure.timing.environment_setup.as_ref()),
+                environment_readiness_ns: duration(failure.timing.environment_readiness.as_ref()),
+                vm_bootstrap_ns: if failure.environment == crate::EvalEnvironment::MicroVm {
+                    duration(failure.timing.environment_readiness.as_ref())
+                } else {
+                    0
+                },
+                agent_setup_ns: duration(failure.timing.agent_setup.as_ref()),
+                agent_execution_ns: duration(failure.timing.agent_execution.as_ref()),
+                model_ns: agent.map_or(0, |agent| agent.metadata.model_duration_ns),
+                tool_work_ns: agent.map_or(0, |agent| agent.metadata.tool_work_duration_ns),
+                tool_wall_ns: agent.map_or(0, |agent| agent.metadata.tool_wall_duration_ns),
+                verifier_ns: duration(failure.timing.verifier.as_ref()),
+                cleanup_ns: [&failure.cleanup.agent, &failure.cleanup.verifier]
+                    .into_iter()
+                    .filter_map(|cleanup| cleanup.timing.as_ref())
+                    .map(|timing| duration(Some(timing)))
+                    .sum(),
+                ..LatencyBreakdown::default()
+            },
+            artifacts: AttemptFactArtifacts {
+                directory: failure.artifacts.directory.clone(),
+                trajectory: failure.artifacts.directory.join("agent/trajectory.json"),
+                verifier_output: failure.artifacts.verifier_output.clone(),
+            },
+        }
+        .with_total()
+    }
+
     const fn with_total(mut self) -> Self {
         let latency = &self.latency;
         self.latency.total_ns = latency
@@ -276,10 +369,18 @@ impl AggregateDataset {
             .map(|(configuration, attempts)| ConfigurationAggregate::new(configuration, &attempts))
             .collect();
         Self {
-            schema_version: 2,
+            schema_version: 3,
             attempts,
+            run_timing: None,
             configurations,
         }
+    }
+
+    /// Attaches run-level cold image and shared cache preparation latency.
+    #[must_use]
+    pub const fn with_run_timing(mut self, run_timing: AggregateRunTiming) -> Self {
+        self.run_timing = Some(run_timing);
+        self
     }
 
     /// Builds an aggregate directly from typed sweep results.
@@ -308,7 +409,11 @@ impl ConfigurationAggregate {
             configuration,
             attempt_ids: attempts.iter().map(|attempt| attempt.attempt_id).collect(),
             success: RateEstimate::new(attempts),
-            cost_usd: MetricSummary::new(attempts.iter().filter_map(|attempt| attempt.cost_usd)),
+            cost_usd: MetricSummary::new(attempts.iter().filter_map(|attempt| {
+                (attempt.billing_completeness == Some(BillingCompleteness::Complete))
+                    .then_some(attempt.cost_usd)
+                    .flatten()
+            })),
             latency_seconds: MetricSummary::new(
                 attempts
                     .iter()
@@ -319,6 +424,12 @@ impl ConfigurationAggregate {
             cleanup_failures: attempts
                 .iter()
                 .filter(|attempt| attempt.cleanup_failed)
+                .count(),
+            billing_unknown_attempts: attempts
+                .iter()
+                .filter(|attempt| {
+                    attempt.billing_completeness == Some(BillingCompleteness::Unknown)
+                })
                 .count(),
             tasks: tasks
                 .into_iter()
@@ -331,9 +442,17 @@ impl ConfigurationAggregate {
                         .iter()
                         .filter(|attempt| attempt.cleanup_failed)
                         .count(),
-                    cost_usd: MetricSummary::new(
-                        attempts.iter().filter_map(|attempt| attempt.cost_usd),
-                    ),
+                    billing_unknown_attempts: attempts
+                        .iter()
+                        .filter(|attempt| {
+                            attempt.billing_completeness == Some(BillingCompleteness::Unknown)
+                        })
+                        .count(),
+                    cost_usd: MetricSummary::new(attempts.iter().filter_map(|attempt| {
+                        (attempt.billing_completeness == Some(BillingCompleteness::Complete))
+                            .then_some(attempt.cost_usd)
+                            .flatten()
+                    })),
                     latency_seconds: MetricSummary::new(
                         attempts
                             .iter()
@@ -503,5 +622,24 @@ mod tests {
         assert_eq!(point.cleanup_failures, 1);
         assert_eq!(point.tasks[0].success.samples, 1);
         assert_eq!(point.tasks[0].cleanup_failures, 1);
+    }
+
+    #[test]
+    fn excludes_partial_cost_when_billing_is_unknown() {
+        let known = fact("medium", "a", 1, true);
+        let mut partial = fact("medium", "a", 2, false);
+        partial.outcome = EvalOutcome::AgentTimeout;
+        partial.scored = false;
+        partial.billing_completeness = Some(BillingCompleteness::Unknown);
+
+        let dataset = AggregateDataset::new(vec![known, partial]);
+        let point = &dataset.configurations[0];
+
+        assert_eq!(point.cost_usd.samples, 1);
+        assert_eq!(point.cost_usd.mean, Some(1.0));
+        assert_eq!(point.billing_unknown_attempts, 1);
+        assert_eq!(point.tasks[0].cost_usd.samples, 1);
+        assert_eq!(point.tasks[0].billing_unknown_attempts, 1);
+        assert_eq!(dataset.attempts[1].cost_usd, Some(2.0));
     }
 }

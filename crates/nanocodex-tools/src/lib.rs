@@ -97,22 +97,22 @@ pub use runtime::{ToolsBuildError, ToolsBuilder};
 #[cfg(all(not(target_family = "wasm"), feature = "workspace-runtime"))]
 pub(crate) use standard::StandardTool;
 
-#[cfg(all(not(target_family = "wasm"), feature = "native"))]
 #[doc(hidden)]
 pub mod __private {
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(all(not(target_family = "wasm"), feature = "workspace-runtime"))]
     pub use async_trait::async_trait;
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(all(not(target_family = "wasm"), feature = "workspace-runtime"))]
     pub use schemars;
     #[cfg(not(target_family = "wasm"))]
     pub use serde;
 
+    #[cfg(all(not(target_family = "wasm"), feature = "native"))]
+    pub use crate::runtime::schema_for;
     #[cfg(not(target_family = "wasm"))]
-    pub use crate::{
-        Tool, ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolResult, runtime::schema_for,
-    };
+    pub use crate::{Tool, ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolResult};
 
     /// Builds the direct Responses tool prefix and the nested Code Mode name map together.
+    #[cfg(feature = "native")]
     pub fn model_contract(
         runtime: &crate::runtime::ToolRuntime,
         session_id: &str,

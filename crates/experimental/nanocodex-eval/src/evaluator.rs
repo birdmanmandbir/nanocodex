@@ -1,7 +1,7 @@
 use std::{
     error::Error,
     ffi::OsString,
-    fs,
+    fmt, fs,
     future::Future,
     io,
     num::ParseFloatError,
@@ -33,9 +33,10 @@ use uuid::Uuid;
 
 use crate::{
     AgentId, AgentMetadata, AgentResult, BillingCompleteness, CleanupPhase, EvalArtifacts,
-    EvalCleanup, EvalEnvironment, EvalEvent, EvalEventKind, EvalEvents, EvalFailure,
-    EvalFailureKind, EvalFailureTiming, EvalOutcome, EvalResult, EvalStatus, EvalTiming,
-    PhaseTiming, Sweep, SweepAttemptResult, SweepResults, Task, TaskLoadError, VerifierResult,
+    EvalAttemptOutcome, EvalCleanup, EvalEnvironment, EvalEvent, EvalEventKind, EvalEvents,
+    EvalFailure, EvalFailureKind, EvalFailureTiming, EvalOutcome, EvalResult, EvalStatus,
+    EvalTiming, PhaseTiming, Sweep, SweepAttemptResult, SweepResults, Task, TaskLoadError,
+    VerifierResult,
     job::EvalJob,
     native::{NativeAttempt, VerifierExecution},
 };
@@ -115,8 +116,10 @@ type AttemptAgentFactory = Arc<
         + 'static,
 >;
 
-type AttemptVerifierFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<AttemptVerification, AttemptError>> + Send + 'a>>;
+type AttemptVerifierFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<AttemptVerification, AttemptVerificationFailure>> + Send + 'a>,
+>;
+type AttemptVerifierCleanupFuture<'a> = Pin<Box<dyn Future<Output = CleanupPhase> + Send + 'a>>;
 type AttemptReadinessFuture =
     Pin<Box<dyn Future<Output = Result<(), AttemptError>> + Send + 'static>>;
 
@@ -138,6 +141,39 @@ pub trait AttemptVerifier: Send {
         task: &'a Task,
         attempt: EvalAttempt<'a>,
     ) -> AttemptVerifierFuture<'a>;
+
+    /// Explicitly joins verifier-owned resources when verification will not run.
+    ///
+    /// Implementations that own processes, VMs, mounts, or other asynchronous
+    /// resources must override this method. The evaluator awaits it on every
+    /// post-construction abort path.
+    fn shutdown(&mut self) -> AttemptVerifierCleanupFuture<'_> {
+        Box::pin(async { CleanupPhase::not_required() })
+    }
+}
+
+/// A verifier's primary semantic error plus independently retained cleanup.
+#[derive(Debug, thiserror::Error)]
+#[error("{error}")]
+pub struct AttemptVerificationFailure {
+    #[source]
+    error: AttemptError,
+    /// Cleanup health observed after the primary verification failure.
+    pub cleanup: CleanupPhase,
+}
+
+impl AttemptVerificationFailure {
+    /// Retains a verifier error and the cleanup attempted after it.
+    pub fn new(error: impl Error + Send + Sync + 'static, cleanup: CleanupPhase) -> Self {
+        Self {
+            error: Box::new(error),
+            cleanup,
+        }
+    }
+
+    fn into_parts(self) -> (AttemptError, CleanupPhase) {
+        (self.error, self.cleanup)
+    }
 }
 
 /// Complete typed output returned by an attempt-owned verifier.
@@ -160,7 +196,7 @@ struct AttemptInput {
 }
 
 struct AttemptOutput {
-    result: EvalResult,
+    outcome: EvalAttemptOutcome,
     coordinate: Option<SweepCoordinate>,
 }
 
@@ -308,8 +344,10 @@ impl Evaluator {
     ///
     /// # Errors
     ///
-    /// Returns an error when setup, the agent, or verification fails.
-    pub async fn task(&self, task: Task) -> Result<EvalResult, EvalError> {
+    /// Returns an operational error when the attempt cannot be admitted.
+    /// Accepted setup, agent, and verifier failures are returned as typed
+    /// [`EvalAttemptOutcome::Unscored`] values.
+    pub async fn task(&self, task: Task) -> Result<EvalAttemptOutcome, EvalError> {
         let queued_at = Utc::now();
         let _permit = self
             .inner
@@ -324,7 +362,7 @@ impl Evaluator {
             queued_at,
         })
         .await
-        .map(|output| output.result)
+        .map(|output| output.outcome)
     }
 
     /// Runs `count` fresh attempts of the same immutable task.
@@ -333,8 +371,13 @@ impl Evaluator {
     ///
     /// # Errors
     ///
-    /// Returns the first setup, agent, or verifier error.
-    pub async fn task_n(&self, task: Task, count: usize) -> Result<Vec<EvalResult>, EvalError> {
+    /// Returns an operational error when the batch cannot be scheduled or
+    /// retained. Attempt failures remain in their original positions.
+    pub async fn task_n(
+        &self,
+        task: Task,
+        count: usize,
+    ) -> Result<Vec<EvalAttemptOutcome>, EvalError> {
         self.tasks(std::iter::repeat_n(task, count).collect()).await
     }
 
@@ -342,8 +385,9 @@ impl Evaluator {
     ///
     /// # Errors
     ///
-    /// Returns the first setup, agent, or verifier error.
-    pub async fn tasks(&self, tasks: Vec<Task>) -> Result<Vec<EvalResult>, EvalError> {
+    /// Returns an operational error when the batch cannot be scheduled or
+    /// retained. Attempt failures remain in their original positions.
+    pub async fn tasks(&self, tasks: Vec<Task>) -> Result<Vec<EvalAttemptOutcome>, EvalError> {
         let inputs = tasks
             .into_iter()
             .map(|task| AttemptInput {
@@ -357,7 +401,7 @@ impl Evaluator {
             .run_tasks(inputs)
             .await?
             .into_iter()
-            .map(|output| output.result)
+            .map(|output| output.outcome)
             .collect())
     }
 
@@ -367,12 +411,13 @@ impl Evaluator {
     ///
     /// # Errors
     ///
-    /// Returns the first setup, agent, or verifier error.
+    /// Returns an operational error when the batch cannot be scheduled or
+    /// retained. Attempt failures remain in their original positions.
     pub async fn tasks_n(
         &self,
         tasks: Vec<Task>,
         count: usize,
-    ) -> Result<Vec<EvalResult>, EvalError> {
+    ) -> Result<Vec<EvalAttemptOutcome>, EvalError> {
         self.tasks(
             tasks
                 .into_iter()
@@ -386,7 +431,9 @@ impl Evaluator {
     ///
     /// # Errors
     ///
-    /// Returns the first setup, agent, or verifier error.
+    /// Returns an operational error when run binding or durable recovery fails.
+    /// Every accepted task × agent × trial coordinate is returned, including
+    /// unscored attempts.
     pub async fn sweep(&self, sweep: Sweep) -> Result<SweepResults, EvalError> {
         let manifest = sweep.manifest();
         self.inner.job.bind_run(&manifest)?;
@@ -417,7 +464,7 @@ impl Evaluator {
                 Ok(SweepAttemptResult::new(
                     coordinate.agent,
                     coordinate.trial,
-                    output.result,
+                    output.outcome,
                 ))
             })
             .collect::<Result<Vec<_>, EvalError>>()?;
@@ -465,19 +512,11 @@ impl Evaluator {
             })
             .buffer_unordered(scheduling_window);
         let mut results = Vec::new();
-        let mut first_error = None;
         while let Some(output) = completed.next().await {
             let Some((index, result)) = output else {
                 continue;
             };
-            match result {
-                Ok(result) => results.push((index, result)),
-                Err(error) if first_error.is_none() => first_error = Some(error),
-                Err(_) => {}
-            }
-        }
-        if let Some(error) = first_error {
-            return Err(error);
+            results.push((index, result?));
         }
         results.sort_unstable_by_key(|(index, _)| *index);
         Ok(results.into_iter().map(|(_, result)| result).collect())
@@ -592,15 +631,20 @@ impl Evaluator {
             .instrument(span.clone())
             .await;
         record_attempt_result(&span, trace_started, &result);
-        match result {
-            Ok(result) => Ok(AttemptOutput { result, coordinate }),
+        let outcome = match result {
+            Ok(result) => EvalAttemptOutcome::Scored(result),
             Err(failure) => {
-                emitter.emit(EvalEventKind::Failed(Box::new(attempt_failure(
+                let failure = attempt_failure(
                     self, attempt_id, task, trial_name, started_at, queue_wait, &failure,
-                ))));
-                Err(failure.error)
+                );
+                emitter.emit(EvalEventKind::Failed(Box::new(failure.clone())));
+                EvalAttemptOutcome::Unscored(failure)
             }
-        }
+        };
+        Ok(AttemptOutput {
+            outcome,
+            coordinate,
+        })
     }
 
     async fn run_task_inner(
@@ -646,14 +690,27 @@ impl Evaluator {
             .await
             .map_err(|failure| AttemptRunFailure::from_agent(&attempt, failure))?;
 
-        task.validate_package().map_err(|error| {
-            AttemptRunFailure::after_agent(&attempt, &agent, EvalError::TaskPackage(error))
-        })?;
+        if let Err(error) = task.validate_package() {
+            let verifier_cleanup = shutdown_attempt_verifier(&mut agent.verifier).await;
+            return Err(AttemptRunFailure::after_agent(
+                &attempt,
+                &agent,
+                EvalError::TaskPackage(error),
+                verifier_cleanup,
+            ));
+        }
         emitter.emit(EvalEventKind::VerifierStarted);
-        let verifier = self
+        let verifier = match self
             .execute_verifier(&task, &attempt, agent.verifier.take())
             .await
-            .map_err(|error| AttemptRunFailure::after_agent(&attempt, &agent, error))?;
+        {
+            Ok(verifier) => verifier,
+            Err(failure) => {
+                return Err(AttemptRunFailure::after_verifier_failure(
+                    &attempt, &agent, failure,
+                ));
+            }
+        };
         task.validate_package().map_err(|error| {
             AttemptRunFailure::after_verifier(
                 &attempt,
@@ -711,7 +768,7 @@ impl Evaluator {
         task: &Task,
         attempt: &NativeAttempt,
         verifier: Option<Box<dyn AttemptVerifier>>,
-    ) -> Result<VerifierExecution, EvalError> {
+    ) -> Result<VerifierExecution, VerifierExecutionFailure> {
         let span = info_span!(
             target: "nanocodex_eval",
             "eval.verifier",
@@ -733,7 +790,7 @@ impl Evaluator {
         let result = async {
             if let Some(mut verifier) = verifier {
                 let started_at = Utc::now();
-                let execution = verifier
+                let execution = match verifier
                     .verify(
                         task,
                         EvalAttempt {
@@ -743,7 +800,24 @@ impl Evaluator {
                         },
                     )
                     .await
-                    .map_err(EvalError::AttemptVerifier)?;
+                {
+                    Ok(execution) => execution,
+                    Err(failure) => {
+                        let (error, cleanup) = failure.into_parts();
+                        let finished_at = cleanup
+                            .timing
+                            .as_ref()
+                            .map_or_else(Utc::now, |timing| timing.started_at);
+                        return Err(VerifierExecutionFailure {
+                            error: EvalError::AttemptVerifier(error),
+                            cleanup,
+                            timing: Some(PhaseTiming {
+                                started_at,
+                                finished_at,
+                            }),
+                        });
+                    }
+                };
                 Ok(VerifierExecution {
                     result: execution.result,
                     timing: PhaseTiming {
@@ -759,7 +833,15 @@ impl Evaluator {
                     cleanup: execution.cleanup,
                 })
             } else {
-                attempt.verify(task).await
+                let started_at = Utc::now();
+                attempt
+                    .verify(task)
+                    .await
+                    .map_err(|error| VerifierExecutionFailure {
+                        error,
+                        cleanup: CleanupPhase::not_required(),
+                        timing: Some(PhaseTiming::finished(started_at)),
+                    })
             }
         }
         .instrument(span.clone())
@@ -791,13 +873,10 @@ impl Evaluator {
         let AgentSetup {
             agent,
             mut events,
-            verifier,
+            mut verifier,
             readiness_timing,
             timing: setup_timing,
-        } = self
-            .setup_agent(emitter, task, attempt, nanocodex)
-            .await
-            .map_err(AgentExecutionFailure::setup)?;
+        } = self.setup_agent(emitter, task, attempt, nanocodex).await?;
         let execution_started = Utc::now();
         let span = info_span!(
             target: "nanocodex_eval",
@@ -830,11 +909,7 @@ impl Evaluator {
                             observation.final_message.clone(),
                         ),
                     };
-                    let completeness = if observation.billable_in_flight == 0 {
-                        BillingCompleteness::Complete
-                    } else {
-                        BillingCompleteness::Unknown
-                    };
+                    let completeness = observation.billing_completeness();
                     let result = AgentResult::from_terminal(final_message, &terminal, completeness);
                     match (primary, result) {
                         (Some(primary), Ok(result)) => Ok(AgentTurnOutcome {
@@ -862,11 +937,7 @@ impl Evaluator {
                 }
                 Ok(Err(error)) => Err(error),
                 Err(_) => {
-                    let completeness = if observation.billable_in_flight == 0 {
-                        BillingCompleteness::Complete
-                    } else {
-                        BillingCompleteness::Unknown
-                    };
+                    let completeness = observation.billing_completeness();
                     let primary = EvalError::AgentTimeout(task.agent_timeout());
                     let _ = control.cancel().await;
                     let result = receive_agent_terminal(&mut events, emitter, &mut observation)
@@ -921,23 +992,29 @@ impl Evaluator {
             .primary
             .or_else(|| cleanup_error.map(EvalError::AgentCleanup));
         if let Some(error) = primary {
+            let verifier_cleanup = shutdown_attempt_verifier(&mut verifier).await;
             return Err(AgentExecutionFailure {
                 error,
                 result: outcome.result,
                 cleanup,
+                verifier_cleanup,
                 readiness_timing: Some(readiness_timing),
                 setup_timing: Some(setup_timing),
                 execution_timing: Some(execution_timing),
             });
         }
-        let result = outcome.result.ok_or_else(|| AgentExecutionFailure {
-            error: EvalError::AgentEventsClosed,
-            result: None,
-            cleanup: cleanup.clone(),
-            readiness_timing: Some(readiness_timing.clone()),
-            setup_timing: Some(setup_timing.clone()),
-            execution_timing: Some(execution_timing.clone()),
-        })?;
+        let Some(result) = outcome.result else {
+            let verifier_cleanup = shutdown_attempt_verifier(&mut verifier).await;
+            return Err(AgentExecutionFailure {
+                error: EvalError::AgentEventsClosed,
+                result: None,
+                cleanup,
+                verifier_cleanup,
+                readiness_timing: Some(readiness_timing),
+                setup_timing: Some(setup_timing),
+                execution_timing: Some(execution_timing),
+            });
+        };
         Ok(AgentExecution {
             result,
             verifier,
@@ -954,7 +1031,7 @@ impl Evaluator {
         task: &Task,
         attempt: &NativeAttempt,
         nanocodex: NanocodexBuilder,
-    ) -> Result<AgentSetup, EvalError> {
+    ) -> Result<AgentSetup, AgentExecutionFailure> {
         let readiness_started = Utc::now();
         let span = info_span!(
             target: "nanocodex_eval",
@@ -979,45 +1056,71 @@ impl Evaluator {
                     emitter.prompt_cache_cohort
                 ));
             let configured = if let Some(factory) = &self.inner.attempt_agent {
-                factory(
+                match factory(
                     EvalAttempt {
                         task,
                         directory: &attempt.paths.root,
                         workspace: &attempt.paths.workspace,
                     },
                     builder,
-                )
-                .map_err(EvalError::AttemptAgent)?
+                ) {
+                    Ok(configured) => configured,
+                    Err(error) => {
+                        return Err(AgentExecutionFailure::setup(
+                            EvalError::AttemptAgent(error),
+                            CleanupPhase::not_required(),
+                            None,
+                        ));
+                    }
+                }
             } else {
                 AttemptAgent::new(builder)
             };
-            let (builder, readiness, verifier) = configured.into_parts();
-            if let Some(readiness) = readiness {
-                readiness.await.map_err(EvalError::AttemptAgent)?;
+            let (builder, readiness, mut verifier) = configured.into_parts();
+            if let Some(readiness) = readiness
+                && let Err(error) = readiness.await
+            {
+                let verifier_cleanup = shutdown_attempt_verifier(&mut verifier).await;
+                return Err(AgentExecutionFailure::setup(
+                    EvalError::AttemptAgent(error),
+                    verifier_cleanup,
+                    None,
+                ));
             }
             let readiness_timing = PhaseTiming::finished(readiness_started);
             let setup_started = Utc::now();
-            let (agent, events) = builder.build()?;
-            Ok::<_, EvalError>((
-                agent,
-                events,
-                verifier,
-                readiness_timing,
-                PhaseTiming::finished(setup_started),
-            ))
+            match builder.build() {
+                Ok((agent, events)) => Ok(AgentSetup {
+                    agent,
+                    events,
+                    verifier,
+                    readiness_timing,
+                    timing: PhaseTiming::finished(setup_started),
+                }),
+                Err(error) => {
+                    let verifier_cleanup = shutdown_attempt_verifier(&mut verifier).await;
+                    Err(AgentExecutionFailure::setup(
+                        EvalError::Nanocodex(error),
+                        verifier_cleanup,
+                        Some(readiness_timing),
+                    ))
+                }
+            }
         }
         .instrument(span.clone())
         .await;
         record_span_result(&span, trace_started, &result);
-        let (agent, events, verifier, readiness_timing, timing) = result?;
-        Ok(AgentSetup {
-            agent,
-            events,
-            verifier,
-            readiness_timing,
-            timing,
-        })
+        result
     }
+}
+
+async fn shutdown_attempt_verifier(
+    verifier: &mut Option<Box<dyn AttemptVerifier>>,
+) -> CleanupPhase {
+    let Some(mut verifier) = verifier.take() else {
+        return CleanupPhase::not_required();
+    };
+    verifier.shutdown().await
 }
 
 struct AgentExecution {
@@ -1029,25 +1132,63 @@ struct AgentExecution {
     cleanup: CleanupPhase,
 }
 
+#[derive(Debug)]
 struct AgentExecutionFailure {
     error: EvalError,
     result: Option<AgentResult>,
     cleanup: CleanupPhase,
+    verifier_cleanup: CleanupPhase,
     readiness_timing: Option<PhaseTiming>,
     setup_timing: Option<PhaseTiming>,
     execution_timing: Option<PhaseTiming>,
 }
 
 impl AgentExecutionFailure {
-    const fn setup(error: EvalError) -> Self {
+    const fn setup(
+        error: EvalError,
+        verifier_cleanup: CleanupPhase,
+        readiness_timing: Option<PhaseTiming>,
+    ) -> Self {
         Self {
             error,
             result: None,
             cleanup: CleanupPhase::not_required(),
-            readiness_timing: None,
+            verifier_cleanup,
+            readiness_timing,
             setup_timing: None,
             execution_timing: None,
         }
+    }
+}
+
+impl fmt::Display for AgentExecutionFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl Error for AgentExecutionFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+#[derive(Debug)]
+struct VerifierExecutionFailure {
+    error: EvalError,
+    cleanup: CleanupPhase,
+    timing: Option<PhaseTiming>,
+}
+
+impl fmt::Display for VerifierExecutionFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl Error for VerifierExecutionFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.error)
     }
 }
 
@@ -1059,6 +1200,7 @@ struct AgentTurnOutcome {
 #[derive(Default)]
 struct AgentObservation {
     billable_in_flight: u32,
+    billing_unknown: bool,
     final_message: String,
 }
 
@@ -1096,7 +1238,7 @@ impl AttemptRunFailure {
             verifier: None,
             cleanup: EvalCleanup {
                 agent: failure.cleanup,
-                verifier: CleanupPhase::not_required(),
+                verifier: failure.verifier_cleanup,
             },
             environment_setup: Some(attempt.setup_timing.clone()),
             environment_readiness: failure.readiness_timing,
@@ -1106,20 +1248,46 @@ impl AttemptRunFailure {
         }
     }
 
-    fn after_agent(attempt: &NativeAttempt, agent: &AgentExecution, error: EvalError) -> Self {
+    fn after_agent(
+        attempt: &NativeAttempt,
+        agent: &AgentExecution,
+        error: EvalError,
+        verifier_cleanup: CleanupPhase,
+    ) -> Self {
         Self {
             error,
             agent: Some(agent.result.clone()),
             verifier: None,
             cleanup: EvalCleanup {
                 agent: agent.cleanup.clone(),
-                verifier: CleanupPhase::not_required(),
+                verifier: verifier_cleanup,
             },
             environment_setup: Some(attempt.setup_timing.clone()),
             environment_readiness: Some(agent.readiness_timing.clone()),
             agent_setup: Some(agent.setup_timing.clone()),
             agent_execution: Some(agent.execution_timing.clone()),
             verifier_timing: None,
+        }
+    }
+
+    fn after_verifier_failure(
+        attempt: &NativeAttempt,
+        agent: &AgentExecution,
+        failure: VerifierExecutionFailure,
+    ) -> Self {
+        Self {
+            error: failure.error,
+            agent: Some(agent.result.clone()),
+            verifier: None,
+            cleanup: EvalCleanup {
+                agent: agent.cleanup.clone(),
+                verifier: failure.cleanup,
+            },
+            environment_setup: Some(attempt.setup_timing.clone()),
+            environment_readiness: Some(agent.readiness_timing.clone()),
+            agent_setup: Some(agent.setup_timing.clone()),
+            agent_execution: Some(agent.execution_timing.clone()),
+            verifier_timing: failure.timing,
         }
     }
 
@@ -1163,6 +1331,14 @@ async fn receive_agent_terminal(
 }
 
 impl AgentObservation {
+    const fn billing_completeness(&self) -> BillingCompleteness {
+        if self.billable_in_flight == 0 && !self.billing_unknown {
+            BillingCompleteness::Complete
+        } else {
+            BillingCompleteness::Unknown
+        }
+    }
+
     fn observe(&mut self, event: &AgentEvent) -> Result<(), EvalError> {
         self.observe_lifecycle(event.kind);
         if event.kind == AgentEventKind::AssistantMessage {
@@ -1180,12 +1356,15 @@ impl AgentObservation {
                 self.billable_in_flight = self.billable_in_flight.saturating_add(1);
             }
             AgentEventKind::ModelWarmupCompleted
-            | AgentEventKind::ModelWarmupFailed
             | AgentEventKind::ModelCallCompleted
+            | AgentEventKind::ModelCompactionCompleted => {
+                self.billable_in_flight = self.billable_in_flight.saturating_sub(1);
+            }
+            AgentEventKind::ModelWarmupFailed
             | AgentEventKind::ModelCallFailed
-            | AgentEventKind::ModelCompactionCompleted
             | AgentEventKind::ModelCompactionFailed => {
                 self.billable_in_flight = self.billable_in_flight.saturating_sub(1);
+                self.billing_unknown = true;
             }
             _ => {}
         }
@@ -2080,7 +2259,7 @@ mod lifecycle_tests {
         collections::BTreeMap,
         convert::Infallible,
         fs,
-        path::Path,
+        path::{Path, PathBuf},
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -2098,20 +2277,30 @@ mod lifecycle_tests {
 
     use super::{
         AgentEventKind, AgentObservation, AttemptAgent, AttemptVerification, AttemptVerifier,
-        AttemptVerifierFuture, EvalAttempt, Evaluator,
+        AttemptVerifierCleanupFuture, AttemptVerifierFuture, EvalAttempt, Evaluator,
     };
     use crate::{
-        AgentStatus, BillingCompleteness, CleanupPhase, CleanupStatus, EvalEventKind, EvalOutcome,
-        EvalStatus, Task, VerifierResult,
+        AgentStatus, BillingCompleteness, CleanupPhase, CleanupStatus, EvalOutcome, EvalStatus,
+        Task, VerifierResult,
     };
 
     struct AttemptResourceProvider {
         live_resources: Arc<AtomicUsize>,
     }
 
+    struct PackageMutatingProvider {
+        mutation: PathBuf,
+    }
+
     impl Drop for AttemptResourceProvider {
         fn drop(&mut self) {
             self.live_resources.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    impl Drop for PackageMutatingProvider {
+        fn drop(&mut self) {
+            fs::write(&self.mutation, "changed after agent execution\n").unwrap();
         }
     }
 
@@ -2137,8 +2326,71 @@ mod lifecycle_tests {
         }
     }
 
+    #[async_trait]
+    impl DynamicToolProvider for PackageMutatingProvider {
+        fn start(&self) {}
+
+        fn direct_tools(&self) -> Vec<Arc<dyn nanocodex_tools::Tool>> {
+            Vec::new()
+        }
+
+        fn available_definitions(&self) -> Vec<ToolDefinition> {
+            Vec::new()
+        }
+
+        async fn execute(
+            &self,
+            _name: &str,
+            _input: Value,
+            _context: ToolContext<'_>,
+        ) -> Option<ToolOutput> {
+            None
+        }
+    }
+
     struct ResourceProbeVerifier {
         live_resources: Arc<AtomicUsize>,
+    }
+
+    struct ShutdownProbeVerifier {
+        shutdowns: Arc<AtomicUsize>,
+    }
+
+    struct FailingCleanupVerifier;
+
+    impl AttemptVerifier for ShutdownProbeVerifier {
+        fn verify<'a>(
+            &'a mut self,
+            _task: &'a Task,
+            _attempt: EvalAttempt<'a>,
+        ) -> AttemptVerifierFuture<'a> {
+            Box::pin(async {
+                panic!("shutdown probe verifier must not execute after an earlier failure")
+            })
+        }
+
+        fn shutdown(&mut self) -> AttemptVerifierCleanupFuture<'_> {
+            Box::pin(async move {
+                self.shutdowns.fetch_add(1, Ordering::AcqRel);
+                CleanupPhase::completed(chrono::Utc::now())
+            })
+        }
+    }
+
+    impl AttemptVerifier for FailingCleanupVerifier {
+        fn verify<'a>(
+            &'a mut self,
+            _task: &'a Task,
+            _attempt: EvalAttempt<'a>,
+        ) -> AttemptVerifierFuture<'a> {
+            Box::pin(async {
+                let cleanup_error = std::io::Error::other("deterministic verifier cleanup failure");
+                Err(super::AttemptVerificationFailure::new(
+                    std::io::Error::other("deterministic verifier primary failure"),
+                    CleanupPhase::failed(chrono::Utc::now(), &cleanup_error),
+                ))
+            })
+        }
     }
 
     impl AttemptVerifier for ResourceProbeVerifier {
@@ -2249,13 +2501,203 @@ mod lifecycle_tests {
         )
         .unwrap();
 
-        let result = evaluator.task(task).await.unwrap();
+        let outcome = evaluator.task(task).await.unwrap();
+        let result = outcome
+            .scored()
+            .expect("the successful verifier must return a scored outcome");
 
         assert_eq!(result.status, EvalStatus::Passed);
         assert_eq!(result.outcome, EvalOutcome::Passed);
         assert_eq!(result.cleanup.agent.status, CleanupStatus::Completed);
         assert_eq!(result.cleanup.verifier.status, CleanupStatus::Failed);
         assert_eq!(live_resources.load(Ordering::Acquire), 0);
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn verifier_primary_and_cleanup_failures_are_both_retained() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let warmup = socket.next().await.unwrap().unwrap();
+            assert!(warmup.is_text());
+            socket
+                .send(Message::Text(
+                    json!({
+                        "type": "response.completed",
+                        "response": { "id": "resp-warmup", "usage": null }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let generation = socket.next().await.unwrap().unwrap();
+            assert!(generation.is_text());
+            socket
+                .send(Message::Text(
+                    json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp-generation",
+                            "status": "completed",
+                            "output": [{
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{ "type": "output_text", "text": "done" }]
+                            }],
+                            "usage": {
+                                "input_tokens": 1,
+                                "input_tokens_details": { "cached_tokens": 0 },
+                                "output_tokens": 1,
+                                "output_tokens_details": { "reasoning_tokens": 0 },
+                                "total_tokens": 2
+                            }
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            while socket.next().await.is_some() {}
+        });
+        let openai = OpenAi::builder("test")
+            .websocket_url(endpoint)
+            .build()
+            .unwrap();
+        let output = tempdir().unwrap();
+        let (evaluator, _events) = Evaluator::builder(Nanocodex::builder(openai))
+            .output_directory(output.path())
+            .attempt_agent(|_attempt, builder| {
+                Ok::<_, Infallible>(AttemptAgent::new(builder).verifier(FailingCleanupVerifier))
+            })
+            .build()
+            .unwrap();
+        let task = Task::load(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tasks/write-greeting"),
+        )
+        .unwrap();
+
+        let outcome = evaluator.task(task).await.unwrap();
+        let failure = outcome
+            .unscored()
+            .expect("verifier execution failure must be unscored");
+
+        assert_eq!(failure.kind, crate::EvalFailureKind::Verifier);
+        assert!(
+            failure
+                .message
+                .contains("deterministic verifier primary failure")
+        );
+        assert!(
+            failure
+                .traceback
+                .contains("deterministic verifier primary failure")
+        );
+        assert_eq!(failure.cleanup.verifier.status, CleanupStatus::Failed);
+        assert!(
+            failure
+                .cleanup
+                .verifier
+                .diagnostic
+                .as_ref()
+                .is_some_and(|diagnostic| diagnostic
+                    .message
+                    .contains("deterministic verifier cleanup failure"))
+        );
+        assert!(failure.timing.verifier.is_some());
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn verifier_is_joined_after_post_agent_package_validation_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let warmup = socket.next().await.unwrap().unwrap();
+            assert!(warmup.is_text());
+            socket
+                .send(Message::Text(
+                    json!({
+                        "type": "response.completed",
+                        "response": { "id": "resp-warmup", "usage": null }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let generation = socket.next().await.unwrap().unwrap();
+            assert!(generation.is_text());
+            socket
+                .send(Message::Text(
+                    json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp-generation",
+                            "status": "completed",
+                            "output": [{
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{ "type": "output_text", "text": "done" }]
+                            }],
+                            "usage": {
+                                "input_tokens": 1,
+                                "input_tokens_details": { "cached_tokens": 0 },
+                                "output_tokens": 1,
+                                "output_tokens_details": { "reasoning_tokens": 0 },
+                                "total_tokens": 2
+                            }
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            while socket.next().await.is_some() {}
+        });
+        let (task_directory, task) = task_with_agent_timeout(5.0);
+        let mutation = task_directory.path().join("environment/README.md");
+        let openai = OpenAi::builder("test")
+            .websocket_url(endpoint)
+            .build()
+            .unwrap();
+        let nanocodex = Nanocodex::builder(openai).tools_factory(move |_agent| {
+            Tools::builder()
+                .without_defaults()
+                .provider(PackageMutatingProvider {
+                    mutation: mutation.clone(),
+                })
+                .build()
+        });
+        let output = tempdir().unwrap();
+        let verifier_shutdowns = Arc::new(AtomicUsize::new(0));
+        let verifier_shutdowns_for_attempt = Arc::clone(&verifier_shutdowns);
+        let (evaluator, _events) = Evaluator::builder(nanocodex)
+            .output_directory(output.path())
+            .attempt_agent(move |_attempt, builder| {
+                Ok::<_, Infallible>(AttemptAgent::new(builder).verifier(ShutdownProbeVerifier {
+                    shutdowns: Arc::clone(&verifier_shutdowns_for_attempt),
+                }))
+            })
+            .build()
+            .unwrap();
+
+        let outcome = evaluator.task(task).await.unwrap();
+        let failure = outcome
+            .unscored()
+            .expect("post-agent package mutation must be returned as unscored");
+
+        assert_eq!(failure.kind, crate::EvalFailureKind::Environment);
+        assert_eq!(failure.cleanup.agent.status, CleanupStatus::Completed);
+        assert_eq!(failure.cleanup.verifier.status, CleanupStatus::Completed);
+        assert_eq!(verifier_shutdowns.load(Ordering::Acquire), 1);
         server.await.unwrap();
     }
 
@@ -2317,32 +2759,36 @@ mod lifecycle_tests {
                 .build()
         });
         let output = tempdir().unwrap();
-        let (evaluator, events) = Evaluator::builder(nanocodex)
+        let verifier_shutdowns = Arc::new(AtomicUsize::new(0));
+        let verifier_shutdowns_for_attempt = Arc::clone(&verifier_shutdowns);
+        let (evaluator, _events) = Evaluator::builder(nanocodex)
             .output_directory(output.path())
+            .attempt_agent(move |_attempt, builder| {
+                Ok::<_, Infallible>(AttemptAgent::new(builder).verifier(ShutdownProbeVerifier {
+                    shutdowns: Arc::clone(&verifier_shutdowns_for_attempt),
+                }))
+            })
             .build()
             .unwrap();
-        let mut events = events.subscribe();
         let task = Task::load(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tasks/write-greeting"),
         )
         .unwrap();
 
-        let error = evaluator
+        let outcome = evaluator
             .task(task)
             .await
-            .expect_err("the provider failure must fail the attempt");
+            .expect("an accepted provider failure must return a terminal outcome");
 
-        assert!(matches!(error, super::EvalError::Nanocodex(_)));
         assert_eq!(live_resources.load(Ordering::Acquire), 0);
-        let failure = loop {
-            let event = events.recv().await.unwrap().unwrap();
-            if let EvalEventKind::Failed(failure) = &event.kind {
-                break failure.clone();
-            }
-        };
+        let failure = outcome
+            .unscored()
+            .expect("the provider failure must be retained as unscored");
         assert_eq!(failure.outcome, EvalOutcome::SafetyRefusal);
         assert_eq!(failure.kind, crate::EvalFailureKind::AgentSafetyRefusal);
         assert_eq!(failure.cleanup.agent.status, CleanupStatus::Completed);
+        assert_eq!(failure.cleanup.verifier.status, CleanupStatus::Completed);
+        assert_eq!(verifier_shutdowns.load(Ordering::Acquire), 1);
         assert!(failure.cleanup.agent.timing.is_some());
         assert!(failure.timing.agent_execution.is_some());
         assert!(failure.timing.queue_wait.finished_at >= failure.timing.queue_wait.started_at);
@@ -2351,8 +2797,47 @@ mod lifecycle_tests {
             .as_ref()
             .expect("terminal run metrics must survive the provider failure");
         assert_eq!(agent.metadata.status, AgentStatus::Failed);
-        assert_eq!(agent.billing_completeness, BillingCompleteness::Complete);
+        assert_eq!(agent.billing_completeness, BillingCompleteness::Unknown);
         server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn verifier_is_joined_after_attempt_readiness_failure() {
+        let output = tempdir().unwrap();
+        let verifier_shutdowns = Arc::new(AtomicUsize::new(0));
+        let verifier_shutdowns_for_attempt = Arc::clone(&verifier_shutdowns);
+        let nanocodex = Nanocodex::builder(OpenAi::new("test").unwrap());
+        let (evaluator, _events) = Evaluator::builder(nanocodex)
+            .output_directory(output.path())
+            .attempt_agent(move |_attempt, builder| {
+                Ok::<_, Infallible>(
+                    AttemptAgent::new(builder)
+                        .ready(async {
+                            Err(std::io::Error::other(
+                                "deterministic attempt readiness failure",
+                            ))
+                        })
+                        .verifier(ShutdownProbeVerifier {
+                            shutdowns: Arc::clone(&verifier_shutdowns_for_attempt),
+                        }),
+                )
+            })
+            .build()
+            .unwrap();
+        let task = Task::load(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tasks/write-greeting"),
+        )
+        .unwrap();
+
+        let outcome = evaluator.task(task).await.unwrap();
+        let failure = outcome
+            .unscored()
+            .expect("readiness failure must be returned as unscored");
+
+        assert_eq!(failure.kind, crate::EvalFailureKind::Environment);
+        assert_eq!(failure.cleanup.agent.status, CleanupStatus::NotRequired);
+        assert_eq!(failure.cleanup.verifier.status, CleanupStatus::Completed);
+        assert_eq!(verifier_shutdowns.load(Ordering::Acquire), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2395,26 +2880,21 @@ mod lifecycle_tests {
                 .build()
         });
         let output = tempdir().unwrap();
-        let (evaluator, events) = Evaluator::builder(nanocodex)
+        let (evaluator, _events) = Evaluator::builder(nanocodex)
             .output_directory(output.path())
             .build()
             .unwrap();
-        let mut events = events.subscribe();
         let (_task_directory, task) = task_with_agent_timeout(0.05);
 
-        let error = evaluator
+        let outcome = evaluator
             .task(task)
             .await
-            .expect_err("the pending model call must reach the task timeout");
+            .expect("an accepted timeout must return a terminal outcome");
 
-        assert!(matches!(error, super::EvalError::AgentTimeout(_)));
         assert_eq!(live_resources.load(Ordering::Acquire), 0);
-        let failure = loop {
-            let event = events.recv().await.unwrap().unwrap();
-            if let EvalEventKind::Failed(failure) = &event.kind {
-                break failure.clone();
-            }
-        };
+        let failure = outcome
+            .unscored()
+            .expect("the timeout must be retained as unscored");
         assert_eq!(failure.outcome, EvalOutcome::AgentTimeout);
         assert_eq!(failure.cleanup.agent.status, CleanupStatus::Completed);
         let agent = failure
@@ -2433,6 +2913,23 @@ mod lifecycle_tests {
         observation.observe_lifecycle(AgentEventKind::ModelCallCompleted);
 
         assert_eq!(observation.billable_in_flight, 0);
+        assert_eq!(
+            observation.billing_completeness(),
+            BillingCompleteness::Complete
+        );
+    }
+
+    #[test]
+    fn failed_model_call_marks_billing_snapshot_unknown() {
+        let mut observation = AgentObservation::default();
+        observation.observe_lifecycle(AgentEventKind::ModelCallStarted);
+        observation.observe_lifecycle(AgentEventKind::ModelCallFailed);
+
+        assert_eq!(observation.billable_in_flight, 0);
+        assert_eq!(
+            observation.billing_completeness(),
+            BillingCompleteness::Unknown
+        );
     }
 
     fn task_with_agent_timeout(timeout_seconds: f64) -> (tempfile::TempDir, Task) {
@@ -2482,9 +2979,7 @@ mod tracing_tests {
         AdmissionController, EvalError, Evaluator, SweepCoordinate, failure_kind,
         output_aliases_task_package, trial_name, validate_attempt_environment,
     };
-    use crate::{
-        EvalFailureKind, Sweep, Task, TaskLoadError, native::NativeAttempt, sweep::AgentId,
-    };
+    use crate::{EvalFailureKind, Sweep, Task, native::NativeAttempt, sweep::AgentId};
 
     #[derive(Clone, Default)]
     struct TraceCapture(Arc<Mutex<HashMap<u64, CapturedSpan>>>);
@@ -2756,10 +3251,13 @@ allow_internet = false
                 .tasks(vec![task.clone(), task])
                 .instrument(tracing::info_span!("test.parent"))
                 .await;
-            assert!(matches!(
-                result,
-                Err(EvalError::UnsupportedNativeTask { .. })
-            ));
+            let outcomes = result.expect("accepted failures must remain in the batch result");
+            assert_eq!(outcomes.len(), 2);
+            assert!(outcomes.iter().all(|outcome| {
+                outcome
+                    .unscored()
+                    .is_some_and(|failure| failure.kind == EvalFailureKind::Environment)
+            }));
             eval_id
         });
 
@@ -2828,12 +3326,12 @@ allow_internet = false
             .build()
             .unwrap();
 
-        let error = runtime.block_on(eval.task(task)).unwrap_err();
+        let outcome = runtime.block_on(eval.task(task)).unwrap();
+        let failure = outcome
+            .unscored()
+            .expect("task package mutation must be an unscored attempt");
 
-        assert!(matches!(
-            error,
-            EvalError::TaskPackage(TaskLoadError::ContentChanged { .. })
-        ));
+        assert!(matches!(failure.kind, EvalFailureKind::Environment));
         assert!(
             fs::read_dir(eval.directory())
                 .unwrap()
