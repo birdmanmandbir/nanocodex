@@ -52,6 +52,7 @@
 
 #![deny(missing_docs, rustdoc::broken_intra_doc_links)]
 
+mod aggregate;
 mod atif;
 mod evaluator;
 mod event;
@@ -62,6 +63,10 @@ mod result;
 mod sweep;
 mod task;
 
+pub use aggregate::{
+    AggregateDataset, AttemptFact, AttemptFactArtifacts, ConfigurationAggregate, LatencyBreakdown,
+    MetricSummary, RateEstimate, TaskAggregate,
+};
 pub use atif::{
     AtifAgent, AtifAgentExtra, AtifBuilder, AtifFinalMetrics, AtifFinalMetricsExtra, AtifMetrics,
     AtifModelCallMetrics, AtifObservation, AtifObservationExtra, AtifObservationResult,
