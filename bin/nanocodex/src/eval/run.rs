@@ -2477,7 +2477,7 @@ fn retained_guest_runtime_bytes(
     origin: &RetainedGuestRuntimeOrigin,
     requested: Option<&Path>,
 ) -> Result<Vec<u8>> {
-    if let Some(requested) = requested {
+    let requested_bytes = if let Some(requested) = requested {
         let requested = fs::canonicalize(requested)?;
         let (bytes, _) = stable_file_bytes(&requested)?;
         validate_vm_guest_elf(&bytes, &requested)?;
@@ -2490,7 +2490,10 @@ fn retained_guest_runtime_bytes(
                 origin.runtime.binary_sha256
             ));
         }
-    }
+        Some(bytes)
+    } else {
+        None
+    };
     if let Some(artifact_path) = &origin.runtime.artifact_path {
         let expected = guest_runtime_artifact_path(&origin.runtime.binary_sha256)?;
         if artifact_path != &expected {
@@ -2516,11 +2519,9 @@ fn retained_guest_runtime_bytes(
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        return recover_retained_guest_runtime_disk(origin);
+        return requested_bytes.map_or_else(|| recover_retained_guest_runtime_disk(origin), Ok);
     }
-    if let Some(requested) = requested {
-        let requested = fs::canonicalize(requested)?;
-        let (bytes, _) = stable_file_bytes(&requested)?;
+    if let Some(bytes) = requested_bytes {
         return Ok(bytes);
     }
     recover_retained_guest_runtime_disk(origin)
@@ -5318,6 +5319,44 @@ mod tests {
         assert_eq!(resumed_runtime.unwrap(), first_runtime);
         drop(resumed_events);
         drop(resumed);
+    }
+
+    #[test]
+    fn retained_resume_rehydrates_missing_job_runtime_from_exact_requested_elf() {
+        let root = tempfile::tempdir().unwrap();
+        let job = root.path().join("job");
+        fs::create_dir(&job).unwrap();
+        let bytes = guest_elf(super::VM_GUEST_ELF_MACHINE);
+        let requested = root.path().join("exact-guest-runtime");
+        fs::write(&requested, &bytes).unwrap();
+        let (artifact_path, artifact) = super::retain_guest_runtime_bytes(&job, &bytes).unwrap();
+        let runtime_disk = nanocodex_vm::GuestRuntimeDisk::prepare(
+            &artifact,
+            job.join(super::GUEST_RUNTIME_CACHE_ROOT),
+        )
+        .unwrap();
+        let origin = super::RetainedGuestRuntimeOrigin {
+            job: job.clone(),
+            runtime: super::RetainedGuestRuntime {
+                target: super::VM_GUEST_TARGET.to_owned(),
+                binary_sha256: hex::encode(sha2::Sha256::digest(&bytes)),
+                runtime_disk_digest: Some(runtime_disk.digest().to_owned()),
+                artifact_path: Some(artifact_path),
+                source: "explicit_binary".to_owned(),
+                source_path: PathBuf::from("/diagnostic/source"),
+                host_git_sha: "test".to_owned(),
+            },
+        };
+        fs::remove_file(&artifact).unwrap();
+        fs::remove_dir_all(job.join(super::GUEST_RUNTIME_CACHE_ROOT)).unwrap();
+
+        let prepared =
+            super::prepare_retained_guest_runtime(&job, &origin, Some(&requested), true).unwrap();
+
+        assert_eq!(fs::read(&artifact).unwrap(), bytes);
+        assert!(prepared.disk.is_file());
+        assert!(prepared.disk.starts_with(&job));
+        assert_eq!(prepared.identity.unwrap(), origin.runtime);
     }
 
     #[test]
