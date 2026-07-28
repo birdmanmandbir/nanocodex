@@ -100,24 +100,32 @@ read-only block device; directory roots must already contain
 The provided root must be session-private; the CLI takes an exclusive advisory
 lock on raw disks to reject accidental concurrent attachment.
 
-A caller that has started one `VmToolSession` opts into VM workspace effects
-through the normal tool-selection API:
+A caller normally materializes one private raw-ext4 root and starts a retained
+workspace through the high-level API. Bootstrap shell, runtime block-device
+mounts, private process configuration, and guest readiness stay inside
+`nanocodex-vm`:
 
 ```rust,no_run
 # use nanocodex::{Nanocodex, OpenAiAuth};
-# use nanocodex_vm::VmToolSession;
-# fn build(auth: OpenAiAuth, session: VmToolSession) -> nanocodex::Result<()> {
-let vm = session.tools();
-let tools = vm
-    .tools_builder()
-    .working_directory("/workspace")
-    .default_shell("sh")
-    .build()?;
+# use nanocodex_vm::VmWorkspaceBuilder;
+# async fn build(auth: OpenAiAuth) -> Result<(), Box<dyn std::error::Error>> {
+let workspace = VmWorkspaceBuilder::private_from(
+    ".cache/nanocodex/images/task.ext4",
+    ".nanocodex/sessions/018f/root.ext4",
+    "nanocodex-vmm",
+)?
+.guest_runtime_disk(".cache/nanocodex/runtime.ext4")
+.firmware_directory(".cache/libkrunfw/libkrunfw")
+.guest_workspace("/app")
+.launch()
+.await?;
+let tools = workspace.tools_builder().build()?;
 let (agent, events) = Nanocodex::builder(auth)
-    .workspace("/workspace")
+    .workspace(workspace.guest_workspace())
     .tools(tools)
     .build()?;
 # drop((agent, events));
+workspace.shutdown().await?;
 # Ok(())
 # }
 ```
@@ -127,7 +135,7 @@ image generation, and `update_plan` retain their existing host-side behavior.
 Callers can disable or replace those independently.
 
 Use `NanocodexBuilder::tools_factory` when an agent can spawn or fork. Start one
-`VmToolSession` for the root agent tree and capture its clone-cheap `VmTools` in
+`VmWorkspace` for the root agent tree and capture its clone-cheap `VmTools` in
 the factory. Nanocodex invokes the factory once per driver, so agent-relative
 tools are freshly bound to that driver while every driver deliberately shares
 the same VM, filesystem, and retained guest shell sessions:

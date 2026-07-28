@@ -6,23 +6,33 @@
 //! protocol. It does not own payment providers, secrets, or evaluation
 //! scheduling policy.
 //!
-//! # Configure a VM
+//! # Prepare a retained workspace
 //!
+//! ```no_run
+//! use nanocodex_vm::VmWorkspaceBuilder;
+//!
+//! # async fn prepare() -> Result<(), Box<dyn std::error::Error>> {
+//! let workspace = VmWorkspaceBuilder::private_from(
+//!     ".cache/nanocodex/images/task.ext4",
+//!     ".nanocodex/sessions/018f/root.ext4",
+//!     "nanocodex-vmm",
+//! )?
+//! .guest_runtime_disk(".cache/nanocodex/runtime.ext4")
+//! .firmware_directory(".cache/libkrunfw/libkrunfw")
+//! .launch()
+//! .await?;
+//! let tools = workspace.tools_builder().build()?;
+//! # drop(tools);
+//! workspace.shutdown().await?;
+//! # Ok(())
+//! # }
 //! ```
-//! use nanocodex_vm::{GuestCommand, Network, VmConfig};
 //!
-//! let vm = VmConfig::ext4("attempts/018f/root.ext4")
-//!     .cpus(2)
-//!     .memory_mib(768)
-//!     .network(Network::Disabled);
-//! let init = GuestCommand::new("/usr/local/bin/nanocodex-vm-guest")
-//!     .arg("/workspace");
-//! # let _ = (vm, init);
-//! ```
-//!
-//! An application normally serializes that pair with [`VmProcessConfig`] and
-//! starts a dedicated, entitled VMM subprocess. [`KrunVm::run`] is the
-//! low-level blocking entry point for that private subprocess.
+//! The application-owned `nanocodex-vmm` process reads the private launch
+//! record appended by the library and calls [`VmProcessConfig::run`]. macOS
+//! packaging signs that process with the hypervisor entitlement; Linux uses
+//! the same host API without signing. [`VmConfig`], [`GuestCommand`], and
+//! [`KrunVm::run`] remain low-level escape hatches.
 
 #![deny(unsafe_code, missing_docs, rustdoc::broken_intra_doc_links)]
 
@@ -43,6 +53,8 @@ mod krun;
 #[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
 mod process;
 pub mod tools;
+#[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
+mod workspace;
 
 #[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
 pub use capabilities::{Capabilities, KrunFeature};
@@ -67,6 +79,8 @@ pub use tools::{
 };
 #[cfg(feature = "guest-runtime")]
 pub use tools::{VmGuestError, serve_guest};
+#[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
+pub use workspace::{VmWorkspace, VmWorkspaceBuilder, VmWorkspaceError};
 
 /// The complete upstream libkrun API pinned by this workspace's lockfile.
 ///
