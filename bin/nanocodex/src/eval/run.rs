@@ -2378,8 +2378,7 @@ fn prepare_new_guest_runtime(
     validate_vm_guest_elf(&bytes, &source.path)?;
     let (artifact_path, artifact) = retain_guest_runtime_bytes(job, &bytes)?;
     let (disk, runtime_disk_digest, cache_status) = if block_runtime {
-        let runtime_disk =
-            GuestRuntimeDisk::prepare(&artifact, job.join(GUEST_RUNTIME_CACHE_ROOT))?;
+        let runtime_disk = prepare_job_guest_runtime_disk(job, &artifact)?;
         let cache_status = runtime_disk.status();
         (
             runtime_disk.path().to_path_buf(),
@@ -2443,8 +2442,7 @@ fn prepare_retained_guest_runtime(
             .ok_or_else(|| {
                 eyre!("retained block VM guest runtime is missing its runtime disk digest")
             })?;
-        let runtime_disk =
-            GuestRuntimeDisk::prepare(&artifact, job.join(GUEST_RUNTIME_CACHE_ROOT))?;
+        let runtime_disk = prepare_job_guest_runtime_disk(job, &artifact)?;
         if runtime_disk.digest() != expected {
             return Err(eyre!(
                 "retained VM guest runtime disk digest is {}, expected {expected}",
@@ -2504,7 +2502,10 @@ fn retained_guest_runtime_bytes(
             ));
         }
         let artifact = origin.job.join(artifact_path);
-        ensure_artifact_parent_is_job_owned(&origin.job, &artifact)?;
+        let artifact_parent = artifact
+            .parent()
+            .ok_or_else(|| eyre!("VM guest runtime artifact path has no parent"))?;
+        ensure_job_owned_path(&origin.job, artifact_parent)?;
         match fs::symlink_metadata(&artifact) {
             Ok(metadata) if metadata.file_type().is_file() => {
                 let (bytes, _) = stable_file_bytes(&artifact)?;
@@ -2565,6 +2566,14 @@ fn recover_retained_guest_runtime_disk(origin: &RetainedGuestRuntimeOrigin) -> R
     ))
 }
 
+fn prepare_job_guest_runtime_disk(job: &Path, artifact: &Path) -> Result<GuestRuntimeDisk> {
+    let cache = job.join(GUEST_RUNTIME_CACHE_ROOT);
+    ensure_job_owned_path(job, &cache)?;
+    let runtime_disk = GuestRuntimeDisk::prepare(artifact, &cache)?;
+    ensure_job_owned_path(job, &cache)?;
+    Ok(runtime_disk)
+}
+
 fn retain_guest_runtime_bytes(job: &Path, bytes: &[u8]) -> Result<(PathBuf, PathBuf)> {
     validate_vm_guest_elf(bytes, Path::new("<VM guest runtime artifact>"))?;
     let digest = hex::encode(Sha256::digest(bytes));
@@ -2573,9 +2582,9 @@ fn retain_guest_runtime_bytes(job: &Path, bytes: &[u8]) -> Result<(PathBuf, Path
     let parent = artifact
         .parent()
         .ok_or_else(|| eyre!("VM guest runtime artifact path has no parent"))?;
-    ensure_artifact_parent_is_job_owned(job, &artifact)?;
+    ensure_job_owned_path(job, parent)?;
     fs::create_dir_all(parent)?;
-    ensure_artifact_parent_is_job_owned(job, &artifact)?;
+    ensure_job_owned_path(job, parent)?;
     match fs::symlink_metadata(&artifact) {
         Ok(metadata) if metadata.file_type().is_file() => {
             let (retained, _) = stable_file_bytes(&artifact)?;
@@ -2620,11 +2629,14 @@ fn retain_guest_runtime_bytes(job: &Path, bytes: &[u8]) -> Result<(PathBuf, Path
     Ok((relative, artifact))
 }
 
-fn ensure_artifact_parent_is_job_owned(job: &Path, artifact: &Path) -> Result<()> {
-    let relative = artifact.strip_prefix(job).map_err(|_| {
+// Eval job directories are application-owned. This rejects pre-existing path and symlink escapes
+// and rechecks created paths, but does not claim a capability boundary against hostile concurrent
+// mutation of the job tree.
+fn ensure_job_owned_path(job: &Path, path: &Path) -> Result<()> {
+    let relative = path.strip_prefix(job).map_err(|_| {
         eyre!(
-            "VM guest runtime artifact {} escapes job {}",
-            artifact.display(),
+            "VM guest runtime path {} escapes job {}",
+            path.display(),
             job.display()
         )
     })?;
@@ -2633,34 +2645,31 @@ fn ensure_artifact_parent_is_job_owned(job: &Path, artifact: &Path) -> Result<()
         .any(|component| !matches!(component, Component::Normal(_)))
     {
         return Err(eyre!(
-            "VM guest runtime artifact {} escapes job {}",
-            artifact.display(),
+            "VM guest runtime path {} escapes job {}",
+            path.display(),
             job.display()
         ));
     }
     let job = fs::canonicalize(job)?;
-    let parent = artifact
-        .parent()
-        .ok_or_else(|| eyre!("VM guest runtime artifact path has no parent"))?;
-    let mut existing = parent;
-    let parent = loop {
+    let mut existing = path;
+    let resolved = loop {
         match fs::symlink_metadata(existing) {
             Ok(_) => break fs::canonicalize(existing)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 existing = existing.parent().ok_or_else(|| {
                     eyre!(
-                        "VM guest runtime artifact parent has no existing ancestor: {}",
-                        parent.display()
+                        "VM guest runtime path has no existing ancestor: {}",
+                        path.display()
                     )
                 })?;
             }
             Err(error) => return Err(error.into()),
         }
     };
-    if !parent.starts_with(&job) {
+    if !resolved.starts_with(&job) {
         return Err(eyre!(
-            "VM guest runtime artifact parent {} escapes job {}",
-            parent.display(),
+            "VM guest runtime path {} escapes job {}",
+            resolved.display(),
             job.display()
         ));
     }
@@ -5407,6 +5416,39 @@ mod tests {
 
         assert!(error.to_string().contains("escapes job"));
         assert!(!outside.join("artifacts").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guest_runtime_disk_rejects_a_sibling_cache_symlink_escape() {
+        let root = tempfile::tempdir().unwrap();
+        let job = root.path().join("job");
+        let outside = root.path().join("outside");
+        fs::create_dir(&job).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let (_, artifact) =
+            super::retain_guest_runtime_bytes(&job, &guest_elf(super::VM_GUEST_ELF_MACHINE))
+                .unwrap();
+        std::os::unix::fs::symlink(&outside, job.join(super::GUEST_RUNTIME_CACHE_ROOT)).unwrap();
+
+        let error = super::prepare_job_guest_runtime_disk(&job, &artifact).unwrap_err();
+
+        assert!(error.to_string().contains("escapes job"));
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn guest_runtime_job_paths_reject_parent_components() {
+        let job = tempfile::tempdir().unwrap();
+        let path = job
+            .path()
+            .join(super::GUEST_RUNTIME_CACHE_ROOT)
+            .join("..")
+            .join("outside");
+
+        let error = super::ensure_job_owned_path(job.path(), &path).unwrap_err();
+
+        assert!(error.to_string().contains("escapes job"));
     }
 
     #[test]
