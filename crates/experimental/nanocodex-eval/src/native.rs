@@ -38,7 +38,7 @@ impl NativeAttempt {
         let verifier = root.join("verifier");
         Self::create_directory(&workspace)?;
         Self::create_directory(&verifier)?;
-        Self::copy_directory_contents(&task.environment_directory(), &workspace)?;
+        task.materialize_environment(&workspace)?;
 
         Ok(Self {
             paths: AttemptPaths {
@@ -110,24 +110,6 @@ impl NativeAttempt {
 
     fn create_directory(path: &Path) -> Result<(), EvalError> {
         fs::create_dir_all(path)?;
-        Ok(())
-    }
-
-    fn copy_directory_contents(source: &Path, destination: &Path) -> Result<(), EvalError> {
-        let entries = fs::read_dir(source)?;
-        for entry in entries {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
-            let target = destination.join(entry.file_name());
-            if file_type.is_dir() {
-                fs::create_dir_all(&target)?;
-                Self::copy_directory_contents(&entry.path(), &target)?;
-            } else if file_type.is_file() {
-                fs::copy(entry.path(), &target)?;
-            } else {
-                return Err(EvalError::UnsupportedEnvironmentEntry(entry.path()));
-            }
-        }
         Ok(())
     }
 }

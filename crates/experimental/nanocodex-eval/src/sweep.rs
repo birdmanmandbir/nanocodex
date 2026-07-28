@@ -234,6 +234,10 @@ impl RunManifest {
         self.tasks.len() * self.agents.len() * usize::from(self.trials.get())
     }
 
+    pub(crate) fn task_roots(&self) -> impl Iterator<Item = &Path> {
+        self.tasks.iter().map(|task| task.root.as_path())
+    }
+
     pub(crate) fn contains_task_root(&self, task_root: &Path) -> bool {
         self.tasks.iter().any(|task| task.root == task_root)
     }

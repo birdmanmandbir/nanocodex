@@ -18,7 +18,6 @@ chrono.workspace = true
 futures-util.workspace = true
 fs2.workspace = true
 hex.workspace = true
-ignore.workspace = true
 nanocodex-agent.workspace = true
 nanocodex-oai-api.workspace = true
 reqwest.workspace = true
