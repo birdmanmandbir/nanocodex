@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use nanocodex_tools::{StandardTool, ToolContext, ToolExecution, ToolInput, ToolResult};
+use nanocodex_tools::{ToolContext, ToolInput, ToolOutput, ToolResult, standard::StandardTool};
 use nanovm::{
     EgressLease, GuestCommand, PrivateVmProcessConfig, VmConfig, VmProcessConfig, VmProcessError,
 };
@@ -558,7 +558,7 @@ impl VmToolSessionHandle {
         tool: StandardTool,
         input: ToolInput,
         context: ToolContext<'_>,
-    ) -> Result<ToolExecution, VmToolSessionError> {
+    ) -> Result<ToolOutput, VmToolSessionError> {
         let (input_kind, input_bytes) = match &input {
             ToolInput::Function(arguments) => ("function", arguments.get().len()),
             ToolInput::Freeform(input) => ("freeform", input.len()),
@@ -604,7 +604,7 @@ impl VmToolSessionHandle {
         input: ToolInput,
         context: ToolContext<'_>,
         span: &tracing::Span,
-    ) -> Result<ToolExecution, VmToolSessionError> {
+    ) -> Result<ToolOutput, VmToolSessionError> {
         let request = SessionRequest::Tool(ToolRequest {
             id: 0,
             tool,
@@ -623,7 +623,7 @@ impl VmToolSessionHandle {
             return Err(VmToolSessionError::Protocol("expected a tool response"));
         };
         match (response.execution, response.error) {
-            (Some(execution), None) => ToolExecution::from_wire(execution).map_err(Into::into),
+            (Some(execution), None) => ToolOutput::from_wire(execution).map_err(Into::into),
             (None, Some(error)) => Err(VmToolSessionError::Guest(error)),
             _ => Err(VmToolSessionError::Protocol(
                 "expected exactly one of execution or error",
@@ -996,7 +996,7 @@ async fn read_frame(
     }
 }
 
-fn set_request_id(request: &mut SessionRequest, id: u64) {
+const fn set_request_id(request: &mut SessionRequest, id: u64) {
     match request {
         SessionRequest::Ready(request) => request.id = id,
         SessionRequest::Tool(request) => request.id = id,
@@ -1108,7 +1108,7 @@ mod tracing_tests {
         time::Duration,
     };
 
-    use nanocodex_tools::{StandardTool, ToolContext, ToolInput};
+    use nanocodex_tools::{ToolContext, ToolInput, standard::StandardTool};
     use serde_json::{json, value::to_raw_value};
     use tracing::{Id, Instrument, Subscriber, field::Visit, span::Attributes};
     use tracing_subscriber::{

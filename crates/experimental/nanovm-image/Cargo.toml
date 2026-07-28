@@ -18,6 +18,7 @@ arcbox-ext4.workspace = true
 flate2.workspace = true
 fs2.workspace = true
 futures-util.workspace = true
+hex.workspace = true
 ignore.workspace = true
 nanocodex-vm.workspace = true
 nanovm.workspace = true

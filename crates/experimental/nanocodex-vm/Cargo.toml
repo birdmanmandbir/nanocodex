@@ -19,6 +19,7 @@ guest = ["dep:nix"]
 host = [
     "dep:arcbox-ext4",
     "dep:fs2",
+    "dep:hex",
     "dep:nanovm",
     "dep:sha2",
     "dep:tempfile",
@@ -29,6 +30,7 @@ arcbox-ext4 = { workspace = true, optional = true }
 async-trait = "0.1.89"
 base64.workspace = true
 fs2 = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
 nanocodex-tools = { path = "../../nanocodex-tools", version = "0.2.0", default-features = false }
 nanovm = { workspace = true, optional = true }
 nix = { workspace = true, optional = true }

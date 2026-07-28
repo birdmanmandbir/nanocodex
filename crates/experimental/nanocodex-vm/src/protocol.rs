@@ -1,4 +1,4 @@
-use nanocodex_tools::{StandardTool, ToolExecutionWire, ToolInput};
+use nanocodex_tools::{ToolInput, contract::ToolOutputWire, standard::StandardTool};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
@@ -199,7 +199,7 @@ pub(crate) enum WireToolInput {
 
 #[cfg(test)]
 mod tests {
-    use nanocodex_tools::{ToolExecution, ToolInput};
+    use nanocodex_tools::{ToolInput, ToolOutput, standard::StandardTool};
     use serde_json::{json, value::to_raw_value};
 
     use super::{
@@ -227,7 +227,7 @@ mod tests {
     fn function_request_round_trips_opaque_arguments() {
         let request = ToolRequest {
             id: 7,
-            tool: nanocodex_tools::StandardTool::ExecCommand,
+            tool: StandardTool::ExecCommand,
             input: WireToolInput::from(ToolInput::Function(
                 to_raw_value(&json!({"cmd": "pwd"})).unwrap(),
             )),
@@ -251,7 +251,7 @@ mod tests {
         let response = ToolResponse {
             id: 8,
             execution: Some(
-                ToolExecution::from_json(json!({"output": "ok"}), true)
+                ToolOutput::from_json(json!({"output": "ok"}), true)
                     .into_wire()
                     .unwrap(),
             ),
@@ -313,13 +313,13 @@ pub(crate) struct WireToolContext {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ToolResponse {
     pub id: u64,
-    pub execution: Option<ToolExecutionWire>,
+    pub execution: Option<ToolOutputWire>,
     pub error: Option<String>,
 }
 
 impl ToolResponse {
     #[cfg(feature = "guest")]
-    pub const fn completed(id: u64, execution: ToolExecutionWire) -> Self {
+    pub const fn completed(id: u64, execution: ToolOutputWire) -> Self {
         Self {
             id,
             execution: Some(execution),

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
-use nanocodex_agent::{AgentEvent, AgentEventKind, MODEL, Usage};
+use nanocodex_agent::events::{AgentEvent, AgentEventKind};
+use nanocodex_oai_api::{MODEL, responses::Usage};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
@@ -174,7 +175,7 @@ pub struct AtifMetrics {
     pub completion_tokens: u64,
     /// Input tokens served from provider cache.
     pub cached_tokens: u64,
-    /// Estimated USD cost when a pricing snapshot was configured.
+    /// Estimated USD cost from provider usage and the built-in pricing catalog.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
     /// Nanocodex transport and execution metrics.
@@ -222,7 +223,7 @@ pub struct AtifFinalMetrics {
     pub total_completion_tokens: u64,
     /// Total cached input tokens.
     pub total_cached_tokens: u64,
-    /// Aggregate estimated USD cost when pricing was configured.
+    /// Aggregate estimated USD cost when provider usage can be priced.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_cost_usd: Option<f64>,
     /// Number of user and agent steps.
@@ -682,7 +683,7 @@ struct ToolResultPayload {
 mod tests {
     use std::path::Path;
 
-    use nanocodex_agent::AgentEvent;
+    use nanocodex_agent::events::AgentEvent;
 
     use crate::{AgentMetadata, AgentResult, AtifSource, Task};
 
@@ -742,7 +743,7 @@ mod tests {
             builder.apply(event).unwrap();
         }
         let task =
-            Task::load(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tasks/write-greeting"))
+            Task::load(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tasks/write-greeting"))
                 .unwrap();
         let metadata: AgentMetadata = serde_json::from_str(TERMINAL_METADATA).unwrap();
         let result = AgentResult {

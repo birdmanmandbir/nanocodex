@@ -22,7 +22,8 @@ use clap::{Args, ValueEnum};
 use eyre::{Result, eyre};
 use fs2::FileExt as _;
 use nanocodex::{
-    NanocodexBuilder, StandardResponses, Thinking, Tools, ToolsBuildError, UpdatePlanTool,
+    NanocodexBuilder, Thinking, Tools,
+    tools::{ToolsBuildError, standard::UpdatePlanTool},
 };
 use nanocodex_eval::{
     AttemptAgent, AttemptVerification, AttemptVerifier, EvalAttempt, EvalEventKind,
@@ -603,7 +604,7 @@ impl Run {
     fn build_evaluator(
         resolved: &ResolvedRun,
         tasks: Vec<Task>,
-        nanocodex: NanocodexBuilder<StandardResponses>,
+        nanocodex: NanocodexBuilder,
         new_job: bool,
     ) -> Result<(EvaluatorBuilder, Sweep, usize)> {
         let sweep = Sweep::builder()
@@ -653,10 +654,9 @@ impl Run {
                 report.summary.total,
                 if report.summary.total == 1 { "" } else { "s" }
             ),
-            None => println!(
-                "Estimated cost: unavailable (configure --pricing-file or \
-                 NANOCODEX_PRICING_FILE)"
-            ),
+            None => {
+                println!("Estimated cost: unavailable (provider usage was unavailable or unpriced)")
+            }
         }
         if report.skipped > 0 {
             println!(
@@ -1234,7 +1234,7 @@ fn bind_finite_run(evaluator: EvaluatorBuilder, sweep: &Sweep, fresh: bool) -> E
     }
 }
 
-fn configure_memory_limit(
+const fn configure_memory_limit(
     evaluator: EvaluatorBuilder,
     max_memory_mb: Option<u64>,
 ) -> EvaluatorBuilder {
@@ -1862,7 +1862,7 @@ fn vm_guest_build_record(workspace: &Path, runtime: &Path) -> Result<Option<VmGu
         runtime_bytes: runtime_metadata.bytes,
         runtime_modified_unix_ns: runtime_metadata.modified_unix_ns,
         input_count: inputs.len(),
-        input_metadata_digest: format!("{:x}", digest.finalize()),
+        input_metadata_digest: hex::encode(digest.finalize()),
     }))
 }
 
@@ -2530,7 +2530,7 @@ impl VerifierCache {
         identity.update(attempt.disk.as_os_str().as_encoded_bytes());
         let temporary = self
             .root
-            .join(format!("cache.{:x}.tmp", identity.finalize()));
+            .join(format!("cache.{}.tmp", hex::encode(identity.finalize())));
         reflink_or_sparse_copy(&attempt.disk, &temporary)?;
         match fs::hard_link(&temporary, &target) {
             Ok(()) => {}
@@ -2556,7 +2556,7 @@ fn verifier_cache_key(
     digest.update(template_identity.as_encoded_bytes());
     digest.update(cacheable_script);
     digest.update(disk_bytes.to_le_bytes());
-    format!("{:x}", digest.finalize())
+    hex::encode(digest.finalize())
 }
 
 fn format_verifier_cache_disk(path: &Path, disk_bytes: u64) -> Result<(), VmAttemptError> {
@@ -3149,7 +3149,7 @@ fn remove_passed_rootfs(rootfs: &Path) -> io::Result<bool> {
     Ok(true)
 }
 
-fn verifier_shell(configured: &str, skip_setup: bool) -> &str {
+const fn verifier_shell(configured: &str, skip_setup: bool) -> &str {
     if skip_setup { "/bin/bash" } else { configured }
 }
 
@@ -3329,7 +3329,7 @@ enum AttemptOutcome {
 }
 
 impl AttemptOutcome {
-    fn from_result(result: EvalResult) -> Self {
+    const fn from_result(result: EvalResult) -> Self {
         match result.status {
             EvalStatus::Passed => Self::Passed(result),
             EvalStatus::Failed => Self::Failed(result),

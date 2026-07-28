@@ -284,7 +284,7 @@ enum GuestEnvironmentParseError {
 }
 
 impl Eval {
-    pub(crate) fn requires_synchronous_vm(&self) -> bool {
+    pub(crate) const fn requires_synchronous_vm(&self) -> bool {
         matches!(
             self.command,
             EvalCommand::Vm {
@@ -789,15 +789,7 @@ mod tests {
     #[test]
     fn complete_eval_surface_is_nested_under_nanocodex() {
         for arguments in [
-            vec![
-                "nanocodex",
-                "eval",
-                "run",
-                "--task",
-                "tasks/write-greeting",
-                "--pricing-file",
-                "pricing.json",
-            ],
+            vec!["nanocodex", "eval", "run", "--task", "tasks/write-greeting"],
             vec![
                 "nanocodex",
                 "eval",

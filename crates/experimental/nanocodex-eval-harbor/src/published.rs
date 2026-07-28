@@ -373,7 +373,7 @@ impl PublishedResults {
         task: &str,
         candidates: Vec<PublishedPath>,
     ) -> Result<Vec<PublishedRecord>, PublishedError> {
-        let task_key = format!("{:x}", Sha256::digest(task.as_bytes()));
+        let task_key = hex::encode(Sha256::digest(task.as_bytes()));
         let manifest = self
             .cache_directory
             .join("task-results-v3")
@@ -408,7 +408,7 @@ impl PublishedResults {
         revision: &str,
         task: &str,
     ) -> Result<Vec<PublishedPath>, PublishedError> {
-        let task_key = format!("{:x}", Sha256::digest(task.as_bytes()));
+        let task_key = hex::encode(Sha256::digest(task.as_bytes()));
         let manifest = self
             .cache_directory
             .join("task-paths")

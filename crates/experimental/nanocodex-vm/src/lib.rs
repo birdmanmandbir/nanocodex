@@ -3,8 +3,8 @@
 //! This crate keeps the model-visible tool contract identical while forwarding
 //! `exec_command`, `write_stdin`, `apply_patch`, and `view_image` to one
 //! isolated guest. The default `host` feature owns the VMM child, cancellation,
-//! bounded protocol, and egress lease. The narrow `guest` feature compiles the
-//! companion server without the host VM or network-client dependency graph.
+//! bounded protocol, and egress lease. The `guest` feature compiles the
+//! companion server over the canonical native workspace-tool runtime.
 
 #![cfg_attr(
     feature = "host",
@@ -78,8 +78,8 @@ use std::sync::Arc;
 
 #[cfg(feature = "host")]
 use nanocodex_tools::{
-    StandardTool, Tool, ToolContext, ToolDefinition, ToolInput, ToolResult, Tools, ToolsBuilder,
-    UpdatePlanTool,
+    Tool, ToolContext, ToolDefinition, ToolInput, ToolResult, Tools, ToolsBuilder,
+    standard::{StandardTool, UpdatePlanTool},
 };
 
 #[cfg(feature = "guest")]
@@ -220,7 +220,7 @@ pub async fn serve_guest(workspace: impl AsRef<Path>) -> Result<(), VmGuestError
 mod tests {
     use std::sync::Mutex;
 
-    use nanocodex_tools::{StandardTool, Tool, ToolContext, ToolExecution, ToolInput};
+    use nanocodex_tools::{Tool, ToolContext, ToolInput, ToolOutput, standard::StandardTool};
 
     use super::{VmToolClient, VmTools};
 
@@ -238,7 +238,7 @@ mod tests {
             _context: ToolContext<'_>,
         ) -> nanocodex_tools::ToolResult {
             self.calls.lock().unwrap().push(tool);
-            Ok(ToolExecution::text(tool.name()))
+            Ok(ToolOutput::text(tool.name()))
         }
     }
 

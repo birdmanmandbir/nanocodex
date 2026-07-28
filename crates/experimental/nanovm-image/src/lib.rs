@@ -533,7 +533,7 @@ impl PreparedRootDisk {
 
     /// Returns the final Docker process environment.
     #[must_use]
-    pub fn environment(&self) -> &BTreeMap<String, String> {
+    pub const fn environment(&self) -> &BTreeMap<String, String> {
         &self.environment
     }
 
@@ -1187,13 +1187,13 @@ fn prepare_context_disk(
         }
         hasher.update(&buffer[..read]);
     }
-    let digest = format!("{:x}", hasher.finalize());
+    let digest = hex::encode(hasher.finalize());
     let disk_bytes = task_disk_bytes.max(CONTEXT_DISK_BYTES);
     let mut identity = Sha256::new();
     identity.update(b"nanoeval-context-ext4-v1\0");
     identity.update(digest.as_bytes());
     identity.update(disk_bytes.to_le_bytes());
-    let key = format!("{:x}", identity.finalize());
+    let key = hex::encode(identity.finalize());
     let path = contexts.join(format!("{key}.ext4"));
     let _lock = CacheLock::acquire(cache, "contexts", &key)?;
     if !valid_cached_ext4_disk(&path) {
@@ -1712,7 +1712,7 @@ fn build_cache_key(
         hasher.update([0]);
         hasher.update(image.manifest_digest.as_bytes());
     }
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 fn host_resolver_configuration() -> io::Result<String> {
@@ -2066,7 +2066,7 @@ fn disk_cache_key(manifest_digest: &str, disk_bytes: u64) -> String {
     hasher.update(manifest_digest.as_bytes());
     hasher.update([0]);
     hasher.update(disk_bytes.to_le_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 fn reference_cache_key(image: &str) -> String {
@@ -2075,7 +2075,7 @@ fn reference_cache_key(image: &str) -> String {
     hasher.update(GUEST_ARCHITECTURE.as_bytes());
     hasher.update([0]);
     hasher.update(image.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 #[cfg(test)]

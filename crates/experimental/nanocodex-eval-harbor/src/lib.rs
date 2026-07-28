@@ -7,12 +7,12 @@
 //! # Record a job
 //!
 //! ```no_run
-//! use nanocodex_agent::Nanocodex;
+//! use nanocodex_agent::{Nanocodex, OpenAi};
 //! use nanocodex_eval::{Evaluator, Task};
 //! use nanocodex_eval_harbor::Harbor;
 //!
 //! # async fn evaluate() -> Result<(), Box<dyn std::error::Error>> {
-//! let agent = Nanocodex::builder(std::env::var("OPENAI_API_KEY")?).instructions(
+//! let agent = Nanocodex::builder(OpenAi::new(std::env::var("OPENAI_API_KEY")?)?).instructions(
 //!     "Work in the provided workspace, complete the task, and verify it.",
 //! );
 //! let (evaluator, events) = Evaluator::builder(agent)
@@ -1335,7 +1335,7 @@ struct HarborMetric {}
 mod tests {
     use std::{collections::BTreeMap, fs};
 
-    use nanocodex_agent::{Nanocodex, OpenAiAuth};
+    use nanocodex_agent::{Nanocodex, OpenAi};
     use nanocodex_eval::{AtifTrajectory, Evaluator, Sweep, Task};
     use serde::Deserialize;
     use tempfile::tempdir;
@@ -1389,17 +1389,21 @@ mod tests {
     fn finite_job_records_pending_trials_before_execution() {
         let output = tempdir().unwrap();
         let task = Task::load(
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tasks/write-greeting"),
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../tasks/write-greeting"),
         )
         .unwrap();
         let sweep = Sweep::builder()
             .task(task)
             .trials(2)
-            .agent("default", Nanocodex::builder("test-key"))
+            .agent(
+                "default",
+                Nanocodex::builder(OpenAi::new("test-key").unwrap()),
+            )
             .unwrap()
             .build()
             .unwrap();
-        let (eval, _) = Evaluator::builder(Nanocodex::builder("test-key"))
+        let (eval, _) = Evaluator::builder(Nanocodex::builder(OpenAi::new("test-key").unwrap()))
             .output_directory(output.path())
             .fresh_run(&sweep)
             .build()
@@ -1446,7 +1450,7 @@ allow_internet = false
         fs::write(task_root.path().join("tests/test.sh"), "exit 0\n").unwrap();
         let task = Task::load(task_root.path()).unwrap();
         let output = tempdir().unwrap();
-        let (eval, events) = Evaluator::builder(Nanocodex::builder(OpenAiAuth::api_key("test")))
+        let (eval, events) = Evaluator::builder(Nanocodex::builder(OpenAi::new("test").unwrap()))
             .output_directory(output.path())
             .build()
             .unwrap();

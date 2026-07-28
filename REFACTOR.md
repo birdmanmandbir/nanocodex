@@ -115,9 +115,9 @@ nanocodex-tools-macros
 └── proc-macro implementation; no agent dependency
 ```
 
-Systems and evaluation crates remain below the agent. VM packages live under
-`crates/experimental/`; they remain workspace members but are outside the
-stable publication and dependency surface:
+Systems and evaluation crates remain below the agent. VM and evaluation
+packages live under `crates/experimental/`; they remain workspace members but
+are outside the stable publication and dependency surface:
 
 ```text
 nanovm-image ──> nanocodex-vm ──> nanovm
@@ -725,8 +725,8 @@ Node/browser WASM.
 - [x] Land the retained VM tool session and composable neutral egress lease.
 - [x] Move current guest ELF staging behind the content-addressed
   `GuestRuntimeDisk` API while retaining Nanoeval's cache identity.
-- [x] Keep the guest dependency graph limited to local workspace tools and the
-  dependency-light OAI contract while preserving MCP in normal native tools.
+- [x] Reuse the canonical local workspace-tool contracts in the guest without
+  introducing an alternate tool runtime or changing native MCP availability.
 - [x] Benchmark warm image lookup, reflink, protocol overhead, real retained
   guest RPC, boot, and shutdown.
 
@@ -743,11 +743,11 @@ resolution is bounded-parallel, and init4-style bounded spans preserve the
 complete Dockerfile. Build CPU, memory, egress, and instruction timeouts are
 explicit builder policy rather than hidden constants.
 
-The three VM crates deliberately remain `publish = false` while `nanovm`
-targets the reviewed libkrun `2.0.0-dev` Git checkpoint, which is not available
-on crates.io. Their public APIs and Rustdoc are complete for path/Git consumers;
-Stack 10 owns publication once that exact dependency can be packaged without
-substituting an older hypervisor API.
+The three VM crates and two evaluation crates deliberately remain
+`publish = false` while `nanovm` targets the reviewed libkrun `2.0.0-dev` Git
+checkpoint, which is not available on crates.io. Their public APIs and Rustdoc
+are complete for path/Git consumers; Stack 10 owns publication once that exact
+dependency can be packaged without substituting an older hypervisor API.
 
 ### 7. Browser on VM
 
@@ -781,9 +781,9 @@ records the exact `nanoeval/master@10aed6b` capability mapping, compatibility
 inputs, retained end-to-end measurements, and the new task/sweep/resume/ATIF
 Criterion budgets. The imported task and verifier fixtures are unchanged.
 `nanocodex-eval` and `nanocodex-eval-harbor` now provide warnings-denied
-progressive rustdoc examples; the CLI accepts the same pricing snapshot as the
-agent and carries estimated USD through results, ATIF, Harbor, JSON, tracing,
-and human summaries. A clean-cache CLI proof rebuilt the guest, ran the task
+progressive rustdoc examples; the CLI uses the agent's built-in pricing catalog
+and carries estimated USD through results, ATIF, Harbor, JSON, tracing, and
+human summaries. A clean-cache CLI proof rebuilt the guest, ran the task
 Dockerfile through the content-addressed entitled VMM, reached the typed guest
 tool server in 292.595 ms, retained complete failure evidence after a deliberate
 zero-cost authentication failure, and was decoded through Harbor's live viewer

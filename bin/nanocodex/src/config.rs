@@ -254,17 +254,6 @@ impl AgentArgs {
     }
 }
 
-pub(crate) fn load_pricing(path: Option<&Path>) -> Result<Option<PricingSnapshot>> {
-    let Some(path) = path else {
-        return Ok(None);
-    };
-    let bytes = std::fs::read(path)
-        .wrap_err_with(|| format!("failed to read pricing snapshot {}", path.display()))?;
-    serde_json::from_slice(&bytes)
-        .wrap_err_with(|| format!("invalid pricing snapshot {}", path.display()))
-        .map(Some)
-}
-
 fn prepare_session_build(
     requested_workspace: Option<PathBuf>,
     rollouts: bool,

@@ -47,7 +47,7 @@ pub(crate) fn package_content_hash(root: &Path) -> Result<String, HarborError> {
         outer.update(file_hash.as_bytes());
         outer.update(b"\n");
     }
-    Ok(format!("{:x}", outer.finalize()))
+    Ok(hex::encode(outer.finalize()))
 }
 
 fn hash_directory(
@@ -145,7 +145,7 @@ fn relative_name(root: &Path, path: &Path) -> String {
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 #[cfg(test)]
@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn matches_harbor_hashes_for_the_fixture() {
-        let task = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tasks/write-greeting");
+        let task = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tasks/write-greeting");
 
         assert_eq!(
             directory_hash(&task).unwrap(),

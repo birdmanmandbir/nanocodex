@@ -297,7 +297,7 @@ fn runtime_digest(bytes: &[u8]) -> String {
     let mut identity = Sha256::new();
     identity.update(IDENTITY_VERSION);
     identity.update(bytes);
-    format!("{:x}", identity.finalize())
+    hex::encode(identity.finalize())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -353,7 +353,7 @@ fn runtime_record_path(cache: &Path, binary: &Path) -> PathBuf {
     identity.update(binary.as_os_str().as_encoded_bytes());
     cache
         .join("runtime-records")
-        .join(format!("{:x}.json", identity.finalize()))
+        .join(format!("{}.json", hex::encode(identity.finalize())))
 }
 
 fn recorded_runtime_disk(
@@ -519,7 +519,7 @@ fn validate_prepared_disk(path: &Path, binary: &[u8]) -> Result<(), GuestRuntime
     Ok(())
 }
 
-fn cache_error(path: PathBuf, source: io::Error) -> GuestRuntimeDiskError {
+const fn cache_error(path: PathBuf, source: io::Error) -> GuestRuntimeDiskError {
     GuestRuntimeDiskError::Cache { path, source }
 }
 

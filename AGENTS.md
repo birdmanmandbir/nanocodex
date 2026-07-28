@@ -70,10 +70,15 @@
 - `nanovm` owns the audited libkrun boundary, typed VM/process configuration,
   gvproxy lifecycle, and provider-neutral egress capabilities.
 - `nanocodex-vm` owns the bounded retained host/guest protocol and VM-backed
-  standard tool adapters. Its guest build uses only local workspace tools and
-  dependency-light OAI contract types.
+  standard tool adapters. Its guest reuses the canonical local workspace-tool
+  contracts rather than introducing a second tool runtime.
 - `nanovm-image` owns OCI/Dockerfile resolution, content-addressed immutable
   ext4 preparation, cache locking, and per-attempt reflinks.
+- `nanocodex-eval` owns typed tasks, attempts, durable scheduling, sweeps,
+  retained results, and native or VM evaluator policy.
+- `nanocodex-eval-harbor` owns the canonical Harbor and ATIF projection of
+  retained evaluation events. It does not own model decisions or task
+  mutation.
 - Each lower crate must remain useful without importing the higher orchestration
   crate. Avoid circular concepts and leaky socket/runtime types.
 - `scripts/check-crate-boundaries.sh` is the executable dependency policy.

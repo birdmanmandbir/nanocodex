@@ -238,10 +238,10 @@ re-running committed results. Events are optional and independent from typed
 results.
 
 ```rust,ignore
-use nanocodex::{Nanocodex, Thinking};
+use nanocodex::{Nanocodex, OpenAi, Thinking};
 use nanocodex_eval::{Evaluator, Sweep, Task};
 
-let agent = Nanocodex::builder(std::env::var("OPENAI_API_KEY")?)
+let agent = Nanocodex::builder(OpenAi::new(std::env::var("OPENAI_API_KEY")?)?)
     .instructions(
         "Work directly in the provided workspace. Complete the requested task, \
          verify your changes, and keep the final answer concise.",
@@ -277,10 +277,10 @@ nanocodex eval compare terminal-bench/configure-git-webserver
 nanocodex eval cleanup .nanocodex/evals --dry-run
 ```
 
-Pass `--pricing-file pricing.json` (or `NANOCODEX_PRICING_FILE`) to retain and
-print the known estimated USD cost alongside exact token usage. Existing
-Nanoeval jobs and environment overrides remain readable during migration, but
-new state is written beneath `.nanocodex`.
+Estimated USD cost is retained and printed automatically from provider-reported
+usage and Nanocodex's built-in pricing catalog. Existing Nanoeval jobs and
+environment overrides remain readable during migration, but new state is
+written beneath `.nanocodex`.
 
 ## Components
 
@@ -310,16 +310,17 @@ bin/nanousd                       shared private credits protocol
 bin/nanousd-api                   credits service
 ```
 
-The monorepo also contains independently useful systems components. VM
-components live under [`crates/experimental/`](crates/experimental/README.md):
+The monorepo also contains independently useful systems components. VM and
+evaluation components live under
+[`crates/experimental/`](crates/experimental/README.md):
 
 | Component | Responsibility |
 | --- | --- |
 | `nanovm` *(experimental)* | Typed libkrun lifecycle, disks, networking, egress capabilities, and shutdown |
 | `nanocodex-vm` *(experimental)* | Bounded retained host/guest RPC and agent tools backed by one VM session tree |
 | `nanovm-image` *(experimental)* | OCI/Dockerfile inputs to content-addressed immutable ext4 disks and attempt reflinks |
-| `nanocodex-eval` | Typed tasks, attempts, scheduling, results, and sweeps |
-| `nanocodex-eval-harbor` | Canonical Harbor/ATIF import and export |
+| `nanocodex-eval` *(experimental)* | Typed tasks, attempts, scheduling, results, and sweeps |
+| `nanocodex-eval-harbor` *(experimental)* | Canonical Harbor/ATIF import and export |
 
 The CLI is a consumer of these libraries. Evaluation is exposed as
 `nanocodex eval ...`; it does not install Nanocodex into every task image or
@@ -376,25 +377,23 @@ Lower-level consumers can depend only on the component they need:
 cargo add nanocodex-oai-api
 cargo add nanocodex-tools
 cargo add nanocodex-agent
-cargo add nanocodex-eval
-cargo add nanocodex-eval-harbor
 ```
 
 `nanocodex-oai-api` enables its Tower transports and managed session client by
-default. Low-level process components can select its dependency-light contract
-without that `client` feature; this is how the musl VM guest reuses exact
-Responses/tool types without linking HTTP, WebSocket, or TLS code. Normal
-native `nanocodex-tools` builds retain MCP, `tool_search`, Code Mode, image
-processing, and remote tools by default.
+default on native targets. Native `nanocodex-tools` builds include MCP,
+`tool_search`, Code Mode, image processing, and remote tools; MCP is not an
+optional compatibility layer.
 
-The experimental VM crates currently track a reviewed libkrun Git checkpoint
-and are not published on crates.io, so Git/path consumers select them
-explicitly:
+The experimental VM and evaluation crates are not published on crates.io. The
+VM crates currently track a reviewed libkrun Git checkpoint, so Git/path
+consumers select these packages explicitly:
 
 ```sh
 cargo add nanovm --git https://github.com/gakonst/nanocodex
 cargo add nanocodex-vm --git https://github.com/gakonst/nanocodex
 cargo add nanovm-image --git https://github.com/gakonst/nanocodex
+cargo add nanocodex-eval --git https://github.com/gakonst/nanocodex
+cargo add nanocodex-eval-harbor --git https://github.com/gakonst/nanocodex
 ```
 
 The daily-driver CLI is available on macOS and Linux:

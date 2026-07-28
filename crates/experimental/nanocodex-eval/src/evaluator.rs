@@ -14,9 +14,12 @@ use std::{
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
 use nanocodex_agent::{
-    AgentEvent, AgentEventKind, AgentEvents, MODEL, Nanocodex, NanocodexBuilder, NanocodexError,
-    ResponsesError, SessionId, StandardResponses,
+    Nanocodex, NanocodexBuilder, NanocodexError,
+    events::{AgentEvent, AgentEventKind, AgentEvents},
+    session::SessionId,
+    transport::ResponsesError,
 };
+use nanocodex_oai_api::MODEL;
 use serde::Deserialize;
 use tokio::{
     sync::{Notify, broadcast},
@@ -47,7 +50,7 @@ pub struct Evaluator {
 
 /// Deliberate evaluator policy configured before running tasks.
 pub struct EvaluatorBuilder {
-    nanocodex: NanocodexBuilder<StandardResponses>,
+    nanocodex: NanocodexBuilder,
     output_directory: PathBuf,
     max_concurrency: usize,
     max_memory_mb: Option<u64>,
@@ -56,7 +59,7 @@ pub struct EvaluatorBuilder {
 }
 
 struct EvaluatorInner {
-    nanocodex: NanocodexBuilder<StandardResponses>,
+    nanocodex: NanocodexBuilder,
     job: EvalJob,
     planned_attempts: Option<usize>,
     admission: Arc<AdmissionController>,
@@ -98,10 +101,7 @@ enum FiniteRunMode {
 
 type AttemptError = Box<dyn Error + Send + Sync + 'static>;
 type AttemptAgentFactory = Arc<
-    dyn for<'a> Fn(
-            EvalAttempt<'a>,
-            NanocodexBuilder<StandardResponses>,
-        ) -> Result<AttemptAgent, AttemptError>
+    dyn for<'a> Fn(EvalAttempt<'a>, NanocodexBuilder) -> Result<AttemptAgent, AttemptError>
         + Send
         + Sync
         + 'static,
@@ -114,7 +114,7 @@ type AttemptReadinessFuture =
 
 /// The Nanocodex configuration and resources owned by one attempt.
 pub struct AttemptAgent {
-    nanocodex: NanocodexBuilder<StandardResponses>,
+    nanocodex: NanocodexBuilder,
     readiness: Option<AttemptReadinessFuture>,
     verifier: Option<Box<dyn AttemptVerifier>>,
 }
@@ -144,7 +144,7 @@ pub struct AttemptVerification {
 
 struct AttemptInput {
     task: Task,
-    nanocodex: NanocodexBuilder<StandardResponses>,
+    nanocodex: NanocodexBuilder,
     coordinate: Option<SweepCoordinate>,
 }
 
@@ -246,7 +246,7 @@ impl Evaluator {
     /// Every attempt receives an independent session and workspace. The recipe
     /// automatically shares only its immutable prompt-cache warmup.
     #[must_use]
-    pub fn builder(nanocodex: NanocodexBuilder<StandardResponses>) -> EvaluatorBuilder {
+    pub fn builder(nanocodex: NanocodexBuilder) -> EvaluatorBuilder {
         EvaluatorBuilder {
             nanocodex: nanocodex.shared_prompt_cache(),
             output_directory: PathBuf::from(".nanocodex/evals"),
@@ -523,7 +523,7 @@ impl Evaluator {
     async fn run_task_inner(
         &self,
         task: Task,
-        nanocodex: NanocodexBuilder<StandardResponses>,
+        nanocodex: NanocodexBuilder,
         attempt_id: Uuid,
         trial_name: String,
         started_at: DateTime<Utc>,
@@ -666,7 +666,7 @@ impl Evaluator {
         emitter: &mut AttemptEmitter<'_>,
         task: &Task,
         attempt: &NativeAttempt,
-        nanocodex: NanocodexBuilder<StandardResponses>,
+        nanocodex: NanocodexBuilder,
     ) -> Result<AgentExecution, EvalError> {
         let AgentSetup {
             agent,
@@ -727,7 +727,7 @@ impl Evaluator {
         emitter: &AttemptEmitter<'_>,
         task: &Task,
         attempt: &NativeAttempt,
-        nanocodex: NanocodexBuilder<StandardResponses>,
+        nanocodex: NanocodexBuilder,
     ) -> Result<AgentSetup, EvalError> {
         let setup_started = Utc::now();
         let span = info_span!(
@@ -855,10 +855,7 @@ impl EvaluatorBuilder {
     #[must_use]
     pub fn attempt_agent<F, E>(mut self, factory: F) -> Self
     where
-        F: for<'a> Fn(
-                EvalAttempt<'a>,
-                NanocodexBuilder<StandardResponses>,
-            ) -> Result<AttemptAgent, E>
+        F: for<'a> Fn(EvalAttempt<'a>, NanocodexBuilder) -> Result<AttemptAgent, E>
             + Send
             + Sync
             + 'static,
@@ -978,7 +975,7 @@ impl Drop for AdmissionPermit {
 impl AttemptAgent {
     /// Uses `nanocodex` for one attempt with the default native verifier.
     #[must_use]
-    pub fn new(nanocodex: NanocodexBuilder<StandardResponses>) -> Self {
+    pub fn new(nanocodex: NanocodexBuilder) -> Self {
         Self {
             nanocodex,
             readiness: None,
@@ -1016,7 +1013,7 @@ impl AttemptAgent {
     fn into_parts(
         self,
     ) -> (
-        NanocodexBuilder<StandardResponses>,
+        NanocodexBuilder,
         Option<AttemptReadinessFuture>,
         Option<Box<dyn AttemptVerifier>>,
     ) {
@@ -1444,7 +1441,7 @@ mod tracing_tests {
         time::Duration,
     };
 
-    use nanocodex_agent::{Nanocodex, NanocodexError, ResponsesError};
+    use nanocodex_agent::{Nanocodex, NanocodexError, OpenAi, transport::ResponsesError};
     use tempfile::tempdir;
     use tracing::{Id, Instrument, Subscriber, field::Visit, span::Attributes};
     use tracing_subscriber::{
@@ -1471,17 +1468,21 @@ mod tracing_tests {
     fn fresh_finite_run_is_bound_before_execution() {
         let output = tempdir().unwrap();
         let task = Task::load(
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tasks/write-greeting"),
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../tasks/write-greeting"),
         )
         .unwrap();
         let sweep = Sweep::builder()
             .task(task)
             .trials(2)
-            .agent("default", Nanocodex::builder("test-key"))
+            .agent(
+                "default",
+                Nanocodex::builder(OpenAi::new("test-key").unwrap()),
+            )
             .unwrap()
             .build()
             .unwrap();
-        let (eval, _) = Evaluator::builder(Nanocodex::builder("test-key"))
+        let (eval, _) = Evaluator::builder(Nanocodex::builder(OpenAi::new("test-key").unwrap()))
             .output_directory(output.path())
             .fresh_run(&sweep)
             .build()
@@ -1627,10 +1628,11 @@ allow_internet = false
 
         tracing::dispatcher::with_default(&dispatch, || {
             runtime.block_on(async {
-                let (eval, _events) = Evaluator::builder(Nanocodex::builder("test"))
-                    .output_directory(output.path())
-                    .build()
-                    .unwrap();
+                let (eval, _events) =
+                    Evaluator::builder(Nanocodex::builder(OpenAi::new("test").unwrap()))
+                        .output_directory(output.path())
+                        .build()
+                        .unwrap();
                 let result = eval
                     .tasks(vec![task.clone(), task])
                     .instrument(tracing::info_span!("test.parent"))
