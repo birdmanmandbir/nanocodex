@@ -3837,7 +3837,6 @@ mod tests {
         assert_eq!(
             names,
             [
-                "nanoeval/browser-runtime",
                 "nanoeval/extract-todos",
                 "nanoeval/uppercase-message",
                 "nanoeval/write-greeting"

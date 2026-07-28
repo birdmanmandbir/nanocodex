@@ -24,21 +24,21 @@ just bench-eval
 Criterion's reported estimate interval is shown verbatim. The 384-event
 workload preserves the model/reasoning/message/tool-call/tool-result shapes and
 roughly the event count of a retained production agent trajectory. The task
-workload uses the checked-in Terminal-Bench and browser tasks, and the resume
+workload uses the checked-in workspace-task fixtures, and the resume
 workload opens an actual durable finite-sweep job under an advisory lock.
 
 | Operation | Representative workload | Estimate |
 | --- | --- | ---: |
 | task load | canonicalize and parse one complete checked-in task | 39.826–40.463 µs |
-| sweep plan | 4 tasks × 4 agent recipes × 5 trials (80 attempts) | 1.4021–1.4073 µs |
+| sweep plan | 3 tasks × 4 agent recipes × 5 trials (60 attempts) | not yet remeasured |
 | durable resume | validate and reopen one matching incomplete job | 145.64–147.51 µs |
 | ATIF projection | 384 ordered full-content typed events | 122.50–122.79 µs |
 
-On this host, planning costs about 17.6 ns per attempt and ATIF projection costs
-about 319 ns per event. Those costs are several orders of magnitude below even
-one provider round trip. Task loading, sweep planning, and event projection can
-run independently; attempt execution remains bounded only by the explicit CPU
-and memory admission policy.
+The earlier 80-attempt plan measured about 17.6 ns per attempt, but that
+measurement included an out-of-scope browser fixture and is not a current
+claim. ATIF projection measured about 319 ns per event. Task loading, sweep
+planning, and event projection can run independently; attempt execution remains
+bounded only by the explicit CPU and memory admission policy.
 
 ## Regression contract
 
@@ -47,7 +47,7 @@ Machine-local investigation budgets:
 | Operation | Budget |
 | --- | ---: |
 | warm task load | ≤ 100 µs |
-| plan the 80-attempt sweep | ≤ 10 µs |
+| plan the 60-attempt sweep | ≤ 10 µs |
 | reopen the one-job resume fixture | ≤ 500 µs |
 | project the 384-event trajectory | ≤ 500 µs |
 
@@ -255,7 +255,6 @@ drift means this is not a controlled reasoning-effort ablation.
 | typed events and results | `EvalEvents`, `EvalEventStream`, `EvalResult`, `EvalFailure`, `SweepResults`; independent subscription, lag, and ordering tests |
 | Harbor job and ATIF projection | `nanocodex_eval::harbor`; canonical package/checksum/result/trajectory tests and warnings-denied public rustdoc examples |
 | published Harbor reader | typed cached reader with bounded downloads, immutable revision selection, task/checksum/agent filters, and compatibility decoding |
-| browser-in-VM implementation | already promoted to `nanocodex-browser-vm` in stack 7; eval consumes the shared VM/image boundary rather than owning a browser |
 | USD accounting | the same versioned `PricingSnapshot` accepted by the agent and CLI flows into per-attempt result, ATIF, Harbor, JSON report, tracing, and an honest known-cost human summary |
 
 The complete CLI remains available under one executable:
