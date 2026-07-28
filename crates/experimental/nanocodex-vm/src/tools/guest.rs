@@ -27,9 +27,9 @@ use tokio::{
 };
 
 use super::protocol::{
-    CancelRequest, ControlResponse, ExecuteRequest, ExecuteResponse, ReadFileRequest,
-    ReadFileResponse, SessionRequest, SessionResponse, ShutdownRequest, ToolResponse,
-    WriteFileRequest,
+    CancelRequest, ControlResponse, CreateDirectoryRequest, ExecuteRequest, ExecuteResponse,
+    ReadFileRequest, ReadFileResponse, SessionRequest, SessionResponse, ShutdownRequest,
+    ToolResponse, WriteFileRequest,
 };
 
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
@@ -184,6 +184,9 @@ async fn execute_request(
             })
         }
         SessionRequest::WriteFile(request) => SessionResponse::WriteFile(write_file(request).await),
+        SessionRequest::CreateDirectory(request) => {
+            SessionResponse::CreateDirectory(create_directory(request).await)
+        }
         SessionRequest::ReadFile(request) => SessionResponse::ReadFile(read_file(request).await),
         SessionRequest::Execute(request) => {
             SessionResponse::Execute(execute_command(request).await)
@@ -330,8 +333,14 @@ async fn sync_filesystems(request: ShutdownRequest) -> ControlResponse {
 }
 
 async fn write_file(request: WriteFileRequest) -> ControlResponse {
-    let result =
-        atomic_write_file(&request.path, &request.contents, request.mode, request.id).await;
+    let result = atomic_write_file(
+        &request.path,
+        &request.contents,
+        request.mode,
+        request.modified_unix_seconds,
+        request.id,
+    )
+    .await;
     ControlResponse {
         id: request.id,
         error: result.err().map(|error| error.to_string()),
@@ -342,6 +351,7 @@ async fn atomic_write_file(
     path: &str,
     contents: &[u8],
     mode: u32,
+    modified_unix_seconds: Option<i64>,
     request_id: u64,
 ) -> std::io::Result<()> {
     let path = PathBuf::from(path);
@@ -369,13 +379,48 @@ async fn atomic_write_file(
                 .await?;
         }
         drop(file);
-        tokio::fs::rename(&temporary, &path).await
+        tokio::fs::rename(&temporary, &path).await?;
+        set_modified_time(&path, modified_unix_seconds)
     }
     .await;
     if result.is_err() {
         let _ = tokio::fs::remove_file(&temporary).await;
     }
     result
+}
+
+async fn create_directory(request: CreateDirectoryRequest) -> ControlResponse {
+    let result =
+        create_directory_path(&request.path, request.mode, request.modified_unix_seconds).await;
+    ControlResponse {
+        id: request.id,
+        error: result.err().map(|error| error.to_string()),
+    }
+}
+
+async fn create_directory_path(
+    path: &str,
+    mode: u32,
+    modified_unix_seconds: Option<i64>,
+) -> std::io::Result<()> {
+    let path = PathBuf::from(path);
+    tokio::fs::create_dir_all(&path).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).await?;
+    }
+    set_modified_time(&path, modified_unix_seconds)
+}
+
+fn set_modified_time(path: &Path, modified_unix_seconds: Option<i64>) -> std::io::Result<()> {
+    let Some(modified_unix_seconds) = modified_unix_seconds else {
+        return Ok(());
+    };
+    filetime::set_file_mtime(
+        path,
+        filetime::FileTime::from_unix_time(modified_unix_seconds, 0),
+    )
 }
 
 async fn read_file(request: ReadFileRequest) -> ReadFileResponse {
@@ -622,8 +667,8 @@ async fn read_bounded(
 #[cfg(test)]
 mod tests {
     use std::{
-        fs::File,
-        time::{Duration, Instant},
+        fs::{self, File},
+        time::{Duration, Instant, UNIX_EPOCH},
     };
 
     use nanocodex_tools::{ToolInput, contract::ToolOutputBody, standard::StandardTool};
@@ -634,10 +679,41 @@ mod tests {
         CancelRequest, ExecuteRequest, ReadFileRequest, ReadyRequest, SessionRequest,
         SessionResponse, ShutdownRequest, ToolRequest, WireToolContext, WireToolInput,
     };
-    use super::{execute_command, read_file, serve_io, serve_io_with_frame_limit};
+    use super::{
+        atomic_write_file, create_directory_path, execute_command, read_file, serve_io,
+        serve_io_with_frame_limit,
+    };
 
     const DEFAULT_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
     const PATH_TRACING_IMAGE_BYTES: u64 = 48_262_737;
+
+    #[tokio::test]
+    async fn filesystem_controls_apply_exact_modes_and_epoch_mtimes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("tests");
+        let file = directory.join("test.sh");
+        let directory = directory.to_string_lossy();
+        let file = file.to_string_lossy();
+
+        create_directory_path(&directory, 0o700, None)
+            .await
+            .unwrap();
+        atomic_write_file(&file, b"#!/bin/sh\n", 0o640, Some(0), 7)
+            .await
+            .unwrap();
+        create_directory_path(&directory, 0o750, Some(0))
+            .await
+            .unwrap();
+
+        let file_metadata = fs::metadata(file.as_ref()).unwrap();
+        assert_eq!(file_metadata.permissions().mode() & 0o7777, 0o640);
+        assert_eq!(file_metadata.modified().unwrap(), UNIX_EPOCH);
+        let directory_metadata = fs::metadata(directory.as_ref()).unwrap();
+        assert_eq!(directory_metadata.permissions().mode() & 0o7777, 0o750);
+        assert_eq!(directory_metadata.modified().unwrap(), UNIX_EPOCH);
+    }
 
     #[tokio::test]
     async fn timeout_kills_descendants_holding_output_pipes() {

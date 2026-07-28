@@ -24,9 +24,9 @@ use tracing::{Instrument, Span, info, info_span};
 use super::{
     VmToolClient,
     protocol::{
-        CancelRequest, ControlResponse, ExecuteRequest, ExecuteResponse, ReadFileRequest,
-        ReadFileResponse, ReadyRequest, SessionRequest, SessionResponse, ShutdownRequest,
-        ToolRequest, WireToolContext, WireToolInput, WriteFileRequest,
+        CancelRequest, ControlResponse, CreateDirectoryRequest, ExecuteRequest, ExecuteResponse,
+        ReadFileRequest, ReadFileResponse, ReadyRequest, SessionRequest, SessionResponse,
+        ShutdownRequest, ToolRequest, WireToolContext, WireToolInput, WriteFileRequest,
     },
 };
 
@@ -481,6 +481,45 @@ impl VmToolSession {
         self.handle.write_file(path, contents, mode).await
     }
 
+    /// Writes one harness-owned file and applies an exact guest modification time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the console closes, file creation or metadata
+    /// application fails in the guest, or the typed response is invalid.
+    pub async fn write_file_with_mtime(
+        &self,
+        path: impl Into<String>,
+        contents: Vec<u8>,
+        mode: u32,
+        modified_unix_seconds: i64,
+    ) -> Result<(), VmToolSessionError> {
+        self.handle
+            .write_file_with_mtime(path, contents, mode, modified_unix_seconds)
+            .await
+    }
+
+    /// Creates or updates one harness-owned guest directory.
+    ///
+    /// `modified_unix_seconds` leaves the current modification time unchanged
+    /// when absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the console closes, directory creation or
+    /// metadata application fails in the guest, or the typed response is
+    /// invalid.
+    pub async fn create_directory(
+        &self,
+        path: impl Into<String>,
+        mode: u32,
+        modified_unix_seconds: Option<i64>,
+    ) -> Result<(), VmToolSessionError> {
+        self.handle
+            .create_directory(path, mode, modified_unix_seconds)
+            .await
+    }
+
     /// Reads one result artifact from the guest.
     ///
     /// # Errors
@@ -683,6 +722,33 @@ impl VmToolSessionHandle {
         contents: Vec<u8>,
         mode: u32,
     ) -> Result<(), VmToolSessionError> {
+        self.write_file_inner(path, contents, mode, None).await
+    }
+
+    /// Writes one harness-owned file and applies an exact guest modification time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session is closed, guest file creation or
+    /// metadata application fails, or the response is invalid.
+    pub async fn write_file_with_mtime(
+        &self,
+        path: impl Into<String>,
+        contents: Vec<u8>,
+        mode: u32,
+        modified_unix_seconds: i64,
+    ) -> Result<(), VmToolSessionError> {
+        self.write_file_inner(path, contents, mode, Some(modified_unix_seconds))
+            .await
+    }
+
+    async fn write_file_inner(
+        &self,
+        path: impl Into<String>,
+        contents: Vec<u8>,
+        mode: u32,
+        modified_unix_seconds: Option<i64>,
+    ) -> Result<(), VmToolSessionError> {
         let response = self
             .control_request(|id| {
                 SessionRequest::WriteFile(WriteFileRequest {
@@ -690,12 +756,46 @@ impl VmToolSessionHandle {
                     path: path.into(),
                     contents,
                     mode,
+                    modified_unix_seconds,
                 })
             })
             .await?;
         let SessionResponse::WriteFile(response) = response else {
             return Err(VmToolSessionError::Protocol(
                 "expected a write-file response",
+            ));
+        };
+        control_result(response)
+    }
+
+    /// Creates or updates one harness-owned guest directory.
+    ///
+    /// `modified_unix_seconds` leaves the current modification time unchanged
+    /// when absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session is closed, guest directory creation
+    /// or metadata application fails, or the response is invalid.
+    pub async fn create_directory(
+        &self,
+        path: impl Into<String>,
+        mode: u32,
+        modified_unix_seconds: Option<i64>,
+    ) -> Result<(), VmToolSessionError> {
+        let response = self
+            .control_request(|id| {
+                SessionRequest::CreateDirectory(CreateDirectoryRequest {
+                    id,
+                    path: path.into(),
+                    mode,
+                    modified_unix_seconds,
+                })
+            })
+            .await?;
+        let SessionResponse::CreateDirectory(response) = response else {
+            return Err(VmToolSessionError::Protocol(
+                "expected a create-directory response",
             ));
         };
         control_result(response)
@@ -1134,6 +1234,7 @@ const fn set_request_id(request: &mut SessionRequest, id: u64) {
         SessionRequest::Ready(request) => request.id = id,
         SessionRequest::Tool(request) => request.id = id,
         SessionRequest::WriteFile(request) => request.id = id,
+        SessionRequest::CreateDirectory(request) => request.id = id,
         SessionRequest::ReadFile(request) => request.id = id,
         SessionRequest::Execute(request) => request.id = id,
         SessionRequest::Cancel(request) => request.id = id,

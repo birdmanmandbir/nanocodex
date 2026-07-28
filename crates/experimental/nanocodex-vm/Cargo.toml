@@ -38,6 +38,7 @@ guest-runtime = ["dep:nix", "nanocodex-tools/workspace-runtime"]
 
 [dependencies]
 base64.workspace = true
+filetime.workspace = true
 nanocodex-tools = { path = "../../nanocodex-tools", version = "0.2.0", default-features = false }
 nix = { workspace = true, optional = true }
 serde.workspace = true
