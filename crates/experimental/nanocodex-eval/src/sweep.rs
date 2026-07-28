@@ -272,11 +272,11 @@ impl RunManifest {
         let compact_id = attempt_id.simple().to_string();
         for agent in &self.agents {
             for repetition in 1..=self.trials.get() {
-                let expected = format!(
-                    "{short_name}__{agent}__{repetition:03}__{}",
-                    &compact_id[..8]
-                );
-                if trial_name == expected {
+                let prefix = format!("{short_name}__{agent}__{repetition:03}__");
+                let retained_id = trial_name.strip_prefix(&prefix);
+                if retained_id
+                    .is_some_and(|retained| retained == compact_id || retained == &compact_id[..8])
+                {
                     return Some(RunCoordinate {
                         task_root: task.root.clone(),
                         agent: agent.clone(),
