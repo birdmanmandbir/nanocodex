@@ -612,61 +612,73 @@ impl Run {
         let attempts_started = Instant::now();
         let execution = finish_or_drain(
             eval.sweep(sweep),
-            tokio::signal::ctrl_c(),
+            ctrl_c_interrupt(),
+            ctrl_c_interrupt(),
             remaining_attempts,
             || {
                 let admitted = eval.begin_drain();
                 eprintln!(
                     "Interrupt received; stopped admitting new trials after {admitted} \
-                     attempt(s), draining admitted work"
+                     attempt(s), draining admitted work; press Ctrl-C again to abort"
                 );
                 admitted
             },
         )
         .await?;
-        expected_attempts.send_replace(execution.terminal_attempts);
+        let DrainExecution {
+            result: sweep_result,
+            terminal_attempts,
+            interrupted,
+            interrupt,
+        } = execution;
+        expected_attempts.send_replace(terminal_attempts);
         drop(expected_attempts);
         let attempts = attempts_started.elapsed();
-        let finished = finish_evaluation(
-            harbor,
-            execution.terminal_attempts,
-            progress,
-            execution.result,
+        finish_or_interrupt(
+            async move {
+                let finished =
+                    finish_evaluation(harbor, terminal_attempts, progress, sweep_result).await?;
+                tokio::task::yield_now().await;
+                let output_started = Instant::now();
+                persist_aggregate(&finished.job)?;
+                tokio::task::yield_now().await;
+                Self::write_report(
+                    &finished.job,
+                    finished.outcomes,
+                    skipped_attempts,
+                    self.json,
+                )?;
+                tokio::task::yield_now().await;
+                let output = output_started.elapsed();
+                let measurements = RunMeasurements {
+                    observability,
+                    task_loading,
+                    vm_runtime,
+                    vm_environments: vm_environments_duration,
+                    evaluation_setup,
+                    attempts,
+                    harbor_finish: finished.harbor_finish,
+                    output,
+                    total: total_started.elapsed(),
+                };
+                measurements.persist(finished.job.directory())?;
+                measurements.record(&finished.results, attempt_count, finished.failed);
+                if !interrupted {
+                    record_last_run(finished.job.directory())?;
+                }
+                finish_run(finished.run_error)?;
+                if interrupted {
+                    return Err(eyre!(
+                        "evaluation interrupted after draining admitted attempts; rerun the same \
+                         workload to resume {}",
+                        finished.job.directory().display()
+                    ));
+                }
+                Ok(())
+            },
+            interrupt,
         )
-        .await?;
-        let output_started = Instant::now();
-        persist_aggregate(&finished.job)?;
-        Self::write_report(
-            &finished.job,
-            finished.outcomes,
-            skipped_attempts,
-            self.json,
-        )?;
-        let output = output_started.elapsed();
-        let measurements = RunMeasurements {
-            observability,
-            task_loading,
-            vm_runtime,
-            vm_environments: vm_environments_duration,
-            evaluation_setup,
-            attempts,
-            harbor_finish: finished.harbor_finish,
-            output,
-            total: total_started.elapsed(),
-        };
-        measurements.persist(finished.job.directory())?;
-        measurements.record(&finished.results, attempt_count, finished.failed);
-        if !execution.interrupted {
-            record_last_run(finished.job.directory())?;
-        }
-        finish_run(finished.run_error)?;
-        if execution.interrupted {
-            return Err(eyre!(
-                "evaluation interrupted after draining admitted attempts; rerun the same \
-                 workload to resume {}",
-                finished.job.directory().display()
-            ));
-        }
+        .await??;
         Ok(())
     }
 
@@ -1317,37 +1329,80 @@ struct DrainExecution<T, E> {
     result: Result<T, E>,
     terminal_attempts: usize,
     interrupted: bool,
+    interrupt: InterruptListener,
 }
 
-async fn finish_or_drain<T, E, Work, Shutdown, Drain>(
+type InterruptListener = Pin<Box<dyn Future<Output = io::Result<()>> + Send>>;
+
+#[derive(Debug, thiserror::Error)]
+enum EvalInterruptError {
+    #[error("failed to listen for Ctrl-C: {0}")]
+    Listener(#[source] io::Error),
+    #[error("second interrupt received; aborted admitted evaluation work")]
+    Forced,
+    #[error("interrupt received during evaluation finalization")]
+    Finalization,
+}
+
+fn ctrl_c_interrupt() -> InterruptListener {
+    Box::pin(tokio::signal::ctrl_c())
+}
+
+async fn finish_or_drain<T, E, Work, Drain>(
     work: Work,
-    shutdown: Shutdown,
+    mut interrupt: InterruptListener,
+    mut drain_interrupt: InterruptListener,
     terminal_attempts: usize,
     drain: Drain,
-) -> io::Result<DrainExecution<T, E>>
+) -> Result<DrainExecution<T, E>, EvalInterruptError>
 where
     Work: Future<Output = Result<T, E>>,
-    Shutdown: Future<Output = io::Result<()>>,
     Drain: FnOnce() -> usize,
 {
     tokio::pin!(work);
-    tokio::pin!(shutdown);
     tokio::select! {
+        biased;
+        signal = interrupt.as_mut() => {
+            signal.map_err(EvalInterruptError::Listener)?;
+            let terminal_attempts = drain();
+            tokio::select! {
+                biased;
+                signal = drain_interrupt.as_mut() => {
+                    signal.map_err(EvalInterruptError::Listener)?;
+                    Err(EvalInterruptError::Forced)
+                }
+                result = &mut work => Ok(DrainExecution {
+                    result,
+                    terminal_attempts,
+                    interrupted: true,
+                    interrupt: drain_interrupt,
+                })
+            }
+        }
         result = &mut work => Ok(DrainExecution {
             result,
             terminal_attempts,
             interrupted: false,
+            interrupt,
         }),
-        signal = &mut shutdown => {
-            signal?;
-            let terminal_attempts = drain();
-            let result = work.await;
-            Ok(DrainExecution {
-                result,
-                terminal_attempts,
-                interrupted: true,
-            })
+    }
+}
+
+async fn finish_or_interrupt<T, Work>(
+    work: Work,
+    mut interrupt: InterruptListener,
+) -> Result<T, EvalInterruptError>
+where
+    Work: Future<Output = T>,
+{
+    tokio::pin!(work);
+    tokio::select! {
+        biased;
+        signal = interrupt.as_mut() => {
+            signal.map_err(EvalInterruptError::Listener)?;
+            Err(EvalInterruptError::Finalization)
         }
+        output = &mut work => Ok(output),
     }
 }
 
@@ -3726,6 +3781,7 @@ fn format_milliseconds(milliseconds: i64) -> String {
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::Cell,
         fs, future,
         path::{Path, PathBuf},
         process::Command as StdCommand,
@@ -3737,12 +3793,12 @@ mod tests {
     use nanocodex_vm::{VmCommandOutput, VmCommandPartialOutput};
 
     use super::{
-        CACHED_VERIFIER_SCRIPT, DEFAULT_HOST_UTILIZATION_PERCENT, DEFAULT_TRIALS, HostResources,
-        RetainedBuild, RetainedScheduling, Run, RunInvocation, RunMeasurements, RunSummary,
-        VmRetention, cached_verifier_script, finish_or_drain, load_tasks,
-        recognized_verifier_setup, remove_passed_rootfs, retained_retry_task_names,
-        retained_task_durations, verifier_bootstrap_network_failed, verifier_cache_key,
-        verifier_network_retry_delay, verifier_shell, verifier_timeout_output,
+        CACHED_VERIFIER_SCRIPT, DEFAULT_HOST_UTILIZATION_PERCENT, DEFAULT_TRIALS,
+        EvalInterruptError, HostResources, RetainedBuild, RetainedScheduling, Run, RunInvocation,
+        RunMeasurements, RunSummary, VmRetention, cached_verifier_script, finish_or_drain,
+        finish_or_interrupt, load_tasks, recognized_verifier_setup, remove_passed_rootfs,
+        retained_retry_task_names, retained_task_durations, verifier_bootstrap_network_failed,
+        verifier_cache_key, verifier_network_retry_delay, verifier_shell, verifier_timeout_output,
     };
 
     #[derive(Parser)]
@@ -3759,7 +3815,8 @@ mod tests {
                 released.await.unwrap();
                 Ok::<_, &'static str>(17)
             },
-            future::ready(Ok(())),
+            Box::pin(future::ready(Ok(()))),
+            Box::pin(future::pending::<std::io::Result<()>>()),
             9,
             || {
                 release.send(()).unwrap();
@@ -3772,6 +3829,75 @@ mod tests {
         assert_eq!(execution.result.unwrap(), 17);
         assert_eq!(execution.terminal_attempts, 3);
         assert!(execution.interrupted);
+    }
+
+    #[tokio::test]
+    async fn injected_second_interrupt_drops_draining_work() {
+        let (started_sender, started) = tokio::sync::oneshot::channel();
+        let (dropped_sender, dropped) = tokio::sync::oneshot::channel();
+        let drain_count = Cell::new(0);
+        let result = finish_or_drain(
+            async move {
+                let _drop_signal = DropSignal(Some(dropped_sender));
+                started_sender.send(()).unwrap();
+                future::pending::<Result<(), &'static str>>().await
+            },
+            Box::pin(async move {
+                started.await.unwrap();
+                Ok(())
+            }),
+            Box::pin(future::ready(Ok(()))),
+            9,
+            || {
+                drain_count.set(drain_count.get() + 1);
+                3
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(EvalInterruptError::Forced)));
+        assert_eq!(drain_count.get(), 1);
+        dropped.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_interrupt_listener_remains_actionable_during_finalization() {
+        let (interrupt_sender, interrupt) = tokio::sync::oneshot::channel();
+        let execution = finish_or_drain(
+            future::ready(Ok::<_, &'static str>(17)),
+            Box::pin(async move {
+                interrupt.await.unwrap();
+                Ok(())
+            }),
+            Box::pin(future::pending::<std::io::Result<()>>()),
+            1,
+            || unreachable!(),
+        )
+        .await
+        .unwrap();
+        let (dropped_sender, dropped) = tokio::sync::oneshot::channel();
+        let result = finish_or_interrupt(
+            async move {
+                let _drop_signal = DropSignal(Some(dropped_sender));
+                interrupt_sender.send(()).unwrap();
+                future::pending::<()>().await
+            },
+            execution.interrupt,
+        )
+        .await;
+
+        assert!(matches!(result, Err(EvalInterruptError::Finalization)));
+        dropped.await.unwrap();
+    }
+
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
     }
 
     #[test]
