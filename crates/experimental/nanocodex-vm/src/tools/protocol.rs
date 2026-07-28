@@ -15,7 +15,7 @@ pub(crate) enum SessionRequest {
 }
 
 impl SessionRequest {
-    #[cfg(feature = "guest")]
+    #[cfg(any(feature = "guest-runtime", test))]
     pub const fn id(&self) -> u64 {
         match self {
             Self::Ready(request) => request.id,
@@ -318,7 +318,7 @@ pub(crate) struct ToolResponse {
 }
 
 impl ToolResponse {
-    #[cfg(feature = "guest")]
+    #[cfg(any(feature = "guest-runtime", test))]
     pub const fn completed(id: u64, execution: ToolOutputWire) -> Self {
         Self {
             id,
@@ -327,7 +327,7 @@ impl ToolResponse {
         }
     }
 
-    #[cfg(feature = "guest")]
+    #[cfg(any(feature = "guest-runtime", test))]
     pub const fn failed(id: u64, error: String) -> Self {
         Self {
             id,

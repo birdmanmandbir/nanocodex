@@ -1,12 +1,18 @@
 use std::{hint::black_box, path::PathBuf, time::Duration};
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use nanocodex_vm::{GuestRuntimeDisk, GuestRuntimeDiskError, VmCommand, VmToolSession};
-use nanovm::{BlockDevice, EgressLease, GuestCommand, VmConfig};
+use nanocodex_vm::{
+    BlockDevice, EgressLease, GuestCommand, GuestRuntimeDisk, GuestRuntimeDiskError, VmCommand,
+    VmConfig, VmToolSession,
+};
 use tokio::process::Command;
 
 const RUNTIME_DEVICE: &str = "/dev/vdb";
 const RUNTIME_MOUNT: &str = "/run/nanocodex";
+#[cfg(target_os = "linux")]
+const FIRMWARE_LIBRARY_PATH_ENVIRONMENT: &str = "LD_LIBRARY_PATH";
+#[cfg(target_os = "macos")]
+const FIRMWARE_LIBRARY_PATH_ENVIRONMENT: &str = "DYLD_LIBRARY_PATH";
 
 fn protocol_server() -> Command {
     let script = r#"
@@ -142,7 +148,7 @@ impl LiveVm {
         let mut vmm = Command::new(&self.vmm);
         vmm.arg("--vmm")
             .env_clear()
-            .env("DYLD_LIBRARY_PATH", &self.firmware);
+            .env(FIRMWARE_LIBRARY_PATH_ENVIRONMENT, &self.firmware);
         VmToolSession::spawn_configured(vmm, config, guest, EgressLease::disabled())
             .await
             .expect("live VM session")

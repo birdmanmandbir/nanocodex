@@ -11,21 +11,26 @@ repository.workspace = true
 readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Typed, durable evaluation for Nanocodex agents"
+description = "Typed, durable evaluation and Harbor artifacts for Nanocodex agents"
 
 [dependencies]
 chrono.workspace = true
 futures-util.workspace = true
 fs2.workspace = true
+hex.workspace = true
+ignore.workspace = true
 nanocodex-agent.workspace = true
 nanocodex-oai-api.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["fs", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 toml.workspace = true
 tracing.workspace = true
+url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

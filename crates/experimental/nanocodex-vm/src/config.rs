@@ -172,14 +172,14 @@ impl VmConfig {
 
     /// Sets the number of virtual CPUs.
     #[must_use]
-    pub fn cpus(mut self, cpus: u8) -> Self {
+    pub const fn cpus(mut self, cpus: u8) -> Self {
         self.cpus = cpus;
         self
     }
 
     /// Sets guest memory in mebibytes.
     #[must_use]
-    pub fn memory_mib(mut self, memory_mib: u32) -> Self {
+    pub const fn memory_mib(mut self, memory_mib: u32) -> Self {
         self.memory_mib = memory_mib;
         self
     }

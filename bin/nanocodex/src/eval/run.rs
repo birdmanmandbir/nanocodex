@@ -25,19 +25,19 @@ use nanocodex::{
     NanocodexBuilder, Thinking, Tools,
     tools::{ToolsBuildError, standard::UpdatePlanTool},
 };
+use nanocodex_eval::harbor::{Harbor, HarborJob, HarborRecorder};
 use nanocodex_eval::{
     AttemptAgent, AttemptVerification, AttemptVerifier, EvalAttempt, EvalEventKind,
     EvalEventStream, EvalFailure, EvalFailureKind, EvalResult, EvalStatus, Evaluator,
     EvaluatorBuilder, NetworkPolicy, Sweep, SweepResults, Task, VerifierEnvironmentMode,
     VerifierResult,
 };
-use nanocodex_eval_harbor::{Harbor, HarborJob, HarborRecorder};
+use nanocodex_vm::image::{CachePolicy, VmImageBuilder, reflink_or_sparse_copy};
+use nanocodex_vm::{BlockDevice, GuestCommand, Network, VmConfig};
 use nanocodex_vm::{
     GuestRuntimeDisk, GuestRuntimeDiskStatus, VmCommand, VmCommandOutput, VmToolSession,
     VmToolSessionError,
 };
-use nanovm::{BlockDevice, GuestCommand, Network, VmConfig};
-use nanovm_image::{CachePolicy, VmImageBuilder, reflink_or_sparse_copy};
 use regex::RegexSet;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -770,7 +770,7 @@ fn resolve_rerun_source(eval: &Run) -> Result<RerunSelection> {
         };
         return Err(eyre!(
             "no unresolved tasks{filter}; inspect the queue with \
-             `nanocodex eval run --rerun --list`"
+             `nanocodex eval --rerun --list`"
         ));
     }
     eprintln!(
@@ -1650,6 +1650,14 @@ const GUEST_RUNTIME_BLOCK_DEVICE: &str = "/dev/vdb";
 const GUEST_RUNTIME_MOUNT: &str = "/run/nanoeval";
 const DEFAULT_VM_CACHE: &str = ".cache/vm";
 const DEFAULT_KRUNFW_DIRECTORY: &str = ".cache/libkrunfw/libkrunfw";
+#[cfg(target_os = "linux")]
+const KRUNFW_LIBRARY_FILENAME: &str = "libkrunfw.so.5";
+#[cfg(target_os = "macos")]
+const KRUNFW_LIBRARY_FILENAME: &str = "libkrunfw.5.dylib";
+#[cfg(target_os = "linux")]
+const KRUNFW_LIBRARY_PATH_ENVIRONMENT: &str = "LD_LIBRARY_PATH";
+#[cfg(target_os = "macos")]
+const KRUNFW_LIBRARY_PATH_ENVIRONMENT: &str = "DYLD_LIBRARY_PATH";
 #[cfg(target_arch = "aarch64")]
 const VM_GUEST_TARGET: &str = "aarch64-unknown-linux-musl";
 #[cfg(target_arch = "x86_64")]
@@ -1736,7 +1744,7 @@ pub(crate) async fn prepare_vm_guest_runtime() -> Result<PathBuf> {
         GuestRuntimeDiskStatus::Created => "created",
     };
     info!(
-        target: "nanocodex_eval",
+        target: "nanocodex_vm",
         duration_ns = u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
         vm_guest_build_status = build_status,
         vm_guest_target = VM_GUEST_TARGET,
@@ -1754,15 +1762,15 @@ fn vm_guest_build_command(workspace: &Path) -> Command {
         .current_dir(workspace)
         .arg("build")
         .arg("--quiet")
-        .arg("--no-default-features")
-        .arg("--features")
-        .arg("guest")
         .arg("--target")
         .arg(VM_GUEST_TARGET)
         .arg("--package")
         .arg("nanocodex-vm")
         .arg("--bin")
-        .arg("nanocodex-vm-guest");
+        .arg("nanocodex-vm-guest")
+        .arg("--no-default-features")
+        .arg("--features")
+        .arg("guest-runtime");
     command
 }
 
@@ -2223,8 +2231,8 @@ impl VmLaunch {
     ) -> Result<VmToolSession, VmAttemptError> {
         let mut command = Command::new(&self.vmm);
         let firmware = Path::new(DEFAULT_KRUNFW_DIRECTORY);
-        if firmware.join("libkrunfw.5.dylib").is_file() {
-            command.env("DYLD_LIBRARY_PATH", firmware.canonicalize()?);
+        if firmware.join(KRUNFW_LIBRARY_FILENAME).is_file() {
+            command.env(KRUNFW_LIBRARY_PATH_ENVIRONMENT, firmware.canonicalize()?);
         }
         command.args(["eval", "vm", "run-config", "--config"]);
 
@@ -3512,7 +3520,7 @@ mod tests {
     }
 
     #[test]
-    fn vm_guest_build_enables_only_the_guest_runtime() {
+    fn vm_guest_build_targets_the_unified_vm_package() {
         let command = super::vm_guest_build_command(Path::new("/tmp/nanocodex-workspace"));
         let arguments = command
             .as_std()
@@ -3525,15 +3533,15 @@ mod tests {
             [
                 "build",
                 "--quiet",
-                "--no-default-features",
-                "--features",
-                "guest",
                 "--target",
                 super::VM_GUEST_TARGET,
                 "--package",
                 "nanocodex-vm",
                 "--bin",
                 "nanocodex-vm-guest",
+                "--no-default-features",
+                "--features",
+                "guest-runtime",
             ]
         );
         assert_eq!(
@@ -3559,7 +3567,7 @@ mod tests {
         }
         let source = workspace
             .path()
-            .join("crates/experimental/nanocodex-vm/src/guest.rs");
+            .join("crates/experimental/nanocodex-vm/src/tools/guest.rs");
         fs::create_dir_all(source.parent().unwrap()).unwrap();
         fs::write(&source, "first guest source").unwrap();
         let runtime = workspace.path().join("target/guest/debug/guest");

@@ -5,7 +5,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::VmError;
+use super::VmError;
 
 /// Optional functionality compiled into the pinned libkrun build.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -124,7 +124,7 @@ fn positive(status: i32, operation: &'static str) -> Result<u32, VmError> {
     })
 }
 
-fn bool_status(status: i32, operation: &'static str) -> Result<bool, VmError> {
+const fn bool_status(status: i32, operation: &'static str) -> Result<bool, VmError> {
     match status {
         0 => Ok(false),
         1 => Ok(true),

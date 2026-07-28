@@ -13,7 +13,7 @@ use std::{
 
 use thiserror::Error;
 
-use crate::{BlockDevice, GuestCommand, Network, RootFilesystem, SharedDirectory, VmConfig};
+use super::{BlockDevice, GuestCommand, Network, RootFilesystem, SharedDirectory, VmConfig};
 
 const ROOT_TAG: &std::ffi::CStr = c"/dev/root";
 const ROOT_BLOCK_ID: &std::ffi::CStr = c"vda";
@@ -515,7 +515,7 @@ fn positive_context(status: i32, operation: &'static str) -> Result<u32, VmError
     })
 }
 
-fn check(status: i32, operation: &'static str) -> Result<(), VmError> {
+const fn check(status: i32, operation: &'static str) -> Result<(), VmError> {
     if status < 0 {
         Err(VmError::Libkrun {
             operation,

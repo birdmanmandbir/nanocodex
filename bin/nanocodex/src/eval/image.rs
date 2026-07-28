@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use nanocodex_eval::Task;
-use nanovm_image::{CachePolicy, ImageError, PreparedRootDisk, VmImageBuilder};
+use nanocodex_vm::image::{CachePolicy, ImageError, PreparedRootDisk, VmImageBuilder};
 
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 

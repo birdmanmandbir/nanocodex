@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use nanovm::Gvproxy as GvproxyProcess;
+use nanocodex_vm::Gvproxy as GvproxyProcess;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use thiserror::Error;
@@ -34,7 +34,7 @@ pub(crate) enum GvproxyError {
     },
 
     #[error(transparent)]
-    Process(#[from] nanovm::GvproxyError),
+    Process(#[from] nanocodex_vm::GvproxyError),
 
     #[error(transparent)]
     Io(#[from] io::Error),

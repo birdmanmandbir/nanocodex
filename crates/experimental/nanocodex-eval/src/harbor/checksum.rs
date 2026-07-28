@@ -7,7 +7,7 @@ use std::{
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use sha2::{Digest, Sha256};
 
-use crate::HarborError;
+use super::HarborError;
 
 const PACKAGE_FILES: [&str; 3] = ["task.toml", "instruction.md", "README.md"];
 const PACKAGE_DIRECTORIES: [&str; 4] = ["environment", "tests", "solution", "steps"];

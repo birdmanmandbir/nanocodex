@@ -1,10 +1,10 @@
 use std::{env, error::Error, path::PathBuf};
 
 use nanocodex::{Nanocodex, OpenAi, Thinking, oai::auth::OpenAiAuth};
+use nanocodex_eval::harbor::Harbor;
 use nanocodex_eval::{
     EvalEventKind, EvalEventStream, EvalEventStreamError, EvalResult, Evaluator, Task,
 };
-use nanocodex_eval_harbor::Harbor;
 
 const K: usize = 5;
 const TASKS: [&str; 3] = [

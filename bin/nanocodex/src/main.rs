@@ -12,6 +12,7 @@ mod subagents;
 mod tui;
 mod update;
 mod version;
+mod vm;
 
 use std::path::PathBuf;
 
@@ -39,6 +40,9 @@ struct Cli {
 
     #[command(flatten)]
     observability: ObservabilityArgs,
+
+    #[command(flatten)]
+    vm: vm::VmArgs,
 
     /// Submit an initial prompt immediately after the TUI opens.
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
@@ -72,6 +76,9 @@ struct RunCommand {
 
     #[command(flatten)]
     observability: ObservabilityArgs,
+
+    #[command(flatten)]
+    vm: vm::VmArgs,
 }
 
 #[derive(Args)]
@@ -85,6 +92,9 @@ struct ResumeCommand {
 
     #[command(flatten)]
     observability: ObservabilityArgs,
+
+    #[command(flatten)]
+    vm: vm::VmArgs,
 
     /// Submit an initial follow-on prompt immediately after the TUI opens.
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
@@ -120,7 +130,7 @@ async fn run(cli: Cli) -> Result<()> {
         Some(Command::Eval(command)) => command.run().await,
         Some(Command::Run(command)) => {
             let _observability = command.observability.install(false, command.agent.cwd())?;
-            command.run.run(command.agent).await
+            command.run.run(command.agent, command.vm).await
         }
         Some(Command::Resume(command)) => {
             let codex_home = config::default_codex_home()?;
@@ -129,12 +139,12 @@ async fn run(cli: Cli) -> Result<()> {
                 .wrap_err_with(|| format!("failed to load Codex thread {}", command.thread_id))?;
             let workspace = PathBuf::from(session.workspace());
             let _observability = command.observability.install(true, &workspace)?;
-            tui::run(command.agent, command.prompt, Some(session)).await
+            tui::run(command.agent, command.vm, command.prompt, Some(session)).await
         }
         Some(Command::Update(command)) => command.run().await,
         None => {
             let _observability = cli.observability.install(true, cli.agent.cwd())?;
-            tui::run(cli.agent, cli.prompt, None).await
+            tui::run(cli.agent, cli.vm, cli.prompt, None).await
         }
     }
 }
@@ -226,6 +236,47 @@ mod tests {
             unreachable!();
         };
         assert!(!command.requires_synchronous_vm());
+    }
+
+    #[test]
+    fn vm_tools_are_opt_in_for_the_tui_and_one_shot_runner() {
+        let tui = Cli::try_parse_from(["nanocodex"]).unwrap();
+        assert!(!tui.vm.is_enabled());
+
+        let tui = Cli::try_parse_from([
+            "nanocodex",
+            "--vm",
+            "/tmp/rootfs.ext4",
+            "--vm-workspace",
+            "/workspace",
+        ])
+        .unwrap();
+        assert!(tui.vm.is_enabled());
+
+        let run = Cli::try_parse_from([
+            "nanocodex",
+            "run",
+            "reply with ok",
+            "--vm",
+            "/tmp/rootfs.ext4",
+        ])
+        .unwrap();
+        let Some(Command::Run(run)) = run.command else {
+            panic!("run command was not parsed");
+        };
+        assert!(run.vm.is_enabled());
+    }
+
+    #[test]
+    fn vm_tuning_requires_an_opted_in_rootfs() {
+        let error = Cli::try_parse_from(["nanocodex", "--vm-cpus", "4"])
+            .err()
+            .unwrap();
+
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
     }
 
     #[test]

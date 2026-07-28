@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::{Args, ValueEnum, builder::NonEmptyStringValueParser};
 use nanocodex_observability::{LogFormat, LogOutput, ObservabilityBuilder, ObservabilityGuard};
 
-const DEFAULT_FILTER: &str = "warn,nanocodex_eval=info,nanocodex_vm=info,nanovm=info,nanovm_image=info,nanocodex=info,nanocodex_agent=info,nanocodex_oai_api=info,nanocodex_tools=info";
+const DEFAULT_FILTER: &str = "warn,nanocodex_eval=info,nanocodex_vm=info,nanocodex=info,nanocodex_agent=info,nanocodex_oai_api=info,nanocodex_tools=info";
 
 #[derive(Args)]
 pub(crate) struct ObservabilityArgs {

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
-use crate::{GuestCommand, KrunVm, VmConfig, VmError};
+use super::{GuestCommand, KrunVm, VmConfig, VmError};
 
 const PROCESS_CONFIG_VERSION: u32 = 1;
 
@@ -27,7 +27,7 @@ pub struct VmProcessConfig {
 impl VmProcessConfig {
     /// Creates a versioned launch record from complete owned VM inputs.
     #[must_use]
-    pub fn new(vm: VmConfig, command: GuestCommand) -> Self {
+    pub const fn new(vm: VmConfig, command: GuestCommand) -> Self {
         Self {
             version: PROCESS_CONFIG_VERSION,
             vm,
@@ -105,8 +105,8 @@ pub enum VmProcessError {
 mod tests {
     use std::{ffi::OsString, os::unix::fs::PermissionsExt};
 
+    use super::super::Network;
     use super::*;
-    use crate::Network;
 
     #[test]
     fn private_config_round_trips_without_argv_delivery() {

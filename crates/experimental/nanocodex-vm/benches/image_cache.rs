@@ -8,11 +8,11 @@ use std::{
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use flate2::{Compression, write::GzEncoder};
-use nanovm_image::{CachePolicy, VmImageBuilder};
+use nanocodex_vm::image::{CachePolicy, VmImageBuilder};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-const FIXTURE_IMAGE: &str = "example.invalid/nanovm-benchmark:latest";
+const FIXTURE_IMAGE: &str = "example.invalid/nanocodex-vm-benchmark:latest";
 const FIXTURE_MANIFEST: &str =
     "sha256:2eeb0b07339f47ea087a4a9a3ece22c2fd80cc74a812870f163189812f9fc4df";
 const FIXTURE_LAYER: &str =

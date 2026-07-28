@@ -1,8 +1,10 @@
 use std::{fs, path::PathBuf};
 
 use arcbox_ext4::Reader;
-use nanocodex_vm::GuestRuntimeDisk;
-use nanovm_image::{CachePolicy, VmImageBuilder};
+use nanocodex_vm::{
+    GuestRuntimeDisk,
+    image::{CachePolicy, VmImageBuilder},
+};
 
 const DISK_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -18,7 +20,7 @@ async fn run_instruction_uses_the_public_private_config_vmm_contract() {
     let context = tempfile::tempdir().expect("build context");
     fs::write(
         context.path().join("Dockerfile"),
-        "FROM alpine:3.24\nRUN printf nanovm-image-live > /nanovm-image-proof\nWORKDIR /workspace\n",
+        "FROM alpine:3.24\nRUN printf nanocodex-vm-image-live > /nanocodex-vm-image-proof\nWORKDIR /workspace\n",
     )
     .expect("Dockerfile");
 
@@ -31,9 +33,9 @@ async fn run_instruction_uses_the_public_private_config_vmm_contract() {
 
     let mut disk = Reader::new(image.path()).expect("prepared ext4");
     assert_eq!(
-        disk.read_file("/nanovm-image-proof", 0, Some(64))
+        disk.read_file("/nanocodex-vm-image-proof", 0, Some(64))
             .expect("proof file"),
-        b"nanovm-image-live"
+        b"nanocodex-vm-image-live"
     );
     assert_eq!(image.workdir(), "/workspace");
 }

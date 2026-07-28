@@ -1,4 +1,4 @@
-//! Content-addressed OCI and Dockerfile root disks for `nanovm`.
+//! Content-addressed OCI and Dockerfile root disks for Nanocodex evaluations.
 //!
 //! The cache owns immutable prepared disks. Each VM attempt should take a
 //! cheap copy-on-write clone with [`PreparedRootDisk::reflink_to`] and mutate
@@ -7,8 +7,7 @@
 //! # Prepare and instantiate an image
 //!
 //! ```no_run
-//! use nanocodex_vm::GuestRuntimeDisk;
-//! use nanovm_image::{CachePolicy, VmImageBuilder};
+//! use nanocodex_vm::{GuestRuntimeDisk, image::{CachePolicy, VmImageBuilder}};
 //!
 //! # async fn prepare() -> Result<(), Box<dyn std::error::Error>> {
 //! let runtime = GuestRuntimeDisk::prepare(
@@ -60,12 +59,14 @@ use std::{
     time::Duration,
 };
 
+use crate::{
+    BlockDevice, EgressLease, GuestCommand, VmConfig,
+    tools::{VmCommand, VmToolSession, VmToolSessionError},
+};
 use arcbox_ext4::{Formatter, Reader};
 use flate2::read::GzDecoder;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use ignore::WalkBuilder;
-use nanocodex_vm::{VmCommand, VmToolSession, VmToolSessionError};
-use nanovm::{BlockDevice, EgressLease, GuestCommand, VmConfig};
 use oci_client::{
     Client, Reference, client::ClientConfig, config::ConfigFile, manifest::ImageIndexEntry,
     secrets::RegistryAuth,
@@ -94,6 +95,14 @@ const BUILD_CONTEXT_MOUNT: &str = "/mnt/nanoeval-context";
 const DEFAULT_GUEST_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const DEFAULT_BUILD_VM_CPUS: u8 = 2;
 const DEFAULT_BUILD_VM_MEMORY_MIB: u32 = 4_096;
+#[cfg(target_os = "linux")]
+const FIRMWARE_LIBRARY_FILENAME: &str = "libkrunfw.so.5";
+#[cfg(target_os = "macos")]
+const FIRMWARE_LIBRARY_FILENAME: &str = "libkrunfw.5.dylib";
+#[cfg(target_os = "linux")]
+const FIRMWARE_LIBRARY_PATH_ENVIRONMENT: &str = "LD_LIBRARY_PATH";
+#[cfg(target_os = "macos")]
+const FIRMWARE_LIBRARY_PATH_ENVIRONMENT: &str = "DYLD_LIBRARY_PATH";
 #[cfg(target_arch = "aarch64")]
 const GUEST_ARCHITECTURE: &str = "arm64";
 #[cfg(target_arch = "x86_64")]
@@ -138,7 +147,7 @@ impl VmImageBuilder {
     /// runtime disk.
     ///
     /// For Dockerfiles with `RUN` or `COPY`, the executable must accept a
-    /// private [`nanovm::VmProcessConfig`] path as its final argument. Use
+    /// private [`crate::VmProcessConfig`] path as its final argument. Use
     /// [`Self::vmm_arg`] when that entry point requires a preceding flag or
     /// subcommand. Flatten-only Dockerfiles do not launch it.
     #[must_use]
@@ -156,11 +165,11 @@ impl VmImageBuilder {
         }
     }
 
-    /// Sets the directory containing `libkrunfw.5.dylib`.
+    /// Sets the directory containing the platform's libkrun firmware library.
     ///
-    /// On macOS, a present firmware library is added to the dedicated VMM's
-    /// `DYLD_LIBRARY_PATH`. Linux builders and VMMs with system-installed
-    /// firmware can omit this setting.
+    /// A present `libkrunfw.5.dylib` on macOS or `libkrunfw.so.5` on Linux is
+    /// added to the dedicated VMM's platform library search path. Builders and
+    /// VMMs with system-installed firmware can omit this setting.
     #[must_use]
     pub fn firmware_directory(mut self, directory: impl Into<PathBuf>) -> Self {
         self.firmware_directory = Some(directory.into());
@@ -261,7 +270,7 @@ impl VmImageBuilder {
         let directory = directory.as_ref();
         let cache = cache.as_ref();
         let span = info_span!(
-            target: "nanovm_image",
+            target: "nanocodex_vm",
             "vm.image.prepare",
             otel.kind = "internal",
             otel.status_code = tracing::field::Empty,
@@ -469,7 +478,7 @@ impl PreparedRootDisk {
         let dockerfile_path = directory.join("Dockerfile");
         let dockerfile = fs::read_to_string(&dockerfile_path)?;
         info!(
-            target: "nanovm_image",
+            target: "nanocodex_vm",
             content_kind = "dockerfile",
             content = dockerfile,
             "VM image input"
@@ -616,7 +625,7 @@ fn read_cache_record<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, Imag
             Ok(record) => Ok(Some(record)),
             Err(error) => {
                 info!(
-                    target: "nanovm_image",
+                    target: "nanocodex_vm",
                     cache_record_path = %path.display(),
                     error = %error,
                     "ignoring invalid VM image cache record"
@@ -671,7 +680,7 @@ async fn acquire_cache_lock(
     key: &str,
 ) -> Result<CacheLock, ImageError> {
     let span = info_span!(
-        target: "nanovm_image",
+        target: "nanocodex_vm",
         "vm.image.cache_lock",
         otel.kind = "internal",
         image.cache.namespace = namespace,
@@ -990,7 +999,7 @@ async fn resolve_recipe_images(
     }
     let images = stream::iter(references.into_iter().map(|reference| {
         let span = info_span!(
-            target: "nanovm_image",
+            target: "nanocodex_vm",
             "vm.image.resolve",
             otel.kind = "client",
             otel.status_code = tracing::field::Empty,
@@ -1049,7 +1058,7 @@ async fn prepare_flattened_disk(
     let temporary_for_task = temporary.to_path_buf();
     let layers = image.layers.clone();
     let span = info_span!(
-        target: "nanovm_image",
+        target: "nanocodex_vm",
         "vm.image.format",
         otel.kind = "internal",
         image.disk.bytes = disk_bytes,
@@ -1077,7 +1086,7 @@ async fn prepare_built_disk(
     let context_directory = context_directory.to_path_buf();
     let context_cache = cache.to_path_buf();
     let span = info_span!(
-        target: "nanovm_image",
+        target: "nanocodex_vm",
         "vm.image.context",
         otel.kind = "internal",
         image.context.path = %context_directory.display(),
@@ -1112,7 +1121,7 @@ async fn prepare_built_disk(
         let stage_root = temporary.path().join(format!("stage-{stage_index}.ext4"));
         reflink_or_sparse_copy(&base, &stage_root)?;
         let span = info_span!(
-            target: "nanovm_image",
+            target: "nanocodex_vm",
             "vm.image.stage",
             otel.kind = "internal",
             image.stage.index = stage_index,
@@ -1301,10 +1310,8 @@ fn build_vmm_inputs(
 ) -> Result<(Command, VmConfig, GuestCommand), ImageError> {
     let mut command = Command::new(&builder.vmm);
     command.args(&builder.vmm_arguments);
-    if let Some(directory) = &builder.firmware_directory
-        && directory.join("libkrunfw.5.dylib").is_file()
-    {
-        command.env("DYLD_LIBRARY_PATH", directory.canonicalize()?);
+    if let Some(directory) = &builder.firmware_directory {
+        configure_firmware_library_path(&mut command, directory)?;
     }
     let mut config = VmConfig::ext4(stage_root)
         .cpus(builder.cpus)
@@ -1325,6 +1332,13 @@ fn build_vmm_inputs(
         ))
         .arg("nanoeval-image-build");
     Ok((command, config, guest))
+}
+
+fn configure_firmware_library_path(command: &mut Command, directory: &Path) -> io::Result<()> {
+    if directory.join(FIRMWARE_LIBRARY_FILENAME).is_file() {
+        command.env(FIRMWARE_LIBRARY_PATH_ENVIRONMENT, directory.canonicalize()?);
+    }
+    Ok(())
 }
 
 async fn execute_stage_inner(
@@ -1520,7 +1534,7 @@ async fn run_build_command(
 ) -> Result<(), ImageError> {
     let output = session.command(command).await?;
     info!(
-        target: "nanovm_image",
+        target: "nanocodex_vm",
         build_stage = stage,
         build_instruction = instruction,
         process.exit_code = output.exit_code,
@@ -1857,7 +1871,7 @@ async fn pull_layers(image: &str, blobs: &Path) -> Result<PulledImage, ImageErro
     let config = parse_image_config(&config_json)?;
     let layers = stream::iter(manifest.layers.into_iter().map(|descriptor| {
         let span = info_span!(
-            target: "nanovm_image",
+            target: "nanocodex_vm",
             "vm.image.blob",
             otel.kind = "client",
             image.reference = image,
@@ -1991,7 +2005,7 @@ fn cached_root_disk(path: &Path) -> Option<String> {
         Ok(shell) => Some(shell),
         Err(error) => {
             info!(
-                target: "nanovm_image",
+                target: "nanocodex_vm",
                 image_root_path = %path.display(),
                 error = %error,
                 "rebuilding invalid VM image cache disk"
@@ -2082,6 +2096,7 @@ fn reference_cache_key(image: &str) -> String {
 mod tests {
     use std::{
         collections::{BTreeMap, HashMap},
+        ffi::OsStr,
         fs::{self, File},
         path::{Path, PathBuf},
         process::Command,
@@ -2089,11 +2104,12 @@ mod tests {
         time::Duration,
     };
 
-    use nanovm::{EgressLease, Network};
+    use crate::{EgressLease, Network};
 
     use super::{
         CACHE_RECORD_VERSION, COPY_SCRIPT, CachePolicy, DiskStatus, DockerfileRecipe,
-        ImageRuntimeConfig, LayerRecord, ReferenceRecord, VmImageBuilder, blob_path,
+        FIRMWARE_LIBRARY_FILENAME, FIRMWARE_LIBRARY_PATH_ENVIRONMENT, ImageRuntimeConfig,
+        LayerRecord, ReferenceRecord, VmImageBuilder, blob_path, configure_firmware_library_path,
         disk_cache_key, docker_process_environment, output_tail, reference_cache_key,
         resolver_configuration, write_cache_record,
     };
@@ -2107,7 +2123,7 @@ mod tests {
         Layer, layer::Context as LayerContext, prelude::*, registry::LookupSpan,
     };
 
-    const FIXTURE_IMAGE: &str = "example.invalid/nanovm-fixture:latest";
+    const FIXTURE_IMAGE: &str = "example.invalid/nanocodex-vm-fixture:latest";
     const FIXTURE_MANIFEST: &str =
         "sha256:56249d7a2f93306106f6d8bcdf6423afb73c1b747d874febcc778beee25cb8bb";
     const FIXTURE_LAYER: &str =
@@ -2284,7 +2300,7 @@ mod tests {
 
     #[test]
     fn builder_retains_explicit_vm_execution_policy() {
-        let builder = VmImageBuilder::new("/opt/nanovm-vmm", "/cache/runtime.ext4")
+        let builder = VmImageBuilder::new("/opt/nanocodex-vmm", "/cache/runtime.ext4")
             .firmware_directory("/opt/libkrunfw")
             .vmm_args(["run", "--private-config"])
             .cpus(6)
@@ -2293,7 +2309,7 @@ mod tests {
             .copy_timeout(Duration::from_mins(2))
             .egress(EgressLease::disabled());
 
-        assert_eq!(builder.vmm, Path::new("/opt/nanovm-vmm"));
+        assert_eq!(builder.vmm, Path::new("/opt/nanocodex-vmm"));
         assert_eq!(builder.runtime_image, Path::new("/cache/runtime.ext4"));
         assert_eq!(
             builder.firmware_directory.as_deref(),
@@ -2305,6 +2321,30 @@ mod tests {
         assert_eq!(builder.run_timeout, Duration::from_mins(15));
         assert_eq!(builder.copy_timeout, Duration::from_mins(2));
         assert_eq!(builder.egress.network(), &Network::Disabled);
+    }
+
+    #[test]
+    fn firmware_directory_sets_the_platform_library_path() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join(FIRMWARE_LIBRARY_FILENAME),
+            b"firmware",
+        )
+        .unwrap();
+        let mut command = tokio::process::Command::new("/opt/nanocodex-vmm");
+
+        configure_firmware_library_path(&mut command, directory.path()).unwrap();
+
+        let configured = command
+            .as_std()
+            .get_envs()
+            .find(|(name, _)| *name == OsStr::new(FIRMWARE_LIBRARY_PATH_ENVIRONMENT))
+            .and_then(|(_, value)| value)
+            .map(OsStr::to_owned);
+        assert_eq!(
+            configured.as_deref(),
+            Some(directory.path().canonicalize().unwrap().as_os_str())
+        );
     }
 
     #[test]
@@ -2609,7 +2649,7 @@ CMD ["/bin/sh"]
         });
         assert_eq!(
             dockerfile_event.as_deref(),
-            Some("FROM example.invalid/nanovm-fixture:latest\nWORKDIR /workspace\n")
+            Some("FROM example.invalid/nanocodex-vm-fixture:latest\nWORKDIR /workspace\n")
         );
     }
 }

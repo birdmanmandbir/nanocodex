@@ -1,8 +1,8 @@
 use std::{env, error::Error, path::PathBuf};
 
 use nanocodex::{Nanocodex, OpenAi, oai::auth::OpenAiAuth};
+use nanocodex_eval::harbor::Harbor;
 use nanocodex_eval::{EvalEventKind, Evaluator, Task};
-use nanocodex_eval_harbor::Harbor;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {

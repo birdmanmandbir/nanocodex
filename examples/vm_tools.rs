@@ -8,8 +8,8 @@ use nanocodex::{
     Tool,
     tools::contract::{ToolContext, ToolInput, ToolOutput, ToolOutputBody, ToolOutputContent},
 };
+use nanocodex_vm::{BlockDevice, EgressLease, GuestCommand, VmConfig, VmProcessConfig};
 use nanocodex_vm::{GuestRuntimeDisk, VmToolSession};
-use nanovm::{BlockDevice, EgressLease, GuestCommand, VmConfig, VmProcessConfig};
 use serde::Deserialize;
 use serde_json::value::to_raw_value;
 use tokio::process::Command;

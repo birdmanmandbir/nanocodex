@@ -8,7 +8,7 @@ use std::{
 
 use clap::Args;
 use eyre::{Context, Result, bail, eyre};
-use nanocodex_eval_harbor::{
+use nanocodex_eval::harbor::{
     PublishedAgentInfo, PublishedAttempts, PublishedQuery, PublishedResults, PublishedTask,
     PublishedTrajectory, PublishedTrial,
 };
@@ -1050,7 +1050,7 @@ fn sort_runs(runs: &mut [RunScore]) {
 }
 
 impl PublishedRun {
-    fn record(&mut self, attempt: nanocodex_eval_harbor::PublishedAttempt) {
+    fn record(&mut self, attempt: nanocodex_eval::harbor::PublishedAttempt) {
         self.agent.get_or_insert_with(|| attempt.agent.clone());
         self.thinking.insert(attempt.thinking);
         self.runs.insert(attempt.run);
@@ -1401,7 +1401,7 @@ fn one_line(value: &str, full: bool) -> String {
 
 #[cfg(test)]
 mod tests {
-    use nanocodex_eval_harbor::{PublishedAttempt, PublishedModelInfo};
+    use nanocodex_eval::harbor::{PublishedAttempt, PublishedModelInfo};
 
     use super::*;
 

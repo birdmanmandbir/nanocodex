@@ -115,36 +115,23 @@ nanocodex-tools-macros
 └── proc-macro implementation; no agent dependency
 ```
 
-Systems and evaluation crates remain below the agent. VM and evaluation
-packages live under `crates/experimental/`; they remain workspace members but
-are outside the stable publication and dependency surface:
+The VM and evaluation stacks remain below the agent. Their two packages live
+under `crates/experimental/`; they remain workspace members but are outside the
+stable publication and dependency surface:
 
 ```text
-nanovm-image ──> nanocodex-vm ──> nanovm
-
-nanocodex-browser-vm
-├── nanocodex-browser
-└── nanocodex-vm ──> nanovm
-
-nanocodex-vm-egress
-├── neutral EgressLease composition
-├── MPP provider
-└── secret gateway provider
+nanocodex-vm
+├── internal libkrun, image, and egress modules
+└── retained guest-tool protocol over nanocodex-tools
 
 nanocodex-eval
 ├── nanocodex-agent
-├── nanovm-image
-├── nanocodex-vm
-└── nanocodex-eval-harbor
-
-nanocentaur
-├── nanocodex-agent
-├── nanocodex-vm
-└── nanocodex-vm-egress
+├── internal task, scheduler, sweep, and result modules
+└── internal Harbor and ATIF projection
 ```
 
-The exact names of the VM image and egress crates remain subject to the
-standalone-API review. Their ownership boundaries do not.
+Those internal module boundaries may become packages only after a concrete
+consumer requires an independently useful dependency boundary.
 
 ## Agreed core APIs
 
@@ -479,14 +466,14 @@ The low-level VM layer owns:
 - bounded multiplexed host/guest RPC; and
 - provider-neutral egress leases.
 
-OCI and Dockerfile materialization becomes a reusable image-building library,
-not code buried in the eval CLI. It understands only the explicitly supported
-Dockerfile shapes and fails closed on unknown behavior. Cache keys include all
-inputs that affect the resulting disk.
+OCI and Dockerfile materialization lives in `nanocodex_vm::image`, not in the
+CLI. It understands only the explicitly supported Dockerfile shapes and fails
+closed on unknown behavior. Cache keys include all inputs that affect the
+resulting disk.
 
-`nanocodex-vm` implements ordinary agent tools over one retained VM session.
-One root session tree shares the VM workspace; each agent driver still receives
-fresh agent-relative tool handlers.
+`nanocodex_vm::tools` implements ordinary agent tools over one retained VM
+session. One root session tree shares the VM workspace; each agent driver still
+receives fresh agent-relative tool handlers.
 
 ### Browser inside the VM
 
@@ -552,7 +539,7 @@ The library layer owns:
 The main CLI exposes:
 
 ```text
-nanocodex eval run ...
+nanocodex eval --task ... [run options]
 nanocodex eval prepare ...
 nanocodex eval inspect ...
 nanocodex eval compare ...
@@ -721,7 +708,7 @@ Node/browser WASM.
 
 - [x] Reconcile Nanoeval's VM/image code with the hardened Nanocodex VM draft.
 - [x] Extract reusable content-addressed OCI/Dockerfile image preparation into
-  `nanovm-image`.
+  `nanocodex_vm::image`.
 - [x] Land the retained VM tool session and composable neutral egress lease.
 - [x] Move current guest ELF staging behind the content-addressed
   `GuestRuntimeDisk` API while retaining Nanoeval's cache identity.
@@ -743,11 +730,12 @@ resolution is bounded-parallel, and init4-style bounded spans preserve the
 complete Dockerfile. Build CPU, memory, egress, and instruction timeouts are
 explicit builder policy rather than hidden constants.
 
-The three VM crates and two evaluation crates deliberately remain
-`publish = false` while `nanovm` targets the reviewed libkrun `2.0.0-dev` Git
-checkpoint, which is not available on crates.io. Their public APIs and Rustdoc
-are complete for path/Git consumers; Stack 10 owns publication once that exact
-dependency can be packaged without substituting an older hypervisor API.
+The consolidated `nanocodex-vm` and `nanocodex-eval` crates deliberately
+remain `publish = false` while the VM crate targets the reviewed libkrun
+`2.0.0-dev` Git checkpoint, which is not available on crates.io. Their public
+APIs and Rustdoc are complete for path/Git consumers; Stack 10 owns publication
+once that exact dependency can be packaged without substituting an older
+hypervisor API.
 
 ### 7. Browser on VM
 
@@ -780,7 +768,7 @@ Evidence:
 records the exact `nanoeval/master@10aed6b` capability mapping, compatibility
 inputs, retained end-to-end measurements, and the new task/sweep/resume/ATIF
 Criterion budgets. The imported task and verifier fixtures are unchanged.
-`nanocodex-eval` and `nanocodex-eval-harbor` now provide warnings-denied
+`nanocodex-eval`, including its `harbor` module, now provides warnings-denied
 progressive rustdoc examples; the CLI uses the agent's built-in pricing catalog
 and carries estimated USD through results, ATIF, Harbor, JSON, tracing, and
 human summaries. A clean-cache CLI proof rebuilt the guest, ran the task

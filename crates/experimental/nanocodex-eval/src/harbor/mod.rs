@@ -1,6 +1,6 @@
-//! Harbor-compatible artifacts for [`nanocodex_eval`].
+//! Harbor-compatible artifacts for [`crate`].
 //!
-//! The evaluator's typed result is authoritative. This crate subscribes to its
+//! The evaluator's typed result is authoritative. This module subscribes to its
 //! optional event stream and durably projects each attempt into Harbor job,
 //! trial, trajectory, verifier, and ATIF files.
 //!
@@ -8,8 +8,7 @@
 //!
 //! ```no_run
 //! use nanocodex_agent::{Nanocodex, OpenAi};
-//! use nanocodex_eval::{Evaluator, Task};
-//! use nanocodex_eval_harbor::Harbor;
+//! use nanocodex_eval::{Evaluator, Task, harbor::Harbor};
 //!
 //! # async fn evaluate() -> Result<(), Box<dyn std::error::Error>> {
 //! let agent = Nanocodex::builder(OpenAi::new(std::env::var("OPENAI_API_KEY")?)?).instructions(
@@ -47,11 +46,11 @@ use std::{
     sync::Mutex,
 };
 
-use chrono::{DateTime, Utc};
-use nanocodex_eval::{
+use crate::{
     AgentMetadata, AtifBuilder, AtifTrajectory, EvalEventKind, EvalEventStream,
     EvalEventStreamError, EvalFailure, EvalResult, Evaluator, PhaseTiming, Task,
 };
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::{sync::oneshot, task::JoinHandle};
 use url::Url;
@@ -1335,8 +1334,8 @@ struct HarborMetric {}
 mod tests {
     use std::{collections::BTreeMap, fs};
 
+    use crate::{AtifTrajectory, Evaluator, Sweep, Task};
     use nanocodex_agent::{Nanocodex, OpenAi};
-    use nanocodex_eval::{AtifTrajectory, Evaluator, Sweep, Task};
     use serde::Deserialize;
     use tempfile::tempdir;
 

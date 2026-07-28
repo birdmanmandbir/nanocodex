@@ -103,7 +103,7 @@ The consolidated CLI was also exercised from a clean local task-image cache.
 Linux guest runtime in 10.717 seconds, resolved the unchanged Alpine manifest,
 ran the task Dockerfile through the signed VMM, and created the ext4 root in
 4.536 seconds (15.254 seconds total). A subsequent warm one-attempt
-`nanocodex eval run --vm` reached the retained typed guest tool server in
+`nanocodex eval --vm` reached the retained typed guest tool server in
 292.595 ms. The attempt then used an intentionally invalid API key and failed
 at the OpenAI WebSocket handshake without model usage or cost.
 
@@ -238,7 +238,7 @@ drift means this is not a controlled reasoning-effort ablation.
 
 | Temporary surface | Nanocodex owner and executable evidence |
 | --- | --- |
-| `nanoeval run` | `nanocodex eval run`; repeated task/suite inputs, k trials, bounded concurrency/memory, host auto-sizing, native/VM modes, output/JSON, web-search, reasoning, auth, resume, `--new`, retry filters, and VM retention retain their parse and behavior tests |
+| `nanoeval run` | `nanocodex eval`; repeated task/suite inputs, k trials, bounded concurrency/memory, host auto-sizing, native/VM modes, output/JSON, web-search, reasoning, auth, resume, `--new`, retry filters, and VM retention retain their parse and behavior tests |
 | durable incomplete-job resume | `nanocodex-eval::EvaluatorBuilder::resume_incomplete`; manifest identity, committed-attempt skip, lock release, active-owner rejection, and scheduler-only override tests |
 | pass@k reruns | CLI retained-result lineage and selection tests, including failed/refused/errored policy and literal/regex task filters |
 | `nanoeval task` | `nanocodex eval task`, with complete typed JSON or progressive human output |
@@ -246,14 +246,14 @@ drift means this is not a controlled reasoning-effort ablation.
 | `nanoeval compare` | `nanocodex eval compare`, including checksum/task/agent filters, exact-revision ranking, drilldown, typed published trajectories, and bounded downloads |
 | `nanoeval cleanup` | `nanocodex eval cleanup`, with dry-run and completed-trial-only disk deletion tests |
 | `nanoeval vm prepare` | `nanocodex eval prepare`; the nested `nanocodex eval vm prepare` spelling remains as a migration alias |
-| raw VM diagnostic and private VMM child | `nanocodex eval vm run` and hidden `run-config`; normal attempts use typed `nanovm`, `nanocodex-vm`, and `nanovm-image` owners |
-| stable entitled macOS VMM | the Cargo runner executes a content-addressed copy signed with `nanovm.entitlements`; the same signed process identity is reused by image construction and attempt children |
-| duplicated OCI/Dockerfile and disk code | deleted from the eval CLI; `nanovm-image::VmImageBuilder` owns preparation and `reflink_or_sparse_copy` owns attempt/verifier disks |
+| raw VM diagnostic and private VMM child | `nanocodex eval vm run` and hidden `run-config`; normal attempts use the typed `nanocodex-vm` lifecycle, image, and retained-tool modules |
+| stable entitled macOS VMM | the Cargo runner executes a content-addressed copy signed with `nanocodex-vm.entitlements`; the same signed process identity is reused by image construction and attempt children |
+| duplicated OCI/Dockerfile and disk code | deleted from the eval CLI; `nanocodex_vm::image::VmImageBuilder` owns preparation and `reflink_or_sparse_copy` owns attempt/verifier disks |
 | native disposable workspaces and verifier | `nanocodex-eval` native backend and deterministic task/verifier tests |
 | Terminal-Bench VM attempts | typed task-image adapter plus retained VM attempt/verifier lifecycle; a typed readiness handshake completes before model work and the live `write-greeting` verifier scored 1.0 |
 | Frontier-Bench separate verifier and artifact handoff | typed task and verifier images, declared artifact archive, fresh verifier VM, reward/CTRF/ATIF retention; two untouched live trials completed the entire harness and the stronger run passed 34/36 hidden assertions |
 | typed events and results | `EvalEvents`, `EvalEventStream`, `EvalResult`, `EvalFailure`, `SweepResults`; independent subscription, lag, and ordering tests |
-| Harbor job and ATIF projection | `nanocodex-eval-harbor`; canonical package/checksum/result/trajectory tests and warnings-denied public rustdoc examples |
+| Harbor job and ATIF projection | `nanocodex_eval::harbor`; canonical package/checksum/result/trajectory tests and warnings-denied public rustdoc examples |
 | published Harbor reader | typed cached reader with bounded downloads, immutable revision selection, task/checksum/agent filters, and compatibility decoding |
 | browser-in-VM implementation | already promoted to `nanocodex-browser-vm` in stack 7; eval consumes the shared VM/image boundary rather than owning a browser |
 | USD accounting | the same versioned `PricingSnapshot` accepted by the agent and CLI flows into per-attempt result, ATIF, Harbor, JSON report, tracing, and an honest known-cost human summary |
@@ -261,7 +261,7 @@ drift means this is not a controlled reasoning-effort ablation.
 The complete CLI remains available under one executable:
 
 ```text
-nanocodex eval run ...
+nanocodex eval --task ... [run options]
 nanocodex eval prepare ...
 nanocodex eval task ...
 nanocodex eval inspect ...
