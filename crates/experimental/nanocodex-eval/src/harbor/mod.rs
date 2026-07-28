@@ -47,7 +47,7 @@ use std::{
 };
 
 use crate::{
-    AgentMetadata, AtifBuilder, AtifTrajectory, EvalEventKind, EvalEventStream,
+    AgentMetadata, AtifBuilder, AtifTrajectory, EvalEnvironment, EvalEventKind, EvalEventStream,
     EvalEventStreamError, EvalFailure, EvalResult, Evaluator, PhaseTiming, Task,
 };
 use chrono::{DateTime, Utc};
@@ -358,6 +358,7 @@ struct HarborArtifacts {
     root: PathBuf,
     jobs_dir: PathBuf,
     max_concurrency: usize,
+    environment: EvalEnvironment,
     planned_attempts: Option<usize>,
     baseline: Option<HarborJobResult>,
     recorded_trials: Mutex<Vec<HarborRecordedTrial>>,
@@ -387,6 +388,7 @@ impl HarborArtifacts {
             root,
             jobs_dir: eval.parent_directory().to_path_buf(),
             max_concurrency: eval.max_concurrency(),
+            environment: eval.attempt_environment(),
             planned_attempts: eval.planned_attempts(),
             baseline,
             recorded_trials: Mutex::new(recorded_trials),
@@ -439,7 +441,7 @@ impl HarborArtifacts {
             trial_name: &result.trial_name,
             trials_dir: &self.root,
             agent: harbor_agent_config(&result.agent.model, &result.agent.effort),
-            environment: HarborEnvironmentConfig::native(),
+            environment: HarborEnvironmentConfig::from(result.environment),
             verifier: HarborVerifierConfig::native(),
             artifacts: Vec::new(),
             extra_instruction_paths: Vec::new(),
@@ -501,6 +503,7 @@ impl HarborArtifacts {
             &result.agent.model,
             &result.agent.effort,
             &task_digest,
+            result.environment,
         );
         Self::write_json(&root.join("lock.json"), &lock)?;
         {
@@ -545,7 +548,7 @@ impl HarborArtifacts {
             trial_name: &failure.trial_name,
             trials_dir: &self.root,
             agent: harbor_agent_config(model, effort),
-            environment: HarborEnvironmentConfig::native(),
+            environment: HarborEnvironmentConfig::from(failure.environment),
             verifier: HarborVerifierConfig::native(),
             artifacts: Vec::new(),
             extra_instruction_paths: Vec::new(),
@@ -598,7 +601,7 @@ impl HarborArtifacts {
         Self::write_file(&root.join("trial.log"), failure.traceback.as_bytes())?;
         Self::write_file(&agent.join("stderr.log"), failure.traceback.as_bytes())?;
 
-        let lock = HarborTrialLock::new(task, model, effort, &task_digest);
+        let lock = HarborTrialLock::new(task, model, effort, &task_digest, failure.environment);
         Self::write_json(&root.join("lock.json"), &lock)?;
         {
             let mut recorded = self
@@ -686,7 +689,7 @@ impl HarborArtifacts {
                 jobs_dir: self.jobs_dir.clone(),
                 n_concurrent_trials: self.max_concurrency,
                 quiet: true,
-                environment: HarborEnvironmentConfig::native(),
+                environment: HarborEnvironmentConfig::from(self.environment),
                 verifier: HarborVerifierConfig::native(),
                 agents,
                 tasks,
@@ -852,7 +855,13 @@ struct HarborTrialLock {
 }
 
 impl HarborTrialLock {
-    fn new(task: &Task, model: &str, effort: &str, digest: &str) -> Self {
+    fn new(
+        task: &Task,
+        model: &str,
+        effort: &str,
+        digest: &str,
+        environment: EvalEnvironment,
+    ) -> Self {
         Self {
             schema_version: 1,
             task: HarborTaskLock {
@@ -877,7 +886,7 @@ impl HarborTrialLock {
                 },
             },
             skills: Vec::new(),
-            environment: HarborEnvironmentConfig::native(),
+            environment: HarborEnvironmentConfig::from(environment),
             verifier: HarborVerifierConfig::native(),
         }
     }
@@ -945,16 +954,20 @@ struct HarborEnvironmentConfig {
     kwargs: NativeEnvironmentKwargs,
 }
 
-impl HarborEnvironmentConfig {
-    fn native() -> Self {
+impl From<EvalEnvironment> for HarborEnvironmentConfig {
+    fn from(environment: EvalEnvironment) -> Self {
+        let (import_path, backend) = match environment {
+            EvalEnvironment::Native => ("nanocodex_eval.native:NativeEnvironment", "native"),
+            EvalEnvironment::MicroVm => ("nanocodex_vm:VmEnvironment", "microvm"),
+        };
         Self {
             environment_type: None,
-            import_path: "nanocodex_eval.native:NativeEnvironment".to_owned(),
+            import_path: import_path.to_owned(),
             delete: false,
             cpu_enforcement_policy: ResourceMode::Ignore,
             memory_enforcement_policy: ResourceMode::Ignore,
             kwargs: NativeEnvironmentKwargs {
-                backend: "native".to_owned(),
+                backend: backend.to_owned(),
             },
         }
     }
@@ -1334,7 +1347,7 @@ struct HarborMetric {}
 mod tests {
     use std::{collections::BTreeMap, fs};
 
-    use crate::{AtifTrajectory, Evaluator, Sweep, Task};
+    use crate::{AtifTrajectory, EvalEnvironment, Evaluator, Sweep, Task};
     use nanocodex_agent::{Nanocodex, OpenAi};
     use serde::Deserialize;
     use tempfile::tempdir;
@@ -1415,6 +1428,26 @@ mod tests {
         assert_eq!(result.n_total_trials, 2);
         assert_eq!(result.stats.completed, 0);
         assert_eq!(result.stats.pending, 2);
+    }
+
+    #[test]
+    fn job_config_records_microvm_backend_before_execution() {
+        let output = tempdir().unwrap();
+        let (eval, _) = Evaluator::builder(Nanocodex::builder(OpenAi::new("test-key").unwrap()))
+            .output_directory(output.path())
+            .attempt_environment(EvalEnvironment::MicroVm)
+            .build()
+            .unwrap();
+
+        Harbor::new(&eval).unwrap();
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(eval.directory().join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            config["environment"]["import_path"],
+            "nanocodex_vm:VmEnvironment"
+        );
+        assert_eq!(config["environment"]["kwargs"]["backend"], "microvm");
     }
 
     #[tokio::test]
