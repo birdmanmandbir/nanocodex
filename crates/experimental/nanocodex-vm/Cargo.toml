@@ -32,8 +32,9 @@ host = [
     "dep:tempfile",
     "dep:tracing",
     "dep:zstd",
+    "nanocodex-tools/native",
 ]
-guest-runtime = ["dep:nix"]
+guest-runtime = ["dep:nix", "nanocodex-tools/workspace-runtime"]
 
 [dependencies]
 base64.workspace = true

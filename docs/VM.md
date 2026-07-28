@@ -15,6 +15,14 @@ host/guest tool protocol.
 The package does not own payment-provider policy, agent identity, secret
 resolution, or the caller's choice to enable VM tools.
 
+The Cargo split stays internal to this boundary. The default `host` feature
+retains image preparation, libkrun lifecycle, and VM-backed `Tools`;
+`guest-runtime` links only the canonical apply-patch, shell, write-stdin, and
+view-image handlers. The guest deliberately excludes the OpenAI transport,
+Code Mode/QuickJS, MCP, HTTP clients, and OCI preparation. Normal
+`nanocodex-tools` and `nanocodex-oai-api` builds retain their complete native
+behavior through default features.
+
 ## Preparing immutable images
 
 `VmImageBuilder` turns a directory containing a concrete `Dockerfile` into one

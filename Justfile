@@ -95,10 +95,20 @@ smoke-mcp:
 # Build the end-to-end VM tool example. macOS VMM executables need the
 # Hypervisor entitlement; signing the built artifact keeps Cargo inputs clean.
 build-vm-guest:
-    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="{{justfile_directory()}}/scripts/aarch64-unknown-linux-musl-linker" \
-    CC_aarch64_unknown_linux_musl="{{justfile_directory()}}/scripts/aarch64-unknown-linux-musl-linker" \
-    AR_aarch64_unknown_linux_musl="{{justfile_directory()}}/scripts/aarch64-unknown-linux-musl-ar" \
-    cargo build -p nanocodex-vm --bin nanocodex-vm-guest --no-default-features --features guest-runtime --target aarch64-unknown-linux-musl
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "$(uname -m)" in
+      arm64|aarch64)
+        target=aarch64-unknown-linux-musl
+        export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="{{justfile_directory()}}/scripts/aarch64-unknown-linux-musl-linker"
+        export CC_aarch64_unknown_linux_musl="{{justfile_directory()}}/scripts/aarch64-unknown-linux-musl-linker"
+        export AR_aarch64_unknown_linux_musl="{{justfile_directory()}}/scripts/aarch64-unknown-linux-musl-ar"
+        ;;
+      x86_64|amd64) target=x86_64-unknown-linux-musl ;;
+      *) echo "unsupported VM guest architecture: $(uname -m)" >&2; exit 2 ;;
+    esac
+    cargo build -p nanocodex-vm --bin nanocodex-vm-guest \
+      --no-default-features --features guest-runtime --target "$target"
 
 build-vm-example:
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="{{justfile_directory()}}/scripts/aarch64-unknown-linux-musl-linker" \
