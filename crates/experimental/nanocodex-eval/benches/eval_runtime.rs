@@ -13,13 +13,8 @@ const EVENTS_PER_TURN: usize = 6;
 
 fn benchmark_eval_runtime(criterion: &mut Criterion) {
     let tasks_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../tasks");
-    let task_paths = [
-        "browser-runtime",
-        "extract-todos",
-        "uppercase-message",
-        "write-greeting",
-    ]
-    .map(|name| tasks_root.join(name));
+    let task_paths =
+        ["extract-todos", "uppercase-message", "write-greeting"].map(|name| tasks_root.join(name));
     let tasks = task_paths
         .iter()
         .map(Task::load)
@@ -39,12 +34,12 @@ fn benchmark_eval_runtime(criterion: &mut Criterion) {
 
     group.bench_function("load_terminal_bench_task", |bencher| {
         bencher.iter(|| {
-            black_box(Task::load(black_box(&task_paths[3])).expect("load benchmark task"));
+            black_box(Task::load(black_box(&task_paths[2])).expect("load benchmark task"));
         });
     });
 
     group.throughput(Throughput::Elements(sweep.attempt_count() as u64));
-    group.bench_function("plan_4x4x5_sweep", |bencher| {
+    group.bench_function("plan_3x4x5_sweep", |bencher| {
         bencher.iter(|| {
             black_box(build_sweep(black_box(&tasks), black_box(&agent)));
         });
