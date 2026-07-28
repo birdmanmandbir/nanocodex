@@ -590,7 +590,7 @@ impl Run {
             self.json,
         )?;
         let output = output_started.elapsed();
-        RunMeasurements {
+        let measurements = RunMeasurements {
             observability,
             task_loading,
             vm_runtime,
@@ -600,8 +600,9 @@ impl Run {
             harbor_finish: finished.harbor_finish,
             output,
             total: total_started.elapsed(),
-        }
-        .record(&finished.results, attempt_count, finished.failed);
+        };
+        measurements.persist(finished.job.directory())?;
+        measurements.record(&finished.results, attempt_count, finished.failed);
         record_last_run(finished.job.directory())?;
         finish_run(finished.run_error)
     }
@@ -1487,7 +1488,39 @@ struct RunMeasurements {
     total: Duration,
 }
 
+#[derive(Serialize)]
+struct RetainedRunMeasurements {
+    schema_version: u32,
+    observability_ns: u64,
+    task_loading_ns: u64,
+    vm_runtime_build_ns: u64,
+    cold_image_and_cache_ns: u64,
+    evaluation_setup_ns: u64,
+    attempts_wall_ns: u64,
+    harbor_finish_ns: u64,
+    output_ns: u64,
+    total_wall_ns: u64,
+}
+
 impl RunMeasurements {
+    fn persist(&self, job: &Path) -> Result<()> {
+        write_json_atomic(
+            &job.join("timing.json"),
+            &RetainedRunMeasurements {
+                schema_version: 1,
+                observability_ns: duration_ns(self.observability),
+                task_loading_ns: duration_ns(self.task_loading),
+                vm_runtime_build_ns: duration_ns(self.vm_runtime),
+                cold_image_and_cache_ns: duration_ns(self.vm_environments),
+                evaluation_setup_ns: duration_ns(self.evaluation_setup),
+                attempts_wall_ns: duration_ns(self.attempts),
+                harbor_finish_ns: duration_ns(self.harbor_finish),
+                output_ns: duration_ns(self.output),
+                total_wall_ns: duration_ns(self.total),
+            },
+        )
+    }
+
     fn record(&self, results: &[EvalResult], attempt_count: usize, errored_attempt_count: usize) {
         let model_ns = results
             .iter()
@@ -3523,6 +3556,7 @@ mod tests {
         fs,
         path::{Path, PathBuf},
         process::Command as StdCommand,
+        time::Duration,
     };
 
     use clap::Parser;
@@ -3531,8 +3565,8 @@ mod tests {
 
     use super::{
         CACHED_VERIFIER_SCRIPT, DEFAULT_HOST_UTILIZATION_PERCENT, DEFAULT_TRIALS, HostResources,
-        Run, RunInvocation, RunSummary, VmRetention, cached_verifier_script, load_tasks,
-        recognized_verifier_setup, remove_passed_rootfs, retained_retry_task_names,
+        Run, RunInvocation, RunMeasurements, RunSummary, VmRetention, cached_verifier_script,
+        load_tasks, recognized_verifier_setup, remove_passed_rootfs, retained_retry_task_names,
         retained_task_durations, verifier_bootstrap_network_failed, verifier_cache_key,
         verifier_network_retry_delay, verifier_shell,
     };
@@ -3541,6 +3575,31 @@ mod tests {
     struct TestCli {
         #[command(flatten)]
         eval: Run,
+    }
+
+    #[test]
+    fn run_measurements_retain_cold_and_warm_phase_boundaries() {
+        let output = tempfile::tempdir().unwrap();
+        RunMeasurements {
+            observability: Duration::from_nanos(1),
+            task_loading: Duration::from_nanos(2),
+            vm_runtime: Duration::from_nanos(3),
+            vm_environments: Duration::from_nanos(4),
+            evaluation_setup: Duration::from_nanos(5),
+            attempts: Duration::from_nanos(6),
+            harbor_finish: Duration::from_nanos(7),
+            output: Duration::from_nanos(8),
+            total: Duration::from_nanos(36),
+        }
+        .persist(output.path())
+        .unwrap();
+
+        let timing: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.path().join("timing.json")).unwrap()).unwrap();
+        assert_eq!(timing["vm_runtime_build_ns"], 3);
+        assert_eq!(timing["cold_image_and_cache_ns"], 4);
+        assert_eq!(timing["attempts_wall_ns"], 6);
+        assert_eq!(timing["total_wall_ns"], 36);
     }
 
     #[test]

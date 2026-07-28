@@ -148,6 +148,7 @@ struct AttemptInput {
     task: Task,
     nanocodex: NanocodexBuilder,
     coordinate: Option<SweepCoordinate>,
+    queued_at: DateTime<Utc>,
 }
 
 struct AttemptOutput {
@@ -266,6 +267,7 @@ impl Evaluator {
     ///
     /// Returns an error when setup, the agent, or verification fails.
     pub async fn task(&self, task: Task) -> Result<EvalResult, EvalError> {
+        let queued_at = Utc::now();
         let _permit = self
             .inner
             .admission
@@ -275,6 +277,7 @@ impl Evaluator {
             task,
             nanocodex: self.inner.nanocodex.clone(),
             coordinate: None,
+            queued_at,
         })
         .await
         .map(|output| output.result)
@@ -303,6 +306,7 @@ impl Evaluator {
                 task,
                 nanocodex: self.inner.nanocodex.clone(),
                 coordinate: None,
+                queued_at: Utc::now(),
             })
             .collect();
         Ok(self
@@ -355,6 +359,7 @@ impl Evaluator {
                     agent: attempt.agent_id().clone(),
                     trial: attempt.trial(),
                 }),
+                queued_at: Utc::now(),
             });
         }
         let attempts = self
@@ -487,6 +492,7 @@ impl Evaluator {
             task,
             nanocodex,
             coordinate,
+            queued_at,
         } = input;
         let session_id = SessionId::new();
         let attempt_id = session_id.as_uuid();
@@ -496,7 +502,12 @@ impl Evaluator {
             .fetch_add(1, Ordering::Relaxed)
             / PROMPT_CACHE_COHORT_SIZE;
         let trial_name = trial_name(&task, attempt_id, coordinate.as_ref());
-        let started_at = Utc::now();
+        let admitted_at = Utc::now();
+        let queue_wait = PhaseTiming {
+            started_at: queued_at,
+            finished_at: admitted_at,
+        };
+        let started_at = queued_at;
         let mut emitter =
             AttemptEmitter::new(self, session_id, prompt_cache_cohort, &task, &trial_name);
         let span = attempt_span(
@@ -515,7 +526,7 @@ impl Evaluator {
                 nanocodex,
                 attempt_id,
                 trial_name.clone(),
-                started_at,
+                queue_wait,
                 &mut emitter,
             )
             .instrument(span.clone())
@@ -535,7 +546,7 @@ impl Evaluator {
         nanocodex: NanocodexBuilder,
         attempt_id: Uuid,
         trial_name: String,
-        started_at: DateTime<Utc>,
+        queue_wait: PhaseTiming,
         emitter: &mut AttemptEmitter<'_>,
     ) -> Result<EvalResult, EvalError> {
         let attempt = {
@@ -586,9 +597,11 @@ impl Evaluator {
             agent: agent.result,
             verifier: verifier.result,
             timing: EvalTiming {
-                started_at,
+                started_at: queue_wait.started_at,
                 finished_at: Utc::now(),
+                queue_wait,
                 environment_setup: attempt.setup_timing.clone(),
+                environment_readiness: agent.readiness_timing,
                 agent_setup: agent.setup_timing,
                 agent_execution: agent.execution_timing,
                 verifier: verifier.timing,
@@ -682,6 +695,7 @@ impl Evaluator {
             agent,
             mut events,
             verifier,
+            readiness_timing,
             timing: setup_timing,
         } = self.setup_agent(emitter, task, attempt, nanocodex).await?;
         let execution_started = Utc::now();
@@ -727,6 +741,7 @@ impl Evaluator {
         Ok(AgentExecution {
             result: AgentResult::from_terminal(turn_result.into_final_message(), &terminal_event)?,
             verifier,
+            readiness_timing,
             setup_timing,
             execution_timing: PhaseTiming::finished(execution_started),
         })
@@ -776,20 +791,23 @@ impl Evaluator {
                 AttemptAgent::new(builder)
             };
             let (builder, readiness, verifier) = configured.into_parts();
+            let readiness_started = Utc::now();
             if let Some(readiness) = readiness {
                 readiness.await.map_err(EvalError::AttemptAgent)?;
             }
+            let readiness_timing = PhaseTiming::finished(readiness_started);
             let (agent, events) = builder.build()?;
-            Ok::<_, EvalError>((agent, events, verifier))
+            Ok::<_, EvalError>((agent, events, verifier, readiness_timing))
         }
         .instrument(span.clone())
         .await;
         record_span_result(&span, trace_started, &result);
-        let (agent, events, verifier) = result?;
+        let (agent, events, verifier, readiness_timing) = result?;
         Ok(AgentSetup {
             agent,
             events,
             verifier,
+            readiness_timing,
             timing: PhaseTiming::finished(setup_started),
         })
     }
@@ -798,6 +816,7 @@ impl Evaluator {
 struct AgentExecution {
     result: AgentResult,
     verifier: Option<Box<dyn AttemptVerifier>>,
+    readiness_timing: PhaseTiming,
     setup_timing: PhaseTiming,
     execution_timing: PhaseTiming,
 }
@@ -806,6 +825,7 @@ struct AgentSetup {
     agent: Nanocodex,
     events: AgentEvents,
     verifier: Option<Box<dyn AttemptVerifier>>,
+    readiness_timing: PhaseTiming,
     timing: PhaseTiming,
 }
 

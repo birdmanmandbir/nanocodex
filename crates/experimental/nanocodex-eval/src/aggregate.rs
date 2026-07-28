@@ -168,6 +168,18 @@ impl AttemptFact {
             passed: result.status == EvalStatus::Passed,
             cost_usd: result.agent.cost_usd,
             latency: LatencyBreakdown {
+                queue_wait_ns: duration(
+                    result.timing.queue_wait.started_at,
+                    result.timing.queue_wait.finished_at,
+                ),
+                vm_bootstrap_ns: if result.environment == crate::EvalEnvironment::MicroVm {
+                    duration(
+                        result.timing.environment_readiness.started_at,
+                        result.timing.environment_readiness.finished_at,
+                    )
+                } else {
+                    0
+                },
                 agent_setup_ns: duration(
                     result.timing.agent_setup.started_at,
                     result.timing.agent_setup.finished_at,

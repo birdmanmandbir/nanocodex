@@ -343,8 +343,12 @@ pub struct EvalTiming {
     pub started_at: DateTime<Utc>,
     /// Time at which the terminal result became durable.
     pub finished_at: DateTime<Utc>,
+    /// Interval spent waiting for scheduler admission.
+    pub queue_wait: PhaseTiming,
     /// Disposable environment preparation interval.
     pub environment_setup: PhaseTiming,
+    /// Attempt backend readiness interval, including VM boot and guest handshake.
+    pub environment_readiness: PhaseTiming,
     /// Agent construction interval.
     pub agent_setup: PhaseTiming,
     /// Agent execution interval.
