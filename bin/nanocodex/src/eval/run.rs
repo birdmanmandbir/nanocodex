@@ -1512,12 +1512,18 @@ async fn selected_vm_environments(
     } else {
         CachePolicy::Reuse
     };
-    let image_builder = VmImageBuilder::new(vmm, runtime_image)
-        .vmm_args(["eval", "vm", "run-config", "--config"])
-        .firmware_directory(DEFAULT_KRUNFW_DIRECTORY);
+    let image_builder = eval_vm_image_builder(vmm, runtime_image);
     Ok(Some(
         prepare_vm_environments(tasks, Path::new(DEFAULT_VM_CACHE), policy, &image_builder).await?,
     ))
+}
+
+fn eval_vm_image_builder(vmm: &Path, runtime_image: &Path) -> VmImageBuilder {
+    EVAL_IMAGE_BUILD_POLICY.apply(
+        VmImageBuilder::new(vmm, runtime_image)
+            .vmm_args(["eval", "vm", "run-config", "--config"])
+            .firmware_directory(DEFAULT_KRUNFW_DIRECTORY),
+    )
 }
 
 async fn prepare_run_environments(
@@ -1798,9 +1804,30 @@ const CACHED_VERIFIER_SCRIPT: &str = "/tmp/nanoeval-verifier.sh";
 const VERIFIER_CACHE_PREPARE_SCRIPT: &str = "/tmp/nanoeval-prepare-verifier.sh";
 const GUEST_PUBLIC_RESOLV_CONF: &str =
     "nameserver 192.168.127.1\\nnameserver 1.1.1.1\\noptions timeout:2 attempts:5\\n";
+const EVAL_IMAGE_BUILD_POLICY: EvalImageBuildPolicy = EvalImageBuildPolicy {
+    prefer_ipv4: true,
+    run_timeout: Duration::from_mins(60),
+};
 const VERIFIER_NETWORK_RETRIES: usize = 4;
 const VERIFIER_NETWORK_RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
 const VM_GUEST_BUILD_RECORD_VERSION: u32 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EvalImageBuildPolicy {
+    prefer_ipv4: bool,
+    run_timeout: Duration,
+}
+
+impl EvalImageBuildPolicy {
+    const fn apply(self, builder: VmImageBuilder) -> VmImageBuilder {
+        let builder = builder.run_timeout(self.run_timeout);
+        if self.prefer_ipv4 {
+            builder.prefer_ipv4()
+        } else {
+            builder
+        }
+    }
+}
 
 #[derive(Clone)]
 struct VmEnvironment {
@@ -3667,6 +3694,17 @@ mod tests {
         assert_eq!(timing["cold_image_and_cache_ns"], 4);
         assert_eq!(timing["attempts_wall_ns"], 6);
         assert_eq!(timing["total_wall_ns"], 36);
+    }
+
+    #[test]
+    fn eval_image_builds_prefer_ipv4_and_use_a_sixty_minute_run_timeout() {
+        assert_eq!(
+            super::EVAL_IMAGE_BUILD_POLICY,
+            super::EvalImageBuildPolicy {
+                prefer_ipv4: true,
+                run_timeout: Duration::from_mins(60),
+            }
+        );
     }
 
     #[test]
