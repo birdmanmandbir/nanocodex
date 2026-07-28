@@ -42,6 +42,14 @@ fn benchmark_eval_runtime(criterion: &mut Criterion) {
         });
     });
 
+    group.bench_function("validate_terminal_bench_task_package", |bencher| {
+        bencher.iter(|| {
+            black_box(&tasks[2])
+                .validate_package()
+                .expect("validate benchmark task");
+        });
+    });
+
     group.throughput(Throughput::Elements(sweep.attempt_count() as u64));
     group.bench_function("plan_3x4x5_sweep", |bencher| {
         bencher.iter(|| {

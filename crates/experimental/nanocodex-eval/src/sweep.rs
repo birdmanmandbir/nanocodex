@@ -8,7 +8,7 @@ use nanocodex_agent::NanocodexBuilder;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use uuid::Uuid;
 
-use crate::Task;
+use crate::{Task, digest::PACKAGE_DIGEST_SCHEMA};
 
 /// Stable caller-defined identity for one agent configuration in a sweep.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -46,6 +46,8 @@ pub(crate) struct SweepAttempt<'a> {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct RunManifest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task_digest_schema: Option<String>,
     tasks: Vec<RunTask>,
     agents: Vec<AgentId>,
     trials: NonZeroU16,
@@ -214,6 +216,7 @@ impl Sweep {
 
     pub(crate) fn manifest(&self) -> RunManifest {
         RunManifest {
+            task_digest_schema: Some(PACKAGE_DIGEST_SCHEMA.to_owned()),
             tasks: self
                 .tasks
                 .iter()
@@ -250,6 +253,10 @@ impl RunManifest {
             .as_deref()
     }
 
+    pub(crate) fn task_digest_schema(&self) -> Option<&str> {
+        self.task_digest_schema.as_deref()
+    }
+
     pub(crate) fn missing_content_digest_roots(&self) -> impl Iterator<Item = &Path> {
         self.tasks
             .iter()
@@ -258,10 +265,7 @@ impl RunManifest {
     }
 
     pub(crate) fn is_compatible_with(&self, other: &Self) -> bool {
-        if self.trials != other.trials
-            || self.agents != other.agents
-            || self.tasks.len() != other.tasks.len()
-        {
+        if !self.has_compatible_coordinates(other) || !self.has_compatible_digest_schema(other) {
             return false;
         }
 
@@ -279,6 +283,59 @@ impl RunManifest {
                     (Some(left), Some(right)) => left == right,
                     (None, _) | (_, None) => true,
                 }
+        })
+    }
+
+    pub(crate) fn incompatible_digest_schema(&self, current: &Self) -> Option<(String, String)> {
+        if !self.has_compatible_coordinates(current) || self.has_compatible_digest_schema(current) {
+            return None;
+        }
+        Some((
+            self.digest_schema_label().to_owned(),
+            current.digest_schema_label().to_owned(),
+        ))
+    }
+
+    pub(crate) fn has_compatible_coordinates(&self, other: &Self) -> bool {
+        if self.trials != other.trials
+            || self.agents != other.agents
+            || self.tasks.len() != other.tasks.len()
+        {
+            return false;
+        }
+        let mut tasks = self.tasks.iter().collect::<Vec<_>>();
+        let mut other_tasks = other.tasks.iter().collect::<Vec<_>>();
+        tasks.sort_unstable_by(|left, right| left.root.cmp(&right.root));
+        other_tasks.sort_unstable_by(|left, right| left.root.cmp(&right.root));
+        tasks.into_iter().zip(other_tasks).all(|(left, right)| {
+            left.root == right.root
+                && match (&left.name, &right.name) {
+                    (Some(left), Some(right)) => left == right,
+                    (None, _) | (_, None) => true,
+                }
+        })
+    }
+
+    fn has_compatible_digest_schema(&self, other: &Self) -> bool {
+        match (&self.task_digest_schema, &other.task_digest_schema) {
+            (Some(left), Some(right)) => left == right,
+            (None, _) if self.tasks.iter().all(|task| task.content_digest.is_none()) => true,
+            (_, None) if other.tasks.iter().all(|task| task.content_digest.is_none()) => true,
+            (None, None) => {
+                self.tasks.iter().all(|task| task.content_digest.is_none())
+                    && other.tasks.iter().all(|task| task.content_digest.is_none())
+            }
+            (None, Some(_)) | (Some(_), None) => false,
+        }
+    }
+
+    fn digest_schema_label(&self) -> &str {
+        self.task_digest_schema.as_deref().unwrap_or_else(|| {
+            if self.tasks.iter().any(|task| task.content_digest.is_some()) {
+                "unversioned"
+            } else {
+                "digestless"
+            }
         })
     }
 
@@ -557,6 +614,10 @@ mod tests {
             .unwrap();
         let current = sweep.manifest();
         let mut retained = serde_json::to_value(&current).unwrap();
+        retained
+            .as_object_mut()
+            .unwrap()
+            .remove("task_digest_schema");
         let retained_task = retained["tasks"][0].as_object_mut().unwrap();
         retained_task.remove("name");
         retained_task.remove("content_digest");
@@ -573,6 +634,32 @@ mod tests {
         assert_eq!(coordinate.task_root(), task.root());
         assert_eq!(coordinate.agent().as_str(), "default");
         assert_eq!(coordinate.repetition(), 1);
+    }
+
+    #[test]
+    fn unversioned_digestful_manifest_is_explicitly_incompatible() {
+        let current = Sweep::builder()
+            .task(load_task("write-greeting"))
+            .agent(
+                "default",
+                Nanocodex::builder(OpenAi::new("test-key").unwrap()),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .manifest();
+        let mut retained = serde_json::to_value(&current).unwrap();
+        retained
+            .as_object_mut()
+            .unwrap()
+            .remove("task_digest_schema");
+        let retained: RunManifest = serde_json::from_value(retained).unwrap();
+
+        assert_eq!(
+            retained.incompatible_digest_schema(&current),
+            Some(("unversioned".to_owned(), PACKAGE_DIGEST_SCHEMA.to_owned()))
+        );
+        assert!(!retained.is_compatible_with(&current));
     }
 
     #[test]

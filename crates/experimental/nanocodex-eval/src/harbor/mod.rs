@@ -49,6 +49,7 @@ use crate::{
     AgentMetadata, AggregateDataset, AtifBuilder, AtifTrajectory, AttemptFact,
     AttemptFactArtifacts, EvalEnvironment, EvalEventKind, EvalEventStream, EvalEventStreamError,
     EvalFailure, EvalResult, Evaluator, LatencyBreakdown, PhaseTiming, Task, TaskLoadError,
+    digest::PACKAGE_DIGEST_SCHEMA,
     durable::scan_manifest_trials,
     sweep::{RunCoordinate, RunManifest},
 };
@@ -583,6 +584,7 @@ impl HarborArtifacts {
             result.environment,
         );
         Self::write_json(&lock_path, &lock)?;
+        task.validate_package()?;
         Self::write_terminal_json(
             &result_path,
             &trial_result,
@@ -711,6 +713,7 @@ impl HarborArtifacts {
             failure.environment,
         );
         Self::write_json(&lock_path, &lock)?;
+        task.validate_package()?;
         Self::write_terminal_json(
             &result_path,
             &trial_result,
@@ -1152,6 +1155,7 @@ impl HarborTrialLock {
                 path: task.root().to_path_buf(),
             },
             nanocodex: Some(NanocodexTrialLock {
+                materialization_digest_schema: PACKAGE_DIGEST_SCHEMA.to_owned(),
                 materialization_digest: format!("sha256:{materialization_digest}"),
             }),
             install_only: false,
@@ -1172,6 +1176,7 @@ impl HarborTrialLock {
 
 #[derive(Clone, Deserialize, Serialize)]
 struct NanocodexTrialLock {
+    materialization_digest_schema: String,
     materialization_digest: String,
 }
 
@@ -1963,6 +1968,10 @@ mod tests {
         assert_eq!(
             retained["nanocodex"]["materialization_digest"],
             format!("sha256:{}", task.content_digest())
+        );
+        assert_eq!(
+            retained["nanocodex"]["materialization_digest_schema"],
+            super::PACKAGE_DIGEST_SCHEMA
         );
         assert_ne!(
             retained["task"]["digest"],

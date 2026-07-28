@@ -4,18 +4,22 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+use filetime::FileTime;
 use sha2::{Digest, Sha256};
 
 const PACKAGE_FILES: [&str; 3] = ["task.toml", "instruction.md", "README.md"];
 const PACKAGE_DIRECTORIES: [&str; 4] = ["environment", "tests", "solution", "steps"];
+pub(crate) const PACKAGE_DIGEST_SCHEMA: &str = "nanocodex-task-package-v1";
 const PACKAGE_DIGEST_DOMAIN: &[u8] = b"nanocodex-task-package-v1\0";
 
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct TaskPackage {
     root: PathBuf,
     entries: Vec<TaskPackageEntry>,
     digest: String,
 }
 
+#[derive(Debug, Eq, PartialEq)]
 struct TaskPackageEntry {
     relative: PathBuf,
     normalized: String,
@@ -23,16 +27,10 @@ struct TaskPackageEntry {
     kind: TaskPackageEntryKind,
 }
 
+#[derive(Debug, Eq, PartialEq)]
 enum TaskPackageEntryKind {
     Directory,
-    File {
-        bytes: u64,
-        digest: [u8; 32],
-    },
-    Symlink {
-        target: PathBuf,
-        normalized_target: String,
-    },
+    File { bytes: u64, digest: [u8; 32] },
 }
 
 impl TaskPackage {
@@ -77,6 +75,20 @@ impl TaskPackage {
         &self.digest
     }
 
+    pub(crate) const fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(crate) fn file_bytes(&self) -> u64 {
+        self.entries
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                TaskPackageEntryKind::File { bytes, .. } => Some(*bytes),
+                TaskPackageEntryKind::Directory => None,
+            })
+            .fold(0_u64, u64::saturating_add)
+    }
+
     pub(crate) fn read_file(&self, relative: &Path) -> io::Result<Option<Vec<u8>>> {
         let Some((bytes, digest)) = self
             .entries
@@ -84,7 +96,7 @@ impl TaskPackage {
             .find(|entry| entry.relative == relative)
             .and_then(|entry| match &entry.kind {
                 TaskPackageEntryKind::File { bytes, digest } => Some((*bytes, *digest)),
-                TaskPackageEntryKind::Directory | TaskPackageEntryKind::Symlink { .. } => None,
+                TaskPackageEntryKind::Directory => None,
             })
         else {
             return Ok(None);
@@ -114,6 +126,9 @@ impl TaskPackage {
             };
             if relative.as_os_str().is_empty() {
                 found = matches!(&entry.kind, TaskPackageEntryKind::Directory);
+                if found {
+                    directory_modes.push((destination.to_path_buf(), entry.mode));
+                }
                 continue;
             }
             let target = destination.join(relative);
@@ -134,9 +149,7 @@ impl TaskPackage {
                         *digest,
                     )?;
                     set_mode(&target, entry.mode)?;
-                }
-                TaskPackageEntryKind::Symlink { target: link, .. } => {
-                    create_symlink(link, &target)?;
+                    normalize_times(&target)?;
                 }
             }
         }
@@ -151,6 +164,7 @@ impl TaskPackage {
         }
         for (directory, mode) in directory_modes.into_iter().rev() {
             set_mode(&directory, mode)?;
+            normalize_times(&directory)?;
         }
         Ok(())
     }
@@ -170,11 +184,14 @@ fn collect_package_entry(
     let mode = metadata_mode(&metadata);
     let kind = if metadata.file_type().is_symlink() {
         let target = fs::read_link(path)?;
-        let normalized_target = normalized_path(&target)?;
-        TaskPackageEntryKind::Symlink {
-            target,
-            normalized_target,
-        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "task package symlinks are unsupported: {} -> {}",
+                path.display(),
+                target.display()
+            ),
+        ));
     } else if metadata.is_dir() {
         TaskPackageEntryKind::Directory
     } else if metadata.is_file() {
@@ -216,12 +233,6 @@ fn package_digest(entries: &[TaskPackageEntry]) -> String {
                 digest.update(b"f");
                 digest.update(bytes.to_le_bytes());
                 digest.update(file);
-            }
-            TaskPackageEntryKind::Symlink {
-                normalized_target, ..
-            } => {
-                digest.update(b"l");
-                update_field(&mut digest, normalized_target.as_bytes());
             }
         }
     }
@@ -333,20 +344,6 @@ fn normalized_relative_path(path: &Path) -> io::Result<String> {
     Ok(normalized)
 }
 
-fn normalized_path(path: &Path) -> io::Result<String> {
-    path.to_str()
-        .map(|path| path.replace(std::path::MAIN_SEPARATOR, "/"))
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "task package symlink target is not UTF-8: {}",
-                    path.display()
-                ),
-            )
-        })
-}
-
 #[cfg(unix)]
 fn metadata_mode(metadata: &fs::Metadata) -> u32 {
     use std::os::unix::fs::PermissionsExt as _;
@@ -370,27 +367,16 @@ fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(mode))
 }
 
+fn normalize_times(path: &Path) -> io::Result<()> {
+    let epoch = FileTime::from_unix_time(0, 0);
+    filetime::set_file_times(path, epoch, epoch)
+}
+
 #[cfg(not(unix))]
 fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
     let mut permissions = fs::metadata(path)?.permissions();
     permissions.set_readonly(mode & 0o222 == 0);
     fs::set_permissions(path, permissions)
-}
-
-#[cfg(unix)]
-fn create_symlink(target: &Path, link: &Path) -> io::Result<()> {
-    std::os::unix::fs::symlink(target, link)
-}
-
-#[cfg(not(unix))]
-fn create_symlink(_target: &Path, link: &Path) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        format!(
-            "task package symlinks are unsupported on this platform: {}",
-            link.display()
-        ),
-    ))
 }
 
 #[cfg(test)]
@@ -427,17 +413,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn symlink_targets_are_execution_inputs() {
+    fn rejects_symlinks_in_the_task_package() {
         let task = package();
         let link = task.path().join("environment/current");
-        std::os::unix::fs::symlink("first", &link).unwrap();
-        let first = TaskPackage::load(task.path()).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", &link).unwrap();
 
-        fs::remove_file(&link).unwrap();
-        std::os::unix::fs::symlink("second", &link).unwrap();
-        let second = TaskPackage::load(task.path()).unwrap();
+        let error = TaskPackage::load(task.path()).unwrap_err();
 
-        assert_ne!(first.digest(), second.digest());
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("symlinks are unsupported"));
+        assert!(error.to_string().contains("/etc/passwd"));
     }
 
     #[cfg(unix)]
@@ -459,16 +444,20 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn package_materialization_preserves_files_directories_symlinks_and_modes() {
+    fn package_materialization_preserves_files_directories_and_modes() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let task = package();
+        fs::set_permissions(
+            task.path().join("environment"),
+            fs::Permissions::from_mode(0o711),
+        )
+        .unwrap();
         let nested = task.path().join("environment/bin");
         fs::create_dir(&nested).unwrap();
         let executable = nested.join("run");
         fs::write(&executable, "#!/bin/sh\n").unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
-        std::os::unix::fs::symlink("run", nested.join("current")).unwrap();
         let package = TaskPackage::load(task.path()).unwrap();
         let destination = tempdir().unwrap();
 
@@ -489,8 +478,26 @@ mod tests {
             0o755
         );
         assert_eq!(
-            fs::read_link(destination.path().join("bin/current")).unwrap(),
-            Path::new("run")
+            fs::metadata(destination.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o711
+        );
+        assert_eq!(
+            fs::metadata(destination.path().join("bin/run"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            std::time::UNIX_EPOCH
+        );
+        assert_eq!(
+            fs::metadata(destination.path())
+                .unwrap()
+                .modified()
+                .unwrap(),
+            std::time::UNIX_EPOCH
         );
     }
 

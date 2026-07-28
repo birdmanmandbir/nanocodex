@@ -14,6 +14,7 @@ pub(crate) struct AttemptPaths {
     pub root: PathBuf,
     pub workspace: PathBuf,
     pub verifier: PathBuf,
+    pub tests: PathBuf,
     pub verifier_output: PathBuf,
     pub reward: PathBuf,
 }
@@ -36,9 +37,12 @@ impl NativeAttempt {
         let root = output.join(trial_name);
         let workspace = root.join("workspace");
         let verifier = root.join("verifier");
+        let tests = root.join("tests");
         Self::create_directory(&workspace)?;
         Self::create_directory(&verifier)?;
+        Self::create_directory(&tests)?;
         task.materialize_environment(&workspace)?;
+        task.materialize_verifier_files(&tests)?;
 
         Ok(Self {
             paths: AttemptPaths {
@@ -47,6 +51,7 @@ impl NativeAttempt {
                 root,
                 workspace,
                 verifier,
+                tests,
             },
             setup_timing: PhaseTiming {
                 started_at,
@@ -59,7 +64,7 @@ impl NativeAttempt {
         let started_at = Utc::now();
         let mut command = Command::new("/bin/sh");
         command
-            .arg(task.verifier().script())
+            .arg(self.paths.tests.join("test.sh"))
             .current_dir(&self.paths.workspace)
             .env_clear()
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
