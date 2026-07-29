@@ -5,6 +5,10 @@ use vergen::EmitBuilder;
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rustc-check-cfg=cfg(nanocodex_tempo)");
+    if env_var("CARGO_PKG_NAME")? == "nanocodex-tempo-bin" {
+        println!("cargo:rustc-cfg=nanocodex_tempo");
+    }
 
     EmitBuilder::builder()
         .build_timestamp()

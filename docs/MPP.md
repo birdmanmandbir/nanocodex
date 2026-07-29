@@ -55,12 +55,18 @@ slippage bound.
 
 ## CLI
 
-Release and nightly artifacts include Tempo support. Source builds opt in so
-the direct-agent development loop does not compile the payment stack:
+Release and nightly artifacts include Tempo support. Source builds use the
+isolated payment workspace so Cargo does not resolve or fetch the pinned Tempo,
+MPP, Alloy, or proxy graph for an ordinary Nanocodex build:
 
 ```console
-cargo build -p nanocodex-bin --bin nanocodex --features tempo
+cargo build --manifest-path bin/tempo/Cargo.toml -p nanocodex-tempo-bin --bin nanocodex
 ```
+
+The direct build remains `cargo build -p nanocodex-bin --bin nanocodex` and has
+no payment dependencies. A feature flag alone cannot provide this boundary:
+Cargo resolves optional git dependencies while constructing a workspace
+dependency graph, even when their feature is disabled.
 
 Enable paid Responses and paid HTTP tool egress with:
 

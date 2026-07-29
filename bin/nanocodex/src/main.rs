@@ -1,9 +1,9 @@
 mod auth;
 mod config;
-#[cfg(feature = "tempo")]
+#[cfg(nanocodex_tempo)]
 mod credits;
 mod mcp;
-#[cfg_attr(not(feature = "tempo"), path = "mpp_disabled.rs")]
+#[cfg_attr(not(nanocodex_tempo), path = "mpp_disabled.rs")]
 mod mpp;
 mod observability;
 mod run;
@@ -53,7 +53,7 @@ enum Command {
     /// Manage `ChatGPT` subscription login.
     Auth(auth::Auth),
     /// Inspect or purchase Nanocodex NANOUSD credits.
-    #[cfg(feature = "tempo")]
+    #[cfg(nanocodex_tempo)]
     Credits(credits::Credits),
     /// Internal entrypoint for one dedicated libkrun VMM process.
     #[command(hide = true)]
@@ -119,7 +119,7 @@ fn main() -> Result<()> {
 async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Some(Command::Auth(command)) => command.run().await,
-        #[cfg(feature = "tempo")]
+        #[cfg(nanocodex_tempo)]
         Some(Command::Credits(command)) => command.run().await,
         Some(Command::VmRunConfig(_)) => unreachable!("VMM commands run before Tokio starts"),
         Some(Command::Run(command)) => {
@@ -147,7 +147,7 @@ async fn run(cli: Cli) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[cfg(feature = "tempo")]
+    #[cfg(nanocodex_tempo)]
     #[test]
     fn tempo_flag_selects_the_tui_transport() {
         let cli = Cli::try_parse_from([
@@ -166,7 +166,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "tempo")]
+    #[cfg(nanocodex_tempo)]
     #[test]
     fn tempo_flag_selects_the_one_shot_transport() {
         let cli = Cli::try_parse_from([
@@ -236,7 +236,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "tempo")]
+    #[cfg(nanocodex_tempo)]
     #[test]
     fn provider_selection_is_exclusive() {
         let error = Cli::try_parse_from(["nanocodex", "--provider.openai", "--provider.tempo"])
@@ -246,7 +246,7 @@ mod tests {
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
-    #[cfg(not(feature = "tempo"))]
+    #[cfg(not(nanocodex_tempo))]
     #[test]
     fn tempo_provider_is_absent_from_direct_agent_builds() {
         let error = Cli::try_parse_from(["nanocodex", "--provider.tempo"])

@@ -14,8 +14,6 @@ RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconf
 COPY Cargo.toml Cargo.lock ./
 COPY bin/nanocodex/Cargo.toml bin/nanocodex/Cargo.toml
 COPY bin/nanocodex/build.rs bin/nanocodex/build.rs
-COPY bin/nanousd/Cargo.toml bin/nanousd/Cargo.toml
-COPY bin/nanousd-api/Cargo.toml bin/nanousd-api/Cargo.toml
 COPY js/bindings/Cargo.toml js/bindings/Cargo.toml
 COPY py/bindings/Cargo.toml py/bindings/Cargo.toml
 COPY crates/nanocodex/Cargo.toml crates/nanocodex/Cargo.toml
@@ -29,8 +27,6 @@ COPY examples/Cargo.toml examples/Cargo.toml
 # this layer, while the cache mounts retain Cargo downloads and target outputs.
 RUN mkdir bin/nanocodex/src \
         bin/nanocodex/benches \
-        bin/nanousd/src \
-        bin/nanousd-api/src \
         js/bindings/src \
         py/bindings/src \
         crates/nanocodex/src \
@@ -44,8 +40,6 @@ RUN mkdir bin/nanocodex/src \
         crates/nanocodex-tools/macros/src && \
     printf 'fn main() {}\n' > bin/nanocodex/src/main.rs && \
     printf 'fn main() {}\n' > bin/nanocodex/benches/tui_render.rs && \
-    printf '\n' > bin/nanousd/src/lib.rs && \
-    printf 'fn main() {}\n' > bin/nanousd-api/src/main.rs && \
     printf '\n' > js/bindings/src/lib.rs && \
     printf '\n' > py/bindings/src/lib.rs && \
     printf '\n' > crates/nanocodex/src/lib.rs && \
@@ -82,8 +76,6 @@ COPY crates ./crates
 RUN --mount=type=cache,id=nanocodex-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=nanocodex-target-${TARGETARCH},target=/build/target \
     touch bin/nanocodex/src/main.rs \
-        bin/nanousd/src/lib.rs \
-        bin/nanousd-api/src/main.rs \
         crates/nanocodex/src/lib.rs \
         crates/nanocodex-agent/src/lib.rs \
         crates/nanocodex-oai-api/src/lib.rs \

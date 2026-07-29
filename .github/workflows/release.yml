@@ -155,8 +155,8 @@ jobs:
           TAG_NAME: ${{ github.ref_name }}
           VERGEN_GIT_SHA: ${{ github.sha }}
         run: >-
-          cargo build --locked --profile maxperf
-          --package nanocodex-bin --bin nanocodex --features tempo
+          cargo build --manifest-path bin/tempo/Cargo.toml --locked --profile maxperf
+          --package nanocodex-tempo-bin --bin nanocodex --target-dir target
           --target ${{ matrix.target }}
       - name: Stage Unix artifact
         if: runner.os != 'Windows'

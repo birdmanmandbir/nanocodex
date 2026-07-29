@@ -42,7 +42,7 @@ jobs:
         with:
           cache-on-failure: true
       - run: cargo test --workspace --locked
-      - run: cargo test --package nanocodex-bin --features tempo --locked
+      - run: cargo test --manifest-path bin/tempo/Cargo.toml --workspace --locked
 
   quality:
     name: rustfmt, clippy, and docs
@@ -62,7 +62,9 @@ jobs:
         with:
           cache-on-failure: true
       - run: cargo fmt --all -- --check
+      - run: cargo fmt --manifest-path bin/tempo/Cargo.toml --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo clippy --manifest-path bin/tempo/Cargo.toml --workspace --all-targets --locked -- -D warnings
       - name: Check independently usable crates and public examples
         run: |
           cargo check --locked --package nanocodex-oai-api
@@ -118,6 +120,7 @@ jobs:
           tool: cargo-deny
       - run: ./scripts/check-experimental-boundary.sh
       - run: cargo deny check
+      - run: cargo deny --manifest-path bin/tempo/Cargo.toml check
       - run: ./scripts/check-crate-boundaries.sh
       - uses: crate-ci/typos@96d9af6217dc2855210655af7e1ff19d23d4e593 # v1
 

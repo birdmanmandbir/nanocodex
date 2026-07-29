@@ -37,15 +37,16 @@ The safe default is mock payment and mock issuance. Mock payment mode is
 intentionally prevented from binding to a non-loopback interface.
 
 ```console
-cargo run -p nanousd-api
+cargo run --manifest-path bin/tempo/Cargo.toml -p nanousd-api
 NANOCODEX_CREDITS_API_URL=http://127.0.0.1:8789 \
-  cargo run -p nanocodex-bin --bin nanocodex --features tempo -- credits buy 5
+  cargo run --manifest-path bin/tempo/Cargo.toml \
+    -p nanocodex-tempo-bin --bin nanocodex -- credits buy 5
 ```
 
 To exercise real Tempo issuance while retaining free mock purchases:
 
 ```console
-cargo run -p nanousd-api -- \
+cargo run --manifest-path bin/tempo/Cargo.toml -p nanousd-api -- \
   --payment-mode mock \
   --issuer-mode alloy
 ```

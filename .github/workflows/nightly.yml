@@ -68,8 +68,8 @@ jobs:
           TAG_NAME: ${{ inputs.pr && format('pr-{0}', inputs.pr) || 'nightly' }}
         run: |
           VERGEN_GIT_SHA="$BUILD_SHA" \
-            cargo build --locked --profile maxperf \
-              --package nanocodex-bin --bin nanocodex --features tempo \
+            cargo build --manifest-path bin/tempo/Cargo.toml --locked --profile maxperf \
+              --package nanocodex-tempo-bin --bin nanocodex --target-dir target \
               --target ${{ matrix.target }}
       - name: Stage Unix artifact
         if: runner.os != 'Windows'

@@ -1,5 +1,6 @@
 [package]
-name = "nanocodex-bin"
+name = "nanocodex-tempo-bin"
+workspace = "../tempo"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,16 +9,19 @@ authors.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Daily-driver TUI and headless JSONL adapter for Nanocodex"
-build = "build.rs"
+description = "Tempo-enabled Nanocodex TUI and headless JSONL adapter"
+build = "../nanocodex/build.rs"
+
+# This package compiles the canonical CLI source with the payment modules
+# enabled; there is no second CLI implementation to drift.
 
 [package.metadata.cargo-machete]
-# cargo-machete does not resolve imports from the package build script.
 ignored = ["chrono", "vergen"]
 
 [dependencies]
 arboard.workspace = true
 async-trait.workspace = true
+alloy-primitives.workspace = true
 base64.workspace = true
 clap.workspace = true
 crossterm.workspace = true
@@ -26,26 +30,33 @@ eyre.workspace = true
 fs2.workspace = true
 futures-util.workspace = true
 hex.workspace = true
+http-body-util.workspace = true
+hudsucker.workspace = true
 image.workspace = true
+mpp = { workspace = true, features = ["client", "tempo", "reqwest-rustls-tls"] }
 nanocodex.workspace = true
 nanocodex-observability.workspace = true
 nanocodex-vm.workspace = true
+nanousd.workspace = true
+nix.workspace = true
 pulldown-cmark.workspace = true
+rand.workspace = true
 ratatui.workspace = true
 reqwest = { workspace = true, features = ["blocking", "stream"] }
 self-replace.workspace = true
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-syntect.workspace = true
-two-face.workspace = true
 sha2.workspace = true
 shlex.workspace = true
+syntect.workspace = true
 tempfile.workspace = true
+tempo-alloy.workspace = true
 thiserror.workspace = true
-toml.workspace = true
 tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+toml.workspace = true
 tracing.workspace = true
+two-face.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
 
@@ -55,19 +66,14 @@ vergen = { workspace = true, features = ["build", "git", "gitcl"] }
 
 [dev-dependencies]
 axum.workspace = true
-criterion.workspace = true
 nanocodex-tools.workspace = true
 reqwest = { workspace = true, features = ["query"] }
 tokio-tungstenite.workspace = true
 tracing-subscriber.workspace = true
 
-[[bench]]
-name = "tui_render"
-harness = false
-
 [[bin]]
 name = "nanocodex"
-path = "src/main.rs"
+path = "../nanocodex/src/main.rs"
 doc = false
 
 [lints]

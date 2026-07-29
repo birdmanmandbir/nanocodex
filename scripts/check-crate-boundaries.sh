@@ -21,6 +21,45 @@ public_packages='[
 ]'
 metadata="$(cargo metadata --locked --no-deps --format-version 1)"
 
+payment_workspace_leaks="$(
+  jq -r '
+    .packages[]
+    | select(
+        .name == "nanousd"
+        or .name == "nanousd-api"
+        or .name == "nanocodex-tempo-bin"
+      )
+    | .name
+  ' <<<"$metadata" | LC_ALL=C sort
+)"
+if [[ -n "$payment_workspace_leaks" ]]; then
+  echo "Tempo payment packages must stay in the isolated bin/tempo workspace:" >&2
+  printf '%s\n' "$payment_workspace_leaks" >&2
+  exit 1
+fi
+
+payment_dependency_leaks="$(
+  jq -r '
+    .packages[]
+    | .name as $from
+    | .dependencies[]
+    | select(
+        .name == "alloy"
+        or .name == "alloy-primitives"
+        or .name == "hudsucker"
+        or .name == "mpp"
+        or .name == "nanousd"
+        or .name == "tempo-alloy"
+      )
+    | "\($from) -> \(.name)"
+  ' <<<"$metadata" | LC_ALL=C sort
+)"
+if [[ -n "$payment_dependency_leaks" ]]; then
+  echo "the default workspace must not resolve payment-only dependencies:" >&2
+  printf '%s\n' "$payment_dependency_leaks" >&2
+  exit 1
+fi
+
 assert_snapshot() {
   local label="$1"
   local expected="$2"
