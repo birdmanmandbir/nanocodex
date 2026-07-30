@@ -61,6 +61,7 @@ try {
     throw new Error(`unexpected final state: ${JSON.stringify(finalState)}`);
   }
 
+  const authStatus = finalState.auth_mode === "chatgpt" ? await subscriptionStatus() : undefined;
   console.log(JSON.stringify({
     session_id: session.session_id,
     first_turn_ms: Math.round(firstMs),
@@ -68,6 +69,7 @@ try {
     restored_turn_ms: Math.round(restoreMs),
     completed_turns: finalState.completed_turns,
     idle_state: idleState.agent_loaded ? "loaded" : "unloaded",
+    ...(authStatus === undefined ? {} : { auth_revision: authStatus.revision }),
     status: "ok",
   }));
 } finally {
@@ -88,6 +90,14 @@ async function createSession() {
 async function state() {
   const response = await fetch(`${baseUrl}/sessions/${session.session_id}`);
   if (!response.ok) throw new Error(`state failed with HTTP ${response.status}: ${await response.text()}`);
+  return response.json();
+}
+
+async function subscriptionStatus() {
+  const response = await fetch(`${baseUrl}/auth/chatgpt`, {
+    headers: { authorization: `Bearer ${adminToken}` },
+  });
+  if (!response.ok) throw new Error(`auth status failed with HTTP ${response.status}: ${await response.text()}`);
   return response.json();
 }
 

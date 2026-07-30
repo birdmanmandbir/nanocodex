@@ -243,9 +243,11 @@ const agent = await Agent.create({
 ```
 
 Server-side Worker runtimes can await a `fetch()`-based WebSocket upgrade. The
-third callback argument contains handshake-only authorization and connection
-metadata; do not retain or log its bearer token. Return the socket alone or a
-descriptor containing response metadata:
+third callback argument is a discriminated authorization request plus connection
+metadata. With `apiKey`, `authorization` is `"bearer"` and `bearerToken` is
+present. With `hostAuth: true`, it is `"host_managed"`; the host must resolve
+credentials without exposing them to WASM. Do not retain or log bearer tokens.
+Return the socket alone or a descriptor containing response metadata:
 
 ```js
 import { Agent } from "nanocodex/browser";
@@ -255,6 +257,9 @@ const agent = await Agent.create({
   apiKey,
   module,
   async createWebSocket(endpoint, sessionId, request) {
+    if (request.authorization !== "bearer") {
+      throw new Error("this host requires Nanocodex bearer authorization");
+    }
     const response = await fetch(endpoint.replace("wss:", "https:"), {
       headers: {
         Authorization: `Bearer ${request.bearerToken}`,
@@ -268,6 +273,11 @@ const agent = await Agent.create({
   },
 });
 ```
+
+`hostAuth` is useful when a Durable Object owns rotating subscription
+credentials. The callback can acquire a fresh token, attempt the upgrade, and
+refresh-and-retry on 401. `apiKey`, `hostAuth`, and `mpp` are mutually
+exclusive.
 
 The complete Cloudflare Durable Object consumer is in
 [`examples/cloudflare-workers`](../../examples/cloudflare-workers).

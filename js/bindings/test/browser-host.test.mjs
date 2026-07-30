@@ -134,6 +134,7 @@ test("browser host awaits Worker upgrades and preserves handshake metadata", asy
     sessionId: "session-1",
     received: {
       accountId: "account-1",
+      authorization: "bearer",
       bearerToken: "secret-token",
       fedramp: true,
       turnState: "turn-state-0",
@@ -146,6 +147,40 @@ test("browser host awaits Worker upgrades and preserves handshake metadata", asy
     server_model: "gpt-test",
     reasoning_included: true,
     turn_state: "turn-state-1",
+  });
+});
+
+test("browser host never exposes its host-managed credential marker", async () => {
+  const socket = new FakeWebSocket("wss://chatgpt.test/backend-api/codex/responses");
+  socket.readyState = FakeWebSocket.OPEN;
+  let request;
+  const host = createBrowserHost({
+    hostAuth: true,
+    createWebSocket(_endpoint, _sessionId, received) {
+      request = received;
+      return socket;
+    },
+  });
+
+  await host.connect(socket.url, "host-managed", "session-1");
+  assert.deepEqual(request, { authorization: "host_managed" });
+});
+
+test("an API key equal to the old host marker remains a bearer credential", async () => {
+  const socket = new FakeWebSocket("wss://api.openai.test/v1/responses");
+  socket.readyState = FakeWebSocket.OPEN;
+  let request;
+  const host = createBrowserHost({
+    createWebSocket(_endpoint, _sessionId, received) {
+      request = received;
+      return socket;
+    },
+  });
+
+  await host.connect(socket.url, "host-managed", "session-1");
+  assert.deepEqual(request, {
+    authorization: "bearer",
+    bearerToken: "host-managed",
   });
 });
 

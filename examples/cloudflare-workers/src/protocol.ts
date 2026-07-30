@@ -25,6 +25,7 @@ export type ServerMessage =
   | { type: "error"; code: string; message: string };
 
 const TURN_ID = /^[A-Za-z0-9._:-]{1,128}$/;
+const PROMPT_ITEM_TYPES = new Set(["text", "image", "audio"]);
 
 export function parseCommand(encoded: string): ClientCommand {
   let value: unknown;
@@ -69,7 +70,7 @@ function validateInput(input: unknown): void {
       throw new ProtocolError("invalid_prompt", "prompt content entries must be objects");
     }
     const type = (item as Record<string, unknown>).type;
-    if (!new Set(["text", "image", "audio"]).has(String(type))) {
+    if (!PROMPT_ITEM_TYPES.has(String(type))) {
       throw new ProtocolError("invalid_prompt", "prompt content supports text, image, and audio entries");
     }
   }

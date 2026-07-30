@@ -23,16 +23,21 @@
       {
         "name": "NANOCODEX_SESSIONS",
         "class_name": "NanocodexSession"
+      },
+      {
+        "name": "NANOCODEX_AUTH",
+        "class_name": "NanocodexSubscriptionAuth"
       }
     ]
   },
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": ["NanocodexSession"]
+      "new_sqlite_classes": ["NanocodexSession", "NanocodexSubscriptionAuth"]
     }
   ],
   "vars": {
-    "AGENT_IDLE_TIMEOUT_MS": "30000"
+    "AGENT_IDLE_TIMEOUT_MS": "30000",
+    "NANOCODEX_AUTH_MODE": "api_key"
   }
 }

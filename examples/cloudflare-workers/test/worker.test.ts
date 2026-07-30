@@ -80,6 +80,74 @@ describe("Nanocodex Durable Object Worker", () => {
     expect(deleted.status).toBe(204);
     expect((await SELF.fetch(`https://example.test/sessions/${created.session_id}`)).status).toBe(404);
   });
+
+  it("keeps subscription credentials behind the singleton auth object", async () => {
+    const denied = await SELF.fetch("https://example.test/auth/chatgpt");
+    expect(denied.status).toBe(401);
+
+    const auth = workerEnv.NANOCODEX_AUTH.getByName("subscription");
+    const snapshots = await Promise.all([
+      auth.fetch("https://auth.internal/snapshot", { method: "POST" }),
+      auth.fetch("https://auth.internal/snapshot", { method: "POST" }),
+    ]);
+    expect(await snapshots[0]!.json()).toMatchObject({
+      accountId: "test-account-id",
+      fedramp: false,
+      revision: 1,
+    });
+    expect(await snapshots[1]!.json()).toMatchObject({ revision: 1 });
+
+    const staleRecovery = await auth.fetch("https://auth.internal/recover", {
+      method: "POST",
+      body: JSON.stringify({ revision: 0 }),
+    });
+    expect(await staleRecovery.json()).toMatchObject({ revision: 1 });
+
+    const status = await SELF.fetch("https://example.test/auth/chatgpt", { headers: authorization });
+    expect(await status.json()).toMatchObject({
+      configured: true,
+      account_id: "test-account-id",
+      revision: 1,
+    });
+    const reset = await SELF.fetch("https://example.test/auth/chatgpt", {
+      method: "DELETE",
+      headers: authorization,
+    });
+    expect(reset.status).toBe(204);
+  });
+
+  it("bounds connection amplification and rejects binary and oversized frames", async () => {
+    const created = await createSession();
+    const sockets: WebSocket[] = [];
+    try {
+      for (let index = 0; index < 64; index += 1) {
+        const response = await SELF.fetch(created.websocket_url.replace("wss:", "https:"), {
+          headers: { Upgrade: "websocket" },
+        });
+        expect(response.status).toBe(101);
+        const socket = response.webSocket!;
+        socket.accept();
+        await nextMessage(socket);
+        sockets.push(socket);
+      }
+      const overflow = await SELF.fetch(created.websocket_url.replace("wss:", "https:"), {
+        headers: { Upgrade: "websocket" },
+      });
+      expect(overflow.status).toBe(429);
+
+      sockets[0]!.send(new Uint8Array([1, 2, 3]).buffer);
+      expect(await nextMessage(sockets[0]!)).toMatchObject({
+        type: "error",
+        code: "binary_unsupported",
+      });
+
+      const closed = nextClose(sockets[1]!);
+      sockets[1]!.send("x".repeat(1024 * 1024 + 1));
+      expect(await closed).toMatchObject({ code: 1009 });
+    } finally {
+      for (const socket of sockets) socket.close(1000, "test complete");
+    }
+  });
 });
 
 async function createSession(): Promise<{ session_id: string; websocket_url: string }> {
@@ -98,4 +166,8 @@ function nextMessage(socket: WebSocket): Promise<Record<string, unknown>> {
     }, { once: true });
     socket.addEventListener("error", () => reject(new Error("WebSocket failed")), { once: true });
   });
+}
+
+function nextClose(socket: WebSocket): Promise<CloseEvent> {
+  return new Promise((resolve) => socket.addEventListener("close", resolve, { once: true }));
 }

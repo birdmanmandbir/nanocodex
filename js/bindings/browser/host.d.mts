@@ -9,13 +9,23 @@ export type BrowserTool = {
 
 export type BrowserToolMap = Record<string, BrowserTool>;
 
-export type BrowserWebSocketRequest = {
+type BrowserWebSocketMetadata = {
   accountId?: string | undefined;
-  /** Resolved credential for this handshake. Do not retain or log it. */
-  bearerToken: string;
   fedramp?: boolean | undefined;
   turnState?: string | undefined;
 };
+
+export type BrowserWebSocketRequest = BrowserWebSocketMetadata & (
+  | {
+    authorization: "bearer";
+    /** Resolved credential for this handshake. Do not retain or log it. */
+    bearerToken: string;
+  }
+  | {
+    authorization: "host_managed";
+    bearerToken?: never;
+  }
+);
 
 export type BrowserWebSocketConnection = {
   socket: WebSocket;
@@ -28,6 +38,7 @@ export type BrowserWebSocketConnection = {
 
 export function createBrowserHost(options?: {
   WebSocketImpl?: typeof WebSocket;
+  hostAuth?: boolean;
   createWebSocket?: (
     endpoint: string,
     sessionId: string,

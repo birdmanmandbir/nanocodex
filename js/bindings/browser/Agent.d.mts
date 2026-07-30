@@ -15,8 +15,9 @@ export type Agent = DefaultAgent;
 export function create(options?: create.Options): Promise<create.ReturnType>;
 export declare namespace create {
   type Options = AgentOptions & (
-    | { apiKey?: string | undefined; mpp?: never }
-    | { apiKey?: never; mpp: MppSession }
+    | { apiKey: string; hostAuth?: never; mpp?: never }
+    | { apiKey?: never; hostAuth?: true; mpp?: never }
+    | { apiKey?: never; hostAuth?: never; mpp: MppSession }
   ) & {
     WebSocketImpl?: typeof WebSocket | undefined;
     apiBaseUrl?: string | undefined;

@@ -42,10 +42,7 @@ try {
       socket.send(JSON.stringify({ type: "ping", nonce: `${client}:${ping}` }));
     }
   }
-  await Promise.race([
-    completed.promise,
-    new Promise((_, reject) => setTimeout(() => reject(new Error("stress run timed out")), 30_000)),
-  ]);
+  await withTimeout(completed.promise, 30_000, "stress run timed out");
   const elapsedMs = performance.now() - started;
   if (seen.size !== expected) throw new Error(`received ${seen.size} unique nonces, expected ${expected}`);
 
@@ -63,14 +60,32 @@ try {
 
 function onceMessage(socket, predicate, timeoutMs) {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("WebSocket open timed out")), timeoutMs);
-    socket.on("message", function onMessage(data) {
+    const onError = (error) => finish(() => reject(error));
+    const timer = setTimeout(() => finish(() => reject(new Error("WebSocket open timed out"))), timeoutMs);
+    const onMessage = (data) => {
       const message = JSON.parse(String(data));
       if (!predicate(message)) return;
+      finish(() => resolve(message));
+    };
+    socket.on("message", onMessage);
+    socket.on("error", onError);
+    function finish(done) {
       clearTimeout(timer);
       socket.off("message", onMessage);
-      resolve(message);
-    });
-    socket.on("error", reject);
+      socket.off("error", onError);
+      done();
+    }
   });
+}
+
+async function withTimeout(promise, timeoutMs, message) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), timeoutMs); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }

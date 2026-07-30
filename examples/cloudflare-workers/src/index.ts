@@ -8,6 +8,12 @@ import type {
 } from "nanocodex";
 import { Agent } from "nanocodex/browser";
 import nanocodexWasm from "./nanocodex.wasm";
+import {
+  NanocodexSubscriptionAuth,
+  type SubscriptionSnapshot,
+} from "./subscription-auth";
+
+export { NanocodexSubscriptionAuth } from "./subscription-auth";
 
 import {
   type ClientCommand,
@@ -19,17 +25,28 @@ import {
 
 const MAX_CLIENT_MESSAGE_BYTES = 1024 * 1024;
 const MAX_ACTIVE_TURNS = 16;
+const MAX_CLIENT_CONNECTIONS = 64;
 const MAX_TERMINAL_TURNS = 256;
 const OPENAI_WEBSOCKET_BETA = "responses_websockets=2026-02-06";
+const CHATGPT_WEBSOCKET_URL = "wss://chatgpt.com/backend-api/codex/responses";
+const CHATGPT_API_BASE_URL = "https://chatgpt.com/backend-api/codex";
 const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const encoder = new TextEncoder();
+const ENCODED_PONG = JSON.stringify({ type: "pong" });
 
 export interface Env {
   NANOCODEX_SESSIONS: DurableObjectNamespace<NanocodexSession>;
-  OPENAI_API_KEY: string;
+  NANOCODEX_AUTH: DurableObjectNamespace<NanocodexSubscriptionAuth>;
+  OPENAI_API_KEY?: string;
   NANOCODEX_ADMIN_TOKEN: string;
+  NANOCODEX_AUTH_MODE?: string;
   AGENT_IDLE_TIMEOUT_MS?: string;
   OPENAI_WEBSOCKET_URL?: string;
+  CHATGPT_ACCESS_TOKEN?: string;
+  CHATGPT_ACCOUNT_ID?: string;
+  CHATGPT_FEDRAMP?: string;
+  CHATGPT_REFRESH_TOKEN?: string;
+  CHATGPT_TOKEN_ENDPOINT?: string;
 }
 
 type SessionRow = {
@@ -40,6 +57,22 @@ type SessionRow = {
 };
 
 type TerminalRow = { payload: string };
+type SessionStatusRow = {
+  session_id: string;
+  has_snapshot: number;
+  completed_turns: number;
+  last_active: number;
+};
+
+type BrowserAuthRequest = {
+  accountId?: string;
+  authorization: "bearer" | "host_managed";
+  bearerToken?: string;
+  fedramp?: boolean;
+  turnState?: string;
+};
+
+type ModelAuthMode = "api_key" | "chatgpt";
 
 const json = (body: unknown, init: ResponseInit = {}) => Response.json(body, {
   ...init,
@@ -69,6 +102,17 @@ export default {
       const websocketUrl = new URL(`/sessions/${sessionId}/ws`, url);
       websocketUrl.protocol = websocketUrl.protocol === "https:" ? "wss:" : "ws:";
       return json({ session_id: sessionId, websocket_url: websocketUrl.href }, { status: 201 });
+    }
+    if (url.pathname === "/auth/chatgpt") {
+      if (!env.NANOCODEX_ADMIN_TOKEN || !authorized(request, env.NANOCODEX_ADMIN_TOKEN)) {
+        return json({ error: "unauthorized" }, { status: 401 });
+      }
+      const auth = env.NANOCODEX_AUTH.getByName("subscription");
+      if (request.method === "GET") return auth.fetch("https://auth.internal/status");
+      if (request.method === "DELETE") {
+        return auth.fetch("https://auth.internal/credentials", { method: "DELETE" });
+      }
+      return json({ error: "method_not_allowed" }, { status: 405 });
     }
 
     const match = url.pathname.match(/^\/sessions\/([^/]+)(?:\/(ws))?$/);
@@ -119,9 +163,9 @@ export class NanocodexSession extends DurableObject<Env> {
     if (request.method === "PUT" && url.pathname === "/initialize") {
       const sessionId = await request.text();
       if (!SESSION_ID.test(sessionId)) return new Response(null, { status: 400 });
-      const current = this.#session();
-      if (current && current.session_id !== sessionId) return new Response(null, { status: 409 });
-      if (!current) {
+      const currentId = this.#sessionId();
+      if (currentId && currentId !== sessionId) return new Response(null, { status: 409 });
+      if (!currentId) {
         this.ctx.storage.sql.exec(
           "INSERT INTO session_state (singleton, session_id, last_active) VALUES (1, ?, ?)",
           sessionId,
@@ -132,16 +176,17 @@ export class NanocodexSession extends DurableObject<Env> {
     }
     if (request.method === "GET" && url.pathname === "/socket") return this.#upgrade();
     if (request.method === "GET" && url.pathname === "/state") {
-      const session = this.#session();
+      const session = this.#sessionStatus();
       if (!session) return json({ error: "not_found" }, { status: 404 });
       return json({
         session_id: session.session_id,
-        has_snapshot: session.snapshot !== null,
+        has_snapshot: session.has_snapshot !== 0,
         completed_turns: session.completed_turns,
         last_active: session.last_active,
         active_turns: this.#activeTurnIds(),
         agent_loaded: this.#agent !== undefined,
         connected_clients: this.ctx.getWebSockets().length,
+        auth_mode: modelAuthMode(this.env),
       });
     }
     if (request.method === "DELETE" && url.pathname === "/session") {
@@ -162,7 +207,8 @@ export class NanocodexSession extends DurableObject<Env> {
       this.#send(socket, { type: "error", code: "binary_unsupported", message: "text frames are required" });
       return;
     }
-    if (encoder.encode(message).byteLength > MAX_CLIENT_MESSAGE_BYTES) {
+    if (message.length > MAX_CLIENT_MESSAGE_BYTES
+      || encoder.encode(message).byteLength > MAX_CLIENT_MESSAGE_BYTES) {
       closeSocket(socket, 1009, "message exceeds 1 MiB");
       return;
     }
@@ -194,8 +240,11 @@ export class NanocodexSession extends DurableObject<Env> {
   }
 
   #upgrade(): Response {
-    const session = this.#session();
+    const session = this.#sessionStatus();
     if (!session) return new Response("Unknown session", { status: 404 });
+    if (this.ctx.getWebSockets("client").length >= MAX_CLIENT_CONNECTIONS) {
+      return new Response("Session client limit reached", { status: 429 });
+    }
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     server.serializeAttachment({ sessionId: session.session_id });
@@ -203,7 +252,7 @@ export class NanocodexSession extends DurableObject<Env> {
     this.#send(server, {
       type: "ready",
       session_id: session.session_id,
-      restored: session.snapshot !== null,
+      restored: session.has_snapshot !== 0,
       active_turns: this.#activeTurnIds(),
     });
     return new Response(null, { status: 101, webSocket: client });
@@ -211,7 +260,8 @@ export class NanocodexSession extends DurableObject<Env> {
 
   async #dispatch(socket: WebSocket, command: ClientCommand): Promise<void> {
     if (command.type === "ping") {
-      this.#send(socket, { type: "pong", ...(command.nonce === undefined ? {} : { nonce: command.nonce }) });
+      if (command.nonce === undefined) this.#sendEncoded(socket, ENCODED_PONG);
+      else this.#send(socket, { type: "pong", nonce: command.nonce });
       return;
     }
     if (command.type === "status") {
@@ -240,7 +290,7 @@ export class NanocodexSession extends DurableObject<Env> {
 
     const terminal = this.#terminal(command.id);
     if (terminal) {
-      this.#send(socket, terminal);
+      this.#sendEncoded(socket, terminal);
       return;
     }
     if (this.#turns.has(command.id) || this.#pendingTurnIds.has(command.id)) {
@@ -284,19 +334,30 @@ export class NanocodexSession extends DurableObject<Env> {
   async #createAgent(): Promise<DefaultAgent> {
     const session = this.#session();
     if (!session) throw new Error("session is not initialized");
-    if (!this.env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is not configured");
+    const authMode = modelAuthMode(this.env);
+    if (authMode === "api_key" && !this.env.OPENAI_API_KEY) {
+      throw new Error("OPENAI_API_KEY is not configured");
+    }
     const resume = session.snapshot === null
       ? undefined
       : JSON.parse(session.snapshot) as SessionSnapshot;
+    const auth = this.env.NANOCODEX_AUTH.getByName("subscription");
+    const authorization = authMode === "api_key"
+      ? { apiKey: this.env.OPENAI_API_KEY! }
+      : { hostAuth: true as const };
     const agent = await Agent.create({
-      apiKey: this.env.OPENAI_API_KEY,
+      ...authorization,
       module: nanocodexWasm,
-      websocketUrl: this.env.OPENAI_WEBSOCKET_URL,
+      websocketUrl: this.env.OPENAI_WEBSOCKET_URL
+        ?? (authMode === "chatgpt" ? CHATGPT_WEBSOCKET_URL : undefined),
+      apiBaseUrl: authMode === "chatgpt" ? CHATGPT_API_BASE_URL : undefined,
       sessionId: session.session_id,
       resume,
       workspace: "/workspace",
       instructions: "You are Nanocodex running inside a Cloudflare Durable Object.",
-      createWebSocket: openAiWebSocket,
+      createWebSocket: authMode === "api_key"
+        ? openAiWebSocket
+        : (endpoint, id, request) => openSubscriptionWebSocket(auth, endpoint, id, request),
       tools: {
         runtimeInfo: {
           description: "Return information about the current agent runtime.",
@@ -354,7 +415,7 @@ export class NanocodexSession extends DurableObject<Env> {
         this.#broadcast({ type: "turn_failed", id, error: `durable commit failed: ${errorMessage(error)}` });
         return;
       }
-      this.#broadcast(terminal);
+      this.#broadcastEncoded(payload);
     } finally {
       this.#turns.delete(id);
       turn.dispose();
@@ -396,12 +457,25 @@ export class NanocodexSession extends DurableObject<Env> {
     ).toArray()[0];
   }
 
-  #terminal(id: string): TurnCompleted | undefined {
+  #sessionId(): string | undefined {
+    return this.ctx.storage.sql.exec<{ session_id: string }>(
+      "SELECT session_id FROM session_state WHERE singleton = 1",
+    ).toArray()[0]?.session_id;
+  }
+
+  #sessionStatus(): SessionStatusRow | undefined {
+    return this.ctx.storage.sql.exec<SessionStatusRow>(
+      `SELECT session_id, snapshot IS NOT NULL AS has_snapshot, completed_turns, last_active
+       FROM session_state WHERE singleton = 1`,
+    ).toArray()[0];
+  }
+
+  #terminal(id: string): string | undefined {
     const row = this.ctx.storage.sql.exec<TerminalRow>(
       "SELECT payload FROM terminal_turns WHERE id = ?",
       id,
     ).toArray()[0];
-    return row ? JSON.parse(row.payload) as TurnCompleted : undefined;
+    return row?.payload;
   }
 
   #activeTurnIds(): string[] {
@@ -414,16 +488,78 @@ export class NanocodexSession extends DurableObject<Env> {
   }
 
   #broadcast(message: ServerMessage): void {
-    for (const socket of this.ctx.getWebSockets("client")) this.#send(socket, message);
+    this.#broadcastEncoded(JSON.stringify(message));
+  }
+
+  #broadcastEncoded(encoded: string): void {
+    for (const socket of this.ctx.getWebSockets("client")) this.#sendEncoded(socket, encoded);
   }
 
   #send(socket: WebSocket, message: ServerMessage): void {
+    this.#sendEncoded(socket, JSON.stringify(message));
+  }
+
+  #sendEncoded(socket: WebSocket, encoded: string): void {
     if (socket.readyState !== WebSocket.OPEN) return;
-    try { socket.send(JSON.stringify(message)); } catch { closeSocket(socket, 1011, "send failed"); }
+    try { socket.send(encoded); } catch { closeSocket(socket, 1011, "send failed"); }
   }
 }
 
 async function openAiWebSocket(
+  endpoint: string,
+  sessionId: string,
+  request: BrowserAuthRequest,
+) {
+  if (request.authorization !== "bearer" || !request.bearerToken) {
+    throw new Error("the API-key WebSocket requires bearer authorization");
+  }
+  return upgradeOpenAiWebSocket(endpoint, sessionId, {
+    bearerToken: request.bearerToken,
+    accountId: request.accountId,
+    fedramp: request.fedramp,
+    turnState: request.turnState,
+  });
+}
+
+async function openSubscriptionWebSocket(
+  auth: DurableObjectStub<NanocodexSubscriptionAuth>,
+  endpoint: string,
+  sessionId: string,
+  request: BrowserAuthRequest,
+) {
+  if (request.authorization !== "host_managed") {
+    throw new Error("the ChatGPT WebSocket requires host-managed authorization");
+  }
+  let snapshot = await subscriptionSnapshot(auth, "/snapshot");
+  try {
+    return await upgradeOpenAiWebSocket(endpoint, sessionId, { ...snapshot, turnState: request.turnState });
+  } catch (error) {
+    if (Number((error as { status?: unknown })?.status) !== 401) throw error;
+    snapshot = await subscriptionSnapshot(auth, "/recover", snapshot.revision);
+    return upgradeOpenAiWebSocket(endpoint, sessionId, { ...snapshot, turnState: request.turnState });
+  }
+}
+
+async function subscriptionSnapshot(
+  auth: DurableObjectStub<NanocodexSubscriptionAuth>,
+  path: "/snapshot" | "/recover",
+  revision?: number,
+): Promise<SubscriptionSnapshot> {
+  const response = await auth.fetch(`https://auth.internal${path}`, {
+    method: "POST",
+    ...(revision === undefined ? {} : {
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ revision }),
+    }),
+  });
+  if (!response.ok) {
+    const detail = await readBoundedText(response, 4_096);
+    throw new Error(`ChatGPT authorization failed with HTTP ${response.status}: ${detail}`);
+  }
+  return response.json<SubscriptionSnapshot>();
+}
+
+async function upgradeOpenAiWebSocket(
   endpoint: string,
   sessionId: string,
   request: { bearerToken: string; accountId?: string; fedramp?: boolean; turnState?: string },
@@ -448,7 +584,7 @@ async function openAiWebSocket(
   const response = await fetch(url, { headers });
   const socket = response.webSocket;
   if (!socket) {
-    const body = (await response.text()).slice(0, 4_096);
+    const body = await readBoundedText(response, 4_096);
     const error = Object.assign(
       new Error(`OpenAI WebSocket upgrade failed with HTTP ${response.status}: ${body}`),
       { status: response.status, body },
@@ -471,6 +607,12 @@ async function openAiWebSocket(
   };
 }
 
+function modelAuthMode(env: Env): ModelAuthMode {
+  const configured = env.NANOCODEX_AUTH_MODE ?? "api_key";
+  if (configured === "api_key" || configured === "chatgpt") return configured;
+  throw new Error("NANOCODEX_AUTH_MODE must be api_key or chatgpt");
+}
+
 function authorized(request: Request, expected: string): boolean {
   const value = request.headers.get("authorization");
   return value !== null && value === `Bearer ${expected}`;
@@ -491,8 +633,27 @@ function uuidV7(): string {
 
 function closeSocket(socket: WebSocket, code: number, reason: string): void {
   if (socket.readyState !== WebSocket.CONNECTING && socket.readyState !== WebSocket.OPEN) return;
-  const safeCode = code === 1000 || (code >= 3000 && code <= 4999) ? code : 1011;
+  const standard = code >= 1000 && code <= 1014 && ![1004, 1005, 1006].includes(code);
+  const safeCode = standard || (code >= 3000 && code <= 4999) ? code : 1011;
   socket.close(safeCode, reason.slice(0, 120));
+}
+
+async function readBoundedText(response: Response, limit: number): Promise<string> {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let total = 0;
+  let body = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) return body + decoder.decode();
+    total += value.byteLength;
+    if (total > limit) {
+      await reader.cancel();
+      return `${body}${decoder.decode(value.subarray(0, Math.max(0, limit - (total - value.byteLength))))}`;
+    }
+    body += decoder.decode(value, { stream: true });
+  }
 }
 
 function errorMessage(error: unknown): string {

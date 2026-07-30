@@ -23,10 +23,10 @@ export function createBrowserHost(options = {}) {
 
   async function connect(endpoint, apiKey, sessionId, metadata = {}) {
     if (options.mpp) return connectMpp(endpoint);
-    const opened = await createWebSocket(endpoint, sessionId, {
-      ...metadata,
-      bearerToken: apiKey,
-    });
+    const authorization = options.hostAuth
+      ? { authorization: "host_managed" }
+      : { authorization: "bearer", bearerToken: apiKey };
+    const opened = await createWebSocket(endpoint, sessionId, { ...metadata, ...authorization });
     const { socket, ...handshake } = normalizeWebSocketConnection(opened);
     return new Promise((resolve, reject) => {
       let settled = false;
