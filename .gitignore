@@ -34,6 +34,7 @@ examples/react-vite/test-results/
 examples/cloudflare-workers/dist/
 examples/cloudflare-workers/node_modules/
 examples/cloudflare-workers/src/nanocodex.wasm
+examples/rivet-actors/node_modules/
 jobs/
 trials/
 /generated_images/

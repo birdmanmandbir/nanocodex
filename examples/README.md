@@ -14,6 +14,8 @@ All language consumers live at this repository boundary:
   package directly, with no install or build step.
 - Cloudflare Workers: `cloudflare-workers/` runs the Rust/WASM harness inside a
   SQLite-backed Durable Object and proves hibernation-safe session recovery.
+- Rivet Actors + AgentOS: `rivet-actors/` runs the same harness as a
+  SQLite-backed Rivet Actor and composes it with an AgentOS workspace actor.
 
 From the repository root:
 
@@ -32,6 +34,7 @@ just smoke-python
 just smoke-wasm-node
 just build-react-example
 just build-cloudflare-example
+just build-rivet-example
 ```
 
 The live programs require `OPENAI_API_KEY`. The browser example instead asks

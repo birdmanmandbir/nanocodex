@@ -89,6 +89,11 @@ build-cloudflare-example: build-wasm
     npm ci --prefix examples/cloudflare-workers
     npm run check --prefix examples/cloudflare-workers
 
+# Type-check and test the Rivet Actors + AgentOS WASM consumer.
+build-rivet-example: build-wasm
+    npm ci --prefix examples/rivet-actors
+    npm run check --prefix examples/rivet-actors
+
 # Run the React frontend and API Worker together in Cloudflare's Vite environment.
 dev-react-example:
     CLOUDFLARE_INCLUDE_PROCESS_ENV=true npm run dev --prefix examples/react-vite -- --host 127.0.0.1
