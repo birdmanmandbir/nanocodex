@@ -84,6 +84,11 @@ smoke-wasm-node: build-wasm
 build-react-example: build-wasm
     npm run build --prefix examples/react-vite
 
+# Type-check, test, and bundle the Cloudflare Durable Object WASM consumer.
+build-cloudflare-example: build-wasm
+    npm ci --prefix examples/cloudflare-workers
+    npm run check --prefix examples/cloudflare-workers
+
 # Run the React frontend and API Worker together in Cloudflare's Vite environment.
 dev-react-example:
     CLOUDFLARE_INCLUDE_PROCESS_ENV=true npm run dev --prefix examples/react-vite -- --host 127.0.0.1

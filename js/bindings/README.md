@@ -242,6 +242,36 @@ const agent = await Agent.create({
 });
 ```
 
+Server-side Worker runtimes can await a `fetch()`-based WebSocket upgrade. The
+third callback argument contains handshake-only authorization and connection
+metadata; do not retain or log its bearer token. Return the socket alone or a
+descriptor containing response metadata:
+
+```js
+import { Agent } from "nanocodex/browser";
+import module from "nanocodex/wasm";
+
+const agent = await Agent.create({
+  apiKey,
+  module,
+  async createWebSocket(endpoint, sessionId, request) {
+    const response = await fetch(endpoint.replace("wss:", "https:"), {
+      headers: {
+        Authorization: `Bearer ${request.bearerToken}`,
+        Upgrade: "websocket",
+        "session-id": sessionId,
+      },
+    });
+    if (!response.webSocket) throw new Error(`upgrade failed: ${response.status}`);
+    response.webSocket.accept();
+    return { socket: response.webSocket, status: response.status };
+  },
+});
+```
+
+The complete Cloudflare Durable Object consumer is in
+[`examples/cloudflare-workers`](../../examples/cloudflare-workers).
+
 After publication, a browser can load the same entrypoint without a package
 manager or build step:
 

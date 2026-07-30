@@ -12,6 +12,8 @@ All language consumers live at this repository boundary:
   ordered events in React.
 - Browser CDN: `browser-cdn/` is one static HTML file that imports the published
   package directly, with no install or build step.
+- Cloudflare Workers: `cloudflare-workers/` runs the Rust/WASM harness inside a
+  SQLite-backed Durable Object and proves hibernation-safe session recovery.
 
 From the repository root:
 
@@ -29,6 +31,7 @@ target/debug/vm-tools ROOTFS [GUEST_RUNTIME_BINARY_OR_EXT4]
 just smoke-python
 just smoke-wasm-node
 just build-react-example
+just build-cloudflare-example
 ```
 
 The live programs require `OPENAI_API_KEY`. The browser example instead asks

@@ -103,6 +103,52 @@ test("browser host does not require a global constructor for host-owned sockets"
   }
 });
 
+test("browser host awaits Worker upgrades and preserves handshake metadata", async () => {
+  const socket = new FakeWebSocket("wss://api.openai.test/v1/responses");
+  socket.readyState = FakeWebSocket.OPEN;
+  let request;
+  const host = createBrowserHost({
+    async createWebSocket(endpoint, sessionId, received) {
+      await Promise.resolve();
+      request = { endpoint, sessionId, received };
+      return {
+        socket,
+        status: 101,
+        requestId: "request-1",
+        serverModel: "gpt-test",
+        reasoningIncluded: true,
+        turnState: "turn-state-1",
+      };
+    },
+  });
+
+  const connected = JSON.parse(await host.connect(
+    "wss://api.openai.test/v1/responses",
+    "secret-token",
+    "session-1",
+    { accountId: "account-1", fedramp: true, turnState: "turn-state-0" },
+  ));
+
+  assert.deepEqual(request, {
+    endpoint: "wss://api.openai.test/v1/responses",
+    sessionId: "session-1",
+    received: {
+      accountId: "account-1",
+      bearerToken: "secret-token",
+      fedramp: true,
+      turnState: "turn-state-0",
+    },
+  });
+  assert.deepEqual(connected, {
+    handle: 1,
+    status: 101,
+    request_id: "request-1",
+    server_model: "gpt-test",
+    reasoning_included: true,
+    turn_state: "turn-state-1",
+  });
+});
+
 test("browser host bounds queued receives and buffered sends", async () => {
   const host = createBrowserHost({
     WebSocketImpl: FakeWebSocket,

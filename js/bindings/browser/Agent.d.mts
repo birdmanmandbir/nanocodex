@@ -4,6 +4,10 @@ import type {
   MppSession,
   ToolMap,
 } from "../types.mjs";
+import type {
+  BrowserWebSocketConnection,
+  BrowserWebSocketRequest,
+} from "./host.mjs";
 
 export type Agent = DefaultAgent;
 
@@ -16,7 +20,11 @@ export declare namespace create {
   ) & {
     WebSocketImpl?: typeof WebSocket | undefined;
     apiBaseUrl?: string | undefined;
-    createWebSocket?(endpoint: string, sessionId: string): WebSocket;
+    createWebSocket?(
+      endpoint: string,
+      sessionId: string,
+      request: BrowserWebSocketRequest,
+    ): WebSocket | BrowserWebSocketConnection | Promise<WebSocket | BrowserWebSocketConnection>;
     module?: unknown;
     tools?: ToolMap | undefined;
     websocketUrl?: string | undefined;
