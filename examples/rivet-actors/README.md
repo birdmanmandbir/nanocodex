@@ -71,6 +71,7 @@ In another terminal:
 ```sh
 npm run smoke --prefix examples/rivet-actors
 npm run stress --prefix examples/rivet-actors
+npm run brutalize --prefix examples/rivet-actors
 ```
 
 The local Rivet endpoint is `http://127.0.0.1:6420`. Set
@@ -80,6 +81,13 @@ The stress driver reuses persistent actor connections and bounds fan-out to
 avoid benchmarking the gateway's per-route rate limiter. Tune
 `NANOCODEX_STRESS_ACTORS`, `NANOCODEX_STRESS_REPLAYS`, and
 `NANOCODEX_STRESS_CONCURRENCY_PER_ACTOR` when sizing a deployment.
+The longer `brutalize` soak reconnects every client between seeding and replay,
+resets a bounded actor pool after each wave, and reports replay latency
+percentiles from a constant-memory histogram plus best/worst wave throughput.
+Tune its corresponding `NANOCODEX_SOAK_*` variables for larger runs. Set
+`NANOCODEX_STRESS_KEYSPACE`
+or `NANOCODEX_SOAK_KEYSPACE` when running multiple drivers concurrently; the
+stable defaults prevent repeated local runs from accumulating actor records.
 
 ## ChatGPT subscription authentication
 

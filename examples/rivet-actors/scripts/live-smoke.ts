@@ -4,7 +4,10 @@ import { createNanocodexClient } from "../src/client.js";
 
 const endpoint = process.env.RIVET_PUBLIC_ENDPOINT ?? "http://127.0.0.1:6420";
 const client = createNanocodexClient(endpoint);
-const session = client.nanocodex.getOrCreate([`smoke-${randomUUID()}`]);
+const session = client.nanocodex.getOrCreate([
+  process.env.NANOCODEX_SMOKE_ACTOR_KEY ?? "nanocodex-smoke",
+]);
+await session.reset();
 const events = session.connect();
 let eventCount = 0;
 events.on("agentEvent", () => eventCount += 1);
@@ -51,5 +54,5 @@ try {
   }));
 } finally {
   await events.dispose();
-  await session.reset().catch(() => {});
+  await session.reset();
 }
