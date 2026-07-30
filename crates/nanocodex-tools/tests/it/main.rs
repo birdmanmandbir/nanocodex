@@ -2,6 +2,7 @@
 
 mod oauth;
 mod support;
+mod terminal;
 mod tool_macro;
 mod tracing;
 

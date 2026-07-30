@@ -31,7 +31,7 @@ impl Tool for ExecCommandHandler {
         true
     }
 
-    async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
+    async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult {
         let arguments = input.decode_json::<ExecCommandArguments>()?;
         let command = ExecCommand::new(
             arguments.cmd,
@@ -41,7 +41,8 @@ impl Tool for ExecCommandHandler {
             arguments.tty,
             arguments.yield_time_ms,
             arguments.max_output_tokens,
-        );
+        )
+        .with_call_id(context.call_id());
         let result = self.sessions.execute(command, &self.workspace).await;
         Ok(shell_execution(&result))
     }

@@ -6,6 +6,7 @@ use tokio::{
 };
 
 use super::CapturedOutput;
+use super::{TerminalControl, TerminalId};
 
 const DEFAULT_MAX_OUTPUT_TOKENS: usize = 10_000;
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -47,15 +48,24 @@ pub(super) fn drain_blocking(
     mut pipe: Box<dyn Read + Send>,
     captured: Arc<Mutex<CapturedOutput>>,
     capture_limit: usize,
+    terminal: Option<(TerminalControl, TerminalId)>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
+        if let Some((control, id)) = &terminal {
+            control.opened(*id);
+        }
         let mut buffer = [0_u8; READ_BUFFER_LENGTH];
         loop {
             match pipe.read(&mut buffer) {
                 Ok(0) => return,
-                Ok(length) => captured
-                    .blocking_lock()
-                    .push(&buffer[..length], capture_limit),
+                Ok(length) => {
+                    captured
+                        .blocking_lock()
+                        .push(&buffer[..length], capture_limit);
+                    if let Some((control, id)) = &terminal {
+                        control.output(*id, &buffer[..length]);
+                    }
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 // PTY masters commonly report EIO when their slave closes.
                 Err(_) => return,

@@ -151,6 +151,8 @@ where
             commands: commands.downgrade(),
         })?
         .for_session(&session_id_text);
+    #[cfg(not(target_family = "wasm"))]
+    let terminals = nanocodex_tools::__private::terminal_control(&tools);
     let durability = spawner.durability.start(
         &session_id_text,
         workspace.as_deref(),
@@ -188,6 +190,8 @@ where
         session_id,
         durability: durability.clone(),
         shutdown: shutdown.clone(),
+        #[cfg(not(target_family = "wasm"))]
+        terminals,
     };
     // Start discovery before returning the handle so an idle CLI or TUI immediately
     // contributes its human think time to provider prewarming.

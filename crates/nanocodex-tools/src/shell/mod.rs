@@ -1,12 +1,17 @@
 mod output;
 mod process;
 mod selection;
+mod terminal;
 mod tool;
 
 #[cfg(feature = "native")]
 pub(crate) use process::ProcessGroupGuard;
 #[cfg(feature = "native")]
 pub use process::ambient_sensitive_environment;
+pub use terminal::{
+    TerminalControl, TerminalError, TerminalEvent, TerminalEventError, TerminalEvents, TerminalId,
+    TerminalInfo, TerminalSize, TerminalSnapshot,
+};
 pub(crate) use tool::{ExecCommandHandler, WriteStdinHandler};
 
 use std::{
@@ -14,8 +19,8 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
     sync::{
-        Arc,
-        atomic::{AtomicI64, AtomicU64, Ordering},
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -32,6 +37,7 @@ const MAX_LIVE_SESSIONS: usize = 64;
 
 pub(crate) struct ExecCommand {
     script: String,
+    call_id: Arc<str>,
     workdir: Option<String>,
     shell: Option<String>,
     login: Option<bool>,
@@ -41,7 +47,7 @@ pub(crate) struct ExecCommand {
 }
 
 impl ExecCommand {
-    pub(crate) const fn new(
+    pub(crate) fn new(
         script: String,
         workdir: Option<String>,
         shell: Option<String>,
@@ -52,6 +58,7 @@ impl ExecCommand {
     ) -> Self {
         Self {
             script,
+            call_id: Arc::from(""),
             workdir,
             shell,
             login,
@@ -59,6 +66,11 @@ impl ExecCommand {
             yield_time_ms,
             max_output_tokens,
         }
+    }
+
+    pub(crate) fn with_call_id(mut self, call_id: impl Into<Arc<str>>) -> Self {
+        self.call_id = call_id.into();
+        self
     }
 }
 
@@ -103,10 +115,10 @@ pub(crate) struct ExecCommandResult {
 
 pub(crate) struct ShellSessions {
     sessions: Mutex<SessionStore>,
-    next_session_id: AtomicI64,
     current_turn: Arc<AtomicU64>,
     default_shell: selection::Shell,
     environment: Arc<Vec<(OsString, OsString)>>,
+    terminals: TerminalControl,
 }
 
 impl ShellSessions {
@@ -124,12 +136,20 @@ impl ShellSessions {
         environment: Arc<Vec<(OsString, OsString)>>,
         current_turn: Arc<AtomicU64>,
     ) -> Self {
+        Self::with_environment_turn_and_terminals(environment, current_turn, TerminalControl::new())
+    }
+
+    pub(crate) fn with_environment_turn_and_terminals(
+        environment: Arc<Vec<(OsString, OsString)>>,
+        current_turn: Arc<AtomicU64>,
+        terminals: TerminalControl,
+    ) -> Self {
         Self {
             sessions: Mutex::new(SessionStore::default()),
-            next_session_id: AtomicI64::new(1),
             current_turn,
             default_shell: selection::default_user_shell(),
             environment,
+            terminals,
         }
     }
 
@@ -144,7 +164,7 @@ impl ShellSessions {
         workspace: &Path,
     ) -> ExecCommandResult {
         let started_at = Instant::now();
-        let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
+        let session_id = self.terminals.next_session_id();
         let workdir = resolve_workdir(workspace, command.workdir.as_deref());
         let shell = command.shell.as_deref().map_or_else(
             || self.default_shell.clone(),
@@ -176,6 +196,12 @@ impl ShellSessions {
             self.current_turn.load(Ordering::Acquire),
             spawned,
             secrets,
+            TerminalLaunch {
+                command: Arc::from(command.script),
+                call_id: command.call_id,
+                working_directory: Arc::from(workdir.as_path()),
+                control: self.terminals.clone(),
+            },
         );
         let _interaction_guard = session.interaction.lock().await;
         let pruned = self.sessions.lock().await.insert(Arc::clone(&session));
@@ -341,10 +367,19 @@ struct Session {
     child: Mutex<process::ProcessChild>,
     stdin: Mutex<Option<process::ProcessStdin>>,
     process_group: Mutex<process::ProcessGroupGuard>,
-    drains: Mutex<Option<Vec<JoinHandle<()>>>>,
+    drains: StdMutex<Option<Vec<JoinHandle<()>>>>,
     captured: Arc<Mutex<CapturedOutput>>,
     secrets: Vec<String>,
     active_interactions: AtomicU64,
+    terminal: Option<process::ProcessTerminal>,
+    terminals: TerminalControl,
+}
+
+struct TerminalLaunch {
+    command: Arc<str>,
+    call_id: Arc<str>,
+    working_directory: Arc<Path>,
+    control: TerminalControl,
 }
 
 impl Session {
@@ -353,10 +388,45 @@ impl Session {
         turn_id: u64,
         spawned: process::SpawnedProcess,
         secrets: Vec<String>,
+        terminal_launch: TerminalLaunch,
     ) -> Arc<Self> {
-        let tty = matches!(spawned.stdin.as_ref(), Some(process::ProcessStdin::Pty(_)));
+        let TerminalLaunch {
+            command,
+            call_id,
+            working_directory,
+            control: terminals,
+        } = terminal_launch;
+        let tty = spawned.terminal.is_some();
         let captured = Arc::new(Mutex::new(CapturedOutput::default()));
-        let drains = match spawned.output {
+        let output = spawned.output;
+        let session = Arc::new(Self {
+            id,
+            turn_id: AtomicU64::new(turn_id),
+            tty,
+            interaction: Mutex::new(()),
+            child: Mutex::new(spawned.child),
+            stdin: Mutex::new(spawned.stdin),
+            process_group: Mutex::new(spawned.process_group),
+            drains: StdMutex::new(None),
+            captured: Arc::clone(&captured),
+            secrets,
+            active_interactions: AtomicU64::new(0),
+            terminal: spawned.terminal,
+            terminals: terminals.clone(),
+        });
+        if tty {
+            terminals.register(
+                &session,
+                TerminalInfo {
+                    id: TerminalId::new(id),
+                    call_id,
+                    command,
+                    working_directory,
+                    size: TerminalSize::default(),
+                },
+            );
+        }
+        let drains = match output {
             process::ProcessOutput::Pipes { stdout, stderr } => vec![
                 tokio::spawn(output::drain(
                     stdout,
@@ -373,21 +443,35 @@ impl Session {
                 reader,
                 Arc::clone(&captured),
                 MAX_CAPTURE_BYTES,
+                Some((terminals, TerminalId::new(id))),
             )],
         };
-        Arc::new(Self {
-            id,
-            turn_id: AtomicU64::new(turn_id),
-            tty,
-            interaction: Mutex::new(()),
-            child: Mutex::new(spawned.child),
-            stdin: Mutex::new(spawned.stdin),
-            process_group: Mutex::new(spawned.process_group),
-            drains: Mutex::new(Some(drains)),
-            captured,
-            secrets,
-            active_interactions: AtomicU64::new(0),
-        })
+        *session
+            .drains
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(drains);
+        if let Some(mut terminal) = session.terminal.clone() {
+            let session = Arc::downgrade(&session);
+            tokio::spawn(async move {
+                let exit_code = match terminal.wait().await {
+                    Ok(exit_code) => exit_code,
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to observe tool terminal exit");
+                        1
+                    }
+                };
+                let Some(session) = session.upgrade() else {
+                    return;
+                };
+                let _interaction = session.interaction.lock().await;
+                let _ = session.process_group.lock().await.terminate_and_disarm();
+                session.finish_drains().await;
+                session
+                    .terminals
+                    .exited(TerminalId::new(session.id), exit_code);
+            });
+        }
+        session
     }
 
     fn begin_interaction(&self) -> ActiveInteraction<'_> {
@@ -415,14 +499,19 @@ impl Session {
         // wait path. Own it before the idempotent reap/drain cleanup so a
         // cancellation acknowledgement is a real process-cleanup boundary.
         let _interaction = self.interaction.lock().await;
-        if let Err(error) = self.child.lock().await.wait().await {
-            tracing::warn!(
-                shell.session.id = self.id,
-                %error,
-                "failed to reap terminated shell process"
-            );
-        }
+        let exit_code = match self.child.lock().await.wait().await {
+            Ok(exit_code) => exit_code,
+            Err(error) => {
+                tracing::warn!(
+                    shell.session.id = self.id,
+                    %error,
+                    "failed to reap terminated shell process"
+                );
+                1
+            }
+        };
         self.finish_drains().await;
+        self.terminals.exited(TerminalId::new(self.id), exit_code);
     }
 
     async fn interrupt(&self) -> std::io::Result<()> {
@@ -430,11 +519,23 @@ impl Session {
     }
 
     async fn write(&self, chars: &str) -> std::io::Result<()> {
+        self.write_bytes(chars.as_bytes()).await
+    }
+
+    async fn write_bytes(&self, bytes: &[u8]) -> std::io::Result<()> {
         let mut stdin = self.stdin.lock().await;
         let stdin = stdin.as_mut().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdin is closed")
         })?;
-        stdin.write(chars.as_bytes()).await
+        stdin.write(bytes).await
+    }
+
+    async fn resize(&self, size: TerminalSize) -> std::io::Result<()> {
+        let terminal = self
+            .terminal
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("session is not attached to a terminal"))?;
+        terminal.resize(size).await
     }
 
     async fn wait_for_output(
@@ -451,6 +552,7 @@ impl Session {
             Ok(Ok(exit_code)) => {
                 let _ = self.process_group.lock().await.terminate_and_disarm();
                 self.finish_drains().await;
+                self.terminals.exited(TerminalId::new(self.id), exit_code);
                 Some(exit_code)
             }
             Ok(Err(error)) => {
@@ -460,6 +562,8 @@ impl Session {
                     .lock()
                     .await
                     .push(message.as_bytes(), MAX_CAPTURE_BYTES);
+                self.finish_drains().await;
+                self.terminals.exited(TerminalId::new(self.id), 1);
                 Some(1)
             }
             Err(_) => None,
@@ -484,7 +588,11 @@ impl Session {
     }
 
     async fn finish_drains(&self) {
-        let handles = self.drains.lock().await.take();
+        let handles = self
+            .drains
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         let Some(handles) = handles else {
             return;
         };
@@ -660,7 +768,9 @@ mod tests {
 
     #[cfg(unix)]
     use super::WriteStdin;
-    use super::{CapturedOutput, ExecCommand, ShellSessions, generate_chunk_id};
+    use super::{
+        CapturedOutput, ExecCommand, ShellSessions, TerminalEvent, TerminalSize, generate_chunk_id,
+    };
 
     #[test]
     fn chunk_ids_match_codex_shape() {
@@ -955,6 +1065,152 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn cancelled_pty_emits_one_terminal_exit_boundary() {
+        let sessions = Arc::new(ShellSessions::new());
+        let terminals = sessions.terminals.clone();
+        let mut events = terminals.subscribe();
+        let execution = {
+            let sessions = Arc::clone(&sessions);
+            tokio::spawn(async move {
+                sessions
+                    .execute(
+                        ExecCommand::new(
+                            "sleep 30".to_owned(),
+                            None,
+                            None,
+                            Some(false),
+                            true,
+                            Some(30_000),
+                            None,
+                        ),
+                        std::path::Path::new("/"),
+                    )
+                    .await
+            })
+        };
+        let id = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(TerminalEvent::Opened(info)) = events.recv().await.unwrap() {
+                    break info.id;
+                }
+            }
+        })
+        .await
+        .expect("PTY should open before cancellation");
+
+        sessions.terminate_all().await;
+        let result = execution.await.expect("execution task should not panic");
+        let exit_code = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(TerminalEvent::Exited {
+                    id: exited,
+                    exit_code,
+                    ..
+                }) = events.recv().await.unwrap()
+                    && exited == id
+                {
+                    break exit_code;
+                }
+            }
+        })
+        .await
+        .expect("cancelled PTY should emit an exit boundary");
+        assert_eq!(result.exit_code, Some(exit_code));
+        assert_eq!(terminals.snapshot(id).unwrap().exit_code, Some(exit_code));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_exit_is_pushed_without_a_model_poll() {
+        let sessions = ShellSessions::new();
+        let terminals = sessions.terminals.clone();
+        let mut events = terminals.subscribe();
+        let result = sessions
+            .execute(
+                ExecCommand::new(
+                    "sleep 0.5; printf done".to_owned(),
+                    None,
+                    None,
+                    Some(false),
+                    true,
+                    Some(250),
+                    None,
+                ),
+                std::path::Path::new("/"),
+            )
+            .await;
+        assert_eq!(result.exit_code, None);
+
+        let id = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut id = None;
+            loop {
+                match events.recv().await.unwrap().unwrap() {
+                    TerminalEvent::Opened(info) => id = Some(info.id),
+                    TerminalEvent::Exited { id: exited, .. } if Some(exited) == id => break exited,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("terminal exit should not depend on another model tool call");
+        let snapshot = terminals.snapshot(id).unwrap();
+        assert_eq!(snapshot.output.as_ref(), b"done");
+        assert_eq!(snapshot.exit_code, Some(0));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replacement_shell_runtimes_keep_terminal_ids_unique() {
+        use std::sync::atomic::AtomicU64;
+
+        let terminals = super::TerminalControl::new();
+        let first = ShellSessions::with_environment_turn_and_terminals(
+            Arc::new(Vec::new()),
+            Arc::new(AtomicU64::new(0)),
+            terminals.clone(),
+        );
+        let second = ShellSessions::with_environment_turn_and_terminals(
+            Arc::new(Vec::new()),
+            Arc::new(AtomicU64::new(0)),
+            terminals,
+        );
+        let first_result = first
+            .execute(
+                ExecCommand::new(
+                    "sleep 30".to_owned(),
+                    None,
+                    None,
+                    Some(false),
+                    true,
+                    Some(250),
+                    None,
+                ),
+                std::path::Path::new("/"),
+            )
+            .await;
+        let second_result = second
+            .execute(
+                ExecCommand::new(
+                    "sleep 30".to_owned(),
+                    None,
+                    None,
+                    Some(false),
+                    true,
+                    Some(250),
+                    None,
+                ),
+                std::path::Path::new("/"),
+            )
+            .await;
+
+        assert_eq!(first_result.session_id, Some(1));
+        assert_eq!(second_result.session_id, Some(2));
+        first.terminate_all().await;
+        second.terminate_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn tty_command_has_a_terminal_and_accepts_stdin() {
         let ready =
             std::env::temp_dir().join(format!("nanocodex-pty-ready-{}", std::process::id()));
@@ -995,6 +1251,151 @@ mod tests {
             format!("{}{}", first.output, second.output),
             "readygot:hello"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_control_streams_without_consuming_model_output() {
+        let sessions = ShellSessions::new();
+        let terminals = sessions.terminals.clone();
+        let mut events = terminals.subscribe();
+        let first = sessions
+            .execute(
+                ExecCommand::new(
+                    "stty -echo; printf ready; read value; printf 'got:%s' \"$value\"".to_owned(),
+                    None,
+                    None,
+                    Some(false),
+                    true,
+                    Some(250),
+                    None,
+                )
+                .with_call_id("call-terminal"),
+                std::path::Path::new("/"),
+            )
+            .await;
+        assert_eq!(first.session_id, Some(1));
+
+        let opened = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(TerminalEvent::Opened(info)) = events.recv().await.unwrap() {
+                    break info;
+                }
+            }
+        })
+        .await
+        .expect("terminal should emit an opened event");
+        assert_eq!(opened.call_id.as_ref(), "call-terminal");
+        assert_eq!(opened.size, TerminalSize::default());
+
+        terminals
+            .write(opened.id, b"hello\n")
+            .await
+            .expect("human terminal input should be accepted");
+        let second = sessions
+            .write_stdin(WriteStdin::new(1, String::new(), Some(5_000), None))
+            .await;
+        assert_eq!(second.exit_code, Some(0));
+        assert_eq!(
+            format!("{}{}", first.output, second.output),
+            "readygot:hello"
+        );
+
+        let mut streamed = Vec::new();
+        let (exit_code, output_end) = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match events
+                    .recv()
+                    .await
+                    .unwrap()
+                    .expect("terminal stream should stay open")
+                {
+                    TerminalEvent::Output { bytes, .. } => streamed.extend_from_slice(&bytes),
+                    TerminalEvent::Exited {
+                        exit_code,
+                        output_end,
+                        ..
+                    } => break (exit_code, output_end),
+                    TerminalEvent::Opened(_) => {}
+                }
+            }
+        })
+        .await
+        .expect("terminal should emit a final exit event");
+        assert_eq!(exit_code, 0);
+        assert_eq!(streamed, b"readygot:hello");
+        assert_eq!(output_end, u64::try_from(streamed.len()).unwrap());
+
+        let snapshot = terminals
+            .snapshot(opened.id)
+            .expect("completed terminal should remain available");
+        assert_eq!(snapshot.output.as_ref(), streamed);
+        assert_eq!(snapshot.exit_code, Some(0));
+        assert!(!snapshot.is_truncated());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_control_resizes_the_child_pty() {
+        let sessions = ShellSessions::new();
+        let terminals = sessions.terminals.clone();
+        let mut events = terminals.subscribe();
+        let first = sessions
+            .execute(
+                ExecCommand::new(
+                    "stty -echo; printf before:; stty size; read value; printf after:; stty size"
+                        .to_owned(),
+                    None,
+                    None,
+                    Some(false),
+                    true,
+                    Some(250),
+                    None,
+                ),
+                std::path::Path::new("/"),
+            )
+            .await;
+        assert_eq!(first.session_id, Some(1));
+        let id = loop {
+            if let Some(TerminalEvent::Opened(info)) = events.recv().await.unwrap() {
+                break info.id;
+            }
+        };
+
+        terminals
+            .resize(id, TerminalSize::new(40, 100))
+            .await
+            .expect("live PTY should accept a resize");
+        terminals.write(id, b"\n").await.unwrap();
+        let second = sessions
+            .write_stdin(WriteStdin::new(1, String::new(), Some(5_000), None))
+            .await;
+        let output = format!("{}{}", first.output, second.output);
+        assert!(output.contains("before:24 80"), "{output:?}");
+        assert!(output.contains("after:40 100"), "{output:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tty_commands_receive_a_terminal_environment() {
+        let sessions = ShellSessions::new();
+        let result = sessions
+            .execute(
+                ExecCommand::new(
+                    "printf %s \"$TERM\"".to_owned(),
+                    None,
+                    None,
+                    Some(false),
+                    true,
+                    Some(1_000),
+                    None,
+                ),
+                std::path::Path::new("/"),
+            )
+            .await;
+
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.output, "xterm-256color");
     }
 
     #[cfg(unix)]

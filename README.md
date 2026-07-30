@@ -132,6 +132,13 @@ next safe model boundary. Both use shared Codex/ChatGPT subscription auth, not
 an API key. Set `NANOCODEX_AUTH_FILE` to override the normal Codex credential
 path.
 
+Native applications can independently call `agent.terminals()` before a turn
+to subscribe to raw PTYs created with `tty: true`. The resulting capability
+provides opened/output/exited notifications, exact-byte input, bounded recovery
+snapshots, and resize control without selecting a renderer, focus policy, or
+key bindings. Terminal input and unredacted output are recorded by tracing and
+must receive the same protection as agent conversations.
+
 ## Thesis
 
 ### Small, excellent building blocks
@@ -221,8 +228,8 @@ services remain concrete and nameable—no boxing or global client is required.
 
 The model-facing tool runtime: the `Tool` contract, heterogeneous `Tools`
 registry, standard workspace tools, shell and process lifecycle, Code Mode,
-deferred `tool_search`, remote dispatch, and MCP. MCP is always available on
-native targets.
+raw application-owned terminal control, deferred `tool_search`, remote
+dispatch, and MCP. MCP is always available on native targets.
 
 Applications can implement `Tool` directly or use the reexported `#[tool]`
 macro. The separate `nanocodex-tools-macros` package exists only for Rust's

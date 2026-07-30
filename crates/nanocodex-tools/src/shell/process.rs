@@ -13,10 +13,11 @@ use nix::{
     sys::signal::{Signal, killpg},
     unistd::Pid,
 };
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
-use tokio::task::JoinHandle;
+use tokio::sync::watch;
 
+use super::TerminalSize;
 use super::selection::Shell;
 
 const SENSITIVE_ENV_PARTS: [&str; 11] = [
@@ -51,6 +52,67 @@ pub(super) struct SpawnedProcess {
     pub(super) stdin: Option<ProcessStdin>,
     pub(super) output: ProcessOutput,
     pub(super) process_group: ProcessGroupGuard,
+    pub(super) terminal: Option<ProcessTerminal>,
+}
+
+#[derive(Clone)]
+pub(super) struct ProcessTerminal {
+    master: Arc<StdMutex<Box<dyn MasterPty>>>,
+    exit: watch::Receiver<Option<PtyExit>>,
+}
+
+impl ProcessTerminal {
+    pub(super) async fn resize(&self, size: TerminalSize) -> io::Result<()> {
+        let master = Arc::clone(&self.master);
+        tokio::task::spawn_blocking(move || {
+            master
+                .lock()
+                .map_err(|_| io::Error::other("PTY master lock poisoned"))?
+                .resize(PtySize {
+                    rows: size.rows,
+                    cols: size.columns,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .map_err(pty_error)
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("PTY resize task failed: {error}")))?
+    }
+
+    pub(super) async fn wait(&mut self) -> io::Result<i32> {
+        wait_for_pty_exit(&mut self.exit).await
+    }
+}
+
+#[derive(Clone)]
+pub(super) enum PtyExit {
+    Exited(i32),
+    Failed {
+        kind: io::ErrorKind,
+        message: String,
+    },
+}
+
+impl PtyExit {
+    fn into_result(self) -> io::Result<i32> {
+        match self {
+            Self::Exited(exit_code) => Ok(exit_code),
+            Self::Failed { kind, message } => Err(io::Error::new(kind, message)),
+        }
+    }
+}
+
+async fn wait_for_pty_exit(receiver: &mut watch::Receiver<Option<PtyExit>>) -> io::Result<i32> {
+    loop {
+        if let Some(exit) = receiver.borrow().clone() {
+            return exit.into_result();
+        }
+        receiver
+            .changed()
+            .await
+            .map_err(|_| io::Error::other("PTY wait task ended without an exit status"))?;
+    }
 }
 
 pub(super) enum ProcessChild {
@@ -59,8 +121,7 @@ pub(super) enum ProcessChild {
         exit_code: Option<i32>,
     },
     Pty {
-        wait: Option<JoinHandle<io::Result<i32>>>,
-        exit_code: Option<i32>,
+        exit: watch::Receiver<Option<PtyExit>>,
     },
 }
 
@@ -78,26 +139,7 @@ impl ProcessChild {
                 *cached = Some(exit_code);
                 Ok(exit_code)
             }
-            Self::Pty {
-                wait,
-                exit_code: cached,
-            } => {
-                if let Some(exit_code) = *cached {
-                    return Ok(exit_code);
-                }
-                // Await by mutable reference so a yield timeout can cancel
-                // this wait without detaching and losing the sole join handle.
-                let result = wait
-                    .as_mut()
-                    .ok_or_else(|| io::Error::other("PTY wait result is unavailable"))?
-                    .await;
-                let exit_code = result.map_err(|error| {
-                    io::Error::other(format!("PTY wait task failed: {error}"))
-                })??;
-                *wait = None;
-                *cached = Some(exit_code);
-                Ok(exit_code)
-            }
+            Self::Pty { exit } => wait_for_pty_exit(exit).await,
         }
     }
 }
@@ -184,6 +226,7 @@ fn spawn_pipes(
             exit_code: None,
         },
         process_group: ProcessGroupGuard::new(pid),
+        terminal: None,
     })
 }
 
@@ -212,6 +255,8 @@ fn spawn_pty(
     for (name, value) in environment {
         command.env(name, value);
     }
+    command.env("TERM", "xterm-256color");
+    command.env_remove("NO_COLOR");
 
     let mut child = pair.slave.spawn_command(command).map_err(pty_error)?;
     let pid = child
@@ -219,20 +264,28 @@ fn spawn_pty(
         .ok_or_else(|| io::Error::other("spawned PTY command without a process identifier"))?;
     let reader = pair.master.try_clone_reader().map_err(pty_error)?;
     let writer = pair.master.take_writer().map_err(pty_error)?;
-    let wait = tokio::task::spawn_blocking(move || {
-        child
-            .wait()
-            .map(|status| i32::try_from(status.exit_code()).unwrap_or(i32::MAX))
+    let (exit_sender, exit) = watch::channel(None);
+    let terminal = ProcessTerminal {
+        master: Arc::new(StdMutex::new(pair.master)),
+        exit: exit.clone(),
+    };
+    tokio::task::spawn_blocking(move || {
+        let status = match child.wait() {
+            Ok(status) => PtyExit::Exited(i32::try_from(status.exit_code()).unwrap_or(i32::MAX)),
+            Err(error) => PtyExit::Failed {
+                kind: error.kind(),
+                message: error.to_string(),
+            },
+        };
+        exit_sender.send_replace(Some(status));
     });
 
     Ok(SpawnedProcess {
-        child: ProcessChild::Pty {
-            wait: Some(wait),
-            exit_code: None,
-        },
+        child: ProcessChild::Pty { exit },
         stdin: Some(ProcessStdin::Pty(Arc::new(StdMutex::new(writer)))),
         output: ProcessOutput::Pty(reader),
         process_group: ProcessGroupGuard::new(pid),
+        terminal: Some(terminal),
     })
 }
 

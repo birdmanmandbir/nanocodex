@@ -114,6 +114,48 @@ execution outside Rust. Implement [`hosted::CodeModeHost`] and pass it to
 notification, observer, and owned-context types as native Code Mode. The
 [`hosted`] module documentation includes a complete host implementation.
 
+## Embed model-created terminals
+
+[`runtime::ToolRuntime::terminals`] exposes raw PTYs without choosing a terminal
+renderer, focus policy, or key bindings. Subscribe before executing a model
+turn, feed `TerminalEvent::Output` bytes into the application's terminal
+emulator, and route user input and pane resizes through the cloneable control:
+
+```rust,no_run
+use nanocodex_tools::{
+    runtime::ToolRuntime,
+    terminal::{TerminalEvent, TerminalSize},
+};
+
+# async fn observe() -> Result<(), Box<dyn std::error::Error>> {
+let runtime = ToolRuntime::new(".", None, None);
+let terminals = runtime.terminals();
+let mut events = terminals.subscribe();
+
+while let Some(event) = events.recv().await? {
+    match event {
+        TerminalEvent::Opened(info) => {
+            terminals.resize(info.id, TerminalSize::new(40, 120)).await?;
+        }
+        TerminalEvent::Output { bytes, .. } => {
+            // Feed exact bytes into the application's terminal emulator.
+            drop(bytes);
+        }
+        TerminalEvent::Exited { .. } => break,
+        _ => {}
+    }
+}
+# Ok(())
+# }
+```
+
+Terminal observation never consumes model-visible shell output. Raw output is
+not redacted. Human input is not added to model history, but terminal input and
+output are recorded verbatim by tracing and may contain credentials. Event
+delivery is bounded; a lagging consumer can rebuild from
+[`terminal::TerminalControl::snapshots`] while the retained raw-byte window is
+not truncated.
+
 ## MCP is native and always available
 
 MCP is not a feature flag. Native consumers configure stdio or Streamable HTTP
@@ -171,6 +213,8 @@ deliberately restoring proxy-safe credential markers to tool subprocesses.
 - [`hosted`] contains the portable application-owned Code Mode boundary.
 - [`runtime`] contains the stateful per-agent executor, built-in connection
   configuration, and dynamic-provider contract.
+- [`terminal`] contains raw PTY lifecycle events, bounded snapshots, exact-byte
+  input, and resize control for application-owned terminal experiences.
 - [`code_mode`] contains cell results, notifications, and nested-tool updates.
 - `mcp` contains transport configuration, authentication, discovery, login,
   and runtime control.

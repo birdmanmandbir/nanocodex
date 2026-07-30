@@ -99,6 +99,43 @@ agent.shutdown().await?;
 # }
 ```
 
+## Application-owned terminals
+
+An embedding application can build an interactive terminal experience without
+adopting Nanocodex's CLI or a particular TUI stack. Subscribe before prompting,
+then render raw PTY output and choose when keyboard focus should attach:
+
+```rust,no_run
+use nanocodex_agent::{
+    Nanocodex, OpenAi,
+    tools::terminal::TerminalEvent,
+};
+
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+let openai = OpenAi::new(std::env::var("OPENAI_API_KEY")?)?;
+let (agent, _agent_events) = Nanocodex::builder(openai).build()?;
+let terminals = agent.terminals();
+let mut terminal_events = terminals.subscribe();
+
+let _turn = agent.prompt("Run the interactive command in a PTY.").await?;
+while let Some(event) = terminal_events.recv().await? {
+    match event {
+        TerminalEvent::Opened(info) => terminals.write(info.id, b"input\n").await?,
+        TerminalEvent::Output { bytes, .. } => drop(bytes),
+        TerminalEvent::Exited { .. } => break,
+        _ => {}
+    }
+}
+agent.shutdown().await?;
+# Ok(())
+# }
+```
+
+This stream is independent from [`AgentEvents`]. It is emitted only for
+`exec_command` calls that request `tty: true`; ordinary piped commands remain
+headless. Terminal rendering, attachment, detachment, and key bindings belong
+to the embedding application.
+
 ## Components
 
 - [`events`](nanocodex_agent::events) contains the complete typed lifecycle
@@ -112,7 +149,7 @@ agent.shutdown().await?;
 - [`transport`](nanocodex_agent::transport) exposes advanced Responses and
   Tower configuration.
 - [`tools`](nanocodex_agent::tools) exposes the complete tool implementation
-  surface.
+  surface, including raw terminal control and events.
 
 OpenAI API-key and managed ChatGPT credentials belong to
 [`nanocodex_oai_api::auth`], independently of this lifecycle crate.

@@ -39,6 +39,20 @@ mod runtime_config;
 mod shell;
 #[cfg(all(not(target_family = "wasm"), feature = "workspace-runtime"))]
 #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
+/// Raw PTY lifecycle, output, and application control.
+///
+/// Output snapshots and events are exact process bytes and are not redacted.
+/// Human input is likewise exact and is recorded by tracing. Applications must
+/// protect terminal data with the same access and retention policy as agent
+/// conversations and tool activity.
+pub mod terminal {
+    pub use crate::shell::{
+        TerminalControl, TerminalError, TerminalEvent, TerminalEventError, TerminalEvents,
+        TerminalId, TerminalInfo, TerminalSize, TerminalSnapshot,
+    };
+}
+#[cfg(all(not(target_family = "wasm"), feature = "workspace-runtime"))]
+#[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
 pub mod standard;
 #[cfg(all(not(target_family = "wasm"), feature = "workspace-runtime"))]
 mod view_image;
@@ -126,6 +140,14 @@ pub mod __private {
     pub use crate::runtime::schema_for;
     #[cfg(not(target_family = "wasm"))]
     pub use crate::{Tool, ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolResult};
+
+    /// Returns the fresh terminal capability bound by [`crate::Tools::for_session`].
+    #[cfg(all(not(target_family = "wasm"), feature = "native"))]
+    pub fn terminal_control(tools: &crate::Tools) -> crate::terminal::TerminalControl {
+        tools
+            .terminal_control()
+            .unwrap_or_else(crate::terminal::TerminalControl::new)
+    }
 
     /// Builds the direct Responses tool prefix and the nested Code Mode name map together.
     #[cfg(feature = "native")]

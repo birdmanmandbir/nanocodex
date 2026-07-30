@@ -12,6 +12,8 @@ pub struct Nanocodex {
     pub(super) session_id: SessionId,
     pub(super) durability: Durability,
     pub(super) shutdown: DriverShutdown,
+    #[cfg(not(target_family = "wasm"))]
+    pub(super) terminals: nanocodex_tools::terminal::TerminalControl,
 }
 
 impl Clone for Nanocodex {
@@ -24,6 +26,8 @@ impl Clone for Nanocodex {
             session_id: self.session_id,
             durability: self.durability.clone(),
             shutdown: self.shutdown.clone(),
+            #[cfg(not(target_family = "wasm"))]
+            terminals: self.terminals.clone(),
         }
     }
 }
@@ -92,6 +96,19 @@ impl Nanocodex {
     #[must_use]
     pub const fn session_id(&self) -> SessionId {
         self.session_id
+    }
+
+    /// Returns raw lifecycle, output, input, and resize control for PTYs owned
+    /// by this agent's workspace-tool runtime.
+    ///
+    /// Subscribe before starting a turn to observe every output chunk. The
+    /// returned capability is independent from [`AgentEvents`] and does not
+    /// affect turn results when unused.
+    #[cfg(not(target_family = "wasm"))]
+    #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
+    #[must_use]
+    pub fn terminals(&self) -> nanocodex_tools::terminal::TerminalControl {
+        self.terminals.clone()
     }
 
     /// Returns the Codex-compatible rollout identity and path when recording is enabled.

@@ -79,6 +79,7 @@ pub struct Tools {
     pub(super) provider_direct: Vec<Arc<dyn Tool>>,
     pub(super) providers: Vec<Arc<dyn DynamicToolProvider>>,
     pub(super) deferred_tools_guidance_enabled: bool,
+    pub(super) terminals: Option<crate::terminal::TerminalControl>,
 }
 
 impl Default for Tools {
@@ -96,6 +97,7 @@ impl Default for Tools {
             provider_direct: Vec::new(),
             providers: Vec::new(),
             deferred_tools_guidance_enabled: false,
+            terminals: None,
         }
     }
 }
@@ -133,6 +135,7 @@ impl fmt::Debug for Tools {
                     .collect::<Vec<_>>(),
             )
             .field("provider_count", &self.providers.len())
+            .field("terminal_control_bound", &self.terminals.is_some())
             .finish()
     }
 }
@@ -183,7 +186,12 @@ impl Tools {
     #[must_use]
     pub fn for_session(mut self, session_id: &str) -> Self {
         self.insert_process_environment(CODEX_THREAD_ID_ENV_VAR.into(), session_id.into());
+        self.terminals = Some(crate::terminal::TerminalControl::new());
         self
+    }
+
+    pub(crate) fn terminal_control(&self) -> Option<crate::terminal::TerminalControl> {
+        self.terminals.clone()
     }
 
     pub(super) fn process_environment(&self) -> Arc<Vec<(OsString, OsString)>> {
