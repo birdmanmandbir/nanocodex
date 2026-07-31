@@ -14,7 +14,7 @@ use nanocodex_vm::host::{EgressError as LeaseError, EgressFile, Network};
 use thiserror::Error;
 use url::Url;
 
-use crate::{CapabilityName, PolicyStore};
+use crate::{CapabilityName, PolicyStore, secrets::MANAGED_SECRET_PROVIDER};
 
 /// Server-derived identity supplied to an egress provider.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -250,6 +250,7 @@ struct LiveSecretResolver {
     policy: Arc<PolicyStore>,
     secrets: Arc<dyn crate::SecretManager>,
     context: EgressContext,
+    routes: BTreeMap<String, crate::SecretView>,
 }
 
 #[async_trait]
@@ -258,19 +259,22 @@ impl SecretResolver for LiveSecretResolver {
         &self,
         reference: &nanocodex_egress::SecretRef,
     ) -> Result<String, SecretResolverError> {
+        if reference.provider() != MANAGED_SECRET_PROVIDER {
+            return Err(SecretResolverError::Unavailable);
+        }
         let configured = self
             .policy
-            .agent_effective_secrets(self.context.agent_id(), self.context.principal())
+            .agent_effective_secret(
+                self.context.agent_id(),
+                self.context.principal(),
+                reference.key(),
+            )
             .map_err(|_| SecretResolverError::Unavailable)?;
-        let reference = crate::SecretRef::new(reference.provider(), reference.key());
-        if !configured
-            .iter()
-            .any(|secret| secret.enabled && secret.source == reference)
-        {
+        if self.routes.get(reference.key()) != Some(&configured) {
             return Err(SecretResolverError::Unavailable);
         }
         self.secrets
-            .resolve(&reference)
+            .resolve(&configured.source)
             .await
             .map_err(|_| SecretResolverError::Unavailable)
     }
@@ -331,6 +335,11 @@ impl EgressProvider for ManagedEgress {
             policy: Arc::clone(&self.policy),
             secrets: Arc::clone(&self.secrets),
             context: context.clone(),
+            routes: configured
+                .iter()
+                .cloned()
+                .map(|secret| (secret.id.clone(), secret))
+                .collect(),
         };
         let secrets = SecretEgress::builder(resolver)
             .rules(rules)
@@ -387,6 +396,18 @@ pub enum EgressError {
 mod tests {
     use super::*;
 
+    struct ConstantSecretManager;
+
+    #[async_trait]
+    impl crate::SecretManager for ConstantSecretManager {
+        async fn resolve(
+            &self,
+            _reference: &crate::SecretRef,
+        ) -> Result<String, crate::SecretError> {
+            Ok("host-secret".to_owned())
+        }
+    }
+
     fn capability(name: &str) -> CapabilityName {
         CapabilityName::new(name).unwrap()
     }
@@ -431,5 +452,83 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, EgressError::CapabilityDenied(_)));
+    }
+
+    #[tokio::test]
+    async fn live_revocation_is_scoped_by_route_even_when_sources_match() {
+        let policy = Arc::new(PolicyStore::in_memory().unwrap());
+        policy
+            .bootstrap("client", "Client", "api-key", "principal", [])
+            .unwrap();
+        for id in ["first", "second"] {
+            policy
+                .create_secret(crate::CreateSecret {
+                    id: Some(id.to_owned()),
+                    name: id.to_owned(),
+                    source: crate::SecretRef::new("environment", "SHARED_KEY"),
+                    upstream: "https://example.com".to_owned(),
+                    rules: Vec::new(),
+                    delivery: crate::SecretDelivery::inject_header("authorization", "Bearer "),
+                    guest: crate::SecretGuestConfig::new(format!(
+                        "{}_BASE_URL",
+                        id.to_ascii_uppercase()
+                    )),
+                })
+                .unwrap();
+            policy.set_principal_secret("principal", id, true).unwrap();
+        }
+        let headers = axum::http::HeaderMap::from_iter([(
+            axum::http::HeaderName::from_static("x-api-key"),
+            axum::http::HeaderValue::from_static("api-key"),
+        )]);
+        let client = policy.authenticate(&headers).unwrap();
+        let (identity, _) = policy
+            .create_or_resolve_agent(&client, Some("route-revocation"))
+            .unwrap();
+        let routes = policy
+            .agent_effective_secrets(&identity.id, "principal")
+            .unwrap()
+            .into_iter()
+            .map(|secret| (secret.id.clone(), secret))
+            .collect();
+        let resolver = LiveSecretResolver {
+            policy: Arc::clone(&policy),
+            secrets: Arc::new(ConstantSecretManager),
+            context: EgressContext::new(identity.id, "principal"),
+            routes,
+        };
+
+        policy
+            .set_principal_secret("principal", "first", false)
+            .unwrap();
+        let first = nanocodex_egress::SecretResolver::resolve(
+            &resolver,
+            &nanocodex_egress::SecretRef::new(MANAGED_SECRET_PROVIDER, "first"),
+        )
+        .await;
+        assert_eq!(first.unwrap_err(), SecretResolverError::Unavailable);
+        let second = nanocodex_egress::SecretResolver::resolve(
+            &resolver,
+            &nanocodex_egress::SecretRef::new(MANAGED_SECRET_PROVIDER, "second"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second, "host-secret");
+
+        policy
+            .patch_secret(
+                "second",
+                crate::PatchSecret {
+                    source: Some(crate::SecretRef::new("environment", "ROTATED_KEY")),
+                    ..crate::PatchSecret::default()
+                },
+            )
+            .unwrap();
+        let stale_route = nanocodex_egress::SecretResolver::resolve(
+            &resolver,
+            &nanocodex_egress::SecretRef::new(MANAGED_SECRET_PROVIDER, "second"),
+        )
+        .await;
+        assert_eq!(stale_route.unwrap_err(), SecretResolverError::Unavailable);
     }
 }

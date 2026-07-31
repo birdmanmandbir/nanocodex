@@ -31,6 +31,8 @@ const MAX_CONTENT_BLOCKS: usize = 64;
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
 const EVENT_BROADCAST_CAPACITY: usize = 1_024;
 const AGENT_COMMAND_CAPACITY: usize = 64;
+const RUNTIME_EVENT_BATCH_SIZE: usize = 64;
+const EVENT_REPLAY_PAGE_SIZE: usize = 256;
 
 /// Request to create or resolve one managed agent.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -224,6 +226,9 @@ pub struct AgentEvent {
     /// Owning managed-agent identifier.
     pub agent_id: String,
     /// Associated durable turn, when known.
+    ///
+    /// Native runtime events leave this unset because their optional stream is
+    /// intentionally independent from managed turn-result completion.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
     /// Typed lifecycle or lossless native runtime payload.
@@ -314,7 +319,6 @@ pub struct AgentManager {
     factory: Arc<dyn ManagedAgentFactory>,
     agents: RwLock<HashMap<String, AgentHandle>>,
     sessions: SessionStore,
-    state_directory: PathBuf,
 }
 
 impl AgentManager {
@@ -334,7 +338,6 @@ impl AgentManager {
             factory,
             agents: RwLock::new(HashMap::new()),
             sessions,
-            state_directory,
         })
     }
 
@@ -445,19 +448,15 @@ impl AgentManager {
         })
     }
 
-    /// Deletes durable session state and the agent workspace.
+    /// Deletes durable session state after stopping any live runtime.
     pub async fn delete(&self, agent_id: &str) -> Result<(), ManagerError> {
-        let handle = self.agents.write().await.remove(agent_id);
-        if let Some(handle) = handle {
-            handle.shutdown().await?;
+        let mut agents = self.agents.write().await;
+        if let Some(handle) = agents.get(agent_id).cloned() {
+            handle.delete().await?;
         }
-        self.sessions.delete(agent_id.to_owned()).await?;
-        let directory = self.state_directory.join("workspaces").join(agent_id);
-        match std::fs::remove_dir_all(directory) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
-        }
+        let result = self.sessions.delete(agent_id.to_owned()).await;
+        agents.remove(agent_id);
+        result.map_err(Into::into)
     }
 
     /// Stops every live harness without deleting its durable `SQLite` session.
@@ -487,7 +486,6 @@ impl AgentManager {
                 .await?;
             return Ok(handle);
         }
-        self.sessions.ensure_agent(identity.id.clone()).await?;
         let stored = self.sessions.load(identity.id.clone()).await?;
         let capabilities = identity.principal.permissions.clone();
         let secret_revision = identity.principal.secret_revision;
@@ -606,12 +604,17 @@ impl AgentHandle {
             sender: self.sender.clone(),
             receiver: subscription.receiver,
             after_event_id,
-            replay: subscription.replay,
+            replay: subscription.replay.events,
+            replay_exhausted: subscription.replay.exhausted,
         })
     }
 
     async fn shutdown(&self) -> Result<(), ManagerError> {
         self.request(|reply| AgentCommand::Shutdown { reply }).await
+    }
+
+    async fn delete(&self) -> Result<(), ManagerError> {
+        self.request(|reply| AgentCommand::Delete { reply }).await
     }
 
     async fn request<T>(
@@ -659,17 +662,17 @@ enum AgentCommand {
     },
     Replay {
         after_event_id: u64,
-        reply: Reply<VecDeque<AgentEvent>>,
+        reply: Reply<EventReplay>,
     },
-    RuntimeEvent(NativeAgentEvent),
+    RuntimeEvents(Vec<NativeAgentEvent>),
     TurnFinished {
         turn_id: String,
         result: Box<Result<AgentRunResult, AgentError>>,
     },
-    FinalizeTurn {
-        turn_id: String,
-    },
     Shutdown {
+        reply: Reply<()>,
+    },
+    Delete {
         reply: Reply<()>,
     },
 }
@@ -685,10 +688,10 @@ impl AgentCommand {
             Self::Evict { .. } => "evict",
             Self::Subscribe { .. } => "subscribe",
             Self::Replay { .. } => "replay",
-            Self::RuntimeEvent(_) => "runtime_event",
+            Self::RuntimeEvents(_) => "runtime_events",
             Self::TurnFinished { .. } => "turn_finished",
-            Self::FinalizeTurn { .. } => "finalize_turn",
             Self::Shutdown { .. } => "shutdown",
+            Self::Delete { .. } => "delete",
         }
     }
 }
@@ -703,12 +706,26 @@ struct StoredTurn {
     view: TurnView,
     inputs: Vec<Vec<ContentBlock>>,
     control: Option<Arc<dyn ManagedTurnControl>>,
-    snapshot: Option<SessionSnapshot>,
 }
 
 struct EventSubscription {
     receiver: broadcast::Receiver<AgentEvent>,
-    replay: VecDeque<AgentEvent>,
+    replay: EventReplay,
+}
+
+struct EventReplay {
+    events: VecDeque<AgentEvent>,
+    exhausted: bool,
+}
+
+impl EventReplay {
+    fn new(events: Vec<AgentEvent>) -> Self {
+        let exhausted = events.len() < EVENT_REPLAY_PAGE_SIZE;
+        Self {
+            events: events.into(),
+            exhausted,
+        }
+    }
 }
 
 struct AgentActor {
@@ -724,13 +741,9 @@ struct AgentActor {
     sessions: SessionStore,
     self_sender: AgentSender,
     active_turn: Option<String>,
-    runtime_event_turn: Option<String>,
-    runtime_terminal_turns: HashSet<String>,
-    pending_results: HashMap<String, Result<AgentRunResult, AgentError>>,
     cancel_requested: HashSet<String>,
     turns: HashMap<String, StoredTurn>,
     turn_order: VecDeque<String>,
-    requests_by_key: HashMap<String, TurnActionResponse>,
     runtime: Option<Runtime>,
     runtime_policy_dirty: bool,
     snapshot: Option<SessionSnapshot>,
@@ -750,13 +763,9 @@ impl AgentActor {
         let mut turns = HashMap::new();
         let mut turn_order = VecDeque::new();
         let mut cancel_requested = HashSet::new();
-        let mut snapshot = None;
         for turn in stored.turns {
             if turn.cancel_requested {
                 cancel_requested.insert(turn.view.turn_id.clone());
-            }
-            if turn.view.state == TurnStatus::Completed {
-                snapshot.clone_from(&turn.snapshot);
             }
             turn_order.push_back(turn.view.turn_id.clone());
             turns.insert(
@@ -765,7 +774,6 @@ impl AgentActor {
                     view: turn.view,
                     inputs: turn.inputs,
                     control: None,
-                    snapshot: turn.snapshot,
                 },
             );
         }
@@ -782,16 +790,12 @@ impl AgentActor {
             sessions,
             self_sender,
             active_turn: None,
-            runtime_event_turn: None,
-            runtime_terminal_turns: HashSet::new(),
-            pending_results: HashMap::new(),
             cancel_requested,
             turns,
             turn_order,
-            requests_by_key: stored.requests,
             runtime: None,
             runtime_policy_dirty: false,
-            snapshot,
+            snapshot: stored.snapshot,
             event_sender,
         }
     }
@@ -807,7 +811,6 @@ impl AgentActor {
         }
         while let Some(envelope) = receiver.recv().await {
             let command_name = envelope.command.name();
-            let should_stop = matches!(&envelope.command, AgentCommand::Shutdown { .. });
             let span = tracing::dispatcher::with_default(&envelope.dispatch, || {
                 tracing::info_span!(
                     parent: &envelope.parent,
@@ -818,7 +821,8 @@ impl AgentActor {
                         u64::try_from(envelope.queued_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
                 )
             });
-            self.handle(envelope.command)
+            let should_stop = self
+                .handle(envelope.command)
                 .instrument(span)
                 .with_subscriber(envelope.dispatch)
                 .await;
@@ -828,7 +832,8 @@ impl AgentActor {
         }
     }
 
-    async fn handle(&mut self, command: AgentCommand) {
+    async fn handle(&mut self, command: AgentCommand) -> bool {
+        let mut should_stop = false;
         match command {
             AgentCommand::View { reply } => {
                 drop(reply.send(Ok(self.view())));
@@ -850,11 +855,15 @@ impl AgentActor {
                 drop(reply.send(result));
             }
             AgentCommand::GetTurn { turn_id, reply } => {
-                let result = self
-                    .turns
-                    .get(&turn_id)
-                    .map(|turn| turn.view.clone())
-                    .ok_or(ManagerError::NotFound);
+                let result = if let Some(turn) = self.turns.get(&turn_id) {
+                    Ok(turn.view.clone())
+                } else {
+                    match self.sessions.turn(self.id.clone(), turn_id).await {
+                        Ok(Some(turn)) => Ok(turn),
+                        Ok(None) => Err(ManagerError::NotFound),
+                        Err(error) => Err(error.into()),
+                    }
+                };
                 drop(reply.send(result));
             }
             AgentCommand::Cancel { turn_id, reply } => {
@@ -876,9 +885,9 @@ impl AgentActor {
                 let receiver = self.event_sender.subscribe();
                 let replay = self
                     .sessions
-                    .events_after(self.id.clone(), after_event_id)
+                    .events_after(self.id.clone(), after_event_id, EVENT_REPLAY_PAGE_SIZE)
                     .await
-                    .map(VecDeque::from)
+                    .map(EventReplay::new)
                     .map_err(ManagerError::from);
                 drop(reply.send(replay.map(|replay| EventSubscription { receiver, replay })));
             }
@@ -888,54 +897,34 @@ impl AgentActor {
             } => {
                 let replay = self
                     .sessions
-                    .events_after(self.id.clone(), after_event_id)
+                    .events_after(self.id.clone(), after_event_id, EVENT_REPLAY_PAGE_SIZE)
                     .await
-                    .map(VecDeque::from)
+                    .map(EventReplay::new)
                     .map_err(ManagerError::from);
                 drop(reply.send(replay));
             }
-            AgentCommand::RuntimeEvent(event) => {
-                self.handle_runtime_event(event).await;
+            AgentCommand::RuntimeEvents(events) => {
+                self.handle_runtime_events(events).await;
             }
             AgentCommand::TurnFinished { turn_id, result } => {
-                self.handle_turn_finished(turn_id, *result).await;
-            }
-            AgentCommand::FinalizeTurn { turn_id } => {
-                if let Some(result) = self.pending_results.remove(&turn_id) {
-                    self.finish_turn(&turn_id, result).await;
-                }
+                self.finish_turn(&turn_id, *result).await;
             }
             AgentCommand::Shutdown { reply } => {
                 self.runtime.take();
                 drop(reply.send(Ok(())));
+                should_stop = true;
+            }
+            AgentCommand::Delete { reply } => {
+                if self.active_turn.is_some() {
+                    drop(reply.send(Err(ManagerError::AgentBusy)));
+                } else {
+                    self.runtime.take();
+                    drop(reply.send(Ok(())));
+                    should_stop = true;
+                }
             }
         }
-    }
-
-    async fn handle_turn_finished(
-        &mut self,
-        turn_id: String,
-        result: Result<AgentRunResult, AgentError>,
-    ) {
-        if self.runtime_terminal_turns.remove(&turn_id) {
-            self.finish_turn(&turn_id, result).await;
-            return;
-        }
-        self.pending_results.insert(turn_id.clone(), result);
-        let sender = self.self_sender.clone();
-        let span = tracing::info_span!(
-            parent: &tracing::Span::current(),
-            "nanocentaur.turn.terminal_grace",
-            agent.id = self.id,
-            turn.id = turn_id,
-        );
-        tokio::spawn(
-            async move {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                drop(sender.send(AgentCommand::FinalizeTurn { turn_id }).await);
-            }
-            .instrument(span),
-        );
+        should_stop
     }
 
     fn apply_policy(&mut self, capabilities: AgentCapabilities, secret_revision: u64) {
@@ -983,9 +972,12 @@ impl AgentActor {
             "managed turn input observed"
         );
         if let Some(key) = &idempotency_key
-            && let Some(response) = self.requests_by_key.get(key)
+            && let Some(response) = self
+                .sessions
+                .find_request(self.id.clone(), key.clone())
+                .await?
         {
-            return Ok(response.clone());
+            return Ok(response);
         }
 
         let content = request.content;
@@ -1008,10 +1000,6 @@ impl AgentActor {
         let (action, state) = if self.active_turn.is_some() {
             (TurnAction::Queued, TurnStatus::Queued)
         } else {
-            self.active_turn = Some(turn_id.clone());
-            if self.runtime_event_turn.is_none() {
-                self.runtime_event_turn = Some(turn_id.clone());
-            }
             (TurnAction::Started, TurnStatus::Running)
         };
         let view = TurnView {
@@ -1048,6 +1036,9 @@ impl AgentActor {
                 },
             )
             .await?;
+        if action == TurnAction::Started {
+            self.active_turn = Some(turn_id.clone());
+        }
         self.publish(event);
         self.turn_order.push_back(turn_id.clone());
         self.turns.insert(
@@ -1056,10 +1047,8 @@ impl AgentActor {
                 view,
                 inputs: vec![content],
                 control: None,
-                snapshot: None,
             },
         );
-        self.remember_request(idempotency_key, &response);
         match managed.prompt(prompt).await {
             Ok(managed_turn) => self.attach_turn(turn_id, managed_turn),
             Err(error) => {
@@ -1111,7 +1100,6 @@ impl AgentActor {
                 if let Some(turn) = self.turns.get_mut(&active_id) {
                     turn.inputs.push(content);
                 }
-                self.remember_request(idempotency_key, &response);
                 Ok(Some(response))
             }
             Err(AgentError::TurnNotSteerable) => {
@@ -1177,9 +1165,16 @@ impl AgentActor {
         let (agent, mut events) = spawned.into_parts();
         let sender = self.self_sender.clone();
         tokio::spawn(async move {
-            while let Some(event) = events.recv().await {
+            let mut batch = Vec::with_capacity(RUNTIME_EVENT_BATCH_SIZE);
+            loop {
+                let received = events.recv_many(&mut batch, RUNTIME_EVENT_BATCH_SIZE).await;
+                if received == 0 {
+                    return;
+                }
+                let ready = batch;
+                batch = Vec::with_capacity(RUNTIME_EVENT_BATCH_SIZE);
                 if sender
-                    .send(AgentCommand::RuntimeEvent(event))
+                    .send(AgentCommand::RuntimeEvents(ready))
                     .await
                     .is_err()
                 {
@@ -1206,17 +1201,9 @@ impl AgentActor {
                     usage = ?usage,
                     "managed turn result observed"
                 );
-                self.snapshot.clone_from(&snapshot);
                 let output = vec![ContentBlock::Text {
                     text: final_message,
                 }];
-                if let Some(turn) = self.turns.get_mut(turn_id) {
-                    turn.view.state = TurnStatus::Completed;
-                    turn.view.output.clone_from(&output);
-                    turn.view.usage = Some(usage.clone());
-                    turn.view.completed_at = Some(completed_at);
-                    turn.snapshot.clone_from(&snapshot);
-                }
                 (
                     TurnStatus::Completed,
                     output.clone(),
@@ -1226,20 +1213,14 @@ impl AgentActor {
                     AgentEventPayload::TurnCompleted { output, usage },
                 )
             }
-            _ if cancelled => {
-                if let Some(turn) = self.turns.get_mut(turn_id) {
-                    turn.view.state = TurnStatus::Cancelled;
-                    turn.view.completed_at = Some(completed_at);
-                }
-                (
-                    TurnStatus::Cancelled,
-                    Vec::new(),
-                    None,
-                    None,
-                    None,
-                    AgentEventPayload::TurnCancelled,
-                )
-            }
+            _ if cancelled => (
+                TurnStatus::Cancelled,
+                Vec::new(),
+                None,
+                None,
+                None,
+                AgentEventPayload::TurnCancelled,
+            ),
             Ok(_) => {
                 // The guarded cancellation arm above is the only remaining
                 // successful-result path.
@@ -1247,11 +1228,6 @@ impl AgentActor {
             }
             Err(error) => {
                 tracing::warn!(agent_id = self.id, turn_id, %error, "turn failed");
-                if let Some(turn) = self.turns.get_mut(turn_id) {
-                    turn.view.state = TurnStatus::Failed;
-                    turn.view.error = Some("managed agent execution failed".to_owned());
-                    turn.view.completed_at = Some(completed_at);
-                }
                 (
                     TurnStatus::Failed,
                     Vec::new(),
@@ -1281,73 +1257,43 @@ impl AgentActor {
             )
             .await
         {
-            Ok(event) => self.publish(event),
+            Ok(finished) => {
+                if status == TurnStatus::Completed {
+                    self.snapshot = finished.snapshot;
+                }
+                self.publish(finished.event);
+            }
             Err(error) => {
                 tracing::error!(agent_id = self.id, turn_id, %error, "failed to persist terminal turn");
                 return;
             }
         }
+        self.turns.remove(turn_id);
+        self.turn_order.retain(|candidate| candidate != turn_id);
         self.advance_after(turn_id).await;
     }
 
-    async fn handle_runtime_event(&mut self, event: NativeAgentEvent) {
-        tracing::info!(
-            target: "nanocentaur::observed",
-            agent_id = %self.id,
-            event = ?event,
-            "native runtime event observed"
-        );
-        let kind = event.kind;
-        if kind == AgentEventKind::RunStarted && self.runtime_event_turn.is_none() {
-            if let Some(next) = self.turn_order.iter().find_map(|id| {
-                self.turns
-                    .get(id)
-                    .filter(|turn| turn.view.state == TurnStatus::Queued)
-                    .map(|_| id.clone())
-            }) {
-                self.active_turn = Some(next.clone());
-                if let Some(turn) = self.turns.get_mut(&next) {
-                    turn.view.state = TurnStatus::Running;
+    async fn handle_runtime_events(&mut self, events: Vec<NativeAgentEvent>) {
+        let events = events
+            .into_iter()
+            .map(|event| {
+                tracing::info!(
+                    target: "nanocentaur::observed",
+                    agent_id = %self.id,
+                    event = ?event,
+                    "native runtime event observed"
+                );
+                (None, AgentEventPayload::Runtime { event })
+            })
+            .collect();
+        match self.sessions.append_events(self.id.clone(), events).await {
+            Ok(events) => {
+                for event in events {
+                    self.publish(event);
                 }
-                match self
-                    .sessions
-                    .mark_started(self.id.clone(), next.clone())
-                    .await
-                {
-                    Ok(event) => self.publish(event),
-                    Err(error) => {
-                        tracing::error!(agent_id = self.id, turn_id = next, %error, "failed to persist queued turn start");
-                    }
-                }
-                self.runtime_event_turn = Some(next);
-            } else {
-                self.runtime_event_turn.clone_from(&self.active_turn);
             }
-        }
-        let turn_id = self.runtime_event_turn.clone();
-        let terminal = kind.is_terminal();
-        match self
-            .sessions
-            .append_event(
-                self.id.clone(),
-                turn_id.clone(),
-                AgentEventPayload::Runtime { event },
-            )
-            .await
-        {
-            Ok(event) => self.publish(event),
             Err(error) => {
-                tracing::error!(agent_id = self.id, %error, "failed to persist runtime event");
-            }
-        }
-        if terminal {
-            self.runtime_event_turn = None;
-            if let Some(turn_id) = turn_id {
-                if let Some(result) = self.pending_results.remove(&turn_id) {
-                    self.finish_turn(&turn_id, result).await;
-                } else {
-                    self.runtime_terminal_turns.insert(turn_id);
-                }
+                tracing::error!(agent_id = self.id, %error, "failed to persist runtime events");
             }
         }
     }
@@ -1362,34 +1308,29 @@ impl AgentActor {
                 .filter(|turn| turn.view.state == TurnStatus::Queued)
                 .map(|_| id.clone())
         });
-        self.active_turn.clone_from(&next);
         if let Some(next) = next {
-            if let Some(turn) = self.turns.get_mut(&next) {
-                turn.view.state = TurnStatus::Running;
-            }
             match self
                 .sessions
                 .mark_started(self.id.clone(), next.clone())
                 .await
             {
-                Ok(event) => self.publish(event),
+                Ok(event) => {
+                    self.active_turn = Some(next.clone());
+                    if let Some(turn) = self.turns.get_mut(&next) {
+                        turn.view.state = TurnStatus::Running;
+                    }
+                    self.publish(event);
+                }
                 Err(error) => {
                     tracing::error!(agent_id = self.id, turn_id = next, %error, "failed to persist queued turn start");
-                    return;
                 }
             }
-            if self.runtime_event_turn.is_none() {
-                self.runtime_event_turn = Some(next);
+        } else {
+            self.active_turn = None;
+            if self.runtime_policy_dirty {
+                self.runtime.take();
+                self.runtime_policy_dirty = false;
             }
-        } else if self.runtime_policy_dirty {
-            self.runtime.take();
-            self.runtime_policy_dirty = false;
-        }
-    }
-
-    fn remember_request(&mut self, idempotency_key: Option<String>, response: &TurnActionResponse) {
-        if let Some(key) = idempotency_key {
-            self.requests_by_key.insert(key, response.clone());
         }
     }
 
@@ -1475,7 +1416,6 @@ impl AgentActor {
             if !started {
                 started = true;
                 self.active_turn = Some(turn_id.clone());
-                self.runtime_event_turn = Some(turn_id.clone());
                 if let Some(turn) = self.turns.get_mut(&turn_id) {
                     turn.view.state = TurnStatus::Running;
                 }
@@ -1505,6 +1445,7 @@ pub struct EventCursor {
     receiver: broadcast::Receiver<AgentEvent>,
     after_event_id: u64,
     replay: VecDeque<AgentEvent>,
+    replay_exhausted: bool,
 }
 
 impl EventCursor {
@@ -1516,6 +1457,10 @@ impl EventCursor {
                 self.after_event_id = event.id;
                 return Some(event);
             }
+            if !self.replay_exhausted {
+                self.replay().await?;
+                continue;
+            }
             match self.receiver.recv().await {
                 Ok(event) if event.id > self.after_event_id => {
                     self.after_event_id = event.id;
@@ -1523,23 +1468,27 @@ impl EventCursor {
                 }
                 Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    let (reply, response) = oneshot::channel();
-                    if self
-                        .sender
-                        .send(AgentCommand::Replay {
-                            after_event_id: self.after_event_id,
-                            reply,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        return None;
-                    }
-                    self.replay = response.await.ok()?.ok()?;
+                    self.replay_exhausted = false;
+                    self.replay().await?;
                 }
                 Err(broadcast::error::RecvError::Closed) => return None,
             }
         }
+    }
+
+    async fn replay(&mut self) -> Option<()> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(AgentCommand::Replay {
+                after_event_id: self.after_event_id,
+                reply,
+            })
+            .await
+            .ok()?;
+        let replay = response.await.ok()?.ok()?;
+        self.replay = replay.events;
+        self.replay_exhausted = replay.exhausted;
+        Some(())
     }
 }
 
@@ -1654,9 +1603,6 @@ pub enum ManagerError {
     /// The configured backend agent failed.
     #[error("managed agent could not be created or controlled")]
     Agent(#[from] AgentError),
-    /// Workspace or state-directory mutation failed.
-    #[error("agent state filesystem failed")]
-    Io(#[from] std::io::Error),
 }
 
 impl From<SessionError> for ManagerError {
@@ -1672,6 +1618,7 @@ impl From<SessionError> for ManagerError {
 mod tests {
     use std::time::Duration;
 
+    use async_trait::async_trait;
     use nanocodex_agent::{CostStatus, TurnUsage};
     use nanocodex_oai_api::{
         pricing::{ServiceTier, estimate},
@@ -1680,7 +1627,46 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::{AgentConfig, EffectivePrincipal, MockAgentFactory};
+    use crate::{AgentConfig, EffectivePrincipal, ManagedTurn, MockAgentFactory, SpawnedAgent};
+
+    struct SilentFactory;
+
+    struct SilentAgent;
+
+    struct SilentTurnControl;
+
+    #[async_trait]
+    impl ManagedAgentFactory for SilentFactory {
+        async fn create(&self, _spec: AgentSpec) -> Result<SpawnedAgent, AgentError> {
+            let (_events, receiver) = mpsc::channel(1);
+            Ok(SpawnedAgent::new(Arc::new(SilentAgent), receiver))
+        }
+    }
+
+    #[async_trait]
+    impl ManagedAgent for SilentAgent {
+        async fn prompt(&self, _prompt: Prompt) -> Result<ManagedTurn, AgentError> {
+            Ok(ManagedTurn::new(
+                Arc::new(SilentTurnControl),
+                std::future::ready(Ok(AgentRunResult::new(
+                    "silent completion",
+                    None,
+                    TurnUsage::default(),
+                ))),
+            ))
+        }
+    }
+
+    #[async_trait]
+    impl ManagedTurnControl for SilentTurnControl {
+        async fn steer(&self, _prompt: Prompt) -> Result<(), AgentError> {
+            Err(AgentError::TurnNotSteerable)
+        }
+
+        async fn cancel(&self) -> Result<(), AgentError> {
+            Err(AgentError::TurnNotCancellable)
+        }
+    }
 
     fn identity(id: &str) -> AgentIdentity {
         AgentIdentity {
@@ -1794,6 +1780,90 @@ mod tests {
             }
         }
         assert!(saw_runtime);
+    }
+
+    #[tokio::test]
+    async fn completion_does_not_wait_for_optional_runtime_events() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = AgentManager::new(Arc::new(SilentFactory), directory.path()).unwrap();
+        let identity = identity("silent");
+        manager.register(identity.clone()).await.unwrap();
+        let response = manager
+            .create_turn(identity.clone(), turn("complete without events"), None)
+            .await
+            .unwrap();
+
+        let completed = tokio::time::timeout(
+            Duration::from_millis(250),
+            wait_for_completed(&manager, identity, &response.turn_id),
+        )
+        .await
+        .expect("turn results must remain independent from the event stream");
+        assert_eq!(completed.state, TurnStatus::Completed);
+        let [ContentBlock::Text { text }] = completed.output.as_slice() else {
+            panic!("expected one text output block");
+        };
+        assert_eq!(text, "silent completion");
+    }
+
+    #[tokio::test]
+    async fn deletion_is_rejected_atomically_while_a_turn_is_active() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = AgentManager::new(
+            Arc::new(MockAgentFactory::new(Duration::from_millis(100))),
+            directory.path(),
+        )
+        .unwrap();
+        let identity = identity("delete-race");
+        manager.register(identity.clone()).await.unwrap();
+        let response = manager
+            .create_turn(identity.clone(), turn("still running"), None)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            manager.delete(&identity.id).await,
+            Err(ManagerError::AgentBusy)
+        ));
+        wait_for_completed(&manager, identity.clone(), &response.turn_id).await;
+        manager.delete(&identity.id).await.unwrap();
+        assert!(
+            manager
+                .sessions
+                .turn(identity.id, response.turn_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_event_replay_is_paged_without_losing_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = AgentManager::new(
+            Arc::new(MockAgentFactory::new(Duration::ZERO)),
+            directory.path(),
+        )
+        .unwrap();
+        let identity = identity("paged-replay");
+        manager.register(identity.clone()).await.unwrap();
+        let event_count = EVENT_REPLAY_PAGE_SIZE * 3 + 17;
+        manager
+            .sessions
+            .append_events(
+                identity.id.clone(),
+                (0..event_count)
+                    .map(|_| (None, AgentEventPayload::TurnCancelRequested))
+                    .collect(),
+            )
+            .await
+            .unwrap();
+
+        let mut events = manager.events(identity, 0).await.unwrap();
+        for expected in 1..=event_count {
+            let event = events.recv().await.unwrap();
+            assert_eq!(event.id, u64::try_from(expected).unwrap());
+        }
     }
 
     #[tokio::test]

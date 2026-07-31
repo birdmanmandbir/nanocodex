@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::Path, time::Instant};
+use std::{path::Path, time::Instant};
 
 use chrono::{DateTime, Utc};
 use nanocodex_agent::session::SessionSnapshot;
@@ -27,14 +27,13 @@ struct CommandEnvelope {
 
 pub(crate) struct StoredSession {
     pub turns: Vec<StoredTurn>,
-    pub requests: HashMap<String, TurnActionResponse>,
+    pub snapshot: Option<SessionSnapshot>,
 }
 
 pub(crate) struct StoredTurn {
     pub view: TurnView,
     pub inputs: Vec<Vec<ContentBlock>>,
     pub cancel_requested: bool,
-    pub snapshot: Option<SessionSnapshot>,
 }
 
 pub(crate) struct NewTurn {
@@ -54,6 +53,11 @@ pub(crate) struct CompletedTurn {
     pub snapshot: Option<SessionSnapshot>,
     pub usage: Option<nanocodex_agent::TurnUsage>,
     pub event: AgentEventPayload,
+}
+
+pub(crate) struct FinishedTurn {
+    pub event: AgentEvent,
+    pub snapshot: Option<SessionSnapshot>,
 }
 
 impl SessionStore {
@@ -86,11 +90,6 @@ impl SessionStore {
         Ok(Self { sender })
     }
 
-    pub async fn ensure_agent(&self, agent_id: String) -> Result<(), SessionError> {
-        self.call(|reply| Command::EnsureAgent { agent_id, reply })
-            .await
-    }
-
     pub async fn load(&self, agent_id: String) -> Result<StoredSession, SessionError> {
         self.call(|reply| Command::Load { agent_id, reply }).await
     }
@@ -103,6 +102,19 @@ impl SessionStore {
         self.call(|reply| Command::FindRequest {
             agent_id,
             key,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn turn(
+        &self,
+        agent_id: String,
+        turn_id: String,
+    ) -> Result<Option<TurnView>, SessionError> {
+        self.call(|reply| Command::GetTurn {
+            agent_id,
+            turn_id,
             reply,
         })
         .await
@@ -171,7 +183,7 @@ impl SessionStore {
         agent_id: String,
         turn_id: String,
         completed: CompletedTurn,
-    ) -> Result<AgentEvent, SessionError> {
+    ) -> Result<FinishedTurn, SessionError> {
         self.call(|reply| Command::FinishTurn {
             agent_id,
             turn_id,
@@ -181,16 +193,14 @@ impl SessionStore {
         .await
     }
 
-    pub async fn append_event(
+    pub async fn append_events(
         &self,
         agent_id: String,
-        turn_id: Option<String>,
-        payload: AgentEventPayload,
-    ) -> Result<AgentEvent, SessionError> {
-        self.call(|reply| Command::AppendEvent {
+        events: Vec<(Option<String>, AgentEventPayload)>,
+    ) -> Result<Vec<AgentEvent>, SessionError> {
+        self.call(|reply| Command::AppendEvents {
             agent_id,
-            turn_id,
-            payload,
+            events,
             reply,
         })
         .await
@@ -200,10 +210,12 @@ impl SessionStore {
         &self,
         agent_id: String,
         after_event_id: u64,
+        limit: usize,
     ) -> Result<Vec<AgentEvent>, SessionError> {
         self.call(|reply| Command::EventsAfter {
             agent_id,
             after_event_id,
+            limit,
             reply,
         })
         .await
@@ -248,10 +260,6 @@ impl SessionStore {
 }
 
 enum Command {
-    EnsureAgent {
-        agent_id: String,
-        reply: Reply<()>,
-    },
     Load {
         agent_id: String,
         reply: Reply<StoredSession>,
@@ -260,6 +268,11 @@ enum Command {
         agent_id: String,
         key: String,
         reply: Reply<Option<TurnActionResponse>>,
+    },
+    GetTurn {
+        agent_id: String,
+        turn_id: String,
+        reply: Reply<Option<TurnView>>,
     },
     RecordTurn {
         agent_id: String,
@@ -288,17 +301,17 @@ enum Command {
         agent_id: String,
         turn_id: String,
         completed: Box<CompletedTurn>,
-        reply: Reply<AgentEvent>,
+        reply: Reply<FinishedTurn>,
     },
-    AppendEvent {
+    AppendEvents {
         agent_id: String,
-        turn_id: Option<String>,
-        payload: AgentEventPayload,
-        reply: Reply<AgentEvent>,
+        events: Vec<(Option<String>, AgentEventPayload)>,
+        reply: Reply<Vec<AgentEvent>>,
     },
     EventsAfter {
         agent_id: String,
         after_event_id: u64,
+        limit: usize,
         reply: Reply<Vec<AgentEvent>>,
     },
     Fork {
@@ -318,15 +331,15 @@ type Reply<T> = oneshot::Sender<Result<T, SessionError>>;
 impl Command {
     const fn name(&self) -> &'static str {
         match self {
-            Self::EnsureAgent { .. } => "ensure_agent",
             Self::Load { .. } => "load",
             Self::FindRequest { .. } => "find_request",
+            Self::GetTurn { .. } => "get_turn",
             Self::RecordTurn { .. } => "record_turn",
             Self::RecordSteer { .. } => "record_steer",
             Self::MarkStarted { .. } => "mark_started",
             Self::RequestCancel { .. } => "request_cancel",
             Self::FinishTurn { .. } => "finish_turn",
-            Self::AppendEvent { .. } => "append_event",
+            Self::AppendEvents { .. } => "append_events",
             Self::EventsAfter { .. } => "events_after",
             Self::Fork { .. } => "fork",
             Self::Delete { .. } => "delete",
@@ -335,9 +348,6 @@ impl Command {
 
     fn execute(self, connection: &Connection) {
         match self {
-            Self::EnsureAgent { agent_id, reply } => {
-                drop(reply.send(ensure_agent(connection, &agent_id)));
-            }
             Self::Load { agent_id, reply } => {
                 drop(reply.send(load(connection, &agent_id)));
             }
@@ -347,6 +357,13 @@ impl Command {
                 reply,
             } => {
                 drop(reply.send(find_request(connection, &agent_id, &key)));
+            }
+            Self::GetTurn {
+                agent_id,
+                turn_id,
+                reply,
+            } => {
+                drop(reply.send(turn(connection, &agent_id, &turn_id)));
             }
             Self::RecordTurn {
                 agent_id,
@@ -394,25 +411,20 @@ impl Command {
             } => {
                 drop(reply.send(finish_turn(connection, &agent_id, &turn_id, *completed)));
             }
-            Self::AppendEvent {
+            Self::AppendEvents {
                 agent_id,
-                turn_id,
-                payload,
+                events,
                 reply,
             } => {
-                drop(reply.send(append_event(
-                    connection,
-                    &agent_id,
-                    turn_id.as_deref(),
-                    payload,
-                )));
+                drop(reply.send(append_events(connection, &agent_id, events)));
             }
             Self::EventsAfter {
                 agent_id,
                 after_event_id,
+                limit,
                 reply,
             } => {
-                drop(reply.send(events_after(connection, &agent_id, after_event_id)));
+                drop(reply.send(events_after(connection, &agent_id, after_event_id, limit)));
             }
             Self::Fork {
                 source_agent_id,
@@ -559,57 +571,45 @@ fn load(connection: &Connection, agent_id: &str) -> Result<StoredSession, Sessio
     transaction.commit()?;
 
     let mut statement = connection.prepare(
-        "SELECT id, delivery, state, output_json, usage_json, error,
-                cancel_requested, checkpoint_json, created_at, completed_at
-         FROM turns WHERE agent_id = ?1 ORDER BY ordinal",
+        "SELECT id, state, cancel_requested, created_at
+         FROM turns
+         WHERE agent_id = ?1 AND state IN ('queued', 'running')
+         ORDER BY ordinal",
     )?;
     let turns = statement
         .query_map(params![agent_id], |row| {
             let turn_id: String = row.get(0)?;
-            let state: String = row.get(2)?;
-            let output_json: String = row.get(3)?;
-            let usage_json: Option<String> = row.get(4)?;
-            let checkpoint_json: Option<String> = row.get(7)?;
-            let created_at: String = row.get(8)?;
-            let completed_at: Option<String> = row.get(9)?;
+            let state: String = row.get(1)?;
+            let created_at: String = row.get(3)?;
             Ok(StoredTurn {
                 view: TurnView {
                     turn_id: turn_id.clone(),
                     agent_id: agent_id.to_owned(),
                     state: parse_status(&state)?,
-                    output: json_from_sql(&output_json)?,
-                    error: row.get(5)?,
-                    usage: usage_json.as_deref().map(json_from_sql).transpose()?,
+                    output: Vec::new(),
+                    error: None,
+                    usage: None,
                     created_at: parse_time(&created_at)?,
-                    completed_at: completed_at.as_deref().map(parse_time).transpose()?,
+                    completed_at: None,
                 },
                 inputs: load_inputs(connection, agent_id, &turn_id)?,
-                cancel_requested: row.get(6)?,
-                snapshot: checkpoint_json.as_deref().map(json_from_sql).transpose()?,
+                cancel_requested: row.get(2)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
-
-    let mut requests_statement = connection.prepare(
-        "SELECT idempotency_key, action, turn_id, state
-         FROM turn_requests WHERE agent_id = ?1",
-    )?;
-    let requests = requests_statement
-        .query_map(params![agent_id], |row| {
-            let key: String = row.get(0)?;
-            let action: String = row.get(1)?;
-            let state: String = row.get(3)?;
-            Ok((
-                key,
-                TurnActionResponse {
-                    action: parse_action(&action)?,
-                    turn_id: row.get(2)?,
-                    state: parse_status(&state)?,
-                },
-            ))
-        })?
-        .collect::<Result<HashMap<_, _>, _>>()?;
-    Ok(StoredSession { turns, requests })
+    let snapshot = connection
+        .query_row(
+            "SELECT checkpoint_json FROM turns
+             WHERE agent_id = ?1 AND state = 'completed' AND checkpoint_json IS NOT NULL
+             ORDER BY ordinal DESC LIMIT 1",
+            params![agent_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .as_deref()
+        .map(json_from_sql)
+        .transpose()?;
+    Ok(StoredSession { turns, snapshot })
 }
 
 fn load_inputs(
@@ -646,6 +646,38 @@ fn find_request(
                     action: parse_action(&action)?,
                     turn_id: row.get(1)?,
                     state: parse_status(&state)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn turn(
+    connection: &Connection,
+    agent_id: &str,
+    turn_id: &str,
+) -> Result<Option<TurnView>, SessionError> {
+    connection
+        .query_row(
+            "SELECT state, output_json, usage_json, error, created_at, completed_at
+             FROM turns WHERE agent_id = ?1 AND id = ?2",
+            params![agent_id, turn_id],
+            |row| {
+                let state: String = row.get(0)?;
+                let output_json: String = row.get(1)?;
+                let usage_json: Option<String> = row.get(2)?;
+                let created_at: String = row.get(4)?;
+                let completed_at: Option<String> = row.get(5)?;
+                Ok(TurnView {
+                    turn_id: turn_id.to_owned(),
+                    agent_id: agent_id.to_owned(),
+                    state: parse_status(&state)?,
+                    output: json_from_sql(&output_json)?,
+                    error: row.get(3)?,
+                    usage: usage_json.as_deref().map(json_from_sql).transpose()?,
+                    created_at: parse_time(&created_at)?,
+                    completed_at: completed_at.as_deref().map(parse_time).transpose()?,
                 })
             },
         )
@@ -763,7 +795,7 @@ fn finish_turn(
     agent_id: &str,
     turn_id: &str,
     completed: CompletedTurn,
-) -> Result<AgentEvent, SessionError> {
+) -> Result<FinishedTurn, SessionError> {
     let transaction = connection.unchecked_transaction()?;
     let event = append_event_tx(&transaction, agent_id, Some(turn_id), completed.event)?;
     transaction.execute(
@@ -792,19 +824,42 @@ fn finish_turn(
         ],
     )?;
     transaction.commit()?;
-    Ok(event)
+    Ok(FinishedTurn {
+        event,
+        snapshot: completed.snapshot,
+    })
 }
 
-fn append_event(
+fn append_events(
     connection: &Connection,
     agent_id: &str,
-    turn_id: Option<&str>,
-    payload: AgentEventPayload,
-) -> Result<AgentEvent, SessionError> {
+    events: Vec<(Option<String>, AgentEventPayload)>,
+) -> Result<Vec<AgentEvent>, SessionError> {
+    if events.is_empty() {
+        return Ok(Vec::new());
+    }
     let transaction = connection.unchecked_transaction()?;
-    let event = append_event_tx(&transaction, agent_id, turn_id, payload)?;
+    let mut next_id: i64 = transaction.query_row(
+        "SELECT COALESCE(MAX(id), 0) + 1 FROM session_events WHERE agent_id = ?1",
+        params![agent_id],
+        |row| row.get(0),
+    )?;
+    let mut persisted = Vec::with_capacity(events.len());
+    for (turn_id, payload) in events {
+        let id = event_id_from_sql(next_id)?;
+        persisted.push(insert_event_tx(
+            &transaction,
+            agent_id,
+            turn_id.as_deref(),
+            id,
+            payload,
+        )?);
+        next_id = next_id
+            .checked_add(1)
+            .ok_or(SessionError::EventIdOverflow)?;
+    }
     transaction.commit()?;
-    Ok(event)
+    Ok(persisted)
 }
 
 fn append_event_tx(
@@ -819,6 +874,16 @@ fn append_event_tx(
         |row| row.get(0),
     )?;
     let id = event_id_from_sql(id)?;
+    insert_event_tx(transaction, agent_id, turn_id, id, payload)
+}
+
+fn insert_event_tx(
+    transaction: &Transaction<'_>,
+    agent_id: &str,
+    turn_id: Option<&str>,
+    id: u64,
+    payload: AgentEventPayload,
+) -> Result<AgentEvent, SessionError> {
     let created_at = Utc::now();
     transaction.execute(
         "INSERT INTO session_events
@@ -845,23 +910,33 @@ fn events_after(
     connection: &Connection,
     agent_id: &str,
     after_event_id: u64,
+    limit: usize,
 ) -> Result<Vec<AgentEvent>, SessionError> {
     let mut statement = connection.prepare(
         "SELECT id, turn_id, payload_json, created_at
-         FROM session_events WHERE agent_id = ?1 AND id > ?2 ORDER BY id",
+         FROM session_events
+         WHERE agent_id = ?1 AND id > ?2
+         ORDER BY id LIMIT ?3",
     )?;
     statement
-        .query_map(params![agent_id, event_id_to_sql(after_event_id)?], |row| {
-            let payload_json: String = row.get(2)?;
-            let created_at: String = row.get(3)?;
-            Ok(AgentEvent {
-                id: event_id_from_sql(row.get(0)?)?,
-                agent_id: agent_id.to_owned(),
-                turn_id: row.get(1)?,
-                payload: json_from_sql(&payload_json)?,
-                created_at: parse_time(&created_at)?,
-            })
-        })?
+        .query_map(
+            params![
+                agent_id,
+                event_id_to_sql(after_event_id)?,
+                i64::try_from(limit).map_err(|_| SessionError::EventIdOverflow)?
+            ],
+            |row| {
+                let payload_json: String = row.get(2)?;
+                let created_at: String = row.get(3)?;
+                Ok(AgentEvent {
+                    id: event_id_from_sql(row.get(0)?)?,
+                    agent_id: agent_id.to_owned(),
+                    turn_id: row.get(1)?,
+                    payload: json_from_sql(&payload_json)?,
+                    created_at: parse_time(&created_at)?,
+                })
+            },
+        )?
         .collect::<Result<Vec<_>, _>>()
         .map_err(Into::into)
 }

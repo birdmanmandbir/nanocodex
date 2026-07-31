@@ -6,7 +6,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use axum::http::HeaderName;
+use axum::http::{HeaderName, HeaderValue};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -18,6 +18,7 @@ const MAX_IDENTIFIER_BYTES: usize = 256;
 const MAX_ENVIRONMENT_NAME_BYTES: usize = 128;
 const MAX_HEADER_NAME_BYTES: usize = 128;
 const MAX_PATH_PREFIX_BYTES: usize = 2_048;
+pub(crate) const MANAGED_SECRET_PROVIDER: &str = "nanocentaur";
 
 /// Opaque host-side secret-manager reference.
 ///
@@ -176,13 +177,6 @@ impl SecretDelivery {
             Self::InjectHeader { header, .. } | Self::ReplaceHeader { header, .. } => header,
         }
     }
-
-    pub(crate) fn placeholder(&self) -> Option<&str> {
-        match self {
-            Self::InjectHeader { .. } => None,
-            Self::ReplaceHeader { placeholder, .. } => Some(placeholder),
-        }
-    }
 }
 
 /// Public guest configuration associated with one secret route.
@@ -322,8 +316,7 @@ impl SecretSpec {
         id: String,
         request: Option<&SecretRequestRule>,
     ) -> Result<nanocodex_egress::SecretRule, nanocodex_egress::SecretConfigError> {
-        let source =
-            nanocodex_egress::SecretRef::new(self.source.provider.clone(), self.source.key.clone());
+        let source = nanocodex_egress::SecretRef::new(MANAGED_SECRET_PROVIDER, self.id.clone());
         let mut builder = nanocodex_egress::SecretRule::builder(id, source, &self.upstream);
         if let Some(request) = request {
             for method in &request.methods {
@@ -346,15 +339,19 @@ impl SecretSpec {
             SecretDelivery::ReplaceHeader {
                 header,
                 placeholder,
-            } => builder
-                .replace_header(header, placeholder)
-                .child_environment(
-                    self.guest.base_url_environment.clone(),
-                    self.guest
-                        .placeholder_environment
-                        .clone()
-                        .unwrap_or_else(|| placeholder.clone()),
-                ),
+            } => {
+                let placeholder_environment = self
+                    .guest
+                    .placeholder_environment
+                    .clone()
+                    .ok_or(nanocodex_egress::SecretConfigError::MissingChildEnvironment)?;
+                builder
+                    .replace_header(header, placeholder)
+                    .child_environment(
+                        self.guest.base_url_environment.clone(),
+                        placeholder_environment,
+                    )
+            }
         };
         builder.build()
     }
@@ -422,6 +419,16 @@ fn validate_spec(spec: &SecretSpec) -> Result<(), SecretConfigError> {
     {
         return Err(SecretConfigError::InvalidUpstream);
     }
+    if upstream.scheme() == "http"
+        && !upstream.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        })
+    {
+        return Err(SecretConfigError::InvalidUpstream);
+    }
     for rule in &spec.rules {
         for prefix in &rule.path_prefixes {
             if !valid_path_prefix(prefix) {
@@ -449,10 +456,17 @@ fn validate_spec(spec: &SecretSpec) -> Result<(), SecretConfigError> {
     if let Some(environment) = &spec.guest.placeholder_environment {
         validate_environment_name(environment)?;
     }
-    if let Some(placeholder) = spec.delivery.placeholder()
-        && spec.guest.placeholder_environment.as_deref() != Some(placeholder)
-    {
-        return Err(SecretConfigError::PlaceholderMismatch);
+    match (&spec.delivery, &spec.guest.placeholder_environment) {
+        (SecretDelivery::InjectHeader { .. }, None) => {}
+        (SecretDelivery::ReplaceHeader { placeholder, .. }, Some(environment))
+            if environment != &spec.guest.base_url_environment
+                && !placeholder.is_empty()
+                && placeholder.len() <= 4 * 1_024
+                && HeaderValue::from_str(placeholder).is_ok() => {}
+        (SecretDelivery::InjectHeader { .. }, Some(_))
+        | (SecretDelivery::ReplaceHeader { .. }, None | Some(_)) => {
+            return Err(SecretConfigError::InvalidPlaceholderConfiguration);
+        }
     }
     Ok(())
 }
@@ -728,9 +742,9 @@ pub enum SecretConfigError {
     /// A guest environment name was not an uppercase shell identifier.
     #[error("secret guest environment names must use uppercase shell identifier syntax")]
     InvalidEnvironmentName,
-    /// Replace delivery and guest placeholder configuration differed.
-    #[error("replace delivery placeholder must equal guest placeholder environment name")]
-    PlaceholderMismatch,
+    /// Delivery and guest placeholder environment configuration were incompatible.
+    #[error("secret delivery and guest placeholder environments are incompatible")]
+    InvalidPlaceholderConfiguration,
 }
 
 /// Administrative request for one host-resolved secret route.
@@ -775,7 +789,7 @@ pub struct PatchSecret {
 }
 
 /// Durable administrative view of one secret route.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SecretView {
     /// Stable route identifier.
     pub id: String,
@@ -872,6 +886,48 @@ mod tests {
         assert_eq!(spec.id(), "openai");
         assert_eq!(spec.upstream(), "https://api.openai.com");
         assert_eq!(spec.rules().len(), 1);
+    }
+
+    #[test]
+    fn replacement_exports_distinct_base_url_and_placeholder_variables() {
+        let spec = SecretSpec::builder(
+            "openai",
+            SecretRef::new("environment", "OPENAI_API_KEY"),
+            "https://api.openai.com",
+            SecretDelivery::replace_header("authorization", "Bearer public-placeholder"),
+            SecretGuestConfig::new("OPENAI_BASE_URL")
+                .placeholder_environment("OPENAI_AUTH_PLACEHOLDER"),
+        )
+        .build()
+        .unwrap();
+        let egress =
+            nanocodex_egress::SecretEgress::builder(nanocodex_egress::StaticSecretResolver::new())
+                .rules(spec.egress_rules().unwrap())
+                .build()
+                .unwrap();
+
+        assert_eq!(
+            egress.environment().get("OPENAI_BASE_URL"),
+            Some(std::ffi::OsStr::new("https://api.openai.com"))
+        );
+        assert_eq!(
+            egress.environment().get("OPENAI_AUTH_PLACEHOLDER"),
+            Some(std::ffi::OsStr::new("Bearer public-placeholder"))
+        );
+    }
+
+    #[test]
+    fn replacement_requires_a_placeholder_environment() {
+        let error = SecretSpec::builder(
+            "openai",
+            SecretRef::new("environment", "OPENAI_API_KEY"),
+            "https://api.openai.com",
+            SecretDelivery::replace_header("authorization", "public-placeholder"),
+            SecretGuestConfig::new("OPENAI_BASE_URL"),
+        )
+        .build()
+        .unwrap_err();
+        assert_eq!(error, SecretConfigError::InvalidPlaceholderConfiguration);
     }
 
     #[test]

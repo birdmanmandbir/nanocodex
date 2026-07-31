@@ -33,6 +33,10 @@ The actor owns live runtime state. SQLite remains authoritative across actor
 eviction and process restart. Each wake creates a fresh model transport and VM,
 then resumes from the last completed typed `SessionSnapshot`.
 
+Live actors retain only unfinished turn controls and inputs plus the latest
+completed snapshot. Completed turn views and old idempotency records remain in
+SQLite instead of growing every actor heap for the lifetime of a session.
+
 ## Agent API
 
 ```text
@@ -96,7 +100,12 @@ Last-Event-ID: 42
 ```
 
 Managed control events and native `nanocodex_agent::events::AgentEvent` values
-remain typed through SQLite and SSE projection.
+remain typed through SQLite and SSE projection. Managed lifecycle events carry
+the durable turn ID. Native runtime events remain session-ordered with no
+synthetic turn attribution, so delayed or absent optional events can never
+delay a typed turn result or be assigned to the wrong queued turn.
+Runtime-event bursts share bounded SQLite transactions, and replay is fetched
+in bounded pages before switching to the live broadcast tail.
 
 ## Durability and forks
 
@@ -159,8 +168,12 @@ For each VM wake, Nanocentaur creates an authenticated loopback proxy and an
 ephemeral interception CA using `nanocodex-egress`. The guest receives proxy
 variables, the public CA, origins, and public placeholders. The host resolves a
 secret only after destination, method, path, active agent, principal, and live
-grant checks pass. Revocation therefore affects the next request. The proxy
-owner is retained by the VM egress lease and disappears with that runtime.
+route-specific grant checks pass. Revocation therefore affects the next
+request even when several routes use the same host secret reference. A route
+configuration change also fails closed on an existing proxy until policy
+refresh replaces its VM runtime, preventing a rotated credential from being
+sent through stale destination rules. The proxy owner is retained by the VM
+egress lease and disappears with that runtime.
 
 Capability routes are independent. No requested network capability produces a
 network-disabled lease; configured capabilities may select direct internet or
@@ -211,4 +224,6 @@ cargo run -p nanocentaur-server --features mpp -- serve ...
 ```
 
 Authorization and policy checks run before payment verification, so rejected
-callers are not charged.
+callers are not charged. Concurrent requests sharing one agent-scoped
+idempotency key are serialized across lookup, payment authorization, and
+durable acceptance, preventing duplicate authorization for the same turn.

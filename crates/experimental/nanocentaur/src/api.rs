@@ -1,6 +1,7 @@
 use std::{
+    collections::HashMap,
     convert::Infallible,
-    sync::Arc,
+    sync::{Arc, Weak},
     time::{Duration, Instant},
 };
 
@@ -34,6 +35,7 @@ pub struct ApiState {
     pub(crate) policy: Arc<PolicyStore>,
     pub(crate) admin: Arc<AdminAuthorizer>,
     pub(crate) payments: Arc<dyn PaymentGate>,
+    idempotency_locks: IdempotencyLocks,
 }
 
 impl ApiState {
@@ -51,12 +53,41 @@ impl ApiState {
             policy,
             admin,
             payments,
+            idempotency_locks: IdempotencyLocks::default(),
         }
     }
 
     /// Builds the REST/SSE router owned by this state.
     pub fn router(self) -> Router {
         router(Arc::new(self))
+    }
+}
+
+#[derive(Default)]
+struct IdempotencyLocks {
+    locks: tokio::sync::Mutex<HashMap<IdempotencyScope, Weak<IdempotencyLock>>>,
+}
+
+type IdempotencyScope = (String, String);
+type IdempotencyLock = tokio::sync::Mutex<()>;
+
+impl IdempotencyLocks {
+    async fn acquire(&self, agent_id: String, key: String) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.locks.lock().await;
+            if locks.len() >= 1_024 {
+                locks.retain(|_, lock| lock.strong_count() > 0);
+            }
+            let scope = (agent_id, key);
+            if let Some(lock) = locks.get(&scope).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(scope, Arc::downgrade(&lock));
+                lock
+            }
+        };
+        lock.lock_owned().await
     }
 }
 
@@ -179,10 +210,7 @@ async fn delete_agent(
     headers: HeaderMap,
     Path(agent_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let (identity, client) = authorize_agent(&state, &headers, &agent_id, "agent.delete")?;
-    if state.manager.get(identity).await?.state == crate::AgentStatus::Running {
-        return Err(ManagerError::AgentBusy.into());
-    }
+    let (_, client) = authorize_agent(&state, &headers, &agent_id, "agent.delete")?;
     state.manager.delete(&agent_id).await?;
     state.policy.delete_agent(&client, &agent_id)?;
     Ok(StatusCode::NO_CONTENT)
@@ -202,6 +230,16 @@ async fn create_turn(
     );
     let (identity, _) = authorize_agent(&state, &headers, &agent_id, "agent.turn")?;
     let idempotency_key = idempotency_key(&headers)?;
+    let _idempotency_guard = if let Some(key) = &idempotency_key {
+        Some(
+            state
+                .idempotency_locks
+                .acquire(agent_id.clone(), key.clone())
+                .await,
+        )
+    } else {
+        None
+    };
     if let Some(key) = idempotency_key.as_deref()
         && let Some(response) = state
             .manager
@@ -509,10 +547,7 @@ impl IntoResponse for ApiError {
                 | PolicyError::Io(_),
             )
             | Self::Manager(
-                ManagerError::ActorStopped
-                | ManagerError::Durability(_)
-                | ManagerError::Agent(_)
-                | ManagerError::Io(_),
+                ManagerError::ActorStopped | ManagerError::Durability(_) | ManagerError::Agent(_),
             )
             | Self::Authorization(AuthorizationError::InvalidConfiguration(_))
             | Self::Internal => (
@@ -547,6 +582,8 @@ impl ErrorResponse {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use std::{
         collections::BTreeSet,
         sync::{Arc, Mutex},
@@ -571,6 +608,21 @@ mod tests {
     };
 
     struct ConstantSecret;
+
+    struct CountingPaymentGate {
+        authorizations: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl PaymentGate for CountingPaymentGate {
+        async fn authorize(&self, _headers: &HeaderMap) -> Result<PaymentOutcome, PaymentError> {
+            self.authorizations.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            Ok(PaymentOutcome::Authorized(crate::PaymentReceipt {
+                header_value: "counted".to_owned(),
+            }))
+        }
+    }
 
     #[async_trait]
     impl SecretManager for ConstantSecret {
@@ -666,6 +718,45 @@ mod tests {
         let body = response_json::<CreateAgentResponse>(response).await;
         assert_eq!(body.agent_id, first);
         assert!(!body.created);
+    }
+
+    #[tokio::test]
+    async fn concurrent_idempotent_turns_are_authorized_for_payment_once() {
+        let factory: Arc<dyn ManagedAgentFactory> =
+            Arc::new(MockAgentFactory::new(Duration::from_millis(50)));
+        let directory = tempfile::tempdir().unwrap().keep();
+        let policy = Arc::new(PolicyStore::in_memory().unwrap());
+        policy
+            .bootstrap("test", "Test", "test-key", "test", [])
+            .unwrap();
+        let payments = Arc::new(CountingPaymentGate {
+            authorizations: AtomicUsize::new(0),
+        });
+        let state = Arc::new(ApiState::new(
+            Arc::new(AgentManager::new(factory, directory).unwrap()),
+            policy,
+            Arc::new(AdminAuthorizer::new("admin-key").unwrap()),
+            payments.clone(),
+        ));
+        let app = router(state);
+        let agent_id = create_test_agent(&app, "context:paid-idempotency").await;
+        let request = || {
+            Request::post(format!("/v1/agent/{agent_id}/turn"))
+                .header("x-api-key", "test-key")
+                .header("idempotency-key", "same-paid-turn")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"content":[{"type":"text","text":"once"}]}"#))
+                .unwrap()
+        };
+
+        let (first, second) = tokio::join!(
+            app.clone().oneshot(request()),
+            app.clone().oneshot(request())
+        );
+        let statuses = [first.unwrap().status(), second.unwrap().status()];
+        assert!(statuses.contains(&StatusCode::ACCEPTED));
+        assert!(statuses.contains(&StatusCode::OK));
+        assert_eq!(payments.authorizations.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
