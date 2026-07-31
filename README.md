@@ -252,9 +252,11 @@ Components whose public contracts are still maturing live under
 | --- | --- |
 | [`nanocodex-voice`](crates/experimental/nanocodex-voice/README.md) | Desktop GPT Realtime audio and reusable voice-to-agent lifecycle |
 | [`nanocodex-vm`](crates/experimental/nanocodex-vm/README.md) | VM lifecycle and images plus retained guest-backed workspace tools |
+| [`nanocentaur`](crates/experimental/nanocentaur/README.md) | Durable host-managed agents with policy, REST/SSE, VM tools, and secret egress |
 
-The CLI is a consumer of these crates. Voice and VM-backed tools remain thin,
-opt-in adapters over the stable library contracts.
+The CLI and Nanocentaur server are consumers of these crates. Voice,
+VM-backed tools, and managed hosting remain opt-in compositions over the
+stable library contracts.
 
 ### CLI and language bindings
 

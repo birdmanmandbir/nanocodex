@@ -4917,8 +4917,10 @@ source = "git+https://github.com/tempoxyz/mpp-rs?rev=3e37469bb19434982b433ae44ea
 dependencies = [
  "alloy",
  "anyhow",
+ "async-stream",
  "async-trait",
  "base64",
+ "futures-core",
  "hex",
  "hmac 0.13.0",
  "http",
@@ -4956,6 +4958,56 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "nanocentaur"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "chrono",
+ "criterion",
+ "futures-util",
+ "nanocodex-agent",
+ "nanocodex-egress",
+ "nanocodex-oai-api",
+ "nanocodex-vm",
+ "reflink-copy",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "nanocentaur-server"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "clap",
+ "eyre",
+ "futures-util",
+ "mpp",
+ "nanocentaur",
+ "nanocodex-oai-api",
+ "nanocodex-vm",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

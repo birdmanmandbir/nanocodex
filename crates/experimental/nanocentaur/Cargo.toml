@@ -1,0 +1,46 @@
+[package]
+name = "nanocentaur"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "Host-managed Nanocodex sessions with capability-scoped VM tools"
+
+[dependencies]
+async-trait.workspace = true
+axum.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+nanocodex-agent.workspace = true
+nanocodex-egress.workspace = true
+nanocodex-oai-api.workspace = true
+nanocodex-vm.workspace = true
+reflink-copy.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+reqwest.workspace = true
+tower.workspace = true
+tracing-subscriber.workspace = true
+
+[[bench]]
+name = "managed_api"
+harness = false
+
+[lints]
+workspace = true

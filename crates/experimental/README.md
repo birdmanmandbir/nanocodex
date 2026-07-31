@@ -11,6 +11,8 @@ being exercised and revised:
   control, diagnostics, artifacts, and headed-browser VM composition.
 - [`nanocodex-egress`](nanocodex-egress/README.md): authenticated loopback
   HTTP(S) forwarding, application-owned middleware, and host-owned secrets.
+- [`nanocentaur`](nanocentaur/README.md): durable host-managed agents,
+  tenant policy, REST/SSE projection, and VM-backed runtime composition.
 
 Experimental means API stability, not reduced engineering standards. These
 packages remain workspace members and must pass the normal formatting, Clippy,

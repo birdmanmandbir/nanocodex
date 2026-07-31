@@ -111,6 +111,12 @@ migration, and it must be independently mergeable.
     starts, with Codex's current `cove` default and Frameless model. Realtime
     coding handoffs atomically steer an active regular turn or start a new turn,
     so spoken follow-ups remain interactive during tool execution.
+12. [x] Reintroduce the managed-agent slice from PR #60 on current `master`:
+    durable SQLite-backed actors and event replay, tenant policy and admin APIs,
+    explicit steering/queueing/cancellation/forks, a thin REST/SSE server, and
+    VM-backed Nanocodex runtimes composed with the current host-owned secret
+    egress boundary. Browser, VM, and egress implementations remain owned by
+    their already-merged experimental crates.
 
 ## Current non-goals
 
@@ -120,6 +126,7 @@ migration, and it must be independently mergeable.
   the core library.
 - No new `.service(...)` transport design without a concrete consumer.
 - No cosmetic CLI/TUI lifecycle rewrite when existing behavior is accepted.
-- No further VM, browser, managed-agent, proxy, or experimental-crate work.
+- No further VM, browser, proxy, or experimental-crate expansion beyond the
+  managed-agent composition recorded above.
 - No benchmark, task, or verifier modification made solely to improve an eval
   score.
