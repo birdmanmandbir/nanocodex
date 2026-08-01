@@ -6,6 +6,9 @@ use mpp::client::{
     AcceptPaymentPolicy, ClientEvent, ClientEventSubscription, ClientEvents, PaymentMiddleware,
     PaymentProvider,
 };
+use mpp::{
+    format_www_authenticate_many, parse_www_authenticate_all, protocol::intents::ChargeRequest,
+};
 use nanocodex_egress::{
     EgressLayer,
     middleware::{
@@ -16,6 +19,85 @@ use nanocodex_egress::{
 
 const DEFAULT_MAX_PAYMENT_REQUIRED_BYTES: usize = 1024 * 1024;
 const MPP_REQUEST_ID: &str = "mpp-request-id";
+
+/// Places charges in the caller-owned funding currency before other otherwise
+/// equivalent Tempo Charge challenges.
+pub(super) struct PreferredChargeCurrency {
+    currency: String,
+}
+
+impl PreferredChargeCurrency {
+    pub(super) fn new(currency: impl ToString) -> Self {
+        Self {
+            currency: currency.to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl EgressLayer for PreferredChargeCurrency {
+    async fn handle(
+        &self,
+        request: Request,
+        extensions: &mut Extensions,
+        next: Next<'_>,
+    ) -> MiddlewareResult<Response> {
+        let mut response = next.run(request, extensions).await?;
+        prefer_charge_currency(&mut response, &self.currency);
+        Ok(response)
+    }
+}
+
+fn prefer_charge_currency(response: &mut Response, currency: &str) {
+    if response.status() != StatusCode::PAYMENT_REQUIRED {
+        return;
+    }
+    let values = response
+        .headers()
+        .get_all(reqwest::header::WWW_AUTHENTICATE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect::<Vec<_>>();
+    let parsed = parse_www_authenticate_all(values);
+    if parsed.len() < 2 || parsed.iter().any(Result::is_err) {
+        return;
+    }
+    let mut challenges = parsed
+        .into_iter()
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    let Some(preferred) = challenges.iter().position(|challenge| {
+        challenge.intent.as_str() == "charge"
+            && challenge
+                .request
+                .decode::<ChargeRequest>()
+                .is_ok_and(|request| request.currency.eq_ignore_ascii_case(currency))
+    }) else {
+        return;
+    };
+    if preferred == 0 {
+        return;
+    }
+    challenges[..=preferred].rotate_right(1);
+    let Ok(values) = format_www_authenticate_many(&challenges) else {
+        return;
+    };
+    let Ok(values) = values
+        .into_iter()
+        .map(|value| value.parse())
+        .collect::<Result<Vec<reqwest::header::HeaderValue>, _>>()
+    else {
+        return;
+    };
+    response
+        .headers_mut()
+        .remove(reqwest::header::WWW_AUTHENTICATE);
+    for value in values {
+        response
+            .headers_mut()
+            .append(reqwest::header::WWW_AUTHENTICATE, value);
+    }
+}
 
 /// MPP payment and replay as one Tempo-owned outbound egress layer.
 pub(super) struct TempoEgress<P> {
@@ -201,6 +283,7 @@ mod tests {
     struct MockProvider {
         active: Arc<AtomicUsize>,
         commits: Arc<AtomicUsize>,
+        currencies: Arc<Mutex<Vec<String>>>,
         delay_payments: bool,
         maximum: Arc<AtomicUsize>,
         payments: Arc<AtomicUsize>,
@@ -220,6 +303,10 @@ mod tests {
         }
 
         async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+            self.currencies
+                .lock()
+                .unwrap()
+                .push(challenge.request.decode::<ChargeRequest>()?.currency);
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.maximum.fetch_max(active, Ordering::SeqCst);
             self.payments.fetch_add(1, Ordering::SeqCst);
@@ -264,9 +351,13 @@ mod tests {
     }
 
     fn challenge_header(id: &str) -> String {
+        charge_challenge_header(id, "test")
+    }
+
+    fn charge_challenge_header(id: &str, currency: &str) -> String {
         let request = Base64UrlJson::from_value(&serde_json::json!({
             "amount": "1",
-            "currency": "test"
+            "currency": currency,
         }))
         .unwrap();
         format_www_authenticate(&PaymentChallenge::new(
@@ -368,6 +459,51 @@ mod tests {
         }
         assert_eq!(payments.load(Ordering::SeqCst), 1);
         assert_eq!(commits.load(Ordering::SeqCst), 1);
+        egress.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn preferred_charge_currency_wins_over_server_order() {
+        const OTHER_CURRENCY: &str = "0x20c000000000000000000000b9537d11c60e8b50";
+        const PREFERRED_CURRENCY: &str = "0x20c0000000000000000000008b4c619d2eedec7a";
+
+        let other = charge_challenge_header("other", OTHER_CURRENCY);
+        let preferred = charge_challenge_header("preferred", PREFERRED_CURRENCY);
+        let origin = spawn_origin(Router::new().route(
+            "/paid",
+            post(move |request: Request| {
+                let other = other.clone();
+                let preferred = preferred.clone();
+                async move {
+                    if request.headers().contains_key("authorization") {
+                        return (AxumStatus::OK, "paid").into_response();
+                    }
+                    let mut headers = axum::http::HeaderMap::new();
+                    headers.append(WWW_AUTHENTICATE, other.parse().unwrap());
+                    headers.append(WWW_AUTHENTICATE, preferred.parse().unwrap());
+                    (AxumStatus::PAYMENT_REQUIRED, headers, "payment required").into_response()
+                }
+            }),
+        ))
+        .await;
+        let provider = MockProvider::default();
+        let currencies = Arc::clone(&provider.currencies);
+        let egress = EgressProxy::builder()
+            .allow_loopback_upstreams(true)
+            .layer(TempoEgress::new(provider))
+            .layer(PreferredChargeCurrency::new(PREFERRED_CURRENCY))
+            .spawn()
+            .await
+            .unwrap();
+
+        let response = proxied_client(&egress)
+            .post(format!("{origin}/paid"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), AxumStatus::OK);
+        assert_eq!(currencies.lock().unwrap().as_slice(), [PREFERRED_CURRENCY]);
         egress.shutdown().await.unwrap();
     }
 

@@ -9,7 +9,7 @@ use std::path::Path;
 mod egress;
 mod resource;
 
-use self::egress::TempoEgress;
+use self::egress::{PreferredChargeCurrency, TempoEgress};
 use clap::{ArgAction, Args, builder::NonEmptyStringValueParser};
 use eyre::{Context, Result, eyre};
 use mpp::{
@@ -153,6 +153,7 @@ impl MppArgs {
         let egress = EgressProxy::builder()
             .allow_loopback_upstreams(allow_loopback)
             .layer(TempoEgress::new(provider))
+            .layer(PreferredChargeCurrency::new(NANOUSD_ADDRESS))
             .spawn()
             .await
             .wrap_err("failed to start the embedded MPP egress proxy")?;
