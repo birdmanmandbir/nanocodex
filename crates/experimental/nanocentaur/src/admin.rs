@@ -121,6 +121,15 @@ fn authorize(state: &ApiState, headers: &HeaderMap) -> Result<(), ApiError> {
     Ok(())
 }
 
+async fn policy<T, F>(state: &ApiState, headers: &HeaderMap, operation: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce(&crate::PolicyStore) -> Result<T, crate::PolicyError> + Send + 'static,
+{
+    authorize(state, headers)?;
+    state.policy_call(operation).await
+}
+
 fn observe_request(operation: &'static str, request: &impl Debug) {
     tracing::info!(
         target: "nanocentaur::observed",
@@ -136,10 +145,14 @@ async fn create_api_client(
     Json(request): Json<CreateApiClient>,
 ) -> Result<(StatusCode, Json<crate::ApiClientView>), ApiError> {
     observe_request("api_client.create", &request);
-    authorize(&state, &headers)?;
     Ok((
         StatusCode::CREATED,
-        Json(state.policy.create_api_client(request)?),
+        Json(
+            policy(&state, &headers, move |store| {
+                store.create_api_client(request)
+            })
+            .await?,
+        ),
     ))
 }
 
@@ -147,8 +160,9 @@ async fn list_api_clients(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<crate::ApiClientView>>, ApiError> {
-    authorize(&state, &headers)?;
-    Ok(Json(state.policy.api_clients()?))
+    Ok(Json(
+        policy(&state, &headers, crate::PolicyStore::api_clients).await?,
+    ))
 }
 
 async fn get_api_client(
@@ -156,8 +170,9 @@ async fn get_api_client(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<crate::ApiClientView>, ApiError> {
-    authorize(&state, &headers)?;
-    Ok(Json(state.policy.api_client(&id)?))
+    Ok(Json(
+        policy(&state, &headers, move |store| store.api_client(&id)).await?,
+    ))
 }
 
 async fn patch_api_client(
@@ -167,8 +182,12 @@ async fn patch_api_client(
     Json(patch): Json<PatchApiClient>,
 ) -> Result<Json<crate::ApiClientView>, ApiError> {
     observe_request("api_client.patch", &patch);
-    authorize(&state, &headers)?;
-    Ok(Json(state.policy.patch_api_client(&id, patch)?))
+    Ok(Json(
+        policy(&state, &headers, move |store| {
+            store.patch_api_client(&id, patch)
+        })
+        .await?,
+    ))
 }
 
 async fn delete_api_client(
@@ -176,8 +195,7 @@ async fn delete_api_client(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    authorize(&state, &headers)?;
-    state.policy.disable_api_client(&id)?;
+    policy(&state, &headers, move |store| store.disable_api_client(&id)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -188,10 +206,14 @@ async fn add_api_key(
     Json(request): Json<CreateApiKey>,
 ) -> Result<(StatusCode, Json<crate::ApiKeyView>), ApiError> {
     observe_request("api_key.create", &request);
-    authorize(&state, &headers)?;
     Ok((
         StatusCode::CREATED,
-        Json(state.policy.add_api_key(&id, request)?),
+        Json(
+            policy(&state, &headers, move |store| {
+                store.add_api_key(&id, request)
+            })
+            .await?,
+        ),
     ))
 }
 
@@ -200,8 +222,10 @@ async fn delete_api_key(
     headers: HeaderMap,
     Path((id, key_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    authorize(&state, &headers)?;
-    state.policy.delete_api_key(&id, &key_id)?;
+    policy(&state, &headers, move |store| {
+        store.delete_api_key(&id, &key_id)
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -211,10 +235,14 @@ async fn create_principal(
     Json(request): Json<CreatePrincipal>,
 ) -> Result<(StatusCode, Json<crate::PrincipalView>), ApiError> {
     observe_request("principal.create", &request);
-    authorize(&state, &headers)?;
     Ok((
         StatusCode::CREATED,
-        Json(state.policy.create_principal(request)?),
+        Json(
+            policy(&state, &headers, move |store| {
+                store.create_principal(request)
+            })
+            .await?,
+        ),
     ))
 }
 
@@ -222,8 +250,9 @@ async fn list_principals(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<crate::PrincipalView>>, ApiError> {
-    authorize(&state, &headers)?;
-    Ok(Json(state.policy.principals()?))
+    Ok(Json(
+        policy(&state, &headers, crate::PolicyStore::principals).await?,
+    ))
 }
 
 async fn get_principal(
@@ -231,8 +260,9 @@ async fn get_principal(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<crate::PrincipalView>, ApiError> {
-    authorize(&state, &headers)?;
-    Ok(Json(state.policy.principal(&id)?))
+    Ok(Json(
+        policy(&state, &headers, move |store| store.principal(&id)).await?,
+    ))
 }
 
 async fn patch_principal(
@@ -242,8 +272,12 @@ async fn patch_principal(
     Json(patch): Json<PatchPrincipal>,
 ) -> Result<Json<crate::PrincipalView>, ApiError> {
     observe_request("principal.patch", &patch);
-    authorize(&state, &headers)?;
-    Ok(Json(state.policy.patch_principal(&id, patch)?))
+    Ok(Json(
+        policy(&state, &headers, move |store| {
+            store.patch_principal(&id, patch)
+        })
+        .await?,
+    ))
 }
 
 async fn delete_principal(
@@ -251,8 +285,7 @@ async fn delete_principal(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    authorize(&state, &headers)?;
-    state.policy.disable_principal(&id)?;
+    policy(&state, &headers, move |store| store.disable_principal(&id)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -262,10 +295,14 @@ async fn create_context_binding(
     Json(request): Json<CreateContextBinding>,
 ) -> Result<(StatusCode, Json<crate::ContextBindingView>), ApiError> {
     observe_request("context_binding.create", &request);
-    authorize(&state, &headers)?;
     Ok((
         StatusCode::CREATED,
-        Json(state.policy.create_context_binding(request)?),
+        Json(
+            policy(&state, &headers, move |store| {
+                store.create_context_binding(request)
+            })
+            .await?,
+        ),
     ))
 }
 
@@ -273,8 +310,9 @@ async fn list_context_bindings(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<crate::ContextBindingView>>, ApiError> {
-    authorize(&state, &headers)?;
-    Ok(Json(state.policy.context_bindings()?))
+    Ok(Json(
+        policy(&state, &headers, crate::PolicyStore::context_bindings).await?,
+    ))
 }
 
 async fn get_context_binding(
@@ -282,8 +320,9 @@ async fn get_context_binding(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<crate::ContextBindingView>, ApiError> {
-    authorize(&state, &headers)?;
-    Ok(Json(state.policy.context_binding(&id)?))
+    Ok(Json(
+        policy(&state, &headers, move |store| store.context_binding(&id)).await?,
+    ))
 }
 
 async fn patch_context_binding(
@@ -293,8 +332,12 @@ async fn patch_context_binding(
     Json(patch): Json<PatchContextBinding>,
 ) -> Result<Json<crate::ContextBindingView>, ApiError> {
     observe_request("context_binding.patch", &patch);
-    authorize(&state, &headers)?;
-    Ok(Json(state.policy.patch_context_binding(&id, patch)?))
+    Ok(Json(
+        policy(&state, &headers, move |store| {
+            store.patch_context_binding(&id, patch)
+        })
+        .await?,
+    ))
 }
 
 async fn delete_context_binding(
@@ -302,8 +345,10 @@ async fn delete_context_binding(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    authorize(&state, &headers)?;
-    state.policy.delete_context_binding(&id)?;
+    policy(&state, &headers, move |store| {
+        store.delete_context_binding(&id)
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -313,8 +358,12 @@ async fn resolve_context(
     Json(request): Json<ResolveContext>,
 ) -> Result<Json<crate::ResolvedContextView>, ApiError> {
     observe_request("context_binding.resolve", &request);
-    authorize(&state, &headers)?;
-    Ok(Json(state.policy.resolve_context(request)?))
+    Ok(Json(
+        policy(&state, &headers, move |store| {
+            store.resolve_context(request)
+        })
+        .await?,
+    ))
 }
 
 async fn create_role(
@@ -323,10 +372,9 @@ async fn create_role(
     Json(request): Json<CreateRole>,
 ) -> Result<(StatusCode, Json<crate::RoleView>), ApiError> {
     observe_request("role.create", &request);
-    authorize(&state, &headers)?;
     Ok((
         StatusCode::CREATED,
-        Json(state.policy.create_role(request)?),
+        Json(policy(&state, &headers, move |store| store.create_role(request)).await?),
     ))
 }
 
@@ -334,8 +382,9 @@ async fn list_roles(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<crate::RoleView>>, ApiError> {
-    authorize(&state, &headers)?;
-    Ok(Json(state.policy.roles()?))
+    Ok(Json(
+        policy(&state, &headers, crate::PolicyStore::roles).await?,
+    ))
 }
 
 async fn get_role(
@@ -343,8 +392,9 @@ async fn get_role(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<crate::RoleView>, ApiError> {
-    authorize(&state, &headers)?;
-    Ok(Json(state.policy.role(&id)?))
+    Ok(Json(
+        policy(&state, &headers, move |store| store.role(&id)).await?,
+    ))
 }
 
 async fn patch_role(
@@ -354,8 +404,9 @@ async fn patch_role(
     Json(patch): Json<PatchRole>,
 ) -> Result<Json<crate::RoleView>, ApiError> {
     observe_request("role.patch", &patch);
-    authorize(&state, &headers)?;
-    Ok(Json(state.policy.patch_role(&id, patch)?))
+    Ok(Json(
+        policy(&state, &headers, move |store| store.patch_role(&id, patch)).await?,
+    ))
 }
 
 async fn delete_role(
@@ -363,8 +414,7 @@ async fn delete_role(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    authorize(&state, &headers)?;
-    state.policy.delete_role(&id)?;
+    policy(&state, &headers, move |store| store.delete_role(&id)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -374,10 +424,14 @@ async fn create_permission(
     Json(request): Json<CreatePermission>,
 ) -> Result<(StatusCode, Json<crate::PermissionView>), ApiError> {
     observe_request("permission.create", &request);
-    authorize(&state, &headers)?;
     Ok((
         StatusCode::CREATED,
-        Json(state.policy.create_permission(request)?),
+        Json(
+            policy(&state, &headers, move |store| {
+                store.create_permission(request)
+            })
+            .await?,
+        ),
     ))
 }
 
@@ -385,8 +439,9 @@ async fn list_permissions(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<crate::PermissionView>>, ApiError> {
-    authorize(&state, &headers)?;
-    Ok(Json(state.policy.permissions()?))
+    Ok(Json(
+        policy(&state, &headers, crate::PolicyStore::permissions).await?,
+    ))
 }
 
 async fn get_permission(
@@ -394,8 +449,9 @@ async fn get_permission(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<crate::PermissionView>, ApiError> {
-    authorize(&state, &headers)?;
-    Ok(Json(state.policy.permission(&id)?))
+    Ok(Json(
+        policy(&state, &headers, move |store| store.permission(&id)).await?,
+    ))
 }
 
 async fn delete_permission(
@@ -403,8 +459,7 @@ async fn delete_permission(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    authorize(&state, &headers)?;
-    state.policy.delete_permission(&id)?;
+    policy(&state, &headers, move |store| store.delete_permission(&id)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -413,10 +468,10 @@ async fn add_principal_role(
     headers: HeaderMap,
     Path((principal_id, role_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    authorize(&state, &headers)?;
-    state
-        .policy
-        .set_principal_role(&principal_id, &role_id, true)?;
+    policy(&state, &headers, move |store| {
+        store.set_principal_role(&principal_id, &role_id, true)
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -425,10 +480,10 @@ async fn remove_principal_role(
     headers: HeaderMap,
     Path((principal_id, role_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    authorize(&state, &headers)?;
-    state
-        .policy
-        .set_principal_role(&principal_id, &role_id, false)?;
+    policy(&state, &headers, move |store| {
+        store.set_principal_role(&principal_id, &role_id, false)
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -437,8 +492,12 @@ async fn list_principal_roles(
     headers: HeaderMap,
     Path(principal_id): Path<String>,
 ) -> Result<Json<Vec<crate::RoleView>>, ApiError> {
-    authorize(&state, &headers)?;
-    Ok(Json(state.policy.principal_roles(&principal_id)?))
+    Ok(Json(
+        policy(&state, &headers, move |store| {
+            store.principal_roles(&principal_id)
+        })
+        .await?,
+    ))
 }
 
 async fn add_role_permission(
@@ -446,10 +505,10 @@ async fn add_role_permission(
     headers: HeaderMap,
     Path((role_id, permission_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    authorize(&state, &headers)?;
-    state
-        .policy
-        .set_role_permission(&role_id, &permission_id, true)?;
+    policy(&state, &headers, move |store| {
+        store.set_role_permission(&role_id, &permission_id, true)
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -458,10 +517,10 @@ async fn remove_role_permission(
     headers: HeaderMap,
     Path((role_id, permission_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    authorize(&state, &headers)?;
-    state
-        .policy
-        .set_role_permission(&role_id, &permission_id, false)?;
+    policy(&state, &headers, move |store| {
+        store.set_role_permission(&role_id, &permission_id, false)
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -470,8 +529,12 @@ async fn list_role_permissions(
     headers: HeaderMap,
     Path(role_id): Path<String>,
 ) -> Result<Json<Vec<crate::PermissionView>>, ApiError> {
-    authorize(&state, &headers)?;
-    Ok(Json(state.policy.role_permissions(&role_id)?))
+    Ok(Json(
+        policy(&state, &headers, move |store| {
+            store.role_permissions(&role_id)
+        })
+        .await?,
+    ))
 }
 
 async fn add_principal_permission(
@@ -479,10 +542,10 @@ async fn add_principal_permission(
     headers: HeaderMap,
     Path((principal_id, permission_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    authorize(&state, &headers)?;
-    state
-        .policy
-        .set_principal_permission(&principal_id, &permission_id, true)?;
+    policy(&state, &headers, move |store| {
+        store.set_principal_permission(&principal_id, &permission_id, true)
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -491,10 +554,10 @@ async fn remove_principal_permission(
     headers: HeaderMap,
     Path((principal_id, permission_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    authorize(&state, &headers)?;
-    state
-        .policy
-        .set_principal_permission(&principal_id, &permission_id, false)?;
+    policy(&state, &headers, move |store| {
+        store.set_principal_permission(&principal_id, &permission_id, false)
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -503,8 +566,12 @@ async fn list_principal_permissions(
     headers: HeaderMap,
     Path(principal_id): Path<String>,
 ) -> Result<Json<Vec<crate::PermissionView>>, ApiError> {
-    authorize(&state, &headers)?;
-    Ok(Json(state.policy.principal_permissions(&principal_id)?))
+    Ok(Json(
+        policy(&state, &headers, move |store| {
+            store.principal_permissions(&principal_id)
+        })
+        .await?,
+    ))
 }
 
 async fn effective_permissions(
@@ -512,8 +579,12 @@ async fn effective_permissions(
     headers: HeaderMap,
     Path(principal_id): Path<String>,
 ) -> Result<Json<Vec<crate::PermissionView>>, ApiError> {
-    authorize(&state, &headers)?;
-    Ok(Json(state.policy.effective_permissions(&principal_id)?))
+    Ok(Json(
+        policy(&state, &headers, move |store| {
+            store.effective_permissions(&principal_id)
+        })
+        .await?,
+    ))
 }
 
 async fn create_secret(
@@ -522,10 +593,9 @@ async fn create_secret(
     Json(request): Json<CreateSecret>,
 ) -> Result<(StatusCode, Json<crate::SecretView>), ApiError> {
     observe_request("secret.create", &request);
-    authorize(&state, &headers)?;
     Ok((
         StatusCode::CREATED,
-        Json(state.policy.create_secret(request)?),
+        Json(policy(&state, &headers, move |store| store.create_secret(request)).await?),
     ))
 }
 
@@ -533,8 +603,9 @@ async fn list_secrets(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<crate::SecretView>>, ApiError> {
-    authorize(&state, &headers)?;
-    Ok(Json(state.policy.secrets()?))
+    Ok(Json(
+        policy(&state, &headers, crate::PolicyStore::secrets).await?,
+    ))
 }
 
 async fn get_secret(
@@ -542,8 +613,9 @@ async fn get_secret(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<crate::SecretView>, ApiError> {
-    authorize(&state, &headers)?;
-    Ok(Json(state.policy.secret(&id)?))
+    Ok(Json(
+        policy(&state, &headers, move |store| store.secret(&id)).await?,
+    ))
 }
 
 async fn patch_secret(
@@ -553,8 +625,12 @@ async fn patch_secret(
     Json(patch): Json<PatchSecret>,
 ) -> Result<Json<crate::SecretView>, ApiError> {
     observe_request("secret.patch", &patch);
-    authorize(&state, &headers)?;
-    Ok(Json(state.policy.patch_secret(&id, patch)?))
+    Ok(Json(
+        policy(&state, &headers, move |store| {
+            store.patch_secret(&id, patch)
+        })
+        .await?,
+    ))
 }
 
 async fn delete_secret(
@@ -562,8 +638,7 @@ async fn delete_secret(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    authorize(&state, &headers)?;
-    state.policy.delete_secret(&id)?;
+    policy(&state, &headers, move |store| store.delete_secret(&id)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -572,8 +647,12 @@ async fn list_principal_secrets(
     headers: HeaderMap,
     Path(principal_id): Path<String>,
 ) -> Result<Json<Vec<crate::SecretView>>, ApiError> {
-    authorize(&state, &headers)?;
-    Ok(Json(state.policy.principal_secrets(&principal_id)?))
+    Ok(Json(
+        policy(&state, &headers, move |store| {
+            store.principal_secrets(&principal_id)
+        })
+        .await?,
+    ))
 }
 
 async fn add_principal_secret(
@@ -581,10 +660,10 @@ async fn add_principal_secret(
     headers: HeaderMap,
     Path((principal_id, secret_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    authorize(&state, &headers)?;
-    state
-        .policy
-        .set_principal_secret(&principal_id, &secret_id, true)?;
+    policy(&state, &headers, move |store| {
+        store.set_principal_secret(&principal_id, &secret_id, true)
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -593,10 +672,10 @@ async fn remove_principal_secret(
     headers: HeaderMap,
     Path((principal_id, secret_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    authorize(&state, &headers)?;
-    state
-        .policy
-        .set_principal_secret(&principal_id, &secret_id, false)?;
+    policy(&state, &headers, move |store| {
+        store.set_principal_secret(&principal_id, &secret_id, false)
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -605,8 +684,9 @@ async fn list_role_secrets(
     headers: HeaderMap,
     Path(role_id): Path<String>,
 ) -> Result<Json<Vec<crate::SecretView>>, ApiError> {
-    authorize(&state, &headers)?;
-    Ok(Json(state.policy.role_secrets(&role_id)?))
+    Ok(Json(
+        policy(&state, &headers, move |store| store.role_secrets(&role_id)).await?,
+    ))
 }
 
 async fn add_role_secret(
@@ -614,8 +694,10 @@ async fn add_role_secret(
     headers: HeaderMap,
     Path((role_id, secret_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    authorize(&state, &headers)?;
-    state.policy.set_role_secret(&role_id, &secret_id, true)?;
+    policy(&state, &headers, move |store| {
+        store.set_role_secret(&role_id, &secret_id, true)
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -624,8 +706,10 @@ async fn remove_role_secret(
     headers: HeaderMap,
     Path((role_id, secret_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    authorize(&state, &headers)?;
-    state.policy.set_role_secret(&role_id, &secret_id, false)?;
+    policy(&state, &headers, move |store| {
+        store.set_role_secret(&role_id, &secret_id, false)
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -634,6 +718,10 @@ async fn effective_secrets(
     headers: HeaderMap,
     Path(principal_id): Path<String>,
 ) -> Result<Json<Vec<crate::SecretView>>, ApiError> {
-    authorize(&state, &headers)?;
-    Ok(Json(state.policy.effective_secrets(&principal_id)?))
+    Ok(Json(
+        policy(&state, &headers, move |store| {
+            store.effective_secrets(&principal_id)
+        })
+        .await?,
+    ))
 }

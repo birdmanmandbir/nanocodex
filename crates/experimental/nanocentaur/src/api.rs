@@ -36,6 +36,7 @@ pub struct ApiState {
     pub(crate) admin: Arc<AdminAuthorizer>,
     pub(crate) payments: Arc<dyn PaymentGate>,
     idempotency_locks: IdempotencyLocks,
+    agent_locks: AgentLocks,
 }
 
 impl ApiState {
@@ -48,18 +49,27 @@ impl ApiState {
         admin: Arc<AdminAuthorizer>,
         payments: Arc<dyn PaymentGate>,
     ) -> Self {
+        manager.attach_policy(Arc::clone(&policy));
         Self {
             manager,
             policy,
             admin,
             payments,
             idempotency_locks: IdempotencyLocks::default(),
+            agent_locks: AgentLocks::default(),
         }
     }
 
     /// Builds the REST/SSE router owned by this state.
     pub fn router(self) -> Router {
         router(Arc::new(self))
+    }
+
+    pub(crate) async fn policy_call<T>(
+        &self,
+        operation: impl FnOnce(&PolicyStore) -> Result<T, PolicyError>,
+    ) -> Result<T, ApiError> {
+        operation(&self.policy).map_err(Into::into)
     }
 }
 
@@ -70,6 +80,11 @@ struct IdempotencyLocks {
 
 type IdempotencyScope = (String, String);
 type IdempotencyLock = tokio::sync::Mutex<()>;
+
+#[derive(Default)]
+struct AgentLocks {
+    locks: tokio::sync::Mutex<HashMap<String, Weak<IdempotencyLock>>>,
+}
 
 impl IdempotencyLocks {
     async fn acquire(&self, agent_id: String, key: String) -> tokio::sync::OwnedMutexGuard<()> {
@@ -84,6 +99,25 @@ impl IdempotencyLocks {
             } else {
                 let lock = Arc::new(tokio::sync::Mutex::new(()));
                 locks.insert(scope, Arc::downgrade(&lock));
+                lock
+            }
+        };
+        lock.lock_owned().await
+    }
+}
+
+impl AgentLocks {
+    async fn acquire(&self, agent_id: String) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.locks.lock().await;
+            if locks.len() >= 1_024 {
+                locks.retain(|_, lock| lock.strong_count() > 0);
+            }
+            if let Some(lock) = locks.get(&agent_id).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(agent_id, Arc::downgrade(&lock));
                 lock
             }
         };
@@ -175,10 +209,20 @@ async fn create_agent(
         request = ?request,
         "create agent request observed"
     );
-    let client = state.policy.authenticate(&headers)?;
-    let (identity, created) = state
-        .policy
-        .create_or_resolve_agent(&client, request.context_key.as_deref())?;
+    let context_key = request.context_key;
+    let (identity, created, client) = state
+        .policy_call(move |policy| {
+            let client = policy.authenticate(&headers)?;
+            let (identity, created) =
+                policy.create_or_resolve_agent(&client, context_key.as_deref())?;
+            Ok((identity, created, client))
+        })
+        .await?;
+    let _agent_guard = state.agent_locks.acquire(identity.id.clone()).await;
+    let agent_id = identity.id;
+    let identity = state
+        .policy_call(move |policy| policy.agent(&client, &agent_id))
+        .await?;
     let view = state.manager.register(identity).await?;
     let response = CreateAgentResponse {
         agent_id: view.agent_id,
@@ -201,7 +245,8 @@ async fn get_agent(
     headers: HeaderMap,
     Path(agent_id): Path<String>,
 ) -> Result<Json<crate::AgentView>, ApiError> {
-    let (identity, _) = authorize_agent(&state, &headers, &agent_id, "agent.read")?;
+    let _agent_guard = state.agent_locks.acquire(agent_id.clone()).await;
+    let (identity, _) = authorize_agent(&state, &headers, &agent_id, "agent.read").await?;
     Ok(Json(state.manager.get(identity).await?))
 }
 
@@ -210,9 +255,20 @@ async fn delete_agent(
     headers: HeaderMap,
     Path(agent_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let (_, client) = authorize_agent(&state, &headers, &agent_id, "agent.delete")?;
+    let _agent_guard = state.agent_locks.acquire(agent_id.clone()).await;
+    let headers_for_delete = headers.clone();
+    let agent_for_delete = agent_id.clone();
+    let client = state
+        .policy_call(move |policy| {
+            let client = policy.authenticate(&headers_for_delete)?;
+            policy.begin_delete_agent(&client, &agent_for_delete)?;
+            Ok(client)
+        })
+        .await?;
     state.manager.delete(&agent_id).await?;
-    state.policy.delete_agent(&client, &agent_id)?;
+    state
+        .policy_call(move |policy| policy.finish_delete_agent(&client, &agent_id))
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -228,7 +284,8 @@ async fn create_turn(
         request = ?request,
         "create turn request observed"
     );
-    let (identity, _) = authorize_agent(&state, &headers, &agent_id, "agent.turn")?;
+    let _agent_guard = state.agent_locks.acquire(agent_id.clone()).await;
+    let (identity, _) = authorize_agent(&state, &headers, &agent_id, "agent.turn").await?;
     let idempotency_key = idempotency_key(&headers)?;
     let _idempotency_guard = if let Some(key) = &idempotency_key {
         Some(
@@ -241,29 +298,60 @@ async fn create_turn(
         None
     };
     if let Some(key) = idempotency_key.as_deref()
-        && let Some(response) = state
+        && let Some(replay) = state
             .manager
-            .find_turn_by_idempotency_key(identity.clone(), key)
+            .find_turn_replay(identity.clone(), key, &request)
             .await?
     {
-        return Ok(Json(response).into_response());
+        let status = turn_action_status(replay.response.action);
+        let mut response = (status, Json(replay.response)).into_response();
+        if let Some(receipt) = replay.payment_receipt {
+            insert_receipt(&mut response, &receipt)?;
+        }
+        return Ok(response);
     }
+    crate::manager::validate_turn_request(&request)?;
 
     let receipt = match state.payments.authorize(&headers).await? {
         PaymentOutcome::Authorized(receipt) => receipt,
         outcome => return payment_response(outcome),
     };
-    let response = state
+    let receipt_header = HeaderValue::from_str(&receipt.header_value).map_err(|error| {
+        tracing::error!(%error, "payment gate returned an invalid receipt header");
+        ApiError::Internal
+    })?;
+    let response = match state
         .manager
-        .create_turn(identity, request, idempotency_key)
-        .await?;
-    let status = match response.action {
+        .create_turn_with_receipt(
+            identity,
+            request,
+            idempotency_key,
+            Some(receipt.header_value.clone()),
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            let mut response = ApiError::from(error).into_response();
+            response
+                .headers_mut()
+                .insert(HeaderName::from_static("payment-receipt"), receipt_header);
+            return Ok(response);
+        }
+    };
+    let status = turn_action_status(response.action);
+    let mut response = (status, Json(response)).into_response();
+    response
+        .headers_mut()
+        .insert(HeaderName::from_static("payment-receipt"), receipt_header);
+    Ok(response)
+}
+
+const fn turn_action_status(action: TurnAction) -> StatusCode {
+    match action {
         TurnAction::Steered => StatusCode::OK,
         TurnAction::Started | TurnAction::Queued => StatusCode::ACCEPTED,
-    };
-    let mut response = (status, Json(response)).into_response();
-    insert_receipt(&mut response, &receipt.header_value)?;
-    Ok(response)
+    }
 }
 
 async fn get_turn(
@@ -271,7 +359,8 @@ async fn get_turn(
     headers: HeaderMap,
     Path((agent_id, turn_id)): Path<(String, String)>,
 ) -> Result<Json<TurnView>, ApiError> {
-    let (identity, _) = authorize_agent(&state, &headers, &agent_id, "agent.read")?;
+    let _agent_guard = state.agent_locks.acquire(agent_id.clone()).await;
+    let (identity, _) = authorize_agent(&state, &headers, &agent_id, "agent.read").await?;
     Ok(Json(state.manager.get_turn(identity, &turn_id).await?))
 }
 
@@ -286,7 +375,8 @@ async fn agent_events(
     Path(agent_id): Path<String>,
     Query(query): Query<EventsQuery>,
 ) -> Result<Response, ApiError> {
-    let (identity, _) = authorize_agent(&state, &headers, &agent_id, "agent.read")?;
+    let _agent_guard = state.agent_locks.acquire(agent_id.clone()).await;
+    let (identity, _) = authorize_agent(&state, &headers, &agent_id, "agent.read").await?;
     let after_event_id = last_event_id(&headers)?
         .or(query.after_event_id)
         .unwrap_or(0);
@@ -320,7 +410,8 @@ async fn cancel_turn(
     headers: HeaderMap,
     Path((agent_id, turn_id)): Path<(String, String)>,
 ) -> Result<Json<CancelTurnResponse>, ApiError> {
-    let (identity, _) = authorize_agent(&state, &headers, &agent_id, "agent.cancel")?;
+    let _agent_guard = state.agent_locks.acquire(agent_id.clone()).await;
+    let (identity, _) = authorize_agent(&state, &headers, &agent_id, "agent.cancel").await?;
     let cancelled = state.manager.cancel_turn(identity, &turn_id).await?;
     Ok(Json(CancelTurnResponse {
         cancel_requested: cancelled,
@@ -337,7 +428,8 @@ async fn evict_agent(
     headers: HeaderMap,
     Path(agent_id): Path<String>,
 ) -> Result<Json<EvictAgentResponse>, ApiError> {
-    let (identity, _) = authorize_agent(&state, &headers, &agent_id, "agent.evict")?;
+    let _agent_guard = state.agent_locks.acquire(agent_id.clone()).await;
+    let (identity, _) = authorize_agent(&state, &headers, &agent_id, "agent.evict").await?;
     let evicted = state.manager.evict(identity).await?;
     Ok(Json(EvictAgentResponse { evicted }))
 }
@@ -364,16 +456,50 @@ async fn fork_agent(
     agent_id: &str,
     turn_id: Option<&str>,
 ) -> Result<Response, ApiError> {
-    let (source, client) = authorize_agent(state, headers, agent_id, "agent.fork")?;
-    let target = state.policy.fork_agent(&client, agent_id)?;
+    let _agent_guard = state.agent_locks.acquire(agent_id.to_owned()).await;
+    let (source, client) = authorize_agent(state, headers, agent_id, "agent.fork").await?;
+    let client_for_fork = client.clone();
+    let source_agent_id = agent_id.to_owned();
+    let target = state
+        .policy_call(move |policy| policy.fork_agent(&client_for_fork, &source_agent_id))
+        .await?;
     match state.manager.fork(source, target.clone(), turn_id).await {
-        Ok(response) => Ok((StatusCode::CREATED, Json(response)).into_response()),
-        Err(error) => {
-            if let Err(cleanup_error) = state.policy.delete_agent(&client, &target.id) {
-                tracing::warn!(%cleanup_error, "failed to clean up fork registry record");
+        Ok(response) => {
+            let client_for_activation = client.clone();
+            let target_id = target.id.clone();
+            if let Err(error) = state
+                .policy_call(move |policy| {
+                    policy.activate_agent(&client_for_activation, &target_id)
+                })
+                .await
+            {
+                cleanup_failed_fork(state, &client, &target).await;
+                return Err(error);
             }
+            Ok((StatusCode::CREATED, Json(response)).into_response())
+        }
+        Err(error) => {
+            cleanup_failed_fork(state, &client, &target).await;
             Err(error.into())
         }
+    }
+}
+
+async fn cleanup_failed_fork(
+    state: &ApiState,
+    client: &crate::AuthenticatedClient,
+    target: &crate::AgentIdentity,
+) {
+    if let Err(error) = state.manager.delete(&target.id).await {
+        tracing::warn!(%error, "failed to clean up fork session state");
+    }
+    let client = client.clone();
+    let target_id = target.id.clone();
+    if let Err(error) = state
+        .policy_call(move |policy| policy.abort_provisioning_agent(&client, &target_id))
+        .await
+    {
+        tracing::warn!(error = ?error, "failed to clean up fork registry record");
     }
 }
 
@@ -381,20 +507,29 @@ async fn payment_session(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let _ = state.policy.authenticate(&headers)?;
+    let authentication_headers = headers.clone();
+    state
+        .policy_call(move |policy| policy.authenticate(&authentication_headers).map(drop))
+        .await?;
     payment_response(state.payments.authorize(&headers).await?)
 }
 
-fn authorize_agent(
+async fn authorize_agent(
     state: &ApiState,
     headers: &HeaderMap,
     agent_id: &str,
-    permission: &str,
+    permission: &'static str,
 ) -> Result<(crate::AgentIdentity, crate::AuthenticatedClient), ApiError> {
-    let client = state.policy.authenticate(headers)?;
-    let identity = state.policy.agent(&client, agent_id)?;
-    require(&identity.principal, permission)?;
-    Ok((identity, client))
+    let headers = headers.clone();
+    let agent_id = agent_id.to_owned();
+    state
+        .policy_call(move |policy| {
+            let client = policy.authenticate(&headers)?;
+            let identity = policy.agent(&client, &agent_id)?;
+            require(&identity.principal, permission)?;
+            Ok((identity, client))
+        })
+        .await
 }
 
 fn payment_response(outcome: PaymentOutcome) -> Result<Response, ApiError> {
@@ -465,6 +600,7 @@ fn optional_header(
         .transpose()
 }
 
+#[derive(Debug)]
 pub(crate) enum ApiError {
     Authorization(AuthorizationError),
     Policy(PolicyError),
@@ -519,6 +655,11 @@ impl IntoResponse for ApiError {
                 StatusCode::CONFLICT,
                 "steer_queue_full",
                 "active turn steering queue is full",
+            ),
+            Self::Manager(ManagerError::IdempotencyConflict) => (
+                StatusCode::CONFLICT,
+                "idempotency_conflict",
+                "Idempotency-Key was already used for a different request",
             ),
             Self::Manager(ManagerError::AgentBusy) => (
                 StatusCode::CONFLICT,
@@ -753,10 +894,69 @@ mod tests {
             app.clone().oneshot(request()),
             app.clone().oneshot(request())
         );
-        let statuses = [first.unwrap().status(), second.unwrap().status()];
-        assert!(statuses.contains(&StatusCode::ACCEPTED));
-        assert!(statuses.contains(&StatusCode::OK));
+        let first = first.unwrap();
+        let second = second.unwrap();
+        let statuses = [first.status(), second.status()];
+        assert_eq!(statuses, [StatusCode::ACCEPTED, StatusCode::ACCEPTED]);
+        assert_eq!(first.headers()["payment-receipt"], "counted");
+        assert_eq!(second.headers()["payment-receipt"], "counted");
         assert_eq!(payments.authorizations.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_turns_are_rejected_before_payment_authorization() {
+        let factory: Arc<dyn ManagedAgentFactory> =
+            Arc::new(MockAgentFactory::new(Duration::from_millis(5)));
+        let directory = tempfile::tempdir().unwrap().keep();
+        let policy = Arc::new(PolicyStore::in_memory().unwrap());
+        policy
+            .bootstrap("test", "Test", "test-key", "test", [])
+            .unwrap();
+        let payments = Arc::new(CountingPaymentGate {
+            authorizations: AtomicUsize::new(0),
+        });
+        let state = Arc::new(ApiState::new(
+            Arc::new(AgentManager::new(factory, directory).unwrap()),
+            policy,
+            Arc::new(AdminAuthorizer::new("admin-key").unwrap()),
+            payments.clone(),
+        ));
+        let app = router(state);
+        let agent_id = create_test_agent(&app, "context:invalid-unpaid").await;
+        let response = app
+            .oneshot(
+                Request::post(format!("/v1/agent/{agent_id}/turn"))
+                    .header("x-api-key", "test-key")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"content":[]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(payments.authorizations.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn idempotency_key_reuse_with_different_content_is_rejected() {
+        let app = test_app(Duration::from_millis(50));
+        let agent_id = create_test_agent(&app, "context:idempotency-conflict").await;
+        let send = |text: &'static str| {
+            Request::post(format!("/v1/agent/{agent_id}/turn"))
+                .header("x-api-key", "test-key")
+                .header("idempotency-key", "same-key")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"content":[{{"type":"text","text":"{text}"}}]}}"#
+                )))
+                .unwrap()
+        };
+        let first = app.clone().oneshot(send("first")).await.unwrap();
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let conflict = app.oneshot(send("different")).await.unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        let body = response_json::<serde_json::Value>(conflict).await;
+        assert_eq!(body["error"]["code"], "idempotency_conflict");
     }
 
     #[tokio::test]

@@ -477,6 +477,7 @@ impl PolicyStore {
                 context_key TEXT,
                 principal_id TEXT NOT NULL REFERENCES principals(id),
                 agent_config_json TEXT NOT NULL,
+                lifecycle_state TEXT NOT NULL DEFAULT 'active',
                 created_at TEXT NOT NULL,
                 UNIQUE(owner_client_id, context_key)
             );
@@ -492,6 +493,7 @@ impl PolicyStore {
             );
             ",
         )?;
+        ensure_agent_lifecycle_column(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -590,15 +592,20 @@ impl PolicyStore {
         let mut connection = self.lock()?;
         let transaction = connection.transaction()?;
         if let Some(context_key) = context_key
-            && let Some(agent_id) = transaction
+            && let Some((agent_id, lifecycle_state)) = transaction
                 .query_row(
-                    "SELECT id FROM agents
+                    "SELECT id, lifecycle_state FROM agents
                      WHERE owner_client_id = ?1 AND context_key = ?2",
                     params![client.id, context_key],
-                    |row| row.get::<_, String>(0),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                 )
                 .optional()?
         {
+            if lifecycle_state != "active" {
+                return Err(PolicyError::Invalid(
+                    "agent lifecycle operation is still in progress",
+                ));
+            }
             let identity = agent_identity(&transaction, &client.id, &agent_id)?;
             require(&identity.principal, "agent.read")?;
             transaction.commit()?;
@@ -618,8 +625,9 @@ impl PolicyStore {
         let created_at = now();
         transaction.execute(
             "INSERT INTO agents
-             (id, owner_client_id, context_key, principal_id, agent_config_json, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             (id, owner_client_id, context_key, principal_id, agent_config_json,
+              lifecycle_state, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6)",
             params![
                 id,
                 client.id,
@@ -645,7 +653,16 @@ impl PolicyStore {
         agent_identity(&connection, &client.id, agent_id)
     }
 
-    /// Creates a fresh managed identity with the source agent's principal.
+    pub(crate) fn agent_for_runtime(
+        &self,
+        owner_client_id: &str,
+        agent_id: &str,
+    ) -> Result<AgentIdentity, PolicyError> {
+        let connection = self.lock()?;
+        agent_identity(&connection, owner_client_id, agent_id)
+    }
+
+    /// Creates a hidden provisioning identity with the source agent's principal.
     pub fn fork_agent(
         &self,
         client: &AuthenticatedClient,
@@ -659,34 +676,93 @@ impl PolicyStore {
         let created_at = now();
         transaction.execute(
             "INSERT INTO agents
-             (id, owner_client_id, context_key, principal_id, agent_config_json, created_at)
-             SELECT ?1, owner_client_id, NULL, principal_id, agent_config_json, ?2
+             (id, owner_client_id, context_key, principal_id, agent_config_json,
+              lifecycle_state, created_at)
+             SELECT ?1, owner_client_id, NULL, principal_id, agent_config_json,
+                    'provisioning', ?2
              FROM agents WHERE id = ?3 AND owner_client_id = ?4",
             params![id, created_at, source_agent_id, client.id],
         )?;
         audit(&transaction, &client.id, "agent.fork", "agent", &id)?;
-        let identity = agent_identity(&transaction, &client.id, &id)?;
+        let identity = agent_identity_any(&transaction, &client.id, &id)?;
         transaction.commit()?;
         Ok(identity)
     }
 
-    /// Deletes an agent identity owned by an authenticated API client.
-    pub fn delete_agent(
+    /// Makes an agent inaccessible before its runtime and session are removed.
+    pub fn begin_delete_agent(
+        &self,
+        client: &AuthenticatedClient,
+        agent_id: &str,
+    ) -> Result<AgentIdentity, PolicyError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let identity = agent_identity_any(&transaction, &client.id, agent_id)?;
+        require(&identity.principal, "agent.delete")?;
+        transaction.execute(
+            "UPDATE agents SET lifecycle_state = 'deleting'
+             WHERE id = ?1 AND owner_client_id = ?2",
+            params![agent_id, client.id],
+        )?;
+        audit(
+            &transaction,
+            &client.id,
+            "agent.delete.begin",
+            "agent",
+            agent_id,
+        )?;
+        transaction.commit()?;
+        Ok(identity)
+    }
+
+    /// Removes an identity after its runtime and durable session are gone.
+    pub fn finish_delete_agent(
         &self,
         client: &AuthenticatedClient,
         agent_id: &str,
     ) -> Result<(), PolicyError> {
         let mut connection = self.lock()?;
         let transaction = connection.transaction()?;
-        let identity = agent_identity(&transaction, &client.id, agent_id)?;
-        require(&identity.principal, "agent.delete")?;
-        transaction.execute(
-            "DELETE FROM agents WHERE id = ?1 AND owner_client_id = ?2",
+        let removed = transaction.execute(
+            "DELETE FROM agents
+             WHERE id = ?1 AND owner_client_id = ?2 AND lifecycle_state = 'deleting'",
             params![agent_id, client.id],
         )?;
+        changed(removed)?;
         audit(&transaction, &client.id, "agent.delete", "agent", agent_id)?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Publishes a fully copied fork identity.
+    pub fn activate_agent(
+        &self,
+        client: &AuthenticatedClient,
+        agent_id: &str,
+    ) -> Result<AgentIdentity, PolicyError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        changed(transaction.execute(
+            "UPDATE agents SET lifecycle_state = 'active'
+             WHERE id = ?1 AND owner_client_id = ?2 AND lifecycle_state = 'provisioning'",
+            params![agent_id, client.id],
+        )?)?;
+        let identity = agent_identity(&transaction, &client.id, agent_id)?;
+        transaction.commit()?;
+        Ok(identity)
+    }
+
+    /// Removes a hidden fork identity after session provisioning failed.
+    pub fn abort_provisioning_agent(
+        &self,
+        client: &AuthenticatedClient,
+        agent_id: &str,
+    ) -> Result<(), PolicyError> {
+        changed(self.lock()?.execute(
+            "DELETE FROM agents
+             WHERE id = ?1 AND owner_client_id = ?2 AND lifecycle_state = 'provisioning'",
+            params![agent_id, client.id],
+        )?)
     }
 
     /// Creates an API client and hashes its initial key.
@@ -1462,6 +1538,7 @@ impl PolicyStore {
                         s.delivery_json, s.guest_json, s.enabled, s.created_at, s.updated_at
                  FROM secrets s
                  JOIN agents a ON a.id = ?1 AND a.principal_id = ?2
+                              AND a.lifecycle_state = 'active'
                  JOIN api_clients c ON c.id = a.owner_client_id AND c.enabled = 1
                  JOIN principals p ON p.id = a.principal_id AND p.enabled = 1
                  WHERE s.id = ?3 AND s.enabled = 1 AND s.id IN (
@@ -1490,6 +1567,7 @@ impl PolicyStore {
                     s.delivery_json, s.guest_json, s.enabled, s.created_at, s.updated_at
              FROM secrets s
              JOIN agents a ON a.id = ?1 AND a.principal_id = ?2
+                          AND a.lifecycle_state = 'active'
              JOIN api_clients c ON c.id = a.owner_client_id AND c.enabled = 1
              JOIN principals p ON p.id = a.principal_id AND p.enabled = 1
              WHERE s.enabled = 1 AND s.id IN (
@@ -1513,6 +1591,19 @@ impl PolicyStore {
     fn lock(&self) -> Result<MutexGuard<'_, Connection>, PolicyError> {
         self.connection.lock().map_err(|_| PolicyError::Poisoned)
     }
+}
+
+fn ensure_agent_lifecycle_column(connection: &Connection) -> Result<(), PolicyError> {
+    let mut statement = connection.prepare("PRAGMA table_info(agents)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|column| column == "lifecycle_state") {
+        connection.execute_batch(
+            "ALTER TABLE agents ADD COLUMN lifecycle_state TEXT NOT NULL DEFAULT 'active'",
+        )?;
+    }
+    Ok(())
 }
 
 /// Requires one capability in an effective principal.
@@ -1581,12 +1672,30 @@ fn agent_identity(
     owner_client_id: &str,
     agent_id: &str,
 ) -> Result<AgentIdentity, PolicyError> {
+    agent_identity_with_state(connection, owner_client_id, agent_id, true)
+}
+
+fn agent_identity_any(
+    connection: &Connection,
+    owner_client_id: &str,
+    agent_id: &str,
+) -> Result<AgentIdentity, PolicyError> {
+    agent_identity_with_state(connection, owner_client_id, agent_id, false)
+}
+
+fn agent_identity_with_state(
+    connection: &Connection,
+    owner_client_id: &str,
+    agent_id: &str,
+    active_only: bool,
+) -> Result<AgentIdentity, PolicyError> {
     let record = connection
         .query_row(
             "SELECT id, owner_client_id, context_key, principal_id,
                     agent_config_json, created_at
-             FROM agents WHERE id = ?1 AND owner_client_id = ?2",
-            params![agent_id, owner_client_id],
+             FROM agents WHERE id = ?1 AND owner_client_id = ?2
+               AND (?3 = 0 OR lifecycle_state = 'active')",
+            params![agent_id, owner_client_id, active_only],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -2051,6 +2160,40 @@ mod tests {
                 .iter()
                 .any(|permission| permission.name == "github.read")
         );
+    }
+
+    #[test]
+    fn lifecycle_tombstones_hide_partial_delete_and_fork_states() {
+        let store = PolicyStore::in_memory().unwrap();
+        store
+            .bootstrap("client", "Client", "key", "principal", [])
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static("key"));
+        let client = store.authenticate(&headers).unwrap();
+        let (source, _) = store
+            .create_or_resolve_agent(&client, Some("source"))
+            .unwrap();
+
+        let target = store.fork_agent(&client, &source.id).unwrap();
+        assert!(matches!(
+            store.agent(&client, &target.id),
+            Err(PolicyError::NotFound)
+        ));
+        store.activate_agent(&client, &target.id).unwrap();
+        assert!(store.agent(&client, &target.id).is_ok());
+
+        store.begin_delete_agent(&client, &source.id).unwrap();
+        assert!(matches!(
+            store.agent(&client, &source.id),
+            Err(PolicyError::NotFound)
+        ));
+        store.begin_delete_agent(&client, &source.id).unwrap();
+        store.finish_delete_agent(&client, &source.id).unwrap();
+        assert!(matches!(
+            store.begin_delete_agent(&client, &source.id),
+            Err(PolicyError::NotFound)
+        ));
     }
 
     fn test_secret(id: &str) -> CreateSecret {

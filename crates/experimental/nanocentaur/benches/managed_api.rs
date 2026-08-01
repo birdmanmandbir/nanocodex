@@ -122,7 +122,7 @@ impl ManagedHarness {
 
     async fn replay_turn(&self, idempotency_key: &str) -> TurnActionResponse {
         let (status, action) = self.submit_turn(idempotency_key).await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::ACCEPTED);
         action
     }
 

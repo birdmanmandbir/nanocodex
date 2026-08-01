@@ -262,14 +262,16 @@ impl SecretResolver for LiveSecretResolver {
         if reference.provider() != MANAGED_SECRET_PROVIDER {
             return Err(SecretResolverError::Unavailable);
         }
-        let configured = self
-            .policy
-            .agent_effective_secret(
-                self.context.agent_id(),
-                self.context.principal(),
-                reference.key(),
-            )
-            .map_err(|_| SecretResolverError::Unavailable)?;
+        let policy = Arc::clone(&self.policy);
+        let agent_id = self.context.agent_id().to_owned();
+        let principal = self.context.principal().to_owned();
+        let secret_id = reference.key().to_owned();
+        let configured = tokio::task::spawn_blocking(move || {
+            policy.agent_effective_secret(&agent_id, &principal, &secret_id)
+        })
+        .await
+        .map_err(|_| SecretResolverError::Unavailable)?
+        .map_err(|_| SecretResolverError::Unavailable)?;
         if self.routes.get(reference.key()) != Some(&configured) {
             return Err(SecretResolverError::Unavailable);
         }
@@ -290,10 +292,15 @@ impl EgressProvider for ManagedEgress {
         requested: &BTreeSet<CapabilityName>,
     ) -> Result<EgressLease, EgressError> {
         let mut lease = self.capabilities.acquire(context, requested).await?;
-        let configured = self
-            .policy
-            .agent_effective_secrets(context.agent_id(), context.principal())
-            .map_err(|error| EgressError::Provider(error.to_string()))?;
+        let policy = Arc::clone(&self.policy);
+        let agent_id = context.agent_id().to_owned();
+        let principal = context.principal().to_owned();
+        let configured = tokio::task::spawn_blocking(move || {
+            policy.agent_effective_secrets(&agent_id, &principal)
+        })
+        .await
+        .map_err(|error| EgressError::Provider(error.to_string()))?
+        .map_err(|error| EgressError::Provider(error.to_string()))?;
         if configured.is_empty() {
             return Ok(lease);
         }

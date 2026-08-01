@@ -12,6 +12,7 @@ use crate::{
 };
 
 const COMMAND_CAPACITY: usize = 256;
+const FULL_CHECKPOINT_INTERVAL: i64 = 32;
 
 #[derive(Clone)]
 pub(crate) struct SessionStore {
@@ -42,9 +43,26 @@ pub(crate) struct NewTurn {
     pub content: Vec<ContentBlock>,
     pub response: TurnActionResponse,
     pub idempotency_key: Option<String>,
+    pub request_hash: Vec<u8>,
+    pub payment_receipt: Option<String>,
     pub event: AgentEventPayload,
 }
 
+pub(crate) struct StoredRequest {
+    pub response: TurnActionResponse,
+    pub request_hash: Option<Vec<u8>>,
+    pub payment_receipt: Option<String>,
+}
+
+pub(crate) struct SteerRequestRecord {
+    pub content: Vec<ContentBlock>,
+    pub response: TurnActionResponse,
+    pub idempotency_key: Option<String>,
+    pub request_hash: Vec<u8>,
+    pub payment_receipt: Option<String>,
+}
+
+#[derive(Clone)]
 pub(crate) struct CompletedTurn {
     pub status: TurnStatus,
     pub output: Vec<ContentBlock>,
@@ -98,7 +116,7 @@ impl SessionStore {
         &self,
         agent_id: String,
         key: String,
-    ) -> Result<Option<TurnActionResponse>, SessionError> {
+    ) -> Result<Option<StoredRequest>, SessionError> {
         self.call(|reply| Command::FindRequest {
             agent_id,
             key,
@@ -137,15 +155,28 @@ impl SessionStore {
         &self,
         agent_id: String,
         turn_id: String,
-        content: Vec<ContentBlock>,
-        response: TurnActionResponse,
-        idempotency_key: Option<String>,
-    ) -> Result<(), SessionError> {
+        record: SteerRequestRecord,
+    ) -> Result<i64, SessionError> {
         self.call(|reply| Command::RecordSteer {
             agent_id,
             turn_id,
-            content,
-            response,
+            record: Box::new(record),
+            reply,
+        })
+        .await
+    }
+
+    pub async fn undo_steer(
+        &self,
+        agent_id: String,
+        turn_id: String,
+        ordinal: i64,
+        idempotency_key: Option<String>,
+    ) -> Result<(), SessionError> {
+        self.call(|reply| Command::UndoSteer {
+            agent_id,
+            turn_id,
+            ordinal,
             idempotency_key,
             reply,
         })
@@ -267,7 +298,7 @@ enum Command {
     FindRequest {
         agent_id: String,
         key: String,
-        reply: Reply<Option<TurnActionResponse>>,
+        reply: Reply<Option<StoredRequest>>,
     },
     GetTurn {
         agent_id: String,
@@ -282,8 +313,13 @@ enum Command {
     RecordSteer {
         agent_id: String,
         turn_id: String,
-        content: Vec<ContentBlock>,
-        response: TurnActionResponse,
+        record: Box<SteerRequestRecord>,
+        reply: Reply<i64>,
+    },
+    UndoSteer {
+        agent_id: String,
+        turn_id: String,
+        ordinal: i64,
         idempotency_key: Option<String>,
         reply: Reply<()>,
     },
@@ -336,6 +372,7 @@ impl Command {
             Self::GetTurn { .. } => "get_turn",
             Self::RecordTurn { .. } => "record_turn",
             Self::RecordSteer { .. } => "record_steer",
+            Self::UndoSteer { .. } => "undo_steer",
             Self::MarkStarted { .. } => "mark_started",
             Self::RequestCancel { .. } => "request_cancel",
             Self::FinishTurn { .. } => "finish_turn",
@@ -375,17 +412,23 @@ impl Command {
             Self::RecordSteer {
                 agent_id,
                 turn_id,
-                content,
-                response,
+                record,
+                reply,
+            } => {
+                drop(reply.send(record_steer(connection, &agent_id, &turn_id, &record)));
+            }
+            Self::UndoSteer {
+                agent_id,
+                turn_id,
+                ordinal,
                 idempotency_key,
                 reply,
             } => {
-                drop(reply.send(record_steer(
+                drop(reply.send(undo_steer(
                     connection,
                     &agent_id,
                     &turn_id,
-                    &content,
-                    &response,
+                    ordinal,
                     idempotency_key.as_deref(),
                 )));
             }
@@ -458,6 +501,11 @@ fn configure(connection: &Connection) -> Result<(), SessionError> {
             created_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS session_tombstones (
+            agent_id TEXT PRIMARY KEY,
+            deleted_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS turns (
             agent_id TEXT NOT NULL REFERENCES session_agents(id) ON DELETE CASCADE,
             id TEXT NOT NULL,
@@ -470,6 +518,10 @@ fn configure(connection: &Connection) -> Result<(), SessionError> {
             cancel_requested INTEGER NOT NULL DEFAULT 0,
             attempt INTEGER NOT NULL DEFAULT 0,
             checkpoint_json TEXT,
+            checkpoint_base_ordinal INTEGER,
+            checkpoint_prefix INTEGER,
+            checkpoint_suffix INTEGER,
+            checkpoint_data BLOB,
             completion_event_id INTEGER,
             created_at TEXT NOT NULL,
             completed_at TEXT,
@@ -494,6 +546,8 @@ fn configure(connection: &Connection) -> Result<(), SessionError> {
             action TEXT NOT NULL,
             turn_id TEXT NOT NULL,
             state TEXT NOT NULL,
+            request_hash BLOB,
+            payment_receipt TEXT,
             created_at TEXT NOT NULL,
             PRIMARY KEY(agent_id, idempotency_key)
         );
@@ -521,6 +575,8 @@ fn configure(connection: &Connection) -> Result<(), SessionError> {
         ",
     )?;
     ensure_turn_usage_column(connection)?;
+    ensure_turn_request_columns(connection)?;
+    ensure_checkpoint_columns(connection)?;
     Ok(())
 }
 
@@ -535,7 +591,41 @@ fn ensure_turn_usage_column(connection: &Connection) -> Result<(), SessionError>
     Ok(())
 }
 
+fn ensure_turn_request_columns(connection: &Connection) -> Result<(), SessionError> {
+    let mut statement = connection.prepare("PRAGMA table_info(turn_requests)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|column| column == "request_hash") {
+        connection.execute_batch("ALTER TABLE turn_requests ADD COLUMN request_hash BLOB")?;
+    }
+    if !columns.iter().any(|column| column == "payment_receipt") {
+        connection.execute_batch("ALTER TABLE turn_requests ADD COLUMN payment_receipt TEXT")?;
+    }
+    Ok(())
+}
+
+fn ensure_checkpoint_columns(connection: &Connection) -> Result<(), SessionError> {
+    let mut statement = connection.prepare("PRAGMA table_info(turns)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (name, definition) in [
+        ("checkpoint_base_ordinal", "INTEGER"),
+        ("checkpoint_prefix", "INTEGER"),
+        ("checkpoint_suffix", "INTEGER"),
+        ("checkpoint_data", "BLOB"),
+    ] {
+        if !columns.iter().any(|column| column == name) {
+            connection
+                .execute_batch(&format!("ALTER TABLE turns ADD COLUMN {name} {definition}"))?;
+        }
+    }
+    Ok(())
+}
+
 fn ensure_agent(connection: &Connection, agent_id: &str) -> Result<(), SessionError> {
+    reject_tombstone(connection, agent_id)?;
     connection.execute(
         "INSERT OR IGNORE INTO session_agents (id, created_at) VALUES (?1, ?2)",
         params![agent_id, now()],
@@ -597,17 +687,9 @@ fn load(connection: &Connection, agent_id: &str) -> Result<StoredSession, Sessio
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    let snapshot = connection
-        .query_row(
-            "SELECT checkpoint_json FROM turns
-             WHERE agent_id = ?1 AND state = 'completed' AND checkpoint_json IS NOT NULL
-             ORDER BY ordinal DESC LIMIT 1",
-            params![agent_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?
+    let snapshot = reconstruct_checkpoint(connection, agent_id, None)?
         .as_deref()
-        .map(json_from_sql)
+        .map(serde_json::from_slice)
         .transpose()?;
     Ok(StoredSession { turns, snapshot })
 }
@@ -633,19 +715,23 @@ fn find_request(
     connection: &Connection,
     agent_id: &str,
     key: &str,
-) -> Result<Option<TurnActionResponse>, SessionError> {
+) -> Result<Option<StoredRequest>, SessionError> {
     connection
         .query_row(
-            "SELECT action, turn_id, state FROM turn_requests
+            "SELECT action, turn_id, state, request_hash, payment_receipt FROM turn_requests
              WHERE agent_id = ?1 AND idempotency_key = ?2",
             params![agent_id, key],
             |row| {
                 let action: String = row.get(0)?;
                 let state: String = row.get(2)?;
-                Ok(TurnActionResponse {
-                    action: parse_action(&action)?,
-                    turn_id: row.get(1)?,
-                    state: parse_status(&state)?,
+                Ok(StoredRequest {
+                    response: TurnActionResponse {
+                        action: parse_action(&action)?,
+                        turn_id: row.get(1)?,
+                        state: parse_status(&state)?,
+                    },
+                    request_hash: row.get(3)?,
+                    payment_receipt: row.get(4)?,
                 })
             },
         )
@@ -717,7 +803,14 @@ fn record_turn(
     )?;
     insert_input(&transaction, agent_id, &turn.view.turn_id, 1, &turn.content)?;
     if let Some(key) = turn.idempotency_key {
-        insert_request(&transaction, agent_id, &key, &turn.response)?;
+        insert_request(
+            &transaction,
+            agent_id,
+            &key,
+            &turn.response,
+            &turn.request_hash,
+            turn.payment_receipt.as_deref(),
+        )?;
     }
     let event = append_event_tx(&transaction, agent_id, Some(&turn.view.turn_id), turn.event)?;
     transaction.commit()?;
@@ -728,10 +821,8 @@ fn record_steer(
     connection: &Connection,
     agent_id: &str,
     turn_id: &str,
-    content: &[ContentBlock],
-    response: &TurnActionResponse,
-    idempotency_key: Option<&str>,
-) -> Result<(), SessionError> {
+    record: &SteerRequestRecord,
+) -> Result<i64, SessionError> {
     let transaction = connection.unchecked_transaction()?;
     let ordinal: i64 = transaction.query_row(
         "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM turn_inputs
@@ -739,9 +830,44 @@ fn record_steer(
         params![agent_id, turn_id],
         |row| row.get(0),
     )?;
-    insert_input(&transaction, agent_id, turn_id, ordinal, content)?;
+    insert_input(&transaction, agent_id, turn_id, ordinal, &record.content)?;
+    if let Some(key) = record.idempotency_key.as_deref() {
+        insert_request(
+            &transaction,
+            agent_id,
+            key,
+            &record.response,
+            &record.request_hash,
+            record.payment_receipt.as_deref(),
+        )?;
+    }
+    transaction.commit()?;
+    Ok(ordinal)
+}
+
+fn undo_steer(
+    connection: &Connection,
+    agent_id: &str,
+    turn_id: &str,
+    ordinal: i64,
+    idempotency_key: Option<&str>,
+) -> Result<(), SessionError> {
+    let transaction = connection.unchecked_transaction()?;
+    let removed = transaction.execute(
+        "DELETE FROM turn_inputs
+         WHERE agent_id = ?1 AND turn_id = ?2 AND ordinal = ?3",
+        params![agent_id, turn_id, ordinal],
+    )?;
+    if removed != 1 {
+        return Err(SessionError::InvalidState(
+            "durable steering input disappeared before compensation",
+        ));
+    }
     if let Some(key) = idempotency_key {
-        insert_request(&transaction, agent_id, key, response)?;
+        transaction.execute(
+            "DELETE FROM turn_requests WHERE agent_id = ?1 AND idempotency_key = ?2",
+            params![agent_id, key],
+        )?;
     }
     transaction.commit()?;
     Ok(())
@@ -790,6 +916,170 @@ fn request_cancel(
     Ok(event)
 }
 
+struct EncodedCheckpoint {
+    base_ordinal: Option<i64>,
+    prefix: i64,
+    suffix: i64,
+    data: Vec<u8>,
+}
+
+fn encode_checkpoint(
+    connection: &Connection,
+    agent_id: &str,
+    ordinal: i64,
+    snapshot: &SessionSnapshot,
+) -> Result<EncodedCheckpoint, SessionError> {
+    let encoded = serde_json::to_vec(snapshot)?;
+    let checkpoints_since_full = connection.query_row(
+        "SELECT COUNT(*) FROM turns
+         WHERE agent_id = ?1 AND ordinal < ?2 AND state = 'completed'
+           AND (checkpoint_data IS NOT NULL OR checkpoint_json IS NOT NULL)
+           AND ordinal > COALESCE((
+               SELECT MAX(ordinal) FROM turns
+               WHERE agent_id = ?1 AND ordinal < ?2 AND state = 'completed'
+                 AND (checkpoint_json IS NOT NULL OR
+                      (checkpoint_data IS NOT NULL AND checkpoint_base_ordinal IS NULL))
+           ), 0)",
+        params![agent_id, ordinal],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if checkpoints_since_full >= FULL_CHECKPOINT_INTERVAL - 1 {
+        return Ok(full_checkpoint(encoded));
+    }
+    let previous_ordinal = connection
+        .query_row(
+            "SELECT ordinal FROM turns
+             WHERE agent_id = ?1 AND ordinal < ?2
+               AND state = 'completed'
+               AND (checkpoint_data IS NOT NULL OR checkpoint_json IS NOT NULL)
+             ORDER BY ordinal DESC LIMIT 1",
+            params![agent_id, ordinal],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    let Some(previous_ordinal) = previous_ordinal else {
+        return Ok(full_checkpoint(encoded));
+    };
+    let Some(previous) = reconstruct_checkpoint(connection, agent_id, Some(previous_ordinal))?
+    else {
+        return Ok(full_checkpoint(encoded));
+    };
+    let prefix = previous
+        .iter()
+        .zip(&encoded)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let max_suffix = previous.len().min(encoded.len()).saturating_sub(prefix);
+    let suffix = previous
+        .iter()
+        .rev()
+        .zip(encoded.iter().rev())
+        .take(max_suffix)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let delta = encoded[prefix..encoded.len() - suffix].to_vec();
+    if delta.len().saturating_add(24) >= encoded.len() {
+        return Ok(full_checkpoint(encoded));
+    }
+    Ok(EncodedCheckpoint {
+        base_ordinal: Some(previous_ordinal),
+        prefix: i64::try_from(prefix).map_err(|_| SessionError::CheckpointOverflow)?,
+        suffix: i64::try_from(suffix).map_err(|_| SessionError::CheckpointOverflow)?,
+        data: delta,
+    })
+}
+
+const fn full_checkpoint(data: Vec<u8>) -> EncodedCheckpoint {
+    EncodedCheckpoint {
+        base_ordinal: None,
+        prefix: 0,
+        suffix: 0,
+        data,
+    }
+}
+
+fn reconstruct_checkpoint(
+    connection: &Connection,
+    agent_id: &str,
+    through_ordinal: Option<i64>,
+) -> Result<Option<Vec<u8>>, SessionError> {
+    let start_ordinal = connection
+        .query_row(
+            "SELECT ordinal FROM turns
+             WHERE agent_id = ?1 AND state = 'completed'
+               AND (?2 IS NULL OR ordinal <= ?2)
+               AND (checkpoint_json IS NOT NULL OR
+                    (checkpoint_data IS NOT NULL AND checkpoint_base_ordinal IS NULL))
+             ORDER BY ordinal DESC LIMIT 1",
+            params![agent_id, through_ordinal],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    let Some(start_ordinal) = start_ordinal else {
+        return Ok(None);
+    };
+    let mut statement = connection.prepare(
+        "SELECT ordinal, checkpoint_json, checkpoint_base_ordinal,
+                checkpoint_prefix, checkpoint_suffix, checkpoint_data
+         FROM turns
+         WHERE agent_id = ?1 AND state = 'completed'
+           AND (?2 IS NULL OR ordinal <= ?2)
+           AND ordinal >= ?3
+           AND (checkpoint_data IS NOT NULL OR checkpoint_json IS NOT NULL)
+         ORDER BY ordinal",
+    )?;
+    let rows = statement.query_map(params![agent_id, through_ordinal, start_ordinal], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<i64>>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+            row.get::<_, Option<i64>>(4)?,
+            row.get::<_, Option<Vec<u8>>>(5)?,
+        ))
+    })?;
+    let mut current: Option<Vec<u8>> = None;
+    let mut current_ordinal = None;
+    for row in rows {
+        let (ordinal, legacy, base, prefix, suffix, data) = row?;
+        let next = if let Some(data) = data {
+            if let Some(base) = base {
+                if current_ordinal != Some(base) {
+                    return Err(SessionError::InvalidState(
+                        "checkpoint delta base is not contiguous",
+                    ));
+                }
+                let previous = current.as_deref().ok_or(SessionError::InvalidState(
+                    "checkpoint delta is missing its base",
+                ))?;
+                let prefix = usize::try_from(prefix.unwrap_or_default())
+                    .map_err(|_| SessionError::CheckpointOverflow)?;
+                let suffix = usize::try_from(suffix.unwrap_or_default())
+                    .map_err(|_| SessionError::CheckpointOverflow)?;
+                if prefix > previous.len() || suffix > previous.len().saturating_sub(prefix) {
+                    return Err(SessionError::InvalidState(
+                        "checkpoint delta exceeds its base",
+                    ));
+                }
+                let mut decoded = Vec::with_capacity(prefix + data.len() + suffix);
+                decoded.extend_from_slice(&previous[..prefix]);
+                decoded.extend_from_slice(&data);
+                decoded.extend_from_slice(&previous[previous.len() - suffix..]);
+                decoded
+            } else {
+                data
+            }
+        } else {
+            legacy
+                .ok_or(SessionError::InvalidState("checkpoint payload is missing"))?
+                .into_bytes()
+        };
+        current = Some(next);
+        current_ordinal = Some(ordinal);
+    }
+    Ok(current)
+}
+
 fn finish_turn(
     connection: &Connection,
     agent_id: &str,
@@ -797,11 +1087,24 @@ fn finish_turn(
     completed: CompletedTurn,
 ) -> Result<FinishedTurn, SessionError> {
     let transaction = connection.unchecked_transaction()?;
+    let ordinal = transaction.query_row(
+        "SELECT ordinal FROM turns WHERE agent_id = ?1 AND id = ?2",
+        params![agent_id, turn_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let checkpoint = completed
+        .snapshot
+        .as_ref()
+        .map(|snapshot| encode_checkpoint(&transaction, agent_id, ordinal, snapshot))
+        .transpose()?;
     let event = append_event_tx(&transaction, agent_id, Some(turn_id), completed.event)?;
     transaction.execute(
         "UPDATE turns
          SET state = ?3, output_json = ?4, usage_json = ?5, error = ?6,
-             completed_at = ?7, checkpoint_json = ?8, completion_event_id = ?9
+             completed_at = ?7, checkpoint_json = NULL,
+             checkpoint_base_ordinal = ?8, checkpoint_prefix = ?9,
+             checkpoint_suffix = ?10, checkpoint_data = ?11,
+             completion_event_id = ?12
          WHERE agent_id = ?1 AND id = ?2",
         params![
             agent_id,
@@ -815,11 +1118,18 @@ fn finish_turn(
                 .transpose()?,
             completed.error,
             completed.completed_at.to_rfc3339(),
-            completed
-                .snapshot
+            checkpoint
                 .as_ref()
-                .map(serde_json::to_string)
-                .transpose()?,
+                .and_then(|checkpoint| checkpoint.base_ordinal),
+            checkpoint
+                .as_ref()
+                .map_or(0, |checkpoint| checkpoint.prefix),
+            checkpoint
+                .as_ref()
+                .map_or(0, |checkpoint| checkpoint.suffix),
+            checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.data.as_slice()),
             event_id_to_sql(event.id)?,
         ],
     )?;
@@ -984,11 +1294,13 @@ fn fork(
     transaction.execute(
         "INSERT INTO turns
          (agent_id, id, ordinal, delivery, state, output_json, usage_json, error,
-          cancel_requested, attempt, checkpoint_json, completion_event_id,
-          created_at, completed_at)
+          cancel_requested, attempt, checkpoint_json, checkpoint_base_ordinal,
+          checkpoint_prefix, checkpoint_suffix, checkpoint_data,
+          completion_event_id, created_at, completed_at)
          SELECT ?1, id, ordinal, delivery, state, output_json, usage_json, error,
-                cancel_requested, attempt, checkpoint_json, completion_event_id,
-                created_at, completed_at
+                cancel_requested, attempt, checkpoint_json, checkpoint_base_ordinal,
+                checkpoint_prefix, checkpoint_suffix, checkpoint_data,
+                completion_event_id, created_at, completed_at
          FROM turns WHERE agent_id = ?2 AND ordinal <= ?3",
         params![target_agent_id, source_agent_id, selected.1],
     )?;
@@ -1024,19 +1336,39 @@ fn fork(
 }
 
 fn delete(connection: &Connection, agent_id: &str) -> Result<(), SessionError> {
-    connection.execute(
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO session_tombstones (agent_id, deleted_at) VALUES (?1, ?2)",
+        params![agent_id, now()],
+    )?;
+    transaction.execute(
         "DELETE FROM session_agents WHERE id = ?1",
         params![agent_id],
     )?;
+    transaction.commit()?;
     Ok(())
 }
 
 fn ensure_agent_tx(transaction: &Transaction<'_>, agent_id: &str) -> Result<(), SessionError> {
+    reject_tombstone(transaction, agent_id)?;
     transaction.execute(
         "INSERT OR IGNORE INTO session_agents (id, created_at) VALUES (?1, ?2)",
         params![agent_id, now()],
     )?;
     Ok(())
+}
+
+fn reject_tombstone(connection: &Connection, agent_id: &str) -> Result<(), SessionError> {
+    let deleted = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_tombstones WHERE agent_id = ?1)",
+        params![agent_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if deleted {
+        Err(SessionError::Deleted)
+    } else {
+        Ok(())
+    }
 }
 
 fn insert_input(
@@ -1066,17 +1398,22 @@ fn insert_request(
     agent_id: &str,
     key: &str,
     response: &TurnActionResponse,
+    request_hash: &[u8],
+    payment_receipt: Option<&str>,
 ) -> Result<(), SessionError> {
     transaction.execute(
         "INSERT INTO turn_requests
-         (agent_id, idempotency_key, action, turn_id, state, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+         (agent_id, idempotency_key, action, turn_id, state, request_hash,
+          payment_receipt, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             agent_id,
             key,
             action_name(response.action),
             response.turn_id,
             status_name(response.state),
+            request_hash,
+            payment_receipt,
             now(),
         ],
     )?;
@@ -1172,8 +1509,14 @@ pub(crate) enum SessionError {
     Stopped,
     #[error("completed fork boundary was not found")]
     ForkBoundaryNotFound,
+    #[error("managed session was permanently deleted")]
+    Deleted,
     #[error("session event identifier exceeded SQLite's signed integer range")]
     EventIdOverflow,
+    #[error("session checkpoint size exceeded supported integer bounds")]
+    CheckpointOverflow,
+    #[error("invalid durable session state: {0}")]
+    InvalidState(&'static str),
     #[error("session SQLite failed")]
     Database(#[from] rusqlite::Error),
     #[error("session JSON encoding failed")]
@@ -1226,5 +1569,76 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert!(columns.iter().any(|column| column == "usage_json"));
+    }
+
+    #[test]
+    fn checkpoint_deltas_reconstruct_shared_history_without_repeating_prefixes() {
+        let connection = Connection::open_in_memory().unwrap();
+        configure(&connection).unwrap();
+        ensure_agent(&connection, "agent").unwrap();
+        let first = br#"{"history":["a"]}"#.to_vec();
+        let second = br#"{"history":["a","b"]}"#.to_vec();
+        let prefix = first
+            .iter()
+            .zip(&second)
+            .take_while(|(left, right)| left == right)
+            .count();
+        let suffix = first
+            .iter()
+            .rev()
+            .zip(second.iter().rev())
+            .take(first.len().min(second.len()).saturating_sub(prefix))
+            .take_while(|(left, right)| left == right)
+            .count();
+        let delta = &second[prefix..second.len() - suffix];
+        for ordinal in 1..=2_i64 {
+            connection
+                .execute(
+                    "INSERT INTO turns
+                     (agent_id, id, ordinal, delivery, state, output_json,
+                      cancel_requested, attempt, created_at)
+                     VALUES ('agent', ?1, ?2, 'steer', 'completed', '[]', 0, 1, ?3)",
+                    params![format!("turn-{ordinal}"), ordinal, now()],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "UPDATE turns SET checkpoint_data = ?1,
+                 checkpoint_prefix = 0, checkpoint_suffix = 0 WHERE ordinal = 1",
+                params![first],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE turns SET checkpoint_base_ordinal = 1,
+                 checkpoint_prefix = ?1, checkpoint_suffix = ?2,
+                 checkpoint_data = ?3 WHERE ordinal = 2",
+                params![
+                    i64::try_from(prefix).unwrap(),
+                    i64::try_from(suffix).unwrap(),
+                    delta
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            reconstruct_checkpoint(&connection, "agent", None)
+                .unwrap()
+                .unwrap(),
+            second
+        );
+        assert!(delta.len() < second.len());
+    }
+
+    #[test]
+    fn deleted_session_ids_cannot_be_recreated_by_stale_authorization() {
+        let connection = Connection::open_in_memory().unwrap();
+        configure(&connection).unwrap();
+        ensure_agent(&connection, "deleted-agent").unwrap();
+        delete(&connection, "deleted-agent").unwrap();
+        assert!(matches!(
+            ensure_agent(&connection, "deleted-agent"),
+            Err(SessionError::Deleted)
+        ));
     }
 }

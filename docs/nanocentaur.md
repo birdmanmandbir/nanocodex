@@ -24,9 +24,9 @@ Axum handlers
              |
              v
          SQLite session actor
-           - accepted turns and idempotency keys
+           - accepted turns and request-bound idempotency keys
            - append-only typed event log
-           - completed session snapshots
+           - bounded-delta session checkpoints
 ```
 
 The actor owns live runtime state. SQLite remains authoritative across actor
@@ -91,6 +91,11 @@ back from `TurnNotSteerable` to a new prompt. `"delivery":"enqueue"` always
 uses the driver's FIFO prompt queue. A full steering queue returns
 `409 steer_queue_full` and is never silently converted to enqueueing.
 
+An idempotency key is bound to the normalized turn request. Reusing it with a
+different body returns `409 idempotency_conflict`; an exact retry returns the
+original action, status, turn ID, and payment receipt without authorizing
+payment again.
+
 The SSE stream spans turns and supports durable replay:
 
 ```http
@@ -114,13 +119,28 @@ idempotency mappings, events, and fork lineage. Acceptance of a turn, its first
 input, its idempotency mapping, and its accepted event are one transaction.
 
 A process restart marks incomplete running turns interrupted, moves them back
-to queued, and wakes them under the same managed turn ID. Only completed model
-boundaries are persisted as Nanocodex snapshots.
+to queued, and wakes them under the same managed turn ID. Accepted steering
+inputs are replayed before the recovered attempt may commit; completions from
+abandoned attempts are ignored. Terminal results and native runtime events stay
+in actor memory and retry their SQLite transaction instead of being dropped on
+a transient storage failure.
+
+Only completed model boundaries are persisted as Nanocodex snapshots. Every
+32nd checkpoint is full; intermediate checkpoints retain a byte delta against
+the preceding completed boundary. Reconstruction begins at the nearest full
+checkpoint, bounding replay work while avoiding full-history duplication on
+every turn.
 
 A fork copies durable model history through a selected completed turn into a
 new agent identity. It receives a fresh VM root and does not copy guest
 filesystem mutations. Applications that need durable artifacts must export
 them explicitly.
+
+Policy identities use hidden `provisioning` and `deleting` lifecycle states
+while the separate session transaction completes. Deleted session IDs receive
+permanent tombstones, so stale authorization or another process cannot recreate
+their durable history. Failed fork provisioning is cleaned up before becoming
+visible, and interrupted deletion can be retried.
 
 ## Policy and authorization
 
@@ -137,6 +157,12 @@ Roles contain grants. A principal's agent configuration owns instructions and
 reasoning effort, avoiding ambiguous prompt merging across roles. Effective
 permissions are checked before each managed operation; agent configuration is
 snapshotted at creation.
+
+Effective capabilities and secret-policy revision are refreshed at every turn
+boundary. Queued prompts are not submitted to a runtime early, so work accepted
+before a revocation starts only after the old runtime has been replaced. An
+already-running turn keeps the capability snapshot it started with; managed
+secret requests still recheck live route grants independently.
 
 ## Managed secret egress
 
@@ -224,6 +250,8 @@ cargo run -p nanocentaur-server --features mpp -- serve ...
 ```
 
 Authorization and policy checks run before payment verification, so rejected
-callers are not charged. Concurrent requests sharing one agent-scoped
-idempotency key are serialized across lookup, payment authorization, and
-durable acceptance, preventing duplicate authorization for the same turn.
+callers are not charged. Turn shape validation also precedes payment. Concurrent
+requests sharing one agent-scoped idempotency key are serialized across lookup,
+payment authorization, and durable acceptance, preventing duplicate
+authorization for the same turn. If a later manager boundary rejects an
+authorized request, its error response still carries the payment receipt.
