@@ -1,6 +1,7 @@
 mod auth;
 mod benchmark;
 mod browser;
+mod computer;
 mod config;
 #[cfg(feature = "tempo")]
 mod credits;
@@ -368,6 +369,28 @@ mod tests {
         let disabled =
             Cli::try_parse_from(["nanocodex", "--browser=none", "--cookies=none"]).unwrap();
         assert!(!disabled.agent.browser_enabled());
+    }
+
+    #[test]
+    fn computer_tool_and_preview_are_opt_in() {
+        let baseline = Cli::try_parse_from(["nanocodex"]).unwrap();
+        assert!(!baseline.agent.computer_enabled());
+
+        let tui = Cli::try_parse_from(["nanocodex", "--computer"]).unwrap();
+        assert!(tui.agent.computer_enabled());
+
+        let headless = Cli::try_parse_from([
+            "nanocodex",
+            "run",
+            "inspect TextEdit",
+            "--computer",
+            "--computer-preview=false",
+        ])
+        .unwrap();
+        let Some(Command::Run(headless)) = headless.command else {
+            panic!("run command was not parsed");
+        };
+        assert!(headless.agent.computer_enabled());
     }
 
     #[test]

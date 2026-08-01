@@ -61,6 +61,11 @@ impl Run {
         } else {
             Ok(())
         };
+        let computer_shutdown_result = if let Some(computer) = configured.computer {
+            computer.shutdown().await
+        } else {
+            Ok(())
+        };
         let vm_shutdown_result = if let Some(vm) = configured.vm {
             vm.shutdown().await
         } else {
@@ -74,6 +79,7 @@ impl Run {
         run_result?;
         agent_shutdown?;
         browser_shutdown_result?;
+        computer_shutdown_result?;
         vm_shutdown_result?;
         shutdown_result
     }

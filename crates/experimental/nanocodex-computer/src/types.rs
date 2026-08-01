@@ -1,0 +1,362 @@
+use std::{fmt, path::PathBuf, time::Duration};
+
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+/// A point in global macOS display coordinates.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize, JsonSchema)]
+pub struct Point {
+    /// Horizontal coordinate in points.
+    pub x: f64,
+    /// Vertical coordinate in points.
+    pub y: f64,
+}
+
+/// A rectangle in global macOS display coordinates.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize, JsonSchema)]
+pub struct Rect {
+    /// Left edge.
+    pub x: f64,
+    /// Top edge.
+    pub y: f64,
+    /// Width.
+    pub width: f64,
+    /// Height.
+    pub height: f64,
+}
+
+impl Rect {
+    /// Returns the center of the rectangle.
+    #[must_use]
+    pub fn center(self) -> Point {
+        Point {
+            x: self.x + self.width / 2.0,
+            y: self.y + self.height / 2.0,
+        }
+    }
+}
+
+/// A running graphical application visible to the capture system.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
+pub struct Application {
+    /// Process identifier.
+    pub pid: i32,
+    /// Display name.
+    pub name: String,
+    /// Stable bundle identifier when macOS supplies one.
+    pub bundle_id: Option<String>,
+}
+
+/// A capturable application window.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
+pub struct Window {
+    /// Core Graphics window identifier.
+    pub id: u32,
+    /// Owning process identifier.
+    pub pid: i32,
+    /// Window title.
+    pub title: Option<String>,
+    /// Current frame.
+    pub frame: Rect,
+    /// Whether the window is currently on screen.
+    pub on_screen: bool,
+}
+
+/// Selects an application without relying on its transient process identifier.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplicationSelector {
+    /// Exact process identifier.
+    Pid(i32),
+    /// Exact bundle identifier, such as `com.apple.TextEdit`.
+    BundleId(String),
+    /// Case-insensitive exact application display name.
+    Name(String),
+}
+
+/// A reference into one particular accessibility snapshot.
+///
+/// References deliberately expire after every observation or action. This
+/// prevents an agent from silently operating on a different element after the
+/// application has changed underneath it.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize, JsonSchema)]
+#[serde(transparent)]
+pub struct ElementRef(pub String);
+
+impl fmt::Display for ElementRef {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// One compact, actionable accessibility node.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
+pub struct Element {
+    /// Generation-bound reference accepted by semantic actions.
+    pub reference: ElementRef,
+    /// Accessibility role, for example `AXButton`.
+    pub role: String,
+    /// Accessibility subrole when present.
+    pub subrole: Option<String>,
+    /// Human-facing label assembled from title, description, and help.
+    pub label: Option<String>,
+    /// Current scalar value when it is useful and bounded.
+    pub value: Option<String>,
+    /// Placeholder text for editable controls.
+    pub placeholder: Option<String>,
+    /// Stable application-provided identifier when present.
+    pub identifier: Option<String>,
+    /// Global bounds when macOS exposes them.
+    pub frame: Option<Rect>,
+    /// Whether the element accepts interaction.
+    pub enabled: Option<bool>,
+    /// Whether the element currently owns focus.
+    pub focused: Option<bool>,
+    /// Accessibility actions supported by the element.
+    pub actions: Vec<String>,
+}
+
+/// A PNG artifact associated with an observation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
+pub struct Screenshot {
+    /// Local PNG path. The computer tool converts this into model image input.
+    pub path: PathBuf,
+    /// Pixel width.
+    pub width: u32,
+    /// Pixel height.
+    pub height: u32,
+    /// Content digest used for visual settling and preview deduplication.
+    pub digest: String,
+}
+
+/// Complete state returned after an observation or mutating action.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
+pub struct ComputerState {
+    /// Monotonic state generation. Element references embed this generation.
+    pub generation: u64,
+    /// Selected application.
+    pub application: Application,
+    /// Selected window.
+    pub window: Window,
+    /// Compact actionable accessibility tree, in depth-first order.
+    pub elements: Vec<Element>,
+    /// Fresh screenshot when requested and permitted.
+    pub screenshot: Option<Screenshot>,
+    /// Whether the post-action state reached two equal samples before timeout.
+    pub settled: bool,
+}
+
+/// A semantic element reference or an absolute point.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractionTarget {
+    /// Resolve the center of a current accessibility element.
+    Element(ElementRef),
+    /// Use a global display coordinate.
+    Point(Point),
+}
+
+/// Mouse button used by click and drag operations.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseButton {
+    /// Primary button.
+    #[default]
+    Left,
+    /// Secondary button.
+    Right,
+    /// Middle button.
+    Center,
+}
+
+/// Modifier held around a key event.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyModifier {
+    Command,
+    Control,
+    Option,
+    Shift,
+    Function,
+}
+
+/// A complete native computer operation.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum ComputerAction {
+    /// Enumerate visible graphical applications and their windows.
+    ListApplications,
+    /// Launch or activate an application by exact bundle identifier.
+    OpenApplication { bundle_id: String },
+    /// Select an already running application and optionally a specific window.
+    Attach {
+        application: ApplicationSelector,
+        window_id: Option<u32>,
+    },
+    /// Return fresh accessibility state and, by default, a screenshot.
+    Observe {
+        #[serde(default = "default_true")]
+        screenshot: bool,
+    },
+    /// Click a semantic element or global point.
+    Click {
+        target: InteractionTarget,
+        #[serde(default)]
+        button: MouseButton,
+    },
+    /// Drag between semantic elements or points.
+    Drag {
+        from: InteractionTarget,
+        to: InteractionTarget,
+        #[serde(default = "default_drag_duration_ms")]
+        duration_ms: u64,
+    },
+    /// Scroll at the current cursor or an explicit target.
+    Scroll {
+        delta_x: i32,
+        delta_y: i32,
+        at: Option<InteractionTarget>,
+    },
+    /// Send one physical key with optional modifiers to the selected process.
+    PressKey {
+        key: String,
+        #[serde(default)]
+        modifiers: Vec<KeyModifier>,
+    },
+    /// Insert Unicode text into the selected process.
+    TypeText { text: String },
+    /// Set an editable accessibility element's value without using clipboard state.
+    SetValue {
+        reference: ElementRef,
+        value: String,
+    },
+    /// Perform a named accessibility action, such as `AXPress` or `AXShowMenu`.
+    PerformAction { reference: ElementRef, name: String },
+    /// Wait while continuing to honor pause and intervention controls.
+    Wait { milliseconds: u64 },
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+const fn default_drag_duration_ms() -> u64 {
+    350
+}
+
+/// Result payload for one action.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ComputerOutput {
+    /// Application and window discovery.
+    Applications {
+        applications: Vec<Application>,
+        windows: Vec<Window>,
+    },
+    /// Fresh selected-application state.
+    State { state: ComputerState },
+    /// An application was launched; attach or observe it next.
+    Opened { bundle_id: String },
+    /// A non-observing operation completed.
+    Done,
+}
+
+/// Timed result for one accepted action.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
+pub struct ComputerActionResult {
+    /// Monotonic action sequence.
+    pub sequence: u64,
+    /// Wall-clock execution duration in milliseconds.
+    pub elapsed_ms: u64,
+    /// Typed output.
+    pub output: ComputerOutput,
+}
+
+impl ComputerActionResult {
+    pub(crate) fn image_paths(&self) -> impl Iterator<Item = &PathBuf> {
+        let screenshot = match &self.output {
+            ComputerOutput::State { state } => state.screenshot.as_ref(),
+            _ => None,
+        };
+        screenshot.into_iter().map(|image| &image.path)
+    }
+}
+
+/// Permission needed for a native operation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Permission {
+    Accessibility,
+    ScreenRecording,
+    InputMonitoring,
+}
+
+/// Why control was returned to the human.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InterventionReason {
+    HumanInput,
+    EscapeKey,
+    Caller(String),
+}
+
+/// Live, ordered event independent from action results.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ComputerEvent {
+    SessionStarted {
+        session_id: String,
+    },
+    /// The bounded observer fell behind; subsequent events remain live.
+    Lagged {
+        skipped: u64,
+    },
+    TargetChanged {
+        application: Application,
+        window: Window,
+    },
+    ActionStarted {
+        sequence: u64,
+        action: ComputerAction,
+    },
+    Frame {
+        sequence: u64,
+        state: ComputerState,
+        final_frame: bool,
+    },
+    ActionCompleted {
+        result: ComputerActionResult,
+    },
+    PermissionRequired {
+        permission: Permission,
+        guidance: String,
+    },
+    Paused,
+    Resumed,
+    UserIntervened {
+        reason: InterventionReason,
+    },
+    Failed {
+        sequence: Option<u64>,
+        message: String,
+    },
+    Stopped,
+}
+
+/// Post-action settling policy.
+#[derive(Clone, Copy, Debug)]
+pub struct SettlePolicy {
+    /// Delay between samples.
+    pub sample_interval: Duration,
+    /// Maximum time spent waiting for two equal semantic/visual samples.
+    pub timeout: Duration,
+}
+
+impl Default for SettlePolicy {
+    fn default() -> Self {
+        Self {
+            sample_interval: Duration::from_millis(150),
+            timeout: Duration::from_secs(5),
+        }
+    }
+}

@@ -614,6 +614,7 @@ pub(crate) async fn run(
     let mpp_adapter = configured.mpp_adapter;
     let mcp = configured.mcp;
     let browser = configured.browser;
+    let computer = configured.computer;
     let vm = configured.vm;
     let (worker_tx, worker_rx) = mpsc::unbounded_channel();
     let (update_tx, mut update_rx) = mpsc::unbounded_channel();
@@ -746,7 +747,8 @@ pub(crate) async fn run(
     // Restore the terminal before disconnecting the paid WebSocket session.
     drop((terminal, worker_tx, agent_events));
     math_renderer.shutdown();
-    let shutdown_result = shutdown_runtime(worker, child_agents, mpp_adapter, browser, vm).await;
+    let shutdown_result =
+        shutdown_runtime(worker, child_agents, mpp_adapter, browser, computer, vm).await;
     loop_result?;
     shutdown_result
 }
@@ -763,6 +765,7 @@ async fn shutdown_runtime(
     child_agents: Option<std::sync::Arc<crate::subagents::ChildAgents>>,
     mpp_adapter: Option<crate::mpp::MppAdapter>,
     browser: Option<crate::browser::ConfiguredBrowser>,
+    computer: Option<crate::computer::ConfiguredComputer>,
     vm: Option<crate::vm::ConfiguredVm>,
 ) -> Result<()> {
     if let Some(child_agents) = child_agents {
@@ -772,6 +775,11 @@ async fn shutdown_runtime(
     let worker_result = worker.await;
     let browser_shutdown_result = if let Some(browser) = browser {
         browser.shutdown().await
+    } else {
+        Ok(())
+    };
+    let computer_shutdown_result = if let Some(computer) = computer {
+        computer.shutdown().await
     } else {
         Ok(())
     };
@@ -791,6 +799,7 @@ async fn shutdown_runtime(
         Err(error) => return Err(error).wrap_err("TUI agent worker failed"),
     }
     browser_shutdown_result?;
+    computer_shutdown_result?;
     vm_shutdown_result?;
     shutdown_result
 }

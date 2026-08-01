@@ -26,6 +26,7 @@ use nanocodex::{
 };
 
 use crate::browser::{BrowserArgs, ConfiguredBrowser};
+use crate::computer::{ComputerArgs, ConfiguredComputer};
 use crate::mcp::{ConfiguredMcp, McpArgs};
 use crate::mpp::{MppAdapter, MppArgs};
 use crate::subagents::{self, ChildAgents, DEFAULT_MAX_SUBAGENTS};
@@ -39,6 +40,7 @@ pub(crate) struct ConfiguredAgent {
     pub(crate) mpp_adapter: Option<MppAdapter>,
     pub(crate) mcp: Option<McpHandle>,
     pub(crate) browser: Option<ConfiguredBrowser>,
+    pub(crate) computer: Option<ConfiguredComputer>,
     pub(crate) vm: Option<ConfiguredVm>,
 }
 
@@ -202,6 +204,9 @@ pub(crate) struct AgentArgs {
 
     #[command(flatten)]
     browser: BrowserArgs,
+
+    #[command(flatten)]
+    computer: ComputerArgs,
 }
 
 impl AgentArgs {
@@ -227,6 +232,11 @@ impl AgentArgs {
     #[cfg(test)]
     pub(crate) const fn uses_brave_browser(&self) -> bool {
         self.browser.uses_brave()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn computer_enabled(&self) -> bool {
+        self.computer.is_enabled()
     }
 
     pub(crate) fn thinking(&self) -> Thinking {
@@ -277,6 +287,7 @@ impl AgentArgs {
         let responses_transport = self.responses_transport();
         let session = prepare_session_build(self.cwd, self.rollouts, &codex_home, durable)?;
         let configured_browser = self.browser.configure(&session.workspace)?;
+        let configured_computer = self.computer.configure().await?;
         let mpp_enabled = self.mpp.is_enabled();
         if mpp_enabled && !matches!(responses_transport, ResponsesTransport::Https) {
             return Err(eyre!(
@@ -344,6 +355,9 @@ impl AgentArgs {
         if let Some(browser) = &configured_browser {
             tools = tools.provider(browser.tool());
         }
+        if let Some(computer) = &configured_computer {
+            tools = tools.provider(computer.tool());
+        }
         let tools = tools.build()?;
         let subagent_runtime = self
             .subagents
@@ -391,6 +405,7 @@ impl AgentArgs {
             mpp_adapter,
             mcp: mcp_handle,
             browser: configured_browser,
+            computer: configured_computer,
             vm: configured_vm,
         })
     }

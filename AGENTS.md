@@ -102,6 +102,12 @@
   and provider-neutral egress, OCI/Dockerfile image preparation, and retained
   host/guest workspace tools. Its guest reuses the canonical local
   workspace-tool contracts rather than introducing a second tool runtime.
+- The unpublished experimental `nanocodex-computer` crate owns native
+  computer-use actions, target selection, semantic/visual state, settling,
+  human intervention, the loopback live preview, and its thin deferred Code
+  Mode provider. Its `nanocodex-computer-macos` child package is the only place
+  low-level macOS FFI may appear. Do not add a Cua dependency or move mutable
+  computer state into `nanocodex-agent`.
 - Each lower crate must remain useful without importing the higher orchestration
   crate. Avoid circular concepts and leaky socket/runtime types.
 - `scripts/check-crate-boundaries.sh` is the executable dependency policy.
@@ -228,10 +234,13 @@
   compatibility layer, skills/plugins framework, or alternate runtime mode.
 - Keep the promoted Ratatui, PyO3, and Node/browser WASM consumers as thin
   adapters over the owned session API; they must consume, not reshape, the
-  library contract. Do not add browser/computer use, JJ review provenance,
-  graders, or a generic local multi-agent scheduler. Application-owned Code
-  Mode child tools and the Ratatui `/btw` fork remain thin consumers of the
-  owned session API rather than core scheduling concepts.
+  library contract. Do not add JJ review provenance, graders, or a generic
+  local multi-agent scheduler. Application-owned browser and computer-use
+  tools, Code Mode child tools, and the Ratatui `/btw` fork remain thin
+  consumers of the owned session API rather than core scheduling concepts.
+- Computer use remains an owned macOS implementation. Do not add a generic
+  cross-platform automation abstraction, a Cua compatibility layer, private
+  SkyLight SPI, app injection, or TCC bypasses.
 - Do not expose raw transport response IDs or internal turn IDs. Branching may
   be exposed through opaque checkpoints on completed typed turn results only
   after the behavior is implemented end to end.

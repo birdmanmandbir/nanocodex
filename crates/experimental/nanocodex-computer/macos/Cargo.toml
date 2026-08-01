@@ -1,0 +1,28 @@
+[package]
+name = "nanocodex-computer-macos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Audited low-level macOS bridge for nanocodex-computer"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+accessibility = "0.2.0"
+accessibility-sys = "0.2.0"
+core-foundation = "0.10.1"
+core-graphics = { version = "0.25.0", features = ["elcapitan", "highsierra"] }
+block2 = "0.6.2"
+foreign-types = "0.5.0"
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSRunningApplication", "libc"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["CGImage"] }
+objc2-screen-capture-kit = { version = "0.3.2", default-features = false, features = ["SCScreenshotManager", "SCShareableContent", "SCStream", "block2", "objc2-core-foundation", "objc2-core-graphics"] }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[lints.rust]
+unsafe_code = "allow"

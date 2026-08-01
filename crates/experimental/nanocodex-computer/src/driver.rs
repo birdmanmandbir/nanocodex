@@ -1,0 +1,512 @@
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
+    time::Instant,
+};
+
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use uuid::Uuid;
+
+use crate::{
+    Application, ComputerAction, ComputerActionResult, ComputerBuildError, ComputerError,
+    ComputerEvent, ComputerOutput, ComputerState, InterventionReason, SettlePolicy, Window,
+    platform::{self, Backend},
+};
+
+const RUNNING: u8 = 0;
+const PAUSED: u8 = 1;
+const STOPPED: u8 = 2;
+const COMMAND_CAPACITY: usize = 16;
+const EVENT_CAPACITY: usize = 256;
+
+pub(crate) struct RunState {
+    status: AtomicU8,
+}
+
+impl RunState {
+    const fn new() -> Self {
+        Self {
+            status: AtomicU8::new(RUNNING),
+        }
+    }
+
+    pub(crate) fn ensure_running(&self) -> Result<(), ComputerError> {
+        match self.status.load(Ordering::Acquire) {
+            RUNNING => Ok(()),
+            PAUSED => Err(ComputerError::Paused),
+            _ => Err(ComputerError::Stopped),
+        }
+    }
+}
+
+/// Cheap cloneable handle to one serial native computer-use session.
+#[derive(Clone)]
+pub struct Computer {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    commands: mpsc::Sender<Command>,
+    control: ComputerControl,
+    frames: watch::Receiver<Option<ComputerState>>,
+    artifact_root: PathBuf,
+    owned_artifacts: bool,
+    _intervention_monitor: Option<platform::InterventionMonitor>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.control.state.status.store(STOPPED, Ordering::Release);
+        if self.owned_artifacts
+            && let Err(error) = std::fs::remove_dir_all(&self.artifact_root)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %self.artifact_root.display(), %error, "failed to remove computer artifacts");
+        }
+    }
+}
+
+/// Receives the contractual ordered lifecycle stream.
+pub struct ComputerEvents {
+    receiver: broadcast::Receiver<ComputerEvent>,
+}
+
+impl ComputerEvents {
+    /// Receives the next event, an explicit lag marker, or `None` after the
+    /// driver has stopped.
+    pub async fn recv(&mut self) -> Option<ComputerEvent> {
+        match self.receiver.recv().await {
+            Ok(event) => Some(event),
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                Some(ComputerEvent::Lagged { skipped })
+            }
+            Err(broadcast::error::RecvError::Closed) => None,
+        }
+    }
+}
+
+/// A coalescing stream that always retains the newest visual/semantic frame.
+#[derive(Clone)]
+pub struct ComputerFrames {
+    receiver: watch::Receiver<Option<ComputerState>>,
+}
+
+impl ComputerFrames {
+    /// Borrows the newest frame without waiting.
+    #[must_use]
+    pub fn latest(&self) -> Option<ComputerState> {
+        self.receiver.borrow().clone()
+    }
+
+    /// Waits until a newer frame is available.
+    pub async fn changed(&mut self) -> Result<ComputerState, ComputerError> {
+        loop {
+            self.receiver
+                .changed()
+                .await
+                .map_err(|_| ComputerError::DriverExited)?;
+            if let Some(state) = self.receiver.borrow_and_update().clone() {
+                return Ok(state);
+            }
+        }
+    }
+}
+
+/// Out-of-band pause, resume, intervention, and stop capability.
+#[derive(Clone)]
+pub struct ComputerControl {
+    state: Arc<RunState>,
+    notices: mpsc::UnboundedSender<ControlNotice>,
+}
+
+impl ComputerControl {
+    /// Pauses new actions immediately. In-flight settling also stops.
+    pub fn pause(&self) {
+        if self
+            .state
+            .status
+            .compare_exchange(RUNNING, PAUSED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let _ = self.notices.send(ControlNotice::Paused);
+        }
+    }
+
+    /// Returns control to the agent after a human inspection or intervention.
+    pub fn resume(&self) {
+        if self
+            .state
+            .status
+            .compare_exchange(PAUSED, RUNNING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let _ = self.notices.send(ControlNotice::Resumed);
+        }
+    }
+
+    /// Immediately records a human takeover and pauses agent actions.
+    pub fn intervene(&self, reason: InterventionReason) {
+        if self
+            .state
+            .status
+            .compare_exchange(RUNNING, PAUSED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let _ = self.notices.send(ControlNotice::Intervened(reason));
+        }
+    }
+
+    /// Permanently stops the session.
+    pub fn stop(&self) {
+        if self.state.status.swap(STOPPED, Ordering::AcqRel) != STOPPED {
+            let _ = self.notices.send(ControlNotice::Stopped);
+        }
+    }
+
+    /// Returns whether actions are currently paused.
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        self.state.status.load(Ordering::Acquire) == PAUSED
+    }
+}
+
+enum ControlNotice {
+    Paused,
+    Resumed,
+    Intervened(InterventionReason),
+    Stopped,
+}
+
+enum Command {
+    Execute {
+        action: ComputerAction,
+        reply: oneshot::Sender<Result<ComputerActionResult, ComputerError>>,
+    },
+}
+
+/// Configures a native computer-use session.
+pub struct ComputerBuilder {
+    artifact_root: Option<PathBuf>,
+    maximum_elements: usize,
+    settle: SettlePolicy,
+    backend: Option<Box<dyn Backend>>,
+    observe_human_input: bool,
+}
+
+impl Default for ComputerBuilder {
+    fn default() -> Self {
+        Self {
+            artifact_root: None,
+            maximum_elements: 1_500,
+            settle: SettlePolicy::default(),
+            backend: None,
+            observe_human_input: true,
+        }
+    }
+}
+
+impl ComputerBuilder {
+    /// Stores screenshot artifacts beneath an explicit caller-owned directory.
+    #[must_use]
+    pub fn artifact_root(mut self, path: impl Into<PathBuf>) -> Self {
+        self.artifact_root = Some(path.into());
+        self
+    }
+
+    /// Bounds one accessibility snapshot's depth-first element count.
+    #[must_use]
+    pub const fn maximum_elements(mut self, maximum: usize) -> Self {
+        self.maximum_elements = maximum;
+        self
+    }
+
+    /// Selects post-action visual/semantic settling policy.
+    #[must_use]
+    pub const fn settle_policy(mut self, policy: SettlePolicy) -> Self {
+        self.settle = policy;
+        self
+    }
+
+    /// Selects whether physical clicks, scrolls, and key presses automatically
+    /// pause computer actions. Synthetic Nanocodex input is ignored.
+    #[must_use]
+    pub const fn observe_human_input(mut self, enabled: bool) -> Self {
+        self.observe_human_input = enabled;
+        self
+    }
+
+    /// Builds the actor and returns its independent event stream.
+    pub fn build(mut self) -> Result<(Computer, ComputerEvents), ComputerBuildError> {
+        if self.maximum_elements == 0 {
+            return Err(ComputerBuildError::Configuration {
+                message: "maximum_elements must be non-zero".to_owned(),
+            });
+        }
+        let _runtime =
+            tokio::runtime::Handle::try_current().map_err(|_| ComputerBuildError::Runtime)?;
+        let (artifact_root, owned_artifacts) = match self.artifact_root.take() {
+            Some(path) => (path, false),
+            None => (
+                std::env::temp_dir().join(format!("nanocodex-computer-{}", Uuid::now_v7())),
+                true,
+            ),
+        };
+        std::fs::create_dir_all(&artifact_root).map_err(|source| {
+            ComputerBuildError::ArtifactDirectory {
+                path: artifact_root.clone(),
+                source,
+            }
+        })?;
+
+        let backend = self.backend.take().unwrap_or_else(|| {
+            platform::native(artifact_root.clone(), self.settle, self.maximum_elements)
+        });
+        let (commands_tx, commands_rx) = mpsc::channel(COMMAND_CAPACITY);
+        let (events_tx, events_rx) = broadcast::channel(EVENT_CAPACITY);
+        let (frames_tx, frames_rx) = watch::channel(None);
+        let (notices_tx, notices_rx) = mpsc::unbounded_channel();
+        let state = Arc::new(RunState::new());
+        let control = ComputerControl {
+            state: Arc::clone(&state),
+            notices: notices_tx,
+        };
+        let intervention_monitor = self.observe_human_input.then(|| {
+            let control = control.clone();
+            platform::intervention_monitor(move || {
+                control.intervene(InterventionReason::HumanInput);
+            })
+        });
+        let (intervention_monitor, startup_permission) = match intervention_monitor {
+            Some(Ok(monitor)) => (Some(monitor), None),
+            Some(Err(_)) => (
+                None,
+                Some(ComputerEvent::PermissionRequired {
+                    permission: crate::Permission::InputMonitoring,
+                    guidance: "enable Input Monitoring for automatic human takeover; manual preview controls remain available"
+                        .to_owned(),
+                }),
+            ),
+            None => (None, None),
+        };
+        let session_id = Uuid::now_v7().to_string();
+        tokio::spawn(run_driver(
+            session_id,
+            backend,
+            commands_rx,
+            notices_rx,
+            events_tx,
+            frames_tx,
+            state,
+            startup_permission,
+        ));
+        Ok((
+            Computer {
+                inner: Arc::new(Inner {
+                    commands: commands_tx,
+                    control,
+                    frames: frames_rx,
+                    artifact_root,
+                    owned_artifacts,
+                    _intervention_monitor: intervention_monitor,
+                }),
+            },
+            ComputerEvents {
+                receiver: events_rx,
+            },
+        ))
+    }
+}
+
+impl Computer {
+    /// Starts configuring a native computer-use session.
+    #[must_use]
+    pub fn builder() -> ComputerBuilder {
+        ComputerBuilder::default()
+    }
+
+    /// Builds a session with bounded defaults.
+    pub fn new() -> Result<(Self, ComputerEvents), ComputerBuildError> {
+        Self::builder().build()
+    }
+
+    /// Returns an out-of-band human intervention capability.
+    #[must_use]
+    pub fn control(&self) -> ComputerControl {
+        self.inner.control.clone()
+    }
+
+    /// Subscribes to the coalescing latest-frame stream.
+    #[must_use]
+    pub fn frames(&self) -> ComputerFrames {
+        ComputerFrames {
+            receiver: self.inner.frames.clone(),
+        }
+    }
+
+    /// Returns the session's screenshot artifact directory.
+    #[must_use]
+    pub fn artifact_root(&self) -> &Path {
+        &self.inner.artifact_root
+    }
+
+    /// Queues one action in strict session order and waits for its typed result.
+    pub async fn execute(
+        &self,
+        action: ComputerAction,
+    ) -> Result<ComputerActionResult, ComputerError> {
+        self.inner.control.state.ensure_running()?;
+        let (reply, result) = oneshot::channel();
+        self.inner
+            .commands
+            .send(Command::Execute { action, reply })
+            .await
+            .map_err(|_| ComputerError::DriverExited)?;
+        result.await.map_err(|_| ComputerError::DriverExited)?
+    }
+
+    /// Stops the session. All clones become permanently unusable.
+    pub fn stop(&self) {
+        self.inner.control.stop();
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the private actor takes each independently owned channel and service"
+)]
+async fn run_driver(
+    session_id: String,
+    mut backend: Box<dyn Backend>,
+    mut commands: mpsc::Receiver<Command>,
+    mut notices: mpsc::UnboundedReceiver<ControlNotice>,
+    events: broadcast::Sender<ComputerEvent>,
+    frames: watch::Sender<Option<ComputerState>>,
+    state: Arc<RunState>,
+    startup_permission: Option<ComputerEvent>,
+) {
+    send(&events, ComputerEvent::SessionStarted { session_id });
+    if let Some(event) = startup_permission {
+        send(&events, event);
+    }
+    let mut sequence = 0_u64;
+    let mut last_target: Option<(Application, Window)> = None;
+    loop {
+        tokio::select! {
+            biased;
+            notice = notices.recv() => {
+                match notice {
+                    Some(ControlNotice::Paused) => send(&events, ComputerEvent::Paused),
+                    Some(ControlNotice::Resumed) => send(&events, ComputerEvent::Resumed),
+                    Some(ControlNotice::Intervened(reason)) => {
+                        send(&events, ComputerEvent::UserIntervened { reason });
+                    }
+                    Some(ControlNotice::Stopped) | None => break,
+                }
+            }
+            command = commands.recv() => {
+                let Some(Command::Execute { action, reply }) = command else { break };
+                sequence = sequence.saturating_add(1);
+                if let Err(error) = state.ensure_running() {
+                    let _ = reply.send(Err(error));
+                    continue;
+                }
+                send(&events, ComputerEvent::ActionStarted {
+                    sequence,
+                    action: action.clone(),
+                });
+                let started = Instant::now();
+                let outcome = backend.execute(action, sequence, Arc::clone(&state)).await;
+                match outcome {
+                    Ok(output) => {
+                        if let ComputerOutput::State { state: snapshot } = &output {
+                            let target = (snapshot.application.clone(), snapshot.window.clone());
+                            if last_target.as_ref() != Some(&target) {
+                                send(&events, ComputerEvent::TargetChanged {
+                                    application: target.0.clone(),
+                                    window: target.1.clone(),
+                                });
+                                last_target = Some(target);
+                            }
+                            let _ = frames.send(Some(snapshot.clone()));
+                            send(&events, ComputerEvent::Frame {
+                                sequence,
+                                state: snapshot.clone(),
+                                final_frame: true,
+                            });
+                        }
+                        let result = ComputerActionResult {
+                            sequence,
+                            elapsed_ms: millis(started.elapsed()),
+                            output,
+                        };
+                        send(&events, ComputerEvent::ActionCompleted {
+                            result: result.clone(),
+                        });
+                        let _ = reply.send(Ok(result));
+                    }
+                    Err(error) => {
+                        if let ComputerError::Permission { permission, guidance } = &error {
+                            send(&events, ComputerEvent::PermissionRequired {
+                                permission: *permission,
+                                guidance: guidance.clone(),
+                            });
+                        }
+                        send(&events, ComputerEvent::Failed {
+                            sequence: Some(sequence),
+                            message: error.to_string(),
+                        });
+                        let _ = reply.send(Err(error));
+                    }
+                }
+            }
+        }
+    }
+    state.status.store(STOPPED, Ordering::Release);
+    send(&events, ComputerEvent::Stopped);
+}
+
+fn send(events: &broadcast::Sender<ComputerEvent>, event: ComputerEvent) {
+    let _ = events.send(event);
+}
+
+fn millis(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+pub(crate) fn recording_builder() -> (ComputerBuilder, Arc<std::sync::Mutex<Vec<ComputerAction>>>) {
+    let actions = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let backend = RecordingBackend {
+        actions: Arc::clone(&actions),
+    };
+    (
+        ComputerBuilder {
+            backend: Some(Box::new(backend)),
+            observe_human_input: false,
+            ..ComputerBuilder::default()
+        },
+        actions,
+    )
+}
+
+#[cfg(test)]
+struct RecordingBackend {
+    actions: Arc<std::sync::Mutex<Vec<ComputerAction>>>,
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl Backend for RecordingBackend {
+    async fn execute(
+        &mut self,
+        action: ComputerAction,
+        _sequence: u64,
+        _state: Arc<RunState>,
+    ) -> Result<ComputerOutput, ComputerError> {
+        self.actions.lock().unwrap().push(action);
+        Ok(ComputerOutput::Done)
+    }
+}

@@ -14,6 +14,12 @@ affect, and observable without adopting the Nanocodex CLI. Experimental crates
 may move faster, but they must preserve the same ownership discipline and may
 not leak application policy into the stable graph.
 
+The active experimental computer-use slice is an independently useful,
+macOS-native crate with typed actions and state, semantic Accessibility
+references, isolated window capture, bounded settling, explicit human
+intervention, and a loopback live preview. It is exposed to agents only as a
+deferred Code Mode tool and does not depend on Cua or mutable agent internals.
+
 ## Current baseline
 
 The PR #50 refactor and the `0.3.0` release are complete. The repository has
@@ -27,6 +33,8 @@ since moved beyond that delivery boundary:
   normal CLI browser provider are implemented;
 - reusable GPT Realtime voice sessions and the Ratatui voice consumer are
   implemented with current Codex transport behavior;
+- owned native macOS computer use, physical-input intervention, and a loopback
+  live preview are available as an opt-in experimental application tool;
 - native, Python, Node, browser WASM, Cloudflare Durable Object, and Rivet Actor
   consumers exercise the same owned session API; and
 - nightly and stable release automation, differential workloads, retained
@@ -286,6 +294,10 @@ with no unrelated workspace changes.
     replaced by a smaller application-owned experiment.
 12. [ ] Cut the next release only after all selected milestones pass the full
     release gate.
+12. [x] Deliver the owned `nanocodex-computer` macOS slice end to end: public
+    contracts, isolated capture and Accessibility backend, strict actor
+    lifecycle, intervention monitoring, live preview, deferred tool provider,
+    CLI integration, native smoke, and repository validation.
 
 ## Current non-goals
 
@@ -305,3 +317,5 @@ with no unrelated workspace changes.
   measured performance reason.
 - No benchmark, task, verifier, or retained-artifact modification made solely
   to improve an evaluation result.
+- No generic cross-platform computer automation layer, Cua compatibility,
+  private SkyLight SPI, app injection, or TCC bypasses.
