@@ -2,7 +2,10 @@ use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 
-use crate::{ComputerAction, ComputerError, ComputerOutput, SettlePolicy, driver::RunState};
+use crate::{
+    ComputerAction, ComputerError, ComputerOutput, SettlePolicy,
+    driver::{FrameSink, RunState},
+};
 
 #[cfg(target_os = "macos")]
 pub(crate) type InterventionMonitor = nanocodex_computer_macos::HumanInputMonitor;
@@ -19,6 +22,7 @@ pub(crate) trait Backend: Send {
         action: ComputerAction,
         sequence: u64,
         state: Arc<RunState>,
+        frames: &mut FrameSink,
     ) -> Result<ComputerOutput, ComputerError>;
 }
 
@@ -68,6 +72,7 @@ impl Backend for UnsupportedBackend {
         _action: ComputerAction,
         _sequence: u64,
         _state: Arc<RunState>,
+        _frames: &mut FrameSink,
     ) -> Result<ComputerOutput, ComputerError> {
         Err(ComputerError::Unsupported {
             platform: std::env::consts::OS,

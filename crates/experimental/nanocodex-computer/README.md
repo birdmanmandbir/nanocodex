@@ -2,7 +2,7 @@
 
 `nanocodex-computer` is Nanocodex's owned native computer-use runtime. It is
 not a Cua client, wrapper, or protocol adapter. The current backend directly
-uses macOS Accessibility, CoreGraphics, and ScreenCaptureKit.
+uses macOS Accessibility, CoreGraphics, and the system screenshot service.
 
 The public boundary is deliberately split into three planes:
 
@@ -15,25 +15,30 @@ human                 -- pause/takeover --> ComputerControl  ----> action gate
 - `Computer` is a cheap cloneable action handle. One private actor owns target
   selection, accessibility generations, input ordering, settling, and capture.
 - `ComputerEvents` is an ordered bounded lifecycle stream with explicit lag
-  markers. `ComputerFrames` is a coalescing latest-frame stream, so a slow
-  visual consumer never blocks input.
+  markers. Additional consumers can subscribe through `Computer::events()`.
+  `ComputerFrames` is a coalescing latest-frame stream, so a slow visual
+  consumer never blocks input.
 - `ComputerControl` pauses, resumes, records takeover, or stops the session
   without going through the model-facing action queue.
 - `ComputerPreview` serves the current target window on an unguessable
   loopback-only URL with Pause, Resume, and Take over controls. It polls the
   coalescing frame stream and never enters the action path.
-- `ComputerTool` exposes one deferred Code Mode tool, `tools.computer`, without
-  adding another always-visible model schema.
+- `ComputerTool` registers one always-available typed tool. With the default
+  exposure it appears only inside Code Mode as `tools.computer`; callers that
+  explicitly select mixed direct exposure also make it a direct Responses tool.
 
 ## Native behavior
 
 The backend discovers graphical apps and layer-zero windows with CoreGraphics
-and captures their isolated contents with ScreenCaptureKit (with a legacy
-CoreGraphics capture fallback). `attach` fixes an exact PID/window pair. `observe` returns a
-fresh PNG plus a bounded accessibility tree containing roles, labels, values,
-actions, bounds, and generation-bound references. A reference includes a
-fingerprint and is rejected if the tree changed or another observation made it
-stale.
+and captures their isolated contents through macOS's bounded
+`/usr/sbin/screencapture` service, with an in-process CoreGraphics fallback.
+The service process has a three-second hard deadline and is terminated on a
+stall. `attach` fixes an exact PID/window pair. `observe` returns a fresh PNG
+plus a bounded accessibility tree containing roles, labels, values, actions,
+bounds, and generation-bound references. Capture and accessibility collection
+run concurrently. A reference includes its raw accessibility-tree index and a
+fingerprint; resolving an action rebuilds metadata only for that candidate and
+rejects it if the tree changed or another observation made it stale.
 
 Semantic actions use `AXPress`, settable `AXValue`, or another advertised AX
 action first. Coordinate clicks, drags, scrolling, keys, and Unicode text use
@@ -42,9 +47,12 @@ clipboard contents. Generated events carry a private marker. A listen-only
 event tap ignores those events and pauses the actor when it observes physical
 clicks, scrolling, or keyboard input from the human.
 
-After a mutation the backend repeatedly captures semantic and visual state. It
-returns after two equal samples or the configured timeout, and reports whether
-the final state settled. Screenshots are file-backed internally and become
+After a mutation the backend repeatedly captures visual samples and publishes
+them as shared in-memory `ComputerFrame`s for human observers. It returns after
+two equal samples or the configured timeout, then captures one bounded
+accessibility tree for the final model-facing `ComputerObservation`. Visual
+settling therefore does not rebuild the accessibility tree or advance semantic
+element-reference generations. The final PNG is persisted once and becomes
 high-detail image input only at the Nanocodex tool boundary. Capture memory is
 pixel-bounded, and a session retains only its 16 newest screenshot artifacts.
 
@@ -92,6 +100,20 @@ nanocodex run "Open TextEdit and draft a note" --computer
 nanocodex run "Inspect the current app" --computer --computer-preview=false
 ```
 
+In the Ratatui consumer, the first frame opens an adaptive live computer pane.
+Kitty-capable terminals render the captured pixels; other terminals retain a
+compact target/status fallback and can use the loopback preview. Human control
+never passes through the model:
+
+```text
+/computer show
+/computer hide
+/computer pause
+/computer resume
+/computer takeover
+/computer open
+```
+
 On first use, Nanocodex invokes the public macOS prompts for Screen & System
 Audio Recording and Accessibility. Enable the executable macOS identifies,
 then fully quit and relaunch it when the system prompt requests that. Automatic
@@ -104,6 +126,15 @@ permission separately for `target/debug/examples/observe` and
 `target/debug/nanocodex`. Rebuilding an ad-hoc development executable can also
 require granting it again; a distributed application should use a stably signed
 app or helper identity.
+
+To exercise the native API directly, including a fresh Accessibility check of
+the typed value:
+
+```sh
+cargo build -p nanocodex-computer --example observe
+target/debug/examples/observe com.apple.TextEdit \
+  --type-text "Hello from Nanocodex" --preview
+```
 
 ## Scope and security
 

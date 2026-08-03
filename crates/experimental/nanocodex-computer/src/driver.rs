@@ -12,9 +12,12 @@ use uuid::Uuid;
 
 use crate::{
     Application, ComputerAction, ComputerActionResult, ComputerBuildError, ComputerError,
-    ComputerEvent, ComputerOutput, ComputerState, InterventionReason, SettlePolicy, Window,
+    ComputerEvent, ComputerFrame, InterventionReason, SettlePolicy, Window,
     platform::{self, Backend},
 };
+
+#[cfg(test)]
+use crate::ComputerOutput;
 
 const RUNNING: u8 = 0;
 const PAUSED: u8 = 1;
@@ -51,7 +54,8 @@ pub struct Computer {
 struct Inner {
     commands: mpsc::Sender<Command>,
     control: ComputerControl,
-    frames: watch::Receiver<Option<ComputerState>>,
+    events: broadcast::Sender<ComputerEvent>,
+    frames: watch::Receiver<Option<Arc<ComputerFrame>>>,
     artifact_root: PathBuf,
     owned_artifacts: bool,
     _intervention_monitor: Option<platform::InterventionMonitor>,
@@ -88,21 +92,21 @@ impl ComputerEvents {
     }
 }
 
-/// A coalescing stream that always retains the newest visual/semantic frame.
+/// A coalescing stream that always retains the newest human-facing visual frame.
 #[derive(Clone)]
 pub struct ComputerFrames {
-    receiver: watch::Receiver<Option<ComputerState>>,
+    receiver: watch::Receiver<Option<Arc<ComputerFrame>>>,
 }
 
 impl ComputerFrames {
     /// Borrows the newest frame without waiting.
     #[must_use]
-    pub fn latest(&self) -> Option<ComputerState> {
+    pub fn latest(&self) -> Option<Arc<ComputerFrame>> {
         self.receiver.borrow().clone()
     }
 
     /// Waits until a newer frame is available.
-    pub async fn changed(&mut self) -> Result<ComputerState, ComputerError> {
+    pub async fn changed(&mut self) -> Result<Arc<ComputerFrame>, ComputerError> {
         loop {
             self.receiver
                 .changed()
@@ -112,6 +116,39 @@ impl ComputerFrames {
                 return Ok(state);
             }
         }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct FrameSink {
+    frames: watch::Sender<Option<Arc<ComputerFrame>>>,
+    events: broadcast::Sender<ComputerEvent>,
+    last_target: Option<(Application, Window)>,
+}
+
+impl FrameSink {
+    pub(crate) fn publish(&mut self, frame: ComputerFrame) {
+        let target = (frame.application.clone(), frame.window.clone());
+        if self.last_target.as_ref() != Some(&target) {
+            send(
+                &self.events,
+                ComputerEvent::TargetChanged {
+                    application: target.0.clone(),
+                    window: target.1.clone(),
+                },
+            );
+            self.last_target = Some(target);
+        }
+        send(
+            &self.events,
+            ComputerEvent::Frame {
+                sequence: frame.sequence,
+                generation: frame.generation,
+                digest: frame.image.digest().to_owned(),
+                phase: frame.phase,
+            },
+        );
+        let _ = self.frames.send(Some(Arc::new(frame)));
     }
 }
 
@@ -297,7 +334,7 @@ impl ComputerBuilder {
             backend,
             commands_rx,
             notices_rx,
-            events_tx,
+            events_tx.clone(),
             frames_tx,
             state,
             startup_permission,
@@ -307,6 +344,7 @@ impl ComputerBuilder {
                 inner: Arc::new(Inner {
                     commands: commands_tx,
                     control,
+                    events: events_tx,
                     frames: frames_rx,
                     artifact_root,
                     owned_artifacts,
@@ -343,6 +381,17 @@ impl Computer {
     pub fn frames(&self) -> ComputerFrames {
         ComputerFrames {
             receiver: self.inner.frames.clone(),
+        }
+    }
+
+    /// Subscribes to the ordered lifecycle stream.
+    ///
+    /// Each subscriber has an independent bounded cursor and receives an
+    /// explicit lag marker if it falls behind.
+    #[must_use]
+    pub fn events(&self) -> ComputerEvents {
+        ComputerEvents {
+            receiver: self.inner.events.subscribe(),
         }
     }
 
@@ -383,16 +432,20 @@ async fn run_driver(
     mut commands: mpsc::Receiver<Command>,
     mut notices: mpsc::UnboundedReceiver<ControlNotice>,
     events: broadcast::Sender<ComputerEvent>,
-    frames: watch::Sender<Option<ComputerState>>,
+    frames: watch::Sender<Option<Arc<ComputerFrame>>>,
     state: Arc<RunState>,
     startup_permission: Option<ComputerEvent>,
 ) {
+    let mut frame_sink = FrameSink {
+        frames,
+        events: events.clone(),
+        last_target: None,
+    };
     send(&events, ComputerEvent::SessionStarted { session_id });
     if let Some(event) = startup_permission {
         send(&events, event);
     }
     let mut sequence = 0_u64;
-    let mut last_target: Option<(Application, Window)> = None;
     loop {
         tokio::select! {
             biased;
@@ -418,25 +471,11 @@ async fn run_driver(
                     action: action.clone(),
                 });
                 let started = Instant::now();
-                let outcome = backend.execute(action, sequence, Arc::clone(&state)).await;
+                let outcome = backend
+                    .execute(action, sequence, Arc::clone(&state), &mut frame_sink)
+                    .await;
                 match outcome {
                     Ok(output) => {
-                        if let ComputerOutput::State { state: snapshot } = &output {
-                            let target = (snapshot.application.clone(), snapshot.window.clone());
-                            if last_target.as_ref() != Some(&target) {
-                                send(&events, ComputerEvent::TargetChanged {
-                                    application: target.0.clone(),
-                                    window: target.1.clone(),
-                                });
-                                last_target = Some(target);
-                            }
-                            let _ = frames.send(Some(snapshot.clone()));
-                            send(&events, ComputerEvent::Frame {
-                                sequence,
-                                state: snapshot.clone(),
-                                final_frame: true,
-                            });
-                        }
                         let result = ComputerActionResult {
                             sequence,
                             elapsed_ms: millis(started.elapsed()),
@@ -503,9 +542,40 @@ impl Backend for RecordingBackend {
     async fn execute(
         &mut self,
         action: ComputerAction,
-        _sequence: u64,
+        sequence: u64,
         _state: Arc<RunState>,
+        frames: &mut FrameSink,
     ) -> Result<ComputerOutput, ComputerError> {
+        if matches!(action, ComputerAction::Observe { .. }) {
+            frames.publish(ComputerFrame {
+                sequence,
+                generation: sequence,
+                application: Application {
+                    pid: 1,
+                    name: "Fixture".to_owned(),
+                    bundle_id: Some("dev.nanocodex.fixture".to_owned()),
+                },
+                window: Window {
+                    id: 1,
+                    pid: 1,
+                    title: Some("Fixture window".to_owned()),
+                    frame: crate::Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 1.0,
+                        height: 1.0,
+                    },
+                    on_screen: true,
+                },
+                phase: crate::ComputerFramePhase::Observed,
+                image: Arc::new(crate::CapturedImage::new(
+                    1,
+                    1,
+                    "fixture-digest".to_owned(),
+                    Arc::from(&b"fixture-png"[..]),
+                )),
+            });
+        }
         self.actions.lock().unwrap().push(action);
         Ok(ComputerOutput::Done)
     }

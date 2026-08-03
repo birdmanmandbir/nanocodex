@@ -13,17 +13,20 @@ use core_graphics::{
     event_source::{CGEventSource, CGEventSourceStateID},
     geometry::CGPoint,
 };
+use image::ImageEncoder as _;
 use nanocodex_computer_macos::{
-    NativeWindow, PermissionRequest, capture_window, element_rect, mark_synthetic,
-    request_accessibility, request_screen_capture,
+    NativeImageData, NativeWindow, PermissionRequest, capture_window, element_rect, mark_synthetic,
+    request_accessibility, request_screen_capture, window as native_window_by_id,
 };
 use sha2::{Digest as _, Sha256};
 
 use super::Backend;
 use crate::{
-    Application, ApplicationSelector, ComputerAction, ComputerError, ComputerOutput, ComputerState,
-    Element, ElementRef, InteractionTarget, KeyModifier, MouseButton, Permission, Point, Rect,
-    Screenshot, SettlePolicy, Window, driver::RunState,
+    Application, ApplicationSelector, CapturedImage, ComputerAction, ComputerError, ComputerFrame,
+    ComputerFramePhase, ComputerObservation, ComputerOutput, Element, ElementRef,
+    InteractionTarget, KeyModifier, MouseButton, Permission, Point, Rect, ScreenshotArtifact,
+    SettlePolicy, Window,
+    driver::{FrameSink, RunState},
 };
 
 const MAX_TEXT_CHARS: usize = 2_000;
@@ -37,6 +40,12 @@ struct Target {
 }
 
 type Discovery = (Vec<Application>, Vec<Window>, Vec<NativeWindow>);
+
+struct VisualSample {
+    application: Application,
+    window: Window,
+    image: Arc<CapturedImage>,
+}
 
 pub(super) struct MacosBackend {
     artifact_root: PathBuf,
@@ -68,13 +77,15 @@ impl MacosBackend {
         sequence: u64,
         screenshot: bool,
         settled: bool,
-    ) -> Result<ComputerState, ComputerError> {
+        phase: ComputerFramePhase,
+        frames: &mut FrameSink,
+    ) -> Result<ComputerObservation, ComputerError> {
         let target = self.target.clone().ok_or(ComputerError::NoTarget)?;
         self.generation = self.generation.saturating_add(1);
         let generation = self.generation;
         let root = self.artifact_root.clone();
         let maximum = self.maximum_elements;
-        let observed = tokio::task::spawn_blocking(move || {
+        let (observed, image) = tokio::task::spawn_blocking(move || {
             observe_target(
                 target, generation, sequence, screenshot, settled, &root, maximum,
             )
@@ -87,6 +98,80 @@ impl MacosBackend {
             application: observed.application.clone(),
             window: observed.window.clone(),
         });
+        if let Some(image) = image {
+            frames.publish(ComputerFrame {
+                sequence,
+                generation,
+                application: observed.application.clone(),
+                window: observed.window.clone(),
+                phase,
+                image,
+            });
+        }
+        self.retain_screenshot(&observed).await;
+        Ok(observed)
+    }
+
+    async fn settled_observation(
+        &mut self,
+        sequence: u64,
+        state: Arc<RunState>,
+        frames: &mut FrameSink,
+    ) -> Result<ComputerObservation, ComputerError> {
+        let deadline = Instant::now() + self.settle.timeout;
+        let mut previous: Option<String> = None;
+        let generation = self.generation.saturating_add(1);
+        loop {
+            state.ensure_running()?;
+            let target = self.target.clone().ok_or(ComputerError::NoTarget)?;
+            let sample = tokio::task::spawn_blocking(move || visual_sample(target))
+                .await
+                .map_err(|error| ComputerError::Native {
+                    message: format!("observation worker panicked: {error}"),
+                })??;
+            let signature = visual_signature(&sample);
+            let matched = previous.as_deref() == Some(signature.as_str());
+            let timed_out = Instant::now() >= deadline;
+            let phase = if matched {
+                ComputerFramePhase::Settled
+            } else if timed_out {
+                ComputerFramePhase::TimedOut
+            } else {
+                ComputerFramePhase::Settling
+            };
+            frames.publish(ComputerFrame {
+                sequence,
+                generation,
+                application: sample.application.clone(),
+                window: sample.window.clone(),
+                phase,
+                image: Arc::clone(&sample.image),
+            });
+            if matched || timed_out {
+                let root = self.artifact_root.clone();
+                let maximum = self.maximum_elements;
+                let settled = matched;
+                let observed = tokio::task::spawn_blocking(move || {
+                    observation_from_visual(sample, generation, sequence, settled, &root, maximum)
+                })
+                .await
+                .map_err(|error| ComputerError::Native {
+                    message: format!("semantic observation worker panicked: {error}"),
+                })??;
+                self.generation = generation;
+                self.target = Some(Target {
+                    application: observed.application.clone(),
+                    window: observed.window.clone(),
+                });
+                self.retain_screenshot(&observed).await;
+                return Ok(observed);
+            }
+            previous = Some(signature);
+            tokio::time::sleep(self.settle.sample_interval).await;
+        }
+    }
+
+    async fn retain_screenshot(&mut self, observed: &ComputerObservation) {
         if let Some(screenshot) = &observed.screenshot {
             self.screenshots.push_back(screenshot.path.clone());
         }
@@ -98,40 +183,6 @@ impl MacosBackend {
                 tracing::warn!(path = %path.display(), %error, "failed to prune old computer screenshot");
             }
         }
-        Ok(observed)
-    }
-
-    async fn settled_observation(
-        &mut self,
-        sequence: u64,
-        state: Arc<RunState>,
-    ) -> Result<ComputerState, ComputerError> {
-        let deadline = Instant::now() + self.settle.timeout;
-        let mut previous: Option<String> = None;
-        let mut previous_path: Option<PathBuf> = None;
-        loop {
-            state.ensure_running()?;
-            let mut observed = self.observe(sequence, true, false).await?;
-            let signature = state_signature(&observed);
-            if previous.as_ref() == Some(&signature) {
-                observed.settled = true;
-                if let Some(path) = previous_path
-                    && observed.screenshot.as_ref().map(|image| &image.path) != Some(&path)
-                {
-                    let _ = tokio::fs::remove_file(path).await;
-                }
-                return Ok(observed);
-            }
-            if let Some(path) = previous_path.take() {
-                let _ = tokio::fs::remove_file(path).await;
-            }
-            previous_path = observed.screenshot.as_ref().map(|image| image.path.clone());
-            previous = Some(signature);
-            if Instant::now() >= deadline {
-                return Ok(observed);
-            }
-            tokio::time::sleep(self.settle.sample_interval).await;
-        }
     }
 
     async fn mutate(
@@ -139,6 +190,7 @@ impl MacosBackend {
         action: NativeAction,
         sequence: u64,
         state: Arc<RunState>,
+        frames: &mut FrameSink,
     ) -> Result<ComputerOutput, ComputerError> {
         state.ensure_running()?;
         let target = self.target.clone().ok_or(ComputerError::NoTarget)?;
@@ -150,7 +202,7 @@ impl MacosBackend {
                 message: format!("input worker panicked: {error}"),
             })??;
         Ok(ComputerOutput::State {
-            state: self.settled_observation(sequence, state).await?,
+            state: self.settled_observation(sequence, state, frames).await?,
         })
     }
 }
@@ -162,6 +214,7 @@ impl Backend for MacosBackend {
         action: ComputerAction,
         sequence: u64,
         state: Arc<RunState>,
+        frames: &mut FrameSink,
     ) -> Result<ComputerOutput, ComputerError> {
         match action {
             ComputerAction::ListApplications => {
@@ -208,15 +261,30 @@ impl Backend for MacosBackend {
                         })??;
                 self.target = Some(target);
                 Ok(ComputerOutput::State {
-                    state: self.observe(sequence, true, true).await?,
+                    state: self
+                        .observe(sequence, true, true, ComputerFramePhase::Observed, frames)
+                        .await?,
                 })
             }
             ComputerAction::Observe { screenshot } => Ok(ComputerOutput::State {
-                state: self.observe(sequence, screenshot, true).await?,
+                state: self
+                    .observe(
+                        sequence,
+                        screenshot,
+                        true,
+                        ComputerFramePhase::Observed,
+                        frames,
+                    )
+                    .await?,
             }),
             ComputerAction::Click { target, button } => {
-                self.mutate(NativeAction::Click { target, button }, sequence, state)
-                    .await
+                self.mutate(
+                    NativeAction::Click { target, button },
+                    sequence,
+                    state,
+                    frames,
+                )
+                .await
             }
             ComputerAction::Drag {
                 from,
@@ -236,6 +304,7 @@ impl Backend for MacosBackend {
                     },
                     sequence,
                     state,
+                    frames,
                 )
                 .await
             }
@@ -252,12 +321,18 @@ impl Backend for MacosBackend {
                     },
                     sequence,
                     state,
+                    frames,
                 )
                 .await
             }
             ComputerAction::PressKey { key, modifiers } => {
-                self.mutate(NativeAction::PressKey { key, modifiers }, sequence, state)
-                    .await
+                self.mutate(
+                    NativeAction::PressKey { key, modifiers },
+                    sequence,
+                    state,
+                    frames,
+                )
+                .await
             }
             ComputerAction::TypeText { text } => {
                 if text.chars().count() > 100_000 {
@@ -265,18 +340,24 @@ impl Backend for MacosBackend {
                         message: "type_text is limited to 100000 Unicode scalar values".to_owned(),
                     });
                 }
-                self.mutate(NativeAction::TypeText { text }, sequence, state)
+                self.mutate(NativeAction::TypeText { text }, sequence, state, frames)
                     .await
             }
             ComputerAction::SetValue { reference, value } => {
-                self.mutate(NativeAction::SetValue { reference, value }, sequence, state)
-                    .await
+                self.mutate(
+                    NativeAction::SetValue { reference, value },
+                    sequence,
+                    state,
+                    frames,
+                )
+                .await
             }
             ComputerAction::PerformAction { reference, name } => {
                 self.mutate(
                     NativeAction::PerformAction { reference, name },
                     sequence,
                     state,
+                    frames,
                 )
                 .await
             }
@@ -297,7 +378,9 @@ impl Backend for MacosBackend {
                 }
                 if self.target.is_some() {
                     Ok(ComputerOutput::State {
-                        state: self.observe(sequence, true, true).await?,
+                        state: self
+                            .observe(sequence, true, true, ComputerFramePhase::Observed, frames)
+                            .await?,
                     })
                 } else {
                     Ok(ComputerOutput::Done)
@@ -389,8 +472,13 @@ fn select_target(
     } else {
         matching_windows
             .clone()
-            .find(|window| window.on_screen)
-            .or_else(|| matching_windows.into_iter().next())
+            .find(|window| primary_window_candidate(window))
+            .or_else(|| {
+                matching_windows
+                    .clone()
+                    .find(|window| normal_window_candidate(window))
+            })
+            .or_else(|| matching_windows.clone().find(|window| window.on_screen))
     }
     .ok_or_else(|| ComputerError::TargetNotFound {
         message: format!(
@@ -402,6 +490,14 @@ fn select_target(
         application,
         window: public_window(native_window),
     })
+}
+
+fn primary_window_candidate(window: &NativeWindow) -> bool {
+    normal_window_candidate(window) && window.title.as_ref().is_some_and(|title| !title.is_empty())
+}
+
+fn normal_window_candidate(window: &NativeWindow) -> bool {
+    window.on_screen && window.width >= 64.0 && window.height >= 64.0
 }
 
 fn public_window(window: &NativeWindow) -> Window {
@@ -427,28 +523,80 @@ fn observe_target(
     settled: bool,
     artifact_root: &Path,
     maximum_elements: usize,
-) -> Result<ComputerState, ComputerError> {
-    let (_, _, native_windows) = discover()?;
-    let native_window = native_windows
-        .iter()
-        .find(|window| window.id == target.window.id)
-        .ok_or_else(|| ComputerError::TargetNotFound {
+) -> Result<(ComputerObservation, Option<Arc<CapturedImage>>), ComputerError> {
+    let native_window =
+        native_window_by_id(target.window.id).ok_or_else(|| ComputerError::TargetNotFound {
             message: format!("window {} is no longer capturable", target.window.id),
         })?;
-    let window = public_window(native_window);
+    let target = Target {
+        application: target.application,
+        window: public_window(&native_window),
+    };
+    let (elements, image) = std::thread::scope(|scope| {
+        let capture = include_screenshot.then(|| scope.spawn(|| capture_image(&native_window)));
+        let elements = accessibility_snapshot(&target, generation, maximum_elements)
+            .map(|elements| elements.into_iter().map(|(element, _)| element).collect());
+        let image = capture.map(|capture| {
+            capture.join().map_err(|_| ComputerError::Native {
+                message: "screenshot worker panicked".to_owned(),
+            })?
+        });
+        (elements, image.transpose())
+    });
+    let elements = elements?;
+    let image = image?;
+    let screenshot = image
+        .as_deref()
+        .map(|image| persist_image(image, generation, sequence, artifact_root))
+        .transpose()?;
+    Ok((
+        ComputerObservation {
+            generation,
+            application: target.application,
+            window: target.window,
+            elements,
+            screenshot,
+            settled,
+        },
+        image,
+    ))
+}
+
+fn visual_sample(target: Target) -> Result<VisualSample, ComputerError> {
+    let native_window =
+        native_window_by_id(target.window.id).ok_or_else(|| ComputerError::TargetNotFound {
+            message: format!("window {} is no longer capturable", target.window.id),
+        })?;
+    Ok(VisualSample {
+        application: target.application,
+        window: public_window(&native_window),
+        image: capture_image(&native_window)?,
+    })
+}
+
+fn observation_from_visual(
+    sample: VisualSample,
+    generation: u64,
+    sequence: u64,
+    settled: bool,
+    artifact_root: &Path,
+    maximum_elements: usize,
+) -> Result<ComputerObservation, ComputerError> {
+    let target = Target {
+        application: sample.application,
+        window: sample.window,
+    };
     let elements = accessibility_snapshot(&target, generation, maximum_elements)?
         .into_iter()
         .map(|(element, _)| element)
         .collect();
-    let screenshot = include_screenshot
-        .then(|| capture(native_window, generation, sequence, artifact_root))
-        .transpose()?;
-    Ok(ComputerState {
+    let screenshot = persist_image(&sample.image, generation, sequence, artifact_root)?;
+    Ok(ComputerObservation {
         generation,
         application: target.application,
-        window,
+        window: target.window,
         elements,
-        screenshot,
+        screenshot: Some(screenshot),
         settled,
     })
 }
@@ -458,6 +606,22 @@ fn accessibility_snapshot(
     generation: u64,
     maximum_elements: usize,
 ) -> Result<Vec<(Element, AXUIElement)>, ComputerError> {
+    let raw = accessibility_elements(target, maximum_elements)?;
+    let mut output = Vec::with_capacity(raw.len());
+    for (raw_index, element) in raw.into_iter().enumerate() {
+        let mut public = public_element(&element, generation, raw_index);
+        if should_include(&public) {
+            public.reference = reference_for(generation, raw_index, &public);
+            output.push((public, element));
+        }
+    }
+    Ok(output)
+}
+
+fn accessibility_elements(
+    target: &Target,
+    maximum_elements: usize,
+) -> Result<Vec<AXUIElement>, ComputerError> {
     if request_accessibility() == PermissionRequest::Prompted {
         return Err(ComputerError::Permission {
             permission: Permission::Accessibility,
@@ -473,16 +637,7 @@ fn accessibility_snapshot(
     let root = select_accessibility_window(&application, target).unwrap_or(application);
     let mut raw = Vec::with_capacity(maximum_elements.min(256));
     walk_accessibility(&root, 0, maximum_elements, &mut raw);
-    let mut output = Vec::with_capacity(raw.len());
-    for (index, element) in raw.into_iter().enumerate() {
-        let mut public = public_element(&element, generation, index);
-        if should_include(&public) {
-            let compact_index = output.len();
-            public.reference = reference_for(generation, compact_index, &public);
-            output.push((public, element));
-        }
-    }
-    Ok(output)
+    Ok(raw)
 }
 
 fn select_accessibility_window(application: &AXUIElement, target: &Target) -> Option<AXUIElement> {
@@ -523,24 +678,14 @@ fn walk_accessibility(
 }
 
 fn public_element(element: &AXUIElement, generation: u64, index: usize) -> Element {
-    let title = string_attribute(element.title());
-    let description = string_attribute(element.description());
-    let help = string_attribute(element.help());
-    let label = [title, description, help]
-        .into_iter()
-        .flatten()
-        .find(|value| !value.trim().is_empty());
+    let label = string_attribute(element.title())
+        .or_else(|| string_attribute(element.description()))
+        .or_else(|| string_attribute(element.help()));
     let actions = element
         .action_names()
         .map(|actions| actions.iter().map(|action| action.to_string()).collect())
         .unwrap_or_default();
-    let frame = element_rect(element).map(|(x, y, width, height)| Rect {
-        x,
-        y,
-        width,
-        height,
-    });
-    Element {
+    let mut public = Element {
         reference: ElementRef(format!("e{generation}_{index}")),
         role: string_attribute(element.role()).unwrap_or_else(|| "AXUnknown".to_owned()),
         subrole: string_attribute(element.subrole()),
@@ -548,11 +693,22 @@ fn public_element(element: &AXUIElement, generation: u64, index: usize) -> Eleme
         value: scalar_value(element),
         placeholder: string_attribute(element.placeholder_value()),
         identifier: string_attribute(element.identifier()),
-        frame,
-        enabled: element.enabled().ok().map(bool::from),
-        focused: element.focused().ok().map(bool::from),
+        frame: None,
+        enabled: None,
+        focused: None,
         actions,
+    };
+    if should_include(&public) {
+        public.frame = element_rect(element).map(|(x, y, width, height)| Rect {
+            x,
+            y,
+            width,
+            height,
+        });
+        public.enabled = element.enabled().ok().map(bool::from);
+        public.focused = element.focused().ok().map(bool::from);
     }
+    public
 }
 
 fn should_include(element: &Element) -> bool {
@@ -613,17 +769,35 @@ fn resolve_element(
     maximum: usize,
     reference: &ElementRef,
 ) -> Result<(Element, AXUIElement), ComputerError> {
-    if !reference.0.starts_with(&format!("e{generation}_")) {
+    let raw_index =
+        reference_index(reference, generation).ok_or_else(|| ComputerError::StaleReference {
+            reference: reference.0.clone(),
+        })?;
+    let element = accessibility_elements(target, maximum)?
+        .into_iter()
+        .nth(raw_index)
+        .ok_or_else(|| ComputerError::StaleReference {
+            reference: reference.0.clone(),
+        })?;
+    let mut public = public_element(&element, generation, raw_index);
+    if !should_include(&public) {
         return Err(ComputerError::StaleReference {
             reference: reference.0.clone(),
         });
     }
-    accessibility_snapshot(target, generation, maximum)?
-        .into_iter()
-        .find(|(element, _)| element.reference == *reference)
-        .ok_or_else(|| ComputerError::StaleReference {
+    public.reference = reference_for(generation, raw_index, &public);
+    if public.reference != *reference {
+        return Err(ComputerError::StaleReference {
             reference: reference.0.clone(),
-        })
+        });
+    }
+    Ok((public, element))
+}
+
+fn reference_index(reference: &ElementRef, generation: u64) -> Option<usize> {
+    let remainder = reference.0.strip_prefix(&format!("e{generation}_"))?;
+    let (index, hash) = remainder.split_once('_')?;
+    (!hash.is_empty()).then(|| index.parse().ok()).flatten()
 }
 
 fn resolve_point(
@@ -986,44 +1160,59 @@ fn key_code(key: &str) -> Option<u16> {
     })
 }
 
-fn capture(
-    window: &NativeWindow,
-    generation: u64,
-    sequence: u64,
-    artifact_root: &Path,
-) -> Result<Screenshot, ComputerError> {
+fn capture_image(window: &NativeWindow) -> Result<Arc<CapturedImage>, ComputerError> {
     if request_screen_capture() == PermissionRequest::Prompted {
         return Err(ComputerError::Permission {
             permission: Permission::ScreenRecording,
             guidance: permission_guidance(Permission::ScreenRecording),
         });
     }
-    let image = capture_window(window.id).ok_or_else(|| ComputerError::Native {
-        message: format!("window {} could not be captured", window.id),
+    let image = capture_window(window.id).map_err(|error| ComputerError::Native {
+        message: format!("window {} could not be captured: {error}", window.id),
     })?;
-    let filename = format!("frame-{sequence:06}-{generation:06}.png");
-    let path = artifact_root.join(filename);
-    image::save_buffer_with_format(
-        &path,
-        &image.rgba,
+    let png = match image.data {
+        NativeImageData::Png(png) => png,
+        NativeImageData::Rgba(rgba) => {
+            let mut png = Vec::new();
+            image::codecs::png::PngEncoder::new(&mut png)
+                .write_image(
+                    &rgba,
+                    image.width,
+                    image.height,
+                    image::ExtendedColorType::Rgba8,
+                )
+                .map_err(|error| ComputerError::Native {
+                    message: format!("failed to encode screenshot: {error}"),
+                })?;
+            png
+        }
+    };
+    let digest = hex_digest(Sha256::digest(&png).as_slice());
+    Ok(Arc::new(CapturedImage::new(
         image.width,
         image.height,
-        image::ColorType::Rgba8,
-        image::ImageFormat::Png,
-    )
-    .map_err(|error| ComputerError::Native {
-        message: format!("failed to encode screenshot: {error}"),
-    })?;
-    let bytes = std::fs::read(&path).map_err(|source| ComputerError::Io {
+        digest,
+        Arc::from(png),
+    )))
+}
+
+fn persist_image(
+    image: &CapturedImage,
+    generation: u64,
+    sequence: u64,
+    artifact_root: &Path,
+) -> Result<ScreenshotArtifact, ComputerError> {
+    let filename = format!("frame-{sequence:06}-{generation:06}.png");
+    let path = artifact_root.join(filename);
+    std::fs::write(&path, image.png()).map_err(|source| ComputerError::Io {
         path: path.clone(),
         source,
     })?;
-    let digest = hex_digest(Sha256::digest(bytes).as_slice());
-    Ok(Screenshot {
+    Ok(ScreenshotArtifact {
         path,
-        width: image.width,
-        height: image.height,
-        digest,
+        width: image.width(),
+        height: image.height(),
+        digest: image.digest().to_owned(),
     })
 }
 
@@ -1038,18 +1227,14 @@ fn permission_guidance(permission: Permission) -> String {
     }
 }
 
-fn state_signature(state: &ComputerState) -> String {
+fn visual_signature(sample: &VisualSample) -> String {
     let mut digest = Sha256::new();
-    digest.update(state.window.id.to_le_bytes());
-    if let Some(screenshot) = &state.screenshot {
-        digest.update(screenshot.digest.as_bytes());
-    }
-    for element in &state.elements {
-        digest.update(element.role.as_bytes());
-        digest.update(element.label.as_deref().unwrap_or_default().as_bytes());
-        digest.update(element.value.as_deref().unwrap_or_default().as_bytes());
-        digest.update(element.focused.unwrap_or(false).to_string().as_bytes());
-    }
+    digest.update(sample.window.id.to_le_bytes());
+    digest.update(sample.window.frame.x.to_bits().to_le_bytes());
+    digest.update(sample.window.frame.y.to_bits().to_le_bytes());
+    digest.update(sample.window.frame.width.to_bits().to_le_bytes());
+    digest.update(sample.window.frame.height.to_bits().to_le_bytes());
+    digest.update(sample.image.digest().as_bytes());
     hex_digest(digest.finalize().as_slice())
 }
 
@@ -1101,5 +1286,36 @@ mod tests {
         let accessibility = permission_guidance(Permission::Accessibility);
         assert!(accessibility.contains("macOS opened its Accessibility request"));
         assert!(accessibility.contains("fully quit and relaunch"));
+    }
+
+    #[test]
+    fn implicit_target_selection_rejects_tiny_auxiliary_windows() {
+        let mut window = NativeWindow {
+            id: 1,
+            pid: 2,
+            owner_name: "Fixture".to_owned(),
+            bundle_id: Some("dev.nanocodex.fixture".to_owned()),
+            title: Some("Document".to_owned()),
+            x: 0.0,
+            y: 0.0,
+            width: 640.0,
+            height: 480.0,
+            on_screen: true,
+        };
+        assert!(primary_window_candidate(&window));
+        window.width = 1.0;
+        assert!(!normal_window_candidate(&window));
+        window.width = 640.0;
+        window.title = None;
+        assert!(normal_window_candidate(&window));
+        assert!(!primary_window_candidate(&window));
+    }
+
+    #[test]
+    fn element_reference_exposes_only_its_generation_scoped_raw_index() {
+        let reference = ElementRef("e7_42_deadbeef".to_owned());
+        assert_eq!(reference_index(&reference, 7), Some(42));
+        assert_eq!(reference_index(&reference, 8), None);
+        assert_eq!(reference_index(&ElementRef("e7_42".to_owned()), 7), None);
     }
 }

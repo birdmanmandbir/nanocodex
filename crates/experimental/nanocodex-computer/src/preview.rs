@@ -9,7 +9,8 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    Computer, ComputerControl, ComputerError, ComputerFrames, ComputerState, InterventionReason,
+    Computer, ComputerControl, ComputerError, ComputerFrame, ComputerFramePhase, ComputerFrames,
+    InterventionReason,
 };
 
 const MAX_REQUEST_BYTES: usize = 16 * 1024;
@@ -154,22 +155,19 @@ async fn handle(
             .await
         }
         ("GET", "state") => {
-            let Some(state) = frames.latest() else {
+            let Some(frame) = frames.latest() else {
                 return respond(&mut stream, 204, "application/json", b"", no_store()).await;
             };
-            let body = serde_json::to_vec(&PreviewState::from_state(&state, token))
+            let body = serde_json::to_vec(&PreviewState::from_frame(&frame, token))
                 .unwrap_or_else(|_| b"{}".to_vec());
             respond(&mut stream, 200, "application/json", &body, no_store()).await
         }
         ("GET", "frame") => {
-            let Some(state) = frames.latest() else {
+            let Some(frame) = frames.latest() else {
                 return respond(&mut stream, 204, "image/png", b"", no_store()).await;
             };
-            let Some(image) = state.screenshot else {
-                return respond(&mut stream, 204, "image/png", b"", no_store()).await;
-            };
-            let metadata = tokio::fs::metadata(&image.path).await?;
-            if metadata.len() > MAX_FRAME_BYTES {
+            let image = &frame.image;
+            if u64::try_from(image.png().len()).unwrap_or(u64::MAX) > MAX_FRAME_BYTES {
                 return respond(
                     &mut stream,
                     413,
@@ -179,8 +177,7 @@ async fn handle(
                 )
                 .await;
             }
-            let body = tokio::fs::read(image.path).await?;
-            respond(&mut stream, 200, "image/png", &body, no_store()).await
+            respond(&mut stream, 200, "image/png", image.png(), no_store()).await
         }
         ("POST", "pause") => {
             control.pause();
@@ -237,21 +234,19 @@ struct PreviewState<'a> {
     generation: u64,
     application: &'a str,
     window: &'a str,
-    elements: usize,
-    settled: bool,
-    digest: Option<&'a str>,
+    phase: ComputerFramePhase,
+    digest: &'a str,
     frame_url: String,
 }
 
 impl<'a> PreviewState<'a> {
-    fn from_state(state: &'a ComputerState, token: &str) -> Self {
+    fn from_frame(frame: &'a ComputerFrame, token: &str) -> Self {
         Self {
-            generation: state.generation,
-            application: &state.application.name,
-            window: state.window.title.as_deref().unwrap_or("Untitled window"),
-            elements: state.elements.len(),
-            settled: state.settled,
-            digest: state.screenshot.as_ref().map(|image| image.digest.as_str()),
+            generation: frame.generation,
+            application: &frame.application.name,
+            window: frame.window.title.as_deref().unwrap_or("Untitled window"),
+            phase: frame.phase,
+            digest: frame.image.digest(),
             frame_url: format!("/{token}/frame"),
         }
     }
@@ -271,7 +266,7 @@ img{{max-width:100%;max-height:100%;object-fit:contain;box-shadow:0 10px 40px #0
 </style></head><body><header><span id="title">Waiting for the first frame…</span><span id="status"></span><button id="pause">Pause</button><button id="resume">Resume</button><button id="takeover">Take over</button></header><main><img id="frame" alt="Live target window"></main>
 <script>
 const root='/{token}/', img=document.querySelector('#frame'), title=document.querySelector('#title'), status=document.querySelector('#status'); let digest='';
-async function poll(){{try{{const r=await fetch(root+'state',{{cache:'no-store'}});if(r.status===200){{const s=await r.json();title.textContent=s.application+' — '+s.window;status.textContent='gen '+s.generation+' · '+s.elements+' AX · '+(s.settled?'settled':'moving');if(s.digest&&s.digest!==digest){{digest=s.digest;img.src=s.frame_url+'?d='+encodeURIComponent(digest)}}}}}}catch(_e){{status.textContent='disconnected'}}setTimeout(poll,250)}}
+async function poll(){{try{{const r=await fetch(root+'state',{{cache:'no-store'}});if(r.status===200){{const s=await r.json();title.textContent=s.application+' — '+s.window;status.textContent='gen '+s.generation+' · '+s.phase;if(s.digest&&s.digest!==digest){{digest=s.digest;img.src=s.frame_url+'?d='+encodeURIComponent(digest)}}}}}}catch(_e){{status.textContent='disconnected'}}setTimeout(poll,100)}}
 for(const id of ['pause','resume','takeover'])document.querySelector('#'+id).onclick=()=>fetch(root+id,{{method:'POST'}});poll();
 </script></body></html>"#
     )
@@ -294,10 +289,22 @@ mod tests {
         let (computer, _events) = builder.build().unwrap();
         let preview = ComputerPreview::spawn(&computer).await.unwrap();
 
+        computer
+            .execute(crate::ComputerAction::Observe { screenshot: true })
+            .await
+            .unwrap();
+
         let response = request(preview.url(), "GET", "").await;
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("Content-Security-Policy:"));
         assert!(response.contains("Nanocodex Computer"));
+
+        let response = request(preview.url(), "GET", "state").await;
+        assert!(response.contains("fixture-digest"));
+        assert!(response.contains("\"phase\":\"observed\""));
+
+        let response = request(preview.url(), "GET", "frame").await;
+        assert!(response.ends_with("fixture-png"));
 
         let response = request(preview.url(), "POST", "takeover").await;
         assert!(response.starts_with("HTTP/1.1 204 No Content"));

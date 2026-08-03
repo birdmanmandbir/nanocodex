@@ -106,6 +106,7 @@ proc-macro-crate = "3"
 proc-macro2 = "1.0.106"
 quote = "1.0.46"
 ratatui = { version = "0.29.0", features = ["unstable-rendered-line-info"] }
+ratatui-image = { version = "9.0.0", default-features = false, features = ["crossterm"] }
 ratatex = "0.1.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-ring"] }
 reqwest-middleware = "0.5.2"

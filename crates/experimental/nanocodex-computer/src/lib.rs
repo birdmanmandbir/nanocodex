@@ -13,16 +13,21 @@ pub use error::{ComputerBuildError, ComputerError};
 pub use preview::ComputerPreview;
 pub use tool::ComputerTool;
 pub use types::{
-    Application, ApplicationSelector, ComputerAction, ComputerActionResult, ComputerEvent,
-    ComputerOutput, ComputerState, Element, ElementRef, InteractionTarget, InterventionReason,
-    KeyModifier, MouseButton, Permission, Point, Rect, Screenshot, SettlePolicy, Window,
+    Application, ApplicationSelector, CapturedImage, ComputerAction, ComputerActionResult,
+    ComputerEvent, ComputerFrame, ComputerFramePhase, ComputerObservation, ComputerOutput, Element,
+    ElementRef, InteractionTarget, InterventionReason, KeyModifier, MouseButton, Permission, Point,
+    Rect, ScreenshotArtifact, SettlePolicy, Window,
 };
 
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use nanocodex_tools::runtime::DynamicToolProvider;
+    use nanocodex_tools::{
+        ToolContext, ToolDefinition,
+        contract::DEFAULT_TOOL_OUTPUT_TOKENS,
+        runtime::{DynamicToolProvider, ToolRuntime, Tools},
+    };
 
     use super::*;
 
@@ -94,18 +99,135 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn computer_tool_is_deferred_with_typed_input_and_output() {
+    async fn lifecycle_subscribers_have_independent_cursors() {
+        let (builder, _) = crate::driver::recording_builder();
+        let (computer, mut original) = builder.build().unwrap();
+        let mut subscribed = computer.events();
+        computer
+            .execute(ComputerAction::ListApplications)
+            .await
+            .unwrap();
+
+        while !matches!(
+            original.recv().await,
+            Some(ComputerEvent::ActionCompleted { .. })
+        ) {}
+        while !matches!(
+            subscribed.recv().await,
+            Some(ComputerEvent::ActionCompleted { .. })
+        ) {}
+    }
+
+    #[tokio::test]
+    async fn target_change_precedes_first_frame_and_is_not_repeated() {
+        let (builder, _) = crate::driver::recording_builder();
+        let (computer, mut events) = builder.build().unwrap();
+        computer
+            .execute(ComputerAction::Observe { screenshot: true })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            events.recv().await,
+            Some(ComputerEvent::SessionStarted { .. })
+        ));
+        assert!(matches!(
+            events.recv().await,
+            Some(ComputerEvent::ActionStarted { sequence: 1, .. })
+        ));
+        assert!(matches!(
+            events.recv().await,
+            Some(ComputerEvent::TargetChanged { .. })
+        ));
+        assert!(matches!(
+            events.recv().await,
+            Some(ComputerEvent::Frame { sequence: 1, .. })
+        ));
+        assert!(matches!(
+            events.recv().await,
+            Some(ComputerEvent::ActionCompleted { .. })
+        ));
+
+        computer
+            .execute(ComputerAction::Observe { screenshot: true })
+            .await
+            .unwrap();
+        assert!(matches!(
+            events.recv().await,
+            Some(ComputerEvent::ActionStarted { sequence: 2, .. })
+        ));
+        assert!(matches!(
+            events.recv().await,
+            Some(ComputerEvent::Frame { sequence: 2, .. })
+        ));
+        assert!(matches!(
+            events.recv().await,
+            Some(ComputerEvent::ActionCompleted { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn computer_tool_has_typed_input_and_output() {
         let (builder, _) = crate::driver::recording_builder();
         let (computer, _events) = builder.build().unwrap();
         let tool = ComputerTool::from_computer(computer);
-        assert!(tool.direct_tools().is_empty());
         assert!(tool.contains("computer"));
         assert!(!tool.contains("other"));
-        let definitions = tool.available_definitions();
+        assert!(tool.available_definitions().is_empty());
+        let definitions = tool.direct_tools();
         assert_eq!(definitions.len(), 1);
-        assert_eq!(definitions[0].name(), "computer");
-        assert!(definitions[0].parameters().is_some());
-        assert!(definitions[0].output_schema().is_some());
+        let definition = definitions[0].definition();
+        assert_eq!(definition.name(), "computer");
+        assert!(definition.parameters().is_some());
+        assert!(definition.output_schema().is_some());
+    }
+
+    #[tokio::test]
+    async fn computer_tool_is_described_and_callable_from_code_mode() {
+        let (builder, actions) = crate::driver::recording_builder();
+        let (computer, _events) = builder.build().unwrap();
+        let tools = Tools::builder()
+            .without_defaults()
+            .provider(ComputerTool::from_computer(computer))
+            .build()
+            .unwrap();
+        let runtime = ToolRuntime::new(".", None, None).with_tools(&tools);
+        let specs = runtime.model_specs("test-session");
+        let exec = specs
+            .iter()
+            .find(|definition| definition.name() == "exec")
+            .unwrap();
+        assert!(
+            exec.description()
+                .contains("declare const tools: { computer(args:")
+        );
+        assert_eq!(
+            specs.iter().map(ToolDefinition::name).collect::<Vec<_>>(),
+            ["exec", "wait"]
+        );
+
+        let execution = runtime
+            .execute_code(
+                r#"
+const result = await tools.computer({ action: "wait", milliseconds: 0 });
+text(result.sequence);
+"#,
+                ToolContext::new(
+                    "test-model",
+                    "test-session",
+                    "test-call",
+                    &[],
+                    DEFAULT_TOOL_OUTPUT_TOKENS,
+                ),
+            )
+            .await;
+        assert!(execution.success);
+        assert_eq!(execution.nested_calls.len(), 1);
+        assert_eq!(execution.nested_calls[0].name, "computer");
+        assert_eq!(
+            actions.lock().unwrap().as_slice(),
+            [ComputerAction::Wait { milliseconds: 0 }]
+        );
     }
 
     #[test]

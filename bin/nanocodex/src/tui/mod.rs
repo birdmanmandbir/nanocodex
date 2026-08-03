@@ -1,6 +1,7 @@
 mod app;
 mod clipboard;
 mod composer;
+mod computer_pane;
 mod diff;
 mod eval_attach;
 mod external_editor;
@@ -35,11 +36,13 @@ use nanocodex::{
     },
     tools::mcp::McpHandle,
 };
+use nanocodex_computer::{ComputerControl, ComputerFrames, InterventionReason};
 use nanocodex_voice::{
     CHATGPT_REALTIME_VOICES, PLATFORM_REALTIME_VOICES, RealtimeVoice, VoiceAgentControl,
     VoiceEvent, VoiceEvents, VoiceSession, VoiceSessionBuilder, VoiceSpeaker,
 };
-use ratatex::{Ratatex, TerminalProfile};
+use ratatex::{PixelSize, Ratatex, TerminalProfile};
+use ratatui_image::picker::{Picker, ProtocolType, cap_parser::QueryStdioOptions};
 use tokio::{
     sync::mpsc,
     time::{MissedTickBehavior, interval, sleep_until},
@@ -48,6 +51,7 @@ use tracing::{Instrument, info_span};
 
 use self::{
     app::{App, EscapeAction, PaneId, ReasoningPickerAction, SubmittedPrompt},
+    computer_pane::ComputerPane,
     notification::Notifier,
     scheduler::{ANIMATION_TICK_INTERVAL, RenderScheduler, RenderScope, STREAM_FRAME_INTERVAL},
     telemetry::{StreamTelemetry, ViewTelemetry},
@@ -142,6 +146,7 @@ enum WorkerCommand {
     },
     VoiceAgentEvent(AgentEvent),
     Voice(VoiceControl),
+    Computer(ComputerCommand),
 }
 
 enum WorkerEvent {
@@ -260,6 +265,7 @@ enum WorkerEvent {
     VoiceStarted {
         voice: RealtimeVoice,
     },
+    VoiceSpeechStarted,
     VoiceTranscript {
         speaker: VoiceSpeaker,
         text: String,
@@ -271,6 +277,14 @@ enum WorkerEvent {
         error: String,
     },
     VoiceStopped,
+    ComputerFrame(ComputerPane),
+    ComputerFrameFailed {
+        error: String,
+    },
+    ComputerStatus {
+        message: String,
+        error: bool,
+    },
 }
 
 struct MainWorkerBranch {
@@ -565,6 +579,7 @@ enum Submission {
     Fast(Option<bool>),
     ReasoningPicker,
     Voice(VoiceControl),
+    Computer(ComputerCommand),
     McpLogin(String),
     McpReload(String),
     InvalidCommand(String),
@@ -576,6 +591,16 @@ enum VoiceControl {
     Start(Option<RealtimeVoice>),
     Stop,
     List,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ComputerCommand {
+    Show,
+    Hide,
+    Pause,
+    Resume,
+    Takeover,
+    OpenPreview,
 }
 
 #[allow(
@@ -615,6 +640,13 @@ pub(crate) async fn run(
     let mcp = configured.mcp;
     let browser = configured.browser;
     let computer = configured.computer;
+    let computer_frames = computer
+        .as_ref()
+        .map(crate::computer::ConfiguredComputer::frames);
+    let computer_control = computer.as_ref().map(|configured| ComputerWorker {
+        control: configured.control(),
+        preview_url: configured.preview_url().map(ToOwned::to_owned),
+    });
     let vm = configured.vm;
     let (worker_tx, worker_rx) = mpsc::unbounded_channel();
     let (update_tx, mut update_rx) = mpsc::unbounded_channel();
@@ -623,12 +655,13 @@ pub(crate) async fn run(
         Arc::clone(&root_session_id),
         realtime,
         mcp,
+        computer_control,
         worker_rx,
-        update_tx,
+        update_tx.clone(),
     );
 
     let mut terminal = TerminalSession::enter().wrap_err("failed to initialize the terminal")?;
-    let terminal_profile = TerminalProfile::query(Duration::from_millis(750));
+    let (terminal_profile, computer_picker) = query_terminal_profile(Duration::from_millis(750));
     let (math_update_tx, mut math_update_rx) = mpsc::channel(1);
     let math_renderer = Ratatex::builder(terminal_profile)
         .on_update(move || {
@@ -643,6 +676,9 @@ pub(crate) async fn run(
         cell_height = terminal_profile.cell.height,
         "initialized Ratatex"
     );
+    if let Some(frames) = computer_frames {
+        forward_computer_frames(frames, computer_picker, update_tx.clone());
+    }
     let mut input_events = EventStream::new();
     let mut ticker = ui_ticker();
     let mut app = App::new(cwd)
@@ -1102,6 +1138,7 @@ fn handle_worker_update(
         WorkerEvent::VoiceStarted { voice } => {
             app.set_active_status(format!("Voice active ({voice}) — /voice off to stop"));
         }
+        WorkerEvent::VoiceSpeechStarted => app.set_active_status("Listening…"),
         WorkerEvent::VoiceTranscript { speaker, text } => {
             let label = match speaker {
                 VoiceSpeaker::User => "🎙 You",
@@ -1113,6 +1150,17 @@ fn handle_worker_update(
         WorkerEvent::VoiceInfo { message } => {
             app.main
                 .push_output(TranscriptItem::Assistant(format!("**Voice:** {message}")));
+        }
+        WorkerEvent::ComputerFrame(pane) => app.set_computer_pane(pane),
+        WorkerEvent::ComputerFrameFailed { error } => {
+            app.push_active_error(format!("Computer preview: {error}"));
+        }
+        WorkerEvent::ComputerStatus { message, error } => {
+            if error {
+                app.push_active_error(message);
+            } else {
+                app.set_active_status(message);
+            }
         }
         WorkerEvent::VoiceFailed { error } => {
             app.push_active_error(format!("Voice: {error}"));
@@ -1128,6 +1176,7 @@ fn spawn_agent_worker(
     root_session_id: Arc<str>,
     realtime: Option<OpenAi>,
     mcp: Option<McpHandle>,
+    computer: Option<ComputerWorker>,
     mut commands: mpsc::UnboundedReceiver<WorkerCommand>,
     updates: mpsc::UnboundedSender<WorkerEvent>,
 ) -> tokio::task::JoinHandle<()> {
@@ -1148,6 +1197,7 @@ fn spawn_agent_worker(
             finished: finished_tx,
             updates,
             mcp,
+            computer,
             realtime,
             voice: None,
             voice_agent_control: VoiceAgentControl::default(),
@@ -1169,6 +1219,60 @@ fn spawn_agent_worker(
     })
 }
 
+fn forward_computer_frames(
+    mut frames: ComputerFrames,
+    picker: Option<Picker>,
+    updates: mpsc::UnboundedSender<WorkerEvent>,
+) {
+    drop(tokio::spawn(async move {
+        loop {
+            let frame = match frames.changed().await {
+                Ok(frame) => frame,
+                Err(error) => {
+                    drop(updates.send(WorkerEvent::ComputerFrameFailed {
+                        error: error.to_string(),
+                    }));
+                    return;
+                }
+            };
+            let picker = picker.clone();
+            let prepared =
+                tokio::task::spawn_blocking(move || ComputerPane::prepare(&frame, picker.as_ref()))
+                    .await;
+            let event = match prepared {
+                Ok(Ok(pane)) => WorkerEvent::ComputerFrame(pane),
+                Ok(Err(error)) => WorkerEvent::ComputerFrameFailed { error },
+                Err(error) => WorkerEvent::ComputerFrameFailed {
+                    error: format!("computer frame worker failed: {error}"),
+                },
+            };
+            if updates.send(event).is_err() {
+                return;
+            }
+        }
+    }));
+}
+
+fn query_terminal_profile(timeout: Duration) -> (TerminalProfile, Option<Picker>) {
+    let options = QueryStdioOptions {
+        timeout,
+        ..QueryStdioOptions::default()
+    };
+    let tmux = std::env::var_os("TMUX").is_some();
+    match Picker::from_query_stdio_with_options(options) {
+        Ok(picker) => {
+            let (width, height) = picker.font_size();
+            let cell = PixelSize::new(width, height);
+            if picker.protocol_type() == ProtocolType::Kitty {
+                (TerminalProfile::kitty(cell, tmux), Some(picker))
+            } else {
+                (TerminalProfile::unsupported(cell), None)
+            }
+        }
+        Err(_) => (TerminalProfile::unsupported(PixelSize::default()), None),
+    }
+}
+
 fn voice_names(voices: &[RealtimeVoice]) -> String {
     voices
         .iter()
@@ -1183,6 +1287,7 @@ fn forward_voice_events(mut events: VoiceEvents, updates: mpsc::UnboundedSender<
             let update = match event {
                 VoiceEvent::Connecting => WorkerEvent::VoiceConnecting,
                 VoiceEvent::Started { voice } => WorkerEvent::VoiceStarted { voice },
+                VoiceEvent::UserSpeechStarted => WorkerEvent::VoiceSpeechStarted,
                 VoiceEvent::Transcript { speaker, text } => {
                     WorkerEvent::VoiceTranscript { speaker, text }
                 }
@@ -1206,9 +1311,15 @@ struct AgentWorker {
     finished: mpsc::UnboundedSender<FinishedTurn>,
     updates: mpsc::UnboundedSender<WorkerEvent>,
     mcp: Option<McpHandle>,
+    computer: Option<ComputerWorker>,
     realtime: Option<OpenAi>,
     voice: Option<VoiceSession>,
     voice_agent_control: VoiceAgentControl,
+}
+
+struct ComputerWorker {
+    control: ComputerControl,
+    preview_url: Option<String>,
 }
 
 impl AgentWorker {
@@ -1259,7 +1370,51 @@ impl AgentWorker {
                 }
             }
             WorkerCommand::Voice(control) => self.control_voice(control).await,
+            WorkerCommand::Computer(command) => self.control_computer(command),
         }
+    }
+
+    fn control_computer(&self, command: ComputerCommand) {
+        let Some(computer) = &self.computer else {
+            drop(self.updates.send(WorkerEvent::ComputerStatus {
+                message: "computer use is not enabled; restart with --computer".to_owned(),
+                error: true,
+            }));
+            return;
+        };
+        let result = match command {
+            ComputerCommand::Pause => {
+                computer.control.pause();
+                Ok("Computer paused".to_owned())
+            }
+            ComputerCommand::Resume => {
+                computer.control.resume();
+                Ok("Computer resumed".to_owned())
+            }
+            ComputerCommand::Takeover => {
+                computer
+                    .control
+                    .intervene(InterventionReason::Caller("TUI takeover".to_owned()));
+                Ok("Computer paused for human takeover".to_owned())
+            }
+            ComputerCommand::OpenPreview => computer.preview_url.as_deref().map_or_else(
+                || Err("external computer preview is disabled".to_owned()),
+                |url| {
+                    open_browser(url)
+                        .map(|()| "Opened external computer preview".to_owned())
+                        .map_err(|error| format!("failed to open computer preview: {error}"))
+                },
+            ),
+            ComputerCommand::Show | ComputerCommand::Hide => return,
+        };
+        let (message, error) = match result {
+            Ok(message) => (message, false),
+            Err(error) => (error, true),
+        };
+        drop(
+            self.updates
+                .send(WorkerEvent::ComputerStatus { message, error }),
+        );
     }
 
     async fn control_voice(&mut self, control: VoiceControl) {
@@ -2744,6 +2899,15 @@ fn submit(
         Submission::Voice(control) => {
             send_command(commands, WorkerCommand::Voice(control))?;
         }
+        Submission::Computer(command) => match command {
+            ComputerCommand::Show => {
+                if !app.show_computer() {
+                    app.set_active_status("Waiting for the first computer frame");
+                }
+            }
+            ComputerCommand::Hide => app.hide_computer(),
+            command => send_command(commands, WorkerCommand::Computer(command))?,
+        },
         Submission::McpLogin(name) => {
             send_command(commands, WorkerCommand::McpLogin { name })?;
         }
@@ -2818,6 +2982,22 @@ fn classify_submission(input: impl Into<SubmittedPrompt>) -> Submission {
                 ),
             },
             _ => Submission::InvalidCommand("Usage: /voice [on|off|list|<voice>]".to_owned()),
+        };
+    }
+    if trimmed == "/computer" {
+        return Submission::Computer(ComputerCommand::Show);
+    }
+    if let Some(argument) = trimmed.strip_prefix("/computer ") {
+        return match argument.trim() {
+            "show" => Submission::Computer(ComputerCommand::Show),
+            "hide" => Submission::Computer(ComputerCommand::Hide),
+            "pause" => Submission::Computer(ComputerCommand::Pause),
+            "resume" => Submission::Computer(ComputerCommand::Resume),
+            "takeover" => Submission::Computer(ComputerCommand::Takeover),
+            "open" => Submission::Computer(ComputerCommand::OpenPreview),
+            _ => Submission::InvalidCommand(
+                "Usage: /computer [show|hide|pause|resume|takeover|open]".to_owned(),
+            ),
         };
     }
     if trimmed == "/fast" {
@@ -2943,8 +3123,8 @@ mod tests {
     use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
     use super::{
-        BTW_BOUNDARY, PaneId, RedrawPriority, Submission, TerminalAction, UiAction, UiModel,
-        UiUpdate, VoiceControl, WorkerCommand, WorkerEvent, active_session_id,
+        BTW_BOUNDARY, ComputerCommand, PaneId, RedrawPriority, Submission, TerminalAction,
+        UiAction, UiModel, UiUpdate, VoiceControl, WorkerCommand, WorkerEvent, active_session_id,
         apply_main_agent_event_batch, classify_submission, handle_key, handle_worker_update,
         paste_clipboard_image, prepare_btw_prompt, report_cancel_outcome, session_trace_url,
         spawn_agent_worker,
@@ -3018,6 +3198,20 @@ mod tests {
             classify_submission("/voice junk"),
             Submission::InvalidCommand(
                 "Unknown voice. Use /voice list to see Codex voices.".to_owned()
+            )
+        );
+        assert_eq!(
+            classify_submission("/computer pause"),
+            Submission::Computer(ComputerCommand::Pause)
+        );
+        assert_eq!(
+            classify_submission(" /computer takeover "),
+            Submission::Computer(ComputerCommand::Takeover)
+        );
+        assert_eq!(
+            classify_submission("/computer wat"),
+            Submission::InvalidCommand(
+                "Usage: /computer [show|hide|pause|resume|takeover|open]".to_owned()
             )
         );
         assert_eq!(classify_submission("/fast"), Submission::Fast(None));
@@ -3456,6 +3650,7 @@ mod tests {
             Arc::from(session_id.to_string()),
             None,
             None,
+            None,
             worker_rx,
             updates,
         );
@@ -3550,6 +3745,7 @@ mod tests {
         spawn_agent_worker(
             agent,
             std::sync::Arc::from(session_id.to_string()),
+            None,
             None,
             None,
             worker_rx,
@@ -3669,6 +3865,7 @@ mod tests {
         spawn_agent_worker(
             agent,
             std::sync::Arc::from(session_id.to_string()),
+            None,
             None,
             None,
             worker_rx,

@@ -5,12 +5,14 @@
 
 use std::{
     ffi::c_void,
+    path::PathBuf,
+    process::{Command, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use accessibility::{AXAttribute, AXUIElement};
@@ -19,7 +21,6 @@ use accessibility_sys::{
     AXValueGetValue, AXValueRef, kAXPositionAttribute, kAXSizeAttribute,
     kAXTrustedCheckOptionPrompt, kAXValueTypeCGPoint, kAXValueTypeCGSize,
 };
-use block2::RcBlock;
 use core_foundation::{
     array::CFArray,
     base::{CFType, TCFType},
@@ -47,17 +48,13 @@ use core_graphics::{
         kCGWindowOwnerPID,
     },
 };
-use foreign_types::ForeignType;
-use objc2::AnyThread;
 use objc2_app_kit::NSRunningApplication;
-use objc2_screen_capture_kit::{
-    SCContentFilter, SCScreenshotManager, SCShareableContent, SCStreamConfiguration,
-};
 
 const SYNTHETIC_MARKER: i64 = 0x004e_414e_4f43_4458;
 const MAX_CAPTURE_PIXELS: usize = 25_000_000;
 static ACCESSIBILITY_REQUESTED: AtomicBool = AtomicBool::new(false);
 static SCREEN_CAPTURE_REQUESTED: AtomicBool = AtomicBool::new(false);
+static CAPTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Result of checking a TCC permission and, when needed, requesting it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -155,18 +152,52 @@ pub struct NativeWindow {
 
 /// A captured window rendered into tightly packed RGBA8 pixels.
 pub struct NativeImage {
-    pub rgba: Vec<u8>,
+    pub data: NativeImageData,
     pub width: u32,
     pub height: u32,
 }
 
+/// Pixel storage returned by a native window capture.
+pub enum NativeImageData {
+    /// Tightly packed RGBA8 pixels from the in-process Quartz fallback.
+    Rgba(Vec<u8>),
+    /// A complete PNG emitted by the macOS screenshot service.
+    Png(Vec<u8>),
+}
+
+/// A bounded native window-capture failure.
+#[derive(Debug)]
+pub struct CaptureWindowError {
+    message: String,
+}
+
+impl std::fmt::Display for CaptureWindowError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CaptureWindowError {}
+
 /// Enumerates all non-desktop layer-zero windows with their owning application.
 #[must_use]
 pub fn windows() -> Vec<NativeWindow> {
-    let Some(raw) = copy_window_info(
+    native_windows(
         kCGWindowListOptionAll | kCGWindowListExcludeDesktopElements,
         kCGNullWindowID,
-    ) else {
+    )
+}
+
+/// Looks up one layer-zero CoreGraphics window without enumerating every application.
+#[must_use]
+pub fn window(window_id: u32) -> Option<NativeWindow> {
+    native_windows(kCGWindowListOptionIncludingWindow, window_id)
+        .into_iter()
+        .find(|window| window.id == window_id)
+}
+
+fn native_windows(options: u32, relative_to: u32) -> Vec<NativeWindow> {
+    let Some(raw) = copy_window_info(options, relative_to) else {
         return Vec::new();
     };
     let reference = raw.as_concrete_TypeRef();
@@ -177,110 +208,133 @@ pub fn windows() -> Vec<NativeWindow> {
         unsafe { CFArray::<CFDictionary<CFString, CFType>>::wrap_under_create_rule(reference) };
     dictionaries
         .iter()
-        .filter_map(|dictionary| {
-            let layer = number(&dictionary, unsafe { kCGWindowLayer })?.to_i32()?;
-            if layer != 0 {
-                return None;
-            }
-            let pid = number(&dictionary, unsafe { kCGWindowOwnerPID })?.to_i32()?;
-            let id =
-                u32::try_from(number(&dictionary, unsafe { kCGWindowNumber })?.to_i64()?).ok()?;
-            let bounds = dictionary_value(&dictionary, unsafe { kCGWindowBounds })?;
-            let bounds = bounds.downcast::<CFDictionary>()?;
-            let frame = CGRect::from_dict_representation(&bounds)?;
-            let owner_name = string(&dictionary, unsafe { kCGWindowOwnerName })?;
-            let title =
-                string(&dictionary, unsafe { kCGWindowName }).filter(|value| !value.is_empty());
-            let on_screen = boolean(&dictionary, unsafe { kCGWindowIsOnscreen }).unwrap_or(false);
-            let (localized_name, bundle_id) = running_application(pid);
-            Some(NativeWindow {
-                id,
-                pid,
-                owner_name: localized_name.unwrap_or(owner_name),
-                bundle_id,
-                title,
-                x: frame.origin.x,
-                y: frame.origin.y,
-                width: frame.size.width,
-                height: frame.size.height,
-                on_screen,
-            })
-        })
+        .filter_map(|dictionary| native_window(&dictionary))
         .collect()
 }
 
-/// Captures one window by ID without compositing other windows above it.
-#[must_use]
-pub fn capture_window(window_id: u32) -> Option<NativeImage> {
-    capture_window_sck(window_id).or_else(|| capture_window_legacy(window_id))
+fn native_window(dictionary: &CFDictionary<CFString, CFType>) -> Option<NativeWindow> {
+    let layer = number(dictionary, unsafe { kCGWindowLayer })?.to_i32()?;
+    if layer != 0 {
+        return None;
+    }
+    let pid = number(dictionary, unsafe { kCGWindowOwnerPID })?.to_i32()?;
+    let id = u32::try_from(number(dictionary, unsafe { kCGWindowNumber })?.to_i64()?).ok()?;
+    let bounds = dictionary_value(dictionary, unsafe { kCGWindowBounds })?;
+    let bounds = bounds.downcast::<CFDictionary>()?;
+    let frame = CGRect::from_dict_representation(&bounds)?;
+    let owner_name = string(dictionary, unsafe { kCGWindowOwnerName })?;
+    let title = string(dictionary, unsafe { kCGWindowName }).filter(|value| !value.is_empty());
+    let on_screen = boolean(dictionary, unsafe { kCGWindowIsOnscreen }).unwrap_or(false);
+    let (localized_name, bundle_id) = running_application(pid);
+    Some(NativeWindow {
+        id,
+        pid,
+        owner_name: localized_name.unwrap_or(owner_name),
+        bundle_id,
+        title,
+        x: frame.origin.x,
+        y: frame.origin.y,
+        width: frame.size.width,
+        height: frame.size.height,
+        on_screen,
+    })
 }
 
-fn capture_window_sck(window_id: u32) -> Option<NativeImage> {
-    let (content_tx, content_rx) = std::sync::mpsc::sync_channel(1);
-    let content_block = RcBlock::new(move |content: *mut SCShareableContent, _error| {
-        if content.is_null() {
-            let _ = content_tx.send(None);
-            return;
-        }
-        // SAFETY: ScreenCaptureKit keeps the callback object alive for the
-        // callback duration. `windows` returns its own retained NSArray.
-        let windows = unsafe { (&*content).windows() };
-        let selected = (0..windows.count())
-            .map(|index| unsafe { windows.objectAtIndex_unchecked(index) })
-            .find(|window| unsafe { window.windowID() == window_id });
-        let Some(window) = selected else {
-            let _ = content_tx.send(None);
-            return;
-        };
-        // SAFETY: Both Objective-C initializers receive live retained objects.
-        let filter = unsafe {
-            SCContentFilter::initWithDesktopIndependentWindow(SCContentFilter::alloc(), window)
-        };
-        let config = unsafe { SCStreamConfiguration::new() };
-        let frame = unsafe { window.frame() };
-        let width = frame.size.width.ceil().clamp(1.0, 16_384.0) as usize;
-        let height = frame.size.height.ceil().clamp(1.0, 16_384.0) as usize;
-        unsafe {
-            config.setWidth(width);
-            config.setHeight(height);
-            config.setShowsCursor(true);
-        }
-        let image_tx = content_tx.clone();
-        let image_block = RcBlock::new(move |image: *mut objc2_core_graphics::CGImage, _error| {
-            if image.is_null() {
-                let _ = image_tx.send(None);
-                return;
+/// Captures one window by ID without compositing other windows above it.
+pub fn capture_window(window_id: u32) -> Result<NativeImage, CaptureWindowError> {
+    capture_window_service(window_id).or_else(|service_error| {
+        capture_window_legacy(window_id).ok_or_else(|| CaptureWindowError {
+            message: format!(
+                "macOS screenshot service failed ({service_error}); the in-process Quartz fallback also returned no image"
+            ),
+        })
+    })
+}
+
+fn capture_window_service(window_id: u32) -> Result<NativeImage, CaptureWindowError> {
+    let sequence = CAPTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "nanocodex-capture-{}-{sequence}-{window_id}.png",
+        std::process::id()
+    ));
+    let temporary = TemporaryCapture(path);
+    let window_id = window_id.to_string();
+    let mut child = Command::new("/usr/sbin/screencapture")
+        .args(["-x", "-o", "-l", &window_id, "-t", "png"])
+        .arg(&temporary.0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| CaptureWindowError {
+            message: format!("could not launch /usr/sbin/screencapture: {error}"),
+        })?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
             }
-            // SAFETY: Retain the callback-borrowed CGImage, then transfer that
-            // +1 reference to core-graphics' owning wrapper.
-            let retained = unsafe {
-                core_foundation::base::CFRetain(image.cast()) as *mut core_graphics::sys::CGImage
-            };
-            let image = unsafe { core_graphics::image::CGImage::from_ptr(retained) };
-            let _ = image_tx.send(render_image(&image));
-        });
-        // SAFETY: ScreenCaptureKit retains the filter, configuration, and
-        // completion block until the callback has completed.
-        unsafe {
-            SCScreenshotManager::captureImageWithFilter_configuration_completionHandler(
-                &filter,
-                &config,
-                Some(&image_block),
-            );
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(CaptureWindowError {
+                    message: "capture exceeded its 3s deadline and was terminated".to_owned(),
+                });
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(CaptureWindowError {
+                    message: format!("could not wait for screenshot service: {error}"),
+                });
+            }
         }
-    });
-    // SAFETY: The copied block remains alive until ScreenCaptureKit invokes it.
-    unsafe {
-        SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(
-            true,
-            false,
-            &content_block,
-        );
+    };
+    if !status.success() {
+        return Err(CaptureWindowError {
+            message: format!("screenshot service exited with {status}"),
+        });
     }
-    content_rx
-        .recv_timeout(Duration::from_secs(5))
-        .ok()
-        .flatten()
+    let png = std::fs::read(&temporary.0).map_err(|error| CaptureWindowError {
+        message: format!("could not read screenshot service output: {error}"),
+    })?;
+    let (width, height) = png_dimensions(&png)?;
+    Ok(NativeImage {
+        data: NativeImageData::Png(png),
+        width,
+        height,
+    })
+}
+
+struct TemporaryCapture(PathBuf);
+
+impl Drop for TemporaryCapture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn png_dimensions(png: &[u8]) -> Result<(u32, u32), CaptureWindowError> {
+    const PNG_HEADER: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if png.len() < 24 || png.get(..8) != Some(PNG_HEADER) || png.get(12..16) != Some(b"IHDR") {
+        return Err(CaptureWindowError {
+            message: "screenshot service returned invalid PNG data".to_owned(),
+        });
+    }
+    let width = u32::from_be_bytes(png[16..20].try_into().map_err(|_| CaptureWindowError {
+        message: "screenshot PNG has no width".to_owned(),
+    })?);
+    let height = u32::from_be_bytes(png[20..24].try_into().map_err(|_| CaptureWindowError {
+        message: "screenshot PNG has no height".to_owned(),
+    })?);
+    if width == 0 || height == 0 || width > 16_384 || height > 16_384 {
+        return Err(CaptureWindowError {
+            message: format!("screenshot service returned invalid dimensions {width}x{height}"),
+        });
+    }
+    Ok((width, height))
 }
 
 fn capture_window_legacy(window_id: u32) -> Option<NativeImage> {
@@ -326,7 +380,7 @@ fn render_image(image: &core_graphics::image::CGImage) -> Option<NativeImage> {
     context.draw_image(destination, image);
     let rgba = context.data().to_vec();
     Some(NativeImage {
-        rgba,
+        data: NativeImageData::Rgba(rgba),
         width: u32::try_from(width).ok()?,
         height: u32::try_from(height).ok()?,
     })
@@ -482,4 +536,18 @@ fn value_attribute<T: Copy>(
         }
     }
     Some(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_png_dimensions_without_decoding_pixels() {
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\0\0\0\0\0".to_vec();
+        png[16..20].copy_from_slice(&1_440_u32.to_be_bytes());
+        png[20..24].copy_from_slice(&900_u32.to_be_bytes());
+        assert_eq!(png_dimensions(&png).unwrap(), (1_440, 900));
+        assert!(png_dimensions(b"not a PNG").is_err());
+    }
 }

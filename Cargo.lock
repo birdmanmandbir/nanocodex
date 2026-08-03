@@ -1647,15 +1647,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "block2"
-version = "0.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdeb9d870516001442e364c5220d3574d2da8dc765554b4a617230d33fa58ef5"
-dependencies = [
- "objc2",
-]
-
-[[package]]
 name = "blst"
 version = "0.3.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5302,6 +5293,7 @@ dependencies = [
  "rand 0.9.5",
  "ratatex",
  "ratatui",
+ "ratatui-image",
  "regex",
  "reqwest",
  "self-replace",
@@ -5392,14 +5384,9 @@ version = "0.3.0"
 dependencies = [
  "accessibility",
  "accessibility-sys",
- "block2",
  "core-foundation",
  "core-graphics 0.25.0",
- "foreign-types",
- "objc2",
  "objc2-app-kit",
- "objc2-core-graphics",
- "objc2-screen-capture-kit",
 ]
 
 [[package]]
@@ -6125,19 +6112,6 @@ dependencies = [
  "bitflags 2.13.1",
  "objc2",
  "objc2-core-foundation",
-]
-
-[[package]]
-name = "objc2-screen-capture-kit"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74b7c5390f477482f001bc354d6571a70db7e4f8d5288e860c45521fbce11394"
-dependencies = [
- "block2",
- "objc2",
- "objc2-core-foundation",
- "objc2-core-graphics",
- "objc2-foundation",
 ]
 
 [[package]]

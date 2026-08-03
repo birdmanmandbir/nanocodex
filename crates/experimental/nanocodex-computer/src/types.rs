@@ -1,4 +1,4 @@
-use std::{fmt, path::PathBuf, time::Duration};
+use std::{fmt, path::PathBuf, sync::Arc, time::Duration};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -116,9 +116,9 @@ pub struct Element {
     pub actions: Vec<String>,
 }
 
-/// A PNG artifact associated with an observation.
+/// A persisted PNG artifact included in a model-facing observation.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
-pub struct Screenshot {
+pub struct ScreenshotArtifact {
     /// Local PNG path. The computer tool converts this into model image input.
     pub path: PathBuf,
     /// Pixel width.
@@ -129,9 +129,9 @@ pub struct Screenshot {
     pub digest: String,
 }
 
-/// Complete state returned after an observation or mutating action.
+/// Complete model-facing state returned after an observation or mutating action.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
-pub struct ComputerState {
+pub struct ComputerObservation {
     /// Monotonic state generation. Element references embed this generation.
     pub generation: u64,
     /// Selected application.
@@ -141,9 +141,91 @@ pub struct ComputerState {
     /// Compact actionable accessibility tree, in depth-first order.
     pub elements: Vec<Element>,
     /// Fresh screenshot when requested and permitted.
-    pub screenshot: Option<Screenshot>,
+    pub screenshot: Option<ScreenshotArtifact>,
     /// Whether the post-action state reached two equal samples before timeout.
     pub settled: bool,
+}
+
+/// One captured PNG shared by live human-facing consumers.
+///
+/// Frame bytes stay in memory and are reference counted so a preview or TUI
+/// never needs to reread a model artifact from disk. This type is deliberately
+/// absent from model-facing serialization and schemas.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapturedImage {
+    width: u32,
+    height: u32,
+    digest: String,
+    png: Arc<[u8]>,
+}
+
+impl CapturedImage {
+    pub(crate) const fn new(width: u32, height: u32, digest: String, png: Arc<[u8]>) -> Self {
+        Self {
+            width,
+            height,
+            digest,
+            png,
+        }
+    }
+
+    /// Returns the encoded PNG width in pixels.
+    #[must_use]
+    pub const fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Returns the encoded PNG height in pixels.
+    #[must_use]
+    pub const fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Returns the stable content digest used for coalescing and settling.
+    #[must_use]
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    /// Borrows the encoded PNG bytes.
+    #[must_use]
+    pub fn png(&self) -> &[u8] {
+        &self.png
+    }
+}
+
+/// Progress represented by one human-facing visual frame.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputerFramePhase {
+    /// A caller explicitly attached to or observed the target.
+    Observed,
+    /// The target is still changing after a mutating action.
+    Settling,
+    /// Two consecutive visual samples matched.
+    Settled,
+    /// The settling deadline expired before consecutive samples matched.
+    TimedOut,
+}
+
+/// One coalesced live frame intended for a TUI, preview, or human observer.
+///
+/// Unlike [`ComputerObservation`], a frame contains no accessibility tree and
+/// is never sent to the model automatically.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ComputerFrame {
+    /// Action sequence that caused this frame.
+    pub sequence: u64,
+    /// Generation that the eventual model-facing observation will use.
+    pub generation: u64,
+    /// Selected application.
+    pub application: Application,
+    /// Selected window.
+    pub window: Window,
+    /// Current visual progress.
+    pub phase: ComputerFramePhase,
+    /// Shared encoded image.
+    pub image: Arc<CapturedImage>,
 }
 
 /// A semantic element reference or an absolute point.
@@ -254,7 +336,7 @@ pub enum ComputerOutput {
         windows: Vec<Window>,
     },
     /// Fresh selected-application state.
-    State { state: ComputerState },
+    State { state: ComputerObservation },
     /// An application was launched; attach or observe it next.
     Opened { bundle_id: String },
     /// A non-observing operation completed.
@@ -321,8 +403,9 @@ pub enum ComputerEvent {
     },
     Frame {
         sequence: u64,
-        state: ComputerState,
-        final_frame: bool,
+        generation: u64,
+        digest: String,
+        phase: ComputerFramePhase,
     },
     ActionCompleted {
         result: ComputerActionResult,
@@ -355,7 +438,7 @@ pub struct SettlePolicy {
 impl Default for SettlePolicy {
     fn default() -> Self {
         Self {
-            sample_interval: Duration::from_millis(150),
+            sample_interval: Duration::from_millis(50),
             timeout: Duration::from_secs(5),
         }
     }

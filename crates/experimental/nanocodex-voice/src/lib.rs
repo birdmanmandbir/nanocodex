@@ -128,6 +128,12 @@ pub enum VoiceEvent {
         /// The selected output voice.
         voice: RealtimeVoice,
     },
+    /// Voice activity detection observed the user begin speaking.
+    ///
+    /// Embeddings may use this immediate local signal for application-owned
+    /// barge-in policy, such as pausing an active computer-use session. The
+    /// voice crate itself only interrupts synthesized audio playback.
+    UserSpeechStarted,
     /// A participant's completed transcript.
     Transcript {
         /// The participant that produced the transcript.
@@ -928,7 +934,10 @@ async fn handle_realtime_event(
                 route_transcript_tail(&agent_bridge.agent, &tail).await?;
             }
         }
-        RealtimeEvent::SpeechStarted => audio.interrupt(),
+        RealtimeEvent::SpeechStarted => {
+            audio.interrupt();
+            send_event(events, VoiceEvent::UserSpeechStarted);
+        }
         RealtimeEvent::InputTranscriptDone(text) => {
             send_transcript(events, VoiceSpeaker::User, text);
         }

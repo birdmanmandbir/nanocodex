@@ -2,6 +2,9 @@ use nanocodex_computer::{Computer, ComputerAction, ComputerOutput};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let show_windows = std::env::args()
+        .skip(1)
+        .any(|argument| argument == "--windows");
     let (computer, _events) = Computer::builder().observe_human_input(false).build()?;
     let result = computer.execute(ComputerAction::ListApplications).await?;
     let ComputerOutput::Applications {
@@ -22,6 +25,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             application.bundle_id.as_deref().unwrap_or("-"),
             application.name,
         );
+        if show_windows {
+            for window in windows
+                .iter()
+                .filter(|window| window.pid == application.pid)
+            {
+                println!(
+                    "  window {}\t{}x{} at {},{}\t{}\t{}",
+                    window.id,
+                    window.frame.width,
+                    window.frame.height,
+                    window.frame.x,
+                    window.frame.y,
+                    if window.on_screen {
+                        "on-screen"
+                    } else {
+                        "off-screen"
+                    },
+                    window.title.as_deref().unwrap_or("-")
+                );
+            }
+        }
     }
     Ok(())
 }

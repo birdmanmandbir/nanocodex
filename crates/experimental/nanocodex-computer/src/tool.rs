@@ -33,6 +33,7 @@ issuing actions until the host resumes control. Never attempt to bypass macOS
 Accessibility or Screen Recording permission errors.";
 
 /// Nanocodex Code Mode provider for one owned native computer session.
+#[derive(Clone)]
 pub struct ComputerTool {
     computer: Computer,
 }
@@ -116,11 +117,11 @@ impl DynamicToolProvider for ComputerTool {
     fn start(&self) {}
 
     fn direct_tools(&self) -> Vec<Arc<dyn Tool>> {
-        Vec::new()
+        vec![Arc::new(self.clone())]
     }
 
     fn available_definitions(&self) -> Vec<ToolDefinition> {
-        vec![definition()]
+        Vec::new()
     }
 
     fn contains(&self, name: &str) -> bool {

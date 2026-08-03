@@ -4,6 +4,10 @@
 Nanocodex's device-neutral GPT Realtime API. It connects the default microphone
 and speaker, delegates repository work to an existing retained `Nanocodex`
 agent, and exposes lifecycle and transcript updates as typed events.
+`VoiceEvent::UserSpeechStarted` exposes the immediate VAD barge-in boundary so
+an embedding can apply local policy—such as pausing computer use—without
+coupling this crate to any effect provider. Voice itself only interrupts
+synthesized playback; application effects remain unchanged by default.
 
 Realtime handoffs use the agent's atomic live-input router. The first coding
 request starts an independently awaitable turn; follow-up speech received while
@@ -50,6 +54,7 @@ let (mut voice, mut events) = VoiceSessionBuilder::new(openai, agent)
 while let Some(event) = events.recv().await {
     match event {
         VoiceEvent::Transcript { speaker, text } => println!("{speaker}: {text}"),
+        VoiceEvent::UserSpeechStarted => println!("user started speaking"),
         VoiceEvent::Failed { error } => return Err(error.into()),
         VoiceEvent::Stopped => break,
         VoiceEvent::Connecting | VoiceEvent::Started { .. } => {}
