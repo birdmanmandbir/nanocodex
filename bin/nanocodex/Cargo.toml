@@ -17,6 +17,7 @@ ignored = ["chrono", "vergen"]
 
 [features]
 default = []
+meeting-mlx = ["nanocodex-voice/meeting-mlx"]
 # Keep paid-provider composition out of the direct-agent development graph.
 tempo = [
     "dep:alloy-primitives",

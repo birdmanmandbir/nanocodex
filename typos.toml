@@ -3,6 +3,7 @@ extend-exclude = [
     ".nanocodex/",
     "crates/experimental/nanocodex-browser/assets/axe.js",
     "crates/experimental/nanocodex-browser/assets/react_diagnostics.js",
+    "crates/experimental/nanocodex-voice/assets/whisper/multilingual.tiktoken",
     "web/public/data/",
     "web/src/data/harness-repository.json",
     "web/worker-configuration.d.ts",

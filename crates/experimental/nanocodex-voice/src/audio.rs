@@ -242,14 +242,14 @@ impl Microphone {
     }
 }
 
-struct LinearResampler {
+pub(crate) struct LinearResampler {
     step: f64,
     position: f64,
     source: Vec<f32>,
 }
 
 impl LinearResampler {
-    fn new(source_rate: u32, destination_rate: u32) -> Self {
+    pub(crate) fn new(source_rate: u32, destination_rate: u32) -> Self {
         Self {
             step: f64::from(source_rate) / f64::from(destination_rate),
             position: 0.0,
@@ -257,7 +257,11 @@ impl LinearResampler {
         }
     }
 
-    fn push_into(&mut self, input: impl IntoIterator<Item = f32>, output: &mut Vec<f32>) {
+    pub(crate) fn push_into(
+        &mut self,
+        input: impl IntoIterator<Item = f32>,
+        output: &mut Vec<f32>,
+    ) {
         self.source.extend(input);
         output.clear();
         while self.position + 1.0 < self.source.len() as f64 {

@@ -68,13 +68,33 @@ policy into the public OpenAI boundary. The Nanocodex Ratatui `/voice` command
 is a thin consumer of this crate.
 
 The experimental `MeetingSessionBuilder` owns bot-free meeting capture. It
-keeps the default microphone and macOS system audio as separate Realtime V2
-transcription sessions, emits unstable deltas separately from finalized
-segments, and never writes an audio recording. System capture uses a bundled
+keeps the default microphone and macOS system audio structurally separate,
+emits replaceable unstable hypotheses separately from finalized segments, and
+never writes an audio recording. System capture uses a bundled
 ScreenCaptureKit helper so the Rust workspace keeps its global no-unsafe-code
 invariant. The Ratatui `/meeting` consumer renders the live transcript on the
-left and a forked, transcript-grounded chat on the right. `/meeting off` stops
-capture while retaining both panes; `/close` releases the meeting branch.
+left and a forked, transcript-grounded chat on the right. `/meeting realtime`
+uses OpenAI Realtime, while `/meeting mlx` selects local Whisper inference on
+Apple Silicon. `/meeting off` stops capture while retaining both panes;
+`/close` releases the meeting branch.
+
+Local MLX transcription is deliberately opt-in. Install Xcode's Metal
+toolchain, build the TUI with the feature, then select the local backend:
+
+```console
+xcodebuild -downloadComponent MetalToolchain
+xcodebuild -runFirstLaunch
+cargo run -p nanocodex-bin --features meeting-mlx
+# In the TUI: /meeting mlx
+```
+
+The first local session downloads
+`mlx-community/whisper-large-v3-turbo` into the Hugging Face cache. Each source
+is resampled to 16 kHz and re-transcribed as a rolling utterance about every two
+seconds. Repeated word prefixes become finalized transcript segments; the
+remaining hypothesis replaces the prior partial display. The implementation
+uses a commit-pinned, experimental pure-Rust `mlx-whisper-rs` dependency and
+does not affect default builds.
 
 Voice default-device capture and playback are implemented on macOS and Windows.
 Meeting system-audio capture is macOS-only in this experiment; Windows degrades

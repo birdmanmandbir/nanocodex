@@ -35,8 +35,8 @@ use nanocodex::{
 };
 use nanocodex_voice::{
     CHATGPT_REALTIME_VOICES, MeetingEvent, MeetingEvents, MeetingSession, MeetingSessionBuilder,
-    MeetingSource, PLATFORM_REALTIME_VOICES, RealtimeVoice, VoiceAgentControl, VoiceEvent,
-    VoiceEvents, VoiceSession, VoiceSessionBuilder, VoiceSpeaker,
+    MeetingSource, MeetingTranscription, PLATFORM_REALTIME_VOICES, RealtimeVoice,
+    VoiceAgentControl, VoiceEvent, VoiceEvents, VoiceSession, VoiceSessionBuilder, VoiceSpeaker,
 };
 use ratatex::{Ratatex, TerminalProfile};
 use tokio::{
@@ -102,9 +102,11 @@ enum WorkerCommand {
     },
     OpenMeeting {
         id: u64,
+        transcription: MeetingTranscription,
     },
     StartMeeting {
         id: u64,
+        transcription: MeetingTranscription,
     },
     StopMeeting {
         id: u64,
@@ -266,13 +268,14 @@ enum WorkerEvent {
     MeetingStarted {
         id: u64,
         system_audio: bool,
+        transcription: MeetingTranscription,
     },
     MeetingDegraded {
         id: u64,
         source: MeetingSource,
         error: String,
     },
-    MeetingTranscriptDelta {
+    MeetingTranscriptPartial {
         id: u64,
         source: MeetingSource,
         text: String,
@@ -666,7 +669,7 @@ enum VoiceControl {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MeetingControl {
     Toggle,
-    Start,
+    Start(MeetingTranscription),
     Stop,
 }
 
@@ -1186,14 +1189,18 @@ fn handle_worker_update(
         WorkerEvent::MeetingConnecting { id } => {
             app.meeting_stopped(id, "Connecting transcription");
         }
-        WorkerEvent::MeetingStarted { id, system_audio } => {
-            app.meeting_started(id, system_audio);
+        WorkerEvent::MeetingStarted {
+            id,
+            system_audio,
+            transcription,
+        } => {
+            app.meeting_started(id, system_audio, transcription);
         }
         WorkerEvent::MeetingDegraded { id, source, error } => {
             app.meeting_degraded(id, source, error);
         }
-        WorkerEvent::MeetingTranscriptDelta { id, source, text } => {
-            app.meeting_transcript_delta(id, source, text);
+        WorkerEvent::MeetingTranscriptPartial { id, source, text } => {
+            app.meeting_transcript_partial(id, source, text);
         }
         WorkerEvent::MeetingTranscriptFinal { id, source, text } => {
             app.meeting_transcript_final(id, source, text);
@@ -1299,14 +1306,19 @@ fn forward_meeting_events(
         while let Some(event) = events.recv().await {
             let update = match event {
                 MeetingEvent::Connecting => WorkerEvent::MeetingConnecting { id },
-                MeetingEvent::Started { system_audio } => {
-                    WorkerEvent::MeetingStarted { id, system_audio }
-                }
+                MeetingEvent::Started {
+                    system_audio,
+                    transcription,
+                } => WorkerEvent::MeetingStarted {
+                    id,
+                    system_audio,
+                    transcription,
+                },
                 MeetingEvent::Degraded { source, error } => {
                     WorkerEvent::MeetingDegraded { id, source, error }
                 }
-                MeetingEvent::TranscriptDelta { source, text } => {
-                    WorkerEvent::MeetingTranscriptDelta { id, source, text }
+                MeetingEvent::TranscriptPartial { source, text } => {
+                    WorkerEvent::MeetingTranscriptPartial { id, source, text }
                 }
                 MeetingEvent::TranscriptFinal { source, text } => {
                     let mut context = match pending.lock() {
@@ -1384,8 +1396,12 @@ impl AgentWorker {
                     self.meeting = None;
                 }
             }
-            WorkerCommand::OpenMeeting { id } => self.open_meeting(id).await,
-            WorkerCommand::StartMeeting { id } => self.start_meeting(id).await,
+            WorkerCommand::OpenMeeting { id, transcription } => {
+                self.open_meeting(id, transcription).await;
+            }
+            WorkerCommand::StartMeeting { id, transcription } => {
+                self.start_meeting(id, transcription).await;
+            }
             WorkerCommand::StopMeeting { id } => {
                 if self
                     .meeting
@@ -1480,7 +1496,7 @@ impl AgentWorker {
         }
     }
 
-    async fn open_meeting(&mut self, id: u64) {
+    async fn open_meeting(&mut self, id: u64, transcription: MeetingTranscription) {
         if self.voice_running() {
             drop(self.updates.send(WorkerEvent::MeetingFailed {
                 id,
@@ -1539,10 +1555,10 @@ impl AgentWorker {
             session: None,
             pending: Arc::new(Mutex::new(Vec::new())),
         });
-        self.start_meeting(id).await;
+        self.start_meeting(id, transcription).await;
     }
 
-    async fn start_meeting(&mut self, id: u64) {
+    async fn start_meeting(&mut self, id: u64, transcription: MeetingTranscription) {
         let Some(meeting) = self.meeting.as_mut().filter(|meeting| meeting.id == id) else {
             drop(self.updates.send(WorkerEvent::MeetingFailed {
                 id,
@@ -1562,15 +1578,21 @@ impl AgentWorker {
         {
             tracing::debug!(%error, "joining the previous meeting capture before restart failed");
         }
-        let Some(realtime) = self.realtime.clone() else {
-            drop(
-                self.updates.send(WorkerEvent::MeetingFailed {
-                    id,
-                    error: "meeting transcription is unavailable with the selected paid provider"
-                        .to_owned(),
-                }),
-            );
-            return;
+        let builder = match transcription {
+            MeetingTranscription::Realtime => {
+                let Some(realtime) = self.realtime.clone() else {
+                    drop(
+                        self.updates.send(WorkerEvent::MeetingFailed {
+                            id,
+                            error: "meeting transcription is unavailable with the selected paid provider"
+                                .to_owned(),
+                        }),
+                    );
+                    return;
+                };
+                MeetingSessionBuilder::new(realtime)
+            }
+            MeetingTranscription::Mlx => MeetingSessionBuilder::local_mlx(),
         };
         let session_id = self
             .btw
@@ -1578,10 +1600,7 @@ impl AgentWorker {
             .filter(|branch| branch.id == id)
             .map(|branch| Arc::clone(&branch.request_id))
             .unwrap_or_else(|| Arc::clone(&self.main.request_id));
-        match MeetingSessionBuilder::new(realtime)
-            .session_id(session_id)
-            .spawn()
-        {
+        match builder.session_id(session_id).spawn() {
             Ok((session, events)) => {
                 forward_meeting_events(
                     id,
@@ -3057,19 +3076,21 @@ fn submit(
             send_command(commands, WorkerCommand::Voice(control))?;
         }
         Submission::Meeting(control) => {
-            let should_start = match control {
-                MeetingControl::Toggle => !app.meeting_running(),
-                MeetingControl::Start => true,
-                MeetingControl::Stop => false,
+            let transcription = match control {
+                MeetingControl::Toggle => app.meeting_transcription().unwrap_or_default(),
+                MeetingControl::Start(transcription) => transcription,
+                MeetingControl::Stop => MeetingTranscription::default(),
             };
+            let should_start = !matches!(control, MeetingControl::Stop)
+                && (!matches!(control, MeetingControl::Toggle) || !app.meeting_running());
             if should_start {
                 if let Some(id) = app.meeting_id() {
-                    send_command(commands, WorkerCommand::StartMeeting { id })?;
+                    send_command(commands, WorkerCommand::StartMeeting { id, transcription })?;
                 } else if app.btw_id().is_some() {
                     app.push_active_error("Close /btw before starting /meeting");
                 } else {
-                    let id = app.begin_meeting();
-                    send_command(commands, WorkerCommand::OpenMeeting { id })?;
+                    let id = app.begin_meeting(transcription);
+                    send_command(commands, WorkerCommand::OpenMeeting { id, transcription })?;
                 }
             } else if let Some(id) = app.meeting_id() {
                 app.meeting_stopped(id, "Stopping capture…");
@@ -3127,9 +3148,14 @@ fn classify_submission(input: impl Into<SubmittedPrompt>) -> Submission {
     }
     if let Some(argument) = trimmed.strip_prefix("/meeting ") {
         return match argument.trim() {
-            "on" => Submission::Meeting(MeetingControl::Start),
+            "on" | "realtime" => {
+                Submission::Meeting(MeetingControl::Start(MeetingTranscription::Realtime))
+            }
+            "mlx" | "local" => {
+                Submission::Meeting(MeetingControl::Start(MeetingTranscription::Mlx))
+            }
             "off" | "stop" => Submission::Meeting(MeetingControl::Stop),
-            _ => Submission::InvalidCommand("Usage: /meeting [on|off]".to_owned()),
+            _ => Submission::InvalidCommand("Usage: /meeting [on|off|realtime|mlx]".to_owned()),
         };
     }
     if let Some(argument) = trimmed.strip_prefix("/voice ") {
@@ -3262,7 +3288,7 @@ mod tests {
     use nanocodex::{
         Nanocodex, OpenAi, Thinking, agent::events::AgentEventKind, oai::__private::EventSink,
     };
-    use nanocodex_voice::{MeetingSource, RealtimeVoice};
+    use nanocodex_voice::{MeetingSource, MeetingTranscription, RealtimeVoice};
     use serde_json::{Value, json};
     use tokio::{net::TcpListener, sync::mpsc, time::timeout};
     use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
@@ -3321,7 +3347,11 @@ mod tests {
         );
         assert_eq!(
             classify_submission("/meeting on"),
-            Submission::Meeting(MeetingControl::Start)
+            Submission::Meeting(MeetingControl::Start(MeetingTranscription::Realtime))
+        );
+        assert_eq!(
+            classify_submission("/meeting mlx"),
+            Submission::Meeting(MeetingControl::Start(MeetingTranscription::Mlx))
         );
         assert_eq!(
             classify_submission("/meeting off"),
@@ -3329,7 +3359,7 @@ mod tests {
         );
         assert_eq!(
             classify_submission("/meeting maybe"),
-            Submission::InvalidCommand("Usage: /meeting [on|off]".to_owned())
+            Submission::InvalidCommand("Usage: /meeting [on|off|realtime|mlx]".to_owned())
         );
         assert_eq!(
             classify_submission("/voice marin"),

@@ -33,7 +33,7 @@ mod startup_context;
 
 pub use meeting::{
     MeetingError, MeetingEvent, MeetingEvents, MeetingFailure, MeetingSession,
-    MeetingSessionBuilder, MeetingShutdownError, MeetingSource,
+    MeetingSessionBuilder, MeetingShutdownError, MeetingSource, MeetingTranscription,
 };
 
 pub use nanocodex::oai::realtime::{

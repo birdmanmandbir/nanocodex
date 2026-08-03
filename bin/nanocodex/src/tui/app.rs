@@ -16,7 +16,7 @@ use nanocodex::{
         rollout::RolloutTranscriptItem,
     },
 };
-use nanocodex_voice::MeetingSource;
+use nanocodex_voice::{MeetingSource, MeetingTranscription};
 use ratatex::Ratatex;
 use ratatui::{
     buffer::Buffer,
@@ -1020,6 +1020,7 @@ pub(super) struct MeetingTranscriptEntry {
 
 pub(super) struct MeetingPane {
     pub(super) id: u64,
+    pub(super) transcription: MeetingTranscription,
     pub(super) entries: Vec<MeetingTranscriptEntry>,
     pub(super) microphone_partial: String,
     pub(super) system_partial: String,
@@ -2108,10 +2109,11 @@ impl App {
         id
     }
 
-    pub(super) fn begin_meeting(&mut self) -> u64 {
+    pub(super) fn begin_meeting(&mut self, transcription: MeetingTranscription) -> u64 {
         let id = self.begin_btw();
         self.meeting = Some(MeetingPane {
             id,
+            transcription,
             entries: Vec::new(),
             microphone_partial: String::new(),
             system_partial: String::new(),
@@ -2126,14 +2128,24 @@ impl App {
         self.meeting.as_ref().map(|meeting| meeting.id)
     }
 
-    pub(super) fn meeting_started(&mut self, id: u64, system_audio: bool) {
+    pub(super) fn meeting_transcription(&self) -> Option<MeetingTranscription> {
+        self.meeting.as_ref().map(|meeting| meeting.transcription)
+    }
+
+    pub(super) fn meeting_started(
+        &mut self,
+        id: u64,
+        system_audio: bool,
+        transcription: MeetingTranscription,
+    ) {
         if let Some(meeting) = self.meeting.as_mut().filter(|meeting| meeting.id == id) {
             meeting.system_audio = system_audio;
+            meeting.transcription = transcription;
             meeting.capture_running = true;
             meeting.status = if system_audio {
-                "Live · microphone + system audio · /meeting off to stop".to_owned()
+                format!("Live · {transcription} · microphone + system audio · /meeting off to stop")
             } else {
-                "Live · microphone only · /meeting off to stop".to_owned()
+                format!("Live · {transcription} · microphone only · /meeting off to stop")
             };
         }
     }
@@ -2147,7 +2159,7 @@ impl App {
         }
     }
 
-    pub(super) fn meeting_transcript_delta(
+    pub(super) fn meeting_transcript_partial(
         &mut self,
         id: u64,
         source: MeetingSource,
@@ -2160,7 +2172,7 @@ impl App {
             MeetingSource::Microphone => &mut meeting.microphone_partial,
             MeetingSource::System => &mut meeting.system_partial,
         };
-        partial.push_str(&text);
+        *partial = text;
     }
 
     pub(super) fn meeting_transcript_final(

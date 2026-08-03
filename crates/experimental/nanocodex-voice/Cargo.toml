@@ -14,6 +14,10 @@ categories.workspace = true
 description = "Experimental desktop voice and meeting sessions for Nanocodex agents"
 build = "build.rs"
 
+[features]
+default = []
+meeting-mlx = ["dep:mlx-whisper-rs"]
+
 [dependencies]
 futures-util.workspace = true
 nanocodex = { workspace = true, features = ["realtime"] }
@@ -26,6 +30,9 @@ whoami.workspace = true
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 cpal.workspace = true
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+mlx-whisper-rs = { workspace = true, optional = true }
 
 [lints]
 workspace = true

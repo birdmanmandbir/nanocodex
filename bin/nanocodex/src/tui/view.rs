@@ -857,14 +857,14 @@ mod tests {
     fn meeting_renders_live_transcript_left_and_grounded_chat_right() {
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
         let mut app = App::new("/workspace".into());
-        let id = app.begin_meeting();
-        app.meeting_started(id, true);
+        let id = app.begin_meeting(nanocodex_voice::MeetingTranscription::Realtime);
+        app.meeting_started(id, true, nanocodex_voice::MeetingTranscription::Realtime);
         app.meeting_transcript_final(
             id,
             nanocodex_voice::MeetingSource::Microphone,
             "I can own the launch plan.".to_owned(),
         );
-        app.meeting_transcript_delta(
+        app.meeting_transcript_partial(
             id,
             nanocodex_voice::MeetingSource::System,
             "What is the deadline?".to_owned(),

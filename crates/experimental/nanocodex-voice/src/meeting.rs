@@ -22,6 +22,12 @@ mod audio;
 #[allow(clippy::missing_const_for_fn)]
 #[path = "meeting_audio_unsupported.rs"]
 mod audio;
+#[cfg(all(feature = "meeting-mlx", target_os = "macos", target_arch = "aarch64"))]
+#[path = "meeting_mlx.rs"]
+mod mlx;
+#[cfg(not(all(feature = "meeting-mlx", target_os = "macos", target_arch = "aarch64")))]
+#[path = "meeting_mlx_unsupported.rs"]
+mod mlx;
 
 use audio::{MicrophoneCapture, SystemCapture};
 
@@ -47,20 +53,42 @@ impl std::fmt::Display for MeetingSource {
     }
 }
 
+/// Transcription engine selected for a meeting lifecycle.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MeetingTranscription {
+    /// OpenAI Realtime, using the client's API-key or managed ChatGPT authorization.
+    #[default]
+    Realtime,
+    /// Local Whisper inference through MLX on Apple Silicon.
+    Mlx,
+}
+
+impl std::fmt::Display for MeetingTranscription {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Realtime => "OpenAI Realtime",
+            Self::Mlx => "local MLX Whisper",
+        })
+    }
+}
+
 /// One typed update from a bot-free meeting transcription lifecycle.
 #[derive(Debug)]
 pub enum MeetingEvent {
     /// The transcription transports are connecting.
     Connecting,
     /// Capture is active. `system_audio` is false for microphone-only fallback.
-    Started { system_audio: bool },
+    Started {
+        system_audio: bool,
+        transcription: MeetingTranscription,
+    },
     /// One source became unavailable while the other source remains live.
     Degraded {
         source: MeetingSource,
         error: String,
     },
-    /// An unstable transcript delta for immediate display only.
-    TranscriptDelta { source: MeetingSource, text: String },
+    /// The complete unstable hypothesis for immediate display only.
+    TranscriptPartial { source: MeetingSource, text: String },
     /// A finalized transcript segment suitable for model context.
     TranscriptFinal { source: MeetingSource, text: String },
     /// The meeting lifecycle failed and stopped.
@@ -136,8 +164,13 @@ impl Drop for MeetingSession {
 
 /// Builder for one dual-source desktop meeting transcription lifecycle.
 pub struct MeetingSessionBuilder {
-    openai: OpenAi,
+    backend: MeetingBackend,
     session_id: Option<Arc<str>>,
+}
+
+enum MeetingBackend {
+    Realtime(OpenAi),
+    Mlx { model: Arc<str> },
 }
 
 impl MeetingSessionBuilder {
@@ -145,9 +178,32 @@ impl MeetingSessionBuilder {
     #[must_use]
     pub const fn new(openai: OpenAi) -> Self {
         Self {
-            openai,
+            backend: MeetingBackend::Realtime(openai),
             session_id: None,
         }
+    }
+
+    /// Creates a fully local Apple-Silicon MLX Whisper meeting lifecycle.
+    #[must_use]
+    pub fn local_mlx() -> Self {
+        Self {
+            backend: MeetingBackend::Mlx {
+                model: Arc::from("mlx-community/whisper-large-v3-turbo"),
+            },
+            session_id: None,
+        }
+    }
+
+    /// Selects the local MLX Whisper model directory or Hugging Face repository.
+    #[must_use]
+    pub fn mlx_model(mut self, model: impl Into<Arc<str>>) -> Self {
+        if let MeetingBackend::Mlx {
+            model: configured_model,
+        } = &mut self.backend
+        {
+            *configured_model = model.into();
+        }
+        self
     }
 
     /// Supplies a stable caller-owned identity for transport correlation.
@@ -221,6 +277,9 @@ pub enum MeetingFailure {
     /// The provider rejected the microphone transcription session.
     #[error("meeting transcription failed: {0}")]
     Provider(String),
+    /// Local MLX transcription could not start or complete.
+    #[error("local MLX meeting transcription failed: {0}")]
+    Mlx(String),
 }
 
 fn run_thread(
@@ -289,13 +348,32 @@ const fn transcriber_configuration(
 async fn run_meeting(
     builder: MeetingSessionBuilder,
     events: &mpsc::UnboundedSender<MeetingEvent>,
+    stopped: oneshot::Receiver<()>,
+) -> Result<(), MeetingFailure> {
+    match builder.backend {
+        MeetingBackend::Realtime(openai) => {
+            run_realtime_meeting(openai, builder.session_id, events, stopped).await
+        }
+        MeetingBackend::Mlx { model } => mlx::run(model, events, stopped).await,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows")),
+    allow(clippy::drop_non_drop)
+)]
+async fn run_realtime_meeting(
+    openai: OpenAi,
+    session_id: Option<Arc<str>>,
+    events: &mpsc::UnboundedSender<MeetingEvent>,
     mut stopped: oneshot::Receiver<()>,
 ) -> Result<(), MeetingFailure> {
     send_event(events, MeetingEvent::Connecting);
     let connect = async {
         futures_util::future::join(
-            connect_transcriber(&builder.openai, builder.session_id.as_ref(), "mic"),
-            connect_transcriber(&builder.openai, builder.session_id.as_ref(), "system"),
+            connect_transcriber(&openai, session_id.as_ref(), "mic"),
+            connect_transcriber(&openai, session_id.as_ref(), "system"),
         )
         .await
     };
@@ -341,8 +419,12 @@ async fn run_meeting(
         events,
         MeetingEvent::Started {
             system_audio: system_capture.is_some(),
+            transcription: MeetingTranscription::Realtime,
         },
     );
+
+    let mut microphone_transcript = RealtimeTranscript::default();
+    let mut system_transcript = RealtimeTranscript::default();
 
     let result = loop {
         tokio::select! {
@@ -387,7 +469,12 @@ async fn run_meeting(
                 let Some(event) = event else {
                     break Err(MeetingFailure::StreamStopped("microphone transcription stopped"));
                 };
-                handle_transcript_event(MeetingSource::Microphone, event, events)?;
+                handle_transcript_event(
+                    MeetingSource::Microphone,
+                    event,
+                    events,
+                    &mut microphone_transcript,
+                )?;
             }
             event = async {
                 match &mut system_events {
@@ -406,7 +493,12 @@ async fn run_meeting(
                     ).await;
                     continue;
                 };
-                if let Err(error) = handle_transcript_event(MeetingSource::System, event, events) {
+                if let Err(error) = handle_transcript_event(
+                    MeetingSource::System,
+                    event,
+                    events,
+                    &mut system_transcript,
+                ) {
                     degrade_system(
                         events,
                         &error.to_string(),
@@ -456,12 +548,21 @@ fn handle_transcript_event(
     source: MeetingSource,
     event: RealtimeEvent,
     events: &mpsc::UnboundedSender<MeetingEvent>,
+    transcript: &mut RealtimeTranscript,
 ) -> Result<(), MeetingFailure> {
     match event {
         RealtimeEvent::InputTranscriptDelta(text) if !text.is_empty() => {
-            send_event(events, MeetingEvent::TranscriptDelta { source, text });
+            transcript.partial.push_str(&text);
+            send_event(
+                events,
+                MeetingEvent::TranscriptPartial {
+                    source,
+                    text: transcript.partial.clone(),
+                },
+            );
         }
         RealtimeEvent::InputTranscriptDone(text) if !text.trim().is_empty() => {
+            transcript.partial.clear();
             send_event(events, MeetingEvent::TranscriptFinal { source, text });
         }
         RealtimeEvent::Error(error) => return Err(MeetingFailure::Provider(error)),
@@ -481,13 +582,20 @@ fn handle_transcript_event(
     Ok(())
 }
 
-fn send_event(events: &mpsc::UnboundedSender<MeetingEvent>, event: MeetingEvent) {
+#[derive(Default)]
+struct RealtimeTranscript {
+    partial: String,
+}
+
+pub(super) fn send_event(events: &mpsc::UnboundedSender<MeetingEvent>, event: MeetingEvent) {
     drop(events.send(event));
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{MeetingSource, handle_transcript_event, transcriber_configuration};
+    use super::{
+        MeetingSource, RealtimeTranscript, handle_transcript_event, transcriber_configuration,
+    };
     use nanocodex::oai::{
         auth::OpenAiAuthMode,
         realtime::{RealtimeEvent, RealtimeSessionMode, RealtimeVersion},
@@ -515,23 +623,38 @@ mod tests {
     #[test]
     fn partial_and_final_transcripts_stay_distinct() {
         let (events, mut receiver) = mpsc::unbounded_channel();
+        let mut transcript = RealtimeTranscript::default();
         handle_transcript_event(
             MeetingSource::System,
             RealtimeEvent::InputTranscriptDelta("hello ".to_owned()),
             &events,
+            &mut transcript,
+        )
+        .unwrap();
+        handle_transcript_event(
+            MeetingSource::System,
+            RealtimeEvent::InputTranscriptDelta("world".to_owned()),
+            &events,
+            &mut transcript,
         )
         .unwrap();
         handle_transcript_event(
             MeetingSource::System,
             RealtimeEvent::InputTranscriptDone("hello world".to_owned()),
             &events,
+            &mut transcript,
         )
         .unwrap();
 
         assert!(matches!(
             receiver.try_recv().unwrap(),
-            super::MeetingEvent::TranscriptDelta { source: MeetingSource::System, text }
+            super::MeetingEvent::TranscriptPartial { source: MeetingSource::System, text }
                 if text == "hello "
+        ));
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            super::MeetingEvent::TranscriptPartial { source: MeetingSource::System, text }
+                if text == "hello world"
         ));
         assert!(matches!(
             receiver.try_recv().unwrap(),
