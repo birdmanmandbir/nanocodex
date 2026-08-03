@@ -28,7 +28,13 @@ mod audio;
 #[allow(clippy::missing_const_for_fn)]
 #[path = "audio_unsupported.rs"]
 mod audio;
+mod meeting;
 mod startup_context;
+
+pub use meeting::{
+    MeetingError, MeetingEvent, MeetingEvents, MeetingFailure, MeetingSession,
+    MeetingSessionBuilder, MeetingShutdownError, MeetingSource,
+};
 
 pub use nanocodex::oai::realtime::{
     CHATGPT_REALTIME_VOICE, CHATGPT_REALTIME_VOICES, PLATFORM_REALTIME_VOICE,
@@ -641,6 +647,9 @@ pub enum AudioError {
         "default microphone/speaker capture is currently supported on macOS and Windows; use nanocodex-oai-api's PCM Realtime API with a platform adapter"
     )]
     UnsupportedPlatform,
+    /// Bot-free system-audio capture is not implemented on this target.
+    #[error("meeting system-audio capture is currently supported on macOS")]
+    SystemAudioUnsupported,
 }
 
 fn run_thread(

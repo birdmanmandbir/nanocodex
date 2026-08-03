@@ -3,12 +3,12 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use std::time::Instant;
 
 use super::{
-    app::{App, Conversation, PaneId, ReasoningPicker, STANDARD_THINKING_OPTIONS},
+    app::{App, Conversation, MeetingPane, PaneId, ReasoningPicker, STANDARD_THINKING_OPTIONS},
     composer::ComposerLayout,
     transcript::InlineEdit,
 };
@@ -223,7 +223,27 @@ fn render_transcripts(
         input: app.input.as_str(),
         cursor: app.cursor,
     });
-    if app.btw.is_some() {
+    if app.meeting.is_some() && app.btw.is_some() {
+        let [transcript_area, chat_area] =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .areas(transcript_area);
+        let preserve_chat = app.mouse_selection_intersects(chat_area);
+        if let (Some(meeting), Some(btw)) = (&app.meeting, &mut app.btw) {
+            render_meeting_transcript(frame, meeting, transcript_area);
+            selectable_areas.push(render_transcript(
+                frame,
+                &mut btw.conversation,
+                chat_area,
+                TranscriptRenderOptions {
+                    title: " Meeting chat · transcript grounded ",
+                    focused: true,
+                    inline_edit: None,
+                    empty_message: "Ask about decisions, risks, people, or action items.",
+                    preserve_view: preserve_chat,
+                },
+            ));
+        }
+    } else if app.btw.is_some() {
         let [main_area, btw_area] =
             Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .areas(transcript_area);
@@ -294,6 +314,70 @@ fn render_transcripts(
             },
         ));
     }
+}
+
+fn render_meeting_transcript(frame: &mut Frame<'_>, meeting: &MeetingPane, area: Rect) {
+    let block = Block::default()
+        .title(" Live transcript · You / Them ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines = vec![Line::styled(
+        format!("{}\n", meeting.status),
+        Style::default().fg(if meeting.system_audio {
+            Color::Green
+        } else {
+            Color::Yellow
+        }),
+    )];
+    for entry in &meeting.entries {
+        let (label, color) = match entry.source {
+            nanocodex_voice::MeetingSource::Microphone => ("You", Color::Cyan),
+            nanocodex_voice::MeetingSource::System => ("Them", Color::Magenta),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{label}: "),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(entry.text.clone()),
+        ]));
+        lines.push(Line::default());
+    }
+    for (label, color, partial) in [
+        ("You", Color::Cyan, meeting.microphone_partial.as_str()),
+        ("Them", Color::Magenta, meeting.system_partial.as_str()),
+    ] {
+        if !partial.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{label}: "),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(partial.to_owned(), Style::default().fg(Color::DarkGray)),
+                Span::styled(" ▍", Style::default().fg(color)),
+            ]));
+        }
+    }
+    if meeting.entries.is_empty()
+        && meeting.microphone_partial.is_empty()
+        && meeting.system_partial.is_empty()
+    {
+        lines.push(Line::styled(
+            "Listening for speech…",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let height = paragraph.line_count(inner.width);
+    let scroll = height.saturating_sub(usize::from(inner.height));
+    frame.render_widget(
+        paragraph.scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
+        inner,
+    );
 }
 
 fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -450,6 +534,7 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect, layout: &Compos
     let conversation = app.active_conversation();
     let target = match app.focus {
         PaneId::Main => "Main",
+        PaneId::Btw(_) if app.meeting.is_some() => "Meeting",
         PaneId::Btw(_) => "BTW",
     };
     let title = if app.historical_editor_active() {
@@ -459,6 +544,8 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect, layout: &Compos
         )
     } else if app.branch_navigator_active() {
         " Message composer · browsing branches ".to_owned()
+    } else if conversation.running && app.meeting.is_some() {
+        format!(" Message → {target} (Enter/Tab queue) ")
     } else if conversation.running {
         format!(" Message → {target} (Enter steers · Tab queues) ")
     } else {
@@ -561,7 +648,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         )
     } else {
         format!(
-            "  /btw <question> side fork · /voice [voice] · {tool_help} · Ctrl+V image · Enter send/steer · Tab queue · {escape_help} · Ctrl+C quit"
+            "  /btw <question> side fork · /meeting · /voice [voice] · {tool_help} · Ctrl+V image · Enter send/steer · Tab queue · {escape_help} · Ctrl+C quit"
         )
     };
     let model_width = app.model().as_str().len() + 3 + "default".len() + 7 + 1;
@@ -764,6 +851,32 @@ mod tests {
         assert!(rendered.contains("BTW · forked context"));
         assert!(rendered.contains("Message → BTW"));
         assert!(rendered.contains("BackTab switch"));
+    }
+
+    #[test]
+    fn meeting_renders_live_transcript_left_and_grounded_chat_right() {
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let mut app = App::new("/workspace".into());
+        let id = app.begin_meeting();
+        app.meeting_started(id, true);
+        app.meeting_transcript_final(
+            id,
+            nanocodex_voice::MeetingSource::Microphone,
+            "I can own the launch plan.".to_owned(),
+        );
+        app.meeting_transcript_delta(
+            id,
+            nanocodex_voice::MeetingSource::System,
+            "What is the deadline?".to_owned(),
+        );
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("Live transcript · You / Them"));
+        assert!(rendered.contains("You: I can own the launch plan."));
+        assert!(rendered.contains("Them: What is the deadline?"));
+        assert!(rendered.contains("Meeting chat · transcript grounded"));
+        assert!(rendered.contains("Message → Meeting"));
     }
 
     #[test]

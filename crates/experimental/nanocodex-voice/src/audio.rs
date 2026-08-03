@@ -179,7 +179,7 @@ impl Playback {
     }
 }
 
-struct Microphone {
+pub(crate) struct Microphone {
     resampler: LinearResampler,
     channels: usize,
     interleaved_tail: Vec<f32>,
@@ -190,7 +190,11 @@ struct Microphone {
 }
 
 impl Microphone {
-    fn new(sample_rate: u32, channels: u16, sender: mpsc::Sender<RealtimeAudio>) -> Self {
+    pub(crate) fn new(
+        sample_rate: u32,
+        channels: u16,
+        sender: mpsc::Sender<RealtimeAudio>,
+    ) -> Self {
         let channels = usize::from(channels);
         Self {
             resampler: LinearResampler::new(sample_rate, REALTIME_SAMPLE_RATE),
@@ -203,7 +207,7 @@ impl Microphone {
         }
     }
 
-    fn push(&mut self, input: impl IntoIterator<Item = f32>) {
+    pub(crate) fn push(&mut self, input: impl IntoIterator<Item = f32>) {
         self.interleaved_tail.extend(input);
         let complete = self.interleaved_tail.len() / self.channels * self.channels;
         self.mono.clear();
@@ -277,7 +281,7 @@ impl LinearResampler {
     }
 }
 
-fn build_input(
+pub(crate) fn build_input(
     device: &Device,
     format: SampleFormat,
     config: StreamConfig,
@@ -444,7 +448,7 @@ fn duration_frames(sample_rate: u32, duration: Duration) -> usize {
         .unwrap_or(usize::MAX)
 }
 
-fn backend(operation: &'static str, error: impl Display) -> AudioError {
+pub(crate) fn backend(operation: &'static str, error: impl Display) -> AudioError {
     AudioError::Backend {
         operation,
         message: error.to_string(),

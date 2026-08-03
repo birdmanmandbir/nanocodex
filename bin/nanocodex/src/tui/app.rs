@@ -16,6 +16,7 @@ use nanocodex::{
         rollout::RolloutTranscriptItem,
     },
 };
+use nanocodex_voice::MeetingSource;
 use ratatex::Ratatex;
 use ratatui::{
     buffer::Buffer,
@@ -1012,6 +1013,21 @@ pub(super) struct BtwPane {
     pub(super) conversation: Conversation,
 }
 
+pub(super) struct MeetingTranscriptEntry {
+    pub(super) source: MeetingSource,
+    pub(super) text: String,
+}
+
+pub(super) struct MeetingPane {
+    pub(super) id: u64,
+    pub(super) entries: Vec<MeetingTranscriptEntry>,
+    pub(super) microphone_partial: String,
+    pub(super) system_partial: String,
+    pub(super) status: String,
+    pub(super) system_audio: bool,
+    pub(super) capture_running: bool,
+}
+
 struct MainBranchPane {
     id: u64,
     parent_id: Option<u64>,
@@ -1148,6 +1164,7 @@ pub(super) struct App {
     pending_branch_switch: Option<u64>,
     branch_navigator: Option<u64>,
     pub(super) btw: Option<BtwPane>,
+    pub(super) meeting: Option<MeetingPane>,
     pub(super) focus: PaneId,
     pub(super) input: String,
     local_images: Vec<AttachedImage>,
@@ -1200,6 +1217,7 @@ impl App {
             pending_branch_switch: None,
             branch_navigator: None,
             btw: None,
+            meeting: None,
             focus: PaneId::Main,
             input: String::new(),
             local_images: Vec::new(),
@@ -2090,6 +2108,96 @@ impl App {
         id
     }
 
+    pub(super) fn begin_meeting(&mut self) -> u64 {
+        let id = self.begin_btw();
+        self.meeting = Some(MeetingPane {
+            id,
+            entries: Vec::new(),
+            microphone_partial: String::new(),
+            system_partial: String::new(),
+            status: "Connecting transcription".to_owned(),
+            system_audio: false,
+            capture_running: false,
+        });
+        id
+    }
+
+    pub(super) fn meeting_id(&self) -> Option<u64> {
+        self.meeting.as_ref().map(|meeting| meeting.id)
+    }
+
+    pub(super) fn meeting_started(&mut self, id: u64, system_audio: bool) {
+        if let Some(meeting) = self.meeting.as_mut().filter(|meeting| meeting.id == id) {
+            meeting.system_audio = system_audio;
+            meeting.capture_running = true;
+            meeting.status = if system_audio {
+                "Live · microphone + system audio · /meeting off to stop".to_owned()
+            } else {
+                "Live · microphone only · /meeting off to stop".to_owned()
+            };
+        }
+    }
+
+    pub(super) fn meeting_degraded(&mut self, id: u64, source: MeetingSource, error: String) {
+        if let Some(meeting) = self.meeting.as_mut().filter(|meeting| meeting.id == id) {
+            if source == MeetingSource::System {
+                meeting.system_audio = false;
+            }
+            meeting.status = format!("Degraded ({source}): {error}");
+        }
+    }
+
+    pub(super) fn meeting_transcript_delta(
+        &mut self,
+        id: u64,
+        source: MeetingSource,
+        text: String,
+    ) {
+        let Some(meeting) = self.meeting.as_mut().filter(|meeting| meeting.id == id) else {
+            return;
+        };
+        let partial = match source {
+            MeetingSource::Microphone => &mut meeting.microphone_partial,
+            MeetingSource::System => &mut meeting.system_partial,
+        };
+        partial.push_str(&text);
+    }
+
+    pub(super) fn meeting_transcript_final(
+        &mut self,
+        id: u64,
+        source: MeetingSource,
+        text: String,
+    ) {
+        let Some(meeting) = self.meeting.as_mut().filter(|meeting| meeting.id == id) else {
+            return;
+        };
+        match source {
+            MeetingSource::Microphone => meeting.microphone_partial.clear(),
+            MeetingSource::System => meeting.system_partial.clear(),
+        }
+        if !text.trim().is_empty() {
+            meeting
+                .entries
+                .push(MeetingTranscriptEntry { source, text });
+        }
+    }
+
+    pub(super) fn meeting_stopped(&mut self, id: u64, status: impl Into<String>) {
+        if let Some(meeting) = self.meeting.as_mut().filter(|meeting| meeting.id == id) {
+            meeting.microphone_partial.clear();
+            meeting.system_partial.clear();
+            meeting.capture_running = false;
+            meeting.status = status.into();
+        }
+    }
+
+    pub(super) fn meeting_running(&self) -> bool {
+        self.meeting
+            .as_ref()
+            .is_some_and(|meeting| meeting.capture_running)
+    }
+
     pub(super) fn toggle_tool_details(&mut self) -> bool {
         self.tool_details_expanded = !self.tool_details_expanded;
         let expanded = self.tool_details_expanded;
@@ -2138,6 +2246,10 @@ impl App {
     }
 
     pub(super) fn toggle_focus(&mut self) {
+        if let Some(id) = self.meeting_id() {
+            self.focus = PaneId::Btw(id);
+            return;
+        }
         self.focus = match (self.focus, self.btw_id()) {
             (PaneId::Main, Some(id)) => PaneId::Btw(id),
             (PaneId::Btw(_), _) | (PaneId::Main, None) => PaneId::Main,
@@ -2153,6 +2265,9 @@ impl App {
                 self.cancel_confirmation = None;
             }
             self.btw = None;
+            if self.meeting_id() == Some(id) {
+                self.meeting = None;
+            }
             self.focus = PaneId::Main;
         }
     }

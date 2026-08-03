@@ -67,6 +67,16 @@ packages one opinionated native lifecycle rather than moving audio-device
 policy into the public OpenAI boundary. The Nanocodex Ratatui `/voice` command
 is a thin consumer of this crate.
 
-Default-device capture and playback are currently implemented on macOS and
-Windows. Other native targets return a typed unsupported-platform failure and
-can continue to use the raw PCM Realtime API.
+The experimental `MeetingSessionBuilder` owns bot-free meeting capture. It
+keeps the default microphone and macOS system audio as separate Realtime V2
+transcription sessions, emits unstable deltas separately from finalized
+segments, and never writes an audio recording. System capture uses a bundled
+ScreenCaptureKit helper so the Rust workspace keeps its global no-unsafe-code
+invariant. The Ratatui `/meeting` consumer renders the live transcript on the
+left and a forked, transcript-grounded chat on the right. `/meeting off` stops
+capture while retaining both panes; `/close` releases the meeting branch.
+
+Voice default-device capture and playback are implemented on macOS and Windows.
+Meeting system-audio capture is macOS-only in this experiment; Windows degrades
+to microphone-only transcription. Other native targets return a typed
+unsupported-platform failure and can continue to use the raw PCM Realtime API.
