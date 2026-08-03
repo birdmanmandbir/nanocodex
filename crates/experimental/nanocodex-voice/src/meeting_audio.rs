@@ -51,7 +51,7 @@ pub(super) struct SystemCapture {
     _directory: tempfile::TempDir,
     child: Child,
     reader: JoinHandle<()>,
-    diagnostics: JoinHandle<()>,
+    diagnostics: JoinHandle<String>,
 }
 
 #[cfg(target_os = "macos")]
@@ -109,6 +109,7 @@ impl SystemCapture {
             if stderr.read_to_string(&mut message).await.is_ok() && !message.trim().is_empty() {
                 tracing::warn!(message = message.trim(), "system-audio helper stopped");
             }
+            message
         });
         Ok((
             Self {
@@ -119,6 +120,30 @@ impl SystemCapture {
             },
             receiver,
         ))
+    }
+
+    pub(super) async fn stopped_reason(&mut self) -> String {
+        let diagnostics =
+            match tokio::time::timeout(std::time::Duration::from_secs(1), &mut self.diagnostics)
+                .await
+            {
+                Ok(Ok(message)) => message,
+                Ok(Err(error)) => format!("failed to collect capture diagnostics: {error}"),
+                Err(_) => {
+                    let _ = self.child.start_kill();
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        &mut self.diagnostics,
+                    )
+                    .await
+                    {
+                        Ok(Ok(message)) => message,
+                        Ok(Err(error)) => format!("failed to collect capture diagnostics: {error}"),
+                        Err(_) => "capture helper stopped without diagnostics".to_owned(),
+                    }
+                }
+            };
+        describe_system_audio_stop(&diagnostics)
     }
 }
 
@@ -139,11 +164,47 @@ impl SystemCapture {
     pub(super) async fn open() -> Result<(Self, mpsc::Receiver<RealtimeAudio>), AudioError> {
         Err(AudioError::SystemAudioUnsupported)
     }
+
+    pub(super) async fn stopped_reason(&mut self) -> String {
+        "system-audio capture stopped".to_owned()
+    }
 }
 
 fn backend(operation: &'static str, error: impl Display) -> AudioError {
     AudioError::Backend {
         operation,
         message: error.to_string(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn describe_system_audio_stop(diagnostics: &str) -> String {
+    let diagnostics = diagnostics.trim();
+    if diagnostics.contains("declined TCCs")
+        || diagnostics.contains("SCStreamErrorDomain Code=-3801")
+    {
+        return "Screen Recording permission was denied; enable your terminal or Nanocodex in System Settings > Privacy & Security > Screen & System Audio Recording, then restart /meeting"
+            .to_owned();
+    }
+    if diagnostics.is_empty() {
+        "system-audio capture stopped without diagnostics".to_owned()
+    } else {
+        diagnostics.to_owned()
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::describe_system_audio_stop;
+
+    #[test]
+    fn screen_recording_denial_is_actionable() {
+        let reason = describe_system_audio_stop(
+            "Error Domain=com.apple.ScreenCaptureKit.SCStreamErrorDomain Code=-3801 The user declined TCCs for application, window, display capture",
+        );
+
+        assert!(reason.contains("Screen Recording permission was denied"));
+        assert!(reason.contains("Privacy & Security"));
+        assert!(reason.contains("restart /meeting"));
     }
 }

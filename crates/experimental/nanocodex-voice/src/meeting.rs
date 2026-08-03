@@ -442,9 +442,13 @@ async fn run_realtime_meeting(
                 }
             } => {
                 let Some(frame) = frame else {
+                    let error = match system_capture.as_mut() {
+                        Some(capture) => capture.stopped_reason().await,
+                        None => "system-audio capture stopped".to_owned(),
+                    };
                     degrade_system(
                         events,
-                        "system-audio capture stopped",
+                        &error,
                         &mut system_capture,
                         &mut system_audio,
                         &mut system_session,

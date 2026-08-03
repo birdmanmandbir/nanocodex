@@ -96,6 +96,12 @@ remaining hypothesis replaces the prior partial display. The implementation
 uses a commit-pinned, experimental pure-Rust `mlx-whisper-rs` dependency and
 does not affect default builds.
 
+macOS must allow the application hosting Nanocodex (for example, the terminal)
+under **System Settings > Privacy & Security > Screen & System Audio
+Recording**. After changing that permission, restart `/meeting`. A denied
+permission degrades the meeting to microphone-only capture and is reported in
+the transcript pane.
+
 Voice default-device capture and playback are implemented on macOS and Windows.
 Meeting system-audio capture is macOS-only in this experiment; Windows degrades
 to microphone-only transcription. Other native targets return a typed

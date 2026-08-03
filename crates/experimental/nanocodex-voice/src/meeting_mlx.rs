@@ -82,11 +82,15 @@ pub(super) async fn run(
                 }
             } => {
                 let Some(frame) = frame else {
+                    let error = match system_capture.as_mut() {
+                        Some(capture) => capture.stopped_reason().await,
+                        None => "system-audio capture stopped".to_owned(),
+                    };
                     send_event(
                         events,
                         MeetingEvent::Degraded {
                             source: MeetingSource::System,
-                            error: "system-audio capture stopped".to_owned(),
+                            error,
                         },
                     );
                     system_capture = None;
