@@ -48,7 +48,7 @@ private enum SystemAudioCapture {
                 domain: "nanocodex.meeting",
                 code: 2,
                 userInfo: [
-                    NSLocalizedDescriptionKey: "Screen Recording permission was not granted. Choose Allow in the macOS prompt. If access was denied previously, enable the application hosting Nanocodex in System Settings > Privacy & Security > Screen & System Audio Recording, then restart /meeting."
+                    NSLocalizedDescriptionKey: "Screen Recording permission was not granted. macOS requires you to turn on the application hosting Nanocodex (Ghostty or another terminal) in System Settings > Privacy & Security > Screen & System Audio Recording; apps cannot enable this switch themselves. Then restart /meeting."
                 ]
             )
         }

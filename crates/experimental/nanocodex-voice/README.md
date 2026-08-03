@@ -96,12 +96,13 @@ remaining hypothesis replaces the prior partial display. The implementation
 uses a commit-pinned, experimental pure-Rust `mlx-whisper-rs` dependency and
 does not affect default builds.
 
-The first macOS system-audio session presents the native Screen Recording
-permission request. If access was denied previously, macOS does not present the
-first-use dialog again; enable the application hosting Nanocodex (for example,
-the terminal) under **System Settings > Privacy & Security > Screen & System
-Audio Recording**, then restart `/meeting`. A denied permission degrades the
-meeting to microphone-only capture and is reported in the transcript pane.
+The first macOS system-audio session requests Screen Recording permission.
+Depending on the macOS version, the request may open **System Settings > Privacy
+& Security > Screen & System Audio Recording** instead of presenting an inline
+Allow dialog. Turn on the application hosting Nanocodex (for example, Ghostty),
+then restart `/meeting`. macOS does not provide an API that can enable this
+privacy switch on the user's behalf. A denied permission degrades the meeting
+to microphone-only capture and is reported in the transcript pane.
 
 Voice default-device capture and playback are implemented on macOS and Windows.
 Meeting system-audio capture is macOS-only in this experiment; Windows degrades

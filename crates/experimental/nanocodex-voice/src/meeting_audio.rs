@@ -182,8 +182,9 @@ fn describe_system_audio_stop(diagnostics: &str) -> String {
     let diagnostics = diagnostics.trim();
     if diagnostics.contains("declined TCCs")
         || diagnostics.contains("SCStreamErrorDomain Code=-3801")
+        || diagnostics.contains("Screen Recording permission was not granted")
     {
-        return "Screen Recording permission was denied; enable your terminal or Nanocodex in System Settings > Privacy & Security > Screen & System Audio Recording, then restart /meeting"
+        return "Screen Recording permission was denied; turn on Ghostty or the terminal hosting Nanocodex in System Settings > Privacy & Security > Screen & System Audio Recording, then restart /meeting. macOS does not allow Nanocodex to enable this switch for you"
             .to_owned();
     }
     if diagnostics.is_empty() {
@@ -206,5 +207,15 @@ mod tests {
         assert!(reason.contains("Screen Recording permission was denied"));
         assert!(reason.contains("Privacy & Security"));
         assert!(reason.contains("restart /meeting"));
+    }
+
+    #[test]
+    fn screen_recording_request_denial_explains_manual_consent() {
+        let reason = describe_system_audio_stop(
+            "system audio capture failed: Screen Recording permission was not granted",
+        );
+
+        assert!(reason.contains("Ghostty or the terminal hosting Nanocodex"));
+        assert!(reason.contains("does not allow Nanocodex to enable this switch"));
     }
 }
