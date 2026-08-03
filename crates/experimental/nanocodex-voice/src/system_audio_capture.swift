@@ -1,5 +1,7 @@
 import AVFoundation
 import CoreMedia
+import CoreGraphics
+import Darwin
 import Foundation
 import ScreenCaptureKit
 
@@ -28,7 +30,31 @@ private final class AudioOutput: NSObject, SCStreamOutput {
 
 @main
 private enum SystemAudioCapture {
-    static func main() async throws {
+    @MainActor
+    static func main() async {
+        do {
+            try requestPermission()
+            try await capture()
+        } catch {
+            let message = "system audio capture failed: \(error.localizedDescription)\n"
+            FileHandle.standardError.write(Data(message.utf8))
+            exit(EXIT_FAILURE)
+        }
+    }
+
+    private static func requestPermission() throws {
+        guard CGPreflightScreenCaptureAccess() || CGRequestScreenCaptureAccess() else {
+            throw NSError(
+                domain: "nanocodex.meeting",
+                code: 2,
+                userInfo: [
+                    NSLocalizedDescriptionKey: "Screen Recording permission was not granted. Choose Allow in the macOS prompt. If access was denied previously, enable the application hosting Nanocodex in System Settings > Privacy & Security > Screen & System Audio Recording, then restart /meeting."
+                ]
+            )
+        }
+    }
+
+    private static func capture() async throws {
         let content = try await SCShareableContent.excludingDesktopWindows(
             false,
             onScreenWindowsOnly: false

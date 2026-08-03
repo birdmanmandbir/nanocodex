@@ -2,6 +2,7 @@ use std::{env, path::PathBuf, process::Command};
 
 fn main() {
     println!("cargo:rerun-if-changed=src/system_audio_capture.swift");
+    println!("cargo:rerun-if-changed=src/system_audio_capture.plist");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }
@@ -12,6 +13,9 @@ fn main() {
     let status = Command::new("xcrun")
         .args(["swiftc", "-O", "-parse-as-library"])
         .arg(manifest.join("src/system_audio_capture.swift"))
+        .args(["-Xlinker", "-sectcreate", "-Xlinker", "__TEXT"])
+        .args(["-Xlinker", "__info_plist", "-Xlinker"])
+        .arg(manifest.join("src/system_audio_capture.plist"))
         .arg("-o")
         .arg(&output)
         .status()
