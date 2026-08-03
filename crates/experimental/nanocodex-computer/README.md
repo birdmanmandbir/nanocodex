@@ -92,10 +92,18 @@ nanocodex run "Open TextEdit and draft a note" --computer
 nanocodex run "Inspect the current app" --computer --computer-preview=false
 ```
 
-macOS will request Screen & System Audio Recording, Accessibility, and (for
-automatic takeover detection) Input Monitoring. Permission denial is typed and
-does not trigger a bypass. The loopback preview remains usable for manual
-pause/takeover if Input Monitoring is unavailable.
+On first use, Nanocodex invokes the public macOS prompts for Screen & System
+Audio Recording and Accessibility. Enable the executable macOS identifies,
+then fully quit and relaunch it when the system prompt requests that. Automatic
+takeover detection separately requires Input Monitoring. Permission denial is
+typed and does not trigger a bypass. The loopback preview remains usable for
+manual pause/takeover if Input Monitoring is unavailable.
+
+Cargo examples and the full CLI are distinct executables, so macOS may request
+permission separately for `target/debug/examples/observe` and
+`target/debug/nanocodex`. Rebuilding an ad-hoc development executable can also
+require granting it again; a distributed application should use a stably signed
+app or helper identity.
 
 ## Scope and security
 

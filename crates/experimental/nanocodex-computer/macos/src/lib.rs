@@ -15,8 +15,9 @@ use std::{
 
 use accessibility::{AXAttribute, AXUIElement};
 use accessibility_sys::{
-    AXIsProcessTrusted, AXValueGetType, AXValueGetTypeID, AXValueGetValue, AXValueRef,
-    kAXPositionAttribute, kAXSizeAttribute, kAXValueTypeCGPoint, kAXValueTypeCGSize,
+    AXIsProcessTrusted, AXIsProcessTrustedWithOptions, AXValueGetType, AXValueGetTypeID,
+    AXValueGetValue, AXValueRef, kAXPositionAttribute, kAXSizeAttribute,
+    kAXTrustedCheckOptionPrompt, kAXValueTypeCGPoint, kAXValueTypeCGSize,
 };
 use block2::RcBlock;
 use core_foundation::{
@@ -29,6 +30,7 @@ use core_foundation::{
     string::{CFString, CFStringRef},
 };
 use core_graphics::{
+    access::ScreenCaptureAccess,
     base::{kCGBitmapByteOrder32Big, kCGImageAlphaPremultipliedLast},
     color_space::CGColorSpace,
     context::CGContext,
@@ -54,12 +56,62 @@ use objc2_screen_capture_kit::{
 
 const SYNTHETIC_MARKER: i64 = 0x004e_414e_4f43_4458;
 const MAX_CAPTURE_PIXELS: usize = 25_000_000;
+static ACCESSIBILITY_REQUESTED: AtomicBool = AtomicBool::new(false);
+static SCREEN_CAPTURE_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Result of checking a TCC permission and, when needed, requesting it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PermissionRequest {
+    /// The process can use the protected API now.
+    Granted,
+    /// macOS was asked to present its permission UI. The caller may need to
+    /// relaunch after the user grants access.
+    Prompted,
+}
 
 /// Returns whether the current process may inspect and operate accessibility elements.
 #[must_use]
 pub fn accessibility_trusted() -> bool {
     // SAFETY: AXIsProcessTrusted accepts no pointers and has no ownership effect.
     unsafe { AXIsProcessTrusted() }
+}
+
+/// Checks Accessibility trust and asks macOS to present its standard prompt
+/// when access has not been granted yet.
+#[must_use]
+pub fn request_accessibility() -> PermissionRequest {
+    if accessibility_trusted() {
+        return PermissionRequest::Granted;
+    }
+    if ACCESSIBILITY_REQUESTED.swap(true, Ordering::AcqRel) {
+        return PermissionRequest::Prompted;
+    }
+    // SAFETY: The dictionary owns both retained CoreFoundation values for the
+    // duration of the call. The option is the documented public prompt key.
+    let prompt_key = unsafe { CFString::wrap_under_get_rule(kAXTrustedCheckOptionPrompt) };
+    let options = CFDictionary::from_CFType_pairs(&[(prompt_key, CFBoolean::true_value())]);
+    let granted = unsafe { AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef()) };
+    if granted {
+        PermissionRequest::Granted
+    } else {
+        PermissionRequest::Prompted
+    }
+}
+
+/// Checks Screen Recording access and asks macOS to present its standard
+/// request UI when the current process is not registered yet.
+#[must_use]
+pub fn request_screen_capture() -> PermissionRequest {
+    let access = ScreenCaptureAccess;
+    if access.preflight() {
+        PermissionRequest::Granted
+    } else if SCREEN_CAPTURE_REQUESTED.swap(true, Ordering::AcqRel) {
+        PermissionRequest::Prompted
+    } else if access.request() {
+        PermissionRequest::Granted
+    } else {
+        PermissionRequest::Prompted
+    }
 }
 
 /// Reads an element's global position and size through retained CoreFoundation values.

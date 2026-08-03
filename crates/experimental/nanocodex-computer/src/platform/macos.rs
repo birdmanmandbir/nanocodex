@@ -9,13 +9,13 @@ use accessibility::{AXAttribute, AXUIElement, attribute::AXUIElementAttributes};
 use async_trait::async_trait;
 use core_foundation::{base::TCFType, string::CFString};
 use core_graphics::{
-    access::ScreenCaptureAccess,
     event::{CGEvent, CGEventFlags, CGEventType, CGMouseButton, KeyCode, ScrollEventUnit},
     event_source::{CGEventSource, CGEventSourceStateID},
     geometry::CGPoint,
 };
 use nanocodex_computer_macos::{
-    NativeWindow, accessibility_trusted, capture_window, element_rect, mark_synthetic,
+    NativeWindow, PermissionRequest, capture_window, element_rect, mark_synthetic,
+    request_accessibility, request_screen_capture,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -458,11 +458,10 @@ fn accessibility_snapshot(
     generation: u64,
     maximum_elements: usize,
 ) -> Result<Vec<(Element, AXUIElement)>, ComputerError> {
-    if !accessibility_trusted() {
+    if request_accessibility() == PermissionRequest::Prompted {
         return Err(ComputerError::Permission {
             permission: Permission::Accessibility,
-            guidance: "enable this executable in System Settings > Privacy & Security > Accessibility, then retry"
-                .to_owned(),
+            guidance: permission_guidance(Permission::Accessibility),
         });
     }
     let application = AXUIElement::application(target.application.pid);
@@ -993,18 +992,14 @@ fn capture(
     sequence: u64,
     artifact_root: &Path,
 ) -> Result<Screenshot, ComputerError> {
-    let image = capture_window(window.id).ok_or_else(|| {
-        if ScreenCaptureAccess.preflight() {
-            ComputerError::Native {
-                message: format!("window {} could not be captured", window.id),
-            }
-        } else {
-            ComputerError::Permission {
-                permission: Permission::ScreenRecording,
-                guidance: "enable this executable in System Settings > Privacy & Security > Screen & System Audio Recording, then retry"
-                    .to_owned(),
-            }
-        }
+    if request_screen_capture() == PermissionRequest::Prompted {
+        return Err(ComputerError::Permission {
+            permission: Permission::ScreenRecording,
+            guidance: permission_guidance(Permission::ScreenRecording),
+        });
+    }
+    let image = capture_window(window.id).ok_or_else(|| ComputerError::Native {
+        message: format!("window {} could not be captured", window.id),
     })?;
     let filename = format!("frame-{sequence:06}-{generation:06}.png");
     let path = artifact_root.join(filename);
@@ -1030,6 +1025,17 @@ fn capture(
         height: image.height,
         digest,
     })
+}
+
+fn permission_guidance(permission: Permission) -> String {
+    match permission {
+        Permission::Accessibility => "macOS opened its Accessibility request. Enable this executable in System Settings > Privacy & Security > Accessibility, then fully quit and relaunch it"
+            .to_owned(),
+        Permission::ScreenRecording => "macOS opened its Screen Recording request. Enable this executable in System Settings > Privacy & Security > Screen & System Audio Recording, then fully quit and relaunch it"
+            .to_owned(),
+        Permission::InputMonitoring => "enable Input Monitoring in System Settings > Privacy & Security to detect human takeover automatically"
+            .to_owned(),
+    }
 }
 
 fn state_signature(state: &ComputerState) -> String {
@@ -1084,5 +1090,16 @@ mod tests {
         assert_eq!(key_code("ESC"), Some(KeyCode::ESCAPE));
         assert_eq!(key_code("arrowLeft"), Some(KeyCode::LEFT_ARROW));
         assert_eq!(key_code("not-a-key"), None);
+    }
+
+    #[test]
+    fn permission_guidance_describes_the_native_prompt_and_required_relaunch() {
+        let screen = permission_guidance(Permission::ScreenRecording);
+        assert!(screen.contains("macOS opened its Screen Recording request"));
+        assert!(screen.contains("fully quit and relaunch"));
+
+        let accessibility = permission_guidance(Permission::Accessibility);
+        assert!(accessibility.contains("macOS opened its Accessibility request"));
+        assert!(accessibility.contains("fully quit and relaunch"));
     }
 }
