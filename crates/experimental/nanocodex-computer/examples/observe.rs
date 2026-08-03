@@ -35,8 +35,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     if let Some(preview) = preview {
         println!("preview: {} (press Return to close)", preview.url());
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line)?;
+        tokio::task::spawn_blocking(|| {
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)
+        })
+        .await??;
     }
     computer.stop();
     Ok(())
