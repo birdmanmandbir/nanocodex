@@ -58,130 +58,144 @@ instructions with the classifications already recorded in
 and classify every intervening commit as port/evaluate/defer/out-of-scope. Do
 not let an unreviewed upstream change silently redefine Nanocodex behavior.
 
-## Active milestones
+## Current phase
 
-### 1. Runtime and Code Mode parity
+The foundational refactor is no longer the roadmap. Nanocodex is entering the
+product-buildout and measured-optimization phase, organized as three parts.
 
-- Land the focused Code Mode contract alignment from
-  [PR #95](https://github.com/gakonst/nanocodex/pull/95) independently of the
-  evaluation stack it came from.
-- Preserve one model-facing Code Mode tool, deferred runtime discovery, exact
-  tool ordering, caller-owned exposure policy, and the current provider-native
-  Responses namespace boundary.
-- Refresh the Codex parity ledger through a deliberately selected current
-  checkpoint. Port only relevant invariants with direct regression evidence;
-  keep app-server, approval, provider-portability, and unrelated TUI behavior
-  classified out of scope.
+### Part 1: build and prove the agent foundation — substantially complete
 
-### 2. Browser identity, placement, and visibility
+- The layered SDK, owned lifecycle, Code Mode parity work, retained VM tools,
+  browser and voice foundations, hosted transports, and the `0.3.0` release are
+  complete.
+- [PR #95](https://github.com/gakonst/nanocodex/pull/95) and the other extracted
+  runtime prerequisites are merged. Refreshing the Codex parity ledger remains
+  ongoing maintenance, not a prerequisite for starting product work.
+- [PR #61](https://github.com/gakonst/nanocodex/pull/61) is merged. Its
+  `nanocodex eval` command and `nanocodex-eval` library are now the authoritative
+  way to measure Nanocodex against stock Codex.
+- Part 1 closes for `0.4.0` when a frozen release candidate has a complete,
+  retained, reproducible differential evidence set suitable for the website.
 
-- Finish the private-browser desktop profile import in
-  [PR #93](https://github.com/gakonst/nanocodex/pull/93). Cookie extraction must
-  remain harness-owned, allowlisted, typed, non-mutating, and absent from the
-  model-callable schema.
-- Replace the single CLI browser boolean with deliberate caller-owned session
-  policy while preserving a migration path for bare `--browser`:
-  - `private-host`: a Nanocodex-owned host browser;
-  - `private-vm`: the existing isolated browser VM; and
-  - `user-chrome`: an explicitly enabled bridge to the user's running Chrome.
-- Keep presentation independent from placement. `background` and `visible` are
-  presentation choices; Chromium running under Xvfb is headed but is not
-  visible until a bounded display or screenshot-stream consumer exists.
-- Keep tab acquisition explicit and fail closed:
-  - private modes create owned tabs;
-  - user-Chrome mode creates a tab in a named Nanocodex group by default;
-  - taking over an existing tab requires an explicit user selection or exact
-    tab mention matched against freshly listed ID, title, URL, browser instance,
-    recency, and group metadata; and
-  - claimed user tabs remain in their existing group and are released rather
-    than closed at cleanup.
-- Implement user-Chrome control through a Nanocodex Chrome extension and a
-  versioned native-messaging host. Do not attach ordinary remote CDP to a
-  personal default profile and do not depend on the proprietary ChatGPT Chrome
-  extension or its protocol.
-- Lease every controlled tab to one browser session, surface user/debugger
-  interruption as cancellation, clean up agent-created tabs deterministically,
-  and keep open-tab inventory out of model context unless the caller explicitly
-  provides the selected tab.
-- Decide whether `private-vm` means the dedicated browser VM or a browser
-  co-located with the retained workspace VM before promising guest-localhost
-  testing. If the processes remain in different VMs, expose an explicit,
-  bounded forwarding path rather than relying on host-network accidents.
-- Preserve `BrowserTool` as an ordinary caller-owned provider. Any extension
-  backend must either support the declared action contract or expose an honest
-  capability-specific contract; unsupported actions must not be discovered as
-  usable.
+### Part 2: make the intelligence useful everywhere — active
 
-### 3. Application-owned terminals and managed sessions
+- Build product surfaces as real consumers of the owned session API. Current
+  work includes application-owned terminals in
+  [PR #79](https://github.com/gakonst/nanocodex/pull/79), owned interactive
+  computer use in [PR #102](https://github.com/gakonst/nanocodex/pull/102), and
+  voice/meeting workflows in
+  [PR #116](https://github.com/gakonst/nanocodex/pull/116).
+- Make the same intelligence deployable wherever users and applications need
+  it. The Vercel Workflow and Cloudflare Durable Object consumers in PRs
+  [#112](https://github.com/gakonst/nanocodex/pull/112) and
+  [#113](https://github.com/gakonst/nanocodex/pull/113) are merged; durable
+  platform sandboxes in [PR #114](https://github.com/gakonst/nanocodex/pull/114),
+  managed agents in [PR #89](https://github.com/gakonst/nanocodex/pull/89), and
+  the retained exe.dev experiment in
+  [PR #119](https://github.com/gakonst/nanocodex/pull/119) continue that work.
+- Keep these surfaces thin and application-owned. Product-specific deployment,
+  UI, tenancy, payment, authentication, and orchestration policy must not widen
+  the stable SDK into an app server or platform abstraction.
 
-- Rebase and finish the narrow application-owned terminal contract in
-  [PR #79](https://github.com/gakonst/nanocodex/pull/79). Retained process state,
-  cancellation, output bounds, and descendant cleanup remain owned by the
-  tool runtime rather than the agent driver.
-- Review and land [PR #89](https://github.com/gakonst/nanocodex/pull/89) only as
-  a concrete experimental managed-session consumer: durable actors may own
-  Nanocodex sessions, idempotency, event replay, policy, disposable VMs, and
-  service projection, but the stable agent crates must not become an app server
-  or generic scheduler.
-- Keep payment, tenant, authentication, deployment, and secret-routing policy
-  in the consuming application. Lower `nanocodex-*` libraries own typed seams,
-  not one hosted product's policy.
+### Part 3: push the frontier with measured ideas — beginning
 
-### 4. Evaluation as product evidence
+- Use the Part 1 baseline to identify concrete performance and capability gaps,
+  then optimize against retained differential evidence instead of intuition.
+- Expand evaluation beyond Terminal-Bench through
+  [PR #72](https://github.com/gakonst/nanocodex/pull/72). StableBench is another
+  suite consumed by `nanocodex eval`, not a second evaluation system.
+- Exercise ideas such as application-owned subagent orchestration and the RLM
+  experiment in [PR #32](https://github.com/gakonst/nanocodex/pull/32) against
+  the same immutable baselines. Promote only demonstrated improvements, and do
+  not turn a successful experiment into a generic core scheduler by default.
 
-- Rebase and complete the VM-backed differential evaluation foundation in
-  [PR #61](https://github.com/gakonst/nanocodex/pull/61) after its extracted
-  Code Mode slice lands.
-- Keep [PR #72](https://github.com/gakonst/nanocodex/pull/72) stacked until the
-  base evaluation contract is merged, then validate StableBench with exact
-  retained artifacts, canonical verifier output, scorer provenance, model
-  usage, and cost.
-- Keep deterministic task correctness authoritative. Optional model scoring may
-  add evidence but must not overwrite verifier rewards or turn scorer failure
-  into a false correctness failure.
-- Re-evaluate the older recursive task-tooling experiment in
-  [PR #32](https://github.com/gakonst/nanocodex/pull/32) only after current
-  differential evidence identifies a concrete need. Do not merge a generic
-  recursive scheduler because the branch exists.
-- Never modify benchmark tasks, verifiers, images, or expected outputs to make
-  Nanocodex pass. Inspect exact JSONL, trajectories, retained files, verifier
-  logs, and cold-versus-warm timing before making an evaluation claim.
+Parts 2 and 3 may advance concurrently. The eval baseline is the anchor that
+lets both move quickly without losing correctness or comparability.
 
-### 5. Next release gate
+## Evaluation contract
 
-- Select the next version only after the included milestones and migrations are
-  known; do not infer a version number from unreleased workspace metadata.
-- Update root and per-crate changelogs, public READMEs, migration notes, and
-  release examples from the actual merged graph.
+`nanocodex eval` is the one operator entry point for release evaluation,
+iteration, and differential analysis. Do not run a parallel direct-Harbor
+campaign or maintain a second campaign format. Benchmark-owned tasks, schemas,
+images, and verifiers may be consumed unchanged behind the Nanocodex evaluator;
+the orchestration, durability, comparison, and retained evidence remain owned
+by `nanocodex-eval`.
+
+Every public performance claim must come from an immutable matched plan:
+
+- pin the Nanocodex commit and binary digest, stock Codex version and digest,
+  model, reasoning effort, tool exposure, task corpus, task-image digest,
+  verifier, repetition count, and evaluator configuration;
+- give both arms the same task inputs and resources, retain every attempt, and
+  classify infrastructure failures as incomplete evidence rather than scores;
+- use the evaluator's prepared-image reuse, disposable overlays, exact resume,
+  fast path, and memory-weighted scheduler to saturate the eval host safely;
+- inspect canonical verifier output, JSONL, trajectories, retained files, model
+  usage, cost, and cold-versus-warm timing before publishing an aggregate; and
+- generate website data from the retained records rather than manually copying
+  headline numbers.
+
+For the `0.4.0` campaign, `ubuntu@dev-georgios` is the primary x86_64 host and
+all run roots, images, caches, logs, and reports belong under the dedicated
+3.5 TB `/mnt/nanocodex-evals` volume. Root-disk space is not evaluation
+capacity. Start with a one-task release-binary smoke, then raise concurrency
+aggressively until CPU, memory, or measured throughput establishes the host's
+real limit. Resume the same immutable plan after interruption; never discard
+completed coordinates just to restart with different scheduling.
+
+Terminal-Bench establishes the broad matched coding-agent baseline. PR #72
+expands the same retained comparison model to StableBench and establishes the
+pattern for further suites. Deterministic task correctness remains
+authoritative. Optional model scoring may add evidence, but may not overwrite
+verifier rewards or convert scorer failure into a false correctness failure.
+
+Never modify benchmark tasks, verifiers, images, expected outputs, or scorer
+inputs to make Nanocodex pass.
+
+## `0.4.0` evidence and release gate
+
+- Repair and smoke the current nightly `nanocodex eval` VM path before spending
+  model budget; a tool-console or guest-launch failure is an evaluator
+  regression, not benchmark evidence.
+- Freeze the candidate commit and run the full matched Terminal-Bench campaign
+  with enough repetitions to report totals, paired outcomes, per-task results,
+  uncertainty, usage, cost, and timing against pinned stock Codex.
+- Rebase PR #72 onto the merged eval foundation and complete the selected
+  StableBench differential campaign with canonical correctness and complete
+  scorer provenance.
+- Publish only claims directly supported by complete retained comparisons. “As
+  good as Codex” requires the matched aggregate and important slices to support
+  that statement; isolated wins and incomplete comparisons are shown as such.
+- Project the immutable release evidence into the website, retain a machine-
+  readable artifact index, and link every displayed aggregate back to its
+  candidate, configuration, and run records.
 - Run crate-boundary checks, rustfmt, warnings-denied Clippy, workspace and
   all-target tests, rustdoc/doctests/examples, WASM, Node/browser, PyO3,
-  CLI/Ratatui, static VM guest, live native smoke, focused browser/VM trials,
-  and the relevant differential suites.
-- Publish only from a clean, reviewed commit with required checks green; retain
-  exact release and evaluation artifacts.
+  CLI/Ratatui, static VM guest, and focused browser/VM trials on the same frozen
+  candidate before publishing `0.4.0`.
+- Update root and per-crate changelogs, public READMEs, migration notes, and
+  release examples from the actual merged graph. Publish only from a clean,
+  reviewed commit with required checks green.
 
 ## Current execution order
 
-1. [x] Merge PR #50, ship `0.3.0`, and establish the layered stable SDK.
-2. [x] Land retained VM tools, browser/VM automation, Realtime voice, reusable
-   hosted transports, composable egress, Cloudflare, and Rivet consumers.
-3. [ ] Finish and merge the focused Code Mode parity slice in PR #95.
-4. [ ] Reconcile and advance the Codex parity checkpoint with a complete commit
-   classification and direct evidence for every adopted behavior.
-5. [ ] Fix, validate, and merge desktop profile import in PR #93.
-6. [ ] Build browser placement and presentation policy for private host and
-   private VM sessions, then prove both through the CLI consumer.
-7. [ ] Prototype the user-Chrome extension/native-host path; prove exact tab
-   claiming, grouping, visible cursor feedback, interruption, leasing, and
-   cleanup before exposing it as normal CLI policy.
-8. [ ] Rebase and decide PR #79, then review PR #89 against the stable-core and
-   application-policy boundaries above.
-9. [ ] Rebase and merge PR #61, then complete the stacked StableBench work in
-   PR #72 and record retained differential evidence.
-10. [ ] Decide whether PR #32 still solves a demonstrated problem or should be
-    replaced by a smaller application-owned experiment.
-11. [ ] Cut the next release only after all selected milestones pass the full
-    release gate.
+1. [x] Ship `0.3.0` and establish the layered, library-first SDK.
+2. [x] Merge Code Mode/runtime parity prerequisites and the VM-backed
+   differential foundation in PR #61.
+3. [ ] Fix the latest-nightly evaluator launch regression and prove one matched
+   task end to end with `nanocodex eval` on the dedicated eval volume.
+4. [ ] Freeze the `0.4.0` candidate and complete the aggressively parallel,
+   resumable Terminal-Bench differential campaign against pinned stock Codex.
+5. [ ] Rebase and finish PR #72, then retain the selected StableBench evidence
+   through the same evaluator and artifact model.
+6. [ ] Generate the website evidence projection, review every public claim, and
+   cut `0.4.0` from the evaluated candidate.
+7. [ ] Advance PRs #79, #102, and #116 as focused terminal, computer-use, and
+   voice product consumers, measuring affected boundaries as they land.
+8. [ ] Advance PRs #89, #114, and #119 as application-owned ways to make
+   Nanocodex available across managed, edge, and hosted environments.
+9. [ ] Re-evaluate PR #32 and subsequent orchestration ideas against the frozen
+   baseline; keep only improvements demonstrated by retained differentials.
 
 ## Current non-goals
 
