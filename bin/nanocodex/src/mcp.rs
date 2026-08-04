@@ -83,6 +83,43 @@ pub(crate) struct McpArgs {
     mcp_tool_timeout: u64,
 }
 
+/// Explicit MCP servers available to an evaluator agent.
+///
+/// Evals intentionally do not inherit the interactive CLI's default servers
+/// or `$CODEX_HOME` configuration. Their model-visible tools must be selected
+/// on the command line so the run can bind that configuration into its durable
+/// identity.
+#[derive(Args, Default)]
+pub(crate) struct EvalMcpArgs {
+    /// Add a named Streamable HTTP MCP server (`NAME=URL`). Repeatable.
+    #[arg(long = "mcp", value_name = "NAME=URL")]
+    http: Vec<NamedValue>,
+
+    /// Add a named stdio MCP server executable (`NAME=COMMAND`). Repeatable.
+    #[arg(long = "mcp-stdio", value_name = "NAME=COMMAND")]
+    stdio: Vec<NamedValue>,
+
+    /// Append one argument to a named stdio MCP server (`NAME=ARG`). Repeatable.
+    #[arg(long = "mcp-arg", value_name = "NAME=ARG")]
+    arguments: Vec<NamedValue>,
+
+    /// Resolve a named HTTP server's bearer token from an environment variable (`NAME=ENV`).
+    #[arg(long = "mcp-bearer-env", value_name = "NAME=ENV")]
+    bearer_env: Vec<NamedValue>,
+
+    /// Resolve an HTTP header from an environment variable (`NAME:HEADER=ENV`). Repeatable.
+    #[arg(long = "mcp-header-env", value_name = "NAME:HEADER=ENV")]
+    header_env: Vec<NamedHeaderValue>,
+
+    /// Seconds allowed for each MCP initialize and tools/list operation.
+    #[arg(long, default_value_t = 30)]
+    mcp_startup_timeout: u64,
+
+    /// Seconds allowed for one remote MCP tool call.
+    #[arg(long, default_value_t = 300)]
+    mcp_tool_timeout: u64,
+}
+
 enum Transport {
     Http(String),
     Stdio(String),
@@ -266,6 +303,83 @@ impl McpArgs {
             oauth_store,
         )?))
     }
+}
+
+impl EvalMcpArgs {
+    pub(crate) fn build(self) -> Result<Option<ConfiguredMcp>> {
+        McpArgs {
+            mcp_defaults: false,
+            mcp_codex_config: false,
+            http: self.http,
+            stdio: self.stdio,
+            arguments: self.arguments,
+            bearer_env: self.bearer_env,
+            header_env: self.header_env,
+            mcp_startup_timeout: self.mcp_startup_timeout,
+            mcp_tool_timeout: self.mcp_tool_timeout,
+        }
+        .build(Path::new("."))
+    }
+
+    pub(crate) const fn is_configured(&self) -> bool {
+        !self.http.is_empty() || !self.stdio.is_empty()
+    }
+
+    pub(crate) fn configuration_digest(&self) -> Result<String> {
+        let mut digest = Sha256::new();
+        digest.update(b"nanocodex-eval-mcp-v1\0");
+        update_u64(&mut digest, self.mcp_startup_timeout);
+        update_u64(&mut digest, self.mcp_tool_timeout);
+        update_named_values(&mut digest, b"http", &self.http, false)?;
+        update_named_values(&mut digest, b"stdio", &self.stdio, false)?;
+        update_named_values(&mut digest, b"argument", &self.arguments, false)?;
+        update_named_values(&mut digest, b"bearer", &self.bearer_env, true)?;
+        for header in &self.header_env {
+            update_bytes(&mut digest, b"header");
+            update_bytes(&mut digest, header.name.as_bytes());
+            update_bytes(&mut digest, header.header.as_bytes());
+            update_bytes(&mut digest, header.value.as_bytes());
+            let value = std::env::var(&header.value).wrap_err_with(|| {
+                format!(
+                    "failed to read MCP header environment variable {}",
+                    header.value
+                )
+            })?;
+            update_bytes(&mut digest, value.as_bytes());
+        }
+        Ok(hex::encode(digest.finalize()))
+    }
+}
+
+fn update_named_values(
+    digest: &mut Sha256,
+    kind: &[u8],
+    values: &[NamedValue],
+    resolve_environment: bool,
+) -> Result<()> {
+    for value in values {
+        update_bytes(digest, kind);
+        update_bytes(digest, value.name.as_bytes());
+        update_bytes(digest, value.value.as_bytes());
+        if resolve_environment {
+            let resolved = std::env::var(&value.value).wrap_err_with(|| {
+                format!(
+                    "failed to read MCP bearer environment variable {}",
+                    value.value
+                )
+            })?;
+            update_bytes(digest, resolved.as_bytes());
+        }
+    }
+    Ok(())
+}
+
+fn update_u64(digest: &mut Sha256, value: u64) {
+    digest.update(value.to_le_bytes());
+}
+
+fn update_bytes(digest: &mut Sha256, value: &[u8]) {
+    digest.update(Sha256::digest(value));
 }
 
 fn build_mcp(

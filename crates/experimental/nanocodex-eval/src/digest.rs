@@ -168,6 +168,39 @@ impl TaskPackage {
         }
         Ok(())
     }
+
+    pub(crate) fn materialize(&self, destination: &Path) -> io::Result<()> {
+        fs::create_dir(destination)?;
+        let mut directory_modes = vec![(destination.to_path_buf(), 0o755)];
+        for entry in &self.entries {
+            let target = destination.join(&entry.relative);
+            match &entry.kind {
+                TaskPackageEntryKind::Directory => {
+                    fs::create_dir(&target)?;
+                    directory_modes.push((target, entry.mode));
+                }
+                TaskPackageEntryKind::File { bytes, digest } => {
+                    let mut file = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&target)?;
+                    copy_file_verified(
+                        &self.root.join(&entry.relative),
+                        &mut file,
+                        *bytes,
+                        *digest,
+                    )?;
+                    set_mode(&target, entry.mode)?;
+                    normalize_times(&target)?;
+                }
+            }
+        }
+        for (directory, mode) in directory_modes.into_iter().rev() {
+            set_mode(&directory, mode)?;
+            normalize_times(&directory)?;
+        }
+        Ok(())
+    }
 }
 
 fn collect_package_entry(

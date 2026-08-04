@@ -88,7 +88,10 @@ use flate2::read::GzDecoder;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use ignore::WalkBuilder;
 use oci_client::{
-    Client, Reference, client::ClientConfig, config::ConfigFile, manifest::ImageIndexEntry,
+    Client, Reference,
+    client::{ClientConfig, ClientProtocol},
+    config::ConfigFile,
+    manifest::ImageIndexEntry,
     secrets::RegistryAuth,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -2274,6 +2277,7 @@ async fn pull_layers(image: &str, blobs: &Path) -> Result<PulledImage, ImageErro
         source,
     })?;
     let config = ClientConfig {
+        protocol: registry_protocol(&reference),
         platform_resolver: Some(Box::new(linux_guest_manifest)),
         ..ClientConfig::default()
     };
@@ -2422,6 +2426,22 @@ fn linux_guest_manifest(manifests: &[ImageIndexEntry]) -> Option<String> {
             })
         })
         .map(|entry| entry.digest.clone())
+}
+
+fn registry_protocol(reference: &Reference) -> ClientProtocol {
+    let registry = reference.registry();
+    let host = registry
+        .strip_prefix('[')
+        .and_then(|registry| registry.split_once(']'))
+        .map_or_else(
+            || registry.split(':').next().unwrap_or(registry),
+            |(host, _)| host,
+        );
+    if matches!(host, "localhost" | "127.0.0.1" | "::1") {
+        ClientProtocol::HttpsExcept(vec![registry.to_owned()])
+    } else {
+        ClientProtocol::Https
+    }
 }
 
 fn format_root_disk(path: &Path, size: u64, layers: &[PulledLayer]) -> Result<(), ImageError> {
@@ -2724,8 +2744,8 @@ mod tests {
         build_cache_key, build_guest_bootstrap_script, cached_file_digest,
         configure_firmware_library_path, configured_root_shell, disk_cache_key,
         docker_process_environment, output_tail, prepare_copy_source_disk, prepare_flattened_disk,
-        reference_cache_key, resolver_configuration, valid_cached_blob, valid_cached_ext4_disk,
-        write_cache_record,
+        reference_cache_key, registry_protocol, resolver_configuration, valid_cached_blob,
+        valid_cached_ext4_disk, write_cache_record,
     };
     use flate2::{Compression, write::GzEncoder};
     use tracing::{
@@ -2741,6 +2761,31 @@ mod tests {
     const FIXTURE_MANIFEST: &str =
         "sha256:56249d7a2f93306106f6d8bcdf6423afb73c1b747d874febcc778beee25cb8bb";
     static IMAGE_PREPARE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn local_oci_registries_use_plain_http() {
+        for image in [
+            "localhost:5100/evals/candidate:v1",
+            "127.0.0.1:5100/evals/candidate:v1",
+        ] {
+            let reference = oci_client::Reference::try_from(image).unwrap();
+            assert_eq!(
+                registry_protocol(&reference),
+                oci_client::client::ClientProtocol::HttpsExcept(vec![
+                    reference.registry().to_owned()
+                ])
+            );
+        }
+    }
+
+    #[test]
+    fn remote_oci_registries_keep_https() {
+        let reference = oci_client::Reference::try_from("ghcr.io/example/eval:latest").unwrap();
+        assert_eq!(
+            registry_protocol(&reference),
+            oci_client::client::ClientProtocol::Https
+        );
+    }
 
     #[test]
     fn configured_root_shell_uses_the_uid_zero_account() {

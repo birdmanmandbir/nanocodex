@@ -82,6 +82,8 @@ mod durable;
 mod evaluator;
 mod event;
 pub mod harbor;
+/// Content-addressed importers for third-party evaluation datasets.
+pub mod import;
 mod job;
 mod native;
 mod result;
@@ -122,8 +124,8 @@ pub use result::{
 };
 pub use sweep::{AgentId, AgentIdError, Sweep, SweepBuilder, SweepError};
 pub use task::{
-    NetworkPolicy, OciImage, Resources, Task, TaskLoadError, Verifier, VerifierCollect,
-    VerifierEnvironmentMode,
+    NetworkPolicy, OciImage, Resources, Task, TaskArtifact, TaskLoadError, TaskOutput, Verifier,
+    VerifierCollect, VerifierEnvironmentMode,
 };
 #[cfg(any(
     all(target_os = "linux", not(target_env = "musl")),

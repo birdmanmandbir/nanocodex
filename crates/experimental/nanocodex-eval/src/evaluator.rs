@@ -43,6 +43,7 @@ use crate::{
     EvalEventKind, EvalEvents, EvalException, EvalExceptionKind, EvalFailure, EvalFailureTiming,
     EvalOutcome, EvalResult, EvalStatus, EvalTiming, PhaseTiming, Sweep, SweepAttemptResult,
     SweepResults, Task, TaskLoadError, UsageTotals, VerifierResult,
+    atif::AtifBuilder,
     codex::{CodexExec, CodexRunError},
     job::EvalJob,
     native::{NativeAttempt, VerifierExecution},
@@ -279,6 +280,8 @@ pub(crate) struct EvalAttempt<'a> {
     task: &'a Task,
     directory: &'a Path,
     workspace: &'a Path,
+    final_message: Option<&'a str>,
+    trajectory: Option<&'a [u8]>,
 }
 
 /// Failure to configure, execute, verify, or durably retain an attempt.
@@ -904,9 +907,23 @@ impl Evaluator {
                 verifier_cleanup,
             ));
         }
+        let trajectory = emitter.finish_trajectory(&task, agent.result.as_ref());
+        let trajectory = serde_json::to_vec(&trajectory)
+            .map_err(EvalError::Json)
+            .map_err(AttemptRunFailure::new)?;
         emitter.emit(EvalEventKind::VerifierStarted);
+        let final_message = agent
+            .result
+            .as_ref()
+            .map(|result| result.final_message.as_str());
         let verifier = match self
-            .execute_verifier(&task, &attempt, agent.verifier.take())
+            .execute_verifier(
+                &task,
+                &attempt,
+                final_message,
+                &trajectory,
+                agent.verifier.take(),
+            )
             .await
         {
             Ok(verifier) => verifier,
@@ -981,6 +998,8 @@ impl Evaluator {
         &self,
         task: &Task,
         attempt: &NativeAttempt,
+        final_message: Option<&str>,
+        trajectory: &[u8],
         verifier: Option<Box<dyn AttemptVerifier>>,
     ) -> Result<VerifierExecution, VerifierExecutionFailure> {
         let span = info_span!(
@@ -1011,6 +1030,8 @@ impl Evaluator {
                             task,
                             directory: &attempt.paths.root,
                             workspace: &attempt.paths.workspace,
+                            final_message,
+                            trajectory: Some(trajectory),
                         },
                     )
                     .await
@@ -1051,14 +1072,13 @@ impl Evaluator {
                 })
             } else {
                 let started_at = Utc::now();
-                attempt
-                    .verify(task)
-                    .await
-                    .map_err(|error| VerifierExecutionFailure {
+                attempt.verify(task, final_message).await.map_err(|error| {
+                    VerifierExecutionFailure {
                         error: RecordedEvalError::now(error),
                         cleanup: CleanupPhase::not_required(),
                         timing: Some(PhaseTiming::finished(started_at)),
-                    })
+                    }
+                })
             }
         }
         .instrument(span.clone())
@@ -1419,6 +1439,8 @@ impl Evaluator {
                         task,
                         directory: &attempt.paths.root,
                         workspace: &attempt.paths.workspace,
+                        final_message: None,
+                        trajectory: None,
                     },
                     builder,
                 ) {
@@ -1831,7 +1853,7 @@ async fn receive_agent_terminal(
         let event = events.recv().await.ok_or(EvalError::AgentEventsClosed)?;
         observation.observe(&event)?;
         let terminal = event.kind.is_terminal();
-        emitter.emit(EvalEventKind::Agent(event.clone()));
+        emitter.emit_agent(event.clone())?;
         if terminal {
             return Ok(event);
         }
@@ -2596,6 +2618,18 @@ impl EvalAttempt<'_> {
     pub(crate) const fn workspace(&self) -> &Path {
         self.workspace
     }
+
+    /// Returns the final assistant message when the agent produced one.
+    #[must_use]
+    pub(crate) const fn final_message(&self) -> Option<&str> {
+        self.final_message
+    }
+
+    /// Returns the canonical ATIF trajectory available to the verifier.
+    #[must_use]
+    pub(crate) const fn trajectory(&self) -> Option<&[u8]> {
+        self.trajectory
+    }
 }
 
 #[derive(Clone)]
@@ -2688,6 +2722,7 @@ struct AttemptEmitter {
     task_name: String,
     trial_name: String,
     sequence: u64,
+    atif: AtifBuilder,
 }
 
 impl AttemptEmitter {
@@ -2706,6 +2741,7 @@ impl AttemptEmitter {
             task_name: task.name().to_owned(),
             trial_name: trial_name.to_owned(),
             sequence: 0,
+            atif: AtifBuilder::default(),
         }
     }
 
@@ -2720,6 +2756,24 @@ impl AttemptEmitter {
             }),
             kind,
         );
+    }
+
+    fn emit_agent(&mut self, event: AgentEvent) -> Result<(), EvalError> {
+        self.atif.apply(&event)?;
+        self.emit(EvalEventKind::Agent(event));
+        Ok(())
+    }
+
+    fn finish_trajectory(
+        &mut self,
+        task: &Task,
+        result: Option<&AgentResult>,
+    ) -> crate::atif::AtifTrajectory {
+        let atif = std::mem::take(&mut self.atif);
+        match result {
+            Some(result) => atif.finish(task, result),
+            None => atif.finish_failure(task),
+        }
     }
 }
 

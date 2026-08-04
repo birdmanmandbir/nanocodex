@@ -8,7 +8,7 @@ use std::{
 use chrono::Utc;
 use tokio::{process::Command, time::timeout};
 
-use crate::{CleanupPhase, EvalError, PhaseTiming, Task, VerifierResult};
+use crate::{CleanupPhase, EvalError, PhaseTiming, Task, TaskOutput, VerifierResult};
 
 pub(crate) struct AttemptPaths {
     pub root: PathBuf,
@@ -61,8 +61,18 @@ impl NativeAttempt {
         })
     }
 
-    pub async fn verify(&self, task: &Task) -> Result<VerifierExecution, EvalError> {
+    pub async fn verify(
+        &self,
+        task: &Task,
+        final_message: Option<&str>,
+    ) -> Result<VerifierExecution, EvalError> {
         let started_at = Utc::now();
+        if task.output() == TaskOutput::FinalMessage {
+            fs::write(
+                self.paths.workspace.join("answer.txt"),
+                final_message.unwrap_or_default(),
+            )?;
+        }
         let mut command = Command::new("/bin/sh");
         command
             .arg(self.paths.tests.join("test.sh"))
@@ -95,10 +105,24 @@ impl NativeAttempt {
         };
         fs::write(&self.paths.verifier_output, combined)?;
 
-        let reward_text = fs::read_to_string(&self.paths.reward)?;
-        let reward = reward_text.trim().parse::<f64>()?;
-        let mut rewards = BTreeMap::new();
-        rewards.insert("reward".to_owned(), reward);
+        let reward_json = self.paths.verifier.join("reward.json");
+        let rewards = if reward_json.is_file() {
+            serde_json::from_slice::<BTreeMap<String, f64>>(&fs::read(reward_json)?)?
+        } else {
+            let reward_text = fs::read_to_string(&self.paths.reward)?;
+            BTreeMap::from([("reward".to_owned(), reward_text.trim().parse::<f64>()?)])
+        };
+        if rewards.is_empty()
+            || rewards
+                .iter()
+                .any(|(name, reward)| name.trim().is_empty() || !reward.is_finite())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "verifier rewards must contain non-empty names and finite numeric values",
+            )
+            .into());
+        }
 
         Ok(VerifierExecution {
             result: VerifierResult {
@@ -123,7 +147,7 @@ impl NativeAttempt {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, os::unix::fs::PermissionsExt as _};
 
     use tempfile::tempdir;
 
@@ -143,11 +167,59 @@ mod tests {
             "hello from nanoeval\n",
         )
         .unwrap();
-        let execution = attempt.verify(&task).await.unwrap();
+        let execution = attempt.verify(&task, None).await.unwrap();
 
         assert!((execution.result.rewards["reward"] - 1.0).abs() < f64::EPSILON);
         assert_eq!(execution.result.exit_code, 0);
         assert!(attempt.paths.verifier_output.is_file());
         assert_eq!(fs::read_to_string(attempt.paths.reward).unwrap(), "1\n");
+    }
+
+    #[tokio::test]
+    async fn final_message_tasks_stage_answer_before_verification() {
+        let package = tempfile::tempdir().unwrap();
+        fs::create_dir(package.path().join("environment")).unwrap();
+        fs::create_dir(package.path().join("tests")).unwrap();
+        fs::write(package.path().join("instruction.md"), "Answer briefly.").unwrap();
+        fs::write(
+            package.path().join("task.toml"),
+            r#"schema_version = "1.3"
+output = "final_message"
+
+[task]
+name = "final-answer"
+
+[agent]
+timeout_sec = 30
+
+[verifier]
+timeout_sec = 30
+
+[environment]
+docker_image = "debian:bookworm-slim"
+cpus = 1
+memory_mb = 512
+storage_mb = 1024
+"#,
+        )
+        .unwrap();
+        let script = package.path().join("tests/test.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\nset -eu\ntest \"$(cat answer.txt)\" = expected\nprintf '1\\n' > \"$NANOCODEX_EVAL_VERIFIER_LOGS/reward.txt\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let task = Task::load(package.path()).unwrap();
+        let output = tempdir().unwrap();
+        let attempt = NativeAttempt::prepare(output.path(), "trial", &task).unwrap();
+
+        let execution = attempt.verify(&task, Some("expected")).await.unwrap();
+
+        assert_eq!(execution.result.rewards["reward"], 1.0);
+        assert_eq!(
+            fs::read_to_string(attempt.paths.workspace.join("answer.txt")).unwrap(),
+            "expected"
+        );
     }
 }

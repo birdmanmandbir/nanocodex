@@ -1,5 +1,7 @@
 use std::{
     cell::Cell,
+    collections::BTreeMap,
+    ffi::OsStr,
     fs, future,
     path::{Path, PathBuf},
     time::Duration,
@@ -179,6 +181,27 @@ fn vm_guest_build_targets_the_unified_vm_package() {
     assert_eq!(
         command.as_std().get_current_dir(),
         Some(Path::new("/tmp/nanocodex-workspace"))
+    );
+}
+
+#[test]
+fn guest_runtime_lookup_honors_cargo_target_directory() {
+    let workspace = Path::new("/workspace/nanocodex");
+
+    assert_eq!(
+        super::runtime::resolve_cargo_target_directory(workspace, None),
+        workspace.join("target")
+    );
+    assert_eq!(
+        super::runtime::resolve_cargo_target_directory(workspace, Some(OsStr::new("build/eval"))),
+        workspace.join("build/eval")
+    );
+    assert_eq!(
+        super::runtime::resolve_cargo_target_directory(
+            workspace,
+            Some(OsStr::new("/mnt/eval-build"))
+        ),
+        PathBuf::from("/mnt/eval-build")
     );
 }
 
@@ -399,6 +422,8 @@ async fn implicit_resume_rebuilds_from_the_job_owned_guest_artifact() {
         vm_retention: VmRetention::Failures,
         thinking: Thinking::Low,
         web_search: false,
+        tool_configuration_digest: "tools".to_owned(),
+        verifier_environment: BTreeMap::new(),
         rerun_from: None,
         automatic_scheduling: None,
     };
@@ -690,6 +715,8 @@ fn resumed_workload_allows_scheduler_changes_only() {
         vm_retention: VmRetention::Failures,
         thinking: "xhigh".to_owned(),
         web_search: false,
+        tool_configuration_digest: "tools".to_owned(),
+        verifier_environment_digest: super::verifier_environment_digest(&BTreeMap::new()),
         rerun_from: None,
     };
     let aggregate_identity = super::aggregate_run_identity(&retained);
@@ -719,6 +746,23 @@ fn resumed_workload_allows_scheduler_changes_only() {
     let mut changed_guest = retained.clone();
     changed_guest.guest_runtime.as_mut().unwrap().binary_sha256 = "different".to_owned();
     assert!(!retained.same_workload(&changed_guest));
+
+    let mut changed_tools = retained.clone();
+    changed_tools.tool_configuration_digest = "other-tools".to_owned();
+    assert!(!retained.same_workload(&changed_tools));
+
+    let verifier_environment = BTreeMap::from([
+        ("OPENAI_API_KEY".to_owned(), "secret-test-value".to_owned()),
+        ("JUDGE_MODEL".to_owned(), "official-judge".to_owned()),
+    ]);
+    let mut changed_verifier = retained.clone();
+    changed_verifier.verifier_environment_digest =
+        super::verifier_environment_digest(&verifier_environment);
+    assert!(!retained.same_workload(&changed_verifier));
+
+    let retained_json = serde_json::to_string(&changed_verifier).unwrap();
+    assert!(!retained_json.contains("secret-test-value"));
+    assert!(!retained_json.contains("OPENAI_API_KEY"));
 }
 
 #[test]
@@ -1060,6 +1104,8 @@ fn retained_invocation(rerun_from: Option<PathBuf>) -> super::RunInvocation {
         vm_retention: super::VmRetention::Failures,
         thinking: "low".to_owned(),
         web_search: false,
+        tool_configuration_digest: "tools".to_owned(),
+        verifier_environment_digest: super::verifier_environment_digest(&BTreeMap::new()),
         rerun_from,
     }
 }

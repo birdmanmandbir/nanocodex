@@ -25,7 +25,7 @@ use nanocodex::{
 };
 
 use crate::browser::{BrowserArgs, ConfiguredBrowser};
-use crate::mcp::{ConfiguredMcp, McpArgs};
+use crate::mcp::{ConfiguredMcp, EvalMcpArgs, McpArgs};
 use crate::mpp::{MppAdapter, MppArgs};
 use crate::subagents::{self, ChildAgents};
 use crate::vm::{ConfiguredVm, VmArgs};
@@ -93,6 +93,19 @@ pub(crate) struct EvalAgentArgs {
 
     #[command(flatten)]
     model_policy: ModelArgs,
+
+    #[command(flatten)]
+    mcp: EvalMcpArgs,
+}
+
+#[cfg(any(
+    all(target_os = "linux", not(target_env = "musl")),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+pub(crate) struct ConfiguredEvalAgent {
+    pub(crate) builder: NanocodexBuilder,
+    pub(crate) additional_tools: Option<Tools>,
+    pub(crate) tool_configuration_digest: String,
 }
 
 #[derive(Args)]
@@ -382,9 +395,28 @@ impl AuthArgs {
     all(target_os = "macos", target_arch = "aarch64")
 ))]
 impl EvalAgentArgs {
-    pub(crate) fn builder(self, thinking: Thinking, web_search: bool) -> Result<NanocodexBuilder> {
+    pub(crate) fn builder(
+        self,
+        thinking: Thinking,
+        web_search: bool,
+    ) -> Result<ConfiguredEvalAgent> {
+        let tool_configuration_digest = self.mcp.configuration_digest()?;
+        let mcp = self.mcp.build()?;
+        let additional_tools = mcp
+            .map(|ConfiguredMcp { provider, .. }| {
+                Tools::builder()
+                    .without_defaults()
+                    .provider(provider)
+                    .build()
+            })
+            .transpose()?;
         let auth = self.auth.resolve()?;
-        eval_builder_with_auth(auth.nanocodex()?, thinking, web_search)
+        let builder = eval_builder_with_auth(auth.nanocodex()?, thinking, web_search)?;
+        Ok(ConfiguredEvalAgent {
+            builder,
+            additional_tools,
+            tool_configuration_digest,
+        })
     }
 
     pub(crate) fn shared_builder(
@@ -392,6 +424,11 @@ impl EvalAgentArgs {
         thinking: Thinking,
         web_search: bool,
     ) -> Result<(NanocodexBuilder, SharedAuth)> {
+        if self.mcp.is_configured() {
+            return Err(eyre!(
+                "explicit MCP servers are not yet supported by matched stock-Codex differential runs"
+            ));
+        }
         let auth = self.auth.resolve()?;
         let builder = eval_builder_with_auth(auth.nanocodex()?, thinking, web_search)?;
         Ok((builder, auth))
@@ -403,6 +440,10 @@ impl EvalAgentArgs {
 
     pub(crate) const fn web_search(&self) -> Option<bool> {
         self.model_policy.web_search
+    }
+
+    pub(crate) fn tool_configuration_digest(&self) -> Result<String> {
+        self.mcp.configuration_digest()
     }
 }
 

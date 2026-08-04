@@ -1,6 +1,7 @@
 mod args;
 mod cleanup;
 mod diff;
+mod import;
 mod inspect;
 mod run;
 
@@ -14,7 +15,7 @@ use std::{
 use clap::{Args, Subcommand};
 use eyre::{Result, eyre};
 use nanocodex_eval::{
-    Task, VerifierCollect, VerifierEnvironmentMode,
+    Task, TaskArtifact, VerifierCollect, VerifierEnvironmentMode,
     vm::{prepare_task_image, prepare_verifier_image},
 };
 use nanocodex_vm::image::{CachePolicy, DiskStatus};
@@ -48,6 +49,9 @@ enum EvalCommand {
         #[arg(long, conflicts_with = "json")]
         prompt: bool,
     },
+
+    /// Convert a third-party dataset into content-addressed evaluator tasks.
+    Import(import::Import),
 
     /// Explain a retained Harbor job or trial and surface exact failure evidence.
     Inspect(inspect::Inspect),
@@ -251,6 +255,7 @@ async fn run(eval: Eval) -> Result<()> {
             }
         }
         Some(EvalCommand::Inspect(command)) => command.run()?,
+        Some(EvalCommand::Import(command)) => command.run()?,
         Some(EvalCommand::Diff(command)) => command.run().await?,
         Some(EvalCommand::Cleanup(command)) => command.run()?,
     }
@@ -266,7 +271,7 @@ struct TaskOutput<'a> {
     image: &'a str,
     agent_timeout_sec: f64,
     verifier: VerifierOutput<'a>,
-    artifacts: &'a [PathBuf],
+    artifacts: &'a [TaskArtifact],
     resources: ResourcesOutput,
     network: &'static str,
     environment: &'a BTreeMap<String, String>,

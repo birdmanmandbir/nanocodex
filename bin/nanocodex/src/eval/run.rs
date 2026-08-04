@@ -58,7 +58,7 @@ pub(crate) use runtime::{prepare_vm_guest_runtime, prepare_vm_guest_runtime_from
 const DEFAULT_OUTPUT_DIRECTORY: &str = ".nanocodex/evals";
 const INVOCATION_FILE: &str = "invocation.json";
 const LAST_RUN_FILE: &str = ".nanocodex/eval/last-run.json";
-const INVOCATION_VERSION: u32 = 3;
+const INVOCATION_VERSION: u32 = 4;
 const SCHEDULING_POLICY: &str = "bounded_fifo_work_conserving-v1";
 const TARGET_EVAL_OPEN_FILES: u64 = 8_192;
 const BYTES_PER_MIB: u64 = 1024 * 1024;
@@ -104,6 +104,11 @@ pub(crate) struct Run {
     /// Writable VM root-disk retention policy.
     #[arg(long, value_enum)]
     vm_retention: Option<VmRetention>,
+
+    /// Host environment variable exposed only to canonical verifier commands.
+    /// Repeat for model judges or authenticated official harnesses.
+    #[arg(long = "verifier-env", value_name = "NAME")]
+    verifier_environment: Vec<String>,
 
     #[command(flatten)]
     agent: EvalAgentArgs,
@@ -166,6 +171,8 @@ struct ResolvedRun {
     vm_retention: VmRetention,
     thinking: Thinking,
     web_search: bool,
+    tool_configuration_digest: String,
+    verifier_environment: BTreeMap<String, String>,
     rerun_from: Option<PathBuf>,
     automatic_scheduling: Option<AutomaticScheduling>,
 }
@@ -225,6 +232,8 @@ struct RunInvocation {
     vm_retention: VmRetention,
     thinking: String,
     web_search: bool,
+    tool_configuration_digest: String,
+    verifier_environment_digest: String,
     rerun_from: Option<PathBuf>,
 }
 
@@ -272,6 +281,8 @@ impl RunInvocation {
             && self.vm_retention == other.vm_retention
             && self.thinking == other.thinking
             && self.web_search == other.web_search
+            && self.tool_configuration_digest == other.tool_configuration_digest
+            && self.verifier_environment_digest == other.verifier_environment_digest
             && self.rerun_from == other.rerun_from
     }
 }
@@ -496,6 +507,8 @@ impl Run {
             .clone()
             .or_else(|| std::env::var_os("NANOCODEX_VM_GUEST_RUNTIME").map(PathBuf::from));
         let scheduling = self.resolve_scheduling(retained_invocation.as_ref());
+        let verifier_environment = resolve_verifier_environment(&self.verifier_environment)?;
+        let tool_configuration_digest = self.agent.tool_configuration_digest()?;
         Ok(ResolvedRun {
             task_paths,
             output,
@@ -515,6 +528,8 @@ impl Run {
                 .unwrap_or_default(),
             thinking,
             web_search,
+            tool_configuration_digest,
+            verifier_environment,
             rerun_from: rerun.map(|rerun| rerun.job),
             automatic_scheduling: scheduling.automatic,
         })
@@ -544,15 +559,24 @@ impl Run {
             load_prioritized_tasks(resolved.task_paths.clone(), &resolved.output)?;
         let evaluation_setup_started = Instant::now();
         let new_job = self.lifecycle.new_job;
-        let nanocodex = self.agent.builder(resolved.thinking, resolved.web_search)?;
-        let vm_backend = VmBackend::builder()
+        let configured_agent = self.agent.builder(resolved.thinking, resolved.web_search)?;
+        if configured_agent.tool_configuration_digest != resolved.tool_configuration_digest {
+            return Err(eyre!(
+                "evaluator tool configuration changed while the run was starting"
+            ));
+        }
+        let mut vm_backend = VmBackend::builder()
             .retain_passed_rootfs(resolved.vm_retention.retains_passes())
             .web_search(resolved.web_search)
-            .build();
+            .verifier_environment(resolved.verifier_environment.clone());
+        if let Some(tools) = configured_agent.additional_tools {
+            vm_backend = vm_backend.additional_agent_tools(tools);
+        }
+        let vm_backend = vm_backend.build();
         let (eval, attempt_count) = Self::build_evaluator(
             &resolved,
             tasks.clone(),
-            nanocodex,
+            configured_agent.builder,
             vm_backend.clone(),
             new_job,
         )?;
@@ -925,9 +949,39 @@ impl ResolvedRun {
             vm_retention: self.vm_retention,
             thinking: self.thinking.to_string(),
             web_search: self.web_search,
+            tool_configuration_digest: self.tool_configuration_digest.clone(),
+            verifier_environment_digest: verifier_environment_digest(&self.verifier_environment),
             rerun_from: self.rerun_from.clone(),
         })
     }
+}
+
+fn resolve_verifier_environment(names: &[String]) -> Result<BTreeMap<String, String>> {
+    let mut environment = BTreeMap::new();
+    for name in names {
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err(eyre!("invalid verifier environment variable name {name:?}"));
+        }
+        let value = std::env::var(name).map_err(|error| {
+            eyre!("failed to read verifier environment variable {name}: {error}")
+        })?;
+        environment.insert(name.clone(), value);
+    }
+    Ok(environment)
+}
+
+fn verifier_environment_digest(environment: &BTreeMap<String, String>) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"nanocodex-eval-verifier-environment-v1\0");
+    for (name, value) in environment {
+        digest.update(Sha256::digest(name.as_bytes()));
+        digest.update(Sha256::digest(value.as_bytes()));
+    }
+    hex::encode(digest.finalize())
 }
 
 fn report_resume(eval: &Evaluator, skipped: usize, total: usize) {

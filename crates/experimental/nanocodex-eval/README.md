@@ -9,6 +9,39 @@ Every benchmark attempt runs tools and verification in a microVM. Native host
 execution exists only inside focused crate tests. Harbor JSONL and ATIF are
 output formats, not alternate runners.
 
+## Third-party datasets
+
+`nanocodex-eval` owns a small normalized import boundary: `DatasetPlan`,
+`CasePlan`, `ImportStore`, and `ImportedDataset`. Format knowledge lives in the
+separate experimental `nanocodex-eval-adapters` crate. Importing snapshots every
+execution input under a content digest and returns ordinary `Task` values; the
+evaluator and VM do not know whether a task originated in Harbor, Arena,
+OpenAI Evals, SWE-bench, MLE-bench, PaperBench, or a private suite.
+
+```text
+source + official harness
+          │ adapter
+          ▼
+      DatasetPlan
+          │ ImportStore (atomic + content-addressed)
+          ▼
+ imported immutable tasks ──► existing VM image cache
+                              ├─► fresh attempt overlays
+                              ├─► bounded scheduler
+                              ├─► durable resume
+                              └─► canonical evidence
+```
+
+The generic output contract is either workspace mutations or the final
+assistant message. Final-message tasks receive the exact message at
+`/workspace/answer.txt` before their verifier runs. Canonical verifiers may
+emit one `reward.txt` value or named `reward.json` values. Benchmark-owned
+services, model judges, MCP servers, and credentials remain run configuration;
+they are never encoded as benchmark-specific VM modes.
+
+See `nanocodex-eval-adapters/README.md` for the support matrix, external harness
+schema, and CLI examples.
+
 ## One task
 
 ```rust,no_run
@@ -60,6 +93,7 @@ See the compiled examples:
 - `eval-task`: one VM attempt, independent events, and Harbor projection.
 - `eval-sweep`: a resumable multi-agent sweep.
 - `eval-differential`: matched Nanocodex-versus-Codex trials.
+- `eval-import`: losslessly import a Harbor-family suite into the shared format.
 
 Set `NANOCODEX_BIN` and `NANOCODEX_VM_RUNTIME` when the default development
 paths do not apply.

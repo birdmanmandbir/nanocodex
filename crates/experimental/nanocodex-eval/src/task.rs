@@ -27,7 +27,8 @@ pub struct Task {
     image: OciImage,
     agent_timeout: Duration,
     verifier: Verifier,
-    artifacts: Vec<PathBuf>,
+    artifacts: Vec<TaskArtifact>,
+    output: TaskOutput,
     resources: Resources,
     network: NetworkPolicy,
     environment: BTreeMap<String, String>,
@@ -65,6 +66,26 @@ pub enum VerifierEnvironmentMode {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct VerifierCollect {
     command: Box<str>,
+}
+
+/// One guest artifact retained after agent execution.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct TaskArtifact {
+    source: PathBuf,
+    exclude: Vec<PathBuf>,
+    service: Option<Box<str>>,
+}
+
+/// Candidate value made available to the canonical verifier.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskOutput {
+    /// The verifier consumes mutations in the task workspace.
+    #[default]
+    Workspace,
+    /// The verifier consumes the final assistant message at `answer.txt` in
+    /// the task workspace.
+    FinalMessage,
 }
 
 /// Task-declared resource requirements used by admission and VM sizing.
@@ -123,7 +144,7 @@ pub enum TaskLoadError {
     },
 
     /// The manifest declares an unsupported schema revision.
-    #[error("unsupported task schema version {found:?}; expected \"1.1\"")]
+    #[error("unsupported task schema version {found:?}; expected \"1.1\" or \"1.3\"")]
     UnsupportedSchema {
         /// Unsupported revision read from the manifest.
         found: String,
@@ -201,7 +222,7 @@ impl Task {
             path: config_path.clone(),
             source,
         })?;
-        if raw.schema_version != "1.1" {
+        if !matches!(raw.schema_version.as_str(), "1.1" | "1.3") {
             return Err(TaskLoadError::UnsupportedSchema {
                 found: raw.schema_version,
             });
@@ -229,6 +250,8 @@ impl Task {
         let image = raw
             .environment
             .docker_image
+            .map(|image| required_string(&config_path, "environment.docker_image", image))
+            .transpose()?
             .unwrap_or_else(|| "local-dockerfile".to_owned());
         let content_digest = package.digest().to_owned().into_boxed_str();
         let task = Self {
@@ -253,7 +276,12 @@ impl Task {
                 environment_mode: raw.verifier.environment_mode,
                 collect: raw.verifier.collect,
             },
-            artifacts: raw.artifacts,
+            artifacts: raw
+                .artifacts
+                .into_iter()
+                .map(|artifact| artifact.validate(&config_path))
+                .collect::<Result<_, _>>()?,
+            output: raw.output,
             resources: Resources {
                 cpus: positive(&config_path, "environment.cpus", raw.environment.cpus)?,
                 memory_mb: positive(
@@ -288,7 +316,9 @@ impl Task {
         &self.root
     }
 
-    pub(crate) fn content_digest(&self) -> &str {
+    /// Returns the canonical digest of every packaged execution input.
+    #[must_use]
+    pub fn content_digest(&self) -> &str {
         &self.content_digest
     }
 
@@ -333,7 +363,17 @@ impl Task {
     /// failed, or the package mutated during the copy.
     #[doc(hidden)]
     pub fn materialize_environment(&self, destination: &Path) -> Result<(), TaskLoadError> {
-        self.materialize_package_directory(Path::new(TASK_ENVIRONMENT), destination)
+        self.materialize_package_directory(Path::new(TASK_ENVIRONMENT), destination)?;
+        let dockerfile = destination.join("Dockerfile");
+        if !dockerfile.exists() && self.image.reference() != "local-dockerfile" {
+            fs::write(&dockerfile, format!("FROM {}\n", self.image.reference())).map_err(
+                |source| TaskLoadError::Fingerprint {
+                    path: dockerfile,
+                    source,
+                },
+            )?;
+        }
+        Ok(())
     }
 
     /// Materializes the verifier tree captured when this task was loaded.
@@ -349,6 +389,16 @@ impl Task {
     #[doc(hidden)]
     pub fn materialize_verifier_files(&self, destination: &Path) -> Result<(), TaskLoadError> {
         self.materialize_package_directory(Path::new("tests"), destination)
+    }
+
+    pub(crate) fn materialize_package(&self, destination: &Path) -> Result<(), TaskLoadError> {
+        self.package
+            .materialize(destination)
+            .map_err(|source| TaskLoadError::Fingerprint {
+                path: self.root.clone(),
+                source,
+            })?;
+        self.validate_package()
     }
 
     /// Reads the verifier script captured when this task was loaded.
@@ -417,8 +467,14 @@ impl Task {
 
     /// Returns task-relative artifact paths requested after verification.
     #[must_use]
-    pub fn artifacts(&self) -> &[PathBuf] {
+    pub fn artifacts(&self) -> &[TaskArtifact] {
         &self.artifacts
+    }
+
+    /// Returns the candidate value consumed by the verifier.
+    #[must_use]
+    pub const fn output(&self) -> TaskOutput {
+        self.output
     }
 
     /// Returns declared resource requirements.
@@ -535,6 +591,26 @@ impl VerifierCollect {
     }
 }
 
+impl TaskArtifact {
+    /// Returns the absolute source path inside the guest.
+    #[must_use]
+    pub fn source(&self) -> &Path {
+        &self.source
+    }
+
+    /// Returns source-relative paths omitted while archiving this artifact.
+    #[must_use]
+    pub fn exclude(&self) -> &[PathBuf] {
+        &self.exclude
+    }
+
+    /// Returns the Compose service that owns the artifact, when declared.
+    #[must_use]
+    pub fn service(&self) -> Option<&str> {
+        self.service.as_deref()
+    }
+}
+
 impl VerifierEnvironmentMode {
     /// Returns the stable manifest and artifact spelling.
     #[must_use]
@@ -550,13 +626,85 @@ impl VerifierEnvironmentMode {
 struct RawTask {
     schema_version: String,
     #[serde(default)]
-    artifacts: Vec<PathBuf>,
+    artifacts: Vec<RawTaskArtifact>,
+    #[serde(default)]
+    output: TaskOutput,
     task: RawTaskInfo,
     #[serde(default)]
     metadata: RawMetadata,
     agent: RawPhase,
     verifier: RawVerifier,
     environment: RawEnvironment,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawTaskArtifact {
+    Path(PathBuf),
+    Detailed {
+        source: PathBuf,
+        #[serde(default)]
+        exclude: Vec<PathBuf>,
+        #[serde(default)]
+        service: Option<String>,
+    },
+}
+
+impl RawTaskArtifact {
+    fn validate(self, config: &Path) -> Result<TaskArtifact, TaskLoadError> {
+        let (source, exclude, service) = match self {
+            Self::Path(source) => (source, Vec::new(), None),
+            Self::Detailed {
+                source,
+                exclude,
+                service,
+            } => (source, exclude, service),
+        };
+        if !safe_absolute_guest_path(&source) {
+            return Err(TaskLoadError::Invalid {
+                path: config.to_path_buf(),
+                message: format!(
+                    "artifact source must be a safe absolute guest path: {}",
+                    source.display()
+                ),
+            });
+        }
+        for path in &exclude {
+            if path.as_os_str().is_empty()
+                || path.is_absolute()
+                || path
+                    .components()
+                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            {
+                return Err(TaskLoadError::Invalid {
+                    path: config.to_path_buf(),
+                    message: format!(
+                        "artifact exclusion must be a safe source-relative path: {}",
+                        path.display()
+                    ),
+                });
+            }
+        }
+        let service = service
+            .map(|service| required_string(config, "artifacts.service", service))
+            .transpose()?
+            .map(String::into_boxed_str);
+        Ok(TaskArtifact {
+            source,
+            exclude,
+            service,
+        })
+    }
+}
+
+fn safe_absolute_guest_path(path: &Path) -> bool {
+    path.is_absolute()
+        && path.strip_prefix("/").is_ok_and(|relative| {
+            !relative.as_os_str().is_empty()
+                && relative
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_)))
+        })
 }
 
 #[derive(Default, Deserialize)]
@@ -797,6 +945,12 @@ MODE = "test"
         assert_eq!(task.environment()["MODE"], "test");
         assert_eq!(task.verifier().environment()["ANSWER"], "42");
         assert!(task.requires_compose());
+        let materialized = tempdir().unwrap();
+        task.materialize_environment(materialized.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(materialized.path().join("Dockerfile")).unwrap(),
+            "FROM example/task:20251031\n"
+        );
     }
 
     #[test]
@@ -949,7 +1103,10 @@ storage_mb = 10240
             task.verifier().environment_mode(),
             VerifierEnvironmentMode::Separate
         );
-        assert_eq!(task.artifacts(), [PathBuf::from("/app/output.txt")]);
+        assert_eq!(
+            task.artifacts()[0].source(),
+            PathBuf::from("/app/output.txt")
+        );
         assert_eq!(
             task.verifier().collect()[0].command(),
             "cp /app/output.txt /tmp/output.txt"

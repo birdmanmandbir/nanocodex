@@ -117,8 +117,7 @@ async fn resolve_vm_guest_runtime_source(prebuilt: Option<&Path>) -> Result<Sour
         .and_then(Path::parent)
         .ok_or_else(|| eyre!("nanocodex binary crate is not inside its Cargo workspace"))?;
     validate_vm_guest_source_identity(workspace).await?;
-    let runtime = workspace
-        .join("target")
+    let runtime = cargo_target_directory(workspace)
         .join(VM_GUEST_TARGET)
         .join("debug/nanocodex-vm-guest");
     let build_status = if vm_guest_runtime_is_fresh(workspace, &runtime)? {
@@ -149,6 +148,27 @@ async fn resolve_vm_guest_runtime_source(prebuilt: Option<&Path>) -> Result<Sour
         build_status,
         source: "host_commit_source",
     })
+}
+
+fn cargo_target_directory(workspace: &Path) -> PathBuf {
+    resolve_cargo_target_directory(workspace, std::env::var_os("CARGO_TARGET_DIR").as_deref())
+}
+
+pub(super) fn resolve_cargo_target_directory(
+    workspace: &Path,
+    configured: Option<&std::ffi::OsStr>,
+) -> PathBuf {
+    configured.map_or_else(
+        || workspace.join("target"),
+        |configured| {
+            let configured = Path::new(configured);
+            if configured.is_absolute() {
+                configured.to_path_buf()
+            } else {
+                workspace.join(configured)
+            }
+        },
+    )
 }
 
 fn prepare_new_guest_runtime(

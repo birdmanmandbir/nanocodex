@@ -60,7 +60,7 @@ pub use nanocodex_vm::{
 
 use crate::{
     CleanupPhase, CodexExec, EvalEnvironment, Evaluator, EvaluatorBuilder, NetworkPolicy, Task,
-    TaskLoadError, VerifierEnvironmentMode, VerifierResult,
+    TaskLoadError, TaskOutput, VerifierEnvironmentMode, VerifierResult,
     evaluator::{
         AttemptAgent, AttemptVerification, AttemptVerificationFailure, AttemptVerifier, EvalAttempt,
     },
@@ -1162,6 +1162,8 @@ pub struct VmBackend {
     retain_failed_rootfs: bool,
     web_search: bool,
     shared_directories: Arc<[SharedDirectory]>,
+    verifier_environment: Arc<BTreeMap<String, String>>,
+    additional_agent_tools: Option<Tools>,
 }
 
 /// Deliberate policy for a [`VmBackend`].
@@ -1170,6 +1172,8 @@ pub struct VmBackendBuilder {
     retain_failed_rootfs: bool,
     web_search: bool,
     shared_directories: Vec<SharedDirectory>,
+    verifier_environment: BTreeMap<String, String>,
+    additional_agent_tools: Option<Tools>,
 }
 
 impl Default for VmBackendBuilder {
@@ -1179,6 +1183,8 @@ impl Default for VmBackendBuilder {
             retain_failed_rootfs: true,
             web_search: false,
             shared_directories: Vec::new(),
+            verifier_environment: BTreeMap::new(),
+            additional_agent_tools: None,
         }
     }
 }
@@ -1269,6 +1275,8 @@ impl VmBackend {
                 retain_failed_rootfs: self.retain_failed_rootfs,
                 web_search: self.web_search,
                 shared_directories: &self.shared_directories,
+                verifier_environment: &self.verifier_environment,
+                additional_agent_tools: self.additional_agent_tools.as_ref(),
             },
             attempt,
         )
@@ -1310,6 +1318,32 @@ impl VmBackendBuilder {
         self
     }
 
+    /// Adds runtime-only environment values to canonical verifier commands.
+    ///
+    /// These values are not part of task packages or retained import
+    /// manifests. Callers should bind an independent configuration digest into
+    /// their durable run identity when values can affect scoring.
+    #[must_use]
+    pub fn verifier_environment(
+        mut self,
+        environment: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        self.verifier_environment.extend(environment);
+        self
+    }
+
+    /// Composes caller-selected non-workspace tools into every VM attempt.
+    ///
+    /// The backend always replaces host workspace tools with the isolated
+    /// guest implementations. Dynamic providers such as MCP remain attached,
+    /// so benchmark capabilities are selected by the caller rather than by VM
+    /// or task-specific policy.
+    #[must_use]
+    pub fn additional_agent_tools(mut self, tools: Tools) -> Self {
+        self.additional_agent_tools = Some(tools);
+        self
+    }
+
     /// Builds a cloneable backend handle.
     #[must_use]
     pub fn build(self) -> VmBackend {
@@ -1319,6 +1353,8 @@ impl VmBackendBuilder {
             retain_failed_rootfs: self.retain_failed_rootfs,
             web_search: self.web_search,
             shared_directories: self.shared_directories.into(),
+            verifier_environment: Arc::new(self.verifier_environment),
+            additional_agent_tools: self.additional_agent_tools,
         }
     }
 }
@@ -1395,6 +1431,8 @@ struct VmAttemptHost<'a> {
     retain_failed_rootfs: bool,
     web_search: bool,
     shared_directories: &'a [SharedDirectory],
+    verifier_environment: &'a BTreeMap<String, String>,
+    additional_agent_tools: Option<&'a Tools>,
 }
 
 struct AttemptGvproxy {
@@ -1737,6 +1775,8 @@ struct VmVerifier {
     root_disks_finalized: bool,
     memory: VmAttemptMemory,
     _network: Option<AttemptGvproxy>,
+    _verifier_network: Option<AttemptGvproxy>,
+    verifier_environment: BTreeMap<String, String>,
 }
 
 struct VmAttemptSetupGuard {
@@ -1878,8 +1918,22 @@ fn vm_attempt_inner(
             .map(|network| network.socket().to_path_buf()),
         shared_directories: host.shared_directories.to_vec(),
     };
-    let separate_launch =
-        prepare_separate_verifier_launch(environment, &launch, host, attempt, root_policy)?;
+    let verifier_network = if environment.verifier.is_some() {
+        spawn_attempt_network(
+            attempt.task().network(),
+            host.gvproxy,
+            &attempt.directory().join("verifier-vm").join("gvproxy.log"),
+        )?
+    } else {
+        None
+    };
+    let separate_launch = prepare_separate_verifier_launch(
+        environment,
+        host,
+        attempt,
+        root_policy,
+        verifier_network.as_ref(),
+    )?;
     if let Some(separate) = &separate_launch
         && let Some(disk) = separate.root.writable_disk()
     {
@@ -1897,7 +1951,10 @@ fn vm_attempt_inner(
     let session = launch.spawn(attempt_cache.as_ref(), VmProcessGroup::Isolated)?;
     let memory = VmAttemptMemory::default();
     let vm = session.tools();
-    let tools = Tools::builder()
+    let tools = host
+        .additional_agent_tools
+        .cloned()
+        .map_or_else(Tools::builder, Tools::into_builder)
         .without_defaults()
         .web_search(host.web_search)
         .image_generation(true)
@@ -1921,6 +1978,8 @@ fn vm_attempt_inner(
         root_disks_finalized: false,
         memory,
         _network: network,
+        _verifier_network: verifier_network,
+        verifier_environment: host.verifier_environment.clone(),
     };
     setup_guard.disarm();
     Ok(VmAttempt {
@@ -2042,10 +2101,10 @@ fn materialize_attempt_root(
 
 fn prepare_separate_verifier_launch(
     environment: &VmEnvironment,
-    agent: &VmLaunch,
     host: VmAttemptHost<'_>,
     attempt: EvalAttempt<'_>,
     root_policy: AttemptRootPolicy,
+    network: Option<&AttemptGvproxy>,
 ) -> Result<Option<VmLaunch>, VmAttemptError> {
     environment
         .verifier
@@ -2069,9 +2128,10 @@ fn prepare_separate_verifier_launch(
                     attempt.task().resources().memory_mb,
                     host.max_guest_memory_mb,
                 ),
-                resolver_configuration: agent.resolver_configuration.clone(),
+                resolver_configuration: network
+                    .map_or_else(String::new, |_| GUEST_PUBLIC_RESOLV_CONF.to_owned()),
                 environment: verifier.environment.clone(),
-                network_socket: agent.network_socket.clone(),
+                network_socket: network.map(|network| network.socket().to_path_buf()),
                 shared_directories: Vec::new(),
             })
         })
@@ -2590,6 +2650,41 @@ fn verifier_bootstrap_network_failed(output: &VmCommandOutput) -> bool {
     apt_bootstrap_failed || dependency_runner_missing && network_failed
 }
 
+async fn read_verifier_rewards(
+    session: &VmToolSession,
+) -> Result<(&'static str, Vec<u8>, BTreeMap<String, f64>), VmAttemptError> {
+    if let Ok(bytes) = session.read_file("/logs/verifier/reward.json").await {
+        let rewards = serde_json::from_slice::<BTreeMap<String, f64>>(&bytes).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid verifier reward.json: {error}"),
+            )
+        })?;
+        validate_verifier_rewards(&rewards)?;
+        return Ok(("reward.json", bytes, rewards));
+    }
+    let bytes = session.read_file("/logs/verifier/reward.txt").await?;
+    let reward = String::from_utf8_lossy(&bytes).trim().parse::<f64>()?;
+    let rewards = BTreeMap::from([("reward".to_owned(), reward)]);
+    validate_verifier_rewards(&rewards)?;
+    Ok(("reward.txt", bytes, rewards))
+}
+
+fn validate_verifier_rewards(rewards: &BTreeMap<String, f64>) -> Result<(), VmAttemptError> {
+    if rewards.is_empty()
+        || rewards
+            .iter()
+            .any(|(name, reward)| name.trim().is_empty() || !reward.is_finite())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "verifier rewards must contain non-empty names and finite numeric values",
+        )
+        .into());
+    }
+    Ok(())
+}
+
 impl AttemptVerifier for VmVerifier {
     fn verify<'a>(
         &'a mut self,
@@ -2644,13 +2739,19 @@ impl VmVerifier {
             .arg("-C")
             .arg("/")
             .arg("-cf")
-            .arg("/tmp/nanoeval-artifacts.tar")
-            .arg("--");
+            .arg("/tmp/nanoeval-artifacts.tar");
         for artifact in task.artifacts() {
-            let relative = artifact.strip_prefix("/").map_err(|_| {
+            if let Some(service) = artifact.service() {
+                return Err(io::Error::other(format!(
+                    "artifact {} belongs to unsupported service {service:?}",
+                    artifact.source().display()
+                ))
+                .into());
+            }
+            let relative = artifact.source().strip_prefix("/").map_err(|_| {
                 io::Error::other(format!(
                     "artifact path must be absolute: {}",
-                    artifact.display()
+                    artifact.source().display()
                 ))
             })?;
             if relative.as_os_str().is_empty()
@@ -2660,17 +2761,29 @@ impl VmVerifier {
             {
                 return Err(io::Error::other(format!(
                     "artifact path is not a safe guest path: {}",
-                    artifact.display()
+                    artifact.source().display()
                 ))
                 .into());
             }
+            for excluded in artifact.exclude() {
+                command = command.arg(format!("--exclude={}", relative.join(excluded).display()));
+            }
+        }
+        command = command.arg("--");
+        for artifact in task.artifacts() {
+            let relative = artifact.source().strip_prefix("/").map_err(|_| {
+                io::Error::other(format!(
+                    "artifact path must be absolute: {}",
+                    artifact.source().display()
+                ))
+            })?;
             command = command.arg(
                 relative
                     .to_str()
                     .ok_or_else(|| {
                         io::Error::other(format!(
                             "artifact path is not UTF-8: {}",
-                            artifact.display()
+                            artifact.source().display()
                         ))
                     })?
                     .to_owned(),
@@ -2749,8 +2862,23 @@ impl VmVerifier {
                 cleanup,
             ));
         }
-        let (verifier_launch, verifier_session) = self.start_verifier_session(task).await?;
+        let (verifier_launch, verifier_session) = self
+            .start_verifier_session(task, attempt.trajectory())
+            .await?;
         let verification = async {
+            if task.output() == TaskOutput::FinalMessage {
+                verifier_session
+                    .write_file(
+                        format!("{}/answer.txt", verifier_launch.workspace),
+                        attempt
+                            .final_message()
+                            .unwrap_or_default()
+                            .as_bytes()
+                            .to_vec(),
+                        0o600,
+                    )
+                    .await?;
+            }
             let command =
                 self.verifier_command(task, &verifier_launch, self.attempt_cache.as_ref())?;
             let (output, verifier_timed_out) = self
@@ -2764,14 +2892,26 @@ impl VmVerifier {
                 (false, false) => format!("{stdout}\n{stderr}"),
             };
             fs::write(verifier_directory.join("test-stdout.txt"), combined)?;
-            let reward_bytes = if verifier_timed_out {
-                b"0\n".to_vec()
+            let (reward_name, reward_bytes, rewards) = if verifier_timed_out {
+                (
+                    "reward.txt",
+                    b"0\n".to_vec(),
+                    BTreeMap::from([("reward".to_owned(), 0.0)]),
+                )
             } else {
-                verifier_session
-                    .read_file("/logs/verifier/reward.txt")
-                    .await?
+                match read_verifier_rewards(&verifier_session).await {
+                    Ok(reward) => reward,
+                    Err(error) if output.exit_code != 0 => {
+                        return Err(io::Error::other(format!(
+                            "verifier exited {} without producing a readable reward: {error}",
+                            output.exit_code
+                        ))
+                        .into());
+                    }
+                    Err(error) => return Err(error),
+                }
             };
-            fs::write(verifier_directory.join("reward.txt"), &reward_bytes)?;
+            fs::write(verifier_directory.join(reward_name), &reward_bytes)?;
             if let Ok(ctrf) = verifier_session.read_file("/logs/verifier/ctrf.json").await {
                 fs::write(verifier_directory.join("ctrf.json"), ctrf)?;
             }
@@ -2779,11 +2919,8 @@ impl VmVerifier {
             if let Ok(answer) = verifier_session.read_file(answer_path).await {
                 fs::write(attempt.workspace().join("answer.txt"), answer)?;
             }
-            let reward = String::from_utf8_lossy(&reward_bytes)
-                .trim()
-                .parse::<f64>()?;
             task.validate_package()?;
-            Ok::<_, VmAttemptError>((output, stdout, stderr, reward))
+            Ok::<_, VmAttemptError>((output, stdout, stderr, rewards))
         }
         .await;
         let verification_error_at = verification.as_ref().err().map(|_| Utc::now());
@@ -2791,7 +2928,7 @@ impl VmVerifier {
         self.observe_session(&verifier_session).await;
         let shutdown = verifier_session.shutdown().await;
         self.observe_session(&verifier_session).await;
-        let (output, stdout, stderr, reward) = match verification {
+        let (output, stdout, stderr, rewards) = match verification {
             Ok(verification) => verification,
             Err(primary) => {
                 let cleanup = self.cleanup_after_shutdown(cleanup_started, shutdown, false);
@@ -2805,7 +2942,8 @@ impl VmVerifier {
         let cleanup = match shutdown {
             Ok(()) => {
                 let cache_cleanup = self.finish_verifier_cache();
-                let disk_cleanup = self.remove_disposable_root_disks(reward > 0.0);
+                let disk_cleanup =
+                    self.remove_disposable_root_disks(rewards.values().all(|reward| *reward > 0.0));
                 match cache_cleanup.and(disk_cleanup) {
                     Ok(()) => CleanupPhase::completed(cleanup_started),
                     Err(error) => CleanupPhase::failed(cleanup_started, &error),
@@ -2820,7 +2958,9 @@ impl VmVerifier {
                         "verifier cache cleanup also failed after VM shutdown failure"
                     );
                 }
-                if let Err(disk_error) = self.remove_disposable_root_disks(reward > 0.0) {
+                if let Err(disk_error) =
+                    self.remove_disposable_root_disks(rewards.values().all(|reward| *reward > 0.0))
+                {
                     warn!(
                         target: "nanocodex_eval",
                         error = %disk_error,
@@ -2834,7 +2974,7 @@ impl VmVerifier {
         Ok(AttemptVerification {
             result: VerifierResult {
                 exit_code: output.exit_code,
-                rewards: BTreeMap::from([("reward".to_owned(), reward)]),
+                rewards,
             },
             stdout,
             stderr,
@@ -2845,6 +2985,7 @@ impl VmVerifier {
     async fn start_verifier_session(
         &mut self,
         task: &Task,
+        trajectory: Option<&[u8]>,
     ) -> Result<(VmLaunch, VmToolSession), AttemptVerificationFailure> {
         let Some(agent_session) = self.agent_session.take() else {
             return Err(AttemptVerificationFailure::new(
@@ -2860,6 +3001,26 @@ impl VmVerifier {
                 occurred_at,
                 cleanup,
             ));
+        }
+        if let Some(trajectory) = trajectory {
+            let setup = async {
+                agent_session
+                    .create_directory("/logs/agent", 0o755, None)
+                    .await?;
+                agent_session
+                    .write_file("/logs/agent/trajectory.json", trajectory.to_vec(), 0o600)
+                    .await
+            }
+            .await;
+            if let Err(primary) = setup {
+                let occurred_at = Utc::now();
+                let cleanup = self.cleanup_session(Some(&agent_session)).await;
+                return Err(AttemptVerificationFailure::observed_at(
+                    primary,
+                    occurred_at,
+                    cleanup,
+                ));
+            }
         }
         let launch = self
             .separate_launch
@@ -2931,30 +3092,12 @@ impl VmVerifier {
             }
             session
         } else {
-            let setup = async {
-                let tests = tempfile::tempdir()?;
-                task.materialize_verifier_files(tests.path())?;
-                Self::copy_directory(
-                    &agent_session,
-                    tests.path(),
-                    tests.path(),
-                    Path::new("/tests"),
-                )
-                .await
-            }
-            .await;
-            if let Err(primary) = setup {
-                let occurred_at = Utc::now();
-                let cleanup = self.cleanup_session(Some(&agent_session)).await;
-                return Err(AttemptVerificationFailure::observed_at(
-                    primary,
-                    occurred_at,
-                    cleanup,
-                ));
-            }
             agent_session
         };
         let setup = async {
+            let tests = tempfile::tempdir()?;
+            task.materialize_verifier_files(tests.path())?;
+            Self::copy_directory(&session, tests.path(), tests.path(), Path::new("/tests")).await?;
             session
                 .write_file("/logs/verifier/.nanoeval", Vec::new(), 0o600)
                 .await?;
@@ -3225,9 +3368,11 @@ impl VmVerifier {
         } else {
             VmCommand::new(verifier_shell(&launch.shell, skip_setup)).arg("/tests/test.sh")
         };
+        let mut environment = base_guest_environment(task, &launch.workspace);
+        environment.extend(self.verifier_environment.clone());
         command = command
             .current_directory(&launch.workspace)
-            .environment(base_guest_environment(task, &launch.workspace))
+            .environment(environment)
             .timeout(task.verifier().timeout());
         Ok(command)
     }

@@ -9,6 +9,7 @@ members = [
     "crates/experimental/nanocodex-egress",
     "crates/experimental/nanocodex-voice",
     "crates/experimental/nanocodex-eval",
+    "crates/experimental/nanocodex-eval-adapters",
     "crates/experimental/nanocodex-vm",
     "crates/nanocodex-oai-api",
     "crates/nanocodex-observability",
@@ -41,6 +42,7 @@ publish = true
 alloy = { version = "2.1.0", default-features = false, features = ["contract", "provider-http", "reqwest", "rpc-types", "sol-types", "std"] }
 arboard = "3"
 base64 = "0.22.1"
+csv = "1.4.0"
 async-trait = "=0.1.89"
 alloy-primitives = { version = "1.6.1", default-features = false, features = ["std"] }
 arcbox-ext4 = "0.1.2"
@@ -74,6 +76,7 @@ nanocodex-browser = { version = "0.3.0", path = "crates/experimental/nanocodex-b
 nanocodex-egress = { version = "0.3.0", path = "crates/experimental/nanocodex-egress" }
 nanocodex-voice = { version = "0.3.0", path = "crates/experimental/nanocodex-voice" }
 nanocodex-eval = { version = "0.3.0", path = "crates/experimental/nanocodex-eval" }
+nanocodex-eval-adapters = { version = "0.3.0", path = "crates/experimental/nanocodex-eval-adapters" }
 nanocodex-vm = { version = "0.3.0", path = "crates/experimental/nanocodex-vm" }
 nanocodex-oai-api = { version = "0.3.0", path = "crates/nanocodex-oai-api" }
 nanocodex-observability = { version = "0.3.0", path = "crates/nanocodex-observability" }
@@ -117,6 +120,7 @@ self-replace = "1.5.0"
 semver = "1.0.27"
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = { version = "1.0.149", features = ["raw_value"] }
+serde_yaml_ng = "0.10.0"
 sha1 = "0.11.0"
 sha2 = { version = "0.11.0", default-features = false }
 shlex = "2.0.1"

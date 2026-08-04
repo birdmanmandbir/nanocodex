@@ -474,6 +474,8 @@ fn verifier_with_launch_root(root: VmLaunchRoot, retain_failed_rootfs: bool) -> 
         root_disks_finalized: false,
         memory: VmAttemptMemory::default(),
         _network: None,
+        _verifier_network: None,
+        verifier_environment: BTreeMap::new(),
     }
 }
 
@@ -785,9 +787,14 @@ done
         root_disks_finalized: false,
         memory: VmAttemptMemory::default(),
         _network: None,
+        _verifier_network: None,
+        verifier_environment: BTreeMap::new(),
     };
 
-    let (_, session) = verifier.start_verifier_session(&task).await.unwrap();
+    let (_, session) = verifier
+        .start_verifier_session(&task, Some(br#"{"schema_version":"ATIF-v1.7"}"#))
+        .await
+        .unwrap();
     session.shutdown().await.unwrap();
 
     let requests = fs::read_to_string(journal)
@@ -802,6 +809,10 @@ done
             .any(|request| request["kind"] == "write_file"),
         "verifier staging must continue in the same guest after process cleanup"
     );
+    assert!(requests.iter().any(|request| {
+        request["kind"] == "write_file"
+            && request["payload"]["path"] == "/logs/agent/trajectory.json"
+    }));
 }
 
 #[test]
