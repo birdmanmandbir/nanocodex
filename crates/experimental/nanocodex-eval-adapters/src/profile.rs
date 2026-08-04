@@ -10,8 +10,8 @@ use nanocodex_eval::{
     import::{Environment, Harness, ImportError, ImportStore, ImportedDataset},
     profile::{
         BenchmarkSelection, LoadedManifest, PreparationError, PreparationReceipt, PreparationStore,
-        PreparedTask, ProfileError, PublishedPreparation, ResolvedProfile, TaskPreparation,
-        TaskPreparer,
+        PreparedTask, ProfileError, ProfileRunRequest, ProfileRunner, PublishedPreparation,
+        ResolvedProfile, TaskPreparation, TaskPreparer,
     },
 };
 use serde::Deserialize;
@@ -256,6 +256,22 @@ impl<P: TaskPreparer> EvaluationWorkspace<P> {
             )));
         }
         Ok(PreparedEvaluation { receipt, published })
+    }
+}
+
+impl<P: ProfileRunner + TaskPreparer> EvaluationWorkspace<P> {
+    /// Opens the mandatory preparation and executes or resumes its full matrix.
+    pub async fn run(self, profile: Option<&str>) -> Result<P::Output, ProfileImportError> {
+        let prepared = self.prepared(profile)?;
+        let profile = prepared.receipt.profile().to_owned();
+        self.preparer
+            .run(ProfileRunRequest::new(
+                prepared.receipt,
+                self.state_directory.join("runs").join(profile),
+                self.state_directory.join("vm"),
+            ))
+            .await
+            .map_err(|source| ProfileImportError::RuntimePreparation(Box::new(source)))
     }
 }
 
@@ -615,6 +631,7 @@ mod tests {
     struct RecordingPreparer {
         tasks: Arc<Mutex<Vec<String>>>,
         cache: Arc<Mutex<Option<PathBuf>>>,
+        run_output: Arc<Mutex<Option<PathBuf>>>,
     }
 
     impl TaskPreparer for RecordingPreparer {
@@ -636,6 +653,23 @@ mod tests {
                 *recorded_tasks.lock().unwrap() = tasks;
                 *recorded_cache.lock().unwrap() = Some(cache);
                 Ok(())
+            }
+        }
+    }
+
+    impl ProfileRunner for RecordingPreparer {
+        type Error = Infallible;
+        type Output = String;
+
+        fn run(
+            self,
+            request: ProfileRunRequest,
+        ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
+            let profile = request.receipt().profile().to_owned();
+            let output = request.output_directory().to_path_buf();
+            async move {
+                *self.run_output.lock().unwrap() = Some(output);
+                Ok(profile)
             }
         }
     }
@@ -828,6 +862,17 @@ thinking = ["low"]
         assert_eq!(
             workspace.prepared(None).unwrap().published(),
             prepared.published()
+        );
+        let runner = EvaluationWorkspace::builder()
+            .manifest(&manifest)
+            .state_directory(&state)
+            .task_preparer(observation.clone())
+            .build()
+            .unwrap();
+        assert_eq!(runner.run(None).await.unwrap(), "adapter-smoke");
+        assert_eq!(
+            observation.run_output.lock().unwrap().as_deref(),
+            Some(state.join("runs/adapter-smoke").as_path())
         );
 
         fs::write(

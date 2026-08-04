@@ -14,10 +14,11 @@ use std::{
 
 use clap::{Args, Subcommand};
 use eyre::Result;
+use nanocodex::Thinking;
 use nanocodex_eval::{
     Task, TaskArtifact, VerifierCollect, VerifierEnvironmentMode,
-    profile::{TaskPreparation, TaskPreparer},
-    vm::{CachePolicy, VmTaskPreparer},
+    profile::{ProfileRunRequest, ProfileRunner, TaskPreparation, TaskPreparer},
+    vm::{CachePolicy, VmProfileRunResult, VmProfileRunner, VmTaskPreparer},
 };
 use serde::Serialize;
 
@@ -35,6 +36,9 @@ pub(crate) struct Eval {
 enum EvalCommand {
     /// Resolve a profile and prepare all imports, images, and execution inputs.
     Prepare(profile::Prepare),
+
+    /// Execute or resume a profile after its mandatory preparation.
+    Run(profile::Run),
 
     /// Prepare task VM images directly without resolving an evaluation profile.
     PrepareImages(PrepareImages),
@@ -93,15 +97,25 @@ struct PrepareImages {
     refresh: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Default)]
 struct NativeEvaluationRuntime {
     cache: Option<PathBuf>,
     refresh: bool,
+    agent: Option<crate::config::EvalAgentArgs>,
 }
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 struct NativeTaskPreparationError(String);
+
+impl NativeEvaluationRuntime {
+    fn for_run(agent: crate::config::EvalAgentArgs) -> Self {
+        Self {
+            agent: Some(agent),
+            ..Self::default()
+        }
+    }
+}
 
 impl TaskPreparer for NativeEvaluationRuntime {
     type Error = NativeTaskPreparationError;
@@ -138,6 +152,39 @@ impl TaskPreparer for NativeEvaluationRuntime {
     }
 }
 
+impl ProfileRunner for NativeEvaluationRuntime {
+    type Error = NativeTaskPreparationError;
+    type Output = VmProfileRunResult;
+
+    async fn run(self, request: ProfileRunRequest) -> Result<Self::Output, Self::Error> {
+        let agent = self.agent.ok_or_else(|| {
+            NativeTaskPreparationError("profile runner has no agent configuration".to_owned())
+        })?;
+        let configured = agent
+            .builder(Thinking::default(), request.receipt().web_search())
+            .map_err(|error| NativeTaskPreparationError(format!("{error:#}")))?;
+        let vmm = std::env::current_exe()
+            .map_err(|error| NativeTaskPreparationError(error.to_string()))?;
+        let runtime = run::prepare_vm_guest_runtime_from(None, request.cache_directory())
+            .await
+            .map_err(|error| NativeTaskPreparationError(format!("{error:#}")))?;
+        let (concurrency, max_memory_mb) = run::automatic_scheduling_defaults(95);
+        let verifier_environment = std::env::var("OPENAI_API_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| BTreeMap::from([("OPENAI_API_KEY".to_owned(), value)]))
+            .unwrap_or_default();
+        VmProfileRunner::new(vmm, runtime, configured.builder)
+            .additional_tools(configured.additional_tools)
+            .verifier_environment(verifier_environment)
+            .max_concurrency(usize::from(concurrency))
+            .max_memory_mb(max_memory_mb)
+            .run(request)
+            .await
+            .map_err(|error| NativeTaskPreparationError(error.to_string()))
+    }
+}
+
 impl Eval {
     pub(crate) async fn run(self) -> Result<()> {
         enable_paint();
@@ -155,6 +202,7 @@ async fn run(eval: Eval) -> Result<()> {
     match command {
         None => run.run().await?,
         Some(EvalCommand::Prepare(command)) => command.run().await?,
+        Some(EvalCommand::Run(command)) => command.run().await?,
         Some(EvalCommand::PrepareImages(PrepareImages {
             tasks,
             suites,
@@ -168,6 +216,7 @@ async fn run(eval: Eval) -> Result<()> {
             NativeEvaluationRuntime {
                 cache: Some(cache.clone()),
                 refresh,
+                agent: None,
             }
             .prepare(TaskPreparation::new(tasks, cache))
             .await?;

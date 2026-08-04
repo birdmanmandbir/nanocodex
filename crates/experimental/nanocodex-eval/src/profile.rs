@@ -14,6 +14,7 @@ use std::{
     str::FromStr as _,
 };
 
+use nanocodex_agent::NanocodexBuilder;
 use nanocodex_oai_api::{Model, Thinking};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest as _, Sha256};
@@ -169,6 +170,53 @@ pub struct TaskPreparation {
     cache_directory: PathBuf,
 }
 
+/// Complete execution request for one validated preparation receipt.
+pub struct ProfileRunRequest {
+    receipt: PreparationReceipt,
+    output_directory: PathBuf,
+    cache_directory: PathBuf,
+}
+
+/// Runtime boundary that executes one prepared profile.
+pub trait ProfileRunner: Sized {
+    /// Concrete execution failure.
+    type Error: Error + Send + Sync + 'static;
+    /// Typed completed-run result.
+    type Output;
+
+    /// Executes or resumes the complete prepared matrix.
+    fn run(
+        self,
+        request: ProfileRunRequest,
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send;
+}
+
+/// Validated Nanocodex-only task/model/thinking sweep derived from a receipt.
+pub struct NanocodexRunPlan {
+    tasks: Vec<crate::Task>,
+    sweep: crate::Sweep,
+}
+
+/// A preparation receipt could not become an executable Nanocodex sweep.
+#[derive(Debug, thiserror::Error)]
+pub enum ProfileRunPlanError {
+    /// Additional CLI harness treatments need their installed driver.
+    #[error("profile selects CLI harnesses that are not installed in the Nanocodex runner: {0}")]
+    UnsupportedHarnesses(String),
+    /// A retained normalized task no longer loads.
+    #[error(transparent)]
+    Task(#[from] crate::TaskLoadError),
+    /// A retained model or thinking value is invalid.
+    #[error("invalid retained profile value: {0}")]
+    Invalid(String),
+    /// An agent coordinate identity was invalid.
+    #[error(transparent)]
+    Agent(#[from] crate::AgentIdError),
+    /// The task × agent × trial sweep was invalid.
+    #[error(transparent)]
+    Sweep(#[from] crate::SweepError),
+}
+
 /// Runtime boundary that prepares every normalized task before a receipt is published.
 pub trait TaskPreparer {
     /// Concrete preparation failure.
@@ -200,6 +248,50 @@ impl TaskPreparation {
     #[must_use]
     pub fn into_tasks(self) -> Vec<crate::Task> {
         self.tasks
+    }
+}
+
+impl ProfileRunRequest {
+    /// Binds one receipt to workspace-owned run and cache directories.
+    #[must_use]
+    pub fn new(
+        receipt: PreparationReceipt,
+        output_directory: impl Into<PathBuf>,
+        cache_directory: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            receipt,
+            output_directory: output_directory.into(),
+            cache_directory: cache_directory.into(),
+        }
+    }
+
+    /// Validated immutable preparation receipt.
+    pub const fn receipt(&self) -> &PreparationReceipt {
+        &self.receipt
+    }
+
+    /// Parent for durable resumable evaluator jobs.
+    pub fn output_directory(&self) -> &Path {
+        &self.output_directory
+    }
+
+    /// Content-addressed VM cache shared with preparation.
+    pub fn cache_directory(&self) -> &Path {
+        &self.cache_directory
+    }
+}
+
+impl NanocodexRunPlan {
+    /// Prepared normalized tasks in deterministic order.
+    pub fn tasks(&self) -> &[crate::Task] {
+        &self.tasks
+    }
+
+    /// Consumes the plan into its finite sweep.
+    #[must_use]
+    pub fn into_sweep(self) -> crate::Sweep {
+        self.sweep
     }
 }
 
@@ -624,6 +716,45 @@ impl PreparationReceipt {
     pub const fn web_search(&self) -> bool {
         self.web_search
     }
+
+    /// Builds the exact Nanocodex task/model/thinking/trial sweep in this receipt.
+    pub fn nanocodex_plan(
+        &self,
+        base: &NanocodexBuilder,
+    ) -> Result<NanocodexRunPlan, ProfileRunPlanError> {
+        if !self.harnesses.is_empty() {
+            return Err(ProfileRunPlanError::UnsupportedHarnesses(
+                self.harnesses
+                    .iter()
+                    .map(|harness| harness.name().to_owned())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ));
+        }
+        let tasks = self
+            .tasks
+            .iter()
+            .map(|prepared| crate::Task::load(prepared.root()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut sweep = crate::Sweep::builder()
+            .tasks(tasks.clone())
+            .trials(self.trials);
+        for model in &self.model {
+            let parsed_model = Model::from_str(model).map_err(ProfileRunPlanError::Invalid)?;
+            for thinking in &self.thinking {
+                let parsed_thinking =
+                    Thinking::from_str(thinking).map_err(ProfileRunPlanError::Invalid)?;
+                sweep = sweep.agent(
+                    format!("nanocodex.{model}.{thinking}"),
+                    base.clone().model(parsed_model).thinking(parsed_thinking),
+                )?;
+            }
+        }
+        Ok(NanocodexRunPlan {
+            tasks,
+            sweep: sweep.build()?,
+        })
+    }
 }
 
 impl PreparedHarness {
@@ -904,6 +1035,8 @@ fn validate_storage_name(kind: &str, name: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use nanocodex_agent::{Nanocodex, OpenAi};
+
     use super::*;
 
     #[derive(Clone, Debug, Deserialize)]
@@ -1040,8 +1173,8 @@ allow_internet = false
             }],
             selections: BTreeMap::new(),
             trials: 1,
-            models: vec![Model::Sol],
-            thinking: vec![Thinking::Low],
+            models: vec![Model::Sol, Model::Terra],
+            thinking: vec![Thinking::Low, Thinking::High],
             web_search: false,
         };
         let receipt = PreparationReceipt::new(
@@ -1050,6 +1183,12 @@ allow_internet = false
             vec![PreparedTask::new("fixture/task", &task)],
         )
         .unwrap();
+        let mut nanocodex_receipt = receipt.clone();
+        nanocodex_receipt.harnesses.clear();
+        let plan = nanocodex_receipt
+            .nanocodex_plan(&Nanocodex::builder(OpenAi::new("test-key").unwrap()))
+            .unwrap();
+        assert_eq!(plan.into_sweep().attempt_count(), 4);
         let store = PreparationStore::new(root.path().join("prepared"));
 
         let first = store.publish(&receipt).unwrap();

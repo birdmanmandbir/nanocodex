@@ -334,6 +334,15 @@ deterministic and network-free. Catalog entries are versioned with Nanocodex,
 and a gated dataset fails with an actionable preparation error instead of
 requiring users to restate adapter plumbing in TOML.
 
+Model-based verifiers, including RewardKit-backed judges, use an explicit
+pinned OpenAI grader model and OpenAI API credentials on the verifier side.
+The built-in recipe declares the grader model and required credential names;
+preparation validates availability and binds the non-secret effective grader
+configuration into identity, while execution passes secret values only to the
+isolated verifier process. Candidate agents and additional harness CLIs never
+receive grader credentials, judge responses, or rubric internals. Changing a
+candidate profile's `model` sweep never changes the grader model implicitly.
+
 For custom sources, `[benchmark.<name>].adapter` must deserialize through the
 same closed, typed adapter configuration with unknown fields denied, construct
 the corresponding PR #72 `DatasetImporter`, and pass only its `DatasetPlan` to
@@ -444,6 +453,17 @@ verify the complete local cross-product; `status adapter-smoke --watch` and
 `report adapter-smoke` must work while it runs. The smoke gate tests plumbing
 and evidence completeness, not benchmark quality, so a legitimate verifier
 score of zero may still be an operationally successful smoke result.
+
+Passing the one-case adapter smoke begins, rather than completes, benchmark
+coverage. Milestone two grows every supported benchmark through the same
+profile lifecycle: first a small deterministic slice that is cheap to rerun
+while fixing adapter and grader issues, then a representative subset large
+enough to expose score variance and long-tail runtime behavior, and finally the
+full release matrix wherever the public tasks and authoritative verifier are
+available. Expansion changes only profile selectors or built-in catalog
+revisions; it must not introduce per-benchmark scripts, runner modes, or state
+layouts. Reports label exact task coverage at every stage so partial slices are
+never presented as full-benchmark results.
 
 Every milestone ends with an adversarial durability and optimization gate:
 

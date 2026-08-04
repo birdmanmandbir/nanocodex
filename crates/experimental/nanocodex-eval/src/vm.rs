@@ -10,7 +10,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     ffi::OsStr,
-    fs,
+    fmt, fs,
     future::Future,
     io,
     io::Read as _,
@@ -64,6 +64,8 @@ use crate::{
     evaluator::{
         AttemptAgent, AttemptVerification, AttemptVerificationFailure, AttemptVerifier, EvalAttempt,
     },
+    harbor::{Harbor, HarborError},
+    profile::{ProfileRunPlanError, ProfileRunRequest, ProfileRunner},
 };
 
 const EMBEDDED_GUEST_TOOL_RUNTIME: &str = "/usr/local/bin/nanocodex-vm-guest";
@@ -209,6 +211,42 @@ pub struct VmTaskPreparer {
     runtime_image: PathBuf,
     cache: Option<PathBuf>,
     cache_policy: CachePolicy,
+}
+
+/// Complete VM-backed runner for one prepared Nanocodex profile.
+pub struct VmProfileRunner {
+    vmm: PathBuf,
+    runtime_image: PathBuf,
+    nanocodex: NanocodexBuilder,
+    additional_tools: Option<Tools>,
+    verifier_environment: BTreeMap<String, String>,
+    max_concurrency: usize,
+    max_memory_mb: Option<u64>,
+}
+
+/// Typed summary of one completed or fully resumed profile run.
+#[derive(Clone, Debug)]
+pub struct VmProfileRunResult {
+    job_directory: PathBuf,
+    attempts: usize,
+    skipped: usize,
+}
+
+/// VM-backed profile execution failed.
+#[derive(Debug, thiserror::Error)]
+pub enum VmProfileRunError {
+    /// The preparation receipt could not become a finite sweep.
+    #[error(transparent)]
+    Plan(#[from] ProfileRunPlanError),
+    /// VM images, caches, or backend configuration failed.
+    #[error(transparent)]
+    Vm(#[from] VmResourcesError),
+    /// Evaluator construction or execution failed.
+    #[error(transparent)]
+    Eval(#[from] crate::EvalError),
+    /// Harbor-compatible evidence recording failed.
+    #[error(transparent)]
+    Harbor(#[from] HarborError),
 }
 
 #[derive(Clone)]
@@ -398,6 +436,134 @@ impl VmTaskPreparer {
     pub const fn cache_policy(mut self, policy: CachePolicy) -> Self {
         self.cache_policy = policy;
         self
+    }
+}
+
+impl VmProfileRunner {
+    /// Creates a runner around one entitled VMM, guest runtime, and agent recipe.
+    pub fn new(
+        vmm: impl Into<PathBuf>,
+        runtime_image: impl Into<PathBuf>,
+        nanocodex: NanocodexBuilder,
+    ) -> Self {
+        Self {
+            vmm: vmm.into(),
+            runtime_image: runtime_image.into(),
+            nanocodex,
+            additional_tools: None,
+            verifier_environment: BTreeMap::new(),
+            max_concurrency: 1,
+            max_memory_mb: None,
+        }
+    }
+
+    /// Adds application-owned tools to every VM attempt.
+    #[must_use]
+    pub fn additional_tools(mut self, tools: Option<Tools>) -> Self {
+        self.additional_tools = tools;
+        self
+    }
+
+    /// Adds host values exposed only to canonical verifier commands.
+    #[must_use]
+    pub fn verifier_environment(mut self, environment: BTreeMap<String, String>) -> Self {
+        self.verifier_environment = environment;
+        self
+    }
+
+    /// Sets the host-wide concurrent-attempt ceiling.
+    #[must_use]
+    pub const fn max_concurrency(mut self, concurrency: usize) -> Self {
+        self.max_concurrency = concurrency;
+        self
+    }
+
+    /// Sets the host-wide admitted task-memory ceiling.
+    #[must_use]
+    pub const fn max_memory_mb(mut self, memory_mb: Option<u64>) -> Self {
+        self.max_memory_mb = memory_mb;
+        self
+    }
+}
+
+impl ProfileRunner for VmProfileRunner {
+    type Error = VmProfileRunError;
+    type Output = VmProfileRunResult;
+
+    async fn run(self, request: ProfileRunRequest) -> Result<Self::Output, Self::Error> {
+        let plan = request.receipt().nanocodex_plan(&self.nanocodex)?;
+        let tasks = plan.tasks().to_vec();
+        let sweep = plan.into_sweep();
+        let mut backend = VmBackend::builder()
+            .web_search(request.receipt().web_search())
+            .verifier_environment(self.verifier_environment);
+        if let Some(tools) = self.additional_tools {
+            backend = backend.additional_agent_tools(tools);
+        }
+        let backend = backend.build();
+        let resources = VmResources::builder(self.vmm, self.runtime_image)
+            .tasks(tasks)
+            .cache_directory(request.cache_directory())
+            .prepare()
+            .await?;
+        resources.configure(&backend).await?;
+
+        let mut evaluator = Evaluator::builder(self.nanocodex, backend)
+            .output_directory(request.output_directory())
+            .max_concurrency(self.max_concurrency)
+            .resume_incomplete(sweep);
+        if let Some(memory_mb) = self.max_memory_mb {
+            evaluator = evaluator.max_memory_mb(memory_mb);
+        }
+        let evaluator = evaluator.build()?;
+        let remaining = evaluator.remaining_attempts()?;
+        let run = evaluator.sweep();
+        let recorder = Harbor::new(&evaluator)?.record(run.events().subscribe())?;
+        let results = run.await?;
+        let job = recorder.finish_all(remaining).await?;
+        Ok(VmProfileRunResult {
+            job_directory: job.directory().to_path_buf(),
+            attempts: results.attempts().len(),
+            skipped: results.skipped(),
+        })
+    }
+}
+
+impl crate::profile::TaskPreparer for VmProfileRunner {
+    type Error = VmResourcesError;
+
+    async fn prepare(&self, request: crate::profile::TaskPreparation) -> Result<(), Self::Error> {
+        VmTaskPreparer::new(&self.vmm, &self.runtime_image)
+            .prepare(request)
+            .await
+    }
+}
+
+impl VmProfileRunResult {
+    /// Retained Harbor-compatible job directory.
+    pub fn job_directory(&self) -> &Path {
+        &self.job_directory
+    }
+
+    /// Attempts returned by this invocation.
+    pub const fn attempts(&self) -> usize {
+        self.attempts
+    }
+
+    /// Previously completed attempts reused while resuming.
+    pub const fn skipped(&self) -> usize {
+        self.skipped
+    }
+}
+
+impl fmt::Display for VmProfileRunResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            formatter,
+            "completed {} attempt(s) ({} resumed)",
+            self.attempts, self.skipped
+        )?;
+        write!(formatter, "artifacts: {}", self.job_directory.display())
     }
 }
 
