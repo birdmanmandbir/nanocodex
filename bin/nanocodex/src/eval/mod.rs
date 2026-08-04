@@ -3,22 +3,22 @@ mod cleanup;
 mod diff;
 mod import;
 mod inspect;
+mod profile;
 mod run;
 
 use std::{
     collections::BTreeMap,
     io::{self, Write},
     path::{Path, PathBuf},
-    time::Instant,
 };
 
 use clap::{Args, Subcommand};
-use eyre::{Result, eyre};
+use eyre::Result;
 use nanocodex_eval::{
     Task, TaskArtifact, VerifierCollect, VerifierEnvironmentMode,
-    vm::{prepare_task_image, prepare_verifier_image},
+    profile::{TaskPreparation, TaskPreparer},
+    vm::{CachePolicy, VmTaskPreparer},
 };
-use nanocodex_vm::image::{CachePolicy, DiskStatus};
 use serde::Serialize;
 
 #[derive(Args)]
@@ -33,8 +33,11 @@ pub(crate) struct Eval {
 
 #[derive(Subcommand)]
 enum EvalCommand {
-    /// Prepare task VM images without running agents.
-    Prepare(Prepare),
+    /// Resolve a profile and prepare all imports, images, and execution inputs.
+    Prepare(profile::Prepare),
+
+    /// Prepare task VM images directly without resolving an evaluation profile.
+    PrepareImages(PrepareImages),
 
     /// Load, validate, and inspect a benchmark task directory.
     Task {
@@ -64,7 +67,7 @@ enum EvalCommand {
 }
 
 #[derive(Args)]
-struct Prepare {
+struct PrepareImages {
     /// Terminal-Bench task directory. Repeat to prepare several environments.
     #[arg(
         long = "task",
@@ -90,6 +93,51 @@ struct Prepare {
     refresh: bool,
 }
 
+#[derive(Clone, Debug, Default)]
+struct NativeEvaluationRuntime {
+    cache: Option<PathBuf>,
+    refresh: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct NativeTaskPreparationError(String);
+
+impl TaskPreparer for NativeEvaluationRuntime {
+    type Error = NativeTaskPreparationError;
+
+    fn prepare(
+        &self,
+        request: TaskPreparation,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+        let cache = self
+            .cache
+            .clone()
+            .unwrap_or_else(|| request.cache_directory().to_path_buf());
+        let tasks = request.into_tasks();
+        let refresh = self.refresh;
+        async move {
+            // Resolve the running, entitled VMM executable before a nested
+            // guest-runtime build can cause Cargo's runner cache to rotate paths.
+            let vmm = std::env::current_exe()
+                .map_err(|error| NativeTaskPreparationError(error.to_string()))?;
+            let runtime = run::prepare_vm_guest_runtime_from(None, &cache)
+                .await
+                .map_err(|error| NativeTaskPreparationError(format!("{error:#}")))?;
+            let policy = if refresh {
+                CachePolicy::Refresh
+            } else {
+                CachePolicy::Reuse
+            };
+            VmTaskPreparer::new(vmm, runtime)
+                .cache_policy(policy)
+                .prepare(TaskPreparation::new(tasks, cache))
+                .await
+                .map_err(|error| NativeTaskPreparationError(error.to_string()))
+        }
+    }
+}
+
 impl Eval {
     pub(crate) async fn run(self) -> Result<()> {
         enable_paint();
@@ -102,142 +150,28 @@ fn enable_paint() {
     yansi::whenever(yansi::Condition::cached(enable));
 }
 
-async fn prepare_tasks(
-    tasks: Vec<PathBuf>,
-    suites: Vec<PathBuf>,
-    cache: PathBuf,
-    refresh: bool,
-) -> Result<()> {
-    let preparation_started = Instant::now();
-    let tasks = run::load_task_paths(tasks, suites)?
-        .into_iter()
-        .map(Task::load)
-        .collect::<Result<Vec<_>, _>>()?;
-    let policy = if refresh {
-        CachePolicy::Refresh
-    } else {
-        CachePolicy::Reuse
-    };
-    // Resolve the running, entitled VMM executable before a nested guest
-    // runtime build can cause Cargo's runner cache to rotate paths.
-    let vmm = std::env::current_exe()?;
-    let runtime_started = Instant::now();
-    let runtime_image = run::prepare_vm_guest_runtime().await?;
-    let runtime_duration = runtime_started.elapsed();
-    let builder = nanocodex_eval::vm::image_builder(&vmm, &runtime_image);
-    let mut cache_hits = 0_usize;
-    let mut cache_creations = 0_usize;
-    let mut failures = Vec::new();
-    for task in tasks {
-        let task_started = Instant::now();
-        if let Err(error) = task.validate_package() {
-            eprintln!(
-                "{}: task package changed duration={:.3?}\n{error:#}",
-                task.name(),
-                task_started.elapsed()
-            );
-            failures.push(task.name().to_owned());
-            continue;
-        }
-        let prepared = match prepare_task_image(&builder, &task, &cache, policy).await {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                eprintln!(
-                    "{}: failed duration={:.3?}\n{error:#}",
-                    task.name(),
-                    task_started.elapsed()
-                );
-                failures.push(task.name().to_owned());
-                continue;
-            }
-        };
-        if let Err(error) = task.validate_package() {
-            eprintln!(
-                "{}: task package changed during image preparation duration={:.3?}\n{error:#}",
-                task.name(),
-                task_started.elapsed()
-            );
-            failures.push(task.name().to_owned());
-            continue;
-        }
-        match prepared.disk_status() {
-            DiskStatus::Hit => cache_hits += 1,
-            DiskStatus::Created => cache_creations += 1,
-        }
-        eprintln!(
-            "{}: manifest={} ({}) root_disk={} duration={:.3?}",
-            task.name(),
-            prepared.manifest_digest(),
-            prepared.manifest_source().as_str(),
-            prepared.disk_status().as_str(),
-            task_started.elapsed()
-        );
-        println!("{}", prepared.path().display());
-        if task.verifier().environment_mode() == VerifierEnvironmentMode::Separate {
-            let verifier_started = Instant::now();
-            let verifier = match prepare_verifier_image(&builder, &task, &cache, policy).await {
-                Ok(verifier) => verifier,
-                Err(error) => {
-                    eprintln!(
-                        "{} verifier: failed duration={:.3?}\n{error:#}",
-                        task.name(),
-                        verifier_started.elapsed()
-                    );
-                    failures.push(format!("{} verifier", task.name()));
-                    continue;
-                }
-            };
-            if let Err(error) = task.validate_package() {
-                eprintln!(
-                    "{} verifier: task package changed during image preparation duration={:.3?}\n{error:#}",
-                    task.name(),
-                    verifier_started.elapsed()
-                );
-                failures.push(format!("{} verifier", task.name()));
-                continue;
-            }
-            match verifier.disk_status() {
-                DiskStatus::Hit => cache_hits += 1,
-                DiskStatus::Created => cache_creations += 1,
-            }
-            eprintln!(
-                "{} verifier: manifest={} ({}) root_disk={} duration={:.3?}",
-                task.name(),
-                verifier.manifest_digest(),
-                verifier.manifest_source().as_str(),
-                verifier.disk_status().as_str(),
-                verifier_started.elapsed()
-            );
-            println!("{}", verifier.path().display());
-        }
-    }
-    eprintln!(
-        "VM preparation: runtime={runtime_duration:.3?} environments={} hits={cache_hits} created={cache_creations} failed={} total={:.3?}",
-        cache_hits + cache_creations,
-        failures.len(),
-        preparation_started.elapsed()
-    );
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(eyre!(
-            "{} VM environment(s) failed preparation: {}",
-            failures.len(),
-            failures.join(", ")
-        ))
-    }
-}
-
 async fn run(eval: Eval) -> Result<()> {
     let Eval { command, run } = eval;
     match command {
         None => run.run().await?,
-        Some(EvalCommand::Prepare(Prepare {
+        Some(EvalCommand::Prepare(command)) => command.run().await?,
+        Some(EvalCommand::PrepareImages(PrepareImages {
             tasks,
             suites,
             cache,
             refresh,
-        })) => prepare_tasks(tasks, suites, cache, refresh).await?,
+        })) => {
+            let tasks = run::load_task_paths(tasks, suites)?
+                .into_iter()
+                .map(Task::load)
+                .collect::<Result<Vec<_>, _>>()?;
+            NativeEvaluationRuntime {
+                cache: Some(cache.clone()),
+                refresh,
+            }
+            .prepare(TaskPreparation::new(tasks, cache))
+            .await?;
+        }
         Some(EvalCommand::Task {
             directory,
             json,
@@ -370,11 +304,11 @@ mod tests {
     use crate::{Cli, Command};
 
     #[test]
-    fn prepare_accepts_repeated_tasks_in_input_order() {
+    fn prepare_images_accepts_repeated_tasks_in_input_order() {
         let cli = Cli::try_parse_from([
             "nanocodex",
             "eval",
-            "prepare",
+            "prepare-images",
             "--task",
             "tasks/first",
             "--task",
@@ -382,7 +316,7 @@ mod tests {
         ])
         .unwrap();
         let Some(Command::Eval(Eval {
-            command: Some(EvalCommand::Prepare(super::Prepare { tasks, .. })),
+            command: Some(EvalCommand::PrepareImages(super::PrepareImages { tasks, .. })),
             ..
         })) = cli.command
         else {
@@ -399,17 +333,17 @@ mod tests {
     }
 
     #[test]
-    fn prepare_accepts_a_complete_suite() {
+    fn prepare_images_accepts_a_complete_suite() {
         let cli = Cli::try_parse_from([
             "nanocodex",
             "eval",
-            "prepare",
+            "prepare-images",
             "--suite",
             "terminal-bench-2-1",
         ])
         .unwrap();
         let Some(Command::Eval(Eval {
-            command: Some(EvalCommand::Prepare(super::Prepare { suites, .. })),
+            command: Some(EvalCommand::PrepareImages(super::PrepareImages { suites, .. })),
             ..
         })) = cli.command
         else {

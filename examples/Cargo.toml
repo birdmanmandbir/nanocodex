@@ -115,5 +115,9 @@ path = "src/bin/eval_differential.rs"
 name = "eval-import"
 path = "src/bin/eval_import.rs"
 
+[[bin]]
+name = "eval-profile"
+path = "src/bin/eval_profile.rs"
+
 [lints]
 workspace = true

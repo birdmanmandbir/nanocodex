@@ -86,6 +86,8 @@ pub mod harbor;
 pub mod import;
 mod job;
 mod native;
+/// Typed manifest profiles and resolved evaluation matrices.
+pub mod profile;
 mod result;
 mod sweep;
 mod task;

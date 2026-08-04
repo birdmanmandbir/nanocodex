@@ -10,6 +10,7 @@ mod external;
 mod harbor;
 mod openai_evals;
 mod openai_simple_evals;
+pub mod profile;
 mod swe_bench;
 
 use std::{fs, path::Path};

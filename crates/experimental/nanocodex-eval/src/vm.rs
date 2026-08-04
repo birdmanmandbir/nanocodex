@@ -202,6 +202,15 @@ pub struct VmResourcesBuilder {
     gvproxy: Option<PathBuf>,
 }
 
+/// Owned VM image preparer for manifest-driven profile preparation.
+#[derive(Clone, Debug)]
+pub struct VmTaskPreparer {
+    vmm: PathBuf,
+    runtime_image: PathBuf,
+    cache: Option<PathBuf>,
+    cache_policy: CachePolicy,
+}
+
 #[derive(Clone)]
 enum VmEnvironmentSource {
     Rootfs(VmEnvironment),
@@ -365,6 +374,53 @@ impl VmResources {
             environments.insert(task.root().to_path_buf(), environment?);
         }
         Ok(environments)
+    }
+}
+
+impl VmTaskPreparer {
+    /// Creates a preparer around one VMM executable and guest-runtime disk.
+    pub fn new(vmm: impl Into<PathBuf>, runtime_image: impl Into<PathBuf>) -> Self {
+        Self {
+            vmm: vmm.into(),
+            runtime_image: runtime_image.into(),
+            cache: None,
+            cache_policy: CachePolicy::Reuse,
+        }
+    }
+
+    /// Selects the content-addressed image and verifier-cache directory.
+    pub fn cache_directory(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.cache = Some(directory.into());
+        self
+    }
+
+    /// Selects whether OCI image references may reuse their local resolution.
+    pub const fn cache_policy(mut self, policy: CachePolicy) -> Self {
+        self.cache_policy = policy;
+        self
+    }
+}
+
+impl crate::profile::TaskPreparer for VmTaskPreparer {
+    type Error = VmResourcesError;
+
+    fn prepare(
+        &self,
+        request: crate::profile::TaskPreparation,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+        let cache = self
+            .cache
+            .clone()
+            .unwrap_or_else(|| request.cache_directory().to_path_buf());
+        let tasks = request.into_tasks();
+        let resources = VmResources::builder(&self.vmm, &self.runtime_image)
+            .tasks(tasks)
+            .cache_directory(cache)
+            .cache_policy(self.cache_policy);
+        async move {
+            resources.prepare().await?.backend().await?;
+            Ok(())
+        }
     }
 }
 

@@ -45,6 +45,7 @@ use retained::{
 };
 #[cfg(test)]
 use retained::{retained_retry_task_names, retry_matcher};
+pub(crate) use runtime::prepare_vm_guest_runtime_from;
 #[cfg(test)]
 use runtime::{
     GUEST_RUNTIME_ARTIFACT_ROOT, GUEST_RUNTIME_CACHE_ROOT, VM_GUEST_ELF_MACHINE, VM_GUEST_TARGET,
@@ -53,7 +54,6 @@ use runtime::{
     vm_guest_build_command, vm_guest_runtime_is_fresh, write_vm_guest_build_record,
 };
 use runtime::{prepare_runtime_for_vm, stable_file_sha256};
-pub(crate) use runtime::{prepare_vm_guest_runtime, prepare_vm_guest_runtime_from};
 
 const DEFAULT_OUTPUT_DIRECTORY: &str = ".nanocodex/evals";
 const INVOCATION_FILE: &str = "invocation.json";

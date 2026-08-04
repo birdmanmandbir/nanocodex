@@ -272,6 +272,24 @@ Keep the two integration boundaries separate and cross-productable:
 | Benchmark adapter | `prepare` | One pinned third-party dataset or official harness bundle | PR #72 `DatasetPlan`, then one content-addressed `ImportedDataset` of ordinary `Task` values |
 | Harness CLI driver | `prepare` and each selected `run` arm | One pinned guest CLI, named variant, and exact argv | One prepared treatment and canonical attempt evidence |
 
+Keep orchestration library-first. `nanocodex-eval` owns the generic profile
+manifest, task selectors, resolved coordinate matrix, preparation receipts,
+durable coordinator state, stop/resume/rerun, monitoring snapshots, and report
+model. `nanocodex-eval-adapters` owns concrete built-in benchmark recipes,
+custom benchmark deserialization, source acquisition, and conversion into
+`DatasetPlan`. The `nanocodex eval` binary contains only Clap arguments,
+credential/process wiring, and thin calls into those APIs. A compiled public
+example must prepare and run the same manifest without going through the CLI so
+embedding applications can build their own coordinator or UI without parsing
+terminal output.
+
+API design is part of every milestone gate. After each vertical slice, exercise
+the library from both the CLI and the public example, remove binary-only state
+or duplicated policy, and iterate names and ownership until the normal consumer
+can compose typed builders and await typed results without knowing retained-file
+layouts. Do not stabilize a generic provider abstraction, app server, or
+benchmark-specific VM mode while doing so.
+
 The built-in benchmark catalog and custom benchmark configuration both resolve
 through PR #72's existing concrete importers:
 
@@ -426,6 +444,29 @@ verify the complete local cross-product; `status adapter-smoke --watch` and
 `report adapter-smoke` must work while it runs. The smoke gate tests plumbing
 and evidence completeness, not benchmark quality, so a legitimate verifier
 score of zero may still be an operationally successful smoke result.
+
+Every milestone ends with an adversarial durability and optimization gate:
+
+- Milestone one repeatedly prepares the same profile, interrupts import, image
+  preparation, agent work, verification, and report publication, then proves
+  exact stop/resume without duplicate coordinates or leaked processes/VMs. It
+  rejects changed manifests, task packages, harness binaries, corrupt receipts,
+  and stale state with actionable errors. Measure cold preparation, warm
+  preparation, admission overhead, and retained-state growth; remove any
+  avoidable serialization, hashing, image, or process-launch cost before the
+  local smoke gate passes.
+- Milestone two brutalizes large model/thinking/harness matrices with repeated
+  detach/reattach, coordinator restarts, partial reports, targeted reruns,
+  verifier failures, API throttling, cancellations, and long-tail tasks. It
+  profiles scheduler throughput, live-view update cost, report generation,
+  retained storage, and cold-versus-warm execution, then optimizes demonstrated
+  bottlenecks before accepting website evidence.
+- Milestone three stress-tests the single `dev-georgios` runner under sustained
+  saturation, memory pressure, disk pressure, VM boot failures, SSH loss, and
+  coordinator restart. It must recover without duplicate model spend, preserve
+  all valid checkpoints, clean disposable state, and show from retained
+  measurements whether memory, CPU, disk, verifier work, or the model/API is the
+  actual limiter. Multi-box work begins only if those measurements justify it.
 
 #### `prepare` and `run`
 
