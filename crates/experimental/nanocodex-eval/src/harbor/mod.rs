@@ -157,6 +157,16 @@ pub struct HarborJob {
     directory: PathBuf,
 }
 
+/// Live durable trial counts from one Harbor-compatible job.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HarborJobProgress {
+    total: usize,
+    completed: usize,
+    running: usize,
+    pending: usize,
+    errored: usize,
+}
+
 impl Harbor {
     /// Validates that a task is stable and readable under every task identity
     /// algorithm emitted by the Harbor adapter.
@@ -254,6 +264,17 @@ impl Drop for HarborRecorder {
 }
 
 impl HarborJob {
+    /// Opens a retained Harbor-compatible job from its result identity.
+    pub fn open(directory: impl Into<PathBuf>) -> Result<Self, HarborError> {
+        let directory = directory.into();
+        let result =
+            serde_json::from_slice::<HarborJobResult>(&fs::read(directory.join("result.json"))?)?;
+        Ok(Self {
+            id: result.id,
+            directory,
+        })
+    }
+
     /// Returns the stable job identifier.
     #[must_use]
     pub const fn id(&self) -> Uuid {
@@ -264,6 +285,20 @@ impl HarborJob {
     #[must_use]
     pub fn directory(&self) -> &Path {
         &self.directory
+    }
+
+    /// Loads live durable trial counts for monitoring a partial or completed job.
+    pub fn progress(&self) -> Result<HarborJobProgress, HarborError> {
+        let result = serde_json::from_slice::<HarborJobResult>(&fs::read(
+            self.directory.join("result.json"),
+        )?)?;
+        Ok(HarborJobProgress {
+            total: result.n_total_trials,
+            completed: result.stats.n_completed_trials,
+            running: result.stats.n_running_trials,
+            pending: result.stats.n_pending_trials,
+            errored: result.stats.n_errored_trials,
+        })
     }
 
     /// Reconstructs the stable aggregate dataset from every durable trial.
@@ -307,6 +342,33 @@ impl HarborJob {
                 ))
         });
         Ok(AggregateDataset::new(attempts))
+    }
+}
+
+impl HarborJobProgress {
+    /// Planned trials.
+    pub const fn total(self) -> usize {
+        self.total
+    }
+
+    /// Durably terminal trials.
+    pub const fn completed(self) -> usize {
+        self.completed
+    }
+
+    /// Trials currently recorded as running.
+    pub const fn running(self) -> usize {
+        self.running
+    }
+
+    /// Trials not yet admitted.
+    pub const fn pending(self) -> usize {
+        self.pending
+    }
+
+    /// Terminal trials with lifecycle errors.
+    pub const fn errored(self) -> usize {
+        self.errored
     }
 }
 

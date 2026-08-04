@@ -7,12 +7,15 @@ use std::{
 
 use nanocodex_eval::{
     Task,
+    aggregate::AggregateDataset,
+    harbor::{HarborError, HarborJob, HarborJobProgress},
     import::{Environment, Harness, ImportError, ImportStore, ImportedDataset},
     profile::{
         BenchmarkSelection, LoadedManifest, PreparationError, PreparationReceipt, PreparationStore,
         PreparedTask, ProfileError, ProfileRunRequest, ProfileRunner, PublishedPreparation,
         ResolvedProfile, TaskPreparation, TaskPreparer,
     },
+    profile_run::{ProfileRunControl, ProfileRunControlError, ProfileRunStatus},
 };
 use serde::Deserialize;
 
@@ -59,6 +62,12 @@ pub struct TaskPreparationRequired;
 pub struct PreparedEvaluation {
     receipt: PreparationReceipt,
     published: PublishedPreparation,
+}
+
+/// Durable coordinator state enriched with live Harbor trial counts.
+pub struct EvaluationStatus {
+    run: ProfileRunStatus,
+    progress: Option<HarborJobProgress>,
 }
 
 /// One custom benchmark source configured in a manifest.
@@ -187,12 +196,98 @@ pub enum ProfileImportError {
     /// Runtime image, disk, or execution-input preparation failed.
     #[error("task runtime preparation failed: {0}")]
     RuntimePreparation(Box<dyn std::error::Error + Send + Sync>),
+    /// Cross-process run status or stop control failed.
+    #[error(transparent)]
+    Control(#[from] ProfileRunControlError),
+    /// Retained Harbor evidence could not be loaded or aggregated.
+    #[error(transparent)]
+    Harbor(#[from] HarborError),
 }
 
 impl EvaluationWorkspace<TaskPreparationRequired> {
     /// Starts a workspace builder.
     pub fn builder() -> EvaluationWorkspaceBuilder {
         EvaluationWorkspaceBuilder::default()
+    }
+}
+
+impl<P> EvaluationWorkspace<P> {
+    /// Loads durable status for the current or most recent profile invocation.
+    pub fn status(
+        &self,
+        profile: Option<&str>,
+    ) -> Result<Option<EvaluationStatus>, ProfileImportError> {
+        let profile = self
+            .manifest
+            .resolve_profile(profile, |name| self.catalog.contains(name))?;
+        let Some(run) =
+            ProfileRunControl::new(self.state_directory.join("runs").join(profile.name()))
+                .status()?
+        else {
+            return Ok(None);
+        };
+        let progress = run
+            .job_directory()
+            .map(HarborJob::open)
+            .transpose()?
+            .map(|job| job.progress())
+            .transpose()?;
+        Ok(Some(EvaluationStatus { run, progress }))
+    }
+
+    /// Requests graceful drain from the active profile coordinator.
+    pub fn stop(&self, profile: Option<&str>) -> Result<ProfileRunStatus, ProfileImportError> {
+        let profile = self
+            .manifest
+            .resolve_profile(profile, |name| self.catalog.contains(name))?;
+        Ok(
+            ProfileRunControl::new(self.state_directory.join("runs").join(profile.name()))
+                .request_stop()?,
+        )
+    }
+
+    /// Rebuilds a stable aggregate report from the current retained job.
+    pub fn report(&self, profile: Option<&str>) -> Result<AggregateDataset, ProfileImportError> {
+        let status = self.status(profile)?.ok_or_else(|| {
+            ProfileImportError::Selection("profile has not run; no report is available".to_owned())
+        })?;
+        let job = status.run.job_directory().ok_or_else(|| {
+            ProfileImportError::Selection(
+                "profile run has not opened an evaluator job yet; no report is available"
+                    .to_owned(),
+            )
+        })?;
+        Ok(HarborJob::open(job)?.aggregate_dataset()?)
+    }
+}
+
+impl EvaluationStatus {
+    /// Durable coordinator phase and identity.
+    pub const fn run(&self) -> &ProfileRunStatus {
+        &self.run
+    }
+
+    /// Live retained trial counts once an evaluator job exists.
+    pub const fn progress(&self) -> Option<HarborJobProgress> {
+        self.progress
+    }
+}
+
+impl fmt::Display for EvaluationStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.run)?;
+        if let Some(progress) = self.progress {
+            write!(
+                formatter,
+                " completed={} running={} pending={} errored={} total={}",
+                progress.completed(),
+                progress.running(),
+                progress.pending(),
+                progress.errored(),
+                progress.total()
+            )?;
+        }
+        Ok(())
     }
 }
 

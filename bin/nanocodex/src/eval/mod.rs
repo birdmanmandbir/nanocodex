@@ -40,6 +40,15 @@ enum EvalCommand {
     /// Execute or resume a profile after its mandatory preparation.
     Run(profile::Run),
 
+    /// Show durable status for a profile run.
+    Status(profile::Status),
+
+    /// Stop admitting work and drain the active profile run.
+    Stop(profile::Stop),
+
+    /// Rebuild a stable aggregate report from retained profile evidence.
+    Report(profile::Report),
+
     /// Prepare task VM images directly without resolving an evaluation profile.
     PrepareImages(PrepareImages),
 
@@ -203,6 +212,9 @@ async fn run(eval: Eval) -> Result<()> {
         None => run.run().await?,
         Some(EvalCommand::Prepare(command)) => command.run().await?,
         Some(EvalCommand::Run(command)) => command.run().await?,
+        Some(EvalCommand::Status(command)) => command.run().await?,
+        Some(EvalCommand::Stop(command)) => command.run()?,
+        Some(EvalCommand::Report(command)) => command.run()?,
         Some(EvalCommand::PrepareImages(PrepareImages {
             tasks,
             suites,

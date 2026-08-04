@@ -66,6 +66,7 @@ use crate::{
     },
     harbor::{Harbor, HarborError},
     profile::{ProfileRunPlanError, ProfileRunRequest, ProfileRunner},
+    profile_run::{ProfileRunControl, ProfileRunControlError},
 };
 
 const EMBEDDED_GUEST_TOOL_RUNTIME: &str = "/usr/local/bin/nanocodex-vm-guest";
@@ -247,6 +248,9 @@ pub enum VmProfileRunError {
     /// Harbor-compatible evidence recording failed.
     #[error(transparent)]
     Harbor(#[from] HarborError),
+    /// Cross-process lease, status, or stop coordination failed.
+    #[error(transparent)]
+    Control(#[from] ProfileRunControlError),
 }
 
 #[derive(Clone)]
@@ -494,6 +498,9 @@ impl ProfileRunner for VmProfileRunner {
         let plan = request.receipt().nanocodex_plan(&self.nanocodex)?;
         let tasks = plan.tasks().to_vec();
         let sweep = plan.into_sweep();
+        let planned_attempts = sweep.attempt_count();
+        let mut active = ProfileRunControl::new(request.output_directory())
+            .acquire(request.receipt().profile(), planned_attempts)?;
         let mut backend = VmBackend::builder()
             .web_search(request.receipt().web_search())
             .verifier_environment(self.verifier_environment);
@@ -516,11 +523,21 @@ impl ProfileRunner for VmProfileRunner {
             evaluator = evaluator.max_memory_mb(memory_mb);
         }
         let evaluator = evaluator.build()?;
+        active.job_directory(evaluator.directory())?;
         let remaining = evaluator.remaining_attempts()?;
         let run = evaluator.sweep();
         let recorder = Harbor::new(&evaluator)?.record(run.events().subscribe())?;
-        let results = run.await?;
-        let job = recorder.finish_all(remaining).await?;
+        tokio::pin!(run);
+        let (results, terminal_attempts) = tokio::select! {
+            result = &mut run => (result?, remaining),
+            stop = active.wait_for_stop() => {
+                stop?;
+                let admitted = evaluator.begin_drain();
+                (run.await?, admitted)
+            }
+        };
+        let job = recorder.finish_all(terminal_attempts).await?;
+        active.complete()?;
         Ok(VmProfileRunResult {
             job_directory: job.directory().to_path_buf(),
             attempts: results.attempts().len(),

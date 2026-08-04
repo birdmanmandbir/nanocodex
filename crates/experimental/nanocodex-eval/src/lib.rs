@@ -88,6 +88,7 @@ mod job;
 mod native;
 /// Typed manifest profiles and resolved evaluation matrices.
 pub mod profile;
+pub mod profile_run;
 mod result;
 mod sweep;
 mod task;
