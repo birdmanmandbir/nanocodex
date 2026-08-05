@@ -382,6 +382,17 @@ impl DatasetPlan {
                 CasePackage::Hermetic(case) => {
                     Self::update_digest(&mut digest, b"hermetic");
                     Self::update_digest(&mut digest, case.prompt.as_bytes());
+                    Self::update_digest(
+                        &mut digest,
+                        &case
+                            .benchmark_prompt_chars
+                            .unwrap_or_default()
+                            .to_le_bytes(),
+                    );
+                    Self::update_digest(
+                        &mut digest,
+                        case.benchmark_case_type.as_deref().unwrap_or("").as_bytes(),
+                    );
                     match &case.environment {
                         Environment::OciImage(image) => {
                             Self::update_digest(&mut digest, b"oci");
@@ -1176,6 +1187,8 @@ mod tests {
         harness: &'a Path,
         contents: &'a [u8],
         scoring_policy: ScoringPolicy,
+        benchmark_prompt_chars: u64,
+        benchmark_case_type: &'a str,
     }
 
     impl DatasetImporter for FixtureImporter {
@@ -1201,8 +1214,8 @@ mod tests {
                     Environment::Dockerfile(self.environment.to_path_buf()),
                     Harness::directory(self.harness)?,
                 )?
-                .benchmark_prompt_chars(21)
-                .benchmark_case_type("fixture")
+                .benchmark_prompt_chars(self.benchmark_prompt_chars)
+                .benchmark_case_type(self.benchmark_case_type)
                 .scoring_policy(self.scoring_policy)
                 .environment_file("data_files/input.csv", self.contents, 0o644)?,
             ))
@@ -1257,6 +1270,8 @@ mod tests {
                 harness: harness.path(),
                 contents: b"value\n1\n",
                 scoring_policy: ScoringPolicy::AllRewardsOne,
+                benchmark_prompt_chars: 21,
+                benchmark_case_type: "fixture",
             })
             .unwrap();
         let changed = ImportStore::new(store.path())
@@ -1265,6 +1280,8 @@ mod tests {
                 harness: harness.path(),
                 contents: b"value\n2\n",
                 scoring_policy: ScoringPolicy::AllRewardsOne,
+                benchmark_prompt_chars: 21,
+                benchmark_case_type: "fixture",
             })
             .unwrap();
 
@@ -1291,9 +1308,23 @@ mod tests {
                 harness: harness.path(),
                 contents: b"value\n1\n",
                 scoring_policy: ScoringPolicy::AllRewardsPositive,
+                benchmark_prompt_chars: 21,
+                benchmark_case_type: "fixture",
             })
             .unwrap();
         assert_ne!(first.digest(), changed_policy.digest());
+
+        let changed_dimensions = ImportStore::new(store.path())
+            .import(&WorkspaceImporter {
+                environment: source.path(),
+                harness: harness.path(),
+                contents: b"value\n1\n",
+                scoring_policy: ScoringPolicy::AllRewardsOne,
+                benchmark_prompt_chars: 22,
+                benchmark_case_type: "other",
+            })
+            .unwrap();
+        assert_ne!(first.digest(), changed_dimensions.digest());
     }
 
     fn make_task(root: &Path, prompt: &str) {
