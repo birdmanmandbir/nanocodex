@@ -2,7 +2,10 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Read, Write},
     net::{Ipv4Addr, SocketAddr},
-    os::unix::{net::UnixStream, process::CommandExt as _},
+    os::{
+        fd::OwnedFd,
+        unix::{net::UnixStream, process::CommandExt as _},
+    },
     path::{Path, PathBuf},
     process::{Child, Stdio},
     thread,
@@ -74,6 +77,7 @@ pub enum GvproxyError {
 /// this value terminates and reaps gvproxy.
 pub struct Gvproxy {
     child: Child,
+    owner_lifeline: Option<UnixStream>,
     network_socket: PathBuf,
     services_socket: PathBuf,
     log: PathBuf,
@@ -134,15 +138,20 @@ impl Gvproxy {
 
         let log_path = log.to_path_buf();
         let log = fs::File::create(log)?;
-        let mut command = std::process::Command::new(binary);
+        let (owner_lifeline, owner_guard) = UnixStream::pair()?;
+        let mut command = std::process::Command::new("/bin/sh");
         command
+            .arg("-c")
+            .arg(OWNER_GUARD_SCRIPT)
+            .arg("nanocodex-gvproxy-owner")
+            .arg(binary)
             .arg("--listen-vfkit")
             .arg(format!("unixgram:{}", network_socket.display()))
             .arg("--services")
             .arg(format!("unix://{}", services_socket.display()))
             .arg("--ssh-port")
             .arg("-1")
-            .stdin(Stdio::null())
+            .stdin(Stdio::from(OwnedFd::from(owner_guard)))
             .stdout(Stdio::null())
             .stderr(log);
         if process_group == ProcessGroup::Isolated {
@@ -172,6 +181,7 @@ impl Gvproxy {
 
         Ok(Self {
             child,
+            owner_lifeline: Some(owner_lifeline),
             network_socket,
             services_socket,
             log: log_path,
@@ -238,6 +248,7 @@ impl Drop for Gvproxy {
         let process_id = self.child.id();
         match self.child.try_wait() {
             Ok(Some(status)) => {
+                drop(self.owner_lifeline.take());
                 let age_ms = elapsed_millis(self.started_at);
                 let message = format!(
                     "nanocodex owner: gvproxy process {process_id} exited before owner cleanup \
@@ -258,13 +269,10 @@ impl Drop for Gvproxy {
                 );
             }
             Ok(None) => {
-                if let Err(error) = self.child.kill() {
-                    warn!(
-                        process.id = process_id,
-                        error.message = %error,
-                        "failed to terminate owned gvproxy process"
-                    );
-                }
+                // Closing the writer wakes the owner guard, which kills and
+                // reaps gvproxy before exiting itself. The same EOF occurs if
+                // this process is terminated without running `Drop`.
+                drop(self.owner_lifeline.take());
                 if let Err(error) = self.child.wait() {
                     warn!(
                         process.id = process_id,
@@ -274,6 +282,7 @@ impl Drop for Gvproxy {
                 }
             }
             Err(error) => {
+                drop(self.owner_lifeline.take());
                 warn!(
                     process.id = process_id,
                     error.message = %error,
@@ -285,6 +294,22 @@ impl Drop for Gvproxy {
         }
     }
 }
+
+const OWNER_GUARD_SCRIPT: &str = r#"
+exec 3<&0
+"$@" </dev/null &
+owned=$!
+(
+    IFS= read -r _ <&3 || kill -KILL "$owned" 2>/dev/null
+) &
+watcher=$!
+exec 3<&-
+wait "$owned"
+status=$?
+kill -KILL "$watcher" 2>/dev/null
+wait "$watcher" 2>/dev/null
+exit "$status"
+"#;
 
 fn append_owner_diagnostic(log: &Path, message: &str) -> io::Result<()> {
     let mut log = OpenOptions::new().append(true).open(log)?;
@@ -365,7 +390,11 @@ mod tests {
         process::Command,
     };
 
-    use nix::unistd::getpgrp;
+    use nix::{
+        errno::Errno,
+        sys::signal::kill,
+        unistd::{Pid, getpgrp},
+    };
 
     use super::*;
 
@@ -382,7 +411,6 @@ mod tests {
 
         assert_eq!(inherited.1, parent_group);
         assert_ne!(inherited.0, inherited.1);
-        assert_eq!(isolated.0, isolated.1);
         assert_ne!(isolated.1, parent_group);
     }
 
@@ -397,6 +425,7 @@ mod tests {
             .unwrap();
         let mut gvproxy = Gvproxy {
             child,
+            owner_lifeline: None,
             network_socket: directory.path().join("network.sock"),
             services_socket: directory.path().join("services.sock"),
             log: log.clone(),
@@ -410,6 +439,40 @@ mod tests {
         assert!(retained.starts_with("gvproxy output\n"));
         assert!(retained.contains("exited before owner cleanup"));
         assert!(retained.contains("exit status: 23"));
+    }
+
+    #[test]
+    fn owner_lifeline_terminates_the_proxy_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("fake-gvproxy");
+        let process = directory.path().join("process");
+        fs::write(
+            &binary,
+            "#!/bin/sh\n\
+             network=${2#unixgram:}\n\
+             services=${4#unix://}\n\
+             printf '%s\\n' \"$$\" > \"$(dirname \"$0\")/process\"\n\
+             : > \"$network\"\n\
+             : > \"$services\"\n\
+             exec sleep 300\n",
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let proxy = Gvproxy::spawn_isolated(
+            &binary,
+            &directory.path().join("state"),
+            &directory.path().join("gvproxy.log"),
+        )
+        .unwrap();
+        let pid = fs::read_to_string(process)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+
+        drop(proxy);
+
+        assert_eq!(kill(Pid::from_raw(pid), None), Err(Errno::ESRCH));
     }
 
     fn recorded_process_group(
@@ -453,6 +516,7 @@ mod tests {
         fs::write(&log, "").unwrap();
         let proxy = Gvproxy {
             child: std::process::Command::new("/usr/bin/true").spawn().unwrap(),
+            owner_lifeline: None,
             network_socket: PathBuf::new(),
             services_socket: PathBuf::new(),
             log,
