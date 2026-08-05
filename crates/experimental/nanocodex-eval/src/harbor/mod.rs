@@ -1696,12 +1696,9 @@ impl DurableHarborTrial {
         let agent = self.result.agent_result.as_ref();
         let metadata = agent.map(|agent| &agent.metadata);
         let scored = self.result.scored;
-        let verifier_passed = self
-            .result
-            .verifier_result
-            .as_ref()
-            .is_some_and(|verifier| verifier.rewards.values().all(|reward| *reward > 0.0));
         let outcome = self.result.outcome;
+        let verifier_passed =
+            retained_verifier_passed(&self.result, &self.lock.nanocodex.scoring_policy);
         let passed = scored && verifier_passed;
         let errored = retained_trial_errored(&self.result);
         let refused = retained_trial_refused(&self.result);
@@ -1882,6 +1879,22 @@ impl DurableHarborTrial {
                 directory: self.directory,
             },
         }
+    }
+}
+
+fn retained_verifier_passed(result: &RetainedHarborTrialResult, scoring_policy: &str) -> bool {
+    let Some(verifier) = result.verifier_result.as_ref() else {
+        return false;
+    };
+    if result.exception_info.is_none() {
+        return result.outcome == EvalOutcome::Passed;
+    }
+    match scoring_policy {
+        "all_rewards_one-v1" => verifier
+            .rewards
+            .values()
+            .all(|reward| reward.to_bits() == 1.0_f64.to_bits()),
+        _ => verifier.rewards.values().all(|reward| *reward > 0.0),
     }
 }
 

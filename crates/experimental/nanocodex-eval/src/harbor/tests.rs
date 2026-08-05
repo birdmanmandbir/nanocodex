@@ -619,6 +619,22 @@ fn pass_at_k_matches_harbors_unbiased_estimator() {
     assert!((pass_at_k[&5] - 1.0).abs() < f64::EPSILON);
 }
 
+#[test]
+fn retained_continuous_score_preserves_terminal_binary_classification() {
+    let mut partial = retained_binary_result(true, Some(2.0 / 3.0));
+    partial.outcome = EvalOutcome::VerifierFailed;
+    assert!(!super::retained_verifier_passed(
+        &partial,
+        "all_rewards_one-v1"
+    ));
+
+    partial.outcome = EvalOutcome::Passed;
+    assert!(super::retained_verifier_passed(
+        &partial,
+        "all_rewards_positive-v1"
+    ));
+}
+
 fn retained_binary_result(scored: bool, reward: Option<f64>) -> super::RetainedHarborTrialResult {
     let outcome = if scored && reward.is_some_and(|reward| reward > 0.0) {
         EvalOutcome::Passed
