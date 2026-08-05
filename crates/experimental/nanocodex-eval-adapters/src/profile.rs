@@ -20,8 +20,8 @@ use nanocodex_eval::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ArenaHard, BuiltinSourceError, BuiltinSources, ExternalHarness, GeneBenchPro, GraphWalks,
-    HarborDataset, HealthBenchProfessional, Mrcr, OpenAiEvals, SweBench,
+    ArenaHard, BuiltinSourceError, BuiltinSources, ExternalHarness, Gdpval, GeneBenchPro,
+    GraphWalks, HarborDataset, HealthBenchProfessional, Mrcr, OpenAiEvals, SweBench,
 };
 
 /// A complete manifest using Nanocodex's concrete third-party benchmark recipes.
@@ -180,6 +180,17 @@ pub enum Benchmark {
         /// Candidate environment.
         #[serde(default = "default_image")]
         image: String,
+    },
+    /// OpenAI's public GDPval workspace tasks and human-authored rubrics.
+    Gdpval {
+        /// Pinned official dataset repository.
+        source: PathBuf,
+        /// Pinned source revision.
+        revision: String,
+        /// Professional-file candidate environment Dockerfile context.
+        environment: PathBuf,
+        /// Evaluator-owned public-reproduction verifier.
+        harness: PathBuf,
     },
     /// Benchmark-owned executable manifest.
     External {
@@ -529,6 +540,7 @@ impl BenchmarkCatalog {
             "graphwalks" => "graphwalks",
             "mrcr-v2" => "mrcr",
             "healthbench-professional" => "healthbench-professional",
+            "gdpval" => "gdpval",
             _ => return None,
         };
         Some(Builtin { adapter })
@@ -574,7 +586,7 @@ impl<'a> ProfileImporter<'a> {
                 })?;
                 &builtin
             };
-            let dataset = self.import_benchmark(name, benchmark)?;
+            let dataset = self.import_benchmark(name, benchmark, selection)?;
             self.select_tasks(name, selection, &dataset, &mut selected)?;
         }
         Ok(selected)
@@ -584,6 +596,7 @@ impl<'a> ProfileImporter<'a> {
         &self,
         name: &str,
         benchmark: &Benchmark,
+        selection: &BenchmarkSelection,
     ) -> Result<ImportedDataset, ImportError> {
         let root = self.manifest.root();
         let store = self.store;
@@ -692,6 +705,23 @@ impl<'a> ProfileImporter<'a> {
                 Environment::OciImage(image.clone()),
                 resolve_path(root, harness),
             )),
+            Benchmark::Gdpval {
+                source,
+                revision,
+                environment,
+                harness,
+            } => {
+                let mut importer = Gdpval::new(
+                    resolve_path(root, source),
+                    revision,
+                    Environment::Dockerfile(resolve_path(root, environment)),
+                    resolve_path(root, harness),
+                );
+                if !selection.is_all() {
+                    importer = importer.tasks(selection.tasks().iter().cloned());
+                }
+                store.import(&importer)
+            }
             Benchmark::External { manifest } => {
                 store.import(&ExternalHarness::new(resolve_path(root, manifest)))
             }
@@ -864,6 +894,7 @@ mod tests {
             "graphwalks",
             "mrcr-v2",
             "healthbench-professional",
+            "gdpval",
         ] {
             assert!(BenchmarkCatalog::new().contains(benchmark), "{benchmark}");
         }
@@ -1109,6 +1140,7 @@ thinking = ["low"]
             [
                 "arena-hard-v2",
                 "external-smoke",
+                "gdpval",
                 "genebench-pro-public",
                 "graphwalks",
                 "healthbench-professional",

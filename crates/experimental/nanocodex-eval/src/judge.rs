@@ -1,23 +1,36 @@
 //! Evaluator-owned OpenAI judge service for isolated benchmark verifiers.
 
-use std::{collections::BTreeMap, net::Ipv4Addr, str::FromStr as _, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    io::Read as _,
+    net::Ipv4Addr,
+    str::FromStr as _,
+    sync::{Arc, Mutex},
+};
 
 use axum::{
     Json, Router,
-    extract::State,
-    http::{HeaderMap, StatusCode},
+    body::Bytes,
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode, header::CONTENT_ENCODING},
     response::{IntoResponse as _, Response},
-    routing::post,
+    routing::{get, post},
 };
+use flate2::read::GzDecoder;
 use nanocodex_agent::NanocodexBuilder;
 use nanocodex_oai_api::Model;
 use nanocodex_tools::Tools;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
+use tokio::{
+    net::TcpListener,
+    sync::{Mutex as AsyncMutex, oneshot},
+    task::{AbortHandle, JoinHandle},
+};
 use uuid::Uuid;
 
 const GUEST_HOST: Ipv4Addr = Ipv4Addr::new(192, 168, 127, 254);
+const MAX_JUDGE_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 
 /// A run-scoped judge endpoint backed by the evaluator's selected OpenAI auth.
 pub struct JudgeRuntime {
@@ -25,12 +38,15 @@ pub struct JudgeRuntime {
     token: Arc<str>,
     shutdown: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
+    workers: Arc<Mutex<Vec<AbortHandle>>>,
 }
 
 #[derive(Clone)]
 struct JudgeState {
     builder: NanocodexBuilder,
     token: Arc<str>,
+    jobs: Arc<AsyncMutex<BTreeMap<String, JudgeJob>>>,
+    workers: Arc<Mutex<Vec<AbortHandle>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -39,14 +55,21 @@ struct JudgeRequest {
     input: Value,
 }
 
+#[derive(Clone)]
 struct JudgeAnswer {
     model: Model,
     message: String,
 }
 
+#[derive(Clone)]
 struct JudgeFailure {
     status: StatusCode,
     message: String,
+}
+
+enum JudgeJob {
+    Pending,
+    Complete(Result<JudgeAnswer, JudgeFailure>),
 }
 
 #[derive(Debug, Serialize)]
@@ -76,12 +99,17 @@ impl JudgeRuntime {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let port = listener.local_addr()?.port();
         let token: Arc<str> = Uuid::now_v7().simple().to_string().into();
+        let workers = Arc::new(Mutex::new(Vec::new()));
         let state = JudgeState {
             builder: builder.tools(Tools::builder().without_defaults().build()?),
             token: Arc::clone(&token),
+            jobs: Arc::new(AsyncMutex::new(BTreeMap::new())),
+            workers: Arc::clone(&workers),
         };
         let application = Router::new()
             .route("/v1/responses", post(Self::respond))
+            .route("/v1/responses/async", post(Self::submit))
+            .route("/v1/responses/async/{id}", get(Self::poll))
             .with_state(state);
         let (shutdown, receiver) = oneshot::channel();
         let task = tokio::spawn(async move {
@@ -99,6 +127,7 @@ impl JudgeRuntime {
             token,
             shutdown: Some(shutdown),
             task,
+            workers,
         })
     }
 
@@ -117,12 +146,96 @@ impl JudgeRuntime {
         headers: HeaderMap,
         Json(request): Json<JudgeRequest>,
     ) -> Response {
-        let answer = match state.answer(&headers, request.model, request.input).await {
+        if !state.authorized(&headers) {
+            return Self::error(StatusCode::UNAUTHORIZED, "invalid judge token");
+        }
+        let answer = match state.answer(request.model, request.input).await {
             Ok(answer) => answer,
             Err(error) => return Self::error(error.status, error.message),
         };
+        Self::answer(format!("judge_{}", Uuid::now_v7().simple()), answer)
+    }
+
+    async fn submit(State(state): State<JudgeState>, headers: HeaderMap, body: Bytes) -> Response {
+        if !state.authorized(&headers) {
+            return Self::error(StatusCode::UNAUTHORIZED, "invalid judge token");
+        }
+        let request = match Self::decode_request(&headers, &body) {
+            Ok(request) => request,
+            Err(error) => return error,
+        };
+        let id = format!("judge_{}", Uuid::now_v7().simple());
+        state
+            .jobs
+            .lock()
+            .await
+            .insert(id.clone(), JudgeJob::Pending);
+        let worker_state = state.clone();
+        let worker_id = id.clone();
+        let worker = tokio::spawn(async move {
+            let result = worker_state.answer(request.model, request.input).await;
+            if let Err(error) = &result {
+                tracing::warn!(
+                    judge_job = %worker_id,
+                    status = error.status.as_u16(),
+                    message = %error.message,
+                    "asynchronous judge job failed"
+                );
+            }
+            worker_state
+                .jobs
+                .lock()
+                .await
+                .insert(worker_id, JudgeJob::Complete(result));
+        });
+        let registered = if let Ok(mut workers) = state.workers.lock() {
+            workers.push(worker.abort_handle());
+            true
+        } else {
+            false
+        };
+        if !registered {
+            worker.abort();
+            state.jobs.lock().await.remove(&id);
+            return Self::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "judge worker registry is unavailable",
+            );
+        }
+        (
+            StatusCode::ACCEPTED,
+            Json(json!({"id": id, "object": "response", "status": "in_progress"})),
+        )
+            .into_response()
+    }
+
+    async fn poll(
+        State(state): State<JudgeState>,
+        Path(id): Path<String>,
+        headers: HeaderMap,
+    ) -> Response {
+        if !state.authorized(&headers) {
+            return Self::error(StatusCode::UNAUTHORIZED, "invalid judge token");
+        }
+        let jobs = state.jobs.lock().await;
+        match jobs.get(&id) {
+            Some(JudgeJob::Pending) => Json(json!({
+                "id": id,
+                "object": "response",
+                "status": "in_progress"
+            }))
+            .into_response(),
+            Some(JudgeJob::Complete(Ok(answer))) => Self::answer(id, answer.clone()),
+            Some(JudgeJob::Complete(Err(error))) => {
+                Self::error(error.status, error.message.clone())
+            }
+            None => Self::error(StatusCode::NOT_FOUND, "unknown judge job"),
+        }
+    }
+
+    fn answer(id: String, answer: JudgeAnswer) -> Response {
         Json(json!({
-            "id": format!("judge_{}", Uuid::now_v7().simple()),
+            "id": id,
             "object": "response",
             "status": "completed",
             "model": answer.model,
@@ -202,21 +315,60 @@ impl JudgeRuntime {
         )
             .into_response()
     }
+
+    fn decode_request(headers: &HeaderMap, body: &[u8]) -> Result<JudgeRequest, Response> {
+        if body.len() > MAX_JUDGE_REQUEST_BYTES {
+            return Err(Self::error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "judge request exceeds 2 MiB",
+            ));
+        }
+        let decoded = match headers
+            .get(CONTENT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+        {
+            None => body.to_vec(),
+            Some("gzip") => {
+                let mut decoded = Vec::new();
+                let limit = u64::try_from(MAX_JUDGE_REQUEST_BYTES)
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(1);
+                if let Err(error) = GzDecoder::new(body).take(limit).read_to_end(&mut decoded) {
+                    return Err(Self::error(
+                        StatusCode::BAD_REQUEST,
+                        format!("invalid gzip judge request: {error}"),
+                    ));
+                }
+                if decoded.len() > MAX_JUDGE_REQUEST_BYTES {
+                    return Err(Self::error(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "decompressed judge request exceeds 2 MiB",
+                    ));
+                }
+                decoded
+            }
+            Some(encoding) => {
+                return Err(Self::error(
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    format!("unsupported judge content encoding {encoding:?}"),
+                ));
+            }
+        };
+        serde_json::from_slice(&decoded).map_err(|error| {
+            Self::error(
+                StatusCode::BAD_REQUEST,
+                format!("invalid judge request JSON: {error}"),
+            )
+        })
+    }
 }
 
 impl JudgeState {
     async fn answer(
         &self,
-        headers: &HeaderMap,
         requested_model: String,
         input: Value,
     ) -> Result<JudgeAnswer, JudgeFailure> {
-        if !self.authorized(headers) {
-            return Err(JudgeFailure {
-                status: StatusCode::UNAUTHORIZED,
-                message: "invalid judge token".to_owned(),
-            });
-        }
         let model = Model::from_str(&requested_model).map_err(|message| JudgeFailure {
             status: StatusCode::BAD_REQUEST,
             message,
@@ -244,6 +396,7 @@ impl JudgeState {
             Ok(turn) => turn.result().await,
             Err(error) => Err(error),
         };
+        let _ = agent.shutdown().await;
         let message = match result {
             Ok(result) => result.into_final_message(),
             Err(error) => {
@@ -253,7 +406,6 @@ impl JudgeState {
                 });
             }
         };
-        let _ = agent.shutdown().await;
         Ok(JudgeAnswer { model, message })
     }
 
@@ -271,12 +423,25 @@ impl Drop for JudgeRuntime {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
+        if let Ok(workers) = self.workers.lock() {
+            for worker in workers.iter() {
+                worker.abort();
+            }
+        }
         self.task.abort();
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use axum::{
+        body::to_bytes,
+        http::{HeaderValue, header::AUTHORIZATION},
+    };
+    use flate2::{Compression, write::GzEncoder};
+    use nanocodex_agent::{Nanocodex, OpenAi};
+    use std::io::Write as _;
+
     use super::*;
 
     #[test]
@@ -302,6 +467,7 @@ mod tests {
             token: Arc::from("judge-token"),
             shutdown: Some(shutdown),
             task: tokio::spawn(std::future::pending()),
+            workers: Arc::new(Mutex::new(Vec::new())),
         };
 
         let environment = runtime.verifier_environment();
@@ -313,5 +479,56 @@ mod tests {
             Some("http://192.168.127.254:43123/v1")
         );
         assert_eq!(environment.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn completed_async_answer_remains_available_after_transport_retries() {
+        let jobs = Arc::new(AsyncMutex::new(BTreeMap::from([(
+            "judge-test".to_owned(),
+            JudgeJob::Complete(Ok(JudgeAnswer {
+                model: Model::from_str("gpt-5.6-sol").unwrap(),
+                message: "stable answer".to_owned(),
+            })),
+        )])));
+        let state = JudgeState {
+            builder: Nanocodex::builder(OpenAi::new("test-key").unwrap()),
+            token: Arc::from("judge-token"),
+            jobs,
+            workers: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer judge-token"),
+        );
+
+        for _ in 0..2 {
+            let response = JudgeRuntime::poll(
+                State(state.clone()),
+                Path("judge-test".to_owned()),
+                headers.clone(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            let document: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(document["status"], "completed");
+            assert_eq!(document["output"][0]["content"][0]["text"], "stable answer");
+        }
+    }
+
+    #[test]
+    fn async_request_accepts_bounded_gzip_payloads() {
+        let body = br#"{"model":"gpt-5.6-sol","input":"grade this"}"#;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(body).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+
+        let request = JudgeRuntime::decode_request(&headers, &compressed).unwrap();
+
+        assert_eq!(request.model, "gpt-5.6-sol");
+        assert_eq!(request.input, "grade this");
     }
 }

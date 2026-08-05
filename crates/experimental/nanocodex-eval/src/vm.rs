@@ -241,6 +241,11 @@ pub struct VmProfileRunner {
     harness_auth: Option<GuestHarnessAuth>,
 }
 
+#[derive(Default)]
+struct ProfileAttemptProgress {
+    finished: usize,
+}
+
 /// OpenAI credentials staged only into selected guest CLI harness attempts.
 #[derive(Clone, Debug)]
 pub enum GuestHarnessAuth {
@@ -728,7 +733,7 @@ impl ProfileRunner for VmProfileRunner {
             resources.configure(&backend).await?;
             cold_image_and_cache = started_at.elapsed();
         }
-        let mut attempts = 0usize;
+        let mut progress = ProfileAttemptProgress::default();
         let job_directory = loop {
             let remaining = evaluator.remaining_attempts()?;
             let run = evaluator.sweep();
@@ -740,11 +745,11 @@ impl ProfileRunner for VmProfileRunner {
                 stop = request.wait_for_stop() => {
                     stop?;
                     stopped = true;
-                    let admitted = evaluator.begin_drain();
+                    let admitted = progress.current_round(evaluator.begin_drain());
                     (run.await?, admitted)
                 }
             };
-            attempts = attempts.saturating_add(results.attempts().len());
+            progress.finished_round(results.attempts().len());
             let job = recorder.finish_all(terminal_attempts).await?;
             let current_job = job.directory().to_path_buf();
             if stopped || retry_rounds >= PROFILE_INFRASTRUCTURE_RETRY_ROUNDS {
@@ -766,10 +771,24 @@ impl ProfileRunner for VmProfileRunner {
         request.complete()?;
         Ok(VmProfileRunResult {
             job_directory,
-            attempts,
+            attempts: progress.finished(),
             skipped: initial_skipped,
             infrastructure_retries,
         })
+    }
+}
+
+impl ProfileAttemptProgress {
+    const fn current_round(&self, total_admitted: usize) -> usize {
+        total_admitted.saturating_sub(self.finished)
+    }
+
+    const fn finished_round(&mut self, attempts: usize) {
+        self.finished = self.finished.saturating_add(attempts);
+    }
+
+    const fn finished(&self) -> usize {
+        self.finished
     }
 }
 

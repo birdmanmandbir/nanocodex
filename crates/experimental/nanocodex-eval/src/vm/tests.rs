@@ -59,6 +59,15 @@ fn profile_resume_reclaims_only_nonterminal_attempt_disks() {
 }
 
 #[test]
+fn profile_stop_counts_only_attempts_admitted_in_the_current_retry_round() {
+    let mut progress = ProfileAttemptProgress::default();
+    progress.finished_round(1);
+
+    assert_eq!(progress.current_round(2), 1);
+    assert_eq!(progress.finished(), 1);
+}
+
+#[test]
 fn eval_guest_memory_cap_only_reduces_large_task_allocations() {
     assert_eq!(effective_guest_memory_mb(8_192, None), 8_192);
     assert_eq!(effective_guest_memory_mb(8_192, Some(1_024)), 1_024);

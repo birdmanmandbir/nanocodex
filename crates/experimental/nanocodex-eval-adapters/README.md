@@ -14,6 +14,7 @@ third-party source at a pinned revision
 ├── GraphWalks adapter ─────────── official Parquet + published F1 grader
 ├── MRCR adapter ───────────────── typed transcript + similarity grader
 ├── HealthBench Professional ───── typed transcript + isolated rubric judge
+├── GDPval public ───────────────── workspace artifacts + pairwise judge
 └── external harness adapter ───── benchmark-owned executable semantics
                  │
                  ▼
@@ -46,6 +47,7 @@ evidence have no benchmark-specific branches.
 | GraphWalks | Reads both official Parquet partitions without flattening prompts and retains expected node sets outside the candidate VM | OpenAI's published final-line extraction and set-F1 contract; raw `f1` is authoritative |
 | MRCR v2 | Reads all six corrected official Parquet partitions and preserves alternating user/assistant messages as a hashed typed transcript | OpenAI's published prefix check and `difflib.SequenceMatcher` ratio; raw `similarity` is authoritative |
 | HealthBench Professional | Reads OpenAI's pinned 525-case release, preserves complete conversations, and keeps physician responses, canary, and rubrics outside the candidate VM | Published rubric equation and length adjustment with an evaluator-owned GPT-5.6 Sol low judge; this is a public reproduction, not the unavailable internal grader |
+| GDPval public release | Reads OpenAI's pinned 220-task Parquet release, exposes only task reference files to the candidate, and keeps expert deliverables and 10,453 human-authored rubric items verifier-only | Order-swapped pairwise comparison against the expert deliverable with an evaluator-owned GPT-5.6 Sol low judge; this is a public reproduction, not Artificial Analysis GDPval-AA v2 |
 | MLE-bench, PaperBench, and private suites | Reads a prepared generic external manifest | Benchmark-owned harness |
 
 Unsupported semantics fail during import. The adapters do not flatten
@@ -58,9 +60,12 @@ retains `similarity` for plots; both use exact-one classification for the
 generic pass axis so partial credit is not silently promoted to a passing
 attempt. HealthBench retains each rubric judgment, raw example score, response
 length, and `length_adjusted_score`; its official aggregate is the clipped mean
-of adjusted example scores, so individual values may be outside `[0, 1]`. The
-policy is part of import identity, the immutable task package, each trial lock,
-and reconstructed reports.
+of adjusted example scores, so individual values may be outside `[0, 1]`.
+GDPval retains both presentation orders, every rubric decision, retry evidence,
+and `public_score`; Artificial Analysis's exact judge panel, office-format
+patches, and Elo pipeline are not public, so this score must never be labeled
+GDPval-AA v2. The policy is part of import identity, the immutable task package,
+each trial lock, and reconstructed reports.
 
 The GPT-5.6 report's public benchmark families map onto the same small set of
 routes rather than VM modes:
@@ -74,7 +79,8 @@ routes rather than VM modes:
 | GraphWalks | installed `graphwalks` recipe pinned to OpenAI's corrected February 2026 data; the public extractor's known prefix bug is intentionally preserved and reported |
 | MRCR v2 | installed `mrcr-v2` recipe pinned to OpenAI's corrected December 2025 data and published continuous grader |
 | HealthBench Professional | installed `healthbench-professional` recipe pinned to OpenAI's 525-case public release and published scoring equation; exact internal-grader parity is unavailable |
-| Agents' Last Exam, GDPval-AA, Big Finance Bench, LifeSciBench, BrowseComp, GPQA, FrontierMath, OSWorld, BenchCAD, CTF, SEC-Bench, ExploitBench, ExploitGym, KernelGen, NanoGPT, PostTrainBench, MMMU Pro, gdp.pdf, AutomationBench, Toolathlon, and ARC-AGI-3 | Not installed until a dedicated recipe or caller-supplied official `external` manifest exists |
+| GDPval public release | installed `gdpval` recipe pinned to OpenAI's 220-task release; a public pairwise reproduction, not the unavailable GDPval-AA v2 pipeline |
+| Agents' Last Exam, Big Finance Bench, LifeSciBench, BrowseComp, GPQA, FrontierMath, OSWorld, BenchCAD, CTF, SEC-Bench, ExploitBench, ExploitGym, KernelGen, NanoGPT, PostTrainBench, MMMU Pro, gdp.pdf, AutomationBench, Toolathlon, and ARC-AGI-3 | Not installed until a dedicated recipe or caller-supplied official `external` manifest exists |
 | OpenAI-internal or unreleased suites | Not importable until the owner supplies tasks and grading semantics |
 
 DeepSWE uses one lifecycle feature beyond ordinary same-VM Harbor tasks:

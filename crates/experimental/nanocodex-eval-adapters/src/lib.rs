@@ -7,6 +7,7 @@
 
 mod arena_hard;
 mod external;
+mod gdpval;
 mod genebench_pro;
 mod graphwalks;
 mod harbor;
@@ -17,10 +18,15 @@ pub mod profile;
 mod source;
 mod swe_bench;
 
-use std::{fs, path::Path};
+use std::{
+    fs,
+    io::{BufReader, Read as _},
+    path::Path,
+};
 
 pub use arena_hard::ArenaHard;
 pub use external::ExternalHarness;
+pub use gdpval::Gdpval;
 pub use genebench_pro::GeneBenchPro;
 pub use graphwalks::GraphWalks;
 pub use harbor::HarborDataset;
@@ -34,11 +40,24 @@ pub use source::{BuiltinSourceError, BuiltinSources};
 pub use swe_bench::SweBench;
 
 fn sha256_file(path: &Path) -> Result<String, ImportError> {
-    let bytes = fs::read(path).map_err(|source| ImportError::Io {
+    let file = fs::File::open(path).map_err(|source| ImportError::Io {
         path: path.to_path_buf(),
         source,
     })?;
-    Ok(hex::encode(Sha256::digest(bytes)))
+    let mut reader = BufReader::new(file);
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).map_err(|source| ImportError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(hex::encode(digest.finalize()))
 }
 
 fn sha256_values(values: impl IntoIterator<Item = impl AsRef<[u8]>>) -> String {

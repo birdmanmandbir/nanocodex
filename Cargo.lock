@@ -5164,6 +5164,7 @@ dependencies = [
  "chrono",
  "criterion",
  "filetime",
+ "flate2",
  "fs2",
  "futures-util",
  "hex",

@@ -11,7 +11,7 @@
 use std::{
     collections::BTreeSet,
     fs::{self, OpenOptions},
-    io::{self, Write as _},
+    io::{self, Read as _, Write as _},
     os::unix::fs::PermissionsExt as _,
     path::{Component, Path, PathBuf},
     time::Duration,
@@ -127,8 +127,14 @@ pub struct Harness {
 #[derive(Clone, Debug)]
 struct GeneratedFile {
     path: PathBuf,
-    bytes: Vec<u8>,
+    contents: GeneratedFileContents,
     mode: u32,
+}
+
+#[derive(Clone, Debug)]
+enum GeneratedFileContents {
+    Inline(Vec<u8>),
+    Source(PathBuf),
 }
 
 /// Failure to inspect, normalize, store, or reload an imported dataset.
@@ -421,7 +427,7 @@ impl DatasetPlan {
                             normalized_relative(&file.path)?.as_bytes(),
                         );
                         Self::update_digest(&mut digest, &file.mode.to_le_bytes());
-                        Self::update_digest(&mut digest, &file.bytes);
+                        Self::update_generated_file(&mut digest, file)?;
                     }
                     Self::update_directory(&mut digest, &case.harness.directory)?;
                     for file in &case.harness_files {
@@ -430,7 +436,7 @@ impl DatasetPlan {
                             normalized_relative(&file.path)?.as_bytes(),
                         );
                         Self::update_digest(&mut digest, &file.mode.to_le_bytes());
-                        Self::update_digest(&mut digest, &file.bytes);
+                        Self::update_generated_file(&mut digest, file)?;
                     }
                     Self::update_digest(
                         &mut digest,
@@ -503,6 +509,34 @@ impl DatasetPlan {
             }
         }
         Ok(())
+    }
+
+    fn update_generated_file(digest: &mut Sha256, file: &GeneratedFile) -> Result<(), ImportError> {
+        match &file.contents {
+            GeneratedFileContents::Inline(bytes) => {
+                Self::update_digest(digest, bytes);
+                Ok(())
+            }
+            GeneratedFileContents::Source(path) => {
+                let mut source = fs::File::open(path).map_err(|error| io_error(path, error))?;
+                let length = source
+                    .metadata()
+                    .map_err(|error| io_error(path, error))?
+                    .len();
+                digest.update(length.to_le_bytes());
+                let mut buffer = [0_u8; 64 * 1024];
+                loop {
+                    let read = source
+                        .read(&mut buffer)
+                        .map_err(|error| io_error(path, error))?;
+                    if read == 0 {
+                        break;
+                    }
+                    digest.update(&buffer[..read]);
+                }
+                Ok(())
+            }
+        }
     }
 
     fn update_digest(digest: &mut Sha256, value: &[u8]) {
@@ -773,9 +807,31 @@ impl HermeticCasePlan {
         bytes: impl Into<Vec<u8>>,
         mode: u32,
     ) -> Result<Self, ImportError> {
-        self.case.environment_files.push(GeneratedFile::new(
+        self.case.environment_files.push(GeneratedFile::inline(
             path.into(),
             bytes.into(),
+            mode,
+            "environment",
+        )?);
+        Ok(self)
+    }
+
+    /// Snapshots one existing file into the candidate environment without
+    /// buffering its contents in the import plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ImportError`] when either path is unsafe or the source is not
+    /// an ordinary file.
+    pub fn environment_file_from(
+        mut self,
+        path: impl Into<PathBuf>,
+        source: impl Into<PathBuf>,
+        mode: u32,
+    ) -> Result<Self, ImportError> {
+        self.case.environment_files.push(GeneratedFile::source(
+            path.into(),
+            source.into(),
             mode,
             "environment",
         )?);
@@ -847,9 +903,31 @@ impl HermeticCasePlan {
         bytes: impl Into<Vec<u8>>,
         mode: u32,
     ) -> Result<Self, ImportError> {
-        self.case.harness_files.push(GeneratedFile::new(
+        self.case.harness_files.push(GeneratedFile::inline(
             path.into(),
             bytes.into(),
+            mode,
+            "harness",
+        )?);
+        Ok(self)
+    }
+
+    /// Snapshots one existing file into the verifier package without
+    /// buffering its contents in the import plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ImportError`] when either path is unsafe or the source is not
+    /// an ordinary file.
+    pub fn harness_file_from(
+        mut self,
+        path: impl Into<PathBuf>,
+        source: impl Into<PathBuf>,
+        mode: u32,
+    ) -> Result<Self, ImportError> {
+        self.case.harness_files.push(GeneratedFile::source(
+            path.into(),
+            source.into(),
             mode,
             "harness",
         )?);
@@ -858,7 +936,26 @@ impl HermeticCasePlan {
 }
 
 impl GeneratedFile {
-    fn new(path: PathBuf, bytes: Vec<u8>, mode: u32, kind: &str) -> Result<Self, ImportError> {
+    fn inline(path: PathBuf, bytes: Vec<u8>, mode: u32, kind: &str) -> Result<Self, ImportError> {
+        Self::new(path, GeneratedFileContents::Inline(bytes), mode, kind)
+    }
+
+    fn source(path: PathBuf, source: PathBuf, mode: u32, kind: &str) -> Result<Self, ImportError> {
+        if !source.is_file() {
+            return Err(ImportError::Invalid(format!(
+                "generated {kind} source is not a file: {}",
+                source.display()
+            )));
+        }
+        Self::new(path, GeneratedFileContents::Source(source), mode, kind)
+    }
+
+    fn new(
+        path: PathBuf,
+        contents: GeneratedFileContents,
+        mode: u32,
+        kind: &str,
+    ) -> Result<Self, ImportError> {
         if path.as_os_str().is_empty()
             || path.is_absolute()
             || path
@@ -870,7 +967,11 @@ impl GeneratedFile {
                 path.display()
             )));
         }
-        Ok(Self { path, bytes, mode })
+        Ok(Self {
+            path,
+            contents,
+            mode,
+        })
     }
 }
 
@@ -995,7 +1096,14 @@ fn materialize_generated_files(
         if let Some(parent) = path.parent() {
             create_dir_all(parent)?;
         }
-        fs::write(&path, file.bytes).map_err(|source| io_error(&path, source))?;
+        match file.contents {
+            GeneratedFileContents::Inline(bytes) => {
+                fs::write(&path, bytes).map_err(|source| io_error(&path, source))?;
+            }
+            GeneratedFileContents::Source(source) => {
+                fs::copy(&source, &path).map_err(|error| io_error(&source, error))?;
+            }
+        }
         fs::set_permissions(&path, fs::Permissions::from_mode(file.mode))
             .map_err(|source| io_error(&path, source))?;
     }
@@ -1246,6 +1354,13 @@ mod tests {
         benchmark_case_type: &'a str,
     }
 
+    struct PathWorkspaceImporter<'a> {
+        environment: &'a Path,
+        harness: &'a Path,
+        candidate: &'a Path,
+        verifier: &'a Path,
+    }
+
     impl DatasetImporter for FixtureImporter {
         fn plan(&self) -> Result<DatasetPlan, ImportError> {
             Ok(DatasetPlan::new(
@@ -1273,6 +1388,25 @@ mod tests {
                 .benchmark_case_type(self.benchmark_case_type)
                 .scoring_policy(self.scoring_policy)
                 .environment_file("data_files/input.csv", self.contents, 0o644)?,
+            ))
+        }
+    }
+
+    impl DatasetImporter for PathWorkspaceImporter<'_> {
+        fn plan(&self) -> Result<DatasetPlan, ImportError> {
+            Ok(DatasetPlan::new(
+                "path-workspace-input",
+                SourceIdentity::new("fixture", "fixture@1", "c".repeat(64))?,
+            )?
+            .case(
+                CasePlan::hermetic(
+                    "case-1",
+                    "Inspect the supplied data.",
+                    Environment::Dockerfile(self.environment.to_path_buf()),
+                    Harness::directory(self.harness)?,
+                )?
+                .environment_file_from("data_files/input.bin", self.candidate, 0o640)?
+                .harness_file_from("expected.bin", self.verifier, 0o600)?,
             ))
         }
     }
@@ -1382,6 +1516,61 @@ mod tests {
             })
             .unwrap();
         assert_ne!(first.digest(), changed_dimensions.digest());
+    }
+
+    #[test]
+    fn path_backed_generated_files_are_snapshotted_and_affect_identity() {
+        let source = tempdir().unwrap();
+        fs::write(
+            source.path().join("Dockerfile"),
+            "FROM debian:bookworm-slim\nCOPY data_files /workspace/data_files\n",
+        )
+        .unwrap();
+        let harness = tempdir().unwrap();
+        fs::write(
+            harness.path().join("test.sh"),
+            "#!/bin/sh\nprintf '1\\n' > \"$NANOCODEX_EVAL_VERIFIER_LOGS/reward.txt\"\n",
+        )
+        .unwrap();
+        let inputs = tempdir().unwrap();
+        let candidate = inputs.path().join("candidate.bin");
+        let verifier = inputs.path().join("verifier.bin");
+        fs::write(&candidate, b"candidate-v1").unwrap();
+        fs::write(&verifier, b"verifier-v1").unwrap();
+        let store = tempdir().unwrap();
+        let first = ImportStore::new(store.path())
+            .import(&PathWorkspaceImporter {
+                environment: source.path(),
+                harness: harness.path(),
+                candidate: &candidate,
+                verifier: &verifier,
+            })
+            .unwrap();
+
+        assert_eq!(
+            fs::read(
+                first.tasks()[0]
+                    .root()
+                    .join("environment/data_files/input.bin")
+            )
+            .unwrap(),
+            b"candidate-v1"
+        );
+        assert_eq!(
+            fs::read(first.tasks()[0].root().join("tests/expected.bin")).unwrap(),
+            b"verifier-v1"
+        );
+
+        fs::write(&candidate, b"candidate-v2").unwrap();
+        let changed = ImportStore::new(store.path())
+            .import(&PathWorkspaceImporter {
+                environment: source.path(),
+                harness: harness.path(),
+                candidate: &candidate,
+                verifier: &verifier,
+            })
+            .unwrap();
+        assert_ne!(first.digest(), changed.digest());
     }
 
     fn make_task(root: &Path, prompt: &str) {

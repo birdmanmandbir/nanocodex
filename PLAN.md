@@ -310,7 +310,10 @@ through PR #72's existing concrete importers:
   `SequenceMatcher` grader; and
 - `healthbench-professional`: OpenAI's pinned 525-case public release, typed
   conversation history, isolated rubric evidence, and published raw/length-
-  adjusted scoring contract; and
+  adjusted scoring contract;
+- `gdpval`: OpenAI's pinned 220-task public release, candidate-visible reference
+  files, verifier-only expert deliverables and rubrics, and a public pairwise
+  reproduction score; and
 - `external`: a benchmark-owned hermetic manifest for PaperBench, MLE-style,
   private, or otherwise executable benchmark semantics.
 
@@ -418,6 +421,19 @@ VM, gvproxy, or overlay processes. It scored 1.0 raw and 1.0336924 after the
 published adjustment for its 854-character response. The next ordinary `run`
 resumed the coordinate with zero model calls and reconstructed a schema-v5
 report. This is adapter/lifecycle evidence, not a release benchmark score.
+
+GDPval's public OpenAI release is now the next active benchmark shape. Its
+catalog recipe pins the 220-row Parquet object and mixed Git/LFS assets, imports
+only profile-selected task artifacts, keeps all expert deliverables and 10,453
+human-authored rubric items outside the candidate VM, and requires candidate
+deliverables in the writable workspace. Its evaluator-owned GPT-5.6 Sol low
+grader performs order-swapped pairwise comparison and retains both judgments.
+Artificial Analysis has not published the exact GDPval-AA v2 judge panel,
+office-format patches, or Elo pipeline, so the resulting `public_score` is
+differential evidence and must never be represented as an AA-v2 score. The
+current smoke has already exposed and fixed workspace-output assumptions,
+large judge-transport fragility, and a retry-round stop accounting bug; a clean
+one-physical-attempt lifecycle and remote Codex differential remain the gate.
 
 Each built-in catalog entry owns its stable user-facing name, authoritative
 source location, pinned revision, adapter choice, official verifier assets,
@@ -794,6 +810,9 @@ may hide missing coordinates or mix incompatible preparation identities.
     family. HealthBench Professional now has a pinned direct-source adapter,
     isolated subscription-backed judge, live smoke, clean resume, and retained
     report evidence; continue with the next obtainable family.
+    The public GDPval adapter and smoke profile are implemented and under live
+    durability validation; finish its clean local lifecycle and remote
+    Nanocodex/Codex comparison before accepting the next adapter as complete.
 11. [ ] Run the coordinator/runner architecture with one saturated remote
     runner on `dev-georgios`, retaining all heavyweight state on its verified
     3.5 TB drive. Add cross-host sharding only after measurements show that

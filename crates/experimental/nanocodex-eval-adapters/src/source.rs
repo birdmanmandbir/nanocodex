@@ -1,14 +1,17 @@
 use std::{
-    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     process::{Command, Output},
 };
 
-use nanocodex_eval::profile::ResolvedProfile;
+use nanocodex_eval::profile::{BenchmarkSelection, ResolvedProfile};
 use sha2::{Digest as _, Sha256};
 
-use crate::{genebench_pro::decode_manifest, profile::Benchmark};
+use crate::{
+    gdpval::{PARQUET_PATH as GDPVAL_PARQUET_PATH, asset_paths as gdpval_asset_paths},
+    genebench_pro::decode_manifest,
+    profile::Benchmark,
+};
 
 const TERMINAL_BENCH_REVISION: &str = "5c8eadf1f393183288fa08b8f73ca9a469cc5e00";
 const ARENA_HARD_REVISION: &str = "196f6b826783b3da7310e361a805fa36f0be83f3";
@@ -33,6 +36,9 @@ const MRCR_REVISION: &str = "f4c69fae7cf81f7ca26b9fee34b392a50f6b8a1d";
 const HEALTHBENCH_PROFESSIONAL_REVISION: &str = "349962fd46dd02343a0d8a606491baf59154ea1a";
 const HEALTHBENCH_PROFESSIONAL_SHA256: &str =
     "d44b08e6e952e04c945e2c406f02533d9e7a989a84e35820ee7efdff20c9e4e2";
+pub(crate) const GDPVAL_REVISION: &str = "11e7900cdcac61bc4daf59e65feb238acda98fbf";
+const GDPVAL_PARQUET_SHA256: &str =
+    "f8422fab9b21d90c0ee5f0659842ab666d418cb8940842918f9f4b0df7ae0202";
 const MRCR_FILES: [(&str, &str); 6] = [
     (
         "2needle/2needle_0.parquet",
@@ -102,20 +108,20 @@ impl BuiltinSources {
     pub async fn prepare(&self, profile: &ResolvedProfile) -> Result<(), BuiltinSourceError> {
         let selected = profile
             .selections()
-            .keys()
-            .filter(|name| Self::is_materialized(name))
-            .cloned()
-            .collect::<BTreeSet<_>>();
+            .iter()
+            .filter(|(name, _)| Self::is_materialized(name))
+            .map(|(name, selection)| (name.clone(), selection.clone()))
+            .collect::<Vec<_>>();
         fs::create_dir_all(&self.root).map_err(|source| BuiltinSourceError::Io {
             path: self.root.clone(),
             source,
         })?;
         let mut jobs = tokio::task::JoinSet::new();
-        for name in selected {
+        for (name, selection) in selected {
             let this = self.clone();
             jobs.spawn_blocking(move || {
                 tracing::info!(benchmark = %name, "preparing built-in benchmark source");
-                let result = this.materialize(&name);
+                let result = this.materialize(&name, &selection);
                 if result.is_ok() {
                     tracing::info!(benchmark = %name, "prepared built-in benchmark source");
                 }
@@ -197,6 +203,12 @@ impl BuiltinSources {
                 harness: assets.join("healthbench-professional"),
                 image: "python:3.12-slim".to_owned(),
             }),
+            "gdpval" => Ok(Benchmark::Gdpval {
+                source: self.root.join("gdpval"),
+                revision: format!("openai/gdpval@{GDPVAL_REVISION}"),
+                environment: assets.join("gdpval/environment"),
+                harness: assets.join("gdpval/verifier"),
+            }),
             other => Err(BuiltinSourceError::Unsupported(other.to_owned())),
         }
     }
@@ -213,10 +225,15 @@ impl BuiltinSources {
                 | "graphwalks"
                 | "mrcr-v2"
                 | "healthbench-professional"
+                | "gdpval"
         )
     }
 
-    fn materialize(&self, name: &str) -> Result<(), BuiltinSourceError> {
+    fn materialize(
+        &self,
+        name: &str,
+        selection: &BenchmarkSelection,
+    ) -> Result<(), BuiltinSourceError> {
         match name {
             "terminal-bench-2.1" => self.git_checkout(
                 "terminal-bench-2-1",
@@ -311,6 +328,7 @@ impl BuiltinSources {
                 ),
                 HEALTHBENCH_PROFESSIONAL_SHA256,
             ),
+            "gdpval" => self.materialize_gdpval(selection),
             other => Err(BuiltinSourceError::Unsupported(other.to_owned())),
         }
     }
@@ -402,6 +420,55 @@ impl BuiltinSources {
         Ok(())
     }
 
+    fn materialize_gdpval(&self, selection: &BenchmarkSelection) -> Result<(), BuiltinSourceError> {
+        self.git_checkout(
+            "gdpval",
+            "https://huggingface.co/datasets/openai/gdpval.git",
+            GDPVAL_REVISION,
+        )?;
+        let parquet = self.root.join("gdpval").join(GDPVAL_PARQUET_PATH);
+        validate_sha256(&parquet, GDPVAL_PARQUET_SHA256)?;
+        let assets =
+            gdpval_asset_paths(&parquet, (!selection.is_all()).then_some(selection.tasks()))
+                .map_err(|error| BuiltinSourceError::Stale(error.to_string()))?;
+        let workers = assets.len().min(16);
+        let mut buckets = vec![Vec::new(); workers];
+        for (index, asset) in assets.into_iter().enumerate() {
+            buckets[index % workers].push(asset);
+        }
+        std::thread::scope(|scope| {
+            let downloads = buckets
+                .into_iter()
+                .map(|bucket| {
+                    scope.spawn(move || {
+                        for asset in bucket {
+                            let relative = asset.to_str().ok_or_else(|| {
+                                BuiltinSourceError::Stale(format!(
+                                    "GDPval asset path is not UTF-8: {}",
+                                    asset.display()
+                                ))
+                            })?;
+                            self.materialize_checkout_lfs_file(
+                                "gdpval",
+                                relative,
+                                GDPVAL_REVISION,
+                            )?;
+                        }
+                        Ok(())
+                    })
+                })
+                .collect::<Vec<_>>();
+            for download in downloads {
+                download.join().map_err(|panic| {
+                    BuiltinSourceError::Command(format!(
+                        "GDPval download worker panicked: {panic:?}"
+                    ))
+                })??;
+            }
+            Ok(())
+        })
+    }
+
     fn git_checkout(
         &self,
         relative: &str,
@@ -424,12 +491,11 @@ impl BuiltinSources {
                     revision
                 )));
             }
-            let dirty = command_output(
-                Command::new("git")
-                    .arg("-C")
-                    .arg(&destination)
-                    .args(["status", "--porcelain"]),
-            )?;
+            let dirty = command_output(Command::new("git").arg("-C").arg(&destination).args([
+                "status",
+                "--porcelain=v1",
+                "-z",
+            ]))?;
             if !dirty.trim().is_empty() && !self.allowed_materialized_lfs(relative, &dirty)? {
                 return Err(BuiltinSourceError::Stale(format!(
                     "{} has local changes; built-in inputs must be immutable",
@@ -517,16 +583,116 @@ impl BuiltinSources {
         checkout: &str,
         status: &str,
     ) -> Result<bool, BuiltinSourceError> {
-        if checkout != "openai-evals"
-            || status.trim() != "M evals/registry/data/test_comp_sci/questions.jsonl"
-        {
+        let records = status
+            .split('\0')
+            .filter(|record| !record.is_empty())
+            .collect::<Vec<_>>();
+        if checkout == "openai-evals" {
+            if records != [" M evals/registry/data/test_comp_sci/questions.jsonl"] {
+                return Ok(false);
+            }
+            let path = self
+                .root
+                .join("openai-evals/evals/registry/data/test_comp_sci/questions.jsonl");
+            let bytes =
+                fs::read(&path).map_err(|source| BuiltinSourceError::Io { path, source })?;
+            return Ok(hex::encode(Sha256::digest(bytes)) == OPENAI_EVALS_SMOKE_DATA_SHA256);
+        }
+        if checkout != "gdpval" || records.is_empty() {
             return Ok(false);
         }
-        let path = self
-            .root
-            .join("openai-evals/evals/registry/data/test_comp_sci/questions.jsonl");
-        let bytes = fs::read(&path).map_err(|source| BuiltinSourceError::Io { path, source })?;
-        Ok(hex::encode(Sha256::digest(bytes)) == OPENAI_EVALS_SMOKE_DATA_SHA256)
+        for record in records {
+            let (status, relative) = record.split_at(3.min(record.len()));
+            if !matches!(status, " M " | " D ") {
+                return Ok(false);
+            }
+            let expected = self.checkout_object(checkout, relative)?.sha256;
+            if status == " M " {
+                let path = self.root.join(checkout).join(relative);
+                if validate_sha256(&path, &expected).is_err() {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn materialize_checkout_lfs_file(
+        &self,
+        checkout: &str,
+        relative: &str,
+        revision: &str,
+    ) -> Result<String, BuiltinSourceError> {
+        let object = self.checkout_object(checkout, relative)?;
+        let expected = object.sha256;
+        let destination = self.root.join(checkout).join(relative);
+        if destination.is_file() && validate_sha256(&destination, &expected).is_ok() {
+            return Ok(expected);
+        }
+        if let Some(bytes) = object.git_bytes {
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent).map_err(|source| BuiltinSourceError::Io {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+            }
+            fs::write(&destination, bytes).map_err(|source| BuiltinSourceError::Io {
+                path: destination.clone(),
+                source,
+            })?;
+            validate_sha256(&destination, &expected)?;
+            return Ok(expected);
+        }
+        if destination.exists() {
+            let bytes = fs::read(&destination).map_err(|source| BuiltinSourceError::Io {
+                path: destination.clone(),
+                source,
+            })?;
+            let retained = String::from_utf8_lossy(&bytes);
+            if parse_lfs_sha256(&retained).as_deref() != Some(expected.as_str()) {
+                return Err(BuiltinSourceError::Stale(format!(
+                    "{} is neither the pinned Git LFS pointer nor its object",
+                    destination.display()
+                )));
+            }
+            fs::remove_file(&destination).map_err(|source| BuiltinSourceError::Io {
+                path: destination.clone(),
+                source,
+            })?;
+        }
+        let url = format!(
+            "https://huggingface.co/datasets/openai/gdpval/resolve/{revision}/{}",
+            encode_url_path(relative)
+        );
+        self.download(&format!("{checkout}/{relative}"), &url, &expected)?;
+        Ok(expected)
+    }
+
+    fn checkout_object(
+        &self,
+        checkout: &str,
+        relative: &str,
+    ) -> Result<CheckoutObject, BuiltinSourceError> {
+        let bytes = command_bytes(
+            Command::new("git")
+                .arg("-C")
+                .arg(self.root.join(checkout))
+                .arg("show")
+                .arg(format!("HEAD:{relative}")),
+        )?;
+        if let Ok(pointer) = std::str::from_utf8(&bytes)
+            && let Some(sha256) = parse_lfs_sha256(pointer)
+        {
+            Ok(CheckoutObject {
+                sha256,
+                git_bytes: None,
+            })
+        } else {
+            Ok(CheckoutObject {
+                sha256: hex::encode(Sha256::digest(&bytes)),
+                git_bytes: Some(bytes),
+            })
+        }
     }
 
     fn materialize_lfs_file(
@@ -560,6 +726,39 @@ impl BuiltinSources {
     }
 }
 
+struct CheckoutObject {
+    sha256: String,
+    git_bytes: Option<Vec<u8>>,
+}
+
+fn parse_lfs_sha256(pointer: &str) -> Option<String> {
+    if !pointer.starts_with("version https://git-lfs.github.com/spec/v1\n") {
+        return None;
+    }
+    pointer.lines().find_map(|line| {
+        let digest = line.strip_prefix("oid sha256:")?;
+        (digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')))
+        .then(|| digest.to_owned())
+    })
+}
+
+fn encode_url_path(path: &str) -> String {
+    let mut encoded = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(b"0123456789ABCDEF"[usize::from(byte >> 4)]));
+            encoded.push(char::from(b"0123456789ABCDEF"[usize::from(byte & 0x0f)]));
+        }
+    }
+    encoded
+}
+
 fn validate_sha256(path: &Path, expected: &str) -> Result<(), BuiltinSourceError> {
     let bytes = fs::read(path).map_err(|source| BuiltinSourceError::Io {
         path: path.to_path_buf(),
@@ -591,6 +790,14 @@ fn command_output(command: &mut Command) -> Result<String, BuiltinSourceError> {
         .map_err(|error| BuiltinSourceError::Command(format!("{rendered}: {error}")))?;
     let output = ensure_success(rendered, output)?;
     String::from_utf8(output.stdout).map_err(|error| BuiltinSourceError::Command(error.to_string()))
+}
+
+fn command_bytes(command: &mut Command) -> Result<Vec<u8>, BuiltinSourceError> {
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .map_err(|error| BuiltinSourceError::Command(format!("{rendered}: {error}")))?;
+    Ok(ensure_success(rendered, output)?.stdout)
 }
 
 fn ensure_success(rendered: String, output: Output) -> Result<Output, BuiltinSourceError> {
