@@ -78,20 +78,33 @@ web_search = true
 
 [profiles.arc-agi-3-smoke]
 harnesses = ["codex", "nanocodex"]
-tasks = ["arc-agi-3-public-smoke/ls20-9607627b"]
+tasks = [
+  "arc-agi-3-public-smoke/ls20-9607627b",
+  "arc-agi-3-public-smoke/tn36-ef4dde99",
+  "arc-agi-3-public-smoke/sb26-7fbdac44",
+]
 trials = 1
 model = ["gpt-5.6-sol"]
 thinking = ["low"]
 
 [profiles.arc-agi-3-smoke-native]
-tasks = ["arc-agi-3-public-smoke/ls20-9607627b"]
+tasks = [
+  "arc-agi-3-public-smoke/ls20-9607627b",
+  "arc-agi-3-public-smoke/tn36-ef4dde99",
+  "arc-agi-3-public-smoke/sb26-7fbdac44",
+]
 trials = 1
 model = ["gpt-5.6-sol"]
 thinking = ["low"]
 
 [profiles.agents-last-exam-smoke]
 harnesses = ["codex", "nanocodex"]
-tasks = ["agents-last-exam/branch_bound_atsp"]
+tasks = [
+  "agents-last-exam/branch_bound_atsp",
+  "agents-last-exam/basel_operational_risk_bia_cn",
+  "agents-last-exam/financial_stmt_reconstruction_aapl_fy2024",
+  "agents-last-exam/atwood_2022_measles_vaccine_reproduction",
+]
 trials = 1
 model = ["gpt-5.6-sol"]
 thinking = ["low"]

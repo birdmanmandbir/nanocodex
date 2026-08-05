@@ -15,7 +15,33 @@ use serde::Deserialize;
 
 use crate::{sha256_file, sha256_values};
 
-const TASK_ID: &str = "computing_math/branch_bound_atsp";
+const TASKS: [AleTask; 4] = [
+    AleTask::new("computing_math/branch_bound_atsp", "branch_bound_atsp"),
+    AleTask::new(
+        "business_finance/basel_operational_risk_bia_cn",
+        "basel_operational_risk_bia_cn",
+    ),
+    AleTask::new(
+        "business_finance/financial_stmt_reconstruction_aapl_fy2024",
+        "financial_stmt_reconstruction_aapl_fy2024",
+    ),
+    AleTask::new(
+        "social_sciences/atwood_2022_measles_vaccine_reproduction",
+        "atwood_2022_measles_vaccine_reproduction",
+    ),
+];
+
+#[derive(Clone, Copy, Debug)]
+struct AleTask {
+    source_id: &'static str,
+    case_id: &'static str,
+}
+
+impl AleTask {
+    const fn new(source_id: &'static str, case_id: &'static str) -> Self {
+        Self { source_id, case_id }
+    }
+}
 
 /// Berkeley RDI's public Agents' Last Exam CLI-compatible Linux task package.
 #[derive(Clone, Debug)]
@@ -51,75 +77,84 @@ impl AgentsLastExam {
 impl DatasetImporter for AgentsLastExam {
     fn plan(&self) -> Result<DatasetPlan, ImportError> {
         let source = canonical_directory(&self.source, "ALE source checkout")?;
-        let task_root = source.join("tasks").join(TASK_ID);
-        let task_card_path = task_root.join("task_card.json");
-        let task_card_bytes = read_file(&task_card_path)?;
-        let task_card: TaskCard = serde_json::from_slice(&task_card_bytes).map_err(|error| {
-            ImportError::Invalid(format!(
-                "failed to decode {}: {error}",
-                task_card_path.display()
-            ))
-        })?;
-        if task_card.task_id != TASK_ID {
-            return Err(ImportError::Invalid(format!(
-                "ALE task card has taskId {:?}, expected {TASK_ID:?}",
-                task_card.task_id
-            )));
-        }
-        let timeout = task_card.vm.timeout_seconds()?;
-        let scorer = task_root.join("scripts/score_outputs.py");
-        let data_root = canonical_directory(
-            &self.task_data.join(TASK_ID).join("base"),
-            "ALE branch_bound_atsp task data",
-        )?;
+        let mut source_digests = Vec::new();
+        let mut cases = Vec::with_capacity(TASKS.len());
+        for recipe in TASKS {
+            let task_root = source.join("tasks").join(recipe.source_id);
+            let task_card_path = task_root.join("task_card.json");
+            let task_card_bytes = read_file(&task_card_path)?;
+            let task_card: TaskCard =
+                serde_json::from_slice(&task_card_bytes).map_err(|error| {
+                    ImportError::Invalid(format!(
+                        "failed to decode {}: {error}",
+                        task_card_path.display()
+                    ))
+                })?;
+            if task_card.task_id != recipe.source_id {
+                return Err(ImportError::Invalid(format!(
+                    "ALE task card has taskId {:?}, expected {:?}",
+                    task_card.task_id, recipe.source_id
+                )));
+            }
+            let timeout = task_card.vm.timeout_seconds()?;
+            let scorer = task_root.join("scripts/score_outputs.py");
+            let data_root = canonical_directory(
+                &self.task_data.join(recipe.source_id).join("base"),
+                "ALE selected task data",
+            )?;
 
-        let mut source_digests = vec![sha256_values([&task_card_bytes]), sha256_file(&scorer)?];
-        let mut task = CasePlan::hermetic(
-            "branch_bound_atsp",
-            task_card.task_prompt,
-            self.environment.clone(),
-            self.harness.clone(),
-        )?
-        .benchmark_case_type("ale-cli-linux")
-        .resources(Resources {
-            cpus: 4,
-            memory_mb: 15_360,
-            storage_mb: 204_800,
-            gpus: 0,
-        })
-        .timeouts(Duration::from_secs(timeout), Duration::from_secs(900))
-        .scoring_policy(ScoringPolicy::AllRewardsOne)
-        // ALE's published agent configurations explicitly permit internet
-        // access; task-level prompts remain authoritative about prohibited
-        // external solvers or replacement inputs.
-        .allow_internet(true)
-        .harness_file_from("score_outputs.py", &scorer, file_mode(&scorer)?)?;
+            source_digests.push(sha256_values([&task_card_bytes]));
+            source_digests.push(sha256_file(&scorer)?);
+            let mut task = CasePlan::hermetic(
+                recipe.case_id,
+                task_card.task_prompt,
+                self.environment.clone(),
+                self.harness.clone(),
+            )?
+            .benchmark_case_type("ale-cli-linux")
+            .resources(Resources {
+                cpus: 4,
+                memory_mb: 15_360,
+                storage_mb: 204_800,
+                gpus: 0,
+            })
+            .timeouts(Duration::from_secs(timeout), Duration::from_secs(900))
+            .scoring_policy(ScoringPolicy::AllRewardsOne)
+            // ALE's published agent configurations explicitly permit internet
+            // access; task-level prompts remain authoritative about prohibited
+            // external solvers or replacement inputs.
+            .allow_internet(true)
+            .harness_file_from("score_outputs.py", &scorer, file_mode(&scorer)?)?;
 
-        for relative in ["input", "software"] {
-            let root = data_root.join(relative);
-            for file in regular_files(&root)? {
-                let nested = file.strip_prefix(&data_root).map_err(|error| {
-                    ImportError::Invalid(format!("failed to relativize ALE task data: {error}"))
+            for relative in ["input", "software"] {
+                let root = data_root.join(relative);
+                for file in regular_files(&root)? {
+                    let nested = file.strip_prefix(&data_root).map_err(|error| {
+                        ImportError::Invalid(format!("failed to relativize ALE task data: {error}"))
+                    })?;
+                    source_digests.push(sha256_file(&file)?);
+                    task = task.environment_file_from(
+                        Path::new("base").join(nested),
+                        &file,
+                        file_mode(&file)?,
+                    )?;
+                }
+            }
+            let references = data_root.join("reference");
+            for file in regular_files(&references)? {
+                let nested = file.strip_prefix(&references).map_err(|error| {
+                    ImportError::Invalid(format!(
+                        "failed to relativize ALE reference data: {error}"
+                    ))
                 })?;
                 source_digests.push(sha256_file(&file)?);
-                task = task.environment_file_from(
-                    Path::new("base").join(nested),
+                task = task.harness_file_from(
+                    Path::new("reference").join(nested),
                     &file,
                     file_mode(&file)?,
                 )?;
             }
-        }
-        let references = data_root.join("reference");
-        for file in regular_files(&references)? {
-            let nested = file.strip_prefix(&references).map_err(|error| {
-                ImportError::Invalid(format!("failed to relativize ALE reference data: {error}"))
-            })?;
-            source_digests.push(sha256_file(&file)?);
-            task = task.harness_file_from(
-                Path::new("reference").join(nested),
-                &file,
-                file_mode(&file)?,
-            )?;
+            cases.push(task);
         }
 
         let source = SourceIdentity::new(
@@ -127,7 +162,11 @@ impl DatasetImporter for AgentsLastExam {
             &self.revision,
             sha256_values(source_digests.iter().map(String::as_bytes)),
         )?;
-        Ok(DatasetPlan::new("agents-last-exam", source)?.case(task))
+        let mut plan = DatasetPlan::new("agents-last-exam", source)?;
+        for case in cases {
+            plan = plan.case(case);
+        }
+        Ok(plan)
     }
 }
 
@@ -245,56 +284,58 @@ mod tests {
             ))
             .unwrap();
 
-        let task = &dataset.tasks()[0];
-        assert_eq!(task.name(), "branch_bound_atsp");
-        assert_eq!(task.network(), NetworkPolicy::Public);
-        assert_eq!(
-            task.verifier().scoring_policy(),
-            ScoringPolicy::AllRewardsOne
-        );
-        assert!(
-            task.root()
-                .join("environment/base/input/problem_spec.md")
-                .is_file()
-        );
-        assert!(
-            task.root()
-                .join("environment/base/software/python")
-                .is_file()
-        );
-        assert!(
-            !task
-                .root()
-                .join("environment/base/reference/results.json")
-                .exists()
-        );
-        assert!(task.root().join("tests/reference/results.json").is_file());
-        assert!(task.root().join("tests/score_outputs.py").is_file());
+        assert_eq!(dataset.tasks().len(), 4);
+        for task in dataset.tasks() {
+            assert_eq!(task.network(), NetworkPolicy::Public);
+            assert_eq!(
+                task.verifier().scoring_policy(),
+                ScoringPolicy::AllRewardsOne
+            );
+            assert!(
+                task.root()
+                    .join("environment/base/input/input.txt")
+                    .is_file()
+            );
+            assert!(
+                task.root()
+                    .join("environment/base/software/python")
+                    .is_file()
+            );
+            assert!(
+                !task
+                    .root()
+                    .join("environment/base/reference/gold.json")
+                    .exists()
+            );
+            assert!(task.root().join("tests/reference/gold.json").is_file());
+            assert!(task.root().join("tests/score_outputs.py").is_file());
+        }
     }
 
     fn make_fixture(root: &Path) {
-        let task = root.join("source/tasks/computing_math/branch_bound_atsp");
-        fs::create_dir_all(task.join("scripts")).unwrap();
-        fs::write(
-            task.join("task_card.json"),
-            r#"{
-  "taskId":"computing_math/branch_bound_atsp",
-  "taskPrompt":"Solve it and write base/output/results.json.",
-  "vm":{"timeout":14400}
-}"#,
-        )
-        .unwrap();
-        fs::write(
-            task.join("scripts/score_outputs.py"),
-            "def score(output, reference):\n    return {'score': 1.0}\n",
-        )
-        .unwrap();
-        let data = root.join("task-data/computing_math/branch_bound_atsp/base");
-        fs::create_dir_all(data.join("input")).unwrap();
-        fs::create_dir_all(data.join("software")).unwrap();
-        fs::create_dir_all(data.join("reference")).unwrap();
-        fs::write(data.join("input/problem_spec.md"), "problem").unwrap();
-        fs::write(data.join("software/python"), "#!/bin/sh\n").unwrap();
-        fs::write(data.join("reference/results.json"), "{}\n").unwrap();
+        for recipe in super::TASKS {
+            let task = root.join("source/tasks").join(recipe.source_id);
+            fs::create_dir_all(task.join("scripts")).unwrap();
+            fs::write(
+                task.join("task_card.json"),
+                format!(
+                    "{{\"taskId\":{task_id:?},\"taskPrompt\":\"Solve it.\",\"vm\":{{\"timeout\":7200}}}}",
+                    task_id = recipe.source_id
+                ),
+            )
+            .unwrap();
+            fs::write(
+                task.join("scripts/score_outputs.py"),
+                "def score(output, reference):\n    return {'score': 1.0}\n",
+            )
+            .unwrap();
+            let data = root.join("task-data").join(recipe.source_id).join("base");
+            fs::create_dir_all(data.join("input")).unwrap();
+            fs::create_dir_all(data.join("software")).unwrap();
+            fs::create_dir_all(data.join("reference")).unwrap();
+            fs::write(data.join("input/input.txt"), "input").unwrap();
+            fs::write(data.join("software/python"), "#!/bin/sh\n").unwrap();
+            fs::write(data.join("reference/gold.json"), "{}\n").unwrap();
+        }
     }
 }

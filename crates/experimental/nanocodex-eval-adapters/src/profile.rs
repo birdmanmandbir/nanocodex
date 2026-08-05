@@ -1264,6 +1264,9 @@ thinking = ["low"]
         let (_, ale) = BenchmarkCatalog::new()
             .load_profile(&manifest, Some("agents-last-exam-smoke"))
             .unwrap();
+        let (_, arc) = BenchmarkCatalog::new()
+            .load_profile(&manifest, Some("arc-agi-3-smoke-native"))
+            .unwrap();
         let mut selected = native
             .selections()
             .keys()
@@ -1294,6 +1297,8 @@ thinking = ["low"]
         );
         assert!(native.harnesses().is_empty());
         assert!(browsing.web_search());
+        assert_eq!(arc.selections()["arc-agi-3-public-smoke"].tasks().len(), 3);
+        assert_eq!(ale.selections()["agents-last-exam"].tasks().len(), 4);
     }
 
     fn make_harness(path: &Path) -> PathBuf {

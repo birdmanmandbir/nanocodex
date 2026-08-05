@@ -326,18 +326,20 @@ through PR #72's existing concrete importers:
   capability, and explicitly labeled subscription-judge reproduction without
   installing the generic deprecated `simple-evals` suite; and
 - `arc-agi-3`: ARC Prize's pinned public interactive API and scorecard contract.
-  The initial task-owned `ls20` command is a deliberately action-capped adapter
-  plumbing smoke: its official environment scorecard is retained as evidence,
-  but it is never labeled RHAE or reported as an official benchmark score. A
+  The task-owned `ls20`, `tn36`, and `sb26` commands form a deliberately
+  action-capped keyboard, click, and mixed-control adapter smoke: each official
+  environment scorecard is retained as evidence, but none is labeled RHAE or
+  reported as an official benchmark score. A
   comparable run remains gated on an evaluator-owned per-frame model-turn loop,
   authoritative state and credential isolation, and cleanup on every exit; and
 - `agents-last-exam`: Berkeley RDI's pinned framework, gated official task-data
   revision, published Linux environment digest, and hidden-reference scoring
-  boundary. The first vertical slice is the CLI-compatible
-  `computing_math/branch_bound_atsp` task; preparation acquires the 44.4 GB
-  gated data archive once, stages only candidate-visible `input/` and
-  `software/`, and keeps `reference/` plus the official scorer in the pristine
-  verifier. Expanding the remaining CLI-compatible Linux tasks requires
+  boundary. The first vertical slice covers four CLI-compatible tasks across
+  algorithmic optimization, spreadsheet classification, PDF/HTML extraction,
+  and economics reproduction; preparation acquires the 44.4 GB gated data
+  archive once, stages only candidate-visible `input/` and `software/`, and
+  keeps `reference/` plus each official scorer in the pristine verifier.
+  Expanding the remaining CLI-compatible Linux tasks requires
   translating each published scorer without exposing references; and
 - `external`: a benchmark-owned hermetic manifest for PaperBench, MLE-style,
   private, or otherwise executable benchmark semantics.
