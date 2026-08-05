@@ -11,6 +11,7 @@ use crate::{
     AtifTrajectory, BillingCompleteness, EvalArtifacts, EvalCleanup, EvalEnvironment, EvalEvent,
     EvalEventAttempt, EvalEventKind, EvalEvents, EvalException, EvalExceptionKind, EvalFailure,
     EvalFailureTiming, EvalOutcome, Evaluator, PhaseTiming, Sweep, Task,
+    aggregate::AggregateRunTiming,
 };
 use chrono::{DateTime, Utc};
 use nanocodex_agent::{Nanocodex, OpenAi};
@@ -246,10 +247,20 @@ fn aggregate_reconstructs_every_durable_trial_with_sweep_provenance() {
         id: eval.id(),
         directory: eval.directory().to_path_buf(),
     };
+    job.record_run_timing(AggregateRunTiming {
+        cold_image_and_cache_ns: 42,
+    })
+    .unwrap();
 
     let aggregate = job.aggregate_dataset().unwrap();
 
     assert_eq!(aggregate.attempts.len(), 2);
+    assert_eq!(
+        aggregate
+            .run_timing
+            .map(|timing| timing.cold_image_and_cache_ns),
+        Some(42)
+    );
     assert_eq!(aggregate.attempts[0].attempt_id, first);
     assert_eq!(aggregate.attempts[0].configuration.id, "recipe__variant");
     assert_eq!(aggregate.attempts[0].repetition, 1);

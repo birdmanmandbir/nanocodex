@@ -4,7 +4,7 @@ use std::{cmp::Ordering, collections::BTreeMap, path::PathBuf};
 
 use chrono::{DateTime, Utc};
 use nanocodex_oai_api::pricing::EstimatedUsdCost;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
@@ -314,7 +314,7 @@ pub struct AggregateDataset {
 }
 
 /// Run-level latency that cannot be assigned honestly to one attempt.
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct AggregateRunTiming {
     /// Image resolution, rootfs preparation, and shared verifier cache setup.
     pub cold_image_and_cache_ns: u64,

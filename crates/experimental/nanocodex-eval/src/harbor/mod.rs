@@ -51,6 +51,7 @@ use crate::{
     EvalEventStream, EvalEventStreamError, EvalExceptionKind, EvalFailure, EvalOutcome, EvalResult,
     Evaluator, LatencyBreakdown, MeasurementCompleteness, PhaseTiming, Task, TaskLoadError,
     UsageTotals,
+    aggregate::AggregateRunTiming,
     digest::PACKAGE_DIGEST_SCHEMA,
     durable::scan_manifest_trials,
     sweep::{RunCoordinate, RunManifest},
@@ -62,6 +63,8 @@ use url::Url;
 use uuid::Uuid;
 
 use checksum::{directory_hash, packager_content_hash};
+
+const RUN_TIMING_FILE: &str = "run-timing.json";
 
 #[derive(Debug, thiserror::Error)]
 /// An error produced while recording or publishing Harbor-compatible artifacts.
@@ -341,7 +344,19 @@ impl HarborJob {
                     right.attempt_id,
                 ))
         });
-        Ok(AggregateDataset::new(attempts))
+        let aggregate = AggregateDataset::new(attempts);
+        let timing = HarborArtifacts::read_json_if_exists::<AggregateRunTiming>(
+            &self.directory.join(RUN_TIMING_FILE),
+        )?;
+        Ok(match timing {
+            Some(timing) => aggregate.with_run_timing(timing),
+            None => aggregate,
+        })
+    }
+
+    /// Durably records shared cold preparation latency for reconstructed reports.
+    pub fn record_run_timing(&self, timing: AggregateRunTiming) -> Result<(), HarborError> {
+        HarborArtifacts::write_json(&self.directory.join(RUN_TIMING_FILE), &timing)
     }
 }
 

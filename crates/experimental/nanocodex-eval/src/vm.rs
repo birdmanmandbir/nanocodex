@@ -46,6 +46,8 @@ use tokio::{
 };
 use tracing::{info, info_span, warn};
 
+use crate::aggregate::AggregateRunTiming;
+
 pub use nanocodex_vm::{
     host::SharedDirectory,
     image::{
@@ -65,7 +67,7 @@ use crate::{
     evaluator::{
         AttemptAgent, AttemptVerification, AttemptVerificationFailure, AttemptVerifier, EvalAttempt,
     },
-    harbor::{Harbor, HarborError},
+    harbor::{Harbor, HarborError, HarborJob},
     profile::{
         PreparationReceipt, PreparedHarness, ProfileRunPlanError, ProfileRunRequest, ProfileRunner,
     },
@@ -715,13 +717,16 @@ impl ProfileRunner for VmProfileRunner {
         let mut retry_rounds = usize::from(infrastructure_retries > 0);
         let initial_remaining = evaluator.remaining_attempts()?;
         let initial_skipped = planned_attempts.saturating_sub(initial_remaining);
+        let mut cold_image_and_cache = Duration::ZERO;
         if initial_remaining > 0 {
+            let started_at = Instant::now();
             let resources = VmResources::builder(self.vmm, self.runtime_image)
                 .tasks(tasks)
                 .cache_directory(request.cache_directory())
                 .prepare()
                 .await?;
             resources.configure(&backend).await?;
+            cold_image_and_cache = started_at.elapsed();
         }
         let mut attempts = 0usize;
         let job_directory = loop {
@@ -752,6 +757,12 @@ impl ProfileRunner for VmProfileRunner {
             infrastructure_retries = infrastructure_retries.saturating_add(retryable);
             retry_rounds = retry_rounds.saturating_add(1);
         };
+        if initial_remaining > 0 {
+            HarborJob::open(&job_directory)?.record_run_timing(AggregateRunTiming {
+                cold_image_and_cache_ns: u64::try_from(cold_image_and_cache.as_nanos())
+                    .unwrap_or(u64::MAX),
+            })?;
+        }
         request.complete()?;
         Ok(VmProfileRunResult {
             job_directory,
