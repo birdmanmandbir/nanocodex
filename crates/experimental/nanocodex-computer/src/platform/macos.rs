@@ -21,7 +21,7 @@ use nanocodex_computer_macos::{
     window as native_window_by_id,
 };
 use sha2::{Digest as _, Sha256};
-use tracing::{Instrument as _, Span, field::Empty, info_span};
+use tracing::{Instrument as _, Span, field::Empty, info, info_span};
 
 use super::Backend;
 use crate::{
@@ -37,6 +37,8 @@ const MAX_TREE_DEPTH: usize = 80;
 const MAX_RETAINED_SCREENSHOTS: usize = 16;
 const ACCESSIBILITY_PRIME_ELEMENTS: usize = 64;
 const ACCESSIBILITY_PRIME_THRESHOLD: usize = 12;
+const ACCESSIBILITY_PRIME_TIMEOUT: Duration = Duration::from_secs(5);
+const APPLICATION_ACTIVATION_TIMEOUT: Duration = Duration::from_millis(750);
 
 #[derive(Clone)]
 struct Target {
@@ -670,26 +672,27 @@ fn prime_application_accessibility(
     let target = select_target(ApplicationSelector::BundleId(bundle_id.to_owned()), None)?;
     let pid = target.application.pid;
     let observation = (|| {
-        let initial_elements = accessibility_elements(&target, ACCESSIBILITY_PRIME_ELEMENTS)?.len();
+        let initial_elements = accessibility_element_count(&target, ACCESSIBILITY_PRIME_ELEMENTS)?;
         let mut final_elements = initial_elements;
         let needs_activation = initial_elements <= ACCESSIBILITY_PRIME_THRESHOLD;
         let activated = needs_activation
             && frontmost_application_pid() != Some(pid)
             && activate_application(pid);
         if needs_activation {
-            let deadline = Instant::now() + Duration::from_millis(750);
+            let deadline = Instant::now() + ACCESSIBILITY_PRIME_TIMEOUT;
             while final_elements <= ACCESSIBILITY_PRIME_THRESHOLD && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(50));
                 final_elements =
-                    accessibility_elements(&target, ACCESSIBILITY_PRIME_ELEMENTS)?.len();
+                    accessibility_element_count(&target, ACCESSIBILITY_PRIME_ELEMENTS)?;
             }
         }
         Ok::<_, ComputerError>((initial_elements, final_elements, activated))
     })();
+    let activation_requested = observation
+        .as_ref()
+        .is_ok_and(|(_, _, activated)| *activated);
     let focus_restored = previous_frontmost.is_some_and(|previous| {
-        previous != pid
-            && frontmost_application_pid() == Some(pid)
-            && activate_application(previous)
+        previous != pid && restore_frontmost_application(previous, pid, activation_requested)
     });
     let (initial_elements, final_elements, activated) = observation?;
     Ok(ApplicationPriming {
@@ -699,6 +702,23 @@ fn prime_application_accessibility(
         activated,
         focus_restored,
     })
+}
+
+fn restore_frontmost_application(previous: i32, target: i32, activation_requested: bool) -> bool {
+    if activation_requested {
+        wait_for_frontmost_application(target, APPLICATION_ACTIVATION_TIMEOUT);
+    }
+    frontmost_application_pid() == Some(previous)
+        || activate_application(previous)
+            && wait_for_frontmost_application(previous, APPLICATION_ACTIVATION_TIMEOUT)
+}
+
+fn wait_for_frontmost_application(pid: i32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while frontmost_application_pid() != Some(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    frontmost_application_pid() == Some(pid)
 }
 
 enum NativeAction {
@@ -1017,10 +1037,35 @@ fn accessibility_elements(
             message: format!("failed to configure accessibility timeout: {error}"),
         })?;
     enable_application_accessibility(&application);
-    let root = select_accessibility_window(&application, target).unwrap_or(application);
+    let (root, match_strategy) =
+        select_accessibility_window(&application, target).ok_or_else(|| {
+            ComputerError::TargetNotFound {
+                message: format!(
+                    "window {} is capturable but has no matching accessibility window",
+                    target.window.id
+                ),
+            }
+        })?;
+    info!(
+        target: "nanocodex_computer",
+        window_id = target.window.id,
+        match_strategy,
+        "matched the attached capture window to its accessibility window"
+    );
     let mut raw = Vec::with_capacity(maximum_elements.min(256));
     walk_accessibility(&root, 0, maximum_elements, &mut raw);
     Ok(raw)
+}
+
+fn accessibility_element_count(
+    target: &Target,
+    maximum_elements: usize,
+) -> Result<usize, ComputerError> {
+    match accessibility_elements(target, maximum_elements) {
+        Ok(elements) => Ok(elements.len()),
+        Err(ComputerError::TargetNotFound { .. }) => Ok(0),
+        Err(error) => Err(error),
+    }
 }
 
 fn enable_application_accessibility(application: &AXUIElement) {
@@ -1035,21 +1080,69 @@ fn enable_application_accessibility(application: &AXUIElement) {
     span.record("computer.accessibility.enhanced", enablement.enhanced);
 }
 
-fn select_accessibility_window(application: &AXUIElement, target: &Target) -> Option<AXUIElement> {
+fn select_accessibility_window(
+    application: &AXUIElement,
+    target: &Target,
+) -> Option<(AXUIElement, &'static str)> {
     let windows = application.windows().ok()?;
-    windows
+    let mut candidates = windows
         .iter()
-        .find(|window| {
-            target.window.title.as_ref().is_some_and(|title| {
-                #[allow(clippy::cmp_owned)]
-                window
-                    .title()
-                    .is_ok_and(|candidate| candidate.to_string() == *title)
-            })
+        .filter(|window| accessibility_window_candidate(window))
+        .map(|window| {
+            let window = (*window).clone();
+            let title = string_attribute(window.title());
+            let frame = element_rect(&window).map(|(x, y, width, height)| Rect {
+                x,
+                y,
+                width,
+                height,
+            });
+            (window, title, frame)
         })
-        .map(|window| (*window).clone())
-        .or_else(|| application.focused_window().ok())
-        .or_else(|| application.main_window().ok())
+        .collect::<Vec<_>>();
+    if let Some((window, _, _)) = candidates
+        .iter()
+        .filter_map(|candidate @ (_, _, frame)| {
+            let frame =
+                frame.filter(|frame| matching_window_frames(*frame, target.window.frame))?;
+            Some((candidate, window_frame_distance(frame, target.window.frame)))
+        })
+        .min_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(candidate, _)| candidate)
+    {
+        return Some((window.clone(), "frame"));
+    }
+
+    if let Some(title) = target.window.title.as_deref() {
+        let mut matching_titles = candidates
+            .iter()
+            .filter(|(_, candidate, _)| candidate.as_deref() == Some(title));
+        let matching = matching_titles.next();
+        if matching.is_some() && matching_titles.next().is_none() {
+            return matching.map(|(window, _, _)| (window.clone(), "unique_title"));
+        }
+    }
+
+    (candidates.len() == 1).then(|| (candidates.swap_remove(0).0, "only_window"))
+}
+
+fn accessibility_window_candidate(element: &AXUIElement) -> bool {
+    string_attribute(element.role()).as_deref() == Some("AXWindow")
+}
+
+fn matching_window_frames(left: Rect, right: Rect) -> bool {
+    const EDGE_TOLERANCE_POINTS: f64 = 8.0;
+    (left.x - right.x).abs() <= EDGE_TOLERANCE_POINTS
+        && (left.y - right.y).abs() <= EDGE_TOLERANCE_POINTS
+        && (left.width - right.width).abs() <= EDGE_TOLERANCE_POINTS
+        && (left.height - right.height).abs() <= EDGE_TOLERANCE_POINTS
+}
+
+fn window_frame_distance(left: Rect, right: Rect) -> f64 {
+    (left.x - right.x).abs()
+        + (left.y - right.y).abs()
+        + (left.width - right.width).abs()
+        + (left.height - right.height).abs()
 }
 
 fn walk_accessibility(
@@ -1148,6 +1241,11 @@ fn truncate(value: String, maximum: usize) -> String {
 }
 
 fn reference_for(generation: u64, index: usize, element: &Element) -> ElementRef {
+    let hash = element_hash(element);
+    ElementRef(format!("e{generation}_{index}_{hash:016x}"))
+}
+
+fn element_hash(element: &Element) -> u64 {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in format!(
         "{}\0{:?}\0{:?}\0{:?}\0{:?}",
@@ -1158,7 +1256,7 @@ fn reference_for(generation: u64, index: usize, element: &Element) -> ElementRef
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    ElementRef(format!("e{generation}_{index}_{hash:016x}"))
+    hash
 }
 
 fn resolve_element(
@@ -1167,35 +1265,58 @@ fn resolve_element(
     maximum: usize,
     reference: &ElementRef,
 ) -> Result<(Element, AXUIElement), ComputerError> {
-    let raw_index =
-        reference_index(reference, generation).ok_or_else(|| ComputerError::StaleReference {
+    let (raw_index, expected_hash) =
+        reference_parts(reference, generation).ok_or_else(|| ComputerError::StaleReference {
             reference: reference.0.clone(),
         })?;
-    let element = accessibility_elements(target, maximum)?
-        .into_iter()
-        .nth(raw_index)
-        .ok_or_else(|| ComputerError::StaleReference {
+    let elements = accessibility_elements(target, maximum)?;
+    if let Some(element) = elements.get(raw_index) {
+        let mut public = public_element(element, generation, raw_index);
+        if should_include(&public) && element_hash(&public) == expected_hash {
+            public.reference = reference.clone();
+            return Ok((public, element.clone()));
+        }
+    }
+
+    let mut relocated = None;
+    for (current_index, element) in elements.into_iter().enumerate() {
+        if current_index == raw_index {
+            continue;
+        }
+        let mut public = public_element(&element, generation, current_index);
+        if !should_include(&public) || element_hash(&public) != expected_hash {
+            continue;
+        }
+        if relocated.is_some() {
+            return Err(ComputerError::StaleReference {
+                reference: reference.0.clone(),
+            });
+        }
+        public.reference = reference.clone();
+        relocated = Some((current_index, public, element));
+    }
+    let (relocated_index, public, element) =
+        relocated.ok_or_else(|| ComputerError::StaleReference {
             reference: reference.0.clone(),
         })?;
-    let mut public = public_element(&element, generation, raw_index);
-    if !should_include(&public) {
-        return Err(ComputerError::StaleReference {
-            reference: reference.0.clone(),
-        });
-    }
-    public.reference = reference_for(generation, raw_index, &public);
-    if public.reference != *reference {
-        return Err(ComputerError::StaleReference {
-            reference: reference.0.clone(),
-        });
-    }
+    info!(
+        target: "nanocodex_computer",
+        generation,
+        hinted_index = raw_index,
+        relocated_index,
+        "relocated a generation-valid accessibility reference after tree reordering"
+    );
     Ok((public, element))
 }
 
-fn reference_index(reference: &ElementRef, generation: u64) -> Option<usize> {
+fn reference_parts(reference: &ElementRef, generation: u64) -> Option<(usize, u64)> {
     let remainder = reference.0.strip_prefix(&format!("e{generation}_"))?;
     let (index, hash) = remainder.split_once('_')?;
-    (!hash.is_empty()).then(|| index.parse().ok()).flatten()
+    let index = index.parse().ok()?;
+    let hash = (hash.len() == 16)
+        .then(|| u64::from_str_radix(hash, 16).ok())
+        .flatten()?;
+    Some((index, hash))
 }
 
 fn resolve_point(
@@ -1798,10 +1919,38 @@ mod tests {
     }
 
     #[test]
-    fn element_reference_exposes_only_its_generation_scoped_raw_index() {
-        let reference = ElementRef("e7_42_deadbeef".to_owned());
-        assert_eq!(reference_index(&reference, 7), Some(42));
-        assert_eq!(reference_index(&reference, 8), None);
-        assert_eq!(reference_index(&ElementRef("e7_42".to_owned()), 7), None);
+    fn accessibility_window_matching_tolerates_coordinate_rounding_only() {
+        let capture = Rect {
+            x: 864.0,
+            y: 33.0,
+            width: 480.0,
+            height: 1_083.0,
+        };
+        assert!(matching_window_frames(
+            Rect {
+                x: 865.0,
+                height: 1_082.0,
+                ..capture
+            },
+            capture
+        ));
+        assert!(!matching_window_frames(
+            Rect {
+                x: 1_152.0,
+                ..capture
+            },
+            capture
+        ));
+    }
+
+    #[test]
+    fn element_reference_exposes_its_generation_scoped_hint_and_hash() {
+        let reference = ElementRef("e7_42_deadbeefdeadbeef".to_owned());
+        assert_eq!(
+            reference_parts(&reference, 7),
+            Some((42, 0xdead_beef_dead_beef))
+        );
+        assert_eq!(reference_parts(&reference, 8), None);
+        assert_eq!(reference_parts(&ElementRef("e7_42".to_owned()), 7), None);
     }
 }
