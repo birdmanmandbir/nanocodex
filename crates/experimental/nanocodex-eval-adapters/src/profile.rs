@@ -20,8 +20,8 @@ use nanocodex_eval::{
 use serde::Deserialize;
 
 use crate::{
-    ArenaHard, BuiltinSourceError, BuiltinSources, ExternalHarness, HarborDataset, OpenAiEvals,
-    SweBench,
+    ArenaHard, BuiltinSourceError, BuiltinSources, ExternalHarness, GeneBenchPro, HarborDataset,
+    OpenAiEvals, SweBench,
 };
 
 /// A complete manifest using Nanocodex's concrete third-party benchmark recipes.
@@ -132,6 +132,18 @@ pub enum Benchmark {
         /// Official image tag.
         #[serde(default = "default_image_tag")]
         image_tag: String,
+    },
+    /// OpenAI's public GeneBench-Pro case-study package.
+    #[serde(rename = "genebench-pro")]
+    GeneBenchPro {
+        /// Root containing the official manifest, grader, configs, and data files.
+        package: PathBuf,
+        /// Pinned package revision.
+        revision: String,
+        /// Scientific candidate environment Dockerfile context.
+        environment: PathBuf,
+        /// Wrapper around the official deterministic reference grader.
+        harness: PathBuf,
     },
     /// Benchmark-owned executable manifest.
     External {
@@ -470,30 +482,11 @@ impl BenchmarkCatalog {
 
     fn recipe(self, name: &str) -> Option<Builtin> {
         let adapter = match name {
-            "terminal-bench-2.1" | "frontier-bench" | "stable-bench" => "harbor",
+            "terminal-bench-2.1" => "harbor",
             "arena-hard-v2" => "arena-hard",
             "openai-evals" => "openai-evals",
-            "swe-bench-pro" | "swe-bench-verified-smoke" => "swe-bench",
-            "agents-last-exam"
-            | "gdpval-aa"
-            | "artificial-analysis"
-            | "frontiermath"
-            | "osworld"
-            | "benchcad"
-            | "ctf"
-            | "sec-bench"
-            | "exploitbench"
-            | "exploitgym"
-            | "genebench"
-            | "kernelbench"
-            | "kernelgen"
-            | "nanogpt"
-            | "posttrainbench"
-            | "mmmu-pro"
-            | "toolathlon"
-            | "mrcr"
-            | "graphwalks"
-            | "arc-agi" => "external",
+            "swe-bench-verified-smoke" => "swe-bench",
+            "genebench-pro-public" => "genebench-pro",
             _ => return None,
         };
         Some(Builtin { adapter })
@@ -613,6 +606,17 @@ impl<'a> ProfileImporter<'a> {
                 .architecture(architecture)
                 .image_tag(image_tag),
             ),
+            Benchmark::GeneBenchPro {
+                package,
+                revision,
+                environment,
+                harness,
+            } => store.import(&GeneBenchPro::new(
+                resolve_path(root, package),
+                revision,
+                Environment::Dockerfile(resolve_path(root, environment)),
+                Harness::directory(resolve_path(root, harness))?,
+            )),
             Benchmark::External { manifest } => {
                 store.import(&ExternalHarness::new(resolve_path(root, manifest)))
             }
@@ -717,6 +721,8 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
+    use sha2::{Digest as _, Sha256};
+
     use super::*;
 
     #[derive(Clone, Default)]
@@ -768,32 +774,18 @@ mod tests {
     }
 
     #[test]
-    fn catalog_covers_recorded_gpt_5_6_families() {
+    fn catalog_contains_only_materialized_builtins() {
         for benchmark in [
             "terminal-bench-2.1",
-            "swe-bench-pro",
-            "agents-last-exam",
-            "gdpval-aa",
-            "artificial-analysis",
-            "frontiermath",
-            "osworld",
-            "benchcad",
-            "ctf",
-            "sec-bench",
-            "exploitbench",
-            "exploitgym",
-            "genebench",
-            "kernelbench",
-            "kernelgen",
-            "nanogpt",
-            "posttrainbench",
-            "mmmu-pro",
-            "toolathlon",
-            "mrcr",
-            "graphwalks",
-            "arc-agi",
+            "arena-hard-v2",
+            "openai-evals",
+            "swe-bench-verified-smoke",
+            "genebench-pro-public",
         ] {
             assert!(BenchmarkCatalog::new().contains(benchmark), "{benchmark}");
+        }
+        for benchmark in ["swe-bench-pro", "exploitbench", "kernelgen", "arc-agi"] {
+            assert!(!BenchmarkCatalog::new().contains(benchmark), "{benchmark}");
         }
     }
 
@@ -829,6 +821,17 @@ mod tests {
         fs::write(
             sources.join("swe.jsonl"),
             "{\"instance_id\":\"owner__repo-1\",\"problem_statement\":\"Fix it.\",\"repo\":\"owner/repo\",\"base_commit\":\"abc\",\"version\":\"1\",\"patch\":\"diff\",\"test_patch\":\"tests\",\"FAIL_TO_PASS\":[],\"PASS_TO_PASS\":[]}\n",
+        )
+        .unwrap();
+
+        let gene = sources.join("gene");
+        let gene_environment = gene.join("environment");
+        let gene_harness = make_harness(&gene.join("harness"));
+        make_genebench_package(&gene.join("package"));
+        fs::create_dir_all(&gene_environment).unwrap();
+        fs::write(
+            gene_environment.join("Dockerfile"),
+            "FROM python:3.12-slim\nCOPY data_files /workspace/data_files\n",
         )
         .unwrap();
 
@@ -886,12 +889,19 @@ instances = {swe:?}
 harness = {harness:?}
 revision = "swe-bench@1"
 
+[benchmark.gene-smoke]
+adapter = "genebench-pro"
+package = {gene_package:?}
+revision = "openai/genebench@1"
+environment = {gene_environment:?}
+harness = {gene_harness:?}
+
 [benchmark.external-smoke]
 adapter = "external"
 manifest = {external_manifest:?}
 
 [profiles.adapter-smoke]
-tasks = ["harbor-smoke", "arena-smoke", "openai-evals-smoke", "swe-smoke", "external-smoke"]
+tasks = ["harbor-smoke", "arena-smoke", "openai-evals-smoke", "swe-smoke", "gene-smoke", "external-smoke"]
 trials = 1
 model = ["gpt-5.6-sol"]
 thinking = ["low"]
@@ -901,6 +911,9 @@ thinking = ["low"]
                 harness = harness,
                 registry = registry,
                 swe = sources.join("swe.jsonl"),
+                gene_package = gene.join("package"),
+                gene_environment = gene_environment,
+                gene_harness = gene_harness,
                 external_manifest = external.join("manifest.toml"),
             ),
         )
@@ -924,7 +937,7 @@ thinking = ["low"]
 
         {
             let tasks = observation.tasks.lock().unwrap();
-            assert_eq!(tasks.len(), 5);
+            assert_eq!(tasks.len(), 6);
         }
         assert_eq!(
             observation.cache.lock().unwrap().as_deref(),
@@ -988,6 +1001,39 @@ thinking = ["low"]
         )
         .unwrap();
         path.to_path_buf()
+    }
+
+    fn make_genebench_package(path: &Path) {
+        let problem = path.join("problems/gene-case");
+        fs::create_dir_all(problem.join("data_files")).unwrap();
+        let config = br#"{"id":"gene-case","task":"Analyze it.","data_files":["data_files/input.tsv.gz"],"ground_truth":{"value":1},"grader":{"type":"numeric_tolerance","config":{"key":"value"}}}"#;
+        let data = b"fixture";
+        fs::write(problem.join("eval_config.json"), config).unwrap();
+        fs::write(problem.join("data_files/input.tsv.gz"), data).unwrap();
+        fs::write(path.join("reference_grader.py"), "# grader\n").unwrap();
+        let file = |path: &str, bytes: &[u8]| {
+            serde_json::json!({
+                "path": path,
+                "bytes": bytes.len(),
+                "sha256": hex::encode(Sha256::digest(bytes)),
+            })
+        };
+        fs::write(
+            path.join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "problem_count": 1,
+                "problems": [{
+                    "eval_id": "gene-case",
+                    "eval_config": "problems/gene-case/eval_config.json",
+                    "files": [
+                        file("problems/gene-case/eval_config.json", config),
+                        file("problems/gene-case/data_files/input.tsv.gz", data),
+                    ],
+                }],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     }
 
     fn make_harbor_task(path: &Path) {

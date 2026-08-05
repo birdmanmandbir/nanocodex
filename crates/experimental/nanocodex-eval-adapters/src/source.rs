@@ -8,7 +8,7 @@ use std::{
 use nanocodex_eval::profile::ResolvedProfile;
 use sha2::{Digest as _, Sha256};
 
-use crate::profile::Benchmark;
+use crate::{genebench_pro::decode_manifest, profile::Benchmark};
 
 const TERMINAL_BENCH_REVISION: &str = "5c8eadf1f393183288fa08b8f73ca9a469cc5e00";
 const ARENA_HARD_REVISION: &str = "196f6b826783b3da7310e361a805fa36f0be83f3";
@@ -18,6 +18,13 @@ const OPENAI_EVALS_SMOKE_DATA_SHA256: &str =
 const SWE_BENCH_REVISION: &str = "f7bbbb2ccdf479001d6467c9e34af59e44a840f9";
 const SWE_VERIFIED_ROW_RESPONSE_SHA256: &str =
     "7c62220a467830a3a330dda51211ab4c1ba099124dffc8371fbec057933c47b8";
+const GENEBENCH_PRO_REVISION: &str = "eb75a3c0996b3cedcc9af685bad02fd166848fa2";
+const GENEBENCH_PRO_MANIFEST_SHA256: &str =
+    "0e80d5dca9ac5211fb9dfa5c0ea8d26e9d557e2039c8f20b0f5a328ea3cd6c58";
+const GENEBENCH_PRO_GRADER_SHA256: &str =
+    "81a50853d1348237300ce90a7b48a9230b4edb5d1af30207c37f17f0de8bbb28";
+const GENEBENCH_PRO_BASE: &str =
+    "https://huggingface.co/datasets/openai/genebench-pro-public-package/resolve";
 
 /// Pinned, workspace-owned source material for built-in benchmark recipes.
 #[derive(Clone, Debug)]
@@ -122,6 +129,12 @@ impl BuiltinSources {
                 architecture: "x86_64".to_owned(),
                 image_tag: "latest".to_owned(),
             }),
+            "genebench-pro-public" => Ok(Benchmark::GeneBenchPro {
+                package: self.root.join("genebench-pro-public-package"),
+                revision: format!("openai/genebench-pro-public-package@{GENEBENCH_PRO_REVISION}"),
+                environment: assets.join("genebench-pro/environment"),
+                harness: assets.join("genebench-pro/verifier"),
+            }),
             other => Err(BuiltinSourceError::Unsupported(other.to_owned())),
         }
     }
@@ -129,7 +142,11 @@ impl BuiltinSources {
     pub(crate) fn is_materialized(name: &str) -> bool {
         matches!(
             name,
-            "terminal-bench-2.1" | "arena-hard-v2" | "openai-evals" | "swe-bench-verified-smoke"
+            "terminal-bench-2.1"
+                | "arena-hard-v2"
+                | "openai-evals"
+                | "swe-bench-verified-smoke"
+                | "genebench-pro-public"
         )
     }
 
@@ -213,8 +230,55 @@ impl BuiltinSources {
                 }
                 Ok(())
             }
+            "genebench-pro-public" => self.materialize_genebench_pro(),
             other => Err(BuiltinSourceError::Unsupported(other.to_owned())),
         }
+    }
+
+    fn materialize_genebench_pro(&self) -> Result<(), BuiltinSourceError> {
+        let package = "genebench-pro-public-package";
+        let manifest_relative = format!("{package}/manifest.json");
+        let manifest_url = format!("{GENEBENCH_PRO_BASE}/{GENEBENCH_PRO_REVISION}/manifest.json");
+        self.download(
+            &manifest_relative,
+            &manifest_url,
+            GENEBENCH_PRO_MANIFEST_SHA256,
+        )?;
+        let grader_url =
+            format!("{GENEBENCH_PRO_BASE}/{GENEBENCH_PRO_REVISION}/reference_grader.py");
+        self.download(
+            &format!("{package}/reference_grader.py"),
+            &grader_url,
+            GENEBENCH_PRO_GRADER_SHA256,
+        )?;
+        let manifest_path = self.root.join(&manifest_relative);
+        let bytes = fs::read(&manifest_path).map_err(|source| BuiltinSourceError::Io {
+            path: manifest_path.clone(),
+            source,
+        })?;
+        let manifest =
+            decode_manifest(&manifest_path, &bytes).map_err(BuiltinSourceError::Stale)?;
+        for problem in manifest.problems {
+            for file in problem.execution_files() {
+                let relative_path = Path::new(&file.path);
+                if relative_path.is_absolute()
+                    || relative_path
+                        .components()
+                        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+                {
+                    return Err(BuiltinSourceError::Stale(format!(
+                        "GeneBench-Pro manifest contains unsafe path {:?}",
+                        file.path
+                    )));
+                }
+                let url = format!(
+                    "{GENEBENCH_PRO_BASE}/{GENEBENCH_PRO_REVISION}/{}",
+                    file.path
+                );
+                self.download(&format!("{package}/{}", file.path), &url, &file.sha256)?;
+            }
+        }
+        Ok(())
     }
 
     fn git_checkout(

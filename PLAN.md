@@ -447,6 +447,7 @@ tasks = [
   "arena-hard-v2/2edbb5f36f5b42be",
   "openai-evals/computer-science-problems.s1.simple-v0-000000",
   "swe-bench-verified-smoke/astropy__astropy-12907",
+  "genebench-pro-public/multiparent_qtl_hmm_lmm",
   "external-smoke/exact-answer",
 ]
 trials = 1
@@ -455,7 +456,7 @@ thinking = ["low"]
 ```
 
 The implementation PR must replace the illustrative task placeholders with
-stable IDs from its pinned real smoke sources. The initial 15-attempt smoke
+stable IDs from its pinned real smoke sources. The expanded 18-attempt smoke
 matrix is one selected task from every benchmark adapter by current host-native
 Nanocodex and one
 variant of every implemented guest harness CLI driver, exactly one valid trial
@@ -664,9 +665,9 @@ may hide missing coordinates or mix incompatible preparation identities.
    The evidence audit reopened this gate after finding verifier-environment and
    differential-trajectory loss in nominally completed runs. The
    Deprecated `simple-evals` routes have been removed rather than carried as
-   hidden compatibility code. The `adapter-smoke` profile now covers five real
-   shapes, including RewardKit judging and SWE-bench. Close the milestone only
-   after all 15 current
+   hidden compatibility code. The `adapter-smoke` profile now covers six real
+   shapes, including RewardKit judging, SWE-bench, and GeneBench Pro. Close the
+   milestone only after all 18 current
    Nanocodex/stock-Codex/external-Nanocodex coordinates retain canonical
    trajectories, identities, verifier artifacts, subscription-backed judge
    evidence, hard-kill recovery, cleanup, and a zero-spend completed-run no-op.

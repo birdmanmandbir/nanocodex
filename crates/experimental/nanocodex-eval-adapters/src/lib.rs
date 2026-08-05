@@ -7,6 +7,7 @@
 
 mod arena_hard;
 mod external;
+mod genebench_pro;
 mod harbor;
 mod openai_evals;
 pub mod profile;
@@ -17,6 +18,7 @@ use std::{fs, path::Path};
 
 pub use arena_hard::ArenaHard;
 pub use external::ExternalHarness;
+pub use genebench_pro::GeneBenchPro;
 pub use harbor::HarborDataset;
 use nanocodex_eval::import::ImportError;
 pub use openai_evals::OpenAiEvals;
@@ -90,12 +92,14 @@ mod tests {
     use std::{fs, path::Path};
 
     use nanocodex_eval::{
-        TaskOutput,
+        NetworkPolicy, TaskOutput,
         import::{DatasetImporter, Environment, Harness, ImportStore},
     };
     use tempfile::tempdir;
 
-    use crate::{ArenaHard, ExternalHarness, OpenAiEvals, SweBench};
+    use sha2::{Digest as _, Sha256};
+
+    use crate::{ArenaHard, ExternalHarness, GeneBenchPro, OpenAiEvals, SweBench};
 
     #[test]
     fn imports_arena_final_message_cases() {
@@ -130,6 +134,81 @@ mod tests {
             .unwrap()["category"],
             "hard"
         );
+    }
+
+    #[test]
+    fn imports_genebench_data_only_into_the_candidate_environment() {
+        let package = tempdir().unwrap();
+        let problem = package.path().join("problems/case-1");
+        fs::create_dir_all(problem.join("data_files")).unwrap();
+        let config = br#"{
+  "id": "case-1",
+  "task": "Analyze the supplied data and return JSON.",
+  "data_files": ["data_files/input.tsv.gz"],
+  "ground_truth": {"value": 2},
+  "grader": {"type": "numeric_tolerance", "config": {"key": "value"}}
+}"#;
+        let data = b"compressed-fixture";
+        fs::write(problem.join("eval_config.json"), config).unwrap();
+        fs::write(problem.join("data_files/input.tsv.gz"), data).unwrap();
+        fs::write(
+            package.path().join("reference_grader.py"),
+            "# official grader\n",
+        )
+        .unwrap();
+        let descriptor = |path: &str, bytes: &[u8]| {
+            serde_json::json!({
+                "path": path,
+                "bytes": bytes.len(),
+                "sha256": hex::encode(Sha256::digest(bytes)),
+            })
+        };
+        fs::write(
+            package.path().join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "problem_count": 1,
+                "problems": [{
+                    "eval_id": "case-1",
+                    "eval_config": "problems/case-1/eval_config.json",
+                    "files": [
+                        descriptor("problems/case-1/eval_config.json", config),
+                        descriptor("problems/case-1/data_files/input.tsv.gz", data),
+                    ],
+                }],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let environment = package.path().join("candidate");
+        fs::create_dir(&environment).unwrap();
+        fs::write(
+            environment.join("Dockerfile"),
+            "FROM python:3.12-slim\nCOPY data_files /workspace/data_files\n",
+        )
+        .unwrap();
+        let harness = make_harness(package.path());
+        let store = tempdir().unwrap();
+
+        let dataset = ImportStore::new(store.path())
+            .import(&GeneBenchPro::new(
+                package.path(),
+                "openai/genebench@fixture",
+                Environment::Dockerfile(environment),
+                Harness::directory(harness).unwrap(),
+            ))
+            .unwrap();
+        let task = &dataset.tasks()[0];
+
+        assert_eq!(task.prompt(), "Analyze the supplied data and return JSON.");
+        assert_eq!(task.output(), TaskOutput::FinalMessage);
+        assert_eq!(task.network(), NetworkPolicy::Disabled);
+        assert_eq!(
+            fs::read(task.root().join("environment/data_files/input.tsv.gz")).unwrap(),
+            data
+        );
+        assert!(task.root().join("tests/eval_config.json").is_file());
+        assert!(task.root().join("tests/reference_grader.py").is_file());
+        assert!(!task.root().join("environment/eval_config.json").exists());
     }
 
     #[test]

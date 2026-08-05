@@ -10,6 +10,7 @@ third-party source at a pinned revision
 ├── Harbor adapter ─────────────── lossless existing task packages
 ├── Arena/OpenAI adapters ──────── prompts, official source, final answers
 ├── SWE-bench adapter ──────────── official instance images + harness
+├── GeneBench-Pro adapter ──────── staged scientific data + reference grader
 └── external harness adapter ───── benchmark-owned executable semantics
                  │
                  ▼
@@ -38,6 +39,7 @@ evidence have no benchmark-specific branches.
 | OpenAI Evals `Match` / `Includes` | Reads registry YAML and JSONL; preserves their starts-with / substring behavior | Snapshotted deterministic harness |
 | Other OpenAI Evals classes | Refused by the declarative adapter | Official code through `ExternalHarness` |
 | SWE-bench | Preserves problem statements and official instance-image naming; packages exact instance metadata | Caller-packaged official SWE-bench harness |
+| GeneBench-Pro public package | Makes only problem `data_files/` candidate-visible and retains config, ground truth, tolerances, and grader outside the candidate VM | OpenAI's pinned `reference_grader.py`; `passed` is authoritative |
 | MLE-bench, PaperBench, and private suites | Reads a prepared generic external manifest | Benchmark-owned harness |
 
 Unsupported semantics fail during import. The adapters do not flatten
@@ -51,8 +53,8 @@ routes rather than VM modes:
 | --- | --- |
 | Terminal-Bench 2.1 | `harbor` |
 | SWE-Bench Pro | `swe-bench` with its official instance images and harness |
-| GeneBench Pro public package | dedicated official-package adapter (planned) |
-| Agents' Last Exam, GDPval-AA, Artificial Analysis, FrontierMath, OSWorld, BenchCAD, CTF, SEC-Bench, ExploitBench, ExploitGym, KernelBench/KernelGen, NanoGPT, PostTrainBench, MMMU Pro, Toolathlon, MRCR, GraphWalks, and ARC-AGI | `external` with the benchmark owner's pinned image/Dockerfile and grader |
+| GeneBench Pro public package | installed `genebench-pro-public` recipe |
+| Agents' Last Exam, GDPval-AA, Artificial Analysis, FrontierMath, OSWorld, BenchCAD, CTF, SEC-Bench, ExploitBench, ExploitGym, KernelBench/KernelGen, NanoGPT, PostTrainBench, MMMU Pro, Toolathlon, MRCR, GraphWalks, and ARC-AGI | Not installed until a dedicated recipe or caller-supplied official `external` manifest exists |
 | OpenAI-internal or unreleased suites | Not importable until the owner supplies tasks and grading semantics |
 
 An `external` route means the normalized execution contract can preserve and
@@ -69,41 +71,15 @@ not depend on the original checkout. A shared dataset mount can replace the
 per-task snapshot later if its measured storage cost warrants the extra
 runtime contract.
 
-## CLI
+## Profile CLI
 
-Imports are durable and idempotent:
-
-```sh
-nanocodex eval import harbor \
-  --name terminal-bench-3 \
-  --revision harbor@<commit> \
-  /data/terminal-bench/tasks
-
-nanocodex eval import arena-hard \
-  --name arena-hard-v2 \
-  --revision arena-hard-auto@<commit> \
-  --harness /data/arena/official-judge-adapter \
-  /data/arena/data/arena-hard-v2.0/question.jsonl
-
-nanocodex eval import openai-evals \
-  --name openai-proofreader \
-  --revision openai-evals@<commit> \
-  --harness crates/experimental/nanocodex-eval-adapters/assets/openai-evals \
-  --eval proofreader.dev.v0 \
-  /data/openai-evals/evals/registry
-
-nanocodex eval import swe-bench \
-  --name swe-bench-verified \
-  --revision swe-bench@<commit> \
-  --harness /data/swe-bench/official-verifier-adapter \
-  /data/swe-bench-verified.jsonl
-```
-
-The command prints the imported `tasks/` directory. Pass that directory to the
-existing runner:
+Preparation acquires every selected built-in source, normalizes all selected
+tasks, and prepares their runtimes once. Running then consumes only the
+published preparation:
 
 ```sh
-nanocodex eval --suite <printed-tasks-directory> --trials 5
+nanocodex eval prepare adapter-smoke
+nanocodex eval run adapter-smoke
 ```
 
 Custom imports take caller-pinned local source. Manifest built-ins instead let

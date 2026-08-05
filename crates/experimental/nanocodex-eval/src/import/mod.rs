@@ -92,8 +92,9 @@ enum CasePackage {
 struct HermeticCase {
     prompt: String,
     environment: Environment,
+    environment_files: Vec<GeneratedFile>,
     harness: Harness,
-    harness_files: Vec<HarnessFile>,
+    harness_files: Vec<GeneratedFile>,
     output: TaskOutput,
     resources: Resources,
     agent_timeout: Duration,
@@ -118,7 +119,7 @@ pub struct Harness {
 }
 
 #[derive(Clone, Debug)]
-struct HarnessFile {
+struct GeneratedFile {
     path: PathBuf,
     bytes: Vec<u8>,
     mode: u32,
@@ -387,6 +388,14 @@ impl DatasetPlan {
                             Self::update_digest(&mut digest, b"dockerfile");
                             Self::update_directory(&mut digest, root)?;
                         }
+                    }
+                    for file in &case.environment_files {
+                        Self::update_digest(
+                            &mut digest,
+                            normalized_relative(&file.path)?.as_bytes(),
+                        );
+                        Self::update_digest(&mut digest, &file.mode.to_le_bytes());
+                        Self::update_digest(&mut digest, &file.bytes);
                     }
                     Self::update_directory(&mut digest, &case.harness.directory)?;
                     for file in &case.harness_files {
@@ -675,6 +684,7 @@ impl CasePlan {
             case: HermeticCase {
                 prompt,
                 environment,
+                environment_files: Vec::new(),
                 harness,
                 harness_files: Vec::new(),
                 output: TaskOutput::Workspace,
@@ -694,6 +704,30 @@ impl CasePlan {
 }
 
 impl HermeticCasePlan {
+    /// Adds one case-specific file to the candidate environment.
+    ///
+    /// Native attempts copy this file into the disposable workspace. A
+    /// Dockerfile-backed VM environment may place it in the guest workspace
+    /// with an ordinary `COPY` instruction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ImportError`] when `path` is not a safe relative path.
+    pub fn environment_file(
+        mut self,
+        path: impl Into<PathBuf>,
+        bytes: impl Into<Vec<u8>>,
+        mode: u32,
+    ) -> Result<Self, ImportError> {
+        self.case.environment_files.push(GeneratedFile::new(
+            path.into(),
+            bytes.into(),
+            mode,
+            "environment",
+        )?);
+        Ok(self)
+    }
+
     /// Applies benchmark-owned model instructions separately from the user prompt.
     #[must_use]
     pub fn instructions(mut self, instructions: impl Into<String>) -> Self {
@@ -741,7 +775,18 @@ impl HermeticCasePlan {
         bytes: impl Into<Vec<u8>>,
         mode: u32,
     ) -> Result<Self, ImportError> {
-        let path = path.into();
+        self.case.harness_files.push(GeneratedFile::new(
+            path.into(),
+            bytes.into(),
+            mode,
+            "harness",
+        )?);
+        Ok(self)
+    }
+}
+
+impl GeneratedFile {
+    fn new(path: PathBuf, bytes: Vec<u8>, mode: u32, kind: &str) -> Result<Self, ImportError> {
         if path.as_os_str().is_empty()
             || path.is_absolute()
             || path
@@ -749,16 +794,11 @@ impl HermeticCasePlan {
                 .any(|component| !matches!(component, Component::Normal(_)))
         {
             return Err(ImportError::Invalid(format!(
-                "unsafe generated harness path: {}",
+                "unsafe generated {kind} path: {}",
                 path.display()
             )));
         }
-        self.case.harness_files.push(HarnessFile {
-            path,
-            bytes: bytes.into(),
-            mode,
-        });
-        Ok(self)
+        Ok(Self { path, bytes, mode })
     }
 }
 
@@ -808,8 +848,9 @@ fn materialize_hermetic_case(
         Environment::OciImage(_) => create_dir_all(&environment)?,
         Environment::Dockerfile(source) => copy_tree(&source, &environment)?,
     }
+    materialize_generated_files(case.environment_files, &environment)?;
     materialize_harness(case.harness, &destination.join("tests"))?;
-    materialize_harness_files(case.harness_files, &destination.join("tests"))?;
+    materialize_generated_files(case.harness_files, &destination.join("tests"))?;
 
     let separate = destination.join("tests/Dockerfile").is_file();
     let raw = GeneratedTaskManifest {
@@ -848,8 +889,8 @@ fn materialize_harness(harness: Harness, destination: &Path) -> Result<(), Impor
     copy_tree(&harness.directory, destination)
 }
 
-fn materialize_harness_files(
-    files: Vec<HarnessFile>,
+fn materialize_generated_files(
+    files: Vec<GeneratedFile>,
     destination: &Path,
 ) -> Result<(), ImportError> {
     for file in files {
@@ -1080,11 +1121,20 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{CasePlan, DatasetImporter, DatasetPlan, ImportError, ImportStore, SourceIdentity};
+    use super::{
+        CasePlan, DatasetImporter, DatasetPlan, Environment, Harness, ImportError, ImportStore,
+        SourceIdentity,
+    };
 
     struct FixtureImporter {
         task: std::path::PathBuf,
         revision: &'static str,
+    }
+
+    struct WorkspaceImporter<'a> {
+        environment: &'a Path,
+        harness: &'a Path,
+        contents: &'a [u8],
     }
 
     impl DatasetImporter for FixtureImporter {
@@ -1094,6 +1144,24 @@ mod tests {
                 SourceIdentity::new("fixture", self.revision, "a".repeat(64))?,
             )?
             .case(CasePlan::existing("case-1", &self.task)?))
+        }
+    }
+
+    impl DatasetImporter for WorkspaceImporter<'_> {
+        fn plan(&self) -> Result<DatasetPlan, ImportError> {
+            Ok(DatasetPlan::new(
+                "workspace-input",
+                SourceIdentity::new("fixture", "fixture@1", "b".repeat(64))?,
+            )?
+            .case(
+                CasePlan::hermetic(
+                    "case-1",
+                    "Inspect the supplied data.",
+                    Environment::Dockerfile(self.environment.to_path_buf()),
+                    Harness::directory(self.harness)?,
+                )?
+                .environment_file("data_files/input.csv", self.contents, 0o644)?,
+            ))
         }
     }
 
@@ -1121,6 +1189,49 @@ mod tests {
         let changed = ImportStore::new(store.path()).import(&importer).unwrap();
         assert_ne!(first.digest(), changed.digest());
         assert_ne!(first.root(), changed.root());
+    }
+
+    #[test]
+    fn generated_environment_files_are_candidate_inputs_and_affect_identity() {
+        let source = tempdir().unwrap();
+        fs::write(
+            source.path().join("Dockerfile"),
+            "FROM debian:bookworm-slim\nCOPY data_files /workspace/data_files\n",
+        )
+        .unwrap();
+        let harness = tempdir().unwrap();
+        fs::write(
+            harness.path().join("test.sh"),
+            "#!/bin/sh\nprintf '1\\n' > \"$NANOCODEX_EVAL_VERIFIER_LOGS/reward.txt\"\n",
+        )
+        .unwrap();
+        let store = tempdir().unwrap();
+
+        let first = ImportStore::new(store.path())
+            .import(&WorkspaceImporter {
+                environment: source.path(),
+                harness: harness.path(),
+                contents: b"value\n1\n",
+            })
+            .unwrap();
+        let changed = ImportStore::new(store.path())
+            .import(&WorkspaceImporter {
+                environment: source.path(),
+                harness: harness.path(),
+                contents: b"value\n2\n",
+            })
+            .unwrap();
+
+        assert_eq!(
+            fs::read(
+                first.tasks()[0]
+                    .root()
+                    .join("environment/data_files/input.csv")
+            )
+            .unwrap(),
+            b"value\n1\n"
+        );
+        assert_ne!(first.digest(), changed.digest());
     }
 
     fn make_task(root: &Path, prompt: &str) {

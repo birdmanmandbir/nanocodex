@@ -17,6 +17,7 @@ tasks = [
   "arena-hard-v2/2edbb5f36f5b42be",
   "openai-evals/computer-science-problems.s1.simple-v0-000000",
   "swe-bench-verified-smoke/astropy__astropy-12907",
+  "genebench-pro-public/multiparent_qtl_hmm_lmm",
   "external-smoke/exact-answer",
 ]
 trials = 1
