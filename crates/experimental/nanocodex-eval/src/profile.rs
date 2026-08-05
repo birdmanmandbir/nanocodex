@@ -175,9 +175,10 @@ pub struct TaskPreparation {
 /// Complete execution request for one validated preparation receipt.
 pub struct ProfileRunRequest {
     receipt: PreparationReceipt,
-    output_directory: PathBuf,
+    control_directory: PathBuf,
+    job_directory: PathBuf,
     cache_directory: PathBuf,
-    rerun_tasks: Option<Vec<String>>,
+    new_tasks: Option<Vec<String>>,
 }
 
 /// Runtime boundary that executes one prepared profile.
@@ -256,21 +257,23 @@ impl ProfileRunRequest {
     #[must_use]
     pub fn new(
         receipt: PreparationReceipt,
-        output_directory: impl Into<PathBuf>,
+        control_directory: impl Into<PathBuf>,
+        job_directory: impl Into<PathBuf>,
         cache_directory: impl Into<PathBuf>,
     ) -> Self {
         Self {
             receipt,
-            output_directory: output_directory.into(),
+            control_directory: control_directory.into(),
+            job_directory: job_directory.into(),
             cache_directory: cache_directory.into(),
-            rerun_tasks: None,
+            new_tasks: None,
         }
     }
 
     /// Forces a fresh run containing all or a selected subset of prepared tasks.
     #[must_use]
-    pub fn rerun(mut self, tasks: Vec<String>) -> Self {
-        self.rerun_tasks = Some(tasks);
+    pub fn start_new(mut self, tasks: Vec<String>) -> Self {
+        self.new_tasks = Some(tasks);
         self
     }
 
@@ -279,9 +282,14 @@ impl ProfileRunRequest {
         &self.receipt
     }
 
-    /// Parent for durable resumable evaluator jobs.
-    pub fn output_directory(&self) -> &Path {
-        &self.output_directory
+    /// Stable profile directory for the coordinator lease and latest status.
+    pub fn control_directory(&self) -> &Path {
+        &self.control_directory
+    }
+
+    /// Preparation-scoped parent for durable resumable evaluator jobs.
+    pub fn job_directory(&self) -> &Path {
+        &self.job_directory
     }
 
     /// Content-addressed VM cache shared with preparation.
@@ -290,8 +298,8 @@ impl ProfileRunRequest {
     }
 
     /// Requested fresh-run task selectors; an empty slice means the full profile.
-    pub fn rerun_tasks(&self) -> Option<&[String]> {
-        self.rerun_tasks.as_deref()
+    pub fn new_tasks(&self) -> Option<&[String]> {
+        self.new_tasks.as_deref()
     }
 }
 
@@ -772,13 +780,13 @@ impl PreparationReceipt {
                         [(_, task)] => selected.push(task.clone()),
                         [] => {
                             return Err(ProfileRunPlanError::Invalid(format!(
-                                "rerun task {request:?} is not in prepared profile {:?}",
+                                "new-run task {request:?} is not in prepared profile {:?}",
                                 self.profile
                             )));
                         }
                         _ => {
                             return Err(ProfileRunPlanError::Invalid(format!(
-                                "rerun task {request:?} is ambiguous; use its complete benchmark/task selector"
+                                "new-run task {request:?} is ambiguous; use its complete benchmark/task selector"
                             )));
                         }
                     }
@@ -1385,7 +1393,7 @@ allow_internet = false
             &Nanocodex::builder(OpenAi::new("test-key").unwrap()),
             Some(&["missing".to_owned()]),
         ) else {
-            panic!("missing rerun task must fail");
+            panic!("missing new-run task must fail");
         };
         assert!(error.to_string().contains("is not in prepared profile"));
         let mut nanocodex_receipt = receipt.clone();

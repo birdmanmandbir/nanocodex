@@ -142,6 +142,7 @@ struct FiniteRun {
 enum FiniteRunMode {
     Fresh,
     Resume,
+    Continue,
 }
 
 type AttemptError = Box<dyn Error + Send + Sync + 'static>;
@@ -2277,6 +2278,16 @@ impl EvaluatorBuilder {
         self
     }
 
+    /// Reopens the newest matching job, including a completed one, or creates it.
+    #[must_use]
+    pub fn continue_run(mut self, sweep: Sweep) -> Self {
+        self.finite_run = Some(FiniteRun {
+            sweep,
+            mode: FiniteRunMode::Continue,
+        });
+        self
+    }
+
     /// Creates a new job already bound to `sweep`, even when a matching
     /// incomplete job exists.
     #[must_use]
@@ -2363,6 +2374,9 @@ impl EvaluatorBuilder {
                     FiniteRunMode::Fresh => EvalJob::create(&self.output_directory)?,
                     FiniteRunMode::Resume => {
                         EvalJob::resume_or_create(&self.output_directory, &manifest)?
+                    }
+                    FiniteRunMode::Continue => {
+                        EvalJob::continue_or_create(&self.output_directory, &manifest)?
                     }
                 };
                 job.bind_run(&manifest)?;

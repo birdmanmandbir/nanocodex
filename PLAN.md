@@ -510,7 +510,7 @@ The normal commands are:
 ```sh
 nanocodex eval prepare [PROFILE] [--host HOST | --hosts HOSTS]
 nanocodex eval run [PROFILE]
-nanocodex eval run [PROFILE] --rerun [TASK ...]
+nanocodex eval run [PROFILE] --new [TASK ...]
 nanocodex eval status [PROFILE] --watch
 nanocodex eval stop [PROFILE]
 nanocodex eval report [PROFILE]
@@ -611,12 +611,18 @@ The live view must show at least:
 `stop` drains by default: it closes admission, lets admitted coordinates reach
 their atomic boundary, and leaves the profile resumable. An explicit immediate
 stop may cancel active attempts and remove only disposable overlays. Re-running
-`run` with the same profile resumes the exact prepared matrix and skips every
-valid checkpoint. A rerun invocation selects completed task names, failure
-classes, or treatments into retained replacement lineage without overwriting
-the original evidence. The normal task-selector form remains
-Foundry-like (`eval run --rerun mailman query-optimize`) rather than requiring
-users to locate retained directories or compose a second manifest.
+`run` with the same profile converges the exact prepared matrix and skips every
+valid checkpoint, including when that matrix is already complete. Repeating it
+is therefore a safe no-op that never starts another sample or duplicates model
+spend. `run --new` explicitly creates a fresh retained sample matrix; optional
+task names select prepared tasks without overwriting the original evidence.
+The normal task-selector form remains Foundry-like
+(`eval run --new mailman query-optimize`) rather than requiring users to locate
+retained directories or compose a second manifest. Every evaluator job lives
+under its immutable preparation identity, while the profile's coordinator path
+continues to point monitoring and reporting at the current invocation; a new
+candidate, harness binary, task input, or policy can never inherit checkpoints
+from another preparation.
 
 `report` reads the same durable state and works while execution is active,
 clearly marking partial coverage. Once complete it freezes a website-ready

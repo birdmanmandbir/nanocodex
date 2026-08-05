@@ -71,6 +71,21 @@ impl EvalJob {
         parent_directory: &Path,
         run: &RunManifest,
     ) -> Result<Self, EvalError> {
+        Self::open_or_create(parent_directory, run, false)
+    }
+
+    pub(crate) fn continue_or_create(
+        parent_directory: &Path,
+        run: &RunManifest,
+    ) -> Result<Self, EvalError> {
+        Self::open_or_create(parent_directory, run, true)
+    }
+
+    fn open_or_create(
+        parent_directory: &Path,
+        run: &RunManifest,
+        include_completed: bool,
+    ) -> Result<Self, EvalError> {
         let parent_directory = prepare_parent_directory(parent_directory)?;
         let mut candidates = Vec::new();
         for entry in fs::read_dir(&parent_directory)? {
@@ -91,7 +106,7 @@ impl EvalJob {
             let trials = scan_manifest_trials(&directory, identity.id, run)
                 .map_err(|error| EvalError::InvalidDurableTrial(error.to_string()))?;
             let completed = trials.len();
-            if completed < run.attempt_count() {
+            if include_completed || completed < run.attempt_count() {
                 candidates.push((identity.started_at, identity, directory));
             }
         }
@@ -532,6 +547,23 @@ mod tests {
         drop(first);
 
         let resumed = EvalJob::resume_or_create(output.path(), &run).unwrap();
+        assert!(resumed.resumed());
+        assert_eq!(resumed.id(), first_id);
+    }
+
+    #[test]
+    fn continuing_reopens_the_latest_completed_job() {
+        let output = tempdir().unwrap();
+        let sweep = sweep(1);
+        let run = sweep.manifest();
+        let first = EvalJob::create(output.path()).unwrap();
+        first.bind_run(&run).unwrap();
+        write_terminal_trial(&first, &sweep);
+        let first_id = first.id();
+        drop(first);
+
+        let resumed = EvalJob::continue_or_create(output.path(), &run).unwrap();
+
         assert!(resumed.resumed());
         assert_eq!(resumed.id(), first_id);
     }

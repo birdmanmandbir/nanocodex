@@ -370,7 +370,7 @@ impl<P: ProfileRunner + TaskPreparer> EvaluationWorkspace<P> {
     }
 
     /// Opens the mandatory preparation and starts a fresh selected matrix.
-    pub async fn rerun(
+    pub async fn start_new(
         self,
         profile: Option<&str>,
         tasks: Vec<String>,
@@ -381,17 +381,22 @@ impl<P: ProfileRunner + TaskPreparer> EvaluationWorkspace<P> {
     async fn execute(
         self,
         profile: Option<&str>,
-        rerun: Option<Vec<String>>,
+        new_tasks: Option<Vec<String>>,
     ) -> Result<P::Output, ProfileImportError> {
         let prepared = self.prepared(profile)?;
         let profile = prepared.receipt.profile().to_owned();
+        let control_directory = self.state_directory.join("runs").join(profile);
+        let job_directory = control_directory
+            .join("preparations")
+            .join(prepared.published.digest());
         let mut request = ProfileRunRequest::new(
             prepared.receipt,
-            self.state_directory.join("runs").join(profile),
+            control_directory,
+            job_directory,
             self.state_directory.join("vm"),
         );
-        if let Some(tasks) = rerun {
-            request = request.rerun(tasks);
+        if let Some(tasks) = new_tasks {
+            request = request.start_new(tasks);
         }
         self.preparer
             .run(request)
@@ -823,7 +828,7 @@ mod tests {
             request: ProfileRunRequest,
         ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
             let profile = request.receipt().profile().to_owned();
-            let output = request.output_directory().to_path_buf();
+            let output = request.job_directory().to_path_buf();
             async move {
                 *self.run_output.lock().unwrap() = Some(output);
                 Ok(profile)
@@ -1009,8 +1014,10 @@ thinking = ["low"]
 
         let prepared = workspace.prepare(None).await.unwrap();
 
-        let tasks = observation.tasks.lock().unwrap();
-        assert_eq!(tasks.len(), 6);
+        {
+            let tasks = observation.tasks.lock().unwrap();
+            assert_eq!(tasks.len(), 6);
+        }
         assert_eq!(
             observation.cache.lock().unwrap().as_deref(),
             Some(state.join("vm").as_path())
@@ -1021,6 +1028,7 @@ thinking = ["low"]
             workspace.prepared(None).unwrap().published(),
             prepared.published()
         );
+        let preparation_digest = prepared.published().digest().to_owned();
         let runner = EvaluationWorkspace::builder()
             .manifest(&manifest)
             .state_directory(&state)
@@ -1030,7 +1038,12 @@ thinking = ["low"]
         assert_eq!(runner.run(None).await.unwrap(), "adapter-smoke");
         assert_eq!(
             observation.run_output.lock().unwrap().as_deref(),
-            Some(state.join("runs/adapter-smoke").as_path())
+            Some(
+                state
+                    .join("runs/adapter-smoke/preparations")
+                    .join(preparation_digest)
+                    .as_path()
+            )
         );
 
         fs::write(

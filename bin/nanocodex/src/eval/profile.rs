@@ -24,9 +24,9 @@ pub(super) struct Run {
     #[command(flatten)]
     agent: crate::config::EvalAgentArgs,
 
-    /// Start a fresh run. Optional values select exact prepared tasks.
+    /// Start a new run. Optional values select exact prepared tasks.
     #[arg(long, num_args = 0.., value_name = "TASK")]
-    rerun: Option<Vec<String>>,
+    new: Option<Vec<String>>,
 }
 
 #[derive(Args)]
@@ -79,10 +79,10 @@ impl Run {
         let workspace = self
             .target
             .workspace(NativeEvaluationRuntime::for_run(self.agent))?;
-        let result = match self.rerun {
+        let result = match self.new {
             Some(tasks) => {
                 workspace
-                    .rerun(self.target.profile.as_deref(), tasks)
+                    .start_new(self.target.profile.as_deref(), tasks)
                     .await?
             }
             None => workspace.run(self.target.profile.as_deref()).await?,
@@ -236,10 +236,10 @@ mod tests {
     }
 
     #[test]
-    fn rerun_accepts_zero_or_more_prepared_task_selectors() {
+    fn new_run_accepts_zero_or_more_prepared_task_selectors() {
         for (arguments, expected) in [
             (
-                vec!["nanocodex", "eval", "run", "adapter-smoke", "--rerun"],
+                vec!["nanocodex", "eval", "run", "adapter-smoke", "--new"],
                 Vec::new(),
             ),
             (
@@ -248,7 +248,7 @@ mod tests {
                     "eval",
                     "run",
                     "adapter-smoke",
-                    "--rerun",
+                    "--new",
                     "exact-answer",
                     "terminal-bench-2.1/fix-git",
                 ],
@@ -260,13 +260,13 @@ mod tests {
         ] {
             let cli = Cli::try_parse_from(arguments).unwrap();
             let Some(Command::Eval(Eval {
-                command: Some(EvalCommand::Run(Run { rerun, .. })),
+                command: Some(EvalCommand::Run(Run { new, .. })),
                 ..
             })) = cli.command
             else {
-                panic!("expected profile rerun command");
+                panic!("expected new profile run command");
             };
-            assert_eq!(rerun, Some(expected));
+            assert_eq!(new, Some(expected));
         }
     }
 

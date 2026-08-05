@@ -602,14 +602,14 @@ impl ProfileRunner for VmProfileRunner {
         } else {
             Some(PreparedGuestAuth::load_ca_certificates()?)
         };
-        let rerun_tasks = request.rerun_tasks().map(<[String]>::to_vec);
+        let new_tasks = request.new_tasks().map(<[String]>::to_vec);
         let plan = request
             .receipt()
-            .run_plan_for(&self.nanocodex, rerun_tasks.as_deref())?;
+            .run_plan_for(&self.nanocodex, new_tasks.as_deref())?;
         let tasks = plan.tasks().to_vec();
         let sweep = plan.into_sweep();
         let planned_attempts = sweep.attempt_count();
-        let mut active = ProfileRunControl::new(request.output_directory())
+        let mut active = ProfileRunControl::new(request.control_directory())
             .acquire(request.receipt().profile(), planned_attempts)?;
         let mut backend = VmBackend::builder()
             .web_search(request.receipt().web_search())
@@ -624,18 +624,12 @@ impl ProfileRunner for VmProfileRunner {
             backend = backend.additional_agent_tools(tools);
         }
         let backend = backend.build();
-        let resources = VmResources::builder(self.vmm, self.runtime_image)
-            .tasks(tasks)
-            .cache_directory(request.cache_directory())
-            .prepare()
-            .await?;
-        resources.configure(&backend).await?;
 
         let treatment_map = Arc::clone(&treatments);
         let evaluator_auth = harness_auth.clone();
         let evaluator_ca = ca_certificates.clone();
         let mut evaluator = Evaluator::new_builder(self.nanocodex)
-            .vm_with(backend, move |attempt, builder, runtime| {
+            .vm_with(backend.clone(), move |attempt, builder, runtime| {
                 let Some(agent) = attempt.agent_id() else {
                     return runtime.nanocodex(builder);
                 };
@@ -656,12 +650,12 @@ impl ProfileRunner for VmProfileRunner {
                     })?,
                 )
             })
-            .output_directory(request.output_directory())
+            .output_directory(request.job_directory())
             .max_concurrency(self.max_concurrency);
-        evaluator = if rerun_tasks.is_some() {
+        evaluator = if new_tasks.is_some() {
             evaluator.fresh_run(sweep)
         } else {
-            evaluator.resume_incomplete(sweep)
+            evaluator.continue_run(sweep)
         };
         if let Some(memory_mb) = self.max_memory_mb {
             evaluator = evaluator.max_memory_mb(memory_mb);
@@ -669,6 +663,14 @@ impl ProfileRunner for VmProfileRunner {
         let evaluator = evaluator.build()?;
         active.job_directory(evaluator.directory())?;
         let remaining = evaluator.remaining_attempts()?;
+        if remaining > 0 {
+            let resources = VmResources::builder(self.vmm, self.runtime_image)
+                .tasks(tasks)
+                .cache_directory(request.cache_directory())
+                .prepare()
+                .await?;
+            resources.configure(&backend).await?;
+        }
         let run = evaluator.sweep();
         let recorder = Harbor::new(&evaluator)?.record(run.events().subscribe())?;
         tokio::pin!(run);
