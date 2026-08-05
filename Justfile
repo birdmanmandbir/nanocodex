@@ -157,14 +157,11 @@ run-otel-detail: otel-up
         --otel-environment local-tui
 
 # Focused streaming-performance gate: owned agent lifecycle, event-envelope
-# overhead, trace-shaped transcript updates, and steady Ratatui diff rendering.
+# overhead, and Tact-derived transcript/rendering operations.
 bench-stream:
     cargo bench -p nanocodex-agent --bench agent_lifecycle
     cargo bench -p nanocodex-oai-api --bench tower_responses -- timed_agent_event_delivery
-    cargo bench -p nanocodex-bin --bench tui_render -- tui_stream_telemetry
-    cargo bench -p nanocodex-bin --bench tui_render -- tui_transcript_delta
-    cargo bench -p nanocodex-bin --bench tui_render -- tui_trace_render
-    cargo bench -p nanocodex-bin --bench tui_render -- '^(tui_redraw_scope|tui_streaming_frame_budget)'
+    cargo bench -p nanocodex-bin --bench tui_render -- 'tui/'
 
 # Rebuild every PR #50 hot-path estimate, then enforce the checked-in median
 # latency thresholds. TUI frame-count, changed-cell, and output-byte limits are
@@ -176,7 +173,7 @@ bench-pr50:
     cargo bench -p nanocodex-oai-api --bench session_lifecycle
     cargo bench -p nanocodex-tools --bench tool_process_output
     cargo bench -p nanocodex-tools --bench mcp_tool_search
-    cargo bench -p nanocodex-bin --bench tui_render -- '^(tui_trace_render/codex_long/tail/(80x24|120x40|200x60)|tui_transcript_delta/assistant_100k|tui_stream_telemetry/apply_1024_and_present|tui_branch_state/codex_long/switch_branch|tui_markdown/syntax_fallback_oversized_line_1m|tui_tool_tree/result_269k_cached_frame/120x40|tui_code_mode_stream/apply_16_out_of_order_completions|tui_trace_resize/codex_long/80x24_to_200x60|tui_live_tail_first_frame/assistant_1m_single_line/120x40|tui_smooth_follow/drain_128_row_backlog/120x40|tui_terminal_output/(catch_up_frame|fast_mode_toggle)/120x40|tui_composer_render/multiline_100k/120x40|tui_large_paste/ingest_100k)$'
+    cargo bench -p nanocodex-bin --bench tui_render
     ./scripts/check-benchmark-thresholds.sh
 
 # Deterministic warm-image and retained VM protocol latency gates.

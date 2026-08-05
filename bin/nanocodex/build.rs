@@ -36,6 +36,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let build_timestamp = env_var("VERGEN_BUILD_TIMESTAMP")?;
     let build_timestamp_unix = DateTime::parse_from_rfc3339(&build_timestamp)?.timestamp();
     let profile = build_profile()?;
+    // Review assets distinguish local binaries from artifacts produced by
+    // Nanocodex's stable and nightly release workflows.
+    println!(
+        "cargo:rustc-env=NANOCODEX_RELEASE_BUILD={}",
+        is_stable || is_nightly
+    );
 
     println!(
         "cargo:rustc-env=NANOCODEX_SEMVER_VERSION={version}+{sha_short}.{build_timestamp_unix}.{profile}"

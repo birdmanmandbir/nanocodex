@@ -48,7 +48,7 @@ claims.
 | 2 | `643de86a190a` Add audio output support to dynamic tools and code mode | `defer` | Preserve the existing model-visible Code Mode audio shape, but do not claim the commit's full dynamic-tool, app-server, history, analytics, and model-modality support. The supported model contract remains text/image, so broader audio input/output stays deferred. |
 | 3 | `0fb559f0f6e2` Support legacy views for paginated thread history | `out-of-scope` | This is app-server projection, resume, and pagination behavior. It is distinct from row 22: Nanocodex consumes legacy Codex rollouts and deliberately rejects a canonical paginated rollout rather than implementing app-server views. |
 | 4 | `9dc372fbafb1` Avoid cloning thread data when rendering transcripts | `evaluate` | Nanocodex uses shared `Arc` transcript entries, but there is no allocation regression proving that resume-to-transcript construction avoids the clones removed by this Codex change. Profile the retained resume path before claiming adoption. |
-| 5 | `3dd3c5d08ac8` Use the Markdown collector as the streaming source of truth | `port` | `P1`: Nanocodex keeps one canonical Markdown source, mutates it during streaming, and seals exact terminal source; parity tests and frame benchmarks cover the path. |
+| 5 | `3dd3c5d08ac8` Use the Markdown collector as the streaming source of truth | `port` | `P1`: Nanocodex accumulates streamed assistant text in one transcript entry and replaces it with the exact canonical message; projection tests and the streaming-frame benchmark cover the path. |
 | 6 | `78fd2f2b2840` Start side conversations without replaying inherited turns | `port` | `P2`: `/btw` forks inherited model context while constructing a fresh, isolated side-pane transcript. No app-server `excludeTurns` API is imported. |
 | 7 | `4d7a5c7c7394` Avoid liveness races when starting side conversations | `port` | `P3`: the side pane is selectable immediately, the direct `agent.fork()` result is authoritative, and generation IDs prevent stale open/failure updates from mutating a reopened pane. Codex app-server metadata reads remain out-of-scope. |
 | 8 | `54994582b189` Avoid cloning buffered TUI history lines | `evaluate` | The Nanocodex Ratatui consumer has a different demand-rendered transcript pipeline. Add an allocation profile for queued history insertion before changing ownership solely to resemble Codex. |
@@ -57,7 +57,7 @@ claims.
 | 11 | `74bfbda9b587` Keep incremental rendering with visualization context | `out-of-scope` | Nanocodex does not expose Codex's inline visualization-context resolver, so its directive-sensitive fallback pipeline is absent. |
 | 12 | `854a82dbfda6` Track TUI command completion separately from output | `port` | `P4`: `ToolCall` establishes running state and only `ToolResult` establishes terminal state; cancellation and continued shell tests cover the lifecycle. App-server output-delta plumbing is not imported. |
 | 13 | `d0516cfe4ba0` Avoid buffering replay-irrelevant thread notifications | `out-of-scope` | Nanocodex has no app-server thread-notification replay buffer or approval/realtime state machine. Contractual typed events are consumed directly by each library client. |
-| 14 | `6a54efb76bf5` Cache finalized Markdown history rendering | `port` | `P5`: finalized Markdown is width-cached, invalidated on source/width changes, parity-tested against fresh rendering, and covered by focused frame benchmarks. Visualization-specific invalidation is absent with the visualization surface. |
+| 14 | `6a54efb76bf5` Cache finalized Markdown history rendering | `port` | `P5`: transcript layouts are cached by entry revision, width, expansion state, and live duration; focused cache tests and frame benchmarks cover invalidation. Visualization-specific invalidation is absent with the visualization surface. |
 | 15 | `c86b1be3cdbe` Avoid cloning file changes in TUI diff rendering | `evaluate` | The Nanocodex patch renderer has a 16-file frame benchmark, but no allocation measurement demonstrates the consume/borrow optimization in this commit. |
 | 16 | `7844386e3de0` Backfill completion items only for the active exec turn | `out-of-scope` | Codex's headless exec consumes a shared app-server event stream and performs `thread/read` backfill. Nanocodex agents own independent typed event streams and do not perform completion backfill requests. |
 | 17 | `5a208c1fc353` Persist names for paginated threads | `out-of-scope` | Paginated app-server thread state, naming, search, and compatibility indexes are not owned by the library SDK. |
@@ -86,56 +86,53 @@ claims.
 
 ### P1 — canonical streaming Markdown source
 
-[`MarkdownContent`](../bin/nanocodex/src/tui/transcript.rs) owns one raw
-`source`. `append` and `append_reasoning` mutate that source, while `finalize`
-installs the exact terminal message and disables streaming healing. The tests
-`streaming_plain_markdown_append_matches_a_fresh_parse` and
-`assistant_markdown_is_healed_and_rendered_while_streaming` compare incremental
-and canonical rendering. The
-[`tui_markdown/healed_streaming_frame/120x40` benchmark](../bin/nanocodex/benches/tui_render.rs)
-covers the changed-frame cost.
+[`TranscriptModel`](../bin/nanocodex/src/tui/transcript/model.rs) appends
+assistant deltas to one entry and replaces that entry when the canonical
+assistant message arrives. `canonical_message_replaces_streamed_deltas` and
+`ordinary_reasoning_deltas_remain_one_streamed_step` cover the projection, and
+the [`tui/transcript_streaming_delta_and_render`](../bin/nanocodex/src/tui/bench.rs)
+benchmark covers the changed-frame cost.
 
 ### P2 — inherited model context, fresh side transcript
 
-[`App::begin_btw`](../bin/nanocodex/src/tui/app.rs) creates a new empty
-`Conversation`; [`open_btw`](../bin/nanocodex/src/tui/mod.rs) obtains the model
-branch through `agent.fork()` and routes its events only to that pane. The test
-`btw_conversation_isolated_and_focus_toggles` covers independent UI state. The
+[`AppNode::begin_fork`](../bin/nanocodex/src/tui/components/app.rs) creates and
+focuses a new pane from the primary pane's projected transcript;
+[`open_fork`](../bin/nanocodex/src/tui/mod.rs) obtains the model branch through
+the typed checkpoint and routes its events only to that pane. The test
+`fork_pane_has_an_independent_session_and_persisted_transcript` covers
+independent UI and persistence state. The
 [fork record](../benchmarks/fork_results.md) additionally records a real PTY
-trial where `/btw` could read inherited model context without leaking branch
+trial where a fork could read inherited model context without leaking branch
 activity back into the root.
 
 ### P3 — side-pane liveness follows the fork result
 
-`begin_btw` focuses and renders the pane before the asynchronous fork finishes.
-`open_btw` treats the direct library fork result as authoritative instead of
-waiting for a second lifecycle notification. The tests
-`btw_renders_as_a_side_by_side_focused_pane` in
-[`view.rs`](../bin/nanocodex/src/tui/view.rs) and
-`stale_btw_updates_do_not_reach_a_reopened_pane` in
-[`app.rs`](../bin/nanocodex/src/tui/app.rs) cover immediate availability and
-generation-scoped stale updates.
+`begin_fork` focuses and renders the pane before the asynchronous model fork
+finishes. The pane generation carried by
+[`PaneGeneration`](../bin/nanocodex/src/tui/pane.rs) scopes asynchronous
+open/close and memory completions so stale work cannot mutate a replacement
+pane. `fork_pane_has_an_independent_session_and_persisted_transcript` and
+`stale_human_delete_is_reported_to_the_originating_pane` cover those boundaries.
 
 ### P4 — command output is not command completion
 
-[`Conversation::on_tool_call`](../bin/nanocodex/src/tui/app.rs) creates running
-tool state. Only `on_tool_result` supplies completed, failed, or cancelled
-state, and continued shell sessions remain running while their result still
-contains a session ID. The tests
-`terminal_transport_resolves_the_original_command_without_leaking` and
-`cancelled_turn_is_terminal_without_rendering_a_generic_error` cover continued
-and interrupted commands.
+[`TranscriptModel::tool_call`](../bin/nanocodex/src/tui/transcript/model.rs)
+creates running tool state. Only `tool_result` supplies completed, failed, or
+cancelled state, and continued shell sessions remain running while their result
+still contains a session ID. The tests
+`yielded_shell_sessions_remain_running_until_they_exit` and
+`ending_a_run_fails_tools_missing_their_terminal_result` cover continued and
+interrupted commands.
 
 ### P5 — finalized Markdown render cache
 
-[`MarkdownContent::with_rendered`](../bin/nanocodex/src/tui/transcript.rs)
-retains a `RenderedText` for the current width and invalidates it when the
-source or width changes. The tests
-`long_styled_markdown_line_uses_parity_checked_cached_rows` and
-`finalized_assistant_renders_markdown_and_reflows_tables_by_width` compare the
-cached path with fresh rendering. The
-[`tui_markdown/finalize_and_first_frame/120x40` benchmark](../bin/nanocodex/benches/tui_render.rs)
-keeps the public frame path measured.
+[`LayoutCache`](../bin/nanocodex/src/tui/components/transcript/mod.rs) retains
+rendered lines by entry revision, width, expansion state, and live duration.
+Entry or width changes rebuild the complete cached entry, while a duration tick
+rebuilds only the mutable tool summary. `live_timer_rebuilds_only_the_cached_summary_of_an_expanded_tool`
+covers focused invalidation, and the transcript tail, streaming delta, and
+large-tool benchmarks in [`tui/bench.rs`](../bin/nanocodex/src/tui/bench.rs)
+keep the public frame path measured.
 
 ### P6 — canonical rollout history-mode validation
 
@@ -215,10 +212,10 @@ cover retention and provider-facing filtering.
 
 ### P14 — rejected turns do not close the TUI
 
-[`start_turn`](../bin/nanocodex/src/tui/mod.rs) converts prompt-admission
-failure into `TurnTraceRejected` and `TurnFinished` updates and returns control
-to the worker loop. `rejected_turns_do_not_stop_the_tui_worker` submits two
-consecutive rejected turns and proves the worker remains available.
+[`start_turn`](../bin/nanocodex/src/tui/worker.rs) reports prompt-admission
+failure as a terminal `WorkerEvent::TurnFinished` update and returns control to
+the worker loop. `explicit_cancellation_interrupts_the_turn_and_keeps_worker_alive`
+proves the same worker remains available after a terminal interruption.
 
 ### P15 — missing checkpoint replay
 
@@ -240,12 +237,11 @@ threshold crossings and missing-usage fallback.
 
 ### P17 — bounded syntax highlighting
 
-[`highlighted_code_lines`](../bin/nanocodex/src/tui/markdown.rs) falls back to
-plain rendering when any source line exceeds 4 KiB.
-`skips_highlighting_for_oversized_source_lines` covers exact content and style,
-while
-[`tui_markdown/syntax_fallback_oversized_line_1m`](../bin/nanocodex/benches/tui_render.rs)
-keeps the pathological retained-trace shape measured.
+[`highlight::line`](../bin/nanocodex/src/tui/components/transcript/highlight.rs)
+falls back to plain rendering when a source line exceeds 4 KiB.
+`oversized_lines_skip_syntax_highlighting` covers exact content and style; the
+highlighted-patch benchmark in [`tui/bench.rs`](../bin/nanocodex/src/tui/bench.rs)
+keeps the ordinary highlighted path measured.
 
 ### P18 — shared request construction
 
@@ -282,9 +278,9 @@ server delay, exhaustion, terminal errors, and checkpoint recovery.
 ### P22 — nonblocking Ratatui interruption
 
 The terminal loop sends a cancellation command and redraws; the independent
-[`AgentWorker`](../bin/nanocodex/src/tui/mod.rs) awaits agent cancellation.
-`second_escape_sends_cancel_for_the_focused_turn` verifies that input handling
-only queues the command rather than awaiting lifecycle work.
+[`worker`](../bin/nanocodex/src/tui/worker.rs) awaits agent cancellation.
+`explicit_cancellation_interrupts_the_turn_and_keeps_worker_alive` verifies
+that cancellation remains outside the input/render loop.
 
 ### P23 — forks use the active typed history
 
@@ -312,10 +308,10 @@ asserting one successful export.
 
 ### P26 — focus does not replace input
 
-Focus events in [`UiModel`](../bin/nanocodex/src/tui/mod.rs) update terminal
-focus, notification, resize, and redraw state without touching the composer.
-`focus_gain_redraws_and_clears_an_unfocused_completion_notification` now also
-asserts that an unfinished draft and cursor survive the round trip.
+Focus events in the [`terminal loop`](../bin/nanocodex/src/tui/mod.rs) refresh
+terminal state and request a redraw without replacing the component tree or
+composer. Composer draft and cursor ownership remains isolated in
+[`Composer`](../bin/nanocodex/src/tui/components/composer.rs).
 
 ### P28 — stable ten-second Code Mode yield
 

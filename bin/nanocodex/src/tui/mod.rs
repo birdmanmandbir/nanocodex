@@ -1,4260 +1,2597 @@
-mod app;
+//! Interactive terminal runtime.
+//!
+//! Derived from Tact v0.3.6 (Apache-2.0), modified for Nanocodex.
+
+#![allow(
+    clippy::missing_const_for_fn,
+    clippy::redundant_clone,
+    clippy::use_self
+)]
+
+mod agent_events;
 mod clipboard;
-mod composer;
-mod diff;
-mod external_editor;
-mod markdown;
-mod notification;
-mod resume_picker;
+mod components;
+mod context;
+mod editor;
+mod format;
+mod pane;
+mod prompt;
+mod review_controller;
 mod scheduler;
-mod selection;
-mod telemetry;
+pub(crate) mod session;
+mod shell;
+mod spinner;
+mod subagent_updates;
 mod terminal;
-mod transcript;
-mod view;
+pub(crate) mod theme;
+pub(crate) mod transcript;
+mod worker;
 
-use std::{
-    collections::VecDeque,
-    path::PathBuf,
-    process::{Command, Stdio},
-    sync::Arc,
-    time::{Duration, Instant},
-};
-
-use crossterm::event::{
-    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
-};
-use eyre::{Result, WrapErr};
-use futures_util::StreamExt;
-use nanocodex::{
-    AgentEvents, Nanocodex, NanocodexError, OpenAi, Thinking, TurnControl, TurnResult,
-    agent::{
-        events::{AgentEvent, TimedAgentEvent},
-        rollout::DurableSession,
+use crate::{
+    app::{
+        config::{Config, ReasoningEffort, ReasoningMode},
+        error::{Result, RuntimeError},
     },
-    tools::mcp::McpHandle,
+    core::{
+        ConfiguredAgent,
+        extensions::{
+            memory::{MemoryError, MemoryKey, MemoryRecord, MemoryStore},
+            subagents::SubagentControl,
+        },
+    },
+    tui::{
+        agent_events::ForwardedAgentEvent,
+        components::{
+            AppEffect, AppEvent, AppNode, ComponentUpdate, RenderRequest,
+            RestoredSessionProjection, RootNode,
+        },
+        editor::EditorOutcome,
+        pane::PaneId,
+        prompt::Submission,
+        review_controller::{ReviewCompletion, ReviewController, ReviewIdentity, ReviewTask},
+        scheduler::{RenderScheduler, STREAM_FRAME_INTERVAL},
+        session::SessionSummary,
+        shell::ShellExecution,
+        subagent_updates::ForwardedSubagentUpdate,
+        terminal::TerminalSession,
+        transcript::{
+            LocalEvent, SessionEnded, SessionOutcome, SessionStarted, ShellId, TranscriptError,
+            TranscriptJournal, TurnId,
+        },
+        worker::{AuxiliaryError, WorkerCommand, WorkerEvent},
+    },
 };
-use nanocodex_voice::{
-    CHATGPT_REALTIME_VOICES, PLATFORM_REALTIME_VOICES, RealtimeVoice, VoiceAgentControl,
-    VoiceEvent, VoiceEvents, VoiceSession, VoiceSessionBuilder, VoiceSpeaker,
+use futures_util::StreamExt;
+use std::{
+    collections::HashMap,
+    io::{self, IsTerminal},
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
-use ratatex::{Ratatex, TerminalProfile};
+use tact_crossterm::event::{
+    Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
+};
 use tokio::{
     sync::mpsc,
-    time::{MissedTickBehavior, interval, sleep_until},
+    task::{JoinHandle, JoinSet},
+    time::sleep_until,
 };
-use tracing::{Instrument, info_span};
+use tokio_util::sync::CancellationToken;
 
-use self::{
-    app::{App, EscapeAction, PaneId, ReasoningPickerAction, SubmittedPrompt},
-    notification::Notifier,
-    scheduler::{ANIMATION_TICK_INTERVAL, RenderScheduler, RenderScope, STREAM_FRAME_INTERVAL},
-    telemetry::{StreamTelemetry, ViewTelemetry},
-    terminal::TerminalSession,
-    transcript::TranscriptItem,
-};
-use crate::config::AgentArgs;
-
-pub(crate) use resume_picker::select_resume_session;
-
-const BTW_BOUNDARY: &str = r"You are answering an ephemeral BTW side question.
-Treat inherited conversation history only as reference context. Do not resume or complete an
-earlier task. Answer only the question after this boundary. Do not modify the workspace unless
-that side question explicitly requests a mutation.
-
-BTW question:
-";
-const DEFAULT_JAEGER_UI_URL: &str = "http://127.0.0.1:16686";
-const JAEGER_UI_URL_ENV: &str = "NANOCODEX_JAEGER_UI_URL";
-const MOUSE_SCROLL_ROWS: usize = 3;
-const MAX_AGENT_EVENTS_PER_BATCH: usize = 256;
-
-enum WorkerCommand {
-    Prompt {
-        target: PaneId,
-        prompt_id: u64,
-        prompt: SubmittedPrompt,
-    },
-    Steer {
-        target: PaneId,
-        id: u64,
-        prompt: SubmittedPrompt,
-    },
-    Cancel {
-        target: PaneId,
-    },
-    InterruptForSteers {
-        target: PaneId,
-        prompt_id: u64,
-        steer_ids: Vec<u64>,
-        prompt: SubmittedPrompt,
-    },
-    OpenBtw {
-        id: u64,
-        prompt_id: Option<u64>,
-        prompt: Option<SubmittedPrompt>,
-    },
-    CloseBtw {
-        id: u64,
-    },
-    EditHistorical {
-        source_branch_id: u64,
-        new_branch_id: u64,
-        prompt_id: u64,
-    },
-    SwitchMainBranch {
-        id: u64,
-    },
-    SetFastMode {
-        enabled: bool,
-    },
-    SetThinking {
-        thinking: Thinking,
-    },
-    McpLogin {
-        name: String,
-    },
-    McpReload {
-        name: String,
-    },
-    VoiceAgentEvent(AgentEvent),
-    Voice(VoiceControl),
+pub(crate) enum StartupMode {
+    NewSession,
+    ResumeSession(String),
+    ResumeSelector,
 }
 
-enum WorkerEvent {
-    TurnTraceStarted {
-        target: PaneId,
-        id: u64,
-        span: tracing::Span,
-    },
-    TurnTraceRejected {
-        target: PaneId,
-        id: u64,
-    },
-    TurnFinished {
-        target: PaneId,
-        main_branch_id: Option<u64>,
-        error: Option<String>,
-    },
-    SteerAdmitted {
-        target: PaneId,
-        id: u64,
-    },
-    SteerQueued {
-        target: PaneId,
-        id: u64,
-        prompt: String,
-    },
-    SteerFailed {
-        target: PaneId,
-        id: u64,
-        error: String,
-    },
-    CancelAccepted {
-        target: PaneId,
-    },
-    CancelSettled {
-        target: PaneId,
-    },
-    CancelFailed {
-        target: PaneId,
-        error: String,
-    },
-    InterruptedSteersResubmitted {
-        target: PaneId,
-        prompt_id: u64,
-        steer_ids: Vec<u64>,
-    },
-    InterruptedSteersKept {
-        target: PaneId,
-        prompt_id: u64,
-    },
-    BtwOpened {
-        id: u64,
-        request_id: Arc<str>,
-    },
-    BtwOpenFailed {
-        id: u64,
-        error: String,
-    },
-    BtwAgentEvent {
-        id: u64,
-        event: TimedAgentEvent,
-    },
-    BtwEventStreamClosed {
-        id: u64,
-    },
-    MainBranchOpened {
-        id: u64,
-        parent_id: u64,
-        prompt_id: u64,
-        request_id: Arc<str>,
-    },
-    MainBranchOpenFailed {
-        id: u64,
-        error: String,
-    },
-    MainBranchSwitched {
-        id: u64,
-        request_id: Arc<str>,
-    },
-    MainBranchSwitchFailed {
-        id: u64,
-        error: String,
-    },
-    MainBranchAgentEvent {
-        id: u64,
-        event: TimedAgentEvent,
-    },
-    MainBranchEventStreamClosed {
-        id: u64,
-    },
-    FastModeChanged {
-        enabled: bool,
-    },
-    FastModeChangeFailed {
-        error: String,
-    },
-    ThinkingChanged {
-        thinking: Thinking,
-    },
-    ThinkingChangeFailed {
-        error: String,
-    },
-    McpLoginStarted {
-        name: String,
-    },
-    McpReady {
-        name: String,
-        tool_count: usize,
-        authenticated: bool,
-    },
-    McpFailed {
-        name: String,
-        error: String,
-    },
-    VoiceConnecting,
-    VoiceStarted {
-        voice: RealtimeVoice,
-    },
-    VoiceTranscript {
-        speaker: VoiceSpeaker,
+type EditorTask =
+    JoinHandle<std::result::Result<EditorCompletion, crate::app::error::ExternalEditorError>>;
+
+type EffortUpdateTask = JoinHandle<Result<EffortUpdate>>;
+
+type FastModeUpdateTask = JoinHandle<Result<FastModeUpdate>>;
+
+type NewSessionTask = JoinHandle<(
+    PaneId,
+    ReasoningEffort,
+    ReasoningMode,
+    bool,
+    Result<ConfiguredAgent>,
+)>;
+
+type SessionListTask = JoinHandle<(PaneId, Result<Vec<SessionSummary>>)>;
+
+type ResumeSessionTask = JoinHandle<(
+    PaneId,
+    ReasoningEffort,
+    ReasoningMode,
+    bool,
+    Result<RestoredSession>,
+)>;
+
+type UpdateCheckTask =
+    JoinHandle<std::result::Result<Option<semver::Version>, crate::app::update::UpdateError>>;
+
+struct AuxiliaryJobRequest {
+    review: ReviewIdentity,
+    prompt: String,
+    shutdown: CancellationToken,
+    completion: tokio::sync::oneshot::Sender<std::result::Result<String, AuxiliaryError>>,
+}
+
+struct ReviewReady {
+    identity: ReviewIdentity,
+    url: String,
+}
+
+fn spawn_update_check() -> Option<UpdateCheckTask> {
+    if crate::app::installation::current().is_development() {
+        return None;
+    }
+    Some(tokio::spawn(crate::app::update::check_for_update()))
+}
+
+struct RestoredSession {
+    configured: ConfiguredAgent,
+    projection: RestoredSessionProjection,
+    reasoning_mode: ReasoningMode,
+}
+
+enum EditorTarget {
+    Draft {
+        pane: PaneId,
         text: String,
     },
-    VoiceInfo {
-        message: String,
+    Queue {
+        pane: PaneId,
+        index: usize,
+        text: String,
     },
-    VoiceFailed {
-        error: String,
+    Config(PathBuf),
+    File(PathBuf),
+}
+
+enum EditorCompletion {
+    Draft {
+        pane: PaneId,
+        outcome: EditorOutcome,
     },
-    VoiceStopped,
+    Queue {
+        pane: PaneId,
+        index: usize,
+        original: String,
+        outcome: EditorOutcome,
+    },
+    Config,
+    File,
 }
 
-struct MainWorkerBranch {
-    id: u64,
-    request_id: Arc<str>,
-    agent: Nanocodex,
-    turns: VecDeque<TrackedTurn>,
-    prompt_order: Vec<u64>,
-    results: Vec<(u64, TurnResult)>,
-}
-
-struct BtwWorker {
-    id: u64,
-    request_id: Arc<str>,
-    agent: Nanocodex,
-    first_prompt: bool,
-    turns: VecDeque<TrackedTurn>,
-}
-
-struct TrackedTurn {
-    id: u64,
-    prompt_id: u64,
-    control: TurnControl,
-    span: tracing::Span,
-}
-
-struct SteerRequest {
-    id: u64,
-    prompt: SubmittedPrompt,
-}
-
-#[derive(Clone, Copy)]
-struct TurnTarget<'a> {
-    session_id: &'a str,
+struct EffortUpdate {
     pane: PaneId,
-    main_branch_id: Option<u64>,
+    to: ReasoningEffort,
+    preferred_reasoning_mode: ReasoningMode,
 }
 
-impl BtwWorker {
-    fn prepare_prompt(&mut self, prompt: SubmittedPrompt) -> SubmittedPrompt {
-        prepare_btw_prompt(&mut self.first_prompt, prompt)
-    }
+struct FastModeUpdate {
+    pane: PaneId,
+    enabled: bool,
 }
 
-fn prepare_btw_prompt(first_prompt: &mut bool, mut prompt: SubmittedPrompt) -> SubmittedPrompt {
-    if *first_prompt {
-        *first_prompt = false;
-        prompt.prepend_text(BTW_BOUNDARY);
-    }
-    prompt
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TerminalAction {
-    Redraw,
-    Ignore,
-    Quit,
-    ExternalEditor,
-}
-
-enum UiAction {
-    Terminal(Event),
-    Agent(AgentEvent),
-    AgentStreamClosed,
-    Worker(WorkerEvent),
-    WorkerStopped,
-    Tick,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RedrawPriority {
-    Immediate,
-    Streaming,
-    InputBurst,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum UiUpdate {
-    Redraw(RedrawPriority),
-    RedrawAnimation,
-    RestoreTerminalGraphics,
-    Ignore,
-    Quit,
-    ExternalEditor,
-}
-
-struct UiModel {
-    app: App,
-    root_session_id: Arc<str>,
-    agent_events_open: bool,
-    worker_updates_open: bool,
-    voice_observing: bool,
-    terminal_focused: bool,
-    pending_notification: Option<String>,
-    pending_mouse_scroll: Option<MouseScrollBurst>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ScrollDirection {
-    Up,
-    Down,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct MouseScrollBurst {
-    target: PaneId,
-    direction: ScrollDirection,
-    rows: usize,
-}
-
-impl MouseScrollBurst {
-    const fn new(target: PaneId, direction: ScrollDirection) -> Self {
-        Self {
-            target,
-            direction,
-            rows: MOUSE_SCROLL_ROWS,
-        }
-    }
-
-    fn push(&mut self, target: PaneId, direction: ScrollDirection) {
-        if self.target != target || self.direction != direction {
-            *self = Self::new(target, direction);
-            return;
-        }
-        self.rows = self.rows.saturating_add(MOUSE_SCROLL_ROWS);
-    }
-
-    fn apply(self, app: &mut App) {
-        match self.direction {
-            ScrollDirection::Up => app.scroll_up_in(self.target, self.rows),
-            ScrollDirection::Down => app.scroll_down_in(self.target, self.rows),
-        }
-    }
-}
-
-impl UiModel {
-    const fn new(app: App, root_session_id: Arc<str>) -> Self {
-        Self {
-            app,
-            root_session_id,
-            agent_events_open: true,
-            worker_updates_open: true,
-            voice_observing: false,
-            terminal_focused: true,
-            pending_notification: None,
-            pending_mouse_scroll: None,
-        }
-    }
-
-    fn queue_mouse_scroll(&mut self, direction: ScrollDirection) {
-        let target = self.app.focus;
-        if let Some(pending) = &mut self.pending_mouse_scroll {
-            pending.push(target, direction);
-        } else {
-            self.pending_mouse_scroll = Some(MouseScrollBurst::new(target, direction));
-        }
-    }
-
-    fn apply_pending_mouse_scroll(&mut self) {
-        if let Some(pending) = self.pending_mouse_scroll.take() {
-            pending.apply(&mut self.app);
-        }
-    }
-
-    fn update(
-        &mut self,
-        action: UiAction,
-        commands: &mpsc::UnboundedSender<WorkerCommand>,
-    ) -> Result<UiUpdate> {
-        match action {
-            UiAction::Terminal(event) => {
-                let mouse_scroll = match event {
-                    Event::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollUp => {
-                        Some(ScrollDirection::Up)
-                    }
-                    Event::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollDown => {
-                        Some(ScrollDirection::Down)
-                    }
-                    _ => None,
-                };
-                if let Some(direction) = mouse_scroll {
-                    let _ = self.app.clear_mouse_selection();
-                    self.queue_mouse_scroll(direction);
-                    return Ok(UiUpdate::Redraw(RedrawPriority::InputBurst));
-                }
-                // A non-wheel event is an ordering barrier: apply the gesture to
-                // the pane it started in before focus or viewport state can change.
-                self.apply_pending_mouse_scroll();
-                match event {
-                    Event::FocusGained => {
-                        self.terminal_focused = true;
-                        self.pending_notification = None;
-                        // tmux can resize this pane before returning focus to it. The resize
-                        // frame may be presented while tmux is still repainting its layout, so
-                        // redraw once more after focus has settled on this pane. Graphics
-                        // passthrough emitted while a tmux window is invisible is discarded, so
-                        // the caller must also restore Ratatex's terminal-side image state.
-                        return Ok(UiUpdate::RestoreTerminalGraphics);
-                    }
-                    Event::FocusLost => {
-                        self.terminal_focused = false;
-                        return Ok(UiUpdate::Ignore);
-                    }
-                    _ => {}
-                }
-                match handle_terminal_event(event, &mut self.app, &self.root_session_id, commands)?
-                {
-                    TerminalAction::Redraw => Ok(UiUpdate::Redraw(RedrawPriority::Immediate)),
-                    TerminalAction::Ignore => Ok(UiUpdate::Ignore),
-                    TerminalAction::Quit => Ok(UiUpdate::Quit),
-                    TerminalAction::ExternalEditor => Ok(UiUpdate::ExternalEditor),
-                }
-            }
-            UiAction::Agent(event) => {
-                if self.voice_observing {
-                    drop(commands.send(WorkerCommand::VoiceAgentEvent(event.clone())));
-                }
-                let updated = self.app.on_main_agent_event(0, &event);
-                request_navigated_branch_switch(&mut self.app, commands)?;
-                if updated {
-                    Ok(UiUpdate::Redraw(RedrawPriority::Streaming))
-                } else {
-                    Ok(UiUpdate::Ignore)
-                }
-            }
-            UiAction::AgentStreamClosed => {
-                self.app.main_branch_event_stream_closed(0);
-                self.agent_events_open = false;
-                Ok(UiUpdate::Redraw(RedrawPriority::Streaming))
-            }
-            UiAction::Worker(update) => {
-                match &update {
-                    WorkerEvent::VoiceConnecting | WorkerEvent::VoiceStarted { .. } => {
-                        self.voice_observing = true;
-                    }
-                    WorkerEvent::VoiceFailed { .. } | WorkerEvent::VoiceStopped => {
-                        self.voice_observing = false;
-                    }
-                    _ => {}
-                }
-                if !self.terminal_focused
-                    && let WorkerEvent::TurnFinished { target, error, .. } = &update
-                {
-                    let scope = if matches!(target, PaneId::Main) {
-                        "Nanocodex"
-                    } else {
-                        "Nanocodex BTW"
-                    };
-                    self.pending_notification = Some(if error.is_some() {
-                        format!("{scope} needs attention")
-                    } else {
-                        format!("{scope} finished")
-                    });
-                }
-                handle_worker_update(&mut self.app, update, commands)?;
-                Ok(UiUpdate::Redraw(RedrawPriority::Streaming))
-            }
-            UiAction::WorkerStopped => {
-                self.app
-                    .main
-                    .push_output(TranscriptItem::Error("agent worker stopped".to_owned()));
-                self.worker_updates_open = false;
-                Ok(UiUpdate::Redraw(RedrawPriority::Streaming))
-            }
-            UiAction::Tick => {
-                let requires_full_redraw =
-                    self.app.mouse_selection_needs_redraw() || self.app.historical_editor_active();
-                self.app.on_tick();
-                Ok(if requires_full_redraw {
-                    UiUpdate::Redraw(RedrawPriority::Streaming)
-                } else {
-                    UiUpdate::RedrawAnimation
-                })
-            }
-        }
-    }
+struct PendingSubmission {
+    id: TurnId,
+    prompt: Submission,
 }
 
 #[derive(Clone, Copy)]
-enum SubmitIntent {
-    Immediate,
-    Queue,
+struct PaneGeneration {
+    pane: PaneId,
+    generation: u64,
 }
 
-#[derive(Debug, Eq, PartialEq)]
-enum Submission {
-    Prompt(SubmittedPrompt),
-    Btw(Option<SubmittedPrompt>),
-    CloseBtw,
-    Cancel,
-    Trace,
-    Fast(Option<bool>),
-    ReasoningPicker,
-    Voice(VoiceControl),
-    McpLogin(String),
-    McpReload(String),
-    InvalidCommand(String),
+struct PaneSession<'a> {
+    id: &'a str,
+    parent_id: Option<&'a str>,
+    previously_persisted: bool,
+    skills_catalog_present: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum VoiceControl {
-    Toggle,
-    Start(Option<RealtimeVoice>),
-    Stop,
-    List,
+#[derive(Clone, Copy)]
+struct PaneSettings {
+    effort: ReasoningEffort,
+    reasoning_mode: ReasoningMode,
+    fast_mode: bool,
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "the ordered terminal, agent, worker, and render event loop is intentionally cohesive"
-)]
-pub(crate) async fn run(
-    config: AgentArgs,
-    vm: crate::vm::VmArgs,
-    initial_prompt: Option<String>,
-    resume: Option<DurableSession>,
-) -> Result<()> {
-    let initial_model = resume
-        .as_ref()
-        .map_or_else(|| config.model(), DurableSession::model);
-    let initial_thinking = config.thinking();
-    let initial_fast_mode = config.fast_mode();
-    let restored_transcript = resume
-        .as_ref()
-        .map(|session| session.transcript().to_vec())
-        .unwrap_or_default();
-    let cwd = resume
-        .as_ref()
-        .map(|session| PathBuf::from(session.workspace()))
-        .unwrap_or(resolve_cwd(&config)?);
-    let configured = if let Some(session) = resume {
-        config.build_resumed(session, vm).await?
-    } else {
-        config.build(vm).await?
-    };
-    let agent = configured.handle;
-    let mut agent_events = configured.events;
-    let realtime = configured.realtime;
-    let root_session_id = Arc::<str>::from(agent_events.request_id());
-    let child_agents = configured.child_agents;
-    let mpp_adapter = configured.mpp_adapter;
-    let mcp = configured.mcp;
-    let browser = configured.browser;
-    let vm = configured.vm;
-    let (worker_tx, worker_rx) = mpsc::unbounded_channel();
-    let (update_tx, mut update_rx) = mpsc::unbounded_channel();
-    let worker = spawn_agent_worker(
-        agent,
-        Arc::clone(&root_session_id),
-        realtime,
-        mcp,
-        worker_rx,
-        update_tx,
-    );
-
-    let mut terminal = TerminalSession::enter().wrap_err("failed to initialize the terminal")?;
-    let terminal_profile = TerminalProfile::query(Duration::from_millis(750));
-    let (math_update_tx, mut math_update_rx) = mpsc::channel(1);
-    let math_renderer = Ratatex::builder(terminal_profile)
-        .on_update(move || {
-            let _ = math_update_tx.try_send(());
-        })
-        .build()
-        .wrap_err("failed to initialize the display-math renderer")?;
-    let availability = math_renderer.availability();
-    tracing::debug!(
-        graphics = availability.graphics,
-        cell_width = terminal_profile.cell.width,
-        cell_height = terminal_profile.cell.height,
-        "initialized Ratatex"
-    );
-    let mut input_events = EventStream::new();
-    let mut ticker = ui_ticker();
-    let mut app = App::new(cwd)
-        .with_model(initial_model)
-        .with_thinking(initial_thinking)
-        .with_fast_mode(initial_fast_mode);
-    app.set_math_renderer(math_renderer.clone());
-    app.restore_transcript(restored_transcript);
-    let mut ui = UiModel::new(app, Arc::clone(&root_session_id));
-    let mut scheduler = RenderScheduler::new(STREAM_FRAME_INTERVAL, Instant::now());
-    let mut stream_telemetry = StreamTelemetry::default();
-    let mut view_telemetry = ViewTelemetry::new(Arc::clone(&root_session_id));
-    let mut notifier = Notifier::from_env();
-
-    submit_initial_prompt(&mut ui.app, &root_session_id, &worker_tx, initial_prompt)?;
-
-    let loop_result: Result<()> = async {
-        loop {
-            view_telemetry.observe(&ui.app);
-            render_due_frame(
-                &mut ui,
-                &mut terminal,
-                &mut scheduler,
-                &mut stream_telemetry,
-                &mut notifier,
-                &math_renderer,
-            )?;
-
-            let render_deadline = scheduler.deadline();
-            tokio::select! {
-            () = async {
-                if let Some(deadline) = render_deadline {
-                    sleep_until(deadline.into()).await;
-                }
-            }, if render_deadline.is_some() => {}
-            event = input_events.next() => {
-                let event = event.transpose()?.ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "terminal input closed")
-                })?;
-                let update = ui.update(UiAction::Terminal(event), &worker_tx)?;
-                if update == UiUpdate::RestoreTerminalGraphics {
-                    math_renderer.reupload_all();
-                    ui.app.invalidate_math_layouts();
-                } else if update == UiUpdate::ExternalEditor {
-                    input_events = run_external_editor(input_events, &mut terminal, &mut ui.app).await?;
-                    math_renderer.reupload_all();
-                    ui.app.invalidate_math_layouts();
-                    scheduler.request_immediate(Instant::now());
-                } else if apply_update(update, &mut scheduler) {
-                    break Ok(());
-                }
-            }
-            event = agent_events.recv_timed(), if ui.agent_events_open => {
-                if apply_main_agent_event_batch(
-                    &mut ui,
-                    &worker_tx,
-                    &mut stream_telemetry,
-                    &mut scheduler,
-                    &mut agent_events,
-                    event,
-                )? {
-                    return Ok(());
-                }
-            }
-            update = update_rx.recv(), if ui.worker_updates_open => {
-                if update.as_ref().is_some_and(|update| {
-                    handle_worker_telemetry(update, &mut stream_telemetry)
-                }) {
-                    continue;
-                }
-                let received = update
-                    .as_ref()
-                    .and_then(|update| worker_event_received(update, &stream_telemetry));
-                let action = update.map_or(UiAction::WorkerStopped, UiAction::Worker);
-                let update = ui.update(action, &worker_tx)?;
-                if let Some(received) = received {
-                    stream_telemetry.event_applied(
-                        received,
-                        matches!(update, UiUpdate::Redraw(RedrawPriority::Streaming)),
-                    );
-                }
-                if apply_update(update, &mut scheduler) {
-                    break Ok(());
-                }
-            }
-            _ = ticker.tick(), if ui.app.main.running
-                || ui.app.btw.as_ref().is_some_and(|btw| btw.conversation.running)
-                || ui.app.mouse_selection_needs_redraw() => {
-                if apply_update(ui.update(UiAction::Tick, &worker_tx)?, &mut scheduler) {
-                    break Ok(());
-                }
-            }
-            _ = math_update_rx.recv() => {
-                ui.app.invalidate_math_layouts();
-                scheduler.request_immediate(Instant::now());
-            }
-            }
+impl PaneSettings {
+    const fn new(effort: ReasoningEffort, reasoning_mode: ReasoningMode, fast_mode: bool) -> Self {
+        Self {
+            effort,
+            reasoning_mode,
+            fast_mode,
         }
     }
-    .await;
-
-    // Restore the terminal before disconnecting the paid WebSocket session.
-    drop((terminal, worker_tx, agent_events));
-    math_renderer.shutdown();
-    let shutdown_result = shutdown_runtime(worker, child_agents, mpp_adapter, browser, vm).await;
-    loop_result?;
-    shutdown_result
 }
 
-fn resolve_cwd(config: &AgentArgs) -> Result<PathBuf> {
-    config
-        .cwd()
-        .canonicalize()
-        .wrap_err("failed to resolve the working directory")
-}
-
-async fn shutdown_runtime(
-    worker: tokio::task::JoinHandle<()>,
-    child_agents: Option<std::sync::Arc<crate::subagents::ChildAgents>>,
-    mpp_adapter: Option<crate::mpp::MppAdapter>,
-    browser: Option<crate::browser::ConfiguredBrowser>,
-    vm: Option<crate::vm::ConfiguredVm>,
-) -> Result<()> {
-    worker.abort();
-    let worker_result = worker.await;
-    if let Some(child_agents) = child_agents {
-        child_agents.shutdown().await;
-    }
-    let browser_shutdown_result = if let Some(browser) = browser {
-        browser.shutdown().await
-    } else {
-        Ok(())
-    };
-    let vm_shutdown_result = if let Some(vm) = vm {
-        vm.shutdown().await
-    } else {
-        Ok(())
-    };
-    let shutdown_result = if let Some(adapter) = mpp_adapter {
-        adapter.shutdown().await
-    } else {
-        Ok(())
-    };
-    match worker_result {
-        Ok(()) => {}
-        Err(error) if error.is_cancelled() => {}
-        Err(error) => return Err(error).wrap_err("TUI agent worker failed"),
-    }
-    browser_shutdown_result?;
-    vm_shutdown_result?;
-    shutdown_result
-}
-
-fn apply_main_agent_event_batch(
-    ui: &mut UiModel,
-    worker_tx: &mpsc::UnboundedSender<WorkerCommand>,
-    stream_telemetry: &mut StreamTelemetry,
-    scheduler: &mut RenderScheduler,
-    agent_events: &mut AgentEvents,
-    first: Option<TimedAgentEvent>,
-) -> Result<bool> {
-    if apply_main_agent_event(ui, worker_tx, stream_telemetry, scheduler, first)? {
-        return Ok(true);
-    }
-    for _ in 1..MAX_AGENT_EVENTS_PER_BATCH {
-        if scheduler.is_due(Instant::now()) {
-            break;
-        }
-        let Some(event) = agent_events.try_recv_timed() else {
-            break;
-        };
-        if apply_main_agent_event(ui, worker_tx, stream_telemetry, scheduler, Some(event))? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn apply_main_agent_event(
-    ui: &mut UiModel,
-    worker_tx: &mpsc::UnboundedSender<WorkerCommand>,
-    stream_telemetry: &mut StreamTelemetry,
-    scheduler: &mut RenderScheduler,
-    event: Option<TimedAgentEvent>,
-) -> Result<bool> {
-    let received = event
-        .as_ref()
-        .map(|event| stream_telemetry.event_received(PaneId::Main, event));
-    let action = event.map_or(UiAction::AgentStreamClosed, |event| {
-        UiAction::Agent(event.event)
-    });
-    let update = ui.update(action, worker_tx)?;
-    if let Some(received) = received {
-        stream_telemetry.event_applied(
-            received,
-            matches!(update, UiUpdate::Redraw(RedrawPriority::Streaming)),
-        );
-    }
-    Ok(apply_update(update, scheduler))
-}
-
-fn render_due_frame(
-    ui: &mut UiModel,
-    terminal: &mut TerminalSession,
-    scheduler: &mut RenderScheduler,
-    stream_telemetry: &mut StreamTelemetry,
-    notifier: &mut Notifier,
-    math_renderer: &Ratatex,
-) -> Result<()> {
-    if !scheduler.is_due(Instant::now()) {
-        return Ok(());
-    }
-    ui.apply_pending_mouse_scroll();
-    ui.app.advance_smooth_scroll();
-    let render_started = Instant::now();
-    let math_output_bytes = flush_math_commands(terminal, math_renderer)?;
-    let mut draw_metrics = match scheduler.scope().unwrap_or(RenderScope::Full) {
-        RenderScope::Full => terminal.draw(|frame| view::render(frame, &mut ui.app))?,
-        RenderScope::Animation => terminal.draw_reusing_last_frame(|frame, reused| {
-            if reused {
-                view::render_animation(frame, &mut ui.app);
-            } else {
-                view::render(frame, &mut ui.app);
-            }
-        })?,
-    };
-    draw_metrics.output_bytes = draw_metrics.output_bytes.saturating_add(math_output_bytes);
-    if let Some(text) = ui.app.take_pending_copy() {
-        match clipboard::copy_to_clipboard(&text) {
-            Ok(()) => {
-                let _ = ui.app.complete_mouse_copy(true);
-            }
-            Err(error) => {
-                let _ = ui.app.complete_mouse_copy(false);
-                tracing::warn!(%error, "failed to copy the mouse selection");
-                ui.app
-                    .set_active_status(format!("Clipboard copy failed: {error}"));
-            }
-        }
-    }
-    let presented_at = Instant::now();
-    scheduler.presented(presented_at);
-    stream_telemetry.frame_presented(render_started, presented_at, draw_metrics, &ui.app);
-    if let Some(message) = ui.pending_notification.take() {
-        notifier.notify(terminal, &message);
-    }
-    if ui.app.smooth_scroll_pending() {
-        scheduler.request_streaming(presented_at);
-    }
-    Ok(())
-}
-
-fn flush_math_commands(terminal: &mut TerminalSession, math_renderer: &Ratatex) -> Result<u64> {
-    let mut output_bytes = 0_u64;
-    for command in math_renderer.drain_terminal_commands() {
-        terminal.write_control_sequence(command.as_bytes())?;
-        output_bytes =
-            output_bytes.saturating_add(u64::try_from(command.len()).unwrap_or(u64::MAX));
-    }
-    Ok(output_bytes)
-}
-
-fn worker_event_received(
-    update: &WorkerEvent,
-    telemetry: &StreamTelemetry,
-) -> Option<telemetry::ReceivedEvent> {
-    match update {
-        WorkerEvent::BtwAgentEvent { id, event } => {
-            Some(telemetry.event_received(PaneId::Btw(*id), event))
-        }
-        WorkerEvent::MainBranchAgentEvent { event, .. } => {
-            Some(telemetry.event_received(PaneId::Main, event))
-        }
-        _ => None,
-    }
-}
-
-fn ui_ticker() -> tokio::time::Interval {
-    let mut ticker = interval(ANIMATION_TICK_INTERVAL);
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    ticker
-}
-
-fn handle_worker_telemetry(update: &WorkerEvent, telemetry: &mut StreamTelemetry) -> bool {
-    match update {
-        WorkerEvent::TurnTraceStarted { target, id, span } => {
-            telemetry.register_turn(*target, *id, span.clone());
-            true
-        }
-        WorkerEvent::TurnTraceRejected { target, id } => {
-            telemetry.reject_turn(*target, *id);
-            true
-        }
-        _ => false,
-    }
-}
-
-fn submit_initial_prompt(
-    app: &mut App,
-    root_session_id: &str,
-    worker: &mpsc::UnboundedSender<WorkerCommand>,
-    initial_prompt: Option<String>,
-) -> Result<()> {
-    if let Some(prompt) = initial_prompt {
-        app.input = prompt;
-        app.cursor = app.input.len();
-        submit(app, root_session_id, worker, SubmitIntent::Immediate)?;
-    }
-    Ok(())
-}
-
-fn apply_update(update: UiUpdate, scheduler: &mut RenderScheduler) -> bool {
-    let now = Instant::now();
-    match update {
-        UiUpdate::Redraw(RedrawPriority::Immediate) => scheduler.request_immediate(now),
-        UiUpdate::RestoreTerminalGraphics => scheduler.request_immediate(now),
-        UiUpdate::Redraw(RedrawPriority::Streaming) => scheduler.request_streaming(now),
-        UiUpdate::Redraw(RedrawPriority::InputBurst) => scheduler.request_input_burst(now),
-        UiUpdate::RedrawAnimation => scheduler.request_animation(now),
-        UiUpdate::Ignore | UiUpdate::ExternalEditor => {}
-        UiUpdate::Quit => return true,
-    }
-    false
-}
-
-fn handle_worker_update(
-    app: &mut App,
-    update: WorkerEvent,
-    commands: &mpsc::UnboundedSender<WorkerCommand>,
-) -> Result<()> {
-    match update {
-        WorkerEvent::TurnFinished {
-            target,
-            main_branch_id,
-            error,
-        } => {
-            app.turn_finished(target, main_branch_id, error);
-            request_navigated_branch_switch(app, commands)?;
-        }
-        WorkerEvent::TurnTraceStarted { .. } | WorkerEvent::TurnTraceRejected { .. } => {}
-        WorkerEvent::SteerAdmitted { target, id } => app.steer_admitted(target, id),
-        WorkerEvent::SteerQueued { target, id, prompt } => {
-            app.steer_queued(target, id, prompt);
-        }
-        WorkerEvent::SteerFailed { target, id, error } => app.steer_failed(target, id, error),
-        WorkerEvent::CancelAccepted { target } => app.cancel_accepted(target),
-        WorkerEvent::CancelSettled { target } => app.cancel_settled(target),
-        WorkerEvent::CancelFailed { target, error } => app.cancel_failed(target, error),
-        WorkerEvent::InterruptedSteersResubmitted {
-            target,
-            prompt_id,
-            steer_ids,
-        } => app.interrupted_steers_resubmitted(target, prompt_id, &steer_ids),
-        WorkerEvent::InterruptedSteersKept { target, prompt_id } => {
-            app.interrupted_steers_kept(target, prompt_id);
-        }
-        WorkerEvent::BtwOpened { id, request_id } => app.btw_opened(id, request_id),
-        WorkerEvent::BtwOpenFailed { id, error } => app.btw_failed(id, error),
-        WorkerEvent::BtwAgentEvent { id, event } => {
-            let _ = app.on_agent_event(PaneId::Btw(id), &event.event);
-        }
-        WorkerEvent::BtwEventStreamClosed { id } => {
-            if app.btw_id() == Some(id) {
-                app.btw_failed(id, "BTW event stream closed".to_owned());
-            }
-        }
-        WorkerEvent::MainBranchOpened {
+impl<'a> PaneSession<'a> {
+    const fn new(id: &'a str, parent_id: Option<&'a str>, skills_catalog_present: bool) -> Self {
+        Self {
             id,
             parent_id,
-            prompt_id,
-            request_id,
-        } => {
-            if let Some(prompt) = app.main_branch_opened(id, parent_id, prompt_id, request_id) {
-                let prompt = SubmittedPrompt::text(prompt);
-                let prompt_id = app
-                    .queue_prompt(PaneId::Main, prompt.display().to_owned())
-                    .ok_or_else(|| {
-                        eyre::eyre!("historical branch disappeared before submission")
-                    })?;
-                send_command(
-                    commands,
-                    WorkerCommand::Prompt {
-                        target: PaneId::Main,
-                        prompt_id,
-                        prompt,
-                    },
-                )?;
-            }
+            previously_persisted: false,
+            skills_catalog_present,
         }
-        WorkerEvent::MainBranchOpenFailed { id, error } => {
-            app.main_branch_open_failed(id, &error);
-        }
-        WorkerEvent::MainBranchSwitched { id, request_id } => {
-            app.main_branch_switched(id, request_id);
-            request_navigated_branch_switch(app, commands)?;
-        }
-        WorkerEvent::MainBranchSwitchFailed { id, error } => {
-            app.main_branch_switch_failed(id, &error);
-        }
-        WorkerEvent::MainBranchAgentEvent { id, event } => {
-            let _ = app.on_main_agent_event(id, &event.event);
-            request_navigated_branch_switch(app, commands)?;
-        }
-        WorkerEvent::MainBranchEventStreamClosed { id } => {
-            app.main_branch_event_stream_closed(id);
-        }
-        WorkerEvent::FastModeChanged { enabled } => app.fast_mode_changed(enabled),
-        WorkerEvent::FastModeChangeFailed { error } => app.fast_mode_change_failed(&error),
-        WorkerEvent::ThinkingChanged { thinking } => app.thinking_changed(thinking),
-        WorkerEvent::ThinkingChangeFailed { error } => app.thinking_change_failed(&error),
-        WorkerEvent::McpLoginStarted { name } => {
-            app.set_active_status(format!("Authorizing MCP server {name} in browser"));
-        }
-        WorkerEvent::McpReady {
-            name,
-            tool_count,
-            authenticated,
-        } => {
-            let action = if authenticated {
-                "Authenticated and reloaded"
-            } else {
-                "Reloaded"
-            };
-            app.set_active_status(format!("{action} MCP server {name} ({tool_count} tools)"));
-        }
-        WorkerEvent::McpFailed { name, error } => {
-            app.push_active_error(format!("MCP server {name}: {error}"));
-        }
-        WorkerEvent::VoiceConnecting => app.set_active_status("Connecting voice…"),
-        WorkerEvent::VoiceStarted { voice } => {
-            app.set_active_status(format!("Voice active ({voice}) — /voice off to stop"));
-        }
-        WorkerEvent::VoiceTranscript { speaker, text } => {
-            let label = match speaker {
-                VoiceSpeaker::User => "🎙 You",
-                VoiceSpeaker::Assistant => "🔊 Voice",
-            };
-            app.main
-                .push_output(TranscriptItem::Assistant(format!("**{label}:** {text}")));
-        }
-        WorkerEvent::VoiceInfo { message } => {
-            app.main
-                .push_output(TranscriptItem::Assistant(format!("**Voice:** {message}")));
-        }
-        WorkerEvent::VoiceFailed { error } => {
-            app.push_active_error(format!("Voice: {error}"));
-            app.set_active_status("Voice unavailable");
-        }
-        WorkerEvent::VoiceStopped => app.set_active_status("Voice stopped"),
     }
-    Ok(())
+
+    const fn persisted(id: &'a str, skills_catalog_present: bool) -> Self {
+        Self {
+            id,
+            parent_id: None,
+            previously_persisted: true,
+            skills_catalog_present,
+        }
+    }
 }
 
-fn spawn_agent_worker(
-    root: Nanocodex,
-    root_session_id: Arc<str>,
-    realtime: Option<OpenAi>,
-    mcp: Option<McpHandle>,
-    mut commands: mpsc::UnboundedReceiver<WorkerCommand>,
-    updates: mpsc::UnboundedSender<WorkerEvent>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let (finished_tx, mut finished_rx) = mpsc::unbounded_channel::<FinishedTurn>();
-        let mut worker = AgentWorker {
-            main: MainWorkerBranch {
-                id: 0,
-                request_id: root_session_id,
-                agent: root,
-                turns: VecDeque::new(),
-                prompt_order: Vec::new(),
-                results: Vec::new(),
+struct PaneRuntime {
+    session_id: String,
+    instructions: Arc<str>,
+    skills_catalog_present: bool,
+    previously_persisted: bool,
+    journal: Option<TranscriptJournal>,
+    writer_path: PathBuf,
+    event_streams_open: usize,
+    next_turn: u64,
+    next_shell: u64,
+    pending_shell_context: Vec<String>,
+    pending_submission: Option<PendingSubmission>,
+    current_effort: ReasoningEffort,
+    reasoning_mode: ReasoningMode,
+    current_fast_mode: bool,
+    active_shells: usize,
+    generation: u64,
+    subagent_control: SubagentControl,
+}
+
+struct WriterCompletion {
+    pane: PaneId,
+    session_id: String,
+    generation: u64,
+    result: std::result::Result<(), TranscriptError>,
+}
+
+enum MemoryOperation {
+    List,
+    Delete(MemoryKey),
+}
+
+enum MemoryCompletion {
+    Listed {
+        pane: PaneId,
+        generation: u64,
+        result: std::result::Result<Vec<MemoryRecord>, String>,
+    },
+    Deleted {
+        pane: PaneId,
+        generation: u64,
+        id: i64,
+        conflict: bool,
+        result: std::result::Result<(), String>,
+    },
+}
+
+impl MemoryCompletion {
+    const fn identity(&self) -> (PaneId, u64) {
+        match self {
+            Self::Listed {
+                pane, generation, ..
+            }
+            | Self::Deleted {
+                pane, generation, ..
+            } => (*pane, *generation),
+        }
+    }
+
+    fn into_event(self) -> AppEvent {
+        match self {
+            Self::Listed {
+                pane,
+                result: Ok(records),
+                ..
+            } => AppEvent::MemoriesLoaded { pane, records },
+            Self::Listed {
+                pane,
+                result: Err(error),
+                ..
+            } => AppEvent::MemoryLoadFailed { pane, error },
+            Self::Deleted {
+                pane,
+                id,
+                result: Ok(()),
+                ..
+            } => AppEvent::MemoryDeleted { pane, id },
+            Self::Deleted {
+                pane,
+                conflict,
+                result: Err(error),
+                ..
+            } => AppEvent::MemoryDeleteFailed {
+                pane,
+                error,
+                conflict,
             },
-            archived_main: Vec::new(),
-            next_turn_id: 1,
-            btw: None,
-            finished: finished_tx,
-            updates,
-            mcp,
-            realtime,
-            voice: None,
-            voice_agent_control: VoiceAgentControl::default(),
-        };
-        loop {
-            tokio::select! {
-                Some(finished) = finished_rx.recv() => {
-                    worker.finish_turn(finished);
-                }
-                command = commands.recv() => {
-                    let Some(command) = command else {
-                        break;
-                    };
-                    worker.handle_command(command).await;
-                }
+        }
+    }
+}
+
+fn configured_memory_store(config: &Config) -> Option<MemoryStore> {
+    config
+        .memory()
+        .enabled()
+        .then(|| MemoryStore::new(config.memory_path()))
+}
+
+fn current_unix_ms() -> i64 {
+    let milliseconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    i64::try_from(milliseconds).unwrap_or(i64::MAX)
+}
+
+fn run_memory_operation(
+    pane: PaneId,
+    generation: u64,
+    store: &MemoryStore,
+    operation: MemoryOperation,
+) -> MemoryCompletion {
+    let now_ms = current_unix_ms();
+    match operation {
+        MemoryOperation::List => MemoryCompletion::Listed {
+            pane,
+            generation,
+            result: store.list(now_ms).map_err(|error| error.to_string()),
+        },
+        MemoryOperation::Delete(key) => {
+            let result = store.delete(key, now_ms);
+            MemoryCompletion::Deleted {
+                pane,
+                generation,
+                id: key.id,
+                conflict: matches!(result, Err(MemoryError::Conflict)),
+                result: result.map_err(|error| error.to_string()),
             }
         }
-        worker.stop_voice().await;
+    }
+}
+
+fn next_memory_generation(generations: &mut HashMap<PaneId, u64>, pane: PaneId) -> u64 {
+    let generation = generations.entry(pane).or_default();
+    *generation = generation.wrapping_add(1).max(1);
+    *generation
+}
+
+impl PaneRuntime {
+    fn journal_mut(&mut self) -> Result<&mut TranscriptJournal> {
+        self.journal
+            .as_mut()
+            .ok_or_else(|| TranscriptError::WriterStopped(self.writer_path.clone()).into())
+    }
+
+    fn exit_session_id(&self) -> Option<String> {
+        (self.previously_persisted || self.writer_path.is_file()).then(|| self.session_id.clone())
+    }
+}
+
+fn subagent_pane(
+    panes: &HashMap<PaneId, PaneRuntime>,
+    event: &ForwardedSubagentUpdate,
+) -> Option<PaneId> {
+    panes.iter().find_map(|(&pane, runtime)| {
+        (runtime.session_id == event.root_session_id
+            && runtime.subagent_control.runtime_id() == event.runtime_id)
+            .then_some(pane)
     })
 }
 
-fn voice_names(voices: &[RealtimeVoice]) -> String {
-    voices
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
+pub(crate) async fn run(
+    mut config: Config,
+    startup: StartupMode,
+    initial_prompt: Option<String>,
+    shutdown: CancellationToken,
+) -> Result<Option<String>> {
+    ensure_interactive()?;
 
-fn forward_voice_events(mut events: VoiceEvents, updates: mpsc::UnboundedSender<WorkerEvent>) {
-    drop(tokio::spawn(async move {
-        while let Some(event) = events.recv().await {
-            let update = match event {
-                VoiceEvent::Connecting => WorkerEvent::VoiceConnecting,
-                VoiceEvent::Started { voice } => WorkerEvent::VoiceStarted { voice },
-                VoiceEvent::Transcript { speaker, text } => {
-                    WorkerEvent::VoiceTranscript { speaker, text }
-                }
-                VoiceEvent::Failed { error } => WorkerEvent::VoiceFailed {
-                    error: error.to_string(),
+    let initial_effort = config.agent().thinking();
+    let initial_fast_mode = config.agent().fast_mode();
+    let initial_max_subagents = config.agent().max_subagents();
+    let preferred_reasoning_mode = config.agent().reasoning_mode();
+    let open_resume_selector = matches!(&startup, StartupMode::ResumeSelector);
+    let resume_session_id = match startup {
+        StartupMode::ResumeSession(session_id) => Some(session_id),
+        StartupMode::NewSession | StartupMode::ResumeSelector => None,
+    };
+    let resuming = resume_session_id.is_some();
+    let (configured, restored_projection, reasoning_mode) =
+        if let Some(session_id) = resume_session_id {
+            let restored_config = config.clone();
+            let config_path = restored_config.path().to_path_buf();
+            let checkpoint_session_id = session_id.clone();
+            let checkpoint = tokio::task::spawn_blocking(move || {
+                session::load_checkpoint(&config_path, &checkpoint_session_id)
+            });
+            let transcript = session::load_transcript_async(
+                restored_config.path().to_path_buf(),
+                session_id.clone(),
+            );
+            let (snapshot, records) = tokio::join!(checkpoint, transcript);
+            let snapshot = snapshot.map_err(RuntimeError::SessionTask)??;
+            let records = records?;
+            tokio::task::spawn_blocking(move || -> Result<_> {
+                let reasoning_mode = session::reasoning_mode(&records);
+                let projection = RootNode::project_session(initial_effort, records);
+                let configured = ConfiguredAgent::from_config_with_session(
+                    &restored_config,
+                    initial_effort,
+                    reasoning_mode,
+                    Some(&session_id),
+                    Some(snapshot),
+                )?;
+                Ok((configured, Some(projection), reasoning_mode))
+            })
+            .await
+            .map_err(RuntimeError::SessionTask)??
+        } else {
+            (
+                ConfiguredAgent::from_config(&config)?,
+                None,
+                preferred_reasoning_mode,
+            )
+        };
+    let mut terminal = TerminalSession::enter().map_err(RuntimeError::Terminal)?;
+    let ConfiguredAgent {
+        agent,
+        events,
+        instructions,
+        skills,
+        memory_enabled,
+        subagent_updates,
+        subagent_control,
+    } = configured;
+    let main_session_id = agent.session_id().to_string();
+    let (writer_sender, mut writer_updates) = mpsc::unbounded_channel();
+    let mut panes = HashMap::new();
+    panes.insert(
+        PaneId::Main,
+        open_pane(
+            PaneGeneration {
+                pane: PaneId::Main,
+                generation: 0,
+            },
+            if resuming {
+                PaneSession::persisted(&main_session_id, !skills.is_empty())
+            } else {
+                PaneSession::new(&main_session_id, None, !skills.is_empty())
+            },
+            &config,
+            PaneSettings::new(initial_effort, reasoning_mode, initial_fast_mode),
+            instructions,
+            subagent_control.clone(),
+            &writer_sender,
+        )?,
+    );
+    let memory_review = if resuming {
+        worker::MemoryReviewState::restored(memory_enabled)
+    } else {
+        worker::MemoryReviewState::fresh(memory_enabled)
+    };
+    let (commands, mut worker_updates) = worker::spawn(agent, memory_review, shutdown.clone());
+    let workspace = config.agent().workspace().to_path_buf();
+    let (agent_event_sender, mut agent_events) = mpsc::unbounded_channel();
+    agent_events::forward(PaneId::Main, 0, events, agent_event_sender.clone());
+    let (subagent_sender, mut subagent_events) = mpsc::unbounded_channel();
+    subagent_updates::forward(
+        subagent_control.runtime_id(),
+        subagent_updates,
+        subagent_sender.clone(),
+    );
+    let mut root = RootNode::new(&workspace, initial_effort);
+    root.set_reasoning_modes(reasoning_mode, preferred_reasoning_mode);
+    root.set_fast_mode(initial_fast_mode);
+    root.set_max_subagents(initial_max_subagents);
+    let mut memory_store = configured_memory_store(&config);
+    root.set_memory_enabled(memory_store.is_some());
+    if let Some(projection) = restored_projection {
+        root.install_session_projection(
+            &workspace,
+            initial_effort,
+            reasoning_mode,
+            preferred_reasoning_mode,
+            initial_fast_mode,
+            projection,
+        );
+    }
+    root.set_skills(skills);
+    let mut theme = config.theme().clone();
+    if let Some(scheme) = theme::detect_system_scheme() {
+        theme.set_system_scheme(scheme);
+    }
+    let mut app = AppNode::new(theme, workspace.clone(), root);
+    let mut update_check_task = spawn_update_check();
+    let (system_theme_sender, mut system_theme_updates) = mpsc::unbounded_channel();
+    theme::watch_system_scheme(system_theme_sender, shutdown.clone());
+    let mut input = Some(EventStream::new());
+    let mut editor_task = None::<EditorTask>;
+    let mut effort_task = None::<EffortUpdateTask>;
+    let mut fast_mode_task = None::<FastModeUpdateTask>;
+    let mut new_session_task = None::<NewSessionTask>;
+    let mut session_list_task = None::<SessionListTask>;
+    let mut review_controller = ReviewController::new();
+    let (auxiliary_sender, mut auxiliary_jobs) = mpsc::unbounded_channel();
+    let (review_ready_sender, mut review_ready_updates) = mpsc::unbounded_channel();
+    let mut resume_session_task = None::<ResumeSessionTask>;
+    let mut scheduler = RenderScheduler::new(STREAM_FRAME_INTERVAL, Instant::now());
+    let mut stopping = false;
+    let mut worker_stopped = false;
+    let mut worker_error = None::<nanocodex::NanocodexError>;
+    let mut writer_error = None::<TranscriptError>;
+    let mut writers_open = 1_usize;
+    let mut shell_tasks = JoinSet::<(PaneId, ShellExecution)>::new();
+    let mut memory_tasks = JoinSet::<MemoryCompletion>::new();
+    let mut memory_generations = HashMap::<PaneId, u64>::new();
+    let mut subagent_shutdowns = JoinSet::<()>::new();
+    let mut subagents_stopping = false;
+    let mut startup_prompt = initial_prompt;
+
+    macro_rules! apply_app_update {
+        ($update:expr) => {
+            apply_update(
+                $update,
+                EffectContext {
+                    app: &mut app,
+                    commands: &commands,
+                    workspace: &workspace,
+                    config: &mut config,
+                    shutdown: &shutdown,
+                    input: &mut input,
+                    editor_task: &mut editor_task,
+                    effort_task: &mut effort_task,
+                    fast_mode_task: &mut fast_mode_task,
+                    new_session_task: &mut new_session_task,
+                    session_list_task: &mut session_list_task,
+                    review_controller: &mut review_controller,
+                    auxiliary_sender: &auxiliary_sender,
+                    review_ready_sender: &review_ready_sender,
+                    resume_session_task: &mut resume_session_task,
+                    terminal: &mut terminal,
+                    scheduler: &mut scheduler,
+                    panes: &mut panes,
+                    shell_tasks: &mut shell_tasks,
+                    memory_store: &mut memory_store,
+                    memory_tasks: &mut memory_tasks,
+                    memory_generations: &mut memory_generations,
+                    subagent_shutdowns: &mut subagent_shutdowns,
                 },
-                VoiceEvent::Stopped => WorkerEvent::VoiceStopped,
-            };
-            if updates.send(update).is_err() {
+            )?;
+        };
+    }
+
+    if open_resume_selector {
+        apply_app_update!(app.open_resume_selector());
+    } else if let Some(prompt) = startup_prompt.take() {
+        apply_app_update!(ComponentUpdate {
+            effects: vec![AppEffect::Pane {
+                pane: PaneId::Main,
+                effect: components::RootEffect::Submit(prompt.into()),
+            }],
+            render: RenderRequest::Immediate,
+        });
+    }
+
+    loop {
+        if stopping && let Some(task) = update_check_task.take() {
+            task.abort();
+        }
+        if stopping {
+            shell_tasks.abort_all();
+            review_controller.cancel();
+            memory_tasks.abort_all();
+        }
+        if stopping && !subagents_stopping {
+            for runtime in panes.values() {
+                schedule_subagent_shutdown(runtime, &mut subagent_shutdowns);
+            }
+            subagents_stopping = true;
+        }
+        if stopping
+            && worker_stopped
+            && panes.values().all(|pane| pane.event_streams_open == 0)
+            && shell_tasks.is_empty()
+            && subagent_shutdowns.is_empty()
+        {
+            close_journals(&mut panes, worker_error.as_ref())?;
+            if writers_open == 0 {
                 break;
             }
         }
-    }));
-}
 
-struct AgentWorker {
-    main: MainWorkerBranch,
-    archived_main: Vec<MainWorkerBranch>,
-    next_turn_id: u64,
-    btw: Option<BtwWorker>,
-    finished: mpsc::UnboundedSender<FinishedTurn>,
-    updates: mpsc::UnboundedSender<WorkerEvent>,
-    mcp: Option<McpHandle>,
-    realtime: Option<OpenAi>,
-    voice: Option<VoiceSession>,
-    voice_agent_control: VoiceAgentControl,
-}
+        if editor_task.is_none() && !stopping && scheduler.is_due(Instant::now()) {
+            terminal
+                .draw(|frame| app.render(frame))
+                .map_err(RuntimeError::Terminal)?;
+            scheduler.presented(Instant::now());
+        }
 
-impl AgentWorker {
-    async fn handle_command(&mut self, command: WorkerCommand) {
-        match command {
-            WorkerCommand::Prompt {
-                target,
-                prompt_id,
-                prompt,
-            } => self.prompt(target, prompt_id, prompt).await,
-            WorkerCommand::Steer { target, id, prompt } => self.steer(target, id, prompt).await,
-            WorkerCommand::Cancel { target } => self.cancel(target).await,
-            WorkerCommand::InterruptForSteers {
-                target,
-                prompt_id,
-                steer_ids,
-                prompt,
-            } => {
-                self.interrupt_for_steers(target, prompt_id, steer_ids, prompt)
-                    .await;
-            }
-            WorkerCommand::OpenBtw {
-                id,
-                prompt_id,
-                prompt,
-            } => self.open_btw(id, prompt_id, prompt).await,
-            WorkerCommand::CloseBtw { id } => {
-                if self.btw.as_ref().is_some_and(|branch| branch.id == id) {
-                    self.btw = None;
+        let render_deadline = scheduler.deadline();
+        let animation_deadline = app.animation_deadline();
+        tokio::select! {
+            () = shutdown.cancelled(), if !stopping => {
+                stopping = true;
+                input = None;
+                if let Some(task) = editor_task.take() {
+                    task.abort();
+                    drop(task.await);
+                }
+                if let Some(task) = effort_task.take() {
+                    task.abort();
+                    drop(task.await);
+                }
+                if let Some(task) = fast_mode_task.take() {
+                    task.abort();
+                    drop(task.await);
+                }
+                if let Some(task) = new_session_task.take() {
+                    task.abort();
+                    drop(task.await);
                 }
             }
-            WorkerCommand::EditHistorical {
-                source_branch_id,
-                new_branch_id,
-                prompt_id,
-            } => {
-                self.edit_historical(source_branch_id, new_branch_id, prompt_id)
-                    .await;
-            }
-            WorkerCommand::SwitchMainBranch { id } => self.switch_main_branch(id),
-            WorkerCommand::SetFastMode { enabled } => self.set_fast_mode(enabled).await,
-            WorkerCommand::SetThinking { thinking } => self.set_thinking(thinking).await,
-            WorkerCommand::McpLogin { name } => self.mcp_login(name),
-            WorkerCommand::McpReload { name } => self.mcp_reload(name),
-            WorkerCommand::VoiceAgentEvent(event) => {
-                if let Some(voice) = &self.voice {
-                    let _ = voice.observe_agent_event(event);
-                }
-            }
-            WorkerCommand::Voice(control) => self.control_voice(control).await,
-        }
-    }
-
-    async fn control_voice(&mut self, control: VoiceControl) {
-        let running = self.voice_running();
-        match control {
-            VoiceControl::List => {
-                let chatgpt = voice_names(CHATGPT_REALTIME_VOICES);
-                let platform = voice_names(PLATFORM_REALTIME_VOICES);
-                drop(self.updates.send(WorkerEvent::VoiceInfo {
-                    message: format!(
-                        "Codex/ChatGPT voices (default cove): {chatgpt}. Platform voices (default marin): {platform}"
-                    ),
-                }));
-                return;
-            }
-            VoiceControl::Stop => {
-                self.stop_voice().await;
-                return;
-            }
-            VoiceControl::Toggle if running => {
-                self.stop_voice().await;
-                return;
-            }
-            VoiceControl::Start(_) if running => {
-                drop(self.updates.send(WorkerEvent::VoiceFailed {
-                    error: "voice is already active; use /voice off before changing it".to_owned(),
-                }));
-                return;
-            }
-            VoiceControl::Toggle | VoiceControl::Start(_) => {}
-        }
-        let voice = match control {
-            VoiceControl::Start(voice) => voice,
-            VoiceControl::Toggle => None,
-            VoiceControl::Stop | VoiceControl::List => return,
-        };
-        if self.btw.is_some() {
-            drop(self.updates.send(WorkerEvent::VoiceFailed {
-                error: "close /btw before starting voice".to_owned(),
-            }));
-            return;
-        }
-        let Some(realtime) = self.realtime.clone() else {
-            drop(self.updates.send(WorkerEvent::VoiceFailed {
-                error: "voice is unavailable with the selected paid provider".to_owned(),
-            }));
-            return;
-        };
-        let mut builder = VoiceSessionBuilder::new(realtime, self.main.agent.clone())
-            .session_id(Arc::clone(&self.main.request_id))
-            .agent_control(self.voice_agent_control.clone());
-        if let Some(voice) = voice {
-            builder = builder.voice(voice);
-        }
-        match builder.spawn() {
-            Ok((session, events)) => {
-                forward_voice_events(events, self.updates.clone());
-                self.voice = Some(session);
-            }
-            Err(error) => drop(self.updates.send(WorkerEvent::VoiceFailed {
-                error: format!("failed to start voice thread: {error}"),
-            })),
-        }
-    }
-
-    fn voice_running(&self) -> bool {
-        self.voice.as_ref().is_some_and(VoiceSession::is_running)
-    }
-
-    async fn stop_voice(&mut self) {
-        let Some(mut voice) = self.voice.take() else {
-            return;
-        };
-        if let Err(error) = voice.shutdown().await {
-            drop(self.updates.send(WorkerEvent::VoiceFailed {
-                error: format!("failed to stop voice cleanly: {error}"),
-            }));
-        }
-    }
-
-    fn mcp_login(&self, name: String) {
-        let Some(mcp) = self.mcp.clone() else {
-            drop(self.updates.send(WorkerEvent::McpFailed {
-                name,
-                error: "MCP is not configured".to_owned(),
-            }));
-            return;
-        };
-        let updates = self.updates.clone();
-        drop(tokio::spawn(async move {
-            let login = match mcp.login(&name).await {
-                Ok(login) => login,
-                Err(error) => {
-                    drop(updates.send(WorkerEvent::McpFailed {
-                        name,
-                        error: error.to_string(),
-                    }));
-                    return;
-                }
-            };
-            let authorization_url = login.authorization_url().to_owned();
-            if let Err(error) = open_browser(&authorization_url) {
-                drop(updates.send(WorkerEvent::McpFailed {
-                    name,
-                    error: format!(
-                        "failed to open OAuth page: {error}; open {authorization_url} manually"
-                    ),
-                }));
-                return;
-            }
-            drop(updates.send(WorkerEvent::McpLoginStarted { name: name.clone() }));
-            match login.wait().await {
-                Ok(tool_count) => {
-                    drop(updates.send(WorkerEvent::McpReady {
-                        name,
-                        tool_count,
-                        authenticated: true,
-                    }));
-                }
-                Err(error) => {
-                    drop(updates.send(WorkerEvent::McpFailed {
-                        name,
-                        error: error.to_string(),
-                    }));
-                }
-            }
-        }));
-    }
-
-    fn mcp_reload(&self, name: String) {
-        let Some(mcp) = self.mcp.clone() else {
-            drop(self.updates.send(WorkerEvent::McpFailed {
-                name,
-                error: "MCP is not configured".to_owned(),
-            }));
-            return;
-        };
-        let updates = self.updates.clone();
-        drop(tokio::spawn(async move {
-            match mcp.reload(&name).await {
-                Ok(tool_count) => {
-                    drop(updates.send(WorkerEvent::McpReady {
-                        name,
-                        tool_count,
-                        authenticated: false,
-                    }));
-                }
-                Err(error) => {
-                    drop(updates.send(WorkerEvent::McpFailed {
-                        name,
-                        error: error.to_string(),
-                    }));
-                }
-            }
-        }));
-    }
-
-    async fn set_fast_mode(&mut self, enabled: bool) {
-        let mut result = self.main.agent.set_fast_mode(enabled).await;
-        for branch in &self.archived_main {
-            if result.is_ok() {
-                result = branch.agent.set_fast_mode(enabled).await;
-            }
-        }
-        if let Some(branch) = &self.btw
-            && result.is_ok()
-        {
-            result = branch.agent.set_fast_mode(enabled).await;
-        }
-
-        let update = match result {
-            Ok(()) => WorkerEvent::FastModeChanged { enabled },
-            Err(error) => WorkerEvent::FastModeChangeFailed {
-                error: error.to_string(),
-            },
-        };
-        drop(self.updates.send(update));
-    }
-
-    async fn set_thinking(&mut self, thinking: Thinking) {
-        let mut result = self.main.agent.set_thinking(thinking).await;
-        for branch in &self.archived_main {
-            if result.is_ok() {
-                result = branch.agent.set_thinking(thinking).await;
-            }
-        }
-        if let Some(branch) = &self.btw
-            && result.is_ok()
-        {
-            result = branch.agent.set_thinking(thinking).await;
-        }
-
-        let update = match result {
-            Ok(()) => WorkerEvent::ThinkingChanged { thinking },
-            Err(error) => WorkerEvent::ThinkingChangeFailed {
-                error: error.to_string(),
-            },
-        };
-        drop(self.updates.send(update));
-    }
-
-    async fn prompt(&mut self, target: PaneId, prompt_id: u64, prompt: SubmittedPrompt) {
-        match target {
-            PaneId::Main => {
-                if let Some(turn) = start_turn(
-                    &self.main.agent,
-                    TurnTarget {
-                        session_id: &self.main.request_id,
-                        pane: target,
-                        main_branch_id: Some(self.main.id),
-                    },
-                    prompt_id,
-                    prompt,
-                    &mut self.next_turn_id,
-                    &self.finished,
-                    &self.updates,
-                )
-                .await
-                {
-                    self.main.prompt_order.push(prompt_id);
-                    self.main.turns.push_back(turn);
-                }
-            }
-            PaneId::Btw(id) => {
-                let Some(branch) = self.btw.as_mut().filter(|branch| branch.id == id) else {
-                    drop(self.updates.send(WorkerEvent::TurnFinished {
-                        target,
-                        main_branch_id: None,
-                        error: Some("BTW branch is not available".to_owned()),
-                    }));
-                    return;
-                };
-                let prompt = branch.prepare_prompt(prompt);
-                if let Some(turn) = start_turn(
-                    &branch.agent,
-                    TurnTarget {
-                        session_id: &branch.request_id,
-                        pane: target,
-                        main_branch_id: None,
-                    },
-                    prompt_id,
-                    prompt,
-                    &mut self.next_turn_id,
-                    &self.finished,
-                    &self.updates,
-                )
-                .await
-                {
-                    branch.turns.push_back(turn);
-                }
-            }
-        }
-    }
-
-    async fn steer(&mut self, target: PaneId, steer_id: u64, prompt: SubmittedPrompt) {
-        let turn = match target {
-            PaneId::Main => {
-                steer_turn(
-                    &self.main.agent,
-                    &self.main.turns,
-                    TurnTarget {
-                        session_id: &self.main.request_id,
-                        pane: target,
-                        main_branch_id: Some(self.main.id),
-                    },
-                    SteerRequest {
-                        id: steer_id,
-                        prompt,
-                    },
-                    &mut self.next_turn_id,
-                    &self.finished,
-                    &self.updates,
-                )
-                .await
-            }
-            PaneId::Btw(branch_id) => {
-                let Some(branch) = self.btw.as_mut().filter(|branch| branch.id == branch_id) else {
-                    drop(self.updates.send(WorkerEvent::SteerFailed {
-                        target,
-                        id: steer_id,
-                        error: "BTW branch is not available".to_owned(),
-                    }));
-                    return;
-                };
-                steer_turn(
-                    &branch.agent,
-                    &branch.turns,
-                    TurnTarget {
-                        session_id: &branch.request_id,
-                        pane: target,
-                        main_branch_id: None,
-                    },
-                    SteerRequest {
-                        id: steer_id,
-                        prompt,
-                    },
-                    &mut self.next_turn_id,
-                    &self.finished,
-                    &self.updates,
-                )
-                .await
-            }
-        };
-        if let Some(turn) = turn {
-            match target {
-                PaneId::Main => {
-                    self.main.prompt_order.push(turn.prompt_id);
-                    self.main.turns.push_back(turn);
-                }
-                PaneId::Btw(branch_id) => {
-                    if let Some(branch) = self.btw.as_mut().filter(|branch| branch.id == branch_id)
-                    {
-                        branch.turns.push_back(turn);
-                    }
-                }
-            }
-        }
-    }
-
-    async fn cancel(&self, target: PaneId) {
-        let (turns, session_id) = match target {
-            PaneId::Main => (Some(&self.main.turns), self.main.request_id.as_ref()),
-            PaneId::Btw(id) => self
-                .btw
-                .as_ref()
-                .filter(|branch| branch.id == id)
-                .map_or((None, ""), |branch| {
-                    (Some(&branch.turns), branch.request_id.as_ref())
-                }),
-        };
-        let mut outcome = cancel_turn(turns, session_id, target).await;
-        if matches!(outcome, Ok(false)) && matches!(target, PaneId::Main) {
-            outcome = self.voice_agent_control.cancel().await;
-        }
-        let _ = report_cancel_outcome(outcome, target, &self.updates);
-    }
-
-    async fn interrupt_for_steers(
-        &mut self,
-        target: PaneId,
-        prompt_id: u64,
-        steer_ids: Vec<u64>,
-        prompt: SubmittedPrompt,
-    ) {
-        let already_running = match target {
-            PaneId::Main => self
-                .main
-                .turns
-                .iter()
-                .any(|turn| steer_ids.contains(&turn.prompt_id)),
-            PaneId::Btw(id) => self
-                .btw
-                .as_ref()
-                .filter(|branch| branch.id == id)
-                .is_some_and(|branch| {
-                    branch
-                        .turns
-                        .iter()
-                        .any(|turn| steer_ids.contains(&turn.prompt_id))
-                }),
-        };
-        if already_running {
-            drop(
-                self.updates
-                    .send(WorkerEvent::InterruptedSteersKept { target, prompt_id }),
-            );
-            return;
-        }
-
-        let (turns, session_id) = match target {
-            PaneId::Main => (Some(&self.main.turns), self.main.request_id.as_ref()),
-            PaneId::Btw(id) => self
-                .btw
-                .as_ref()
-                .filter(|branch| branch.id == id)
-                .map_or((None, ""), |branch| {
-                    (Some(&branch.turns), branch.request_id.as_ref())
-                }),
-        };
-        if !report_cancel_outcome(
-            cancel_turn(turns, session_id, target).await,
-            target,
-            &self.updates,
-        ) {
-            drop(
-                self.updates
-                    .send(WorkerEvent::InterruptedSteersKept { target, prompt_id }),
-            );
-            return;
-        }
-
-        drop(
-            self.updates
-                .send(WorkerEvent::InterruptedSteersResubmitted {
-                    target,
-                    prompt_id,
-                    steer_ids,
-                }),
-        );
-        self.prompt(target, prompt_id, prompt).await;
-    }
-
-    async fn open_btw(&mut self, id: u64, prompt_id: Option<u64>, prompt: Option<SubmittedPrompt>) {
-        if self.voice_running() {
-            drop(self.updates.send(WorkerEvent::BtwOpenFailed {
-                id,
-                error: "stop /voice before opening /btw".to_owned(),
-            }));
-            return;
-        }
-        self.btw = None;
-        let span = info_span!(
-            target: "nanocodex",
-            parent: None,
-            "tui.btw.open",
-            otel.kind = "internal",
-            otel.status_code = tracing::field::Empty,
-            session.id = self.main.request_id.as_ref(),
-            tui.btw.id = id,
-            tui.btw.session_id = tracing::field::Empty,
-            status = tracing::field::Empty,
-        );
-        match self.main.agent.fork().instrument(span.clone()).await {
-            Ok((agent, events)) => {
-                let request_id = Arc::<str>::from(events.request_id());
-                span.record("tui.btw.session_id", request_id.as_ref());
-                span.record("status", "completed");
-                span.record("otel.status_code", "OK");
-                forward_btw_events(id, events, self.updates.clone());
-                drop(self.updates.send(WorkerEvent::BtwOpened {
-                    id,
-                    request_id: Arc::clone(&request_id),
-                }));
-                let mut branch = BtwWorker {
-                    id,
-                    request_id,
-                    agent,
-                    first_prompt: true,
-                    turns: VecDeque::new(),
-                };
-                if let Some(prompt) = prompt {
-                    let prompt = branch.prepare_prompt(prompt);
-                    let Some(prompt_id) = prompt_id else {
-                        drop(self.updates.send(WorkerEvent::BtwOpenFailed {
-                            id,
-                            error: "BTW prompt identity was unavailable".to_owned(),
-                        }));
-                        return;
-                    };
-                    if let Some(turn) = start_turn(
-                        &branch.agent,
-                        TurnTarget {
-                            session_id: &branch.request_id,
-                            pane: PaneId::Btw(id),
-                            main_branch_id: None,
-                        },
-                        prompt_id,
-                        prompt,
-                        &mut self.next_turn_id,
-                        &self.finished,
-                        &self.updates,
-                    )
+            event = async {
+                input
+                    .as_mut()
+                    .expect("input branch is disabled without an event stream")
+                    .next()
                     .await
-                    {
-                        branch.turns.push_back(turn);
-                    }
-                }
-                self.btw = Some(branch);
-            }
-            Err(error) => {
-                span.record("status", "failed");
-                span.record("otel.status_code", "ERROR");
-                drop(self.updates.send(WorkerEvent::BtwOpenFailed {
-                    id,
-                    error: error.to_string(),
-                }));
-            }
-        }
-    }
-
-    async fn edit_historical(&mut self, source_branch_id: u64, new_branch_id: u64, prompt_id: u64) {
-        if self.voice_running() {
-            drop(self.updates.send(WorkerEvent::MainBranchOpenFailed {
-                id: new_branch_id,
-                error: "stop /voice before editing history".to_owned(),
-            }));
-            return;
-        }
-        if self.main.id != source_branch_id || self.btw.is_some() {
-            drop(self.updates.send(WorkerEvent::MainBranchOpenFailed {
-                id: new_branch_id,
-                error: "close /btw before editing history".to_owned(),
-            }));
-            return;
-        }
-        let Some(position) = self
-            .main
-            .prompt_order
-            .iter()
-            .position(|candidate| *candidate == prompt_id)
-        else {
-            drop(self.updates.send(WorkerEvent::MainBranchOpenFailed {
-                id: new_branch_id,
-                error: "the selected prompt is not associated with this branch".to_owned(),
-            }));
-            return;
-        };
-        if !self.main.turns.is_empty()
-            && !report_cancel_outcome(
-                cancel_turn(Some(&self.main.turns), &self.main.request_id, PaneId::Main).await,
-                PaneId::Main,
-                &self.updates,
-            )
-        {
-            drop(self.updates.send(WorkerEvent::MainBranchOpenFailed {
-                id: new_branch_id,
-                error: "the active turn could not be cancelled before editing".to_owned(),
-            }));
-            return;
-        }
-        let parent = self.main.prompt_order[..position]
-            .iter()
-            .rev()
-            .find_map(|candidate| {
-                self.main
-                    .results
-                    .iter()
-                    .find(|(completed_id, _)| completed_id == candidate)
-                    .map(|(_, result)| result.clone())
-            });
-        let fork = if let Some(parent) = parent.as_ref() {
-            self.main.agent.fork_from(parent).await
-        } else {
-            self.main.agent.spawn().await
-        };
-        let (agent, events) = match fork {
-            Ok(branch) => branch,
-            Err(error) => {
-                drop(self.updates.send(WorkerEvent::MainBranchOpenFailed {
-                    id: new_branch_id,
-                    error: error.to_string(),
-                }));
-                return;
-            }
-        };
-
-        let request_id = Arc::<str>::from(events.request_id());
-        let inherited_ids = &self.main.prompt_order[..position];
-        let inherited_results = self
-            .main
-            .results
-            .iter()
-            .filter(|(completed_id, _)| inherited_ids.contains(completed_id))
-            .cloned()
-            .collect();
-        let branch = MainWorkerBranch {
-            id: new_branch_id,
-            request_id: Arc::clone(&request_id),
-            agent,
-            turns: VecDeque::new(),
-            prompt_order: inherited_ids.to_vec(),
-            results: inherited_results,
-        };
-        let parent_id = self.main.id;
-        let previous = std::mem::replace(&mut self.main, branch);
-        self.archived_main.push(previous);
-        forward_main_branch_events(new_branch_id, events, self.updates.clone());
-        drop(self.updates.send(WorkerEvent::MainBranchOpened {
-            id: new_branch_id,
-            parent_id,
-            prompt_id,
-            request_id,
-        }));
-    }
-
-    fn switch_main_branch(&mut self, id: u64) {
-        if self.main.id == id {
-            drop(self.updates.send(WorkerEvent::MainBranchSwitched {
-                id,
-                request_id: Arc::clone(&self.main.request_id),
-            }));
-            return;
-        }
-        if self.voice_running() {
-            drop(self.updates.send(WorkerEvent::MainBranchSwitchFailed {
-                id,
-                error: "stop /voice before switching branches".to_owned(),
-            }));
-            return;
-        }
-        if !self.main.turns.is_empty() || self.btw.is_some() {
-            drop(self.updates.send(WorkerEvent::MainBranchSwitchFailed {
-                id,
-                error: "finish the main turn and close /btw before switching branches".to_owned(),
-            }));
-            return;
-        }
-        let Some(position) = self.archived_main.iter().position(|branch| branch.id == id) else {
-            drop(self.updates.send(WorkerEvent::MainBranchSwitchFailed {
-                id,
-                error: "the requested branch is no longer available".to_owned(),
-            }));
-            return;
-        };
-        if !self.archived_main[position].turns.is_empty() {
-            drop(self.updates.send(WorkerEvent::MainBranchSwitchFailed {
-                id,
-                error: "the requested branch still has an active turn".to_owned(),
-            }));
-            return;
-        }
-        let requested = self.archived_main.swap_remove(position);
-        let previous = std::mem::replace(&mut self.main, requested);
-        self.archived_main.push(previous);
-        drop(self.updates.send(WorkerEvent::MainBranchSwitched {
-            id,
-            request_id: Arc::clone(&self.main.request_id),
-        }));
-    }
-
-    fn finish_turn(&mut self, finished: FinishedTurn) {
-        let main_branch_id = finished.main_branch_id;
-        match finished.target {
-            PaneId::Main => {
-                let branch_id = main_branch_id.unwrap_or(self.main.id);
-                let branch = if self.main.id == branch_id {
-                    Some(&mut self.main)
-                } else {
-                    self.archived_main
-                        .iter_mut()
-                        .find(|branch| branch.id == branch_id)
-                };
-                if let Some(branch) = branch {
-                    remove_finished(&mut branch.turns, finished.id);
-                    if let Some(result) = finished.result {
-                        branch.results.push((finished.prompt_id, result));
-                    }
-                }
-            }
-            PaneId::Btw(id) => {
-                if let Some(branch) = self.btw.as_mut().filter(|branch| branch.id == id) {
-                    remove_finished(&mut branch.turns, finished.id);
-                }
-            }
-        }
-        drop(self.updates.send(WorkerEvent::TurnFinished {
-            target: finished.target,
-            main_branch_id,
-            error: finished.error,
-        }));
-    }
-}
-
-async fn start_turn(
-    agent: &Nanocodex,
-    target: TurnTarget<'_>,
-    prompt_id: u64,
-    prompt: SubmittedPrompt,
-    next_turn_id: &mut u64,
-    finished: &mpsc::UnboundedSender<FinishedTurn>,
-    updates: &mpsc::UnboundedSender<WorkerEvent>,
-) -> Option<TrackedTurn> {
-    let started_at = Instant::now();
-    let id = *next_turn_id;
-    let span = info_span!(
-        target: "nanocodex",
-        parent: None,
-        "tui.turn",
-        otel.kind = "internal",
-        otel.status_code = tracing::field::Empty,
-        session.id = target.session_id,
-        tui.turn.id = id,
-        tui.pane = telemetry::pane_name(target.pane),
-        tui.btw.id = telemetry::pane_btw_id(target.pane).unwrap_or_default(),
-        status = tracing::field::Empty,
-        duration_ns = tracing::field::Empty,
-    );
-    drop(updates.send(WorkerEvent::TurnTraceStarted {
-        target: target.pane,
-        id,
-        span: span.clone(),
-    }));
-    match agent
-        .prompt(prompt.into_prompt())
-        .instrument(span.clone())
-        .await
-    {
-        Ok(turn) => {
-            *next_turn_id = next_turn_id.saturating_add(1);
-            let control = turn.control();
-            let finished = finished.clone();
-            let agent = agent.clone();
-            let task_span = span.clone();
-            tokio::spawn(
-                async move {
-                    let turn_result = turn.result().await;
-                    let rollout_result = agent.flush_rollout().await;
-                    let (result, error, status, otel_status) = match (turn_result, rollout_result) {
-                        (Ok(result), Ok(())) => (Some(result), None, "completed", "OK"),
-                        (Err(NanocodexError::TurnCancelled), Ok(())) => {
-                            (None, None, "cancelled", "ERROR")
-                        }
-                        (Ok(result), Err(error)) => {
-                            (Some(result), Some(error.to_string()), "failed", "ERROR")
-                        }
-                        (Err(error), _) => (None, Some(error.to_string()), "failed", "ERROR"),
-                    };
-                    task_span.record("status", status);
-                    task_span.record("otel.status_code", otel_status);
-                    task_span.record(
-                        "duration_ns",
-                        telemetry::elapsed_ns(started_at, Instant::now()),
+            }, if input.is_some() && !stopping => {
+                let event = event
+                    .transpose()
+                    .map_err(RuntimeError::Terminal)?
+                    .ok_or_else(|| RuntimeError::Terminal(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "terminal input closed",
+                    )))?;
+                let refresh_cursor = matches!(&event, Event::FocusGained)
+                    || matches!(
+                        &event,
+                        Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Down(_))
                     );
-                    drop(finished.send(FinishedTurn {
-                        id,
-                        target: target.pane,
-                        main_branch_id: target.main_branch_id,
-                        prompt_id,
-                        result,
-                        error,
-                    }));
+                if refresh_cursor {
+                    terminal.invalidate_cursor_visibility();
                 }
-                .instrument(span.clone()),
-            );
-            Some(TrackedTurn {
-                id,
-                prompt_id,
-                control,
-                span,
-            })
-        }
-        Err(error) => {
-            drop(updates.send(WorkerEvent::TurnTraceRejected {
-                target: target.pane,
-                id,
-            }));
-            span.record("status", "rejected");
-            span.record("otel.status_code", "ERROR");
-            span.record(
-                "duration_ns",
-                telemetry::elapsed_ns(started_at, Instant::now()),
-            );
-            drop(updates.send(WorkerEvent::TurnFinished {
-                target: target.pane,
-                main_branch_id: target.main_branch_id,
-                error: Some(error.to_string()),
-            }));
-            None
-        }
-    }
-}
-
-async fn steer_turn(
-    agent: &Nanocodex,
-    turns: &VecDeque<TrackedTurn>,
-    target: TurnTarget<'_>,
-    request: SteerRequest,
-    next_turn_id: &mut u64,
-    finished: &mpsc::UnboundedSender<FinishedTurn>,
-    updates: &mpsc::UnboundedSender<WorkerEvent>,
-) -> Option<TrackedTurn> {
-    for turn in turns {
-        let started_at = Instant::now();
-        let span = info_span!(
-            target: "nanocodex",
-            parent: &turn.span,
-            "tui.steer",
-            otel.kind = "internal",
-            otel.status_code = tracing::field::Empty,
-            session.id = target.session_id,
-            tui.turn.id = turn.id,
-            tui.steer.id = request.id,
-            tui.pane = telemetry::pane_name(target.pane),
-            status = tracing::field::Empty,
-            duration_ns = tracing::field::Empty,
-        );
-        let outcome = turn
-            .control
-            .steer(request.prompt.clone().into_prompt())
-            .instrument(span.clone())
-            .await;
-        span.record(
-            "duration_ns",
-            telemetry::elapsed_ns(started_at, Instant::now()),
-        );
-        match outcome {
-            Ok(()) => {
-                span.record("status", "admitted");
-                span.record("otel.status_code", "OK");
-                drop(updates.send(WorkerEvent::SteerAdmitted {
-                    target: target.pane,
-                    id: request.id,
-                }));
-                return None;
-            }
-            Err(NanocodexError::TurnNotSteerable) => {
-                span.record("status", "not_steerable");
-                span.record("otel.status_code", "OK");
-            }
-            Err(error) => {
-                span.record("status", "failed");
-                span.record("otel.status_code", "ERROR");
-                drop(updates.send(WorkerEvent::SteerFailed {
-                    target: target.pane,
-                    id: request.id,
-                    error: error.to_string(),
-                }));
-                return None;
-            }
-        }
-    }
-    // Completion delivery can lag behind the driver's exact active-turn
-    // state. If no retained capability is active, preserve this as a new turn.
-    drop(updates.send(WorkerEvent::SteerQueued {
-        target: target.pane,
-        id: request.id,
-        prompt: request.prompt.display().to_owned(),
-    }));
-    start_turn(
-        agent,
-        target,
-        request.id,
-        request.prompt,
-        next_turn_id,
-        finished,
-        updates,
-    )
-    .await
-}
-
-async fn cancel_turn(
-    turns: Option<&VecDeque<TrackedTurn>>,
-    session_id: &str,
-    target: PaneId,
-) -> Result<bool, NanocodexError> {
-    for turn in turns.into_iter().flatten() {
-        let started_at = Instant::now();
-        let span = info_span!(
-            target: "nanocodex",
-            parent: &turn.span,
-            "tui.cancel",
-            otel.kind = "internal",
-            otel.status_code = tracing::field::Empty,
-            session.id = session_id,
-            tui.turn.id = turn.id,
-            tui.pane = telemetry::pane_name(target),
-            status = tracing::field::Empty,
-            duration_ns = tracing::field::Empty,
-        );
-        let result = turn.control.cancel().instrument(span.clone()).await;
-        span.record(
-            "duration_ns",
-            telemetry::elapsed_ns(started_at, Instant::now()),
-        );
-        match result {
-            Err(NanocodexError::TurnNotCancellable) => {
-                span.record("status", "not_cancellable");
-                span.record("otel.status_code", "OK");
-            }
-            result => {
-                span.record("status", if result.is_ok() { "accepted" } else { "failed" });
-                span.record(
-                    "otel.status_code",
-                    if result.is_ok() { "OK" } else { "ERROR" },
-                );
-                return result.map(|()| true);
-            }
-        }
-    }
-    Ok(false)
-}
-
-fn report_cancel_outcome(
-    outcome: Result<bool, NanocodexError>,
-    target: PaneId,
-    updates: &mpsc::UnboundedSender<WorkerEvent>,
-) -> bool {
-    let accepted = matches!(outcome, Ok(true));
-    let event = match outcome {
-        Ok(true) => WorkerEvent::CancelAccepted { target },
-        Ok(false) => WorkerEvent::CancelSettled { target },
-        Err(error) => WorkerEvent::CancelFailed {
-            target,
-            error: error.to_string(),
-        },
-    };
-    drop(updates.send(event));
-    accepted
-}
-
-struct FinishedTurn {
-    id: u64,
-    target: PaneId,
-    main_branch_id: Option<u64>,
-    prompt_id: u64,
-    result: Option<TurnResult>,
-    error: Option<String>,
-}
-
-fn remove_finished(turns: &mut VecDeque<TrackedTurn>, id: u64) {
-    if let Some(index) = turns.iter().position(|turn| turn.id == id) {
-        drop(turns.remove(index));
-    }
-}
-
-fn forward_btw_events(
-    id: u64,
-    mut events: AgentEvents,
-    updates: mpsc::UnboundedSender<WorkerEvent>,
-) {
-    tokio::spawn(async move {
-        while let Some(event) = events.recv_timed().await {
-            if updates
-                .send(WorkerEvent::BtwAgentEvent { id, event })
-                .is_err()
-            {
-                return;
-            }
-        }
-        drop(updates.send(WorkerEvent::BtwEventStreamClosed { id }));
-    });
-}
-
-fn forward_main_branch_events(
-    id: u64,
-    mut events: AgentEvents,
-    updates: mpsc::UnboundedSender<WorkerEvent>,
-) {
-    tokio::spawn(async move {
-        while let Some(event) = events.recv_timed().await {
-            if updates
-                .send(WorkerEvent::MainBranchAgentEvent { id, event })
-                .is_err()
-            {
-                return;
-            }
-        }
-        drop(updates.send(WorkerEvent::MainBranchEventStreamClosed { id }));
-    });
-}
-
-fn handle_terminal_event(
-    event: Event,
-    app: &mut App,
-    root_session_id: &str,
-    commands: &mpsc::UnboundedSender<WorkerCommand>,
-) -> Result<TerminalAction> {
-    match event {
-        Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-            let _ = app.clear_mouse_selection();
-            handle_key(key, app, root_session_id, commands)
-        }
-        Event::Paste(text) => {
-            let _ = app.clear_mouse_selection();
-            app.handle_paste(&text);
-            Ok(TerminalAction::Redraw)
-        }
-        Event::Mouse(mouse) => match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                let changed = app.begin_mouse_selection((mouse.column, mouse.row).into());
-                Ok(if changed {
-                    TerminalAction::Redraw
-                } else {
-                    TerminalAction::Ignore
-                })
-            }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                let changed = app.drag_mouse_selection((mouse.column, mouse.row).into());
-                Ok(if changed {
-                    TerminalAction::Redraw
-                } else {
-                    TerminalAction::Ignore
-                })
-            }
-            MouseEventKind::Up(MouseButton::Left) => {
-                let changed = app.finish_mouse_selection((mouse.column, mouse.row).into());
-                Ok(if changed {
-                    TerminalAction::Redraw
-                } else {
-                    TerminalAction::Ignore
-                })
-            }
-            MouseEventKind::ScrollUp => {
-                let _ = app.clear_mouse_selection();
-                app.scroll_up(MOUSE_SCROLL_ROWS);
-                Ok(TerminalAction::Redraw)
-            }
-            MouseEventKind::ScrollDown => {
-                let _ = app.clear_mouse_selection();
-                app.scroll_down(MOUSE_SCROLL_ROWS);
-                Ok(TerminalAction::Redraw)
-            }
-            _ => Ok(TerminalAction::Ignore),
-        },
-        Event::Resize(_, _) => {
-            let _ = app.clear_mouse_selection();
-            Ok(TerminalAction::Redraw)
-        }
-        Event::FocusGained | Event::FocusLost | Event::Key(_) => Ok(TerminalAction::Ignore),
-    }
-}
-
-fn handle_key(
-    key: KeyEvent,
-    app: &mut App,
-    root_session_id: &str,
-    commands: &mpsc::UnboundedSender<WorkerCommand>,
-) -> Result<TerminalAction> {
-    if matches!(key.code, KeyCode::Char('v' | 'V'))
-        && key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-    {
-        paste_clipboard_image(app, clipboard::paste_image_to_temp_png);
-        return Ok(TerminalAction::Redraw);
-    }
-
-    if let Some(action) = handle_reasoning_picker_key(key, app, commands)? {
-        return Ok(action);
-    }
-
-    if let Some(action) = handle_inline_historical_editor_key(key, app, commands)? {
-        return Ok(action);
-    }
-
-    if let Some(action) = handle_global_navigation_key(key, app, commands)? {
-        return Ok(action);
-    }
-
-    if let Some(action) = handle_branch_navigator_key(key, app, commands)? {
-        return Ok(action);
-    }
-
-    if let Some(action) = handle_transcript_selection_key(key, app) {
-        return Ok(action);
-    }
-
-    if key.modifiers.contains(KeyModifiers::CONTROL) {
-        match key.code {
-            KeyCode::Char('c') => return Ok(TerminalAction::Quit),
-            KeyCode::Char('g') => return Ok(TerminalAction::ExternalEditor),
-            KeyCode::Char('o') => {
-                let _ = app.toggle_tool_details();
-            }
-            KeyCode::Char('d') if app.input.is_empty() => return Ok(TerminalAction::Quit),
-            KeyCode::Char('d') => app.delete(),
-            KeyCode::Char('h') => app.backspace(),
-            KeyCode::Char('j') => app.insert_char('\n'),
-            KeyCode::Char('a') => app.move_home(),
-            KeyCode::Char('e') => app.move_end(),
-            KeyCode::Char('b') => app.move_left(),
-            KeyCode::Char('f') => app.move_right(),
-            KeyCode::Char('p') => app.move_up(),
-            KeyCode::Char('n') => app.move_down(),
-            KeyCode::Char('w') => app.delete_word_before_cursor(),
-            KeyCode::Char('u') => app.delete_to_line_start(),
-            KeyCode::Char('k') => app.delete_to_line_end(),
-            KeyCode::Left => app.move_word_left(),
-            KeyCode::Right => app.move_word_right(),
-            KeyCode::End => app.jump_to_bottom(),
-            _ => {}
-        }
-        return Ok(TerminalAction::Redraw);
-    }
-
-    if key.modifiers.contains(KeyModifiers::ALT) {
-        match key.code {
-            KeyCode::Backspace => app.delete_word_before_cursor(),
-            KeyCode::Char('b') | KeyCode::Left => app.move_word_left(),
-            KeyCode::Char('f') | KeyCode::Right => app.move_word_right(),
-            _ => {}
-        }
-        return Ok(TerminalAction::Redraw);
-    }
-
-    match key.code {
-        KeyCode::Enter
-            if key
-                .modifiers
-                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
-        {
-            app.insert_char('\n');
-        }
-        KeyCode::Enter => submit(app, root_session_id, commands, SubmitIntent::Immediate)?,
-        KeyCode::Char(character) => app.insert_char(character),
-        KeyCode::Backspace => app.backspace(),
-        KeyCode::Delete => app.delete(),
-        KeyCode::Left => app.move_left(),
-        KeyCode::Right => app.move_right(),
-        KeyCode::Home => app.move_home(),
-        KeyCode::End => app.move_end(),
-        KeyCode::Up => app.move_up(),
-        KeyCode::Down => app.move_down(),
-        KeyCode::PageUp => app.scroll_up(12),
-        KeyCode::PageDown => app.scroll_down(12),
-        KeyCode::Esc if key.kind == KeyEventKind::Repeat => {}
-        KeyCode::Esc => handle_escape_key(app, commands)?,
-        KeyCode::Tab if app.has_input() => {
-            submit(app, root_session_id, commands, SubmitIntent::Queue)?;
-        }
-        KeyCode::Tab | KeyCode::BackTab => app.toggle_focus(),
-        KeyCode::Insert
-        | KeyCode::F(_)
-        | KeyCode::Null
-        | KeyCode::CapsLock
-        | KeyCode::ScrollLock
-        | KeyCode::NumLock
-        | KeyCode::PrintScreen
-        | KeyCode::Pause
-        | KeyCode::Menu
-        | KeyCode::KeypadBegin
-        | KeyCode::Media(_)
-        | KeyCode::Modifier(_) => {}
-    }
-    Ok(TerminalAction::Redraw)
-}
-
-fn handle_reasoning_picker_key(
-    key: KeyEvent,
-    app: &mut App,
-    commands: &mpsc::UnboundedSender<WorkerCommand>,
-) -> Result<Option<TerminalAction>> {
-    if app.reasoning_picker().is_none() {
-        return Ok(None);
-    }
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
-        return Ok(Some(TerminalAction::Quit));
-    }
-    if key.modifiers.is_empty() {
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => app.move_reasoning_picker(-1),
-            KeyCode::Down | KeyCode::Char('j') => app.move_reasoning_picker(1),
-            KeyCode::Enter => {
-                if let Some(ReasoningPickerAction::Selected(thinking)) =
-                    app.confirm_reasoning_picker()
+                let mut update = if is_image_paste(&event)
+                    && let Some(data_url) = clipboard::image_data_url()
                 {
-                    send_command(commands, WorkerCommand::SetThinking { thinking })?;
+                    app.update(AppEvent::PasteImage(data_url))
+                } else {
+                    app.update(AppEvent::Terminal(event))
+                };
+                if refresh_cursor {
+                    update.render = update.render.max(RenderRequest::Immediate);
+                }
+                apply_app_update!(update);
+            }
+            Some(scheme) = system_theme_updates.recv(), if !stopping => {
+                schedule(app.update(AppEvent::SystemThemeChanged(scheme)), &mut scheduler);
+            }
+            result = async {
+                update_check_task
+                    .as_mut()
+                    .expect("update-check branch is disabled without a task")
+                    .await
+            }, if update_check_task.is_some() && !stopping => {
+                update_check_task = None;
+                if let Ok(Ok(Some(version))) = result {
+                    schedule(app.update(AppEvent::UpdateAvailable(version)), &mut scheduler);
                 }
             }
-            KeyCode::Esc | KeyCode::Char('q') => app.back_reasoning_picker(),
-            _ => {}
-        }
-    }
-    Ok(Some(TerminalAction::Redraw))
-}
-
-fn handle_escape_key(app: &mut App, commands: &mpsc::UnboundedSender<WorkerCommand>) -> Result<()> {
-    match app.handle_escape(Instant::now()) {
-        Some(EscapeAction::Cancel(target)) => {
-            app.cancel_pending(target);
-            send_command(commands, WorkerCommand::Cancel { target })?;
-        }
-        Some(EscapeAction::InterruptForSteers {
-            target,
-            prompt_id,
-            steer_ids,
-            prompt,
-        }) => {
-            send_command(
-                commands,
-                WorkerCommand::InterruptForSteers {
-                    target,
-                    prompt_id,
-                    steer_ids,
-                    prompt,
-                },
-            )?;
-        }
-        None => {}
-    }
-    Ok(())
-}
-
-fn paste_clipboard_image(
-    app: &mut App,
-    paste: impl FnOnce() -> Result<std::path::PathBuf, String>,
-) {
-    match paste() {
-        Ok(path) => {
-            app.attach_local_image(path);
-            app.insert_char(' ');
-        }
-        Err(error) => {
-            tracing::warn!(%error, "failed to paste a clipboard image");
-            app.push_active_error(format!("Failed to paste image: {error}"));
-        }
-    }
-}
-
-fn handle_global_navigation_key(
-    key: KeyEvent,
-    app: &mut App,
-    commands: &mpsc::UnboundedSender<WorkerCommand>,
-) -> Result<Option<TerminalAction>> {
-    if !key
-        .modifiers
-        .contains(KeyModifiers::CONTROL | KeyModifiers::ALT)
-    {
-        return Ok(None);
-    }
-    if matches!(key.code, KeyCode::Char('b')) {
-        let _ = app.toggle_branch_navigator();
-        return Ok(Some(TerminalAction::Redraw));
-    }
-    let direction = match key.code {
-        KeyCode::Up => Some(-1),
-        KeyCode::Down => Some(1),
-        _ => None,
-    };
-    let Some(direction) = direction else {
-        return Ok(None);
-    };
-    if let Some(id) = app.cycle_main_branch(direction) {
-        send_command(commands, WorkerCommand::SwitchMainBranch { id })?;
-    }
-    Ok(Some(TerminalAction::Redraw))
-}
-
-fn handle_branch_navigator_key(
-    key: KeyEvent,
-    app: &mut App,
-    commands: &mpsc::UnboundedSender<WorkerCommand>,
-) -> Result<Option<TerminalAction>> {
-    if !app.branch_navigator_active() {
-        return Ok(None);
-    }
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
-        return Ok(Some(TerminalAction::Quit));
-    }
-    if key.modifiers.is_empty() {
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                app.move_branch_navigator(-1);
-                request_navigated_branch_switch(app, commands)?;
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                app.move_branch_navigator(1);
-                request_navigated_branch_switch(app, commands)?;
-            }
-            KeyCode::Enter => request_navigated_branch_switch(app, commands)?,
-            KeyCode::Esc | KeyCode::Char('q') => app.close_branch_navigator(),
-            _ => {}
-        }
-    }
-    Ok(Some(TerminalAction::Redraw))
-}
-
-fn request_navigated_branch_switch(
-    app: &mut App,
-    commands: &mpsc::UnboundedSender<WorkerCommand>,
-) -> Result<()> {
-    if let Some(id) = app.switch_to_navigated_branch() {
-        send_command(commands, WorkerCommand::SwitchMainBranch { id })?;
-    }
-    Ok(())
-}
-
-fn handle_transcript_selection_key(key: KeyEvent, app: &mut App) -> Option<TerminalAction> {
-    if !app.transcript_selection_active() {
-        return None;
-    }
-    if key.modifiers.contains(KeyModifiers::CONTROL) {
-        match key.code {
-            KeyCode::Char('c') => return Some(TerminalAction::Quit),
-            KeyCode::Char('p') => app.move_up(),
-            KeyCode::Char('n') => app.move_down(),
-            _ => {}
-        }
-    } else if key.modifiers.is_empty() {
-        match key.code {
-            KeyCode::Up => app.move_up(),
-            KeyCode::Down => app.move_down(),
-            KeyCode::Char('e') => {
-                let _ = app.start_historical_edit();
-            }
-            KeyCode::Esc => app.dismiss_transcript_selection(),
-            _ => {}
-        }
-    }
-    Some(TerminalAction::Redraw)
-}
-
-fn request_historical_edit(
-    app: &mut App,
-    commands: &mpsc::UnboundedSender<WorkerCommand>,
-) -> Result<()> {
-    let cancel_source = app.main.running || app.main.pending_turns > 0;
-    let Some(request) = app.commit_historical_edit() else {
-        return Ok(());
-    };
-    if cancel_source {
-        app.cancel_pending(PaneId::Main);
-    }
-    send_command(
-        commands,
-        WorkerCommand::EditHistorical {
-            source_branch_id: request.source_branch,
-            new_branch_id: request.new_branch,
-            prompt_id: request.prompt,
-        },
-    )
-}
-
-fn handle_inline_historical_editor_key(
-    key: KeyEvent,
-    app: &mut App,
-    commands: &mpsc::UnboundedSender<WorkerCommand>,
-) -> Result<Option<TerminalAction>> {
-    if !app.historical_editor_active() {
-        return Ok(None);
-    }
-    if key.modifiers.contains(KeyModifiers::CONTROL) {
-        match key.code {
-            KeyCode::Char('c') => return Ok(Some(TerminalAction::Quit)),
-            KeyCode::Char('g') => return Ok(Some(TerminalAction::ExternalEditor)),
-            KeyCode::Char('d') => app.delete(),
-            KeyCode::Char('h') => app.backspace(),
-            KeyCode::Char('j') => app.insert_char('\n'),
-            KeyCode::Char('a') => app.move_home(),
-            KeyCode::Char('e') => app.move_end(),
-            KeyCode::Char('b') => app.move_left(),
-            KeyCode::Char('f') => app.move_right(),
-            KeyCode::Char('p') => app.move_inline_editor_up(),
-            KeyCode::Char('n') => app.move_inline_editor_down(),
-            KeyCode::Char('w') => app.delete_word_before_cursor(),
-            KeyCode::Char('u') => app.delete_to_line_start(),
-            KeyCode::Char('k') => app.delete_to_line_end(),
-            KeyCode::Left => app.move_word_left(),
-            KeyCode::Right => app.move_word_right(),
-            _ => {}
-        }
-        return Ok(Some(TerminalAction::Redraw));
-    }
-    if key.modifiers.contains(KeyModifiers::ALT) {
-        match key.code {
-            KeyCode::Enter => app.insert_char('\n'),
-            KeyCode::Backspace => app.delete_word_before_cursor(),
-            KeyCode::Char('b') | KeyCode::Left => app.move_word_left(),
-            KeyCode::Char('f') | KeyCode::Right => app.move_word_right(),
-            _ => {}
-        }
-        return Ok(Some(TerminalAction::Redraw));
-    }
-
-    match key.code {
-        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => app.insert_char('\n'),
-        KeyCode::Enter => request_historical_edit(app, commands)?,
-        KeyCode::Char(character) => app.insert_char(character),
-        KeyCode::Backspace => app.backspace(),
-        KeyCode::Delete => app.delete(),
-        KeyCode::Left => app.move_left(),
-        KeyCode::Right => app.move_right(),
-        KeyCode::Home => app.move_home(),
-        KeyCode::End => app.move_end(),
-        KeyCode::Up => app.move_inline_editor_up(),
-        KeyCode::Down => app.move_inline_editor_down(),
-        KeyCode::Esc => app.cancel_historical_edit(),
-        _ => {}
-    }
-    Ok(Some(TerminalAction::Redraw))
-}
-
-async fn edit_in_external_editor(terminal: &mut TerminalSession, app: &mut App) -> Result<()> {
-    let editor = match external_editor::resolve_editor_command() {
-        Ok(editor) => editor,
-        Err(error) => {
-            app.editor_failed(error);
-            return Ok(());
-        }
-    };
-
-    terminal.suspend()?;
-    let editor_result = external_editor::edit(&app.input, &editor, &app.cwd).await;
-    let resume_result = terminal.resume();
-    resume_result?;
-
-    match editor_result {
-        Ok(input) => app.replace_input(input.trim_end().to_owned()),
-        Err(error) => app.editor_failed(error),
-    }
-    Ok(())
-}
-
-async fn run_external_editor(
-    input_events: EventStream,
-    terminal: &mut TerminalSession,
-    app: &mut App,
-) -> Result<EventStream> {
-    drop(input_events);
-    edit_in_external_editor(terminal, app).await?;
-    Ok(EventStream::new())
-}
-
-fn submit(
-    app: &mut App,
-    root_session_id: &str,
-    commands: &mpsc::UnboundedSender<WorkerCommand>,
-    intent: SubmitIntent,
-) -> Result<()> {
-    let Some(input) = app.take_submission() else {
-        return Ok(());
-    };
-    match classify_submission(input) {
-        Submission::Prompt(prompt) => {
-            let target = app.focus;
-            if matches!(intent, SubmitIntent::Immediate) && app.is_running(target) {
-                if let Some(id) = app.queue_steer(target, prompt.clone()) {
-                    send_command(commands, WorkerCommand::Steer { target, id, prompt })?;
-                }
-            } else if let Some(prompt_id) = app.queue_prompt(target, prompt.display().to_owned()) {
-                send_command(
-                    commands,
-                    WorkerCommand::Prompt {
-                        target,
-                        prompt_id,
-                        prompt,
-                    },
-                )?;
-            }
-        }
-        Submission::Btw(prompt) => {
-            if let Some(id) = app.btw_id() {
-                app.focus_btw();
-                if let Some(prompt) = prompt {
-                    let target = PaneId::Btw(id);
-                    if let Some(prompt_id) = app.queue_prompt(target, prompt.display().to_owned()) {
-                        send_command(
-                            commands,
-                            WorkerCommand::Prompt {
-                                target,
-                                prompt_id,
-                                prompt,
-                            },
-                        )?;
+            event = agent_events.recv(), if panes.values().any(|pane| pane.event_streams_open > 0) => {
+                let Some(event) = event else {
+                    for (&pane, runtime) in &mut panes {
+                        if runtime.event_streams_open > 0 {
+                            runtime.event_streams_open = 0;
+                            schedule(app.update(AppEvent::AgentStreamClosed(pane)), &mut scheduler);
+                        }
+                    }
+                    continue;
+                };
+                match event {
+                    ForwardedAgentEvent::Event { pane, session_id, generation, event } => {
+                        let Some(runtime) = panes.get_mut(&pane) else {
+                            continue;
+                        };
+                        if runtime.session_id != session_id || runtime.generation != generation {
+                            continue;
+                        }
+                        let record = runtime.journal_mut()?.append_agent(event)?;
+                        apply_app_update!(app.update(AppEvent::Transcript { pane, record }));
+                    }
+                    ForwardedAgentEvent::Closed { pane, session_id, generation } => {
+                        let mut stream_closed = false;
+                        if let Some(runtime) = panes.get_mut(&pane)
+                            && runtime.session_id == session_id
+                            && runtime.generation == generation
+                        {
+                            runtime.event_streams_open = runtime.event_streams_open.saturating_sub(1);
+                            stream_closed = runtime.event_streams_open == 0;
+                        }
+                        if stream_closed {
+                            schedule(app.update(AppEvent::AgentStreamClosed(pane)), &mut scheduler);
+                        }
                     }
                 }
-            } else {
-                let id = app.begin_btw();
-                let prompt_id = prompt.as_ref().and_then(|prompt| {
-                    app.queue_prompt(PaneId::Btw(id), prompt.display().to_owned())
-                });
-                send_command(
-                    commands,
-                    WorkerCommand::OpenBtw {
-                        id,
-                        prompt_id,
-                        prompt,
-                    },
-                )?;
             }
-        }
-        Submission::CloseBtw => {
-            if let Some(id) = app.btw_id() {
-                if app.btw_busy() {
-                    app.reject_btw_close_while_busy();
-                } else {
-                    app.close_btw(id);
-                    send_command(commands, WorkerCommand::CloseBtw { id })?;
+            Some(event) = subagent_events.recv(), if !stopping => {
+                if let Some(pane) = subagent_pane(&panes, &event) {
+                    schedule(
+                        app.update(AppEvent::Subagent {
+                            pane,
+                            update: event.update,
+                        }),
+                        &mut scheduler,
+                    );
                 }
             }
+            Some(ready) = review_ready_updates.recv(), if !stopping => {
+                if review_controller.identity() != Some(ready.identity) {
+                    continue;
+                }
+                review_controller.set_url(ready.identity, ready.url.clone());
+                let url = review_controller
+                    .url(ready.identity.pane)
+                    .expect("the active review just stored its URL")
+                    .to_owned();
+                schedule(
+                    app.update(AppEvent::ReviewReady {
+                        pane: ready.identity.pane,
+                        url: url.clone(),
+                    }),
+                    &mut scheduler,
+                );
+                if let Err(error) = crate::app::browser::open(&url) {
+                    schedule(
+                        app.update(AppEvent::NotifyError {
+                            pane: ready.identity.pane,
+                            error: format!(
+                                "Could not open the browser. Press O to retry or open {} manually: {error}",
+                                url,
+                            ),
+                        }),
+                        &mut scheduler,
+                    );
+                }
+            }
+            Some(request) = auxiliary_jobs.recv(), if !stopping => {
+                let AuxiliaryJobRequest {
+                    review,
+                    prompt,
+                    shutdown,
+                    completion,
+                } = request;
+                if !review_controller.accepts(review, &shutdown) {
+                    drop(completion.send(Err(AuxiliaryError::Cancelled)));
+                    continue;
+                }
+                let pane = review.pane;
+                let Some(runtime) = panes
+                    .get_mut(&pane)
+                    .filter(|runtime| runtime.generation == review.pane_generation)
+                else {
+                    drop(completion.send(Err(AuxiliaryError::Failed(
+                        "auxiliary job pane is no longer available".to_owned(),
+                    ))));
+                    continue;
+                };
+                if shutdown.is_cancelled() {
+                    drop(completion.send(Err(AuxiliaryError::Cancelled)));
+                    continue;
+                }
+                let id = TurnId::new(runtime.next_turn);
+                runtime.next_turn = runtime.next_turn.saturating_add(1);
+                commands
+                    .send(WorkerCommand::Auxiliary {
+                        pane,
+                        id,
+                        prompt: prompt.into(),
+                        shutdown,
+                        completion,
+                    })
+                    .map_err(|_| RuntimeError::AgentWorkerStopped)?;
+            }
+            update = worker_updates.recv(), if !worker_stopped => {
+                let Some(update) = update else {
+                    worker_stopped = true;
+                    continue;
+                };
+                match update {
+                    WorkerEvent::Stopped { error } => {
+                        for (&pane, runtime) in &mut panes {
+                            let journal = runtime.journal_mut()?;
+                            if journal.is_empty() {
+                                continue;
+                            }
+                            let record = journal.append_local(LocalEvent::WorkerStopped {
+                                error: error.as_ref().map(ToString::to_string),
+                            })?;
+                            schedule(app.update(AppEvent::Transcript { pane, record }), &mut scheduler);
+                        }
+                        worker_stopped = true;
+                        worker_error = error;
+                    }
+                    WorkerEvent::TurnAccepted { pane, id } => {
+                        let record = panes.get_mut(&pane).expect("worker pane must exist")
+                            .journal_mut()?.append_local(LocalEvent::WorkerTurnAccepted { id })?;
+                        schedule(app.update(AppEvent::Transcript { pane, record }), &mut scheduler);
+                    }
+                    WorkerEvent::TurnFinished { pane, id, error, snapshot } => {
+                        let Some(runtime) = panes.get_mut(&pane) else {
+                            continue;
+                        };
+                        if let Some(snapshot) = snapshot {
+                            session::save_checkpoint(
+                                config.path(),
+                                &runtime.session_id,
+                                &snapshot,
+                                &runtime.instructions,
+                                runtime.skills_catalog_present,
+                            )?;
+                        }
+                        let record = runtime.journal_mut()?.append_local(LocalEvent::WorkerTurnFinished {
+                            id,
+                            error,
+                        })?;
+                        schedule(app.update(AppEvent::Transcript { pane, record }), &mut scheduler);
+                        apply_app_update!(app.update(AppEvent::WorkerTurnFinished(pane)));
+                    }
+                    WorkerEvent::SteerAdmitted { pane, queue_id } => {
+                        apply_app_update!(app.update(AppEvent::SteerAdmitted { pane, id: queue_id }));
+                    }
+                    WorkerEvent::SteerPromoted { pane, queue_id, id, prompt } => {
+                        let Some(runtime) = panes.get_mut(&pane) else {
+                            continue;
+                        };
+                        let record = runtime.journal_mut()?.append_local(LocalEvent::UserSubmitted {
+                            id,
+                            text: prompt.display_text().to_owned(),
+                        })?;
+                        schedule(app.update(AppEvent::Transcript { pane, record }), &mut scheduler);
+                        schedule(app.update(AppEvent::SteerPromoted { pane, id: queue_id }), &mut scheduler);
+                    }
+                    WorkerEvent::SteerFailed {
+                        pane,
+                        queue_id,
+                        error,
+                    } => {
+                        let Some(runtime) = panes.get_mut(&pane) else {
+                            continue;
+                        };
+                        let record = runtime.journal_mut()?.append_local(LocalEvent::WorkerSteerFailed {
+                            error,
+                        })?;
+                        schedule(app.update(AppEvent::Transcript { pane, record }), &mut scheduler);
+                        apply_app_update!(app.update(AppEvent::SteerFailed { pane, id: queue_id }));
+                    }
+                    WorkerEvent::TurnsCancelled { pane, count, error } => {
+                        let Some(runtime) = panes.get_mut(&pane) else {
+                            continue;
+                        };
+                        if count > 0 || error.is_some() {
+                            let record = runtime.journal_mut()?.append_local(
+                                LocalEvent::WorkerTurnsInterrupted { count, error },
+                            )?;
+                            schedule(
+                                app.update(AppEvent::Transcript { pane, record }),
+                                &mut scheduler,
+                            );
+                        }
+                        schedule(app.update(AppEvent::TurnsCancelled(pane)), &mut scheduler);
+                    }
+                    WorkerEvent::ForkOpened { pane, events } => {
+                        let session_id = events.request_id().to_owned();
+                        let parent_session_id = panes
+                            .get(&PaneId::Main)
+                            .map(|runtime| runtime.session_id.clone());
+                        let effort = app
+                            .root(pane)
+                            .map(|root| root.composer().effort())
+                            .unwrap_or_else(|| config.agent().thinking());
+                        let fast_mode = panes
+                            .get(&PaneId::Main)
+                            .expect("main pane must exist")
+                            .current_fast_mode;
+                        let reasoning_mode = panes
+                            .get(&PaneId::Main)
+                            .expect("main pane must exist")
+                            .reasoning_mode;
+                        let subagent_control = panes
+                            .get(&PaneId::Main)
+                            .expect("main pane must exist")
+                            .subagent_control
+                            .clone();
+                        let instructions = Arc::clone(
+                            &panes
+                                .get(&PaneId::Main)
+                                .expect("main pane must exist")
+                                .instructions,
+                        );
+                        let skills_catalog_present = panes
+                            .get(&PaneId::Main)
+                            .expect("main pane must exist")
+                            .skills_catalog_present;
+                        panes.insert(
+                            pane,
+                            open_pane(
+                                PaneGeneration {
+                                    pane,
+                                    generation: 0,
+                                },
+                                PaneSession::new(
+                                    &session_id,
+                                    parent_session_id.as_deref(),
+                                    skills_catalog_present,
+                                ),
+                                &config,
+                                PaneSettings::new(effort, reasoning_mode, fast_mode),
+                                instructions,
+                                subagent_control.clone(),
+                                &writer_sender,
+                            )?,
+                        );
+                        writers_open = writers_open.saturating_add(1);
+                        agent_events::forward(pane, 0, events, agent_event_sender.clone());
+                        apply_app_update!(app.update(AppEvent::ForkReady(pane)));
+                    }
+                    WorkerEvent::ForkFailed { pane, error } => {
+                        apply_app_update!(app.update(AppEvent::ForkFailed { pane, error }));
+                    }
+                    WorkerEvent::ThinkingUpdated {
+                        pane,
+                        effort,
+                        result,
+                    } => {
+                        result?;
+                        let runtime = panes.get_mut(&pane).expect("effort pane must exist");
+                        let previous_effort = runtime.current_effort;
+                        let journal = runtime.journal_mut()?;
+                        if journal.is_empty() {
+                            journal.set_initial_effort(effort);
+                        } else {
+                            let record = journal.append_local(LocalEvent::EffortChanged {
+                                from: previous_effort,
+                                to: effort,
+                            })?;
+                            schedule(app.update(AppEvent::Transcript { pane, record }), &mut scheduler);
+                        }
+                        runtime.current_effort = effort;
+                        if pane == PaneId::Main {
+                            config.set_thinking(effort);
+                        }
+                        input = Some(EventStream::new());
+                        scheduler.request_immediate(Instant::now());
+                    }
+                    WorkerEvent::FastModeUpdated { pane, enabled, result } => {
+                        result?;
+                        let runtime = panes.get_mut(&pane).expect("fast-mode pane must exist");
+                        let previous = runtime.current_fast_mode;
+                        let journal = runtime.journal_mut()?;
+                        if journal.is_empty() {
+                            journal.set_initial_fast_mode(enabled);
+                        } else {
+                            let record = journal.append_local(LocalEvent::FastModeChanged {
+                                from: previous,
+                                to: enabled,
+                            })?;
+                            schedule(app.update(AppEvent::Transcript { pane, record }), &mut scheduler);
+                        }
+                        runtime.current_fast_mode = enabled;
+                        if pane == PaneId::Main {
+                            config.set_fast_mode(enabled);
+                        }
+                        input = Some(EventStream::new());
+                        scheduler.request_immediate(Instant::now());
+                    }
+                }
+            }
+            result = shell_tasks.join_next(), if !shell_tasks.is_empty() => {
+                let Some(result) = result else {
+                    continue;
+                };
+                let Ok((pane, execution)) = result else {
+                    continue;
+                };
+                let Some(runtime) = panes.get_mut(&pane) else {
+                    continue;
+                };
+                runtime.active_shells = runtime.active_shells.saturating_sub(1);
+                runtime.pending_shell_context.push(execution.model_context());
+                let record = runtime.journal_mut()?.append_local(LocalEvent::ShellFinished {
+                    id: execution.id,
+                    output: execution.output,
+                    exit_code: execution.exit_code,
+                    duration_ns: execution.duration_ns,
+                    truncated: execution.truncated,
+                    error: execution.error,
+                })?;
+                let submission = if runtime.active_shells == 0 {
+                    runtime.pending_submission.take()
+                } else {
+                    None
+                };
+                apply_app_update!(app.update(AppEvent::Transcript { pane, record }));
+                schedule(app.update(AppEvent::ShellFinished(pane)), &mut scheduler);
+                if let Some(submission) = submission {
+                    let runtime = panes.get_mut(&pane).expect("shell pane must exist");
+                    send_submission(
+                        &commands,
+                        pane,
+                        &mut runtime.pending_shell_context,
+                        submission,
+                    )?;
+                }
+            }
+            result = memory_tasks.join_next(), if !memory_tasks.is_empty() && !stopping => {
+                let Some(Ok(completion)) = result else {
+                    continue;
+                };
+                let (pane, generation) = completion.identity();
+                if memory_generations.get(&pane) != Some(&generation) {
+                    continue;
+                }
+                schedule(app.update(completion.into_event()), &mut scheduler);
+            }
+            result = subagent_shutdowns.join_next(), if !subagent_shutdowns.is_empty() => {
+                drop(result);
+            }
+            result = async {
+                editor_task
+                    .as_mut()
+                    .expect("editor branch is disabled without an editor task")
+                    .await
+            }, if editor_task.is_some() && !stopping => {
+                editor_task = None;
+                terminal.resume().map_err(RuntimeError::Terminal)?;
+                input = Some(EventStream::new());
+                match result.map_err(RuntimeError::ExternalEditorTask)?? {
+                    EditorCompletion::Draft { pane, outcome: EditorOutcome::Updated(draft) } => {
+                        schedule(app.update(AppEvent::EditorDraft { pane, draft }), &mut scheduler);
+                    }
+                    EditorCompletion::Queue {
+                        pane,
+                        index,
+                        original,
+                        outcome,
+                    } => {
+                        let text = match outcome {
+                            EditorOutcome::Updated(text) => text,
+                            EditorOutcome::Unchanged => original,
+                        };
+                        schedule(
+                            app.update(AppEvent::QueueEditorFinished { pane, index, text }),
+                            &mut scheduler,
+                        );
+                    }
+                    EditorCompletion::Draft { outcome: EditorOutcome::Unchanged, .. }
+                    | EditorCompletion::Config
+                    | EditorCompletion::File => {}
+                }
+                scheduler.request_immediate(Instant::now());
+            }
+            result = async {
+                effort_task
+                    .as_mut()
+                    .expect("effort branch is disabled without an effort task")
+                    .await
+            }, if effort_task.is_some() && !stopping => {
+                effort_task = None;
+                let update = result.map_err(RuntimeError::EffortUpdateTask)??;
+                config.set_reasoning_mode(update.preferred_reasoning_mode);
+                app.set_preferred_reasoning_mode(update.preferred_reasoning_mode);
+                commands
+                    .send(WorkerCommand::SetThinking {
+                        pane: update.pane,
+                        effort: update.to,
+                    })
+                    .map_err(|_| RuntimeError::AgentWorkerStopped)?;
+            }
+            result = async {
+                fast_mode_task
+                    .as_mut()
+                    .expect("fast-mode branch is disabled without a task")
+                    .await
+            }, if fast_mode_task.is_some() && !stopping => {
+                fast_mode_task = None;
+                let update = result.map_err(RuntimeError::FastModeUpdateTask)??;
+                commands
+                    .send(WorkerCommand::SetFastMode {
+                        pane: update.pane,
+                        enabled: update.enabled,
+                    })
+                    .map_err(|_| RuntimeError::AgentWorkerStopped)?;
+            }
+            result = async {
+                new_session_task
+                    .as_mut()
+                    .expect("new-session branch is disabled without a task")
+                    .await
+            }, if new_session_task.is_some() && !stopping => {
+                new_session_task = None;
+                input = Some(EventStream::new());
+                let (pane, effort, reasoning_mode, fast_mode, configured) =
+                    result.map_err(RuntimeError::NewSessionTask)?;
+                match configured {
+                    Ok(configured) => {
+                        let ConfiguredAgent {
+                            agent,
+                            events,
+                            instructions,
+                            skills,
+                            memory_enabled,
+                            subagent_updates,
+                            subagent_control,
+                        } = configured;
+                        let session_id = events.request_id().to_owned();
+                        let generation = panes
+                            .get(&pane)
+                            .expect("new-session pane must exist")
+                            .generation
+                            .saturating_add(1);
+                        schedule_subagent_shutdown(
+                            panes.get(&pane).expect("new-session pane must exist"),
+                            &mut subagent_shutdowns,
+                        );
+                        close_pane_journal(
+                            panes.get_mut(&pane).expect("new-session pane must exist"),
+                            SessionOutcome::Closed,
+                            None,
+                        )?;
+                        panes.insert(
+                            pane,
+                            open_pane(
+                                PaneGeneration { pane, generation },
+                                PaneSession::new(&session_id, None, !skills.is_empty()),
+                                &config,
+                                PaneSettings::new(effort, reasoning_mode, fast_mode),
+                                instructions,
+                                subagent_control.clone(),
+                                &writer_sender,
+                            )?,
+                        );
+                        writers_open = writers_open.saturating_add(1);
+                        agent_events::forward(
+                            pane,
+                            generation,
+                            events,
+                            agent_event_sender.clone(),
+                        );
+                        subagent_updates::forward(
+                            subagent_control.runtime_id(),
+                            subagent_updates,
+                            subagent_sender.clone(),
+                        );
+                        commands
+                            .send(WorkerCommand::ReplaceAgent {
+                                pane,
+                                agent,
+                                memory_review: worker::MemoryReviewState::fresh(memory_enabled),
+                            })
+                            .map_err(|_| RuntimeError::AgentWorkerStopped)?;
+                        schedule(
+                            app.update(AppEvent::NewSessionReady {
+                                pane,
+                                effort,
+                                reasoning_mode,
+                                fast_mode,
+                                skills,
+                            }),
+                            &mut scheduler,
+                        );
+                    }
+                    Err(error) => schedule(
+                        app.update(AppEvent::NewSessionFailed {
+                            pane,
+                            error: error.to_string(),
+                        }),
+                        &mut scheduler,
+                    ),
+                }
+                scheduler.request_immediate(Instant::now());
+            }
+            result = async {
+                session_list_task
+                    .as_mut()
+                    .expect("session-list branch is disabled without a task")
+                    .await
+            }, if session_list_task.is_some() && !stopping => {
+                session_list_task = None;
+                input = Some(EventStream::new());
+                let (pane, sessions) = result.map_err(RuntimeError::SessionTask)?;
+                match sessions {
+                    Ok(sessions) => schedule(
+                        app.update(AppEvent::SessionsLoaded { pane, sessions }),
+                        &mut scheduler,
+                    ),
+                    Err(error) => schedule(
+                        app.update(AppEvent::SessionLoadFailed {
+                            pane,
+                            error: format!("Could not load sessions: {error}"),
+                        }),
+                        &mut scheduler,
+                    ),
+                }
+                scheduler.request_immediate(Instant::now());
+            }
+            result = async {
+                review_controller
+                    .task_mut()
+                    .expect("review branch is disabled without a task")
+                    .await
+            }, if review_controller.is_active() && !stopping => {
+                let completion = result.map_err(RuntimeError::SessionTask)?;
+                if !review_controller.complete(completion.identity) {
+                    continue;
+                }
+                let pane = completion.identity.pane;
+                if !panes
+                    .get(&pane)
+                    .is_some_and(|runtime| runtime.generation == completion.identity.pane_generation)
+                {
+                    continue;
+                }
+                match completion.result {
+                    Ok(Some(markdown)) => schedule(
+                        app.update(AppEvent::ReviewFinished { pane, markdown }),
+                        &mut scheduler,
+                    ),
+                    Ok(None) => schedule(
+                        app.update(AppEvent::ReviewCancelled(pane)),
+                        &mut scheduler,
+                    ),
+                    Err(error) => schedule(
+                        app.update(AppEvent::ReviewFailed {
+                            pane,
+                            error: error.user_message(),
+                        }),
+                        &mut scheduler,
+                    ),
+                }
+                scheduler.request_immediate(Instant::now());
+            }
+            result = async {
+                resume_session_task
+                    .as_mut()
+                    .expect("resume-session branch is disabled without a task")
+                    .await
+            }, if resume_session_task.is_some() && !stopping => {
+                resume_session_task = None;
+                input = Some(EventStream::new());
+                let (pane, effort, preferred_reasoning_mode, fast_mode, restored) =
+                    result.map_err(RuntimeError::SessionTask)?;
+                match restored {
+                    Ok(RestoredSession {
+                        configured,
+                        projection,
+                        reasoning_mode,
+                    }) => {
+                        let ConfiguredAgent {
+                            agent,
+                            events,
+                            instructions,
+                            skills,
+                            memory_enabled,
+                            subagent_updates,
+                            subagent_control,
+                        } = configured;
+                        let session_id = events.request_id().to_owned();
+                        let generation = panes
+                            .get(&pane)
+                            .expect("resumed pane must exist")
+                            .generation
+                            .saturating_add(1);
+                        schedule_subagent_shutdown(
+                            panes.get(&pane).expect("resumed pane must exist"),
+                            &mut subagent_shutdowns,
+                        );
+                        close_pane_journal(
+                            panes.get_mut(&pane).expect("resumed pane must exist"),
+                            SessionOutcome::Closed,
+                            None,
+                        )?;
+                        panes.insert(
+                            pane,
+                            open_pane(
+                                PaneGeneration { pane, generation },
+                                PaneSession::persisted(&session_id, !skills.is_empty()),
+                                &config,
+                                PaneSettings::new(effort, reasoning_mode, fast_mode),
+                                instructions,
+                                subagent_control.clone(),
+                                &writer_sender,
+                            )?,
+                        );
+                        writers_open = writers_open.saturating_add(1);
+                        agent_events::forward(
+                            pane,
+                            generation,
+                            events,
+                            agent_event_sender.clone(),
+                        );
+                        subagent_updates::forward(
+                            subagent_control.runtime_id(),
+                            subagent_updates,
+                            subagent_sender.clone(),
+                        );
+                        commands
+                            .send(WorkerCommand::ReplaceAgent {
+                                pane,
+                                agent,
+                                memory_review: worker::MemoryReviewState::restored(memory_enabled),
+                            })
+                            .map_err(|_| RuntimeError::AgentWorkerStopped)?;
+                        schedule(
+                            app.update(AppEvent::SessionRestored {
+                                pane,
+                                projection: Box::new(projection),
+                                effort,
+                                reasoning_mode,
+                                preferred_reasoning_mode,
+                                fast_mode,
+                                skills,
+                            }),
+                            &mut scheduler,
+                        );
+                        if let Some(prompt) = startup_prompt.take() {
+                            apply_app_update!(ComponentUpdate {
+                                effects: vec![AppEffect::Pane {
+                                    pane,
+                                    effect: components::RootEffect::Submit(prompt.into()),
+                                }],
+                                render: RenderRequest::Immediate,
+                            });
+                        }
+                    }
+                    Err(error) => schedule(
+                        app.update(AppEvent::SessionLoadFailed {
+                            pane,
+                            error: format!("Could not resume session: {error}"),
+                        }),
+                        &mut scheduler,
+                    ),
+                }
+                scheduler.request_immediate(Instant::now());
+            }
+            completion = writer_updates.recv(), if writers_open > 0 => {
+                let Some(completion) = completion else {
+                    writers_open = 0;
+                    continue;
+                };
+                writers_open = writers_open.saturating_sub(1);
+                if let Err(error) = completion.result {
+                    writer_error = Some(error);
+                    stopping = true;
+                    input = None;
+                    shutdown.cancel();
+                }
+                if let Some(runtime) = panes.get_mut(&completion.pane)
+                    && runtime.session_id == completion.session_id
+                    && runtime.generation == completion.generation
+                {
+                    runtime.journal = None;
+                }
+            }
+            () = async {
+                sleep_until(animation_deadline.expect("animation branch is disabled without a deadline").into()).await;
+            }, if animation_deadline.is_some() && editor_task.is_none() && !stopping => {
+                schedule(app.update(AppEvent::AnimationFrame(Instant::now())), &mut scheduler);
+            }
+            () = async {
+                sleep_until(render_deadline.expect("deadline branch is disabled without a deadline").into()).await;
+            }, if render_deadline.is_some() && editor_task.is_none() && !stopping => {}
         }
-        Submission::Cancel => {
-            let target = app.focus;
-            app.cancel_pending(target);
-            send_command(commands, WorkerCommand::Cancel { target })?;
+    }
+
+    let session_id = panes
+        .get(&PaneId::Main)
+        .and_then(PaneRuntime::exit_session_id);
+    drop(terminal);
+    if let Some(error) = writer_error {
+        return Err(error.into());
+    }
+    worker_error.map_or(Ok(session_id), |error| Err(error.into()))
+}
+
+pub(crate) fn ensure_interactive() -> Result<()> {
+    validate_interactive(io::stdin().is_terminal(), io::stdout().is_terminal())
+}
+
+fn validate_interactive(stdin: bool, stdout: bool) -> Result<()> {
+    if stdin && stdout {
+        return Ok(());
+    }
+    Err(RuntimeError::InteractiveTerminal.into())
+}
+
+fn open_pane(
+    identity: PaneGeneration,
+    session: PaneSession<'_>,
+    config: &Config,
+    settings: PaneSettings,
+    instructions: Arc<str>,
+    subagent_control: SubagentControl,
+    writer_updates: &mpsc::UnboundedSender<WriterCompletion>,
+) -> Result<PaneRuntime> {
+    let PaneGeneration { pane, generation } = identity;
+    let PaneSettings {
+        effort,
+        reasoning_mode,
+        fast_mode,
+    } = settings;
+    let PaneSession {
+        id: session_id,
+        parent_id: parent_session_id,
+        previously_persisted,
+        skills_catalog_present,
+    } = session;
+    if pane == PaneId::Main && generation == 0 {
+        session::remove_obsolete_checkpoints(config.path())?;
+    }
+    let (mut journal, writer) = TranscriptJournal::open(config.path(), session_id)?;
+    let writer_path = journal.path().to_path_buf();
+    journal.defer_start(SessionStarted {
+        session_id: session_id.to_owned(),
+        parent_session_id: parent_session_id.map(str::to_owned),
+        model: nanocodex::oai::MODEL.to_owned(),
+        effort,
+        reasoning_mode,
+        fast_mode,
+        workspace: config.agent().workspace().to_path_buf(),
+        application_version: env!("CARGO_PKG_VERSION").to_owned(),
+    });
+
+    let updates = writer_updates.clone();
+    let completion_session_id = session_id.to_owned();
+    tokio::spawn(async move {
+        let result = writer
+            .into_task()
+            .await
+            .map_err(TranscriptError::WriterTask)
+            .and_then(|result| result);
+        drop(updates.send(WriterCompletion {
+            pane,
+            session_id: completion_session_id,
+            generation,
+            result,
+        }));
+    });
+
+    Ok(PaneRuntime {
+        session_id: session_id.to_owned(),
+        instructions,
+        skills_catalog_present,
+        previously_persisted,
+        journal: Some(journal),
+        writer_path,
+        event_streams_open: 1,
+        next_turn: 1,
+        next_shell: 1,
+        pending_shell_context: Vec::new(),
+        pending_submission: None,
+        current_effort: effort,
+        reasoning_mode,
+        current_fast_mode: fast_mode,
+        active_shells: 0,
+        generation,
+        subagent_control,
+    })
+}
+
+fn close_journals(
+    panes: &mut HashMap<PaneId, PaneRuntime>,
+    worker_error: Option<&nanocodex::NanocodexError>,
+) -> Result<()> {
+    let outcome = if worker_error.is_some() {
+        SessionOutcome::Failed
+    } else {
+        SessionOutcome::Cancelled
+    };
+    for runtime in panes.values_mut() {
+        close_pane_journal(runtime, outcome, worker_error.map(ToString::to_string))?;
+    }
+    Ok(())
+}
+
+fn schedule_subagent_shutdown(runtime: &PaneRuntime, tasks: &mut JoinSet<()>) {
+    let control = runtime.subagent_control.clone();
+    let root_session_id = runtime.session_id.clone();
+    tasks.spawn(async move {
+        control.close_all(&root_session_id).await;
+    });
+}
+
+fn close_pane_journal(
+    runtime: &mut PaneRuntime,
+    outcome: SessionOutcome,
+    error: Option<String>,
+) -> Result<()> {
+    let Some(mut journal) = runtime.journal.take() else {
+        return Ok(());
+    };
+    if journal.is_empty() {
+        return Ok(());
+    }
+    journal.append_local(LocalEvent::SessionEnded(SessionEnded { outcome, error }))?;
+    drop(journal);
+    Ok(())
+}
+
+struct EffectContext<'a> {
+    app: &'a mut AppNode,
+    commands: &'a tokio::sync::mpsc::UnboundedSender<WorkerCommand>,
+    workspace: &'a Path,
+    config: &'a mut Config,
+    shutdown: &'a CancellationToken,
+    input: &'a mut Option<EventStream>,
+    editor_task: &'a mut Option<EditorTask>,
+    effort_task: &'a mut Option<EffortUpdateTask>,
+    fast_mode_task: &'a mut Option<FastModeUpdateTask>,
+    new_session_task: &'a mut Option<NewSessionTask>,
+    session_list_task: &'a mut Option<SessionListTask>,
+    review_controller: &'a mut ReviewController,
+    auxiliary_sender: &'a mpsc::UnboundedSender<AuxiliaryJobRequest>,
+    review_ready_sender: &'a mpsc::UnboundedSender<ReviewReady>,
+    resume_session_task: &'a mut Option<ResumeSessionTask>,
+    terminal: &'a mut TerminalSession,
+    scheduler: &'a mut RenderScheduler,
+    panes: &'a mut HashMap<PaneId, PaneRuntime>,
+    shell_tasks: &'a mut JoinSet<(PaneId, ShellExecution)>,
+    memory_store: &'a mut Option<MemoryStore>,
+    memory_tasks: &'a mut JoinSet<MemoryCompletion>,
+    memory_generations: &'a mut HashMap<PaneId, u64>,
+    subagent_shutdowns: &'a mut JoinSet<()>,
+}
+
+fn apply_update(update: ComponentUpdate<AppEffect>, mut context: EffectContext<'_>) -> Result<()> {
+    for effect in update.effects {
+        match effect {
+            AppEffect::OpenFork(pane) => context
+                .commands
+                .send(WorkerCommand::OpenFork(pane))
+                .map_err(|_| RuntimeError::AgentWorkerStopped)?,
+            AppEffect::ClosePane(pane) => {
+                if let Some(runtime) = context.panes.get(&pane) {
+                    schedule_subagent_shutdown(runtime, context.subagent_shutdowns);
+                }
+                context
+                    .commands
+                    .send(WorkerCommand::ClosePane(pane))
+                    .map_err(|_| RuntimeError::AgentWorkerStopped)?;
+            }
+            AppEffect::SetTheme(mode) => context.config.persist_theme_mode(mode)?,
+            AppEffect::Shutdown => context.shutdown.cancel(),
+            AppEffect::Pane { pane, effect } => {
+                apply_pane_effect(pane, effect, &mut context)?;
+            }
         }
-        Submission::Trace => {
-            let Some(session_id) = active_session_id(app, root_session_id) else {
-                app.push_active_error("BTW traces are available after the fork finishes");
+    }
+    request_render(update.render, context.scheduler);
+    Ok(())
+}
+
+fn apply_pane_effect(
+    pane: PaneId,
+    effect: components::RootEffect,
+    context: &mut EffectContext<'_>,
+) -> Result<()> {
+    match effect {
+        components::RootEffect::Submit(prompt) => {
+            let runtime = context
+                .panes
+                .get_mut(&pane)
+                .expect("UI pane must have a runtime");
+            let id = TurnId::new(runtime.next_turn);
+            runtime.next_turn = runtime.next_turn.saturating_add(1);
+            let record = runtime
+                .journal_mut()?
+                .append_local(LocalEvent::UserSubmitted {
+                    id,
+                    text: prompt.display_text().to_owned(),
+                })?;
+            schedule(
+                context.app.update(AppEvent::Transcript { pane, record }),
+                context.scheduler,
+            );
+            let submission = PendingSubmission { id, prompt };
+            if runtime.active_shells == 0 {
+                send_submission(
+                    context.commands,
+                    pane,
+                    &mut runtime.pending_shell_context,
+                    submission,
+                )?;
+            } else {
+                debug_assert!(runtime.pending_submission.is_none());
+                runtime.pending_submission = Some(submission);
+            }
+        }
+        components::RootEffect::RunShell(command) => {
+            let runtime = context
+                .panes
+                .get_mut(&pane)
+                .expect("UI pane must have a runtime");
+            let id = ShellId::new(runtime.next_shell);
+            runtime.next_shell = runtime.next_shell.saturating_add(1);
+            runtime.active_shells = runtime.active_shells.saturating_add(1);
+            let record = runtime
+                .journal_mut()?
+                .append_local(LocalEvent::ShellStarted {
+                    id,
+                    command: command.clone(),
+                    workspace: context.workspace.to_path_buf(),
+                })?;
+            schedule(
+                context.app.update(AppEvent::Transcript { pane, record }),
+                context.scheduler,
+            );
+            let workspace = context.workspace.to_path_buf();
+            context
+                .shell_tasks
+                .spawn(async move { (pane, shell::execute(id, command, workspace).await) });
+        }
+        components::RootEffect::OpenLink(destination) if is_web_link(&destination) => {
+            if let Err(error) = crate::app::browser::open(&destination) {
+                schedule(
+                    context.app.update(AppEvent::NotifyError {
+                        pane,
+                        error: format!("Could not open link: {error}"),
+                    }),
+                    context.scheduler,
+                );
+            }
+        }
+        editor_effect @ (components::RootEffect::OpenDraftEditor
+        | components::RootEffect::OpenQueueEditor { .. }
+        | components::RootEffect::OpenConfigEditor
+        | components::RootEffect::OpenLink(_)) => {
+            context.terminal.suspend().map_err(RuntimeError::Terminal)?;
+            *context.input = None;
+            let target = match editor_effect {
+                components::RootEffect::OpenDraftEditor => EditorTarget::Draft {
+                    pane,
+                    text: context
+                        .app
+                        .root(pane)
+                        .expect("editor pane must exist")
+                        .composer()
+                        .draft()
+                        .to_owned(),
+                },
+                components::RootEffect::OpenQueueEditor { index, text } => {
+                    EditorTarget::Queue { pane, index, text }
+                }
+                components::RootEffect::OpenConfigEditor => {
+                    EditorTarget::Config(context.config.path().to_path_buf())
+                }
+                components::RootEffect::OpenLink(destination) => {
+                    EditorTarget::File(local_link_path(&destination, context.workspace))
+                }
+                _ => unreachable!("editor effect pattern is exhaustive"),
+            };
+            let workspace = context.workspace.to_path_buf();
+            *context.editor_task = Some(tokio::spawn(async move {
+                match target {
+                    EditorTarget::Draft { pane, text } => {
+                        let outcome = editor::edit(&text, &workspace).await?;
+                        Ok(EditorCompletion::Draft { pane, outcome })
+                    }
+                    EditorTarget::Queue { pane, index, text } => {
+                        let outcome = editor::edit(&text, &workspace).await?;
+                        Ok(EditorCompletion::Queue {
+                            pane,
+                            index,
+                            original: text,
+                            outcome,
+                        })
+                    }
+                    EditorTarget::Config(path) => editor::edit_config(&path, &workspace)
+                        .await
+                        .map(|()| EditorCompletion::Config),
+                    EditorTarget::File(path) => editor::open_file(&path, &workspace)
+                        .await
+                        .map(|()| EditorCompletion::File),
+                }
+            }));
+        }
+        components::RootEffect::SetEffort {
+            effort,
+            reasoning_mode,
+        } => {
+            *context.input = None;
+            let config = context.config.clone();
+            *context.effort_task = Some(tokio::task::spawn_blocking(move || {
+                if pane == PaneId::Main {
+                    config.persist_thinking(effort)?;
+                }
+                config.persist_reasoning_mode(reasoning_mode)?;
+                Ok(EffortUpdate {
+                    pane,
+                    to: effort,
+                    preferred_reasoning_mode: reasoning_mode,
+                })
+            }));
+        }
+        components::RootEffect::SetFastMode(enabled) => {
+            *context.input = None;
+            let config = (pane == PaneId::Main).then(|| context.config.clone());
+            *context.fast_mode_task = Some(tokio::task::spawn_blocking(move || {
+                if let Some(config) = config {
+                    config.persist_fast_mode(enabled)?;
+                }
+                Ok(FastModeUpdate { pane, enabled })
+            }));
+        }
+        components::RootEffect::SetMaxSubagents(limit) => {
+            context.config.persist_max_subagents(limit)?;
+            context.config.set_max_subagents(limit);
+            context.app.set_max_subagents(limit);
+            for runtime in context.panes.values() {
+                runtime.subagent_control.set_max_concurrency(limit);
+            }
+        }
+        components::RootEffect::LoadMemories => {
+            let Some(store) = context.memory_store.clone() else {
+                schedule(
+                    context.app.update(AppEvent::MemoryLoadFailed {
+                        pane,
+                        error: "Memory is disabled. Enable it with memory.enabled = true."
+                            .to_owned(),
+                    }),
+                    context.scheduler,
+                );
                 return Ok(());
             };
-            match open_session_traces(session_id) {
-                Ok(()) => app.set_active_status("Opened session traces in Jaeger"),
-                Err(error) => app.push_active_error(format!("failed to open Jaeger: {error}")),
+            let generation = next_memory_generation(context.memory_generations, pane);
+            context.memory_tasks.spawn_blocking(move || {
+                run_memory_operation(pane, generation, &store, MemoryOperation::List)
+            });
+        }
+        components::RootEffect::DeleteMemory(key) => {
+            let Some(store) = context.memory_store.clone() else {
+                schedule(
+                    context.app.update(AppEvent::MemoryDeleteFailed {
+                        pane,
+                        error: "Memory was disabled before the deletion completed.".to_owned(),
+                        conflict: false,
+                    }),
+                    context.scheduler,
+                );
+                return Ok(());
+            };
+            let generation = next_memory_generation(context.memory_generations, pane);
+            context.memory_tasks.spawn_blocking(move || {
+                run_memory_operation(pane, generation, &store, MemoryOperation::Delete(key))
+            });
+        }
+        components::RootEffect::ReloadConfig => match context.config.reload() {
+            Ok(reload) => {
+                let (config, workspace_changed) = reload.into_parts();
+                let theme = config.theme().clone();
+                let max_subagents = config.agent().max_subagents();
+                let preferred_reasoning_mode = config.agent().reasoning_mode();
+                let memory_enabled = config.memory().enabled();
+                *context.memory_store = configured_memory_store(&config);
+                context.app.set_max_subagents(max_subagents);
+                for runtime in context.panes.values() {
+                    runtime
+                        .subagent_control
+                        .set_max_concurrency(max_subagents);
+                }
+                *context.config = config;
+                let message = if workspace_changed {
+                    "Reloaded config · theme, UI, and memory browser applied · agent/auth/tool settings apply to new sessions · workspace requires restart"
+                } else {
+                    "Reloaded config · theme, UI, and memory browser applied · agent/auth/tool settings apply to new sessions"
+                };
+                schedule(
+                    context.app.update(AppEvent::ConfigReloaded {
+                        pane,
+                        theme,
+                        preferred_reasoning_mode,
+                        memory_enabled,
+                        message: message.to_owned(),
+                    }),
+                    context.scheduler,
+                );
             }
+            Err(error) => schedule(
+                context.app.update(AppEvent::ConfigReloadFailed {
+                    pane,
+                    error: format!("Could not reload config: {error}"),
+                }),
+                context.scheduler,
+            ),
+        },
+        components::RootEffect::NewSession => {
+            *context.input = None;
+            let effort = context.config.agent().thinking();
+            let reasoning_mode = context.config.agent().reasoning_mode();
+            let config = context.config.clone();
+            *context.new_session_task = Some(tokio::task::spawn_blocking(move || {
+                let fast_mode = config.agent().fast_mode();
+                let configured = ConfiguredAgent::from_config_with_session(
+                    &config,
+                    effort,
+                    reasoning_mode,
+                    None,
+                    None,
+                );
+                (pane, effort, reasoning_mode, fast_mode, configured)
+            }));
         }
-        Submission::Fast(enabled) => {
-            let enabled = enabled.unwrap_or(!app.fast_mode());
-            send_command(commands, WorkerCommand::SetFastMode { enabled })?;
+        components::RootEffect::LoadSessions => {
+            *context.input = None;
+            let config_path = context.config.path().to_path_buf();
+            let workspace = context.workspace.to_path_buf();
+            let active_session_id = context
+                .panes
+                .get(&pane)
+                .expect("session-list pane must exist")
+                .session_id
+                .clone();
+            *context.session_list_task = Some(tokio::spawn(async move {
+                let sessions = session::list_async(config_path, workspace)
+                    .await
+                    .map(|mut sessions| {
+                    sessions.retain(|session| session.session_id != active_session_id);
+                    sessions
+                });
+                (pane, sessions.map_err(Into::into))
+            }));
         }
-        Submission::ReasoningPicker => app.open_reasoning_picker(),
-        Submission::Voice(control) => {
-            send_command(commands, WorkerCommand::Voice(control))?;
+        components::RootEffect::Review { download_assets } => {
+            if context.review_controller.is_active() {
+                schedule(
+                    context.app.update(AppEvent::NotifyError {
+                        pane,
+                        error: "A review is already open.".to_owned(),
+                    }),
+                    context.scheduler,
+                );
+                return Ok(());
+            }
+
+            match crate::review::ReviewAssets::availability() {
+                Ok(crate::review::AssetAvailability::Ready(assets)) => {
+                    start_review(context, pane, Some(assets));
+                }
+                Ok(crate::review::AssetAvailability::DownloadRequired) if !download_assets => {
+                    schedule(
+                        context
+                            .app
+                            .update(AppEvent::ConfirmReviewDownload { pane }),
+                        context.scheduler,
+                    );
+                    return Ok(());
+                }
+                Ok(crate::review::AssetAvailability::DownloadRequired) => {
+                    start_review(context, pane, None);
+                }
+                Ok(crate::review::AssetAvailability::DevelopmentInstallRequired { path }) => {
+                    schedule(
+                        context.app.update(AppEvent::NotifyError {
+                            pane,
+                            error: format!(
+                                "You are running a development build of Nanocodex, which cannot download review assets automatically. Run `cd web/review && bun install --frozen-lockfile && just install-dev`, or set NANOCODEX_REVIEW_ASSETS to the absolute `web/review/dist` path. The development install path is {}.",
+                                path.display()
+                            ),
+                        }),
+                        context.scheduler,
+                    );
+                    return Ok(());
+                }
+                Err(error) => {
+                    schedule(
+                        context.app.update(AppEvent::NotifyError {
+                            pane,
+                            error: format!("Could not load review assets: {error}"),
+                        }),
+                        context.scheduler,
+                    );
+                    return Ok(());
+                }
+            }
+            schedule(
+                context.app.update(AppEvent::ReviewStarted(pane)),
+                context.scheduler,
+            );
         }
-        Submission::McpLogin(name) => {
-            send_command(commands, WorkerCommand::McpLogin { name })?;
+        components::RootEffect::ResumeSession(session_id) => {
+            *context.input = None;
+            let effort = context.config.agent().thinking();
+            let preferred_reasoning_mode = context.config.agent().reasoning_mode();
+            let fast_mode = context.config.agent().fast_mode();
+            let config = context.config.clone();
+            *context.resume_session_task = Some(tokio::spawn(async move {
+                let config_path = config.path().to_path_buf();
+                let checkpoint_session_id = session_id.clone();
+                let checkpoint = tokio::task::spawn_blocking(move || {
+                    session::load_checkpoint(&config_path, &checkpoint_session_id)
+                });
+                let transcript =
+                    session::load_transcript_async(config.path().to_path_buf(), session_id.clone());
+                let restored = async {
+                    let (snapshot, records) = tokio::join!(checkpoint, transcript);
+                    let snapshot = snapshot.map_err(RuntimeError::SessionTask)??;
+                    let records = records?;
+                    tokio::task::spawn_blocking(move || -> Result<_> {
+                    let reasoning_mode = session::reasoning_mode(&records);
+                    let projection = RootNode::project_session(effort, records);
+                    let configured = ConfiguredAgent::from_config_with_session(
+                        &config,
+                        effort,
+                        reasoning_mode,
+                        Some(&session_id),
+                        Some(snapshot),
+                    )?;
+                    Ok(RestoredSession {
+                        configured,
+                        projection,
+                        reasoning_mode,
+                    })
+                    })
+                    .await
+                    .map_err(RuntimeError::SessionTask)?
+                }
+                .await;
+                (
+                    pane,
+                    effort,
+                    preferred_reasoning_mode,
+                    fast_mode,
+                    restored,
+                )
+            }));
         }
-        Submission::McpReload(name) => {
-            send_command(commands, WorkerCommand::McpReload { name })?;
+        components::RootEffect::Copy(text) => match clipboard::copy_text(&text) {
+            Ok(()) => schedule(
+                context.app.update(AppEvent::NotifySuccess {
+                    pane,
+                    message: "Copied selection to clipboard.".to_owned(),
+                }),
+                context.scheduler,
+            ),
+            Err(native_error) => {
+                match context.terminal.copy_to_clipboard(&text) {
+                    Ok(()) => schedule(
+                        context.app.update(AppEvent::NotifySuccess {
+                            pane,
+                            message: "Sent selection to the terminal clipboard.".to_owned(),
+                        }),
+                        context.scheduler,
+                    ),
+                    Err(terminal_error) => schedule(
+                        context.app.update(AppEvent::NotifyError {
+                            pane,
+                            error: format!(
+                                "Could not copy selection: {native_error}; terminal fallback failed: {terminal_error}"
+                            ),
+                        }),
+                        context.scheduler,
+                    ),
+                }
+            }
+        },
+        components::RootEffect::Steer { id, prompt } => {
+            let runtime = context.panes.get_mut(&pane).expect("steer pane must exist");
+            let fallback_id = TurnId::new(runtime.next_turn);
+            runtime.next_turn = runtime.next_turn.saturating_add(1);
+            context
+                .commands
+                .send(WorkerCommand::Steer {
+                    pane,
+                    queue_id: id,
+                    fallback_id,
+                    prompt,
+                })
+                .map_err(|_| RuntimeError::AgentWorkerStopped)?;
         }
-        Submission::InvalidCommand(error) => app.push_active_error(error),
+        components::RootEffect::PersistSteer(text) => {
+            let runtime = context.panes.get_mut(&pane).expect("steer pane must exist");
+            let record = runtime
+                .journal_mut()?
+                .append_local(LocalEvent::UserSteered { text })?;
+            schedule(
+                context.app.update(AppEvent::Transcript { pane, record }),
+                context.scheduler,
+            );
+        }
+        components::RootEffect::CancelTurns => {
+            let runtime = context
+                .panes
+                .get(&pane)
+                .expect("cancelled pane must exist");
+            let subagents = runtime.subagent_control.clone();
+            let root_session_id = runtime.session_id.clone();
+            tokio::spawn(async move { subagents.cancel_all(&root_session_id).await });
+            context
+                .commands
+                .send(WorkerCommand::CancelAll(pane))
+                .map_err(|_| RuntimeError::AgentWorkerStopped)?;
+        }
+        components::RootEffect::CancelReview => {
+            context.review_controller.cancel();
+            schedule(
+                context.app.update(AppEvent::ReviewCancelled(pane)),
+                context.scheduler,
+            );
+        }
+        components::RootEffect::Fork
+        | components::RootEffect::SetTheme(_)
+        | components::RootEffect::Shutdown => {
+            unreachable!("application effects are handled before pane dispatch")
+        }
     }
     Ok(())
 }
 
-fn send_command(
-    commands: &mpsc::UnboundedSender<WorkerCommand>,
-    command: WorkerCommand,
+fn start_review(
+    context: &mut EffectContext<'_>,
+    pane: PaneId,
+    assets: Option<crate::review::ReviewAssets>,
+) {
+    let pane_generation = context
+        .panes
+        .get(&pane)
+        .expect("review pane must exist")
+        .generation;
+    let auxiliary_jobs = context.auxiliary_sender.clone();
+    let ready_updates = context.review_ready_sender.clone();
+    let workspace = context.workspace.to_path_buf();
+    context
+        .review_controller
+        .start(pane, pane_generation, move |identity, cancellation| {
+            spawn_review(
+                identity,
+                cancellation,
+                auxiliary_jobs,
+                ready_updates,
+                workspace,
+                assets,
+            )
+        });
+}
+
+fn spawn_review(
+    identity: ReviewIdentity,
+    cancellation: CancellationToken,
+    auxiliary_jobs: mpsc::UnboundedSender<AuxiliaryJobRequest>,
+    ready_updates: mpsc::UnboundedSender<ReviewReady>,
+    workspace: PathBuf,
+    assets: Option<crate::review::ReviewAssets>,
+) -> ReviewTask {
+    tokio::spawn(async move {
+        let result = async {
+            let assets = match assets {
+                Some(assets) => assets,
+                None => crate::review::ReviewAssets::download().await?,
+            };
+            let review_agent: crate::review::ReviewAgent = Arc::new(move |prompt, shutdown| {
+                let auxiliary_jobs = auxiliary_jobs.clone();
+                let cancellation = cancellation.clone();
+                Box::pin(async move {
+                    if cancellation.is_cancelled() || shutdown.is_cancelled() {
+                        return Err(crate::review::ReviewAgentError::Cancelled);
+                    }
+                    let (completion, result) = tokio::sync::oneshot::channel();
+                    auxiliary_jobs
+                        .send(AuxiliaryJobRequest {
+                            review: identity,
+                            prompt,
+                            shutdown,
+                            completion,
+                        })
+                        .map_err(|_| {
+                            crate::review::ReviewAgentError::Failed(
+                                "review agent worker stopped".to_owned(),
+                            )
+                        })?;
+                    match result.await.map_err(|_| {
+                        crate::review::ReviewAgentError::Failed(
+                            "review agent worker stopped".to_owned(),
+                        )
+                    })? {
+                        Ok(response) => Ok(response),
+                        Err(AuxiliaryError::Cancelled) => {
+                            Err(crate::review::ReviewAgentError::Cancelled)
+                        }
+                        Err(AuxiliaryError::Failed(error)) => {
+                            Err(crate::review::ReviewAgentError::Failed(error))
+                        }
+                    }
+                })
+            });
+            let handle =
+                crate::review::ReviewService::start(review_agent, &workspace, assets).await?;
+            drop(ready_updates.send(ReviewReady {
+                identity,
+                url: handle.url(),
+            }));
+            handle.wait().await
+        }
+        .await;
+        ReviewCompletion { identity, result }
+    })
+}
+
+fn is_web_link(destination: &str) -> bool {
+    destination.starts_with("https://") || destination.starts_with("http://")
+}
+
+fn local_link_path(destination: &str, workspace: &Path) -> PathBuf {
+    let destination = destination.strip_prefix("file://").unwrap_or(destination);
+    let destination = destination
+        .rsplit_once("#L")
+        .filter(|(_, line)| line.parse::<u32>().is_ok())
+        .map_or(destination, |(path, _)| path);
+    let destination = destination
+        .rsplit_once(':')
+        .filter(|(_, line)| line.parse::<u32>().is_ok())
+        .map_or(destination, |(path, _)| path);
+    let path = Path::new(destination);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace.join(path)
+    }
+}
+
+fn send_submission(
+    commands: &tokio::sync::mpsc::UnboundedSender<WorkerCommand>,
+    pane: PaneId,
+    shell_context: &mut Vec<String>,
+    submission: PendingSubmission,
 ) -> Result<()> {
     commands
-        .send(command)
-        .map_err(|_| eyre::eyre!("agent worker stopped"))
+        .send(WorkerCommand::Submit {
+            pane,
+            id: submission.id,
+            prompt: inject_shell_context(shell_context, submission.prompt),
+        })
+        .map_err(|_| RuntimeError::AgentWorkerStopped.into())
 }
 
-fn classify_submission(input: impl Into<SubmittedPrompt>) -> Submission {
-    let mut input = input.into();
-    let trimmed = input.display().trim();
-    if trimmed == "/btw" {
-        return Submission::Btw(None);
+fn inject_shell_context(contexts: &mut Vec<String>, prompt: Submission) -> Submission {
+    if contexts.is_empty() {
+        return prompt;
     }
-    if let Some(prompt) = trimmed.strip_prefix("/btw ") {
-        let prompt = prompt.trim();
-        if prompt.is_empty() {
-            return Submission::Btw(None);
-        }
-        input.set_display(prompt.to_owned());
-        return Submission::Btw(Some(input));
-    }
-    if trimmed == "/close" {
-        return Submission::CloseBtw;
-    }
-    if trimmed == "/cancel" {
-        return Submission::Cancel;
-    }
-    if trimmed == "/trace" {
-        return Submission::Trace;
-    }
-    if trimmed == "/voice" {
-        return Submission::Voice(VoiceControl::Toggle);
-    }
-    if let Some(argument) = trimmed.strip_prefix("/voice ") {
-        let argument = argument.trim();
-        return match argument {
-            "on" => Submission::Voice(VoiceControl::Start(None)),
-            "off" => Submission::Voice(VoiceControl::Stop),
-            "list" => Submission::Voice(VoiceControl::List),
-            _ if argument.split_whitespace().count() == 1 => match argument.parse() {
-                Ok(voice) => Submission::Voice(VoiceControl::Start(Some(voice))),
-                Err(_) => Submission::InvalidCommand(
-                    "Unknown voice. Use /voice list to see Codex voices.".to_owned(),
-                ),
-            },
-            _ => Submission::InvalidCommand("Usage: /voice [on|off|list|<voice>]".to_owned()),
-        };
-    }
-    if trimmed == "/fast" {
-        return Submission::Fast(None);
-    }
-    if let Some(argument) = trimmed.strip_prefix("/fast ") {
-        return match argument.trim() {
-            "on" => Submission::Fast(Some(true)),
-            "off" => Submission::Fast(Some(false)),
-            _ => Submission::InvalidCommand("Usage: /fast [on|off]".to_owned()),
-        };
-    }
-    if matches!(trimmed, "/model" | "/thinking") {
-        return Submission::ReasoningPicker;
-    }
-    if trimmed.starts_with("/model ") || trimmed.starts_with("/thinking ") {
-        return Submission::InvalidCommand("Usage: /model or /thinking".to_owned());
-    }
-    if let Some(name) = trimmed.strip_prefix("/mcp login ") {
-        let name = name.trim();
-        return if name.is_empty() || name.split_whitespace().count() != 1 {
-            Submission::InvalidCommand("Usage: /mcp login <server>".to_owned())
-        } else {
-            Submission::McpLogin(name.to_owned())
-        };
-    }
-    if let Some(name) = trimmed.strip_prefix("/mcp reload ") {
-        let name = name.trim();
-        return if name.is_empty() || name.split_whitespace().count() != 1 {
-            Submission::InvalidCommand("Usage: /mcp reload <server>".to_owned())
-        } else {
-            Submission::McpReload(name.to_owned())
-        };
-    }
-    if trimmed == "/mcp" || trimmed.starts_with("/mcp ") {
-        return Submission::InvalidCommand(
-            "Usage: /mcp login <server> or /mcp reload <server>".to_owned(),
-        );
-    }
-    Submission::Prompt(input)
+    let context = contexts.join("\n\n");
+    contexts.clear();
+    prompt.prepend_text(context)
 }
 
-fn active_session_id<'a>(app: &'a App, root_session_id: &'a str) -> Option<&'a str> {
-    match app.focus {
-        PaneId::Main => app.main_branch_request_id().or(Some(root_session_id)),
-        PaneId::Btw(id) => app
-            .btw
-            .as_ref()
-            .filter(|btw| btw.id == id)
-            .and_then(|btw| btw.request_id.as_deref()),
+fn is_image_paste(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key(key)
+            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                && key.code == KeyCode::Char('v')
+                && key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+    )
+}
+
+fn schedule(update: ComponentUpdate<AppEffect>, scheduler: &mut RenderScheduler) {
+    debug_assert!(update.effects.is_empty());
+    request_render(update.render, scheduler);
+}
+
+fn request_render(request: RenderRequest, scheduler: &mut RenderScheduler) {
+    let now = Instant::now();
+    match request {
+        RenderRequest::None => {}
+        RenderRequest::Streaming => scheduler.request_streaming(now),
+        RenderRequest::Immediate => scheduler.request_immediate(now),
     }
-}
-
-fn session_trace_url(base_url: &str, session_id: &str) -> Result<reqwest::Url> {
-    let base = reqwest::Url::parse(base_url).wrap_err("invalid Jaeger UI URL")?;
-    let mut url = base.join("search").wrap_err("invalid Jaeger search URL")?;
-    let tags = serde_json::json!({ "session.id": session_id }).to_string();
-    url.query_pairs_mut()
-        .append_pair("service", "nanocodex")
-        .append_pair("lookback", "1w")
-        .append_pair("limit", "1500")
-        .append_pair("tags", &tags);
-    Ok(url)
-}
-
-fn open_session_traces(session_id: &str) -> Result<()> {
-    let base_url =
-        std::env::var(JAEGER_UI_URL_ENV).unwrap_or_else(|_| DEFAULT_JAEGER_UI_URL.to_owned());
-    let url = session_trace_url(&base_url, session_id)?;
-    open_browser(url.as_str())
-}
-
-fn open_browser(url: &str) -> Result<()> {
-    let mut command = browser_command(url);
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .wrap_err("browser launcher failed")?;
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn browser_command(url: &str) -> Command {
-    let mut command = Command::new("open");
-    command.arg(url);
-    command
-}
-
-#[cfg(target_os = "windows")]
-fn browser_command(url: &str) -> Command {
-    let mut command = Command::new("cmd");
-    command.args(["/C", "start", "", url]);
-    command
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn browser_command(url: &str) -> Command {
-    let mut command = Command::new("xdg-open");
-    command.arg(url);
-    command
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        path::PathBuf,
-        sync::Arc,
-        time::{Duration, Instant},
-    };
-
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
-    use futures_util::{SinkExt, StreamExt};
-    use nanocodex::{
-        Nanocodex, OpenAi, Thinking, agent::events::AgentEventKind, oai::__private::EventSink,
-    };
-    use nanocodex_voice::RealtimeVoice;
-    use serde_json::{Value, json};
-    use tokio::{net::TcpListener, sync::mpsc, time::timeout};
-    use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
-
     use super::{
-        BTW_BOUNDARY, PaneId, RedrawPriority, Submission, TerminalAction, UiAction, UiModel,
-        UiUpdate, VoiceControl, WorkerCommand, WorkerEvent, active_session_id,
-        apply_main_agent_event_batch, classify_submission, handle_key, handle_worker_update,
-        paste_clipboard_image, prepare_btw_prompt, report_cancel_outcome, session_trace_url,
-        spawn_agent_worker,
+        MemoryCompletion, MemoryOperation, PaneGeneration, PaneSession, PaneSettings,
+        PendingSubmission, close_pane_journal, configured_memory_store, current_unix_ms,
+        is_image_paste, local_link_path, next_memory_generation, open_pane, run_memory_operation,
+        send_submission, subagent_pane, validate_interactive,
     };
-    use crate::tui::{
-        app::App,
-        scheduler::{RenderScheduler, STREAM_FRAME_INTERVAL},
-        telemetry::StreamTelemetry,
+    use crate::{
+        app::{
+            config::{Config, ConfigOverrides, ReasoningEffort, ReasoningMode},
+            error::{Error, RuntimeError},
+        },
+        core::extensions::{
+            memory::MemoryStore,
+            subagents::{AgentId, AgentStatus, AgentUpdate},
+        },
+        tui::{
+            pane::PaneId,
+            subagent_updates::ForwardedSubagentUpdate,
+            transcript::{LocalEvent, TurnId, load},
+            worker::WorkerCommand,
+        },
     };
+    use std::{collections::HashMap, fs, path::Path, sync::Arc};
+    use tempfile::tempdir;
 
-    fn mouse_scroll(kind: MouseEventKind) -> Event {
-        Event::Mouse(MouseEvent {
-            kind,
-            column: 0,
-            row: 0,
-            modifiers: KeyModifiers::NONE,
-        })
+    #[test]
+    fn control_or_super_v_requests_an_image_paste() {
+        use tact_crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        assert!(is_image_paste(&Event::Key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL,
+        ))));
+        assert!(is_image_paste(&Event::Key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::SUPER,
+        ))));
+        assert!(!is_image_paste(&Event::Key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::NONE,
+        ))));
     }
 
     #[test]
-    fn parses_tui_commands_without_capturing_similar_prompts() {
+    fn local_links_resolve_against_the_workspace_and_ignore_line_suffixes() {
+        let workspace = Path::new("/work/project");
+
         assert_eq!(
-            classify_submission("/btw".to_owned()),
-            Submission::Btw(None)
+            local_link_path("src/main.rs:42", workspace),
+            workspace.join("src/main.rs")
         );
         assert_eq!(
-            classify_submission(" /btw   inspect the cache  ".to_owned()),
-            Submission::Btw(Some("inspect the cache".into()))
-        );
-        assert_eq!(
-            classify_submission("/close".to_owned()),
-            Submission::CloseBtw
-        );
-        assert_eq!(
-            classify_submission("/cancel".to_owned()),
-            Submission::Cancel
-        );
-        assert_eq!(
-            classify_submission(" /trace ".to_owned()),
-            Submission::Trace
-        );
-        assert_eq!(
-            classify_submission(" /voice "),
-            Submission::Voice(VoiceControl::Toggle)
-        );
-        assert_eq!(
-            classify_submission("/voice marin"),
-            Submission::Voice(VoiceControl::Start(Some(RealtimeVoice::Marin)))
-        );
-        assert_eq!(
-            classify_submission("/voice cove"),
-            Submission::Voice(VoiceControl::Start(Some(RealtimeVoice::Cove)))
-        );
-        assert_eq!(
-            classify_submission("/voice list"),
-            Submission::Voice(VoiceControl::List)
-        );
-        assert_eq!(
-            classify_submission("/voice junk"),
-            Submission::InvalidCommand(
-                "Unknown voice. Use /voice list to see Codex voices.".to_owned()
-            )
-        );
-        assert_eq!(classify_submission("/fast"), Submission::Fast(None));
-        assert_eq!(
-            classify_submission(" /fast on "),
-            Submission::Fast(Some(true))
-        );
-        assert_eq!(
-            classify_submission("/fast off"),
-            Submission::Fast(Some(false))
-        );
-        assert_eq!(
-            classify_submission("/fast turbo"),
-            Submission::InvalidCommand("Usage: /fast [on|off]".to_owned())
-        );
-        assert_eq!(classify_submission("/model"), Submission::ReasoningPicker);
-        assert_eq!(
-            classify_submission(" /thinking "),
-            Submission::ReasoningPicker
-        );
-        assert_eq!(
-            classify_submission("/thinking high"),
-            Submission::InvalidCommand("Usage: /model or /thinking".to_owned())
-        );
-        assert_eq!(
-            classify_submission(" /mcp login centaur-tempo "),
-            Submission::McpLogin("centaur-tempo".to_owned())
-        );
-        assert_eq!(
-            classify_submission("/mcp reload centaur-paradigm"),
-            Submission::McpReload("centaur-paradigm".to_owned())
-        );
-        assert_eq!(
-            classify_submission("/mcp login"),
-            Submission::InvalidCommand(
-                "Usage: /mcp login <server> or /mcp reload <server>".to_owned()
-            )
-        );
-        assert_eq!(
-            classify_submission("/btw-not-a-command".to_owned()),
-            Submission::Prompt("/btw-not-a-command".into())
-        );
-        assert_eq!(
-            classify_submission("/trace-this".to_owned()),
-            Submission::Prompt("/trace-this".into())
-        );
-        assert_eq!(
-            classify_submission("/fastest"),
-            Submission::Prompt("/fastest".into())
-        );
-        assert_eq!(
-            classify_submission("/modeling"),
-            Submission::Prompt("/modeling".into())
+            local_link_path("file:///tmp/example.rs#L7", workspace),
+            Path::new("/tmp/example.rs")
         );
     }
 
     #[test]
-    fn reasoning_picker_changes_subsequent_turn_effort() {
-        let (commands, mut worker) = mpsc::unbounded_channel();
-        let mut app = App::new("/workspace".into());
-        app.open_reasoning_picker();
+    fn bare_non_tty_invocation_points_to_headless_run() {
+        let error = validate_interactive(false, true).unwrap_err();
 
-        handle_key(
-            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
-            &mut app,
-            "main-session",
-            &commands,
-        )
-        .unwrap();
-        handle_key(
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &mut app,
-            "main-session",
-            &commands,
-        )
-        .unwrap();
-
-        assert!(app.reasoning_picker().is_none());
         assert!(matches!(
-            worker.try_recv(),
-            Ok(WorkerCommand::SetThinking {
-                thinking: Thinking::Medium
-            })
+            error,
+            Error::Runtime(RuntimeError::InteractiveTerminal)
         ));
-        assert_eq!(app.thinking(), Thinking::High);
-
-        handle_worker_update(
-            &mut app,
-            WorkerEvent::ThinkingChanged {
-                thinking: Thinking::Medium,
-            },
-            &commands,
-        )
-        .unwrap();
-        assert_eq!(app.thinking(), Thinking::Medium);
+        assert!(error.to_string().contains("nanocodex run <PROMPT>"));
     }
 
     #[test]
-    fn clipboard_image_paste_attaches_the_materialized_image() {
-        let mut app = App::new("/workspace".into());
-        let path = PathBuf::from("/tmp/copied-image.png");
+    fn submission_consumes_pending_shell_context_before_reaching_the_worker() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut context = vec!["<local_shell_result>done</local_shell_result>".to_owned()];
 
-        paste_clipboard_image(&mut app, || Ok(path.clone()));
+        send_submission(
+            &sender,
+            PaneId::Main,
+            &mut context,
+            PendingSubmission {
+                id: TurnId::new(3),
+                prompt: "explain it".to_owned().into(),
+            },
+        )
+        .unwrap();
 
-        assert_eq!(app.input, "[Image #1] ");
-        let submission = app.take_submission().unwrap();
-        let nanocodex::agent::input::PromptInput::Content(content) =
-            submission.into_prompt().instruction
+        assert!(context.is_empty());
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(WorkerCommand::Submit { pane: PaneId::Main, id, prompt })
+                if id == TurnId::new(3)
+                    && prompt.display_text()
+                        == "<local_shell_result>done</local_shell_result>\n\nexplain it"
+        ));
+    }
+
+    #[test]
+    fn disabled_memory_does_not_construct_or_open_the_database() {
+        let directory = tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        fs::write(&config_path, "").unwrap();
+        let config = Config::load(ConfigOverrides {
+            path: Some(config_path),
+            workspace: Some(directory.path().to_path_buf()),
+            ..ConfigOverrides::default()
+        })
+        .unwrap();
+        let memory_path = config.memory_path();
+
+        assert!(configured_memory_store(&config).is_none());
+        assert!(!memory_path.exists());
+    }
+
+    #[test]
+    fn enabled_memory_constructs_the_global_store_without_eagerly_opening_it() {
+        let directory = tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        fs::write(&config_path, "[memory]\nenabled = true\n").unwrap();
+        let config = Config::load(ConfigOverrides {
+            path: Some(config_path),
+            workspace: Some(directory.path().to_path_buf()),
+            ..ConfigOverrides::default()
+        })
+        .unwrap();
+        let memory_path = config.memory_path();
+
+        assert!(configured_memory_store(&config).is_some());
+        assert!(!memory_path.exists());
+    }
+
+    #[test]
+    fn memory_list_inspection_does_not_change_use_telemetry() {
+        let directory = tempdir().unwrap();
+        let store = MemoryStore::new(directory.path().join("memory.sqlite3"));
+        let now_ms = current_unix_ms();
+        store.put("inspect without using", None, now_ms).unwrap();
+
+        let MemoryCompletion::Listed {
+            pane: PaneId::Fork(4),
+            result: Ok(records),
+            ..
+        } = run_memory_operation(PaneId::Fork(4), 1, &store, MemoryOperation::List)
         else {
-            panic!("clipboard image should produce typed content");
+            panic!("list should complete for the originating pane");
         };
-        assert!(matches!(
-            &content[0],
-            nanocodex::agent::input::UserInput::LocalImage {
-                path: submitted_path,
-                detail: None,
-            } if submitted_path == &path
-        ));
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].scan_count, 0);
+        assert_eq!(records[0].last_scanned_at_ms, None);
+        assert_eq!(records[0].use_count, 0);
+        assert_eq!(records[0].last_used_at_ms, None);
     }
 
     #[test]
-    fn control_end_jumps_the_focused_transcript_to_the_tail() {
-        let (commands, _worker) = mpsc::unbounded_channel();
-        let mut app = App::new("/workspace".into());
-        let btw_id = app.begin_btw();
-        app.main.scroll_from_bottom = 11;
-        app.main.has_unseen_output = true;
-        app.btw.as_mut().unwrap().conversation.scroll_from_bottom = 8;
-        app.btw.as_mut().unwrap().conversation.has_unseen_output = true;
+    fn newer_memory_operations_supersede_older_pane_completions() {
+        let mut generations = HashMap::new();
 
-        let key = KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL);
-        assert_eq!(
-            handle_key(key, &mut app, "main-session", &commands).unwrap(),
-            TerminalAction::Redraw
-        );
-
-        assert_eq!(app.main.scroll_from_bottom, 11);
-        assert!(app.main.has_unseen_output);
-        let btw = &app.btw.as_ref().unwrap().conversation;
-        assert_eq!(btw.scroll_from_bottom, 0);
-        assert!(!btw.has_unseen_output);
-        assert_eq!(app.focus, PaneId::Btw(btw_id));
+        assert_eq!(next_memory_generation(&mut generations, PaneId::Main), 1);
+        assert_eq!(next_memory_generation(&mut generations, PaneId::Fork(1)), 1);
+        assert_eq!(next_memory_generation(&mut generations, PaneId::Main), 2);
+        assert_eq!(generations[&PaneId::Main], 2);
     }
 
     #[test]
-    fn jaeger_search_targets_the_focused_session_and_encodes_its_tag() {
-        let mut app = App::new("/workspace".into());
-        assert_eq!(
-            active_session_id(&app, "main-session"),
-            Some("main-session")
-        );
-
-        let btw_id = app.begin_btw();
-        assert_eq!(active_session_id(&app, "main-session"), None);
-        app.btw_opened(btw_id, std::sync::Arc::from("btw session/&"));
-        let session_id = active_session_id(&app, "main-session").unwrap();
-        assert_eq!(session_id, "btw session/&");
-
-        let url = session_trace_url("http://127.0.0.1:16686", session_id).unwrap();
-        assert_eq!(url.path(), "/search");
-        let query = url
-            .query_pairs()
-            .collect::<std::collections::HashMap<_, _>>();
-        assert_eq!(query.get("service").map(AsRef::as_ref), Some("nanocodex"));
-        assert_eq!(query.get("lookback").map(AsRef::as_ref), Some("1w"));
-        assert_eq!(query.get("limit").map(AsRef::as_ref), Some("1500"));
-        assert_eq!(
-            query.get("tags").map(AsRef::as_ref),
-            Some(r#"{"session.id":"btw session/&"}"#)
-        );
-    }
-
-    #[test]
-    fn side_boundary_wraps_only_the_first_btw_prompt() {
-        let mut first = true;
-        assert_eq!(
-            prepare_btw_prompt(&mut first, "first".into()).display(),
-            format!("{BTW_BOUNDARY}first")
-        );
-        assert_eq!(
-            prepare_btw_prompt(&mut first, "follow-up".into()).display(),
-            "follow-up"
-        );
-    }
-
-    #[test]
-    fn all_event_sources_cross_the_ui_action_boundary() {
-        let (commands, _worker) = mpsc::unbounded_channel();
-        let mut ui = UiModel::new(
-            App::new("/workspace".into()),
-            std::sync::Arc::from("main-session"),
-        );
-
-        assert_eq!(
-            ui.update(UiAction::Terminal(Event::Resize(100, 40)), &commands)
-                .unwrap(),
-            UiUpdate::Redraw(RedrawPriority::Immediate)
-        );
-        assert_eq!(
-            ui.update(UiAction::Tick, &commands).unwrap(),
-            UiUpdate::RedrawAnimation
-        );
-        assert_eq!(
-            ui.update(UiAction::WorkerStopped, &commands).unwrap(),
-            UiUpdate::Redraw(RedrawPriority::Streaming)
-        );
-        assert!(!ui.worker_updates_open);
-    }
-
-    #[test]
-    fn main_event_batches_apply_assistant_deltas_individually() {
-        let (events, mut agent_events) = EventSink::channel("test".to_owned());
-        events
-            .emit(
-                AgentEventKind::AssistantDelta,
-                json!({"model_call_index": 0, "text": "A"}),
-            )
-            .unwrap();
-        events.emit(AgentEventKind::ApiEvent, json!({})).unwrap();
-        events
-            .emit(
-                AgentEventKind::AssistantDelta,
-                json!({"model_call_index": 0, "text": "B"}),
-            )
-            .unwrap();
-        events
-            .emit(
-                AgentEventKind::ReasoningSummaryDelta,
-                json!({"model_call_index": 0, "text": "reasoning"}),
-            )
-            .unwrap();
-        events
-            .emit(
-                AgentEventKind::AssistantDelta,
-                json!({"model_call_index": 0, "text": "C"}),
-            )
-            .unwrap();
-        events
-            .emit(AgentEventKind::AssistantDelta, json!({"malformed": true}))
-            .unwrap();
-        events
-            .emit(
-                AgentEventKind::AssistantDelta,
-                json!({"model_call_index": 0, "text": "D"}),
-            )
+    fn stale_human_delete_is_reported_to_the_originating_pane() {
+        let directory = tempdir().unwrap();
+        let store = MemoryStore::new(directory.path().join("memory.sqlite3"));
+        let now_ms = current_unix_ms();
+        let original = store.put("old value", None, now_ms).unwrap();
+        store
+            .put("new value", Some(original.key), now_ms.saturating_add(1))
             .unwrap();
 
-        let (commands, _worker) = mpsc::unbounded_channel();
-        let mut ui = UiModel::new(App::new("/workspace".into()), Arc::from("main-session"));
-        let mut telemetry = StreamTelemetry::default();
-        let now = Instant::now();
-        let mut scheduler = RenderScheduler::new(Duration::from_secs(1), now);
-        scheduler.presented(now);
-        let first = agent_events.try_recv_timed();
-
-        assert!(
-            !apply_main_agent_event_batch(
-                &mut ui,
-                &commands,
-                &mut telemetry,
-                &mut scheduler,
-                &mut agent_events,
-                first,
-            )
-            .unwrap()
-        );
-        assert_eq!(ui.app.main.transcript.assistant_sources(), ["AB", "CD"]);
-        assert!(agent_events.try_recv_timed().is_none());
-    }
-
-    #[test]
-    fn due_streaming_frame_stops_before_later_output_and_completion() {
-        let (events, mut agent_events) = EventSink::channel("test".to_owned());
-        events.emit(AgentEventKind::ApiEvent, json!({})).unwrap();
-        events
-            .emit(
-                AgentEventKind::ReasoningSummaryDelta,
-                json!({"model_call_index": 0, "text": "Inspecting"}),
-            )
-            .unwrap();
-        events.emit(AgentEventKind::ApiEvent, json!({})).unwrap();
-        events
-            .emit(
-                AgentEventKind::AssistantDelta,
-                json!({"model_call_index": 0, "text": "Answer"}),
-            )
-            .unwrap();
-        events
-            .emit(AgentEventKind::RunCompleted, json!({}))
-            .unwrap();
-
-        let (commands, _worker) = mpsc::unbounded_channel();
-        let mut ui = UiModel::new(App::new("/workspace".into()), Arc::from("main-session"));
-        let mut telemetry = StreamTelemetry::default();
-        let now = Instant::now();
-        let mut scheduler = RenderScheduler::new(STREAM_FRAME_INTERVAL, now);
-        scheduler.presented(now - STREAM_FRAME_INTERVAL);
-        let first = agent_events.try_recv_timed();
-
-        assert!(
-            !apply_main_agent_event_batch(
-                &mut ui,
-                &commands,
-                &mut telemetry,
-                &mut scheduler,
-                &mut agent_events,
-                first,
-            )
-            .unwrap()
-        );
-
-        assert!(scheduler.is_due(Instant::now()));
-        assert_eq!(ui.app.main.status, "Thinking...");
-        assert_eq!(ui.app.main.transcript.assistant_sources(), [] as [&str; 0]);
-        assert!(agent_events.try_recv_timed().is_some());
-    }
-
-    #[test]
-    fn reversing_a_queued_mouse_scroll_discards_the_previous_direction() {
-        let (commands, _worker) = mpsc::unbounded_channel();
-        let mut app = App::new("/workspace".into());
-        app.main.scroll_from_bottom = 15;
-        let mut ui = UiModel::new(app, std::sync::Arc::from("main-session"));
-
-        for _ in 0..4 {
-            assert_eq!(
-                ui.update(
-                    UiAction::Terminal(mouse_scroll(MouseEventKind::ScrollUp)),
-                    &commands,
-                )
-                .unwrap(),
-                UiUpdate::Redraw(RedrawPriority::InputBurst)
-            );
-        }
-        assert_eq!(ui.app.main.scroll_from_bottom, 15);
-
-        ui.update(
-            UiAction::Terminal(mouse_scroll(MouseEventKind::ScrollDown)),
-            &commands,
-        )
-        .unwrap();
-        ui.apply_pending_mouse_scroll();
-
-        assert_eq!(
-            ui.app.main.scroll_from_bottom, 12,
-            "the reverse tick should replace, not unwind, the queued upward ticks",
-        );
-        assert!(ui.pending_mouse_scroll.is_none());
-    }
-
-    #[test]
-    fn same_direction_mouse_scrolls_accumulate_until_the_frame() {
-        let (commands, _worker) = mpsc::unbounded_channel();
-        let mut ui = UiModel::new(
-            App::new("/workspace".into()),
-            std::sync::Arc::from("main-session"),
-        );
-
-        for _ in 0..3 {
-            ui.update(
-                UiAction::Terminal(mouse_scroll(MouseEventKind::ScrollUp)),
-                &commands,
-            )
-            .unwrap();
-        }
-        ui.apply_pending_mouse_scroll();
-
-        assert_eq!(ui.app.main.scroll_from_bottom, 9);
-    }
-
-    #[test]
-    fn focus_gain_redraws_and_clears_an_unfocused_completion_notification() {
-        let (commands, _worker) = mpsc::unbounded_channel();
-        let mut ui = UiModel::new(
-            App::new("/workspace".into()),
-            std::sync::Arc::from("main-session"),
-        );
-        ui.app.input = "unfinished draft".to_owned();
-        ui.app.cursor = ui.app.input.len();
-
-        ui.update(UiAction::Terminal(Event::FocusLost), &commands)
-            .unwrap();
-        ui.update(
-            UiAction::Worker(WorkerEvent::TurnFinished {
-                target: PaneId::Main,
-                main_branch_id: Some(0),
-                error: None,
-            }),
-            &commands,
-        )
-        .unwrap();
-        assert_eq!(
-            ui.pending_notification.as_deref(),
-            Some("Nanocodex finished")
-        );
-
-        assert_eq!(
-            ui.update(UiAction::Terminal(Event::FocusGained), &commands)
-                .unwrap(),
-            UiUpdate::RestoreTerminalGraphics
-        );
-        assert!(ui.pending_notification.is_none());
-        assert_eq!(ui.app.input, "unfinished draft");
-        assert_eq!(ui.app.cursor, ui.app.input.len());
-        ui.update(
-            UiAction::Worker(WorkerEvent::TurnFinished {
-                target: PaneId::Main,
-                main_branch_id: Some(0),
-                error: None,
-            }),
-            &commands,
-        )
-        .unwrap();
-        assert!(ui.pending_notification.is_none());
-    }
-
-    #[tokio::test]
-    async fn rejected_turns_do_not_stop_the_tui_worker() -> eyre::Result<()> {
-        let openai = OpenAi::builder("test-key")
-            .websocket_url("ws://127.0.0.1:1")
-            .build()?;
-        let session_id = nanocodex::agent::session::SessionId::new();
-        let (agent, events) = Nanocodex::builder(openai).session_id(session_id).build()?;
-        agent.shutdown().await?;
-        drop(events);
-
-        let (commands, worker_rx) = mpsc::unbounded_channel();
-        let (updates, mut update_rx) = mpsc::unbounded_channel();
-        let worker = spawn_agent_worker(
-            agent,
-            Arc::from(session_id.to_string()),
-            None,
-            None,
-            worker_rx,
-            updates,
-        );
-
-        for prompt_id in 1..=2 {
-            commands.send(WorkerCommand::Prompt {
-                target: PaneId::Main,
-                prompt_id,
-                prompt: format!("rejected prompt {prompt_id}").into(),
-            })?;
-            timeout(Duration::from_secs(5), async {
-                loop {
-                    let update = update_rx
-                        .recv()
-                        .await
-                        .ok_or_else(|| eyre::eyre!("TUI worker stopped after a rejected turn"))?;
-                    if let WorkerEvent::TurnFinished {
-                        target: PaneId::Main,
-                        main_branch_id: Some(0),
-                        error: Some(error),
-                    } = update
-                    {
-                        assert!(error.contains("agent stopped"));
-                        return Ok::<(), eyre::Report>(());
-                    }
-                }
-            })
-            .await??;
-        }
-
-        drop(commands);
-        worker.await?;
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_lines)]
-    #[tokio::test]
-    async fn tui_worker_steer_becomes_a_user_item_at_the_next_model_boundary() -> eyre::Result<()> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let endpoint = format!("ws://{}", listener.local_addr()?);
-        let (first_seen, first_seen_rx) = tokio::sync::oneshot::channel();
-        let (release_first, release_first_rx) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await?;
-            let mut socket = accept_async(stream).await?;
-            let warmup = next_ws_json(&mut socket).await?;
-            assert_eq!(warmup["generate"], false);
-            send_ws_json(
-                &mut socket,
-                json!({
-                    "type": "response.completed",
-                    "response": { "id": "resp-warmup", "usage": null }
-                }),
-            )
-            .await?;
-
-            let initial = next_ws_json(&mut socket).await?;
-            assert_eq!(initial["previous_response_id"], "resp-warmup");
-            assert!(initial.to_string().contains("initial task"));
-            first_seen
-                .send(())
-                .map_err(|()| eyre::eyre!("initial request signal receiver dropped"))?;
-            release_first_rx
-                .await
-                .map_err(|_| eyre::eyre!("initial request release sender dropped"))?;
-            send_completed(&mut socket, "resp-initial", "initial draft").await?;
-
-            let steered = next_ws_json(&mut socket).await?;
-            assert_eq!(steered["previous_response_id"], "resp-initial");
-            assert_eq!(steered["input"].as_array().map(Vec::len), Some(1));
-            assert_eq!(steered["input"][0]["role"], "user");
-            assert_eq!(
-                steered["input"][0]["content"][0]["text"],
-                "steering correction"
-            );
-            send_completed(&mut socket, "resp-steered", "steered answer").await
-        });
-
-        let workspace = temporary_workspace("tui-steer")?;
-        let openai = OpenAi::builder("test-key")
-            .websocket_url(endpoint)
-            .build()?;
-        let session_id = nanocodex::agent::session::SessionId::new();
-        let (agent, mut events) = Nanocodex::builder(openai)
-            .instructions("Apply steering at the next safe model boundary.")
-            .thinking(Thinking::Low)
-            .workspace(&workspace)
-            .session_id(session_id)
-            .build()?;
-        let (commands, worker_rx) = mpsc::unbounded_channel();
-        let (updates, mut update_rx) = mpsc::unbounded_channel();
-        spawn_agent_worker(
-            agent,
-            std::sync::Arc::from(session_id.to_string()),
-            None,
-            None,
-            worker_rx,
-            updates,
-        );
-
-        commands.send(WorkerCommand::Prompt {
-            target: PaneId::Main,
-            prompt_id: 1,
-            prompt: "initial task".into(),
-        })?;
-        first_seen_rx.await?;
-        commands.send(WorkerCommand::Steer {
-            target: PaneId::Main,
-            id: 7,
-            prompt: "steering correction".into(),
-        })?;
-        timeout(Duration::from_secs(5), async {
-            loop {
-                if matches!(
-                    update_rx.recv().await,
-                    Some(WorkerEvent::SteerAdmitted {
-                        target: PaneId::Main,
-                        id: 7
-                    })
-                ) {
-                    break;
-                }
-            }
-        })
-        .await
-        .map_err(|_| eyre::eyre!("TUI worker did not acknowledge the steer"))?;
-        release_first
-            .send(())
-            .map_err(|()| eyre::eyre!("initial request release receiver dropped"))?;
-
-        timeout(Duration::from_secs(5), async {
-            loop {
-                let event = events
-                    .recv()
-                    .await
-                    .ok_or_else(|| eyre::eyre!("agent events closed before run.steered"))?;
-                if event.kind == nanocodex::agent::events::AgentEventKind::RunSteered {
-                    return eyre::Result::<()>::Ok(());
-                }
-            }
-        })
-        .await
-        .map_err(|_| eyre::eyre!("steer did not reach the model boundary"))??;
-        timeout(Duration::from_secs(5), server)
-            .await
-            .map_err(|_| eyre::eyre!("mock Responses server did not finish"))???;
-        drop(commands);
-        std::fs::remove_dir_all(workspace)?;
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_lines)]
-    #[tokio::test]
-    async fn historical_edit_cancels_the_active_turn_and_keeps_the_parent_branch()
-    -> eyre::Result<()> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let endpoint = format!("ws://{}", listener.local_addr()?);
-        let (second_seen, second_seen_rx) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await?;
-            let mut root = accept_async(stream).await?;
-            let warmup = next_ws_json(&mut root).await?;
-            assert_eq!(warmup["generate"], false);
-            send_ws_json(
-                &mut root,
-                json!({
-                    "type": "response.completed",
-                    "response": { "id": "resp-warmup", "usage": null }
-                }),
-            )
-            .await?;
-
-            let first = next_ws_json(&mut root).await?;
-            assert!(first.to_string().contains("first prompt"));
-            send_completed(&mut root, "resp-first", "first answer").await?;
-            let second = next_ws_json(&mut root).await?;
-            assert_eq!(second["previous_response_id"], "resp-first");
-            assert!(second.to_string().contains("second prompt"));
-            second_seen
-                .send(())
-                .map_err(|()| eyre::eyre!("second-request signal receiver dropped"))?;
-
-            let (stream, _) = listener.accept().await?;
-            let mut branch = accept_async(stream).await?;
-            let edited = next_ws_json(&mut branch).await?;
-            assert_eq!(edited["previous_response_id"], "resp-first");
-            assert_eq!(edited["input"].as_array().map(Vec::len), Some(1));
-            assert_eq!(
-                edited["input"][0]["content"][0]["text"],
-                "revised second prompt"
-            );
-            send_completed(&mut branch, "resp-edited", "edited answer").await?;
-            Ok::<_, eyre::Report>(())
-        });
-
-        let workspace = temporary_workspace("tui-historical-edit")?;
-        let openai = OpenAi::builder("test-key")
-            .websocket_url(endpoint)
-            .store(true)
-            .build()?;
-        let session_id = nanocodex::agent::session::SessionId::new();
-        let (agent, mut events) = Nanocodex::builder(openai)
-            .instructions("Preserve committed history when editing a prior turn.")
-            .thinking(Thinking::Low)
-            .workspace(&workspace)
-            .session_id(session_id)
-            .build()?;
-        let event_drain = tokio::spawn(async move { while events.recv().await.is_some() {} });
-        let (commands, worker_rx) = mpsc::unbounded_channel();
-        let (updates, mut update_rx) = mpsc::unbounded_channel();
-        spawn_agent_worker(
-            agent,
-            std::sync::Arc::from(session_id.to_string()),
-            None,
-            None,
-            worker_rx,
-            updates,
-        );
-
-        commands.send(WorkerCommand::Prompt {
-            target: PaneId::Main,
-            prompt_id: 1,
-            prompt: "first prompt".into(),
-        })?;
-        timeout(Duration::from_secs(5), async {
-            loop {
-                if matches!(
-                    update_rx.recv().await,
-                    Some(WorkerEvent::TurnFinished {
-                        target: PaneId::Main,
-                        main_branch_id: Some(0),
-                        error: None,
-                    })
-                ) {
-                    break;
-                }
-            }
-        })
-        .await
-        .map_err(|_| eyre::eyre!("first root turn did not finish"))?;
-
-        commands.send(WorkerCommand::Prompt {
-            target: PaneId::Main,
-            prompt_id: 2,
-            prompt: "second prompt".into(),
-        })?;
-        timeout(Duration::from_secs(5), second_seen_rx)
-            .await
-            .map_err(|_| eyre::eyre!("second root turn did not start"))??;
-
-        commands.send(WorkerCommand::EditHistorical {
-            source_branch_id: 0,
-            new_branch_id: 1,
-            prompt_id: 2,
-        })?;
-        timeout(Duration::from_secs(5), async {
-            let mut cancellation_accepted = false;
-            let mut branch_opened = false;
-            loop {
-                match update_rx.recv().await {
-                    Some(WorkerEvent::CancelAccepted {
-                        target: PaneId::Main,
-                    }) => cancellation_accepted = true,
-                    Some(WorkerEvent::MainBranchOpened {
-                        id: 1,
-                        parent_id: 0,
-                        prompt_id: 2,
-                        ..
-                    }) => branch_opened = true,
-                    _ => {}
-                }
-                if cancellation_accepted && branch_opened {
-                    break;
-                }
-            }
-        })
-        .await
-        .map_err(|_| eyre::eyre!("historical branch did not open"))?;
-
-        commands.send(WorkerCommand::Prompt {
-            target: PaneId::Main,
-            prompt_id: 3,
-            prompt: "revised second prompt".into(),
-        })?;
-        timeout(Duration::from_secs(5), async {
-            let mut parent_finished = false;
-            let mut branch_finished = false;
-            loop {
-                match update_rx.recv().await {
-                    Some(WorkerEvent::TurnFinished {
-                        target: PaneId::Main,
-                        main_branch_id: Some(0),
-                        error: None,
-                    }) => parent_finished = true,
-                    Some(WorkerEvent::TurnFinished {
-                        target: PaneId::Main,
-                        main_branch_id: Some(1),
-                        error: None,
-                    }) => branch_finished = true,
-                    _ => {}
-                }
-                if parent_finished && branch_finished {
-                    break;
-                }
-            }
-        })
-        .await
-        .map_err(|_| eyre::eyre!("parent cancellation or edited branch did not finish"))?;
-
-        commands.send(WorkerCommand::SwitchMainBranch { id: 0 })?;
-        timeout(Duration::from_secs(5), async {
-            loop {
-                if matches!(
-                    update_rx.recv().await,
-                    Some(WorkerEvent::MainBranchSwitched { id: 0, .. })
-                ) {
-                    break;
-                }
-            }
-        })
-        .await
-        .map_err(|_| eyre::eyre!("parent branch was not retained"))?;
-
-        drop(commands);
-        timeout(Duration::from_secs(5), server)
-            .await
-            .map_err(|_| eyre::eyre!("mock Responses server did not finish"))???;
-        event_drain.abort();
-        std::fs::remove_dir_all(workspace)?;
-        Ok(())
-    }
-
-    #[test]
-    fn second_escape_sends_cancel_for_the_focused_turn() {
-        let (commands, mut worker) = mpsc::unbounded_channel();
-        let mut app = App::new("/workspace".into());
-        app.main.running = true;
-        app.input = "preserved draft".to_owned();
-        app.cursor = app.input.len();
-        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-
-        assert_eq!(
-            handle_key(escape, &mut app, "main-session", &commands).unwrap(),
-            TerminalAction::Redraw
-        );
-        assert!(worker.try_recv().is_err());
-        assert_eq!(
-            handle_key(escape, &mut app, "main-session", &commands).unwrap(),
-            TerminalAction::Redraw
-        );
-        assert!(matches!(
-            worker.try_recv(),
-            Ok(WorkerCommand::Cancel {
-                target: super::PaneId::Main
-            })
-        ));
-        assert_eq!(app.input, "preserved draft");
-    }
-
-    #[test]
-    fn already_settled_cancel_is_quiet() -> eyre::Result<()> {
-        let (updates, mut update_rx) = mpsc::unbounded_channel();
-        assert!(!report_cancel_outcome(Ok(false), PaneId::Main, &updates));
-        assert!(matches!(
-            update_rx.try_recv(),
-            Ok(WorkerEvent::CancelSettled {
-                target: PaneId::Main
-            })
-        ));
-
-        let (commands, _) = mpsc::unbounded_channel();
-        let mut app = App::new("/workspace".into());
-        app.cancel_pending(PaneId::Main);
-        handle_worker_update(
-            &mut app,
-            WorkerEvent::CancelSettled {
-                target: PaneId::Main,
-            },
-            &commands,
-        )?;
-        assert_eq!(app.main.status, "Ready");
-        assert!(app.main.transcript.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn first_escape_interrupts_and_resubmits_pending_steers() {
-        let (commands, mut worker) = mpsc::unbounded_channel();
-        let mut app = App::new("/workspace".into());
-        app.main.running = true;
-        app.input = "preserved draft".to_owned();
-        app.cursor = app.input.len();
-        let first = app
-            .queue_steer(PaneId::Main, "first correction".to_owned())
-            .unwrap();
-        let second = app
-            .queue_steer(PaneId::Main, "second correction".to_owned())
-            .unwrap();
-
-        assert_eq!(
-            handle_key(
-                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-                &mut app,
-                "main-session",
-                &commands,
-            )
-            .unwrap(),
-            TerminalAction::Redraw
+        let completion = run_memory_operation(
+            PaneId::Fork(9),
+            1,
+            &store,
+            MemoryOperation::Delete(original.key),
         );
 
         assert!(matches!(
-            worker.try_recv(),
-            Ok(WorkerCommand::InterruptForSteers {
-                target: PaneId::Main,
-                steer_ids,
-                prompt,
+            completion,
+            MemoryCompletion::Deleted {
+                pane: PaneId::Fork(9),
+                id,
+                conflict: true,
+                result: Err(error),
                 ..
-            }) if steer_ids == vec![first, second]
-                && prompt.display() == "first correction\nsecond correction"
-        ));
-        assert_eq!(app.input, "preserved draft");
-        assert!(worker.try_recv().is_err());
-    }
-
-    #[test]
-    fn control_g_requests_the_external_editor_without_changing_the_draft() {
-        let (commands, _worker) = mpsc::unbounded_channel();
-        let mut app = App::new("/workspace".into());
-        app.input = "multiline\ndraft".to_owned();
-        app.cursor = 4;
-        let key = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
-
-        assert_eq!(
-            handle_key(key, &mut app, "main-session", &commands).unwrap(),
-            TerminalAction::ExternalEditor
-        );
-        assert_eq!(app.input, "multiline\ndraft");
-        assert_eq!(app.cursor, 4);
-    }
-
-    #[test]
-    fn control_o_toggles_tool_detail_density() {
-        let (commands, _worker) = mpsc::unbounded_channel();
-        let mut app = App::new("/workspace".into());
-        let key = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
-
-        assert!(app.tool_details_expanded());
-        assert_eq!(
-            handle_key(key, &mut app, "main-session", &commands).unwrap(),
-            TerminalAction::Redraw
-        );
-        assert!(!app.tool_details_expanded());
-    }
-
-    #[test]
-    fn running_generation_continues_while_its_prompt_is_selected_and_edited() {
-        let (commands, mut worker) = mpsc::unbounded_channel();
-        let mut app = App::new("/workspace".into());
-        app.input = "message with typo".to_owned();
-        app.cursor = app.input.len();
-
-        assert_eq!(
-            handle_key(
-                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-                &mut app,
-                "main-session",
-                &commands,
-            )
-            .unwrap(),
-            TerminalAction::Redraw
-        );
-        assert!(matches!(
-            worker.try_recv(),
-            Ok(WorkerCommand::Prompt { prompt, .. }) if prompt == "message with typo"
-        ));
-        app.main.running = true;
-        assert_eq!(
-            handle_key(
-                KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
-                &mut app,
-                "main-session",
-                &commands,
-            )
-            .unwrap(),
-            TerminalAction::Redraw
-        );
-        assert!(app.transcript_selection_active());
-        assert!(worker.try_recv().is_err());
-
-        assert_eq!(
-            handle_key(
-                KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
-                &mut app,
-                "main-session",
-                &commands,
-            )
-            .unwrap(),
-            TerminalAction::Redraw
-        );
-        assert_eq!(app.input, "message with typo");
-        assert!(app.historical_editor_active());
-        assert!(app.main.running);
-        assert!(worker.try_recv().is_err());
-
-        app.main.push_assistant_delta("generation continues");
-        assert!(app.historical_editor_active());
-        assert_eq!(app.input, "message with typo");
-        assert!(app.main.running);
-        assert!(worker.try_recv().is_err());
-
-        app.replace_input("message without typo".to_owned());
-        assert_eq!(
-            handle_key(
-                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-                &mut app,
-                "main-session",
-                &commands,
-            )
-            .unwrap(),
-            TerminalAction::Redraw
-        );
-        assert!(matches!(
-            worker.try_recv(),
-            Ok(WorkerCommand::EditHistorical {
-                source_branch_id: 0,
-                new_branch_id: 1,
-                prompt_id: 1,
-            })
-        ));
-        assert_eq!(app.main.status, "Cancelling");
-        assert!(!app.historical_editor_active());
-    }
-
-    #[test]
-    fn e_edits_the_selected_prompt_inline_before_requesting_a_fork() {
-        let (commands, mut worker) = mpsc::unbounded_channel();
-        let mut app = App::new("/workspace".into());
-        app.main
-            .transcript
-            .push_editable_user("earlier prompt".to_owned(), 17);
-        app.input = "current draft".to_owned();
-
-        assert_eq!(
-            handle_key(
-                KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
-                &mut app,
-                "main-session",
-                &commands,
-            )
-            .unwrap(),
-            TerminalAction::Redraw
-        );
-        assert!(app.transcript_selection_active());
-
-        assert_eq!(
-            handle_key(
-                KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
-                &mut app,
-                "main-session",
-                &commands,
-            )
-            .unwrap(),
-            TerminalAction::Redraw
-        );
-        assert_eq!(app.input, "earlier prompt");
-        assert!(app.historical_editor_active());
-        assert!(worker.try_recv().is_err());
-
-        app.replace_input("revised prompt".to_owned());
-        assert_eq!(
-            handle_key(
-                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-                &mut app,
-                "main-session",
-                &commands,
-            )
-            .unwrap(),
-            TerminalAction::Redraw
-        );
-        assert_eq!(app.input, "current draft");
-        assert!(!app.historical_editor_active());
-        assert!(matches!(
-            worker.try_recv(),
-            Ok(WorkerCommand::EditHistorical {
-                source_branch_id: 0,
-                new_branch_id: 1,
-                prompt_id: 17,
-            })
+            } if id == original.key.id && error.contains("changed since it was read")
         ));
     }
 
-    #[test]
-    fn escape_cancels_inline_history_edit_and_restores_the_composer_draft() {
-        let (commands, mut worker) = mpsc::unbounded_channel();
-        let mut app = App::new("/workspace".into());
-        app.main
-            .transcript
-            .push_editable_user("earlier prompt".to_owned(), 17);
-        app.input = "preserved draft".to_owned();
-        app.cursor = app.input.len();
-        app.move_up();
-        app.move_up();
-        assert!(app.start_historical_edit());
-        app.replace_input("discard this revision".to_owned());
+    #[tokio::test]
+    async fn opening_a_session_removes_obsolete_checkpoints() {
+        let directory = tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        fs::write(&config_path, "").unwrap();
+        let config = Config::load(ConfigOverrides {
+            path: Some(config_path),
+            workspace: Some(directory.path().to_path_buf()),
+            ..ConfigOverrides::default()
+        })
+        .unwrap();
+        let obsolete = directory.path().join("checkpoints/6161.json.zst");
+        fs::create_dir_all(obsolete.parent().unwrap()).unwrap();
+        fs::write(&obsolete, b"obsolete checkpoint").unwrap();
+        let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+        let (_subagents, subagent_control, _updates) =
+            crate::core::extensions::subagents::channel(32);
 
-        assert_eq!(
-            handle_key(
-                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-                &mut app,
-                "main-session",
-                &commands,
-            )
-            .unwrap(),
-            TerminalAction::Redraw
-        );
-        assert_eq!(app.input, "preserved draft");
-        assert_eq!(app.cursor, 0);
-        assert!(!app.historical_editor_active());
-        assert!(!app.transcript_selection_active());
-        assert!(worker.try_recv().is_err());
-    }
-
-    #[test]
-    fn opened_historical_branch_submits_the_inline_revision() {
-        let mut app = App::new("/workspace".into());
-        app.main
-            .transcript
-            .push_editable_user("earlier prompt".to_owned(), 17);
-        app.move_up();
-        assert!(app.start_historical_edit());
-        app.replace_input("revised prompt".to_owned());
-        let request = app
-            .commit_historical_edit()
-            .expect("inline edit should request a branch");
-        let mut ui = UiModel::new(app, Arc::from("root-session"));
-        let (commands, mut worker) = mpsc::unbounded_channel();
-
-        assert_eq!(
-            ui.update(
-                UiAction::Worker(WorkerEvent::MainBranchOpened {
-                    id: request.new_branch,
-                    parent_id: request.source_branch,
-                    prompt_id: request.prompt,
-                    request_id: Arc::from("branch-session"),
-                }),
-                &commands,
-            )
-            .unwrap(),
-            UiUpdate::Redraw(RedrawPriority::Streaming)
-        );
-        assert!(matches!(
-            worker.try_recv(),
-            Ok(WorkerCommand::Prompt {
-                target: PaneId::Main,
-                prompt_id: 1,
-                prompt,
-            }) if prompt == "revised prompt"
-        ));
-        assert!(ui.app.input.is_empty());
-        assert_eq!(ui.app.main_branch_graph(), "0 1*←0");
-    }
-
-    #[test]
-    fn control_alt_arrows_request_branch_navigation() {
-        let (commands, mut worker) = mpsc::unbounded_channel();
-        let mut app = App::new("/workspace".into());
-        app.main
-            .transcript
-            .push_editable_user("earlier prompt".to_owned(), 17);
-        app.move_up();
-        assert!(app.start_historical_edit());
-        let request = app
-            .commit_historical_edit()
-            .expect("inline editor should commit");
-        let _ = app.main_branch_opened(
-            request.new_branch,
-            request.source_branch,
-            request.prompt,
-            std::sync::Arc::from("branch-session"),
-        );
-
-        let key = KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL | KeyModifiers::ALT);
-        assert_eq!(
-            handle_key(key, &mut app, "root-session", &commands).unwrap(),
-            TerminalAction::Redraw
-        );
-        assert!(matches!(
-            worker.try_recv(),
-            Ok(WorkerCommand::SwitchMainBranch { id: 0 })
-        ));
-    }
-
-    #[test]
-    fn branch_navigator_switches_as_selection_moves() -> eyre::Result<()> {
-        let (commands, mut worker) = mpsc::unbounded_channel();
-        let mut app = App::new("/workspace".into());
-        app.main
-            .transcript
-            .push_editable_user("root prompt".to_owned(), 17);
-        app.move_up();
-        assert!(app.start_historical_edit());
-        app.replace_input("branch prompt".to_owned());
-        let request = app.commit_historical_edit().unwrap();
-        let _ = app.main_branch_opened(
-            request.new_branch,
-            request.source_branch,
-            request.prompt,
-            Arc::from("branch-session"),
-        );
-        app.main
-            .transcript
-            .push_editable_user("branch prompt".to_owned(), 18);
-
-        assert_eq!(
-            handle_key(
-                KeyEvent::new(
-                    KeyCode::Char('b'),
-                    KeyModifiers::CONTROL | KeyModifiers::ALT,
-                ),
-                &mut app,
-                "root-session",
-                &commands,
-            )
-            .unwrap(),
-            TerminalAction::Redraw
-        );
-        assert!(app.branch_navigator_active());
-        assert!(worker.try_recv().is_err());
-
-        let _ = handle_key(
-            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
-            &mut app,
-            "root-session",
-            &commands,
-        )?;
-        assert_eq!(
-            app.branch_previews()
-                .into_iter()
-                .find(|preview| preview.selected)
-                .map(|preview| preview.id),
-            Some(0)
-        );
-        assert!(matches!(
-            worker.try_recv(),
-            Ok(WorkerCommand::SwitchMainBranch { id: 0 })
-        ));
-
-        let _ = handle_key(
-            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-            &mut app,
-            "root-session",
-            &commands,
-        )?;
-        assert!(worker.try_recv().is_err());
-        handle_worker_update(
-            &mut app,
-            WorkerEvent::MainBranchSwitched {
-                id: 0,
-                request_id: Arc::from("root-session"),
+        let pane = open_pane(
+            PaneGeneration {
+                pane: PaneId::Main,
+                generation: 0,
             },
-            &commands,
-        )?;
-        assert!(matches!(
-            worker.try_recv(),
-            Ok(WorkerCommand::SwitchMainBranch { id: 1 })
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn readline_control_keys_are_dispatched_to_the_composer() {
-        let (commands, _worker) = mpsc::unbounded_channel();
-        let mut app = App::new("/workspace".into());
-        app.input = "one two".to_owned();
-        app.cursor = app.input.len();
-
-        for character in ['w', 'a', 'k'] {
-            let key = KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL);
-            assert_eq!(
-                handle_key(key, &mut app, "main-session", &commands).unwrap(),
-                TerminalAction::Redraw
-            );
-        }
-
-        assert!(app.input.is_empty());
-        assert_eq!(app.cursor, 0);
-    }
-
-    #[test]
-    fn alt_backspace_deletes_the_previous_composer_word() {
-        let (commands, _worker) = mpsc::unbounded_channel();
-        let mut app = App::new("/workspace".into());
-        app.input = "one two".to_owned();
-        app.cursor = app.input.len();
-
-        let key = KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT);
-        assert_eq!(
-            handle_key(key, &mut app, "main-session", &commands).unwrap(),
-            TerminalAction::Redraw
-        );
-
-        assert_eq!(app.input, "one ");
-        assert_eq!(app.cursor, app.input.len());
-    }
-
-    #[test]
-    fn alt_backspace_deletes_the_previous_inline_edit_word() {
-        let (commands, _worker) = mpsc::unbounded_channel();
-        let mut app = App::new("/workspace".into());
-        app.main
-            .transcript
-            .push_editable_user("earlier prompt".to_owned(), 17);
-        app.move_up();
-        assert!(app.start_historical_edit());
-
-        let key = KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT);
-        assert_eq!(
-            handle_key(key, &mut app, "main-session", &commands).unwrap(),
-            TerminalAction::Redraw
-        );
-
-        assert_eq!(app.input, "earlier ");
-        assert_eq!(app.cursor, app.input.len());
-    }
-
-    async fn next_ws_json<S>(socket: &mut WebSocketStream<S>) -> eyre::Result<Value>
-    where
-        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-    {
-        loop {
-            let message = socket
-                .next()
-                .await
-                .ok_or_else(|| eyre::eyre!("client closed before sending a request"))??;
-            if let Message::Text(text) = message {
-                return Ok(serde_json::from_str(text.as_str())?);
-            }
-        }
-    }
-
-    async fn send_completed<S>(
-        socket: &mut WebSocketStream<S>,
-        response_id: &str,
-        text: &str,
-    ) -> eyre::Result<()>
-    where
-        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-    {
-        send_ws_json(
-            socket,
-            json!({
-                "type": "response.completed",
-                "response": {
-                    "id": response_id,
-                    "status": "completed",
-                    "output": [{
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{ "type": "output_text", "text": text }]
-                    }],
-                    "usage": null
-                }
-            }),
+            PaneSession::new("main-session", None, false),
+            &config,
+            PaneSettings::new(ReasoningEffort::Low, ReasoningMode::Standard, false),
+            Arc::from("instructions"),
+            subagent_control,
+            &sender,
         )
-        .await
+        .unwrap();
+
+        assert!(!obsolete.exists());
+        drop(pane);
+        completions.recv().await.unwrap().result.unwrap();
     }
 
-    async fn send_ws_json<S>(socket: &mut WebSocketStream<S>, value: Value) -> eyre::Result<()>
-    where
-        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-    {
-        socket.send(Message::Text(value.to_string().into())).await?;
-        Ok(())
+    #[tokio::test]
+    async fn fork_pane_has_an_independent_session_and_persisted_transcript() {
+        let directory = tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        fs::write(&config_path, "").unwrap();
+        let config = Config::load(ConfigOverrides {
+            path: Some(config_path),
+            workspace: Some(directory.path().to_path_buf()),
+            ..ConfigOverrides::default()
+        })
+        .unwrap();
+        let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+        let (_subagents, subagent_control, _updates) =
+            crate::core::extensions::subagents::channel(32);
+        let main = open_pane(
+            PaneGeneration {
+                pane: PaneId::Main,
+                generation: 0,
+            },
+            PaneSession::new("main-session", None, false),
+            &config,
+            PaneSettings::new(ReasoningEffort::Low, ReasoningMode::Standard, false),
+            Arc::from("instructions"),
+            subagent_control.clone(),
+            &sender,
+        )
+        .unwrap();
+        let fork = open_pane(
+            PaneGeneration {
+                pane: PaneId::Fork(1),
+                generation: 0,
+            },
+            PaneSession::new("fork-session", Some("main-session"), false),
+            &config,
+            PaneSettings::new(ReasoningEffort::Low, ReasoningMode::Standard, false),
+            Arc::from("instructions"),
+            subagent_control.clone(),
+            &sender,
+        )
+        .unwrap();
+        let mut panes = HashMap::from([(PaneId::Main, main), (PaneId::Fork(1), fork)]);
+        let fork_update = ForwardedSubagentUpdate {
+            runtime_id: subagent_control.runtime_id(),
+            root_session_id: "fork-session".to_owned(),
+            update: AgentUpdate::Status {
+                id: AgentId::new(1),
+                status: AgentStatus::Closed,
+            },
+        };
+
+        assert_eq!(subagent_pane(&panes, &fork_update), Some(PaneId::Fork(1)));
+
+        let (_other_registry, other_control, _other_updates) =
+            crate::core::extensions::subagents::channel(32);
+        let stale_update = ForwardedSubagentUpdate {
+            runtime_id: other_control.runtime_id(),
+            root_session_id: "fork-session".to_owned(),
+            update: AgentUpdate::Status {
+                id: AgentId::new(1),
+                status: AgentStatus::Closed,
+            },
+        };
+        assert_eq!(subagent_pane(&panes, &stale_update), None);
+
+        let mut main = panes.remove(&PaneId::Main).unwrap();
+        let mut fork = panes.remove(&PaneId::Fork(1)).unwrap();
+        let main_path = main.writer_path.clone();
+        let fork_path = fork.writer_path.clone();
+        fork.journal_mut()
+            .unwrap()
+            .append_local(LocalEvent::UserSubmitted {
+                id: TurnId::new(1),
+                text: "fork-only prompt".to_owned(),
+            })
+            .unwrap();
+
+        assert_eq!(main.session_id, "main-session");
+        assert_eq!(fork.session_id, "fork-session");
+        assert_ne!(main.writer_path, fork.writer_path);
+
+        drop(main.journal.take());
+        drop(fork.journal.take());
+        for _ in 0..2 {
+            completions.recv().await.unwrap().result.unwrap();
+        }
+        assert!(!main_path.exists());
+        assert!(main.exit_session_id().is_none());
+        assert_eq!(fork.exit_session_id().as_deref(), Some("fork-session"));
+        let records = load(&fork_path).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].kind(), "session.started");
+        let started = records[0]
+            .decode_payload::<crate::tui::transcript::SessionStarted>()
+            .unwrap();
+        assert_eq!(started.parent_session_id.as_deref(), Some("main-session"));
+        assert_eq!(records[1].kind(), "user.submitted");
     }
 
-    fn temporary_workspace(label: &str) -> eyre::Result<PathBuf> {
-        let path = std::env::temp_dir().join(format!(
-            "nanocodex-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&path)?;
-        Ok(path)
+    #[tokio::test]
+    async fn replacing_a_pane_does_not_persist_the_new_session_until_it_has_transcript_items() {
+        let directory = tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        fs::write(&config_path, "").unwrap();
+        let config = Config::load(ConfigOverrides {
+            path: Some(config_path),
+            workspace: Some(directory.path().to_path_buf()),
+            ..ConfigOverrides::default()
+        })
+        .unwrap();
+        let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
+        let (_subagents, subagent_control, _updates) =
+            crate::core::extensions::subagents::channel(32);
+        let mut old = open_pane(
+            PaneGeneration {
+                pane: PaneId::Main,
+                generation: 0,
+            },
+            PaneSession::new("old-session", None, false),
+            &config,
+            PaneSettings::new(ReasoningEffort::Medium, ReasoningMode::Standard, false),
+            Arc::from("instructions"),
+            subagent_control.clone(),
+            &sender,
+        )
+        .unwrap();
+        let old_path = old.writer_path.clone();
+        old.journal_mut()
+            .unwrap()
+            .append_local(LocalEvent::UserSubmitted {
+                id: TurnId::new(1),
+                text: "old prompt".to_owned(),
+            })
+            .unwrap();
+
+        close_pane_journal(&mut old, super::SessionOutcome::Closed, None).unwrap();
+        let mut new = open_pane(
+            PaneGeneration {
+                pane: PaneId::Main,
+                generation: 1,
+            },
+            PaneSession::new("new-session", None, false),
+            &config,
+            PaneSettings::new(ReasoningEffort::Medium, ReasoningMode::Standard, false),
+            Arc::from("instructions"),
+            subagent_control,
+            &sender,
+        )
+        .unwrap();
+        let new_path = new.writer_path.clone();
+        drop(new.journal.take());
+
+        for _ in 0..2 {
+            completions.recv().await.unwrap().result.unwrap();
+        }
+        let old_records = load(&old_path).unwrap();
+
+        assert_eq!(old_records.last().unwrap().kind(), "session.ended");
+        let ended = old_records
+            .last()
+            .unwrap()
+            .decode_payload::<crate::tui::transcript::SessionEnded>()
+            .unwrap();
+        assert_eq!(ended.outcome, super::SessionOutcome::Closed);
+        assert!(!new_path.exists());
+        assert!(new.exit_session_id().is_none());
     }
 }

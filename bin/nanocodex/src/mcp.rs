@@ -111,6 +111,7 @@ struct CodexConfig {
 
 pub(crate) struct ConfiguredMcp {
     pub(crate) provider: Mcp,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) handle: McpHandle,
 }
 

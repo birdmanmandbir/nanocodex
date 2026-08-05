@@ -50,7 +50,6 @@ chrono = { version = "0.4.43", default-features = false, features = ["clock", "s
 chromiumoxide = "0.9.1"
 clap = { version = "4.5.54", features = ["derive", "env"] }
 cpal = "0.16.0"
-crossterm = { version = "0.28.1", features = ["bracketed-paste", "event-stream"] }
 criterion = { version = "0.7.0", default-features = false, features = ["async_tokio", "cargo_bench_support"] }
 dotenvy = "0.15.7"
 eyre = "0.6.12"
@@ -66,6 +65,7 @@ hmac = "0.13.0"
 hudsucker = { version = "0.25.0", git = "https://github.com/gakonst/hudsucker", rev = "9a13609adc4b37b3e7fba28a320546bf672f0f4d", default-features = false, features = ["rcgen-ca", "ring", "rustls-client"] }
 ignore = "0.4.31"
 jiff = { version = "0.2.35", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
+jsonschema = { version = "0.48.5", default-features = false }
 krun = { package = "libkrun", version = "=2.0.0-dev", git = "https://github.com/containers/libkrun", rev = "df85b8b75f55e8ef1b06b5bc18f08dc6d7b5aeb0", features = ["blk", "net"] }
 mpp = { version = "=0.11.0", git = "https://github.com/tempoxyz/mpp-rs", rev = "3e37469bb19434982b433ae44ea8c713f7ea923a", default-features = false }
 nanocodex = { version = "0.3.0", path = "crates/nanocodex" }
@@ -88,9 +88,7 @@ iana-time-zone = "0.1.64"
 js-sys = "0.3.82"
 nix = { version = "0.31.3", default-features = false, features = ["process", "resource", "signal", "user"] }
 portable-pty = "0.9.0"
-pulldown-cmark = { version = "0.10", default-features = false }
 syntect = { version = "5.3.0", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
-two-face = { version = "0.5.1", default-features = false, features = ["syntect-fancy"] }
 opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-client", "trace"] }
 opentelemetry-semantic-conventions = "0.32"
@@ -101,8 +99,6 @@ pyo3 = "0.29.0"
 proc-macro-crate = "3"
 proc-macro2 = "1.0.106"
 quote = "1.0.46"
-ratatui = { version = "0.29.0", features = ["unstable-rendered-line-info"] }
-ratatex = "0.1.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-ring"] }
 reqwest-middleware = "0.5.2"
 rustls = { version = "0.23.42", default-features = false, features = ["ring"] }
@@ -151,6 +147,7 @@ web-time = "1.1.0"
 webrtc = "0.17.0"
 whoami = "1.6.1"
 yansi = { version = "1.0", features = ["detect-env", "detect-tty"] }
+zeroize = { version = "1.9.0", features = ["derive"] }
 zstd = "0.13"
 
 [patch.crates-io]
@@ -172,44 +169,6 @@ result-large-err = "allow"
 [profile.dev]
 debug = "line-tables-only"
 split-debuginfo = "unpacked"
-
-# Display math runs during interactive debug builds. Keep the small native
-# parser/layout/raster stack optimized so a cold formula is ready in one frame.
-[profile.dev.package.ratatex]
-opt-level = 1
-
-[profile.dev.package.ratex-font]
-opt-level = 3
-
-[profile.dev.package.ratex-font-loader]
-opt-level = 3
-
-[profile.dev.package.ratex-katex-fonts]
-opt-level = 3
-
-[profile.dev.package.ratex-layout]
-opt-level = 3
-
-[profile.dev.package.ratex-lexer]
-opt-level = 3
-
-[profile.dev.package.ratex-parser]
-opt-level = 3
-
-[profile.dev.package.ratex-render]
-opt-level = 3
-
-[profile.dev.package.ratex-types]
-opt-level = 3
-
-[profile.dev.package.ratex-unicode-font]
-opt-level = 3
-
-[profile.dev.package.tiny-skia]
-opt-level = 3
-
-[profile.dev.package.tiny-skia-path]
-opt-level = 3
 
 [profile.release]
 opt-level = 3

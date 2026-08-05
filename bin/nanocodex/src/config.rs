@@ -13,15 +13,11 @@ use eyre::{Result, WrapErr, eyre};
 use nanocodex::NanocodexBuilder;
 use nanocodex::{
     AgentEvents, Model, Nanocodex, OpenAi, ReasoningMode, Thinking, Tools,
-    agent::{
-        rollout::{DurableSession, RolloutConfig},
-        session::{SessionId, SessionSnapshot},
-    },
+    agent::rollout::RolloutConfig,
     oai::{
         auth::{OpenAiAuth, OpenAiAuthMode},
         transport::ResponsesTransport,
     },
-    tools::mcp::McpHandle,
 };
 
 use crate::browser::{BrowserArgs, ConfiguredBrowser};
@@ -30,21 +26,52 @@ use crate::mpp::{MppAdapter, MppArgs};
 use crate::subagents::{self, ChildAgents};
 use crate::vm::{ConfiguredVm, VmArgs};
 
+use crate::app::config::{
+    Config as TuiConfig, ConfigOverrides as TuiConfigOverrides,
+    ReasoningEffort as TuiReasoningEffort, ReasoningMode as TuiReasoningMode, TuiAgentRuntime,
+};
+
 pub(crate) struct ConfiguredAgent {
     pub(crate) handle: Nanocodex,
     pub(crate) events: AgentEvents,
-    pub(crate) realtime: Option<OpenAi>,
     pub(crate) child_agents: Option<Arc<ChildAgents>>,
     pub(crate) mpp_adapter: Option<MppAdapter>,
-    pub(crate) mcp: Option<McpHandle>,
     pub(crate) browser: Option<ConfiguredBrowser>,
     pub(crate) vm: Option<ConfiguredVm>,
 }
 
+pub(crate) struct TuiResources {
+    mpp_adapter: Option<MppAdapter>,
+    browser: Option<ConfiguredBrowser>,
+    vm: Option<ConfiguredVm>,
+}
+
+impl TuiResources {
+    pub(crate) async fn shutdown(self) -> Result<()> {
+        let mut error = None;
+        if let Some(browser) = self.browser
+            && let Err(source) = browser.shutdown().await
+        {
+            error = Some(source);
+        }
+        if let Some(vm) = self.vm
+            && let Err(source) = vm.shutdown().await
+            && error.is_none()
+        {
+            error = Some(source);
+        }
+        if let Some(adapter) = self.mpp_adapter
+            && let Err(source) = adapter.shutdown().await
+            && error.is_none()
+        {
+            error = Some(source);
+        }
+        error.map_or(Ok(()), Err)
+    }
+}
+
 struct SessionBuild {
     workspace: PathBuf,
-    session_id: Option<SessionId>,
-    snapshot: Option<SessionSnapshot>,
     rollout: Option<RolloutConfig>,
 }
 
@@ -101,6 +128,10 @@ pub(crate) struct EvalAgentArgs {
     reason = "independent CLI feature toggles are not one state machine"
 )]
 pub(crate) struct AgentArgs {
+    /// Load interactive TUI settings from this file.
+    #[arg(long, env = "NANOCODEX_CONFIG", value_name = "PATH")]
+    config: Option<PathBuf>,
+
     #[command(flatten)]
     auth: AuthArgs,
 
@@ -139,6 +170,14 @@ pub(crate) struct AgentArgs {
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
     instructions: Option<String>,
 
+    /// Append instructions after Nanocodex's built-in TUI guidance.
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    append_instructions: Option<String>,
+
+    /// Maximum number of TUI subagents that may run concurrently.
+    #[arg(long, env = "NANOCODEX_MAX_SUBAGENTS", value_name = "COUNT")]
+    max_subagents: Option<usize>,
+
     /// Whether image generation is exposed to the model.
     #[arg(
         long,
@@ -148,14 +187,17 @@ pub(crate) struct AgentArgs {
     )]
     image_generation: bool,
 
-    /// Expose reusable clean, forked, and follow-up child agents in Code Mode.
+    /// Enable Nanocodex's hierarchical subagent runtime.
     #[arg(
         long,
         env = "NANOCODEX_SUBAGENTS",
-        default_value_t = false,
         action = ArgAction::Set
     )]
-    subagents: bool,
+    subagents: Option<bool>,
+
+    /// Enable persistent global SQLite memory and its browser.
+    #[arg(long, env = "NANOCODEX_MEMORY", action = ArgAction::Set)]
+    memory: Option<bool>,
 
     /// Write Codex-compatible resumable threads beneath `CODEX_HOME`.
     #[arg(
@@ -228,12 +270,26 @@ impl AgentArgs {
         self.model_policy.web_search.unwrap_or(true)
     }
 
-    pub(crate) const fn fast_mode(&self) -> bool {
-        self.fast_mode
-    }
-
-    pub(crate) const fn model(&self) -> Model {
-        self.model
+    pub(crate) fn load_tui_config(&self) -> Result<TuiConfig> {
+        TuiConfig::load(TuiConfigOverrides {
+            path: self.config.clone(),
+            auth_mode: None,
+            auth_file: None,
+            workspace: self.cwd.clone(),
+            thinking: Some(tui_reasoning_effort(self.thinking())),
+            reasoning_mode: Some(tui_reasoning_mode(self.reasoning_mode)),
+            fast_mode: Some(self.fast_mode),
+            max_subagents: self.max_subagents,
+            instructions: self.instructions.clone(),
+            append_instructions: self.append_instructions.clone(),
+            web_search: Some(self.web_search()),
+            image_generation: Some(self.image_generation),
+            websocket_url: self.websocket_url.clone(),
+            api_base_url: self.api_base_url.clone(),
+            memory: self.memory,
+            subagents: self.subagents,
+        })
+        .map_err(|error| eyre!(error))
     }
 
     pub(crate) fn responses_transport(&self) -> ResponsesTransport {
@@ -245,28 +301,110 @@ impl AgentArgs {
             })
     }
 
+    pub(crate) async fn prepare_tui(
+        self,
+        vm: VmArgs,
+        mut config: TuiConfig,
+    ) -> Result<(TuiConfig, TuiResources)> {
+        let workspace = config
+            .agent()
+            .workspace()
+            .canonicalize()
+            .wrap_err("failed to resolve the TUI workspace")?;
+        let codex_home = default_codex_home()?;
+        let responses_transport = self.responses_transport();
+        let configured_browser = self.browser.configure(&workspace)?;
+        let mpp_enabled = self.mpp.is_enabled();
+        if mpp_enabled && !matches!(responses_transport, ResponsesTransport::Https) {
+            return Err(eyre!(
+                "the Tempo provider currently supports HTTPS Responses with Charge only"
+            ));
+        }
+        let auth = if mpp_enabled {
+            OpenAiAuth::api_key("tempo-proxy")
+        } else {
+            self.auth.resolve()?.nanocodex()?
+        };
+        let direct_websocket_url = direct_websocket_url(self.websocket_url, auth.mode());
+        let mpp_adapter = self.mpp.start().await?;
+        let mut openai = OpenAi::builder(auth)
+            .transport(responses_transport)
+            .websocket_url(direct_websocket_url);
+        if let Some(prefix) = self.model_id_prefix.as_deref() {
+            openai = openai.model_id_prefix(prefix);
+        }
+        if mpp_enabled {
+            openai = openai.max_attempts(NonZeroU32::MIN);
+        }
+        if let Some(store) = self.store_responses {
+            openai = openai.store(store);
+        }
+        let api_base_url = selected_api_base_url(
+            self.api_base_url,
+            mpp_adapter.as_ref().map(MppAdapter::api_base_url),
+        );
+        if let Some(api_base_url) = api_base_url {
+            openai = openai.api_base_url(api_base_url);
+        }
+        if matches!(responses_transport, ResponsesTransport::Https)
+            && let Some(mpp_adapter) = &mpp_adapter
+        {
+            openai = openai.http_client(mpp_adapter.responses_http_client()?);
+        }
+        let openai = openai.build()?;
+        let vm_egress = if vm.is_enabled() {
+            mpp_adapter
+                .as_ref()
+                .map(MppAdapter::vm_egress_lease)
+                .transpose()?
+        } else {
+            None
+        };
+        let configured_vm = vm.start(vm_egress).await?;
+        let mut tools = configured_vm
+            .as_ref()
+            .map_or_else(Tools::builder, ConfiguredVm::tools_builder)
+            .web_search(config.agent().web_search())
+            .image_generation(config.agent().image_generation());
+        let mcp = self.mcp.build(&codex_home)?;
+        if let Some(ConfiguredMcp { provider, .. }) = mcp {
+            tools = tools.provider(provider);
+        }
+        if let Some(mpp_adapter) = &mpp_adapter {
+            if configured_vm.is_none() {
+                tools = tools.process_environment(mpp_adapter.tool_environment());
+            }
+            tools = tools.remote_http_client(mpp_adapter.tool_http_client()?);
+        }
+        if let Some(browser) = &configured_browser {
+            tools = tools.provider(browser.tool());
+        }
+        let tools = tools.build()?;
+        config.install_runtime(Arc::new(TuiAgentRuntime {
+            openai,
+            tools,
+            model: self.model,
+        }));
+        Ok((
+            config,
+            TuiResources {
+                mpp_adapter,
+                browser: configured_browser,
+                vm: configured_vm,
+            },
+        ))
+    }
+
     pub(crate) async fn build(self, vm: VmArgs) -> Result<ConfiguredAgent> {
-        self.build_inner(None, vm).await
+        self.build_inner(vm).await
     }
 
-    pub(crate) async fn build_resumed(
-        self,
-        session: DurableSession,
-        vm: VmArgs,
-    ) -> Result<ConfiguredAgent> {
-        self.build_inner(Some(session), vm).await
-    }
-
-    async fn build_inner(
-        self,
-        durable: Option<DurableSession>,
-        vm: VmArgs,
-    ) -> Result<ConfiguredAgent> {
+    async fn build_inner(self, vm: VmArgs) -> Result<ConfiguredAgent> {
         let thinking = self.thinking();
         let web_search = self.web_search();
         let codex_home = default_codex_home()?;
         let responses_transport = self.responses_transport();
-        let session = prepare_session_build(self.cwd, self.rollouts, &codex_home, durable)?;
+        let session = prepare_session_build(self.cwd, self.rollouts, &codex_home);
         let configured_browser = self.browser.configure(&session.workspace)?;
         let mpp_enabled = self.mpp.is_enabled();
         if mpp_enabled && !matches!(responses_transport, ResponsesTransport::Https) {
@@ -306,7 +444,6 @@ impl AgentArgs {
             openai = openai.http_client(mpp_adapter.responses_http_client()?);
         }
         let openai = openai.build()?;
-        let realtime = (!mpp_enabled).then(|| openai.clone());
         let vm_egress = if vm.is_enabled() {
             mpp_adapter
                 .as_ref()
@@ -322,7 +459,6 @@ impl AgentArgs {
             .web_search(web_search)
             .image_generation(self.image_generation);
         let mcp = self.mcp.build(&codex_home)?;
-        let mcp_handle = mcp.as_ref().map(|mcp| mcp.handle.clone());
         if let Some(ConfiguredMcp { provider, .. }) = mcp {
             tools = tools.provider(provider);
         }
@@ -336,7 +472,10 @@ impl AgentArgs {
             tools = tools.provider(browser.tool());
         }
         let tools = tools.build()?;
-        let child_agents = self.subagents.then(|| Arc::new(ChildAgents::default()));
+        let child_agents = self
+            .subagents
+            .unwrap_or(true)
+            .then(|| Arc::new(ChildAgents::default()));
         let mut builder = Nanocodex::builder(openai)
             .model(self.model)
             .reasoning_mode(self.reasoning_mode)
@@ -344,12 +483,6 @@ impl AgentArgs {
             .fast_mode(self.fast_mode)
             .workspace(session.workspace)
             .codex_home(codex_home);
-        if let Some(session_id) = session.session_id {
-            builder = builder.session_id(session_id);
-        }
-        if let Some(snapshot) = session.snapshot {
-            builder = builder.resume(snapshot);
-        }
         if let Some(rollout) = session.rollout {
             builder = builder.rollout(rollout);
         }
@@ -371,10 +504,8 @@ impl AgentArgs {
         Ok(ConfiguredAgent {
             handle,
             events,
-            realtime,
             child_agents,
             mpp_adapter,
-            mcp: mcp_handle,
             browser: configured_browser,
             vm: configured_vm,
         })
@@ -443,42 +574,28 @@ fn prepare_session_build(
     requested_workspace: Option<PathBuf>,
     rollouts: bool,
     codex_home: &Path,
-    durable: Option<DurableSession>,
-) -> Result<SessionBuild> {
-    let Some(session) = durable else {
-        return Ok(SessionBuild {
-            workspace: requested_workspace.unwrap_or_else(|| PathBuf::from(".")),
-            session_id: None,
-            snapshot: None,
-            rollout: rollouts.then(|| RolloutConfig::new(codex_home)),
-        });
-    };
-    let restored = Path::new(session.workspace())
-        .canonicalize()
-        .wrap_err("failed to resolve the resumed workspace")?;
-    if let Some(requested) = requested_workspace {
-        let requested = requested
-            .canonicalize()
-            .wrap_err("failed to resolve the requested workspace")?;
-        if requested != restored {
-            return Err(eyre!(
-                "resumed thread workspace is {}; --cwd requested {}",
-                restored.display(),
-                requested.display()
-            ));
-        }
+) -> SessionBuild {
+    SessionBuild {
+        workspace: requested_workspace.unwrap_or_else(|| PathBuf::from(".")),
+        rollout: rollouts.then(|| RolloutConfig::new(codex_home)),
     }
-    let (session_id, snapshot, rollout) = session.into_parts();
-    Ok(SessionBuild {
-        workspace: restored,
-        session_id: Some(
-            session_id
-                .parse()
-                .wrap_err("resumed Codex thread ID is not UUIDv7")?,
-        ),
-        snapshot: Some(snapshot),
-        rollout: rollouts.then_some(rollout),
-    })
+}
+
+const fn tui_reasoning_effort(thinking: Thinking) -> TuiReasoningEffort {
+    match thinking {
+        Thinking::None | Thinking::Low => TuiReasoningEffort::Low,
+        Thinking::Medium => TuiReasoningEffort::Medium,
+        Thinking::High => TuiReasoningEffort::High,
+        Thinking::Xhigh => TuiReasoningEffort::Xhigh,
+        Thinking::Max => TuiReasoningEffort::Max,
+    }
+}
+
+const fn tui_reasoning_mode(mode: ReasoningMode) -> TuiReasoningMode {
+    match mode {
+        ReasoningMode::Standard => TuiReasoningMode::Standard,
+        ReasoningMode::Pro => TuiReasoningMode::Pro,
+    }
 }
 
 fn direct_websocket_url(explicit: Option<String>, auth_mode: OpenAiAuthMode) -> String {
@@ -683,14 +800,14 @@ mod tests {
     }
 
     #[test]
-    fn subagents_are_opt_in() {
+    fn subagent_cli_override_defers_to_the_enabled_tui_default() {
         let command = crate::Cli::command();
         let subagents = command
             .get_arguments()
             .find(|argument| argument.get_id() == "subagents")
             .expect("the CLI should expose the subagents argument");
 
-        assert_eq!(subagents.get_default_values(), ["false"]);
+        assert!(subagents.get_default_values().is_empty());
     }
 
     #[test]

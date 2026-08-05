@@ -25,6 +25,10 @@ js/tui/node_modules/
 js/tui/dist/
 js/tui-react/node_modules/
 js/tui-react/dist/
+web/review/node_modules/
+web/review/dist/
+web/review/review/
+web/review/nanocodex-review-*.tar.gz
 js/bindings/pkg-node/
 js/bindings/pkg-web/
 examples/node/node_modules/

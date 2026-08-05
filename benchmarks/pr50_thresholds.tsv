@@ -22,19 +22,19 @@ mcp_discovery_cold/1000_tools	53712840.583	250000000	cold MCP discovery for 1,00
 mcp_tool_search_warm/1	2051.999	10000	warm deferred search over one MCP tool
 mcp_tool_search_warm/1000	95865.336	500000	warm deferred search over 1,000 MCP tools
 mcp_tool_dispatch_warm_stdio	1094306.402	10000000	warm MCP stdio dispatch
-tui_trace_render/codex_long/tail_80x24	53557.644	500000	representative retained Codex trace tail at a small terminal
-tui_trace_render/codex_long/tail_120x40	110263.207	1000000	representative retained Codex trace tail render
-tui_trace_render/codex_long/tail_200x60	237303.290	2000000	representative retained Codex trace tail at a large terminal
-tui_transcript_delta/assistant_100k	2518.750	50000	incremental 100 KiB assistant transcript update
-tui_stream_telemetry/apply_1024_and_present	83413.791	500000	1,024-event TUI state update and presentation
-tui_branch_state/codex_long/switch_branch	4337.346	250000	long-trace branch switch
-tui_markdown_syntax_fallback_oversized_line_1m	74491.185	1000000	one-megabyte syntax-highlight fallback
-tui_tool_tree_result_269k_cached_frame_120x40	88420.360	1000000	cached 269 KiB tool-result frame
-tui_code_mode_stream/apply_16_out_of_order_completions	2796.263	100000	sixteen out-of-order Code Mode completions
-tui_trace_resize/codex_long/80x24_to_200x60	241535.474	2000000	long-trace terminal resize
-tui_live_tail_first_frame/assistant_1m_single_line/120x40	23992869.958	100000000	first frame for a one-megabyte live line
-tui_smooth_follow/drain_128_row_backlog_120x40	999950.334	10000000	drain 128 rows of smooth-follow backlog
-tui_terminal_output/catch_up_frame_120x40	105373.108	1000000	catch-up terminal diff; also capped at 2,400 cells and 4,096 bytes
-tui_terminal_output/fast_mode_toggle_120x40	61606.134	500000	footer-only diff; also capped at 48 cells and 256 bytes
-tui_composer_render_multiline_100k_120x40	148036.206	2000000	render a 100 KiB multiline draft
-tui_large_paste/ingest_100k	24277.002	500000	ingest a 100 KiB paste
+tui_app_root_first_120x40_frame	129751.692	1000000	construct and render the complete first 120x40 application frame
+tui_empty_idle_render	84618.476	500000	render an unchanged idle application frame
+tui_single_character_update_and_render	82682.181	500000	apply one composer character and render its frame
+tui_six_row_composer_render	92706.396	500000	render a wrapped six-row composer
+tui_scrolled_large_draft_render	600295.021	5000000	render the viewport tail of a large scrolled draft
+tui_transcript_large_tail_render	122744.778	1000000	render a long transcript at its live tail
+tui_transcript_page_up_and_render	290328.842	2000000	page and render a long transcript away from its tail
+tui_transcript_streaming_delta_and_render	97732.150	1000000	apply and render one streamed assistant delta
+tui_transcript_collapsed_tools_render	127195.925	1000000	render a transcript containing many collapsed tool calls
+tui_transcript_expand_large_tool	72880.525	1000000	expand and render a large tool result
+tui_transcript_expand_highlighted_patch	73713.647	1000000	expand and render a syntax-highlighted patch
+session/catalog_api_heavy_archive	230362.290	2000000	catalog a large archive containing unrelated sessions
+session/load_known_api_heavy_transcript_cold	19553802.020	100000000	cold-load and project one API-heavy transcript
+session/load_known_multi_segment_transcript_parallel_cold	6693747.822	50000000	cold-load a multi-segment transcript through the parallel path
+session/project_mixed_transcript	3162237.502	20000000	project a mixed long-session transcript into TUI state
+session/resume_mixed_transcript	8990351.492	50000000	warm-load and restore a mixed long-session transcript

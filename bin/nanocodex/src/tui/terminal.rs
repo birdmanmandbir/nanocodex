@@ -1,15 +1,15 @@
+//! Terminal lifecycle and synchronized Ratatui frames.
+
 use std::{
-    cell::Cell as CounterCell,
     io::{self, IsTerminal, Stdout, Write, stdin, stdout},
     panic,
-    rc::Rc,
     sync::{
         Once,
         atomic::{AtomicBool, Ordering},
     },
 };
-
-use crossterm::{
+use tact_crossterm::{
+    clipboard::CopyToClipboard,
     cursor::{Hide, Show},
     event::{
         DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
@@ -22,65 +22,46 @@ use crossterm::{
         disable_raw_mode, enable_raw_mode,
     },
 };
-use ratatui::{
+use tact_ratatui::{
     Frame, Terminal,
     backend::{Backend, ClearType, CrosstermBackend, WindowSize},
-    buffer::{Buffer, Cell},
-    layout::{Position, Rect, Size},
+    buffer::Cell,
+    layout::{Position, Size},
 };
 
-type TuiTerminal = Terminal<MeasuredBackend<CrosstermBackend<ByteCountingWriter<Stdout>>>>;
+type TuiTerminal = Terminal<StableCursorBackend<CrosstermBackend<Stdout>>>;
 
-#[derive(Clone, Copy, Debug, Default)]
-pub(super) struct DrawMetrics {
-    pub changed_cells: u64,
-    pub output_bytes: u64,
+/// Avoids restarting the terminal's cursor blink cycle on every rendered frame.
+struct StableCursorBackend<B> {
+    inner: B,
+    cursor_visibility: CursorVisibility,
 }
 
-pub(super) struct ByteCountingWriter<W> {
-    pub(super) inner: W,
-    pub(super) bytes: Rc<CounterCell<u64>>,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CursorVisibility {
+    Hidden,
+    Visible,
+    Unknown,
 }
 
-pub(super) struct MeasuredBackend<B> {
-    pub(super) inner: B,
-    pub(super) changed_cells: u64,
-    frame_cache: FrameCache,
-}
-
-enum FrameCache {
-    Disabled,
-    Invalid,
-    Ready(Buffer),
-}
-
-pub(super) struct TerminalSession {
-    terminal: TuiTerminal,
-    output_bytes: Rc<CounterCell<u64>>,
-    active: bool,
-}
-
-static INSTALL_PANIC_HOOK: Once = Once::new();
-static TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
-
-struct RestoreOnDrop {
-    armed: bool,
-}
-
-impl<W: Write> Write for ByteCountingWriter<W> {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        let written = self.inner.write(buffer)?;
-        self.bytes
-            .set(self.bytes.get().saturating_add(written as u64));
-        Ok(written)
+impl<B> StableCursorBackend<B> {
+    const fn hidden(inner: B) -> Self {
+        Self {
+            inner,
+            cursor_visibility: CursorVisibility::Hidden,
+        }
     }
 
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
+    const fn assume_cursor_hidden(&mut self) {
+        self.cursor_visibility = CursorVisibility::Hidden;
+    }
+
+    const fn invalidate_cursor_visibility(&mut self) {
+        self.cursor_visibility = CursorVisibility::Unknown;
     }
 }
 
-impl<B: Write> Write for MeasuredBackend<B> {
+impl<B: Write> Write for StableCursorBackend<B> {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         self.inner.write(buffer)
     }
@@ -90,272 +71,242 @@ impl<B: Write> Write for MeasuredBackend<B> {
     }
 }
 
-impl<B> MeasuredBackend<B> {
-    pub(super) const fn new(inner: B) -> Self {
-        Self {
-            inner,
-            changed_cells: 0,
-            frame_cache: FrameCache::Disabled,
-        }
-    }
+impl<B: Backend> Backend for StableCursorBackend<B> {
+    type Error = B::Error;
 
-    pub(super) fn with_frame_cache(inner: B) -> Self {
-        let mut backend = Self::new(inner);
-        backend.frame_cache = FrameCache::Invalid;
-        backend
-    }
-
-    fn invalidate_frame_cache(&mut self) {
-        if !matches!(self.frame_cache, FrameCache::Disabled) {
-            self.frame_cache = FrameCache::Invalid;
-        }
-    }
-
-    fn take_frame_cache(&mut self) -> Option<Buffer> {
-        match std::mem::replace(&mut self.frame_cache, FrameCache::Invalid) {
-            FrameCache::Ready(buffer) => Some(buffer),
-            FrameCache::Disabled => {
-                self.frame_cache = FrameCache::Disabled;
-                None
-            }
-            FrameCache::Invalid => None,
-        }
-    }
-
-    fn restore_frame_cache(&mut self, buffer: Buffer) {
-        self.frame_cache = FrameCache::Ready(buffer);
-    }
-}
-
-impl<B: Backend> Backend for MeasuredBackend<B> {
-    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,
     {
-        if matches!(self.frame_cache, FrameCache::Invalid) {
-            let size = self.inner.size()?;
-            self.frame_cache =
-                FrameCache::Ready(Buffer::empty(Rect::from((Position::ORIGIN, size))));
+        self.inner.draw(content)
+    }
+
+    fn append_lines(&mut self, count: u16) -> Result<(), Self::Error> {
+        self.inner.append_lines(count)
+    }
+
+    fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+        if self.cursor_visibility == CursorVisibility::Hidden {
+            return Ok(());
         }
+        self.inner.hide_cursor()?;
+        self.cursor_visibility = CursorVisibility::Hidden;
+        Ok(())
+    }
 
-        let mut changed_cells = 0_u64;
-        let mut cache_valid = true;
-        let mut cached = match &mut self.frame_cache {
-            FrameCache::Ready(buffer) => Some(buffer),
-            FrameCache::Disabled | FrameCache::Invalid => None,
-        };
-        let content = content.inspect(|(x, y, cell)| {
-            changed_cells = changed_cells.saturating_add(1);
-            if let Some(cached) = cached.as_deref_mut() {
-                let position = Position::new(*x, *y);
-                if cached.area.contains(position) {
-                    cached[(*x, *y)].clone_from(cell);
-                } else {
-                    cache_valid = false;
-                }
-            }
-        });
-        let result = self.inner.draw(content);
-        self.changed_cells = self.changed_cells.saturating_add(changed_cells);
-        if !cache_valid {
-            self.invalidate_frame_cache();
+    fn show_cursor(&mut self) -> Result<(), Self::Error> {
+        if self.cursor_visibility == CursorVisibility::Visible {
+            return Ok(());
         }
-        result
+        self.inner.show_cursor()?;
+        self.cursor_visibility = CursorVisibility::Visible;
+        Ok(())
     }
 
-    fn append_lines(&mut self, n: u16) -> io::Result<()> {
-        let result = self.inner.append_lines(n);
-        if result.is_ok() {
-            self.invalidate_frame_cache();
-        }
-        result
-    }
-
-    fn hide_cursor(&mut self) -> io::Result<()> {
-        self.inner.hide_cursor()
-    }
-
-    fn show_cursor(&mut self) -> io::Result<()> {
-        self.inner.show_cursor()
-    }
-
-    fn get_cursor_position(&mut self) -> io::Result<Position> {
+    fn get_cursor_position(&mut self) -> Result<Position, Self::Error> {
         self.inner.get_cursor_position()
     }
 
-    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> Result<(), Self::Error> {
         self.inner.set_cursor_position(position)
     }
 
-    fn clear(&mut self) -> io::Result<()> {
-        let result = self.inner.clear();
-        if result.is_ok() {
-            self.invalidate_frame_cache();
-        }
-        result
+    fn clear(&mut self) -> Result<(), Self::Error> {
+        self.inner.clear()
     }
 
-    fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
-        let result = self.inner.clear_region(clear_type);
-        if result.is_ok() {
-            self.invalidate_frame_cache();
-        }
-        result
+    fn clear_region(&mut self, clear_type: ClearType) -> Result<(), Self::Error> {
+        self.inner.clear_region(clear_type)
     }
 
-    fn size(&self) -> io::Result<Size> {
+    fn size(&self) -> Result<Size, Self::Error> {
         self.inner.size()
     }
 
-    fn window_size(&mut self) -> io::Result<WindowSize> {
+    fn window_size(&mut self) -> Result<WindowSize, Self::Error> {
         self.inner.window_size()
     }
 
-    fn flush(&mut self) -> io::Result<()> {
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        self.inner.flush()
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct MeasuredBackend<B> {
+    inner: B,
+    changed_cells: u64,
+    cursor_reads: u64,
+    cursor_hides: u64,
+    cursor_shows: u64,
+}
+
+pub(crate) struct TerminalSession {
+    terminal: TuiTerminal,
+    active: bool,
+}
+
+struct RestoreOnDrop {
+    armed: bool,
+}
+
+static INSTALL_PANIC_HOOK: Once = Once::new();
+static TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+impl<B: Backend> Backend for MeasuredBackend<B> {
+    type Error = B::Error;
+
+    fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+    where
+        I: Iterator<Item = (u16, u16, &'a Cell)>,
+    {
+        let mut changed_cells = 0_u64;
+        let content = content.inspect(|_| changed_cells = changed_cells.saturating_add(1));
+        let result = self.inner.draw(content);
+        self.changed_cells = self.changed_cells.saturating_add(changed_cells);
+        result
+    }
+
+    fn append_lines(&mut self, count: u16) -> Result<(), Self::Error> {
+        self.inner.append_lines(count)
+    }
+
+    fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+        self.cursor_hides = self.cursor_hides.saturating_add(1);
+        self.inner.hide_cursor()
+    }
+
+    fn show_cursor(&mut self) -> Result<(), Self::Error> {
+        self.cursor_shows = self.cursor_shows.saturating_add(1);
+        self.inner.show_cursor()
+    }
+
+    fn get_cursor_position(&mut self) -> Result<Position, Self::Error> {
+        self.cursor_reads = self.cursor_reads.saturating_add(1);
+        self.inner.get_cursor_position()
+    }
+
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> Result<(), Self::Error> {
+        self.inner.set_cursor_position(position)
+    }
+
+    fn clear(&mut self) -> Result<(), Self::Error> {
+        self.inner.clear()
+    }
+
+    fn clear_region(&mut self, clear_type: ClearType) -> Result<(), Self::Error> {
+        self.inner.clear_region(clear_type)
+    }
+
+    fn size(&self) -> Result<Size, Self::Error> {
+        self.inner.size()
+    }
+
+    fn window_size(&mut self) -> Result<WindowSize, Self::Error> {
+        self.inner.window_size()
+    }
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
         self.inner.flush()
     }
 }
 
 impl TerminalSession {
-    pub(super) fn enter() -> io::Result<Self> {
+    pub(crate) fn enter() -> io::Result<Self> {
         if !stdin().is_terminal() || !stdout().is_terminal() {
             return Err(io::Error::other(
-                "interactive mode requires terminal stdin and stdout; use `nanocodex run` for JSONL",
+                "interactive mode requires terminal stdin and stdout; use `nanocodex run <PROMPT>` for JSONL output",
             ));
         }
+
         install_panic_hook();
         let mut restore = RestoreOnDrop { armed: true };
         enable_raw_mode()?;
         let mut output = stdout();
         activate_commands(&mut output)?;
         TERMINAL_ACTIVE.store(true, Ordering::Release);
-        let output_bytes = Rc::new(CounterCell::new(0));
-        let writer = ByteCountingWriter {
-            inner: output,
-            bytes: Rc::clone(&output_bytes),
-        };
-        let terminal = Terminal::new(MeasuredBackend::with_frame_cache(CrosstermBackend::new(
-            writer,
-        )))?;
+        let terminal = Terminal::new(StableCursorBackend::hidden(CrosstermBackend::new(output)))?;
         restore.armed = false;
+
         Ok(Self {
             terminal,
-            output_bytes,
             active: true,
         })
     }
 
-    pub(super) fn draw(&mut self, render: impl FnOnce(&mut Frame<'_>)) -> io::Result<DrawMetrics> {
-        self.draw_inner(render)
-    }
-
-    pub(super) fn draw_reusing_last_frame(
-        &mut self,
-        render: impl FnOnce(&mut Frame<'_>, bool),
-    ) -> io::Result<DrawMetrics> {
-        self.terminal.autoresize()?;
-        let reused = seed_from_cached_frame(&mut self.terminal);
-        self.draw_inner(|frame| render(frame, reused))
-    }
-
-    fn draw_inner(&mut self, render: impl FnOnce(&mut Frame<'_>)) -> io::Result<DrawMetrics> {
-        let bytes_before = self.output_bytes.get();
-        self.terminal.backend_mut().changed_cells = 0;
+    pub(crate) fn draw(&mut self, render: impl FnOnce(&mut Frame<'_>)) -> io::Result<()> {
         begin_synchronized_update(self.terminal.backend_mut())?;
-        let draw_result = self.terminal.draw(render).map(|_| ());
-        let end_result = end_synchronized_update(self.terminal.backend_mut());
-        draw_result.and(end_result)?;
-        Ok(DrawMetrics {
-            changed_cells: self.terminal.backend().changed_cells,
-            output_bytes: self.output_bytes.get().saturating_sub(bytes_before),
-        })
+        let draw = self.terminal.draw(render).map(|_| ());
+        let end = end_synchronized_update(self.terminal.backend_mut());
+        draw.and(end)
     }
 
-    pub(super) fn write_control_sequence(&mut self, sequence: &[u8]) -> io::Result<()> {
-        self.terminal.backend_mut().write_all(sequence)?;
-        Write::flush(self.terminal.backend_mut())
+    pub(crate) fn invalidate_cursor_visibility(&mut self) {
+        self.terminal.backend_mut().invalidate_cursor_visibility();
     }
 
-    pub(super) fn suspend(&mut self) -> io::Result<()> {
+    pub(crate) fn copy_to_clipboard(&mut self, text: &str) -> io::Result<()> {
+        copy_to_clipboard(self.terminal.backend_mut(), text)
+    }
+
+    pub(crate) fn suspend(&mut self) -> io::Result<()> {
         if !self.active {
             return Ok(());
         }
+
         self.terminal.show_cursor()?;
-        restore(self.terminal.backend_mut());
+        restore_terminal(self.terminal.backend_mut());
         self.active = false;
         Ok(())
     }
 
-    pub(super) fn resume(&mut self) -> io::Result<()> {
+    pub(crate) fn resume(&mut self) -> io::Result<()> {
         if self.active {
             return Ok(());
         }
+
         let mut restore = RestoreOnDrop { armed: true };
         enable_raw_mode()?;
         activate_commands(self.terminal.backend_mut())?;
+        self.terminal.backend_mut().assume_cursor_hidden();
         TERMINAL_ACTIVE.store(true, Ordering::Release);
-        self.terminal.clear()?;
-        self.terminal.autoresize()?;
+        reset_after_resume(&mut self.terminal)?;
         restore.armed = false;
         self.active = true;
         Ok(())
     }
 }
 
-pub(super) fn seed_from_cached_frame<B: Backend>(
-    terminal: &mut Terminal<MeasuredBackend<B>>,
-) -> bool {
-    let Some(cached) = terminal.backend_mut().take_frame_cache() else {
-        return false;
-    };
-    {
-        let current = terminal.current_buffer_mut();
-        if current.area != cached.area {
-            return false;
-        }
-        current.clone_from(&cached);
-    }
-    terminal.backend_mut().restore_frame_cache(cached);
-    true
+fn reset_after_resume<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), B::Error> {
+    let area = terminal.size()?.into();
+    terminal.resize(area)
+}
+
+fn copy_to_clipboard(output: &mut impl Write, text: &str) -> io::Result<()> {
+    execute!(output, CopyToClipboard::to_clipboard_from(text))
 }
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
-        if self.active {
-            drop(self.terminal.show_cursor());
-            restore(self.terminal.backend_mut());
+        if !self.active {
+            return;
         }
+
+        drop(self.terminal.show_cursor());
+        restore_terminal(self.terminal.backend_mut());
     }
 }
 
 impl Drop for RestoreOnDrop {
     fn drop(&mut self) {
         if self.armed {
-            restore(&mut stdout());
+            restore_terminal(&mut stdout());
         }
     }
 }
 
-fn restore(output: &mut impl io::Write) {
-    TERMINAL_ACTIVE.store(false, Ordering::Release);
-    drop(disable_raw_mode());
-    restore_commands(output);
-}
-
-fn restore_commands(output: &mut impl io::Write) {
-    drop(execute!(
-        output,
-        EndSynchronizedUpdate,
-        Show,
-        PopKeyboardEnhancementFlags,
-        DisableFocusChange,
-        DisableMouseCapture,
-        DisableBracketedPaste,
-        LeaveAlternateScreen
-    ));
-}
-
-fn activate_commands(output: &mut impl io::Write) -> io::Result<()> {
+fn activate_commands(output: &mut impl Write) -> io::Result<()> {
     execute!(
         output,
         EnterAlternateScreen,
@@ -375,6 +326,25 @@ fn activate_commands(output: &mut impl io::Write) -> io::Result<()> {
     Ok(())
 }
 
+fn restore_terminal(output: &mut impl Write) {
+    TERMINAL_ACTIVE.store(false, Ordering::Release);
+    drop(disable_raw_mode());
+    restore_commands(output);
+}
+
+fn restore_commands(output: &mut impl Write) {
+    drop(execute!(
+        output,
+        EndSynchronizedUpdate,
+        Show,
+        PopKeyboardEnhancementFlags,
+        DisableFocusChange,
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    ));
+}
+
 fn begin_synchronized_update(output: &mut impl Write) -> io::Result<()> {
     queue!(output, BeginSynchronizedUpdate)
 }
@@ -388,7 +358,7 @@ fn install_panic_hook() {
         let previous = panic::take_hook();
         panic::set_hook(Box::new(move |info| {
             if TERMINAL_ACTIVE.swap(false, Ordering::AcqRel) {
-                restore(&mut stdout());
+                restore_terminal(&mut stdout());
             }
             previous(info);
         }));
@@ -397,17 +367,22 @@ fn install_panic_hook() {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, io::Write, rc::Rc};
-
-    use ratatui::{Terminal, backend::TestBackend, text::Text, widgets::Paragraph};
-
     use super::{
-        ByteCountingWriter, MeasuredBackend, begin_synchronized_update, end_synchronized_update,
-        restore_commands, seed_from_cached_frame,
+        MeasuredBackend, StableCursorBackend, activate_commands, begin_synchronized_update,
+        copy_to_clipboard, end_synchronized_update, reset_after_resume, restore_commands,
     };
+    use crate::{
+        app::config::ReasoningEffort,
+        tui::{
+            components::{AppNode, RootNode},
+            theme::Theme,
+        },
+    };
+    use std::path::Path;
+    use tact_ratatui::{Terminal, backend::TestBackend, layout::Position};
 
     #[test]
-    fn synchronized_update_uses_csi_2026() {
+    fn synchronized_updates_use_csi_2026() {
         let mut output = Vec::new();
 
         begin_synchronized_update(&mut output).unwrap();
@@ -417,115 +392,127 @@ mod tests {
     }
 
     #[test]
-    fn restoration_ends_sync_before_leaving_the_alternate_screen() {
+    fn activation_requests_terminal_focus_changes() {
+        let mut output = Vec::new();
+
+        activate_commands(&mut output).unwrap();
+
+        assert!(output.windows(8).any(|window| window == b"\x1b[?1004h"));
+    }
+
+    #[test]
+    fn restoration_ends_sync_and_restores_input_modes() {
         let mut output = Vec::new();
 
         restore_commands(&mut output);
 
         assert!(output.starts_with(b"\x1b[?2026l\x1b[?25h"));
+        assert!(output.windows(5).any(|window| window == b"\x1b[<1u"));
+        assert!(output.windows(8).any(|window| window == b"\x1b[?1004l"));
+        assert!(output.windows(8).any(|window| window == b"\x1b[?1000l"));
+        assert!(output.windows(8).any(|window| window == b"\x1b[?2004l"));
         assert!(output.ends_with(b"\x1b[?1049l"));
     }
 
     #[test]
-    fn writer_counts_only_bytes_accepted_by_the_terminal() {
-        let bytes = Rc::new(Cell::new(0));
-        let mut writer = ByteCountingWriter {
-            inner: Vec::new(),
-            bytes: Rc::clone(&bytes),
-        };
+    fn clipboard_copy_uses_osc_52() {
+        let mut output = Vec::new();
 
-        writer.write_all(b"abcdef").unwrap();
+        copy_to_clipboard(&mut output, "copy me").unwrap();
 
-        assert_eq!(bytes.get(), 6);
-        assert_eq!(writer.inner, b"abcdef");
+        assert_eq!(output, b"\x1b]52;c;Y29weSBtZQ==\x1b\\");
     }
 
     #[test]
-    fn measured_backend_counts_ratatui_diff_cells() {
-        let backend = MeasuredBackend::new(TestBackend::new(20, 2));
+    fn unchanged_frames_produce_zero_ratatui_diff_cells() {
+        let backend = MeasuredBackend {
+            inner: TestBackend::new(40, 5),
+            changed_cells: 0,
+            cursor_reads: 0,
+            cursor_hides: 0,
+            cursor_shows: 0,
+        };
         let mut terminal = Terminal::new(backend).unwrap();
+        let root = RootNode::new(Path::new("/work"), ReasoningEffort::Medium);
+        let mut app = AppNode::new(Theme::default(), Path::new("/work").to_path_buf(), root);
 
-        terminal
-            .draw(|frame| frame.render_widget(Paragraph::new(Text::raw("hello")), frame.area()))
-            .unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
         assert!(terminal.backend().changed_cells > 0);
 
         terminal.backend_mut().changed_cells = 0;
-        terminal
-            .draw(|frame| frame.render_widget(Paragraph::new(Text::raw("hello")), frame.area()))
-            .unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
         assert_eq!(terminal.backend().changed_cells, 0);
     }
 
     #[test]
-    fn cached_frame_seeds_unchanged_cells_for_partial_redraws() {
-        let backend = MeasuredBackend::with_frame_cache(TestBackend::new(20, 2));
+    fn resuming_does_not_query_the_terminal_cursor() {
+        let backend = MeasuredBackend {
+            inner: TestBackend::new(40, 5),
+            changed_cells: 0,
+            cursor_reads: 0,
+            cursor_hides: 0,
+            cursor_shows: 0,
+        };
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| {
-                frame.render_widget(Paragraph::new(Text::raw("static content")), frame.area());
-            })
-            .unwrap();
 
-        assert!(seed_from_cached_frame(&mut terminal));
-        terminal
-            .draw(|frame| {
-                frame.buffer_mut()[(0, 1)].set_symbol("x");
-            })
-            .unwrap();
+        reset_after_resume(&mut terminal).unwrap();
 
-        let rendered = terminal.backend().inner.buffer();
-        assert_eq!(rendered[(0, 0)].symbol(), "s");
-        assert_eq!(rendered[(0, 1)].symbol(), "x");
-
-        assert!(seed_from_cached_frame(&mut terminal));
-        terminal
-            .draw(|frame| {
-                frame.buffer_mut()[(1, 1)].set_symbol("y");
-            })
-            .unwrap();
-        let rendered = terminal.backend().inner.buffer();
-        assert_eq!(rendered[(0, 0)].symbol(), "s");
-        assert_eq!(rendered[(0, 1)].symbol(), "x");
-        assert_eq!(rendered[(1, 1)].symbol(), "y");
+        assert_eq!(terminal.backend().cursor_reads, 0);
     }
 
     #[test]
-    fn clearing_the_terminal_invalidates_the_frame_cache() {
-        let backend = MeasuredBackend::with_frame_cache(TestBackend::new(20, 2));
+    fn unchanged_cursor_visibility_does_not_reach_the_terminal() {
+        let measured = MeasuredBackend {
+            inner: TestBackend::new(10, 2),
+            changed_cells: 0,
+            cursor_reads: 0,
+            cursor_hides: 0,
+            cursor_shows: 0,
+        };
+        let backend = StableCursorBackend::hidden(measured);
         let mut terminal = Terminal::new(backend).unwrap();
+
         terminal
-            .draw(|frame| {
-                frame.render_widget(Paragraph::new(Text::raw("static content")), frame.area());
-            })
+            .draw(|frame| frame.set_cursor_position(Position::new(0, 0)))
             .unwrap();
-        assert!(seed_from_cached_frame(&mut terminal));
+        terminal
+            .draw(|frame| frame.set_cursor_position(Position::new(1, 0)))
+            .unwrap();
+        terminal.draw(|_| {}).unwrap();
+        terminal.draw(|_| {}).unwrap();
 
-        terminal.clear().unwrap();
-
-        assert!(!seed_from_cached_frame(&mut terminal));
+        assert_eq!(terminal.backend().inner.cursor_shows, 1);
+        assert_eq!(terminal.backend().inner.cursor_hides, 1);
     }
 
     #[test]
-    fn resizing_invalidates_then_rebuilds_the_frame_cache() {
-        let backend = MeasuredBackend::with_frame_cache(TestBackend::new(20, 2));
+    fn invalidated_cursor_visibility_is_reasserted_once() {
+        let measured = MeasuredBackend {
+            inner: TestBackend::new(10, 2),
+            changed_cells: 0,
+            cursor_reads: 0,
+            cursor_hides: 0,
+            cursor_shows: 0,
+        };
+        let backend = StableCursorBackend::hidden(measured);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| {
-                frame.render_widget(Paragraph::new(Text::raw("before resize")), frame.area());
-            })
-            .unwrap();
-        assert!(seed_from_cached_frame(&mut terminal));
-
-        terminal.backend_mut().inner.resize(30, 3);
-        terminal.autoresize().unwrap();
-        assert!(!seed_from_cached_frame(&mut terminal));
 
         terminal
-            .draw(|frame| {
-                frame.render_widget(Paragraph::new(Text::raw("after resize")), frame.area());
-            })
+            .draw(|frame| frame.set_cursor_position(Position::new(0, 0)))
             .unwrap();
-        assert!(seed_from_cached_frame(&mut terminal));
+        terminal.backend_mut().invalidate_cursor_visibility();
+        terminal
+            .draw(|frame| frame.set_cursor_position(Position::new(1, 0)))
+            .unwrap();
+        terminal
+            .draw(|frame| frame.set_cursor_position(Position::new(2, 0)))
+            .unwrap();
+
+        terminal.backend_mut().invalidate_cursor_visibility();
+        terminal.draw(|_| {}).unwrap();
+        terminal.draw(|_| {}).unwrap();
+
+        assert_eq!(terminal.backend().inner.cursor_shows, 2);
+        assert_eq!(terminal.backend().inner.cursor_hides, 1);
     }
 }
