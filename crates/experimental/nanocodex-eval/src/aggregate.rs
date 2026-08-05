@@ -712,7 +712,7 @@ impl AttemptTaskIdentity {
                 ),
                 environment_mode: Some(task.verifier().environment_mode().as_str().to_owned()),
                 timeout_ns: Some(duration_ns_saturating(task.verifier().timeout())),
-                scoring_policy: "all_rewards_positive-v1".to_owned(),
+                scoring_policy: task.verifier().scoring_policy().as_str().to_owned(),
             },
         }
     }

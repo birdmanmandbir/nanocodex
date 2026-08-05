@@ -20,7 +20,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{Resources, Task, TaskLoadError, TaskOutput};
+use crate::{Resources, ScoringPolicy, Task, TaskLoadError, TaskOutput};
 
 const IMPORT_SCHEMA: &str = "nanocodex-import-v1";
 const PLAN_INDEX_SCHEMA: &str = "nanocodex-import-plan-index-v1";
@@ -100,6 +100,7 @@ struct HermeticCase {
     agent_timeout: Duration,
     agent_instructions: Option<String>,
     verifier_timeout: Duration,
+    scoring_policy: ScoringPolicy,
     allow_internet: bool,
 }
 
@@ -697,6 +698,7 @@ impl CasePlan {
                 agent_timeout: Duration::from_secs(900),
                 agent_instructions: None,
                 verifier_timeout: Duration::from_secs(300),
+                scoring_policy: ScoringPolicy::AllRewardsPositive,
                 allow_internet: true,
             },
         })
@@ -754,6 +756,13 @@ impl HermeticCasePlan {
     pub const fn timeouts(mut self, agent: Duration, verifier: Duration) -> Self {
         self.case.agent_timeout = agent;
         self.case.verifier_timeout = verifier;
+        self
+    }
+
+    /// Selects how numeric verifier rewards map to binary pass/fail status.
+    #[must_use]
+    pub const fn scoring_policy(mut self, policy: ScoringPolicy) -> Self {
+        self.case.scoring_policy = policy;
         self
     }
 
@@ -867,6 +876,7 @@ fn materialize_hermetic_case(
         verifier: GeneratedVerifier {
             timeout_sec: case.verifier_timeout.as_secs_f64(),
             environment_mode: if separate { "separate" } else { "same" },
+            scoring_policy: case.scoring_policy,
         },
         environment: GeneratedEnvironment {
             docker_image: image.as_deref(),
@@ -931,6 +941,7 @@ struct GeneratedPhase<'a> {
 struct GeneratedVerifier<'a> {
     timeout_sec: f64,
     environment_mode: &'a str,
+    scoring_policy: ScoringPolicy,
 }
 
 #[derive(Serialize)]
@@ -1121,6 +1132,8 @@ mod tests {
 
     use tempfile::tempdir;
 
+    use crate::ScoringPolicy;
+
     use super::{
         CasePlan, DatasetImporter, DatasetPlan, Environment, Harness, ImportError, ImportStore,
         SourceIdentity,
@@ -1160,6 +1173,7 @@ mod tests {
                     Environment::Dockerfile(self.environment.to_path_buf()),
                     Harness::directory(self.harness)?,
                 )?
+                .scoring_policy(ScoringPolicy::AllRewardsOne)
                 .environment_file("data_files/input.csv", self.contents, 0o644)?,
             ))
         }
@@ -1230,6 +1244,10 @@ mod tests {
             )
             .unwrap(),
             b"value\n1\n"
+        );
+        assert_eq!(
+            first.tasks()[0].verifier().scoring_policy(),
+            ScoringPolicy::AllRewardsOne
         );
         assert_ne!(first.digest(), changed.digest());
     }

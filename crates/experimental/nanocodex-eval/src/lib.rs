@@ -129,8 +129,8 @@ pub use result::{
 };
 pub use sweep::{AgentId, AgentIdError, Sweep, SweepBuilder, SweepError};
 pub use task::{
-    NetworkPolicy, OciImage, Resources, Task, TaskArtifact, TaskLoadError, TaskOutput, Verifier,
-    VerifierCollect, VerifierEnvironmentMode,
+    NetworkPolicy, OciImage, Resources, ScoringPolicy, Task, TaskArtifact, TaskLoadError,
+    TaskOutput, Verifier, VerifierCollect, VerifierEnvironmentMode,
 };
 #[cfg(any(
     all(target_os = "linux", not(target_env = "musl")),

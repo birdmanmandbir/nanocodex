@@ -51,6 +51,18 @@ pub struct Verifier {
     environment: BTreeMap<String, String>,
     environment_mode: VerifierEnvironmentMode,
     collect: Vec<VerifierCollect>,
+    scoring_policy: ScoringPolicy,
+}
+
+/// Binary classification applied to benchmark-owned numeric rewards.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScoringPolicy {
+    /// Every named reward must be strictly positive.
+    #[default]
+    AllRewardsPositive,
+    /// Every named reward must be exactly one.
+    AllRewardsOne,
 }
 
 /// Whether verification reuses the agent environment or a separate image.
@@ -286,6 +298,7 @@ impl Task {
                 environment: raw.verifier.env,
                 environment_mode: raw.verifier.environment_mode,
                 collect: raw.verifier.collect,
+                scoring_policy: raw.verifier.scoring_policy,
             },
             artifacts: raw
                 .artifacts
@@ -613,6 +626,34 @@ impl Verifier {
     pub fn collect(&self) -> &[VerifierCollect] {
         &self.collect
     }
+
+    /// Returns the benchmark-owned binary classification policy.
+    #[must_use]
+    pub const fn scoring_policy(&self) -> ScoringPolicy {
+        self.scoring_policy
+    }
+}
+
+impl ScoringPolicy {
+    /// Classifies a non-empty set of finite verifier rewards.
+    #[must_use]
+    pub fn passes(self, rewards: &BTreeMap<String, f64>) -> bool {
+        match self {
+            Self::AllRewardsPositive => rewards.values().all(|reward| *reward > 0.0),
+            Self::AllRewardsOne => rewards
+                .values()
+                .all(|reward| reward.to_bits() == 1.0_f64.to_bits()),
+        }
+    }
+
+    /// Returns the stable retained-evidence spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AllRewardsPositive => "all_rewards_positive-v1",
+            Self::AllRewardsOne => "all_rewards_one-v1",
+        }
+    }
 }
 
 impl VerifierCollect {
@@ -793,6 +834,8 @@ struct RawVerifier {
     collect: Vec<VerifierCollect>,
     #[serde(default)]
     network_mode: Option<RawNetworkMode>,
+    #[serde(default)]
+    scoring_policy: ScoringPolicy,
 }
 
 #[derive(Deserialize)]
@@ -990,7 +1033,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{NetworkPolicy, Task, VerifierEnvironmentMode};
+    use super::{NetworkPolicy, ScoringPolicy, Task, VerifierEnvironmentMode};
 
     #[test]
     fn loads_terminal_bench_2_1_task_directory() {
@@ -1047,6 +1090,10 @@ MODE = "test"
         assert_eq!(task.network(), NetworkPolicy::Disabled);
         assert_eq!(task.environment()["MODE"], "test");
         assert_eq!(task.verifier().environment()["ANSWER"], "42");
+        assert_eq!(
+            task.verifier().scoring_policy(),
+            ScoringPolicy::AllRewardsPositive
+        );
         assert!(task.requires_compose());
         let materialized = tempdir().unwrap();
         task.materialize_environment(materialized.path()).unwrap();
@@ -1054,6 +1101,17 @@ MODE = "test"
             fs::read_to_string(materialized.path().join("Dockerfile")).unwrap(),
             "FROM example/task:20251031\n"
         );
+    }
+
+    #[test]
+    fn scoring_policies_distinguish_partial_from_exact_continuous_rewards() {
+        let partial = std::collections::BTreeMap::from([("f1".to_owned(), 2.0 / 3.0)]);
+        let exact = std::collections::BTreeMap::from([("f1".to_owned(), 1.0)]);
+
+        assert!(ScoringPolicy::AllRewardsPositive.passes(&partial));
+        assert!(!ScoringPolicy::AllRewardsOne.passes(&partial));
+        assert!(ScoringPolicy::AllRewardsOne.passes(&exact));
+        assert_eq!(ScoringPolicy::AllRewardsOne.as_str(), "all_rewards_one-v1");
     }
 
     #[test]

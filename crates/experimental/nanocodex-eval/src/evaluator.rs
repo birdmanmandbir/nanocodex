@@ -981,7 +981,7 @@ impl Evaluator {
         });
         emitter.emit(EvalEventKind::VerifierCompleted(verifier.result.clone()));
 
-        let status = verifier_status(&verifier.result);
+        let status = verifier_status(&task, &verifier.result);
         let score_outcome = match status {
             EvalStatus::Passed => EvalOutcome::Passed,
             EvalStatus::Failed => EvalOutcome::VerifierFailed,
@@ -1119,7 +1119,10 @@ impl Evaluator {
         .instrument(span.clone())
         .await;
         if let Ok(verifier) = &result {
-            let passed = verifier.result.rewards.values().all(|reward| *reward > 0.0);
+            let passed = task
+                .verifier()
+                .scoring_policy()
+                .passes(&verifier.result.rewards);
             span.record("process.exit.code", verifier.result.exit_code);
             span.record(
                 "verifier.reward.total",
@@ -3399,8 +3402,8 @@ fn validate_attempt_environment(task: &Task, custom_backend: bool) -> Result<(),
     Ok(())
 }
 
-fn verifier_status(verifier: &crate::VerifierResult) -> EvalStatus {
-    if verifier.rewards.values().all(|reward| *reward > 0.0) {
+fn verifier_status(task: &Task, verifier: &crate::VerifierResult) -> EvalStatus {
+    if task.verifier().scoring_policy().passes(&verifier.rewards) {
         EvalStatus::Passed
     } else {
         EvalStatus::Failed

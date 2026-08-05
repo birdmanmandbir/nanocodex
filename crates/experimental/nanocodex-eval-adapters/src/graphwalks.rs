@@ -1,7 +1,7 @@
 use std::{fs::File, path::PathBuf, time::Duration};
 
 use nanocodex_eval::{
-    Resources, TaskOutput,
+    Resources, ScoringPolicy, TaskOutput,
     import::{
         CasePlan, DatasetImporter, DatasetPlan, Environment, Harness, ImportError, SourceIdentity,
     },
@@ -96,6 +96,7 @@ impl DatasetImporter for GraphWalks {
                         gpus: 0,
                     })
                     .timeouts(Duration::from_secs(1_800), Duration::from_secs(60))
+                    .scoring_policy(ScoringPolicy::AllRewardsOne)
                     .harness_file("expected.json", expected, 0o600)?,
                 );
             }

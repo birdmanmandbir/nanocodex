@@ -1366,7 +1366,7 @@ impl HarborTrialLock {
                 verifier_environment_mode: task.verifier().environment_mode().as_str().to_owned(),
                 verifier_timeout_ns: u64::try_from(task.verifier().timeout().as_nanos())
                     .unwrap_or(u64::MAX),
-                scoring_policy: "all_rewards_positive-v1".to_owned(),
+                scoring_policy: task.verifier().scoring_policy().as_str().to_owned(),
             },
             install_only: false,
             timeout_multiplier: 1.0,

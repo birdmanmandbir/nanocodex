@@ -120,7 +120,11 @@ async fn resolve_vm_guest_runtime_source(prebuilt: Option<&Path>) -> Result<Sour
         "hit"
     } else {
         let previous_runtime = file_metadata_snapshot(&runtime)?;
-        let exit = vm_guest_build_command(workspace).status().await?;
+        let exit = vm_guest_build_command(workspace).status().await.map_err(|error| {
+            eyre!(
+                "failed to start Cargo while building the VM guest runtime: {error}; set CARGO to the Cargo executable or make cargo available on PATH"
+            )
+        })?;
         if !exit.success() {
             return Err(eyre!("building the VM guest runtime failed with {exit}"));
         }
