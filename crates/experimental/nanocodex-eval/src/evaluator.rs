@@ -2939,6 +2939,9 @@ fn failure_outcome(error: &EvalError) -> EvalOutcome {
     match error {
         EvalError::Nanocodex(error) if is_safety_refusal(error) => EvalOutcome::SafetyRefusal,
         EvalError::Codex(error) if error.is_safety_refusal() => EvalOutcome::SafetyRefusal,
+        EvalError::Nanocodex(error) if is_context_window_exceeded(error) => {
+            EvalOutcome::ContextWindowExceeded
+        }
         EvalError::AgentTimeout(_) => EvalOutcome::AgentTimeout,
         _ => EvalOutcome::InfrastructureError,
     }
@@ -2951,6 +2954,9 @@ fn failure_kind(error: &EvalError) -> EvalExceptionKind {
         }
         EvalError::Codex(error) if error.is_safety_refusal() => {
             EvalExceptionKind::AgentSafetyRefusal
+        }
+        EvalError::Nanocodex(error) if is_context_window_exceeded(error) => {
+            EvalExceptionKind::ModelContextWindow
         }
         EvalError::Nanocodex(error)
             if error
@@ -3137,6 +3143,12 @@ fn is_safety_refusal(error: &NanocodexError) -> bool {
                 .and_then(|error| error.code)
         })
         .is_some_and(|code| code == "cyber_policy")
+}
+
+fn is_context_window_exceeded(error: &NanocodexError) -> bool {
+    error
+        .responses_error()
+        .is_some_and(ResponsesError::is_context_window_exceeded)
 }
 
 fn error_traceback(error: &dyn Error) -> String {

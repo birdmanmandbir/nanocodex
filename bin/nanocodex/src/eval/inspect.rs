@@ -462,6 +462,7 @@ fn trial_classification(
                 outcome,
                 EvalOutcome::SafetyRefusal
                     | EvalOutcome::AgentTimeout
+                    | EvalOutcome::ContextWindowExceeded
                     | EvalOutcome::InfrastructureError
             ),
         ),

@@ -409,6 +409,19 @@ fn classifies_cyber_policy_as_an_agent_safety_refusal() {
 }
 
 #[test]
+fn classifies_context_window_rejection_as_a_model_limit() {
+    let error = EvalError::Nanocodex(NanocodexError::Response(
+        ResponsesError::ContextWindowExceeded {
+            event: r#"{"type":"error","error":{"code":"context_length_exceeded"}}"#.to_owned(),
+        }
+        .into(),
+    ));
+
+    assert_eq!(failure_outcome(&error), EvalOutcome::ContextWindowExceeded);
+    assert_eq!(failure_kind(&error), EvalExceptionKind::ModelContextWindow);
+}
+
+#[test]
 fn classifies_stock_codex_policy_rejection_as_an_agent_safety_refusal() {
     let error = EvalError::Codex(crate::CodexExecError::SafetyRefusal(
         "flagged for possible cybersecurity risk".to_owned(),

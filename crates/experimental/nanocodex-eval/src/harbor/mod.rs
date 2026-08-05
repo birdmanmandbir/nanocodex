@@ -1930,6 +1930,7 @@ fn retained_exception_kind(exception_type: &str) -> Option<EvalExceptionKind> {
         "AgentSafetyRefusalError" => Some(EvalExceptionKind::AgentSafetyRefusal),
         "AgentAuthenticationError" => Some(EvalExceptionKind::AgentAuthentication),
         "AgentTimeoutError" => Some(EvalExceptionKind::AgentTimeout),
+        "ModelContextWindowError" => Some(EvalExceptionKind::ModelContextWindow),
         "VerifierTimeoutError" => Some(EvalExceptionKind::VerifierTimeout),
         "AgentError" => Some(EvalExceptionKind::Agent),
         "VerifierError" => Some(EvalExceptionKind::Verifier),
@@ -2206,6 +2207,7 @@ fn retained_lifecycle_classification(
                 outcome,
                 EvalOutcome::SafetyRefusal
                     | EvalOutcome::AgentTimeout
+                    | EvalOutcome::ContextWindowExceeded
                     | EvalOutcome::InfrastructureError
             ),
             outcome == EvalOutcome::SafetyRefusal,

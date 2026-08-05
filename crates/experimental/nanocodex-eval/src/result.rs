@@ -45,6 +45,8 @@ pub enum EvalOutcome {
     SafetyRefusal,
     /// Agent execution exceeded its task deadline.
     AgentTimeout,
+    /// The selected model rejected the benchmark input as larger than its context window.
+    ContextWindowExceeded,
     /// The attempt did not produce trustworthy verifier evidence.
     InfrastructureError,
 }
@@ -73,6 +75,8 @@ pub enum EvalExceptionKind {
     AgentAuthentication,
     /// Agent execution exceeded the task deadline.
     AgentTimeout,
+    /// The selected model rejected the benchmark input as larger than its context window.
+    ModelContextWindow,
     /// Verifier execution exceeded its deadline.
     VerifierTimeout,
     /// Agent setup or execution failed.
@@ -509,6 +513,7 @@ impl EvalExceptionKind {
             Self::AgentSafetyRefusal => "AgentSafetyRefusalError",
             Self::AgentAuthentication => "AgentAuthenticationError",
             Self::AgentTimeout => "AgentTimeoutError",
+            Self::ModelContextWindow => "ModelContextWindowError",
             Self::VerifierTimeout => "VerifierTimeoutError",
             Self::Agent => "AgentError",
             Self::Verifier => "VerifierError",
