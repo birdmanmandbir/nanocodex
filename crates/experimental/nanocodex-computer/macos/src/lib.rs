@@ -54,18 +54,22 @@ use core_graphics::{
     geometry::{CGPoint, CGRect, CGSize},
     window::{
         copy_window_info, create_image, kCGNullWindowID, kCGWindowBounds,
-        kCGWindowImageBestResolution, kCGWindowImageBoundsIgnoreFraming, kCGWindowIsOnscreen,
-        kCGWindowLayer, kCGWindowListExcludeDesktopElements, kCGWindowListOptionAll,
+        kCGWindowImageBestResolution, kCGWindowImageBoundsIgnoreFraming,
+        kCGWindowImageNominalResolution, kCGWindowIsOnscreen, kCGWindowLayer,
+        kCGWindowListExcludeDesktopElements, kCGWindowListOptionAll,
         kCGWindowListOptionIncludingWindow, kCGWindowName, kCGWindowNumber, kCGWindowOwnerName,
         kCGWindowOwnerPID,
     },
 };
-use objc2::{AnyThread, MainThreadMarker, MainThreadOnly, rc::Retained};
+use objc2::{
+    AnyThread, MainThreadMarker, MainThreadOnly,
+    rc::{Retained, autoreleasepool},
+};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy,
     NSAutoresizingMaskOptions, NSBackingStoreType, NSBitmapImageRep, NSColor, NSCursor,
     NSDeviceRGBColorSpace, NSEventMask, NSFloatingWindowLevel, NSImage, NSImageScaling,
-    NSImageView, NSPanel, NSRunningApplication, NSScreen, NSWindowCollectionBehavior,
+    NSImageView, NSPanel, NSRunningApplication, NSScreen, NSView, NSWindowCollectionBehavior,
     NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{NSData, NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize, NSString};
@@ -99,6 +103,7 @@ pub fn enable_application_accessibility(application: &AXUIElement) -> Accessibil
 
 const SYNTHETIC_MARKER: i64 = 0x004e_414e_4f43_4458;
 const MAX_CAPTURE_PIXELS: usize = 25_000_000;
+const MAX_LIVE_CAPTURE_PIXELS: usize = 300_000;
 static ACCESSIBILITY_REQUESTED: AtomicBool = AtomicBool::new(false);
 static SCREEN_CAPTURE_REQUESTED: AtomicBool = AtomicBool::new(false);
 static CAPTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -229,18 +234,22 @@ impl std::error::Error for CaptureWindowError {}
 /// Enumerates all non-desktop layer-zero windows with their owning application.
 #[must_use]
 pub fn windows() -> Vec<NativeWindow> {
-    native_windows(
-        kCGWindowListOptionAll | kCGWindowListExcludeDesktopElements,
-        kCGNullWindowID,
-    )
+    autoreleasepool(|_| {
+        native_windows(
+            kCGWindowListOptionAll | kCGWindowListExcludeDesktopElements,
+            kCGNullWindowID,
+        )
+    })
 }
 
 /// Looks up one layer-zero CoreGraphics window without enumerating every application.
 #[must_use]
 pub fn window(window_id: u32) -> Option<NativeWindow> {
-    native_windows(kCGWindowListOptionIncludingWindow, window_id)
-        .into_iter()
-        .find(|window| window.id == window_id)
+    autoreleasepool(|_| {
+        native_windows(kCGWindowListOptionIncludingWindow, window_id)
+            .into_iter()
+            .find(|window| window.id == window_id)
+    })
 }
 
 fn native_windows(options: u32, relative_to: u32) -> Vec<NativeWindow> {
@@ -290,7 +299,12 @@ fn native_window(dictionary: &CFDictionary<CFString, CFType>) -> Option<NativeWi
 /// Captures one window by ID without compositing other windows above it.
 pub fn capture_window(window_id: u32) -> Result<NativeImage, CaptureWindowError> {
     capture_window_service(window_id).or_else(|service_error| {
-        capture_window_legacy(window_id).ok_or_else(|| CaptureWindowError {
+        capture_window_legacy(
+            window_id,
+            MAX_CAPTURE_PIXELS,
+            kCGWindowImageBestResolution,
+        )
+        .ok_or_else(|| CaptureWindowError {
             message: format!(
                 "macOS screenshot service failed ({service_error}); the in-process Quartz fallback also returned no image"
             ),
@@ -303,7 +317,12 @@ pub fn capture_window(window_id: u32) -> Result<NativeImage, CaptureWindowError>
 /// This is intended for live human-facing previews. Model observations use
 /// [`capture_window`] so they retain the more reliable screenshot-service fallback.
 pub fn capture_window_in_process(window_id: u32) -> Result<NativeImage, CaptureWindowError> {
-    capture_window_legacy(window_id).ok_or_else(|| CaptureWindowError {
+    capture_window_legacy(
+        window_id,
+        MAX_LIVE_CAPTURE_PIXELS,
+        kCGWindowImageNominalResolution,
+    )
+    .ok_or_else(|| CaptureWindowError {
         message: format!("window {window_id} is unavailable to in-process capture"),
     })
 }
@@ -394,26 +413,33 @@ fn png_dimensions(png: &[u8]) -> Result<(u32, u32), CaptureWindowError> {
     Ok((width, height))
 }
 
-fn capture_window_legacy(window_id: u32) -> Option<NativeImage> {
+fn capture_window_legacy(
+    window_id: u32,
+    maximum_pixels: usize,
+    resolution: u32,
+) -> Option<NativeImage> {
     let bounds = CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(0.0, 0.0));
     let image = create_image(
         bounds,
         kCGWindowListOptionIncludingWindow,
         window_id,
-        kCGWindowImageBoundsIgnoreFraming | kCGWindowImageBestResolution,
+        kCGWindowImageBoundsIgnoreFraming | resolution,
     )?;
-    render_image(&image)
+    render_image(&image, maximum_pixels)
 }
 
-fn render_image(image: &core_graphics::image::CGImage) -> Option<NativeImage> {
+fn render_image(
+    image: &core_graphics::image::CGImage,
+    maximum_pixels: usize,
+) -> Option<NativeImage> {
     let source_width = image.width();
     let source_height = image.height();
     if source_width == 0 || source_height == 0 || source_width > 16_384 || source_height > 16_384 {
         return None;
     }
     let source_pixels = source_width.checked_mul(source_height)?;
-    let scale = if source_pixels > MAX_CAPTURE_PIXELS {
-        (MAX_CAPTURE_PIXELS as f64 / source_pixels as f64).sqrt()
+    let scale = if source_pixels > maximum_pixels {
+        (maximum_pixels as f64 / source_pixels as f64).sqrt()
     } else {
         1.0
     };
@@ -510,6 +536,7 @@ pub struct NativePipWindow {
     panel: Retained<NSPanel>,
     image_view: Retained<NSImageView>,
     cursor_view: Retained<NSImageView>,
+    agent_cursor_halo: Retained<NSView>,
     agent_cursor_view: Retained<NSImageView>,
     cursor_source: CGEventSource,
     source_frame: Cell<Option<CGRect>>,
@@ -591,12 +618,28 @@ impl NativePipWindow {
         cursor_view.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
         cursor_view.setHidden(true);
         image_view.addSubview(&cursor_view);
+        let agent_cursor_halo = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(18.0, 18.0)),
+        );
+        agent_cursor_halo.setWantsLayer(true);
+        if let Some(layer) = agent_cursor_halo.layer() {
+            let cyan = NSColor::systemCyanColor().CGColor();
+            layer.setBackgroundColor(Some(&cyan));
+            layer.setCornerRadius(9.0);
+            layer.setShadowColor(Some(&cyan));
+            layer.setShadowOpacity(0.85);
+            layer.setShadowRadius(5.0);
+        }
+        agent_cursor_halo.setHidden(true);
+        image_view.addSubview(&agent_cursor_halo);
         let agent_cursor_view = NSImageView::initWithFrame(
             NSImageView::alloc(mtm),
             NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(22.0, 29.0)),
         );
         agent_cursor_view.setImage(Some(&NSCursor::arrowCursor().image()));
         agent_cursor_view.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
+        agent_cursor_view.setAlphaValue(0.92);
         agent_cursor_view.setHidden(true);
         image_view.addSubview(&agent_cursor_view);
         panel.setContentView(Some(&image_view));
@@ -608,6 +651,7 @@ impl NativePipWindow {
             panel,
             image_view,
             cursor_view,
+            agent_cursor_halo,
             agent_cursor_view,
             cursor_source,
             source_frame: Cell::new(None),
@@ -618,10 +662,17 @@ impl NativePipWindow {
 
     /// Updates the global source-window geometry used to place the cursor overlay.
     pub fn set_source_frame(&self, x: f64, y: f64, width: f64, height: f64) {
-        self.source_frame.set(Some(CGRect::new(
-            &CGPoint::new(x, y),
-            &CGSize::new(width, height),
-        )));
+        let source = CGRect::new(&CGPoint::new(x, y), &CGSize::new(width, height));
+        self.source_frame.set(Some(source));
+        if self.agent_cursor.get().is_none_or(|cursor| {
+            cursor.x < x || cursor.x > x + width || cursor.y < y || cursor.y > y + height
+        }) {
+            self.agent_cursor.set(Some(AgentCursor {
+                x: x + width / 2.0,
+                y: y + height / 2.0,
+                pressed_until: None,
+            }));
+        }
     }
 
     /// Updates the independent logical cursor used by background agent input.
@@ -644,13 +695,16 @@ impl NativePipWindow {
 
     /// Replaces the displayed frame from complete PNG bytes.
     pub fn update_png(&self, png: &[u8]) -> Result<(), NativePipWindowError> {
-        MainThreadMarker::new().ok_or(NativePipWindowError)?;
-        // SAFETY: NSData copies exactly `png.len()` initialized bytes during the
-        // call and does not retain the borrowed Rust pointer.
-        let data =
-            unsafe { NSData::dataWithBytes_length(png.as_ptr().cast::<c_void>(), png.len()) };
-        let image = NSImage::initWithData(NSImage::alloc(), &data).ok_or(NativePipWindowError)?;
-        self.present_image(&image)
+        autoreleasepool(|_| {
+            MainThreadMarker::new().ok_or(NativePipWindowError)?;
+            // SAFETY: NSData copies exactly `png.len()` initialized bytes during the
+            // call and does not retain the borrowed Rust pointer.
+            let data =
+                unsafe { NSData::dataWithBytes_length(png.as_ptr().cast::<c_void>(), png.len()) };
+            let image =
+                NSImage::initWithData(NSImage::alloc(), &data).ok_or(NativePipWindowError)?;
+            self.present_image(&image)
+        })
     }
 
     /// Replaces the displayed frame from tightly packed premultiplied RGBA8 pixels.
@@ -660,46 +714,48 @@ impl NativePipWindow {
         width: u32,
         height: u32,
     ) -> Result<(), NativePipWindowError> {
-        MainThreadMarker::new().ok_or(NativePipWindowError)?;
-        let width = usize::try_from(width).map_err(|_| NativePipWindowError)?;
-        let height = usize::try_from(height).map_err(|_| NativePipWindowError)?;
-        let bytes_per_row = width.checked_mul(4).ok_or(NativePipWindowError)?;
-        let expected = bytes_per_row
-            .checked_mul(height)
+        autoreleasepool(|_| {
+            MainThreadMarker::new().ok_or(NativePipWindowError)?;
+            let width = usize::try_from(width).map_err(|_| NativePipWindowError)?;
+            let height = usize::try_from(height).map_err(|_| NativePipWindowError)?;
+            let bytes_per_row = width.checked_mul(4).ok_or(NativePipWindowError)?;
+            let expected = bytes_per_row
+                .checked_mul(height)
+                .ok_or(NativePipWindowError)?;
+            if rgba.len() != expected {
+                return Err(NativePipWindowError);
+            }
+            // SAFETY: A null planes pointer asks AppKit to allocate the bitmap.
+            // The validated dimensions and row stride describe the complete RGBA8
+            // buffer copied immediately below.
+            let representation = unsafe {
+                NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+                    NSBitmapImageRep::alloc(),
+                    std::ptr::null_mut(),
+                    width as isize,
+                    height as isize,
+                    8,
+                    4,
+                    true,
+                    false,
+                    NSDeviceRGBColorSpace,
+                    bytes_per_row as isize,
+                    32,
+                )
+            }
             .ok_or(NativePipWindowError)?;
-        if rgba.len() != expected {
-            return Err(NativePipWindowError);
-        }
-        // SAFETY: A null planes pointer asks AppKit to allocate the bitmap.
-        // The validated dimensions and row stride describe the complete RGBA8
-        // buffer copied immediately below.
-        let representation = unsafe {
-            NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
-                NSBitmapImageRep::alloc(),
-                std::ptr::null_mut(),
-                width as isize,
-                height as isize,
-                8,
-                4,
-                true,
-                false,
-                NSDeviceRGBColorSpace,
-                bytes_per_row as isize,
-                32,
-            )
-        }
-        .ok_or(NativePipWindowError)?;
-        let bitmap = representation.bitmapData();
-        if bitmap.is_null() {
-            return Err(NativePipWindowError);
-        }
-        // SAFETY: AppKit allocated at least `bytes_per_row * height` bytes for
-        // the representation and both slices are valid and non-overlapping.
-        unsafe { std::ptr::copy_nonoverlapping(rgba.as_ptr(), bitmap, rgba.len()) };
-        let image =
-            NSImage::initWithSize(NSImage::alloc(), NSSize::new(width as f64, height as f64));
-        image.addRepresentation(&representation);
-        self.present_image(&image)
+            let bitmap = representation.bitmapData();
+            if bitmap.is_null() {
+                return Err(NativePipWindowError);
+            }
+            // SAFETY: AppKit allocated at least `bytes_per_row * height` bytes for
+            // the representation and both slices are valid and non-overlapping.
+            unsafe { std::ptr::copy_nonoverlapping(rgba.as_ptr(), bitmap, rgba.len()) };
+            let image =
+                NSImage::initWithSize(NSImage::alloc(), NSSize::new(width as f64, height as f64));
+            image.addRepresentation(&representation);
+            self.present_image(&image)
+        })
     }
 
     fn present_image(&self, image: &NSImage) -> Result<(), NativePipWindowError> {
@@ -750,27 +806,29 @@ impl NativePipWindow {
 
     /// Drains a bounded number of pending AppKit events without blocking.
     pub fn pump(&self) -> Result<(), NativePipWindowError> {
-        MainThreadMarker::new().ok_or(NativePipWindowError)?;
-        self.update_cursor();
-        self.update_agent_cursor();
-        let expiration = NSDate::distantPast();
-        for _ in 0..32 {
-            let Some(event) = self
-                .application
-                .nextEventMatchingMask_untilDate_inMode_dequeue(
-                    NSEventMask::Any,
-                    Some(&expiration),
-                    // SAFETY: NSDefaultRunLoopMode is a process-lifetime Foundation constant.
-                    unsafe { NSDefaultRunLoopMode },
-                    true,
-                )
-            else {
-                break;
-            };
-            self.application.sendEvent(&event);
-        }
-        self.application.updateWindows();
-        Ok(())
+        autoreleasepool(|_| {
+            MainThreadMarker::new().ok_or(NativePipWindowError)?;
+            self.update_cursor();
+            self.update_agent_cursor();
+            let expiration = NSDate::distantPast();
+            for _ in 0..32 {
+                let Some(event) = self
+                    .application
+                    .nextEventMatchingMask_untilDate_inMode_dequeue(
+                        NSEventMask::Any,
+                        Some(&expiration),
+                        // SAFETY: NSDefaultRunLoopMode is a process-lifetime Foundation constant.
+                        unsafe { NSDefaultRunLoopMode },
+                        true,
+                    )
+                else {
+                    break;
+                };
+                self.application.sendEvent(&event);
+            }
+            self.application.updateWindows();
+            Ok(())
+        })
     }
 
     fn update_cursor(&self) {
@@ -804,45 +862,62 @@ impl NativePipWindow {
 
     fn update_agent_cursor(&self) {
         let Some(cursor) = self.agent_cursor.get() else {
+            self.agent_cursor_halo.setHidden(true);
             self.agent_cursor_view.setHidden(true);
             return;
         };
         let Some(source) = self.source_frame.get() else {
+            self.agent_cursor_halo.setHidden(true);
             self.agent_cursor_view.setHidden(true);
             return;
         };
         if source.size.width <= 0.0 || source.size.height <= 0.0 {
+            self.agent_cursor_halo.setHidden(true);
             self.agent_cursor_view.setHidden(true);
             return;
         }
         let relative_x = (cursor.x - source.origin.x) / source.size.width;
         let relative_y = (cursor.y - source.origin.y) / source.size.height;
         if !(0.0..=1.0).contains(&relative_x) || !(0.0..=1.0).contains(&relative_y) {
+            self.agent_cursor_halo.setHidden(true);
             self.agent_cursor_view.setHidden(true);
             return;
         }
         let pressed = cursor
             .pressed_until
             .is_some_and(|deadline| deadline > Instant::now());
-        let size = if pressed {
+        let cursor_size = if pressed {
             NSSize::new(26.0, 34.0)
         } else {
             NSSize::new(22.0, 29.0)
         };
-        self.agent_cursor_view.setFrameSize(size);
+        let halo_size = if pressed {
+            NSSize::new(26.0, 26.0)
+        } else {
+            NSSize::new(18.0, 18.0)
+        };
+        self.agent_cursor_view.setFrameSize(cursor_size);
+        self.agent_cursor_halo.setFrameSize(halo_size);
         let bounds = self.image_view.bounds();
-        self.agent_cursor_view.setFrameOrigin(NSPoint::new(
-            bounds.origin.x + relative_x * bounds.size.width,
-            bounds.origin.y + (1.0 - relative_y) * bounds.size.height - size.height,
+        let x = bounds.origin.x + relative_x * bounds.size.width;
+        let y = bounds.origin.y + (1.0 - relative_y) * bounds.size.height;
+        self.agent_cursor_halo.setFrameOrigin(NSPoint::new(
+            x - halo_size.width / 2.0,
+            y - halo_size.height / 2.0,
         ));
+        self.agent_cursor_view
+            .setFrameOrigin(NSPoint::new(x, y - cursor_size.height));
+        self.agent_cursor_halo.setHidden(false);
         self.agent_cursor_view.setHidden(false);
     }
 
     /// Removes the panel from screen without activating another application.
     pub fn hide(&self) -> Result<(), NativePipWindowError> {
-        MainThreadMarker::new().ok_or(NativePipWindowError)?;
-        self.panel.orderOut(None);
-        Ok(())
+        autoreleasepool(|_| {
+            MainThreadMarker::new().ok_or(NativePipWindowError)?;
+            self.panel.orderOut(None);
+            Ok(())
+        })
     }
 }
 

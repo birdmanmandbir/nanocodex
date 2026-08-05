@@ -11,7 +11,7 @@ use nanocodex_computer_macos::{
     NativeImageData, capture_window_in_process, window as native_window,
 };
 #[cfg(target_os = "macos")]
-const LIVE_CAPTURE_INTERVAL: Duration = Duration::from_millis(100);
+const LIVE_CAPTURE_INTERVAL: Duration = Duration::from_millis(250);
 
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy)]

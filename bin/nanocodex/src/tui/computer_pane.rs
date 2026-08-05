@@ -8,6 +8,8 @@ use ratatui::{
 };
 use ratatui_image::{StatefulImage, picker::Picker, protocol::StatefulProtocol};
 
+const MAX_PANE_PIXELS: u64 = 1_000_000;
+
 /// Prepared state for the application-owned live computer pane.
 ///
 /// PNG decoding happens before this reaches the render loop. Ratatui only
@@ -27,6 +29,7 @@ impl ComputerPane {
         let protocol = picker
             .map(|picker| {
                 image::load_from_memory(frame.image.png())
+                    .map(bound_image)
                     .map(|image| picker.new_resize_protocol(image))
                     .map_err(|error| format!("failed to decode computer frame: {error}"))
             })
@@ -96,6 +99,17 @@ impl ComputerPane {
             );
         }
     }
+}
+
+fn bound_image(image: image::DynamicImage) -> image::DynamicImage {
+    let pixels = u64::from(image.width()).saturating_mul(u64::from(image.height()));
+    if pixels <= MAX_PANE_PIXELS {
+        return image;
+    }
+    let scale = (MAX_PANE_PIXELS as f64 / pixels as f64).sqrt();
+    let width = (f64::from(image.width()) * scale).floor().max(1.0) as u32;
+    let height = (f64::from(image.height()) * scale).floor().max(1.0) as u32;
+    image.thumbnail(width, height)
 }
 
 const fn phase_label(phase: ComputerFramePhase) -> &'static str {

@@ -1263,11 +1263,12 @@ fn query_terminal_profile(timeout: Duration) -> (TerminalProfile, Option<Picker>
         Ok(picker) => {
             let (width, height) = picker.font_size();
             let cell = PixelSize::new(width, height);
-            if picker.protocol_type() == ProtocolType::Kitty {
-                (TerminalProfile::kitty(cell, tmux), Some(picker))
+            let terminal_profile = if picker.protocol_type() == ProtocolType::Kitty {
+                TerminalProfile::kitty(cell, tmux)
             } else {
-                (TerminalProfile::unsupported(cell), None)
-            }
+                TerminalProfile::unsupported(cell)
+            };
+            (terminal_profile, Some(picker))
         }
         Err(_) => (TerminalProfile::unsupported(PixelSize::default()), None),
     }
