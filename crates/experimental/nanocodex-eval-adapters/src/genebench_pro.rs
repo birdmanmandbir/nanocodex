@@ -91,7 +91,11 @@ impl DatasetImporter for GeneBenchPro {
                 gpus: 0,
             })
             .timeouts(Duration::from_secs(1_800), Duration::from_secs(300))
-            .allow_internet(false)
+            // Guest CLI harnesses own their model transport inside the VM.
+            // This public case-study package publishes its answers and is not
+            // a hidden-answer leaderboard, so its operational recipe permits
+            // the network device required by those harnesses.
+            .allow_internet(true)
             .harness_file("eval_config.json", config_bytes.clone(), 0o600)?
             .harness_file("reference_grader.py", grader.clone(), 0o700)?;
             source_values.push(config_bytes);

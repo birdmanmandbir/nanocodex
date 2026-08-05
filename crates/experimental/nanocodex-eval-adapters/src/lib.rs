@@ -201,7 +201,7 @@ mod tests {
 
         assert_eq!(task.prompt(), "Analyze the supplied data and return JSON.");
         assert_eq!(task.output(), TaskOutput::FinalMessage);
-        assert_eq!(task.network(), NetworkPolicy::Disabled);
+        assert_eq!(task.network(), NetworkPolicy::Public);
         assert_eq!(
             fs::read(task.root().join("environment/data_files/input.tsv.gz")).unwrap(),
             data
