@@ -124,7 +124,9 @@ cargo run -p nanocodex-bin -- run \
 ```
 
 With preview enabled, the CLI opens a non-activating native floating PIP and
-keeps the loopback controls available without foregrounding a browser. In the
+keeps the loopback controls available without foregrounding a browser. The PIP
+shows the live system cursor, remains draggable and edge-resizable, and preserves
+the user's placement and scale when the source window changes shape. In the
 Ratatui consumer, the first frame also opens an adaptive live computer pane.
 Kitty-capable terminals render the captured pixels; other terminals retain a
 compact target/status fallback and can use the loopback preview. Human control

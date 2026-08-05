@@ -276,6 +276,9 @@ impl MacosBackend {
             computer.settle.minimum_duration_ms = millis(self.settle.minimum_duration),
             computer.settle.sample_count = Empty,
             computer.settle.loading_sample_count = Empty,
+            computer.settle.notification_wake_count = Empty,
+            computer.settle.poll_wake_count = Empty,
+            computer.settle.wait_duration_ns = Empty,
             computer.focus.steal_count = Empty,
             computer.focus.restore_count = Empty,
             computer.accessibility.notification.count = Empty,
@@ -303,6 +306,33 @@ impl MacosBackend {
             .unwrap_or_default()
     }
 
+    async fn wait_for_observation_change(
+        &self,
+        revision: u64,
+        deadline: Instant,
+    ) -> Result<bool, ComputerError> {
+        let timeout = self
+            .settle
+            .sample_interval
+            .min(deadline.saturating_duration_since(Instant::now()));
+        if timeout.is_zero() {
+            return Ok(false);
+        }
+        let Some(waiter) = self
+            .accessibility_monitor
+            .as_ref()
+            .map(AccessibilityNotificationMonitor::waiter)
+        else {
+            tokio::time::sleep(timeout).await;
+            return Ok(false);
+        };
+        tokio::task::spawn_blocking(move || waiter.wait_for_change(revision, timeout))
+            .await
+            .map_err(|error| ComputerError::Native {
+                message: format!("Accessibility wait worker panicked: {error}"),
+            })
+    }
+
     async fn settled_observation_inner(
         &mut self,
         sequence: u64,
@@ -319,6 +349,9 @@ impl MacosBackend {
         let generation = self.generation.saturating_add(1);
         let mut sample_count = 0_u64;
         let mut loading_sample_count = 0_u64;
+        let mut notification_wake_count = 0_u64;
+        let mut poll_wake_count = 0_u64;
+        let mut wait_duration = Duration::ZERO;
         let mut focus_steal_count = 0_u64;
         let mut focus_restore_count = 0_u64;
         loop {
@@ -382,6 +415,15 @@ impl MacosBackend {
             if matched || timed_out {
                 span.record("computer.settle.sample_count", sample_count);
                 span.record("computer.settle.loading_sample_count", loading_sample_count);
+                span.record(
+                    "computer.settle.notification_wake_count",
+                    notification_wake_count,
+                );
+                span.record("computer.settle.poll_wake_count", poll_wake_count);
+                span.record(
+                    "computer.settle.wait_duration_ns",
+                    elapsed_ns(wait_duration),
+                );
                 span.record("computer.focus.steal_count", focus_steal_count);
                 span.record("computer.focus.restore_count", focus_restore_count);
                 span.record(
@@ -462,7 +504,6 @@ impl MacosBackend {
                     }
                     previous = Some(signature);
                     previous_signal_revision = Some(verified_signal.revision);
-                    tokio::time::sleep(self.settle.sample_interval).await;
                     continue;
                 }
                 self.authorize_observation_urls(&observed)?;
@@ -480,7 +521,16 @@ impl MacosBackend {
             }
             previous = Some(signature);
             previous_signal_revision = Some(signal.revision);
-            tokio::time::sleep(self.settle.sample_interval).await;
+            let wait_started = Instant::now();
+            let notification_wake = self
+                .wait_for_observation_change(signal.revision, deadline)
+                .await?;
+            wait_duration += wait_started.elapsed();
+            if notification_wake {
+                notification_wake_count = notification_wake_count.saturating_add(1);
+            } else {
+                poll_wake_count = poll_wake_count.saturating_add(1);
+            }
         }
     }
 
@@ -536,6 +586,8 @@ impl MacosBackend {
             })?;
         let action_kind = action.kind();
         let dispatch = action.dispatch();
+        let initial_pointer_fallbacks = self.intervention_target.synthetic_pointer_fallback_count();
+        let intervention_target = Arc::clone(&self.intervention_target);
         let span = info_span!(
             target: "nanocodex_computer",
             "computer.input.dispatch",
@@ -544,6 +596,7 @@ impl MacosBackend {
             computer.input.dispatch = dispatch,
             computer.target.pid = target.application.pid,
             computer.target.window_id = target.window.id,
+            computer.input.synthetic_pointer_fallback_count = Empty,
             duration_ns = Empty,
             status = Empty,
             otel.status_code = Empty,
@@ -557,6 +610,7 @@ impl MacosBackend {
                     maximum,
                     action,
                     allowed_url_origins.as_deref(),
+                    &intervention_target,
                 )
             })
             .await
@@ -566,6 +620,12 @@ impl MacosBackend {
         }
         .instrument(span.clone())
         .await;
+        span.record(
+            "computer.input.synthetic_pointer_fallback_count",
+            self.intervention_target
+                .synthetic_pointer_fallback_count()
+                .saturating_sub(initial_pointer_fallbacks),
+        );
         finish_span(&span, started, &outcome);
         if let Err(ComputerError::UrlDenied { url }) = &outcome {
             self.blocked_url = Some(url.clone());
@@ -1864,11 +1924,16 @@ fn native_action(
     maximum: usize,
     action: NativeAction,
     allowed_url_origins: Option<&[Url]>,
+    intervention_target: &super::InterventionTarget,
 ) -> Result<(), ComputerError> {
     if screen_locked() {
         return Err(ComputerError::ScreenLocked);
     }
     let pid = target.application.pid;
+    let input = NativeInput {
+        pid,
+        intervention_target,
+    };
     match action {
         NativeAction::Click {
             target: InteractionTarget::Element(reference),
@@ -1884,7 +1949,7 @@ fn native_action(
                     });
             }
             post_click(
-                pid,
+                &input,
                 public
                     .frame
                     .map(Rect::center)
@@ -1898,7 +1963,7 @@ fn native_action(
             target: point,
             button,
         } => post_click(
-            pid,
+            &input,
             resolve_point(target, generation, maximum, point)?,
             button,
         ),
@@ -1907,7 +1972,7 @@ fn native_action(
             to,
             duration_ms,
         } => post_drag(
-            pid,
+            &input,
             resolve_point(target, generation, maximum, from)?,
             resolve_point(target, generation, maximum, to)?,
             duration_ms,
@@ -1918,17 +1983,17 @@ fn native_action(
             at,
         } => {
             if let Some(at) = at {
-                post_move(pid, resolve_point(target, generation, maximum, at)?)?;
+                post_move(&input, resolve_point(target, generation, maximum, at)?)?;
             }
             let source = event_source()?;
             let event =
                 CGEvent::new_scroll_event(source, ScrollEventUnit::PIXEL, 2, delta_y, delta_x, 0)
                     .map_err(|()| native_event_error("scroll"))?;
-            post_event(&event, pid);
+            input.post(&event);
             Ok(())
         }
-        NativeAction::PressKey { key, modifiers } => post_key(pid, &key, &modifiers),
-        NativeAction::TypeText { text } => post_text(pid, &text),
+        NativeAction::PressKey { key, modifiers } => post_key(&input, &key, &modifiers),
+        NativeAction::TypeText { text } => post_text(&input, &text),
         NativeAction::SetValue { reference, value } => {
             let (_, element) = resolve_element(target, generation, maximum, &reference)?;
             let attribute =
@@ -2002,7 +2067,25 @@ fn event_source() -> Result<CGEventSource, ComputerError> {
         .map_err(|()| native_event_error("event source"))
 }
 
-fn post_click(pid: i32, point: Point, button: MouseButton) -> Result<(), ComputerError> {
+struct NativeInput<'a> {
+    pid: i32,
+    intervention_target: &'a super::InterventionTarget,
+}
+
+impl NativeInput<'_> {
+    fn post(&self, event: &CGEvent) {
+        mark_synthetic(event);
+        self.intervention_target
+            .expect_synthetic_pointer_event(event);
+        event.post_to_pid(self.pid);
+    }
+}
+
+fn post_click(
+    input: &NativeInput<'_>,
+    point: Point,
+    button: MouseButton,
+) -> Result<(), ComputerError> {
     let source = event_source()?;
     let (button, down, up) = match button {
         MouseButton::Left => (
@@ -2026,13 +2109,13 @@ fn post_click(pid: i32, point: Point, button: MouseButton) -> Result<(), Compute
         .map_err(|()| native_event_error("mouse down"))?;
     let up = CGEvent::new_mouse_event(source, up, point, button)
         .map_err(|()| native_event_error("mouse up"))?;
-    post_event(&down, pid);
+    input.post(&down);
     std::thread::sleep(Duration::from_millis(20));
-    post_event(&up, pid);
+    input.post(&up);
     Ok(())
 }
 
-fn post_move(pid: i32, point: Point) -> Result<(), ComputerError> {
+fn post_move(input: &NativeInput<'_>, point: Point) -> Result<(), ComputerError> {
     let event = CGEvent::new_mouse_event(
         event_source()?,
         CGEventType::MouseMoved,
@@ -2040,11 +2123,16 @@ fn post_move(pid: i32, point: Point) -> Result<(), ComputerError> {
         CGMouseButton::Left,
     )
     .map_err(|()| native_event_error("mouse move"))?;
-    post_event(&event, pid);
+    input.post(&event);
     Ok(())
 }
 
-fn post_drag(pid: i32, from: Point, to: Point, duration_ms: u64) -> Result<(), ComputerError> {
+fn post_drag(
+    input: &NativeInput<'_>,
+    from: Point,
+    to: Point,
+    duration_ms: u64,
+) -> Result<(), ComputerError> {
     let source = event_source()?;
     let down = CGEvent::new_mouse_event(
         source.clone(),
@@ -2053,7 +2141,7 @@ fn post_drag(pid: i32, from: Point, to: Point, duration_ms: u64) -> Result<(), C
         CGMouseButton::Left,
     )
     .map_err(|()| native_event_error("drag down"))?;
-    post_event(&down, pid);
+    input.post(&down);
     let steps = (duration_ms / 16).clamp(2, 240);
     for step in 1..=steps {
         let progress = step as f64 / steps as f64;
@@ -2068,7 +2156,7 @@ fn post_drag(pid: i32, from: Point, to: Point, duration_ms: u64) -> Result<(), C
             CGMouseButton::Left,
         )
         .map_err(|()| native_event_error("drag move"))?;
-        post_event(&event, pid);
+        input.post(&event);
         std::thread::sleep(Duration::from_millis(duration_ms / steps));
     }
     let up = CGEvent::new_mouse_event(
@@ -2078,11 +2166,15 @@ fn post_drag(pid: i32, from: Point, to: Point, duration_ms: u64) -> Result<(), C
         CGMouseButton::Left,
     )
     .map_err(|()| native_event_error("drag up"))?;
-    post_event(&up, pid);
+    input.post(&up);
     Ok(())
 }
 
-fn post_key(pid: i32, key: &str, modifiers: &[KeyModifier]) -> Result<(), ComputerError> {
+fn post_key(
+    input: &NativeInput<'_>,
+    key: &str,
+    modifiers: &[KeyModifier],
+) -> Result<(), ComputerError> {
     let code = key_code(key).ok_or_else(|| ComputerError::UnknownKey {
         key: key.to_owned(),
     })?;
@@ -2094,13 +2186,13 @@ fn post_key(pid: i32, key: &str, modifiers: &[KeyModifier]) -> Result<(), Comput
         .map_err(|()| native_event_error("key up"))?;
     down.set_flags(flags);
     up.set_flags(flags);
-    post_event(&down, pid);
+    input.post(&down);
     std::thread::sleep(Duration::from_millis(10));
-    post_event(&up, pid);
+    input.post(&up);
     Ok(())
 }
 
-fn post_text(pid: i32, text: &str) -> Result<(), ComputerError> {
+fn post_text(input: &NativeInput<'_>, text: &str) -> Result<(), ComputerError> {
     let source = event_source()?;
     for chunk in unicode_chunks(text, 20) {
         let down = CGEvent::new_keyboard_event(source.clone(), 0, true)
@@ -2109,8 +2201,8 @@ fn post_text(pid: i32, text: &str) -> Result<(), ComputerError> {
             .map_err(|()| native_event_error("Unicode key up"))?;
         down.set_string(chunk);
         up.set_string(chunk);
-        post_event(&down, pid);
-        post_event(&up, pid);
+        input.post(&down);
+        input.post(&up);
     }
     Ok(())
 }
@@ -2148,11 +2240,6 @@ fn modifier_flags(modifiers: &[KeyModifier]) -> CGEventFlags {
                     KeyModifier::Function => CGEventFlags::CGEventFlagSecondaryFn,
                 }
         })
-}
-
-fn post_event(event: &CGEvent, pid: i32) {
-    mark_synthetic(event);
-    event.post_to_pid(pid);
 }
 
 fn key_code(key: &str) -> Option<u16> {

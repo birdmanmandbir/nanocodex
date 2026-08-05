@@ -22,11 +22,13 @@ impl ComputerPip {
                     let _ = ready_tx.send(false);
                     return;
                 };
-                if let Some(frame) = frames.latest()
-                    && window.update_png(frame.image.png()).is_err()
-                {
-                    let _ = ready_tx.send(false);
-                    return;
+                if let Some(frame) = frames.latest() {
+                    let source = frame.window.frame;
+                    window.set_source_frame(source.x, source.y, source.width, source.height);
+                    if window.update_png(frame.image.png()).is_err() {
+                        let _ = ready_tx.send(false);
+                        return;
+                    }
                 }
                 tracing::info!(target: "nanocodex_computer", "native computer PIP host ready");
                 let _ = ready_tx.send(true);
@@ -41,6 +43,8 @@ impl ComputerPip {
                         }
                         frame = frames.changed() => {
                             let Ok(frame) = frame else { break };
+                            let source = frame.window.frame;
+                            window.set_source_frame(source.x, source.y, source.width, source.height);
                             if window.update_png(frame.image.png()).is_err() {
                                 tracing::warn!(target: "nanocodex_computer", generation = frame.generation, "native computer PIP frame rendering failed");
                                 break;

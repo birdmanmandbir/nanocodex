@@ -15,7 +15,7 @@ accessibility-sys = "0.2.0"
 core-foundation = "0.10.1"
 core-graphics = { version = "0.25.0", features = ["elcapitan", "highsierra"] }
 objc2 = "0.6.4"
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSCell", "NSColor", "NSControl", "NSEvent", "NSGraphics", "NSImage", "NSImageView", "NSPanel", "NSResponder", "NSRunningApplication", "NSScreen", "NSView", "NSWindow", "NSWorkspace", "libc", "objc2-quartz-core"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSCell", "NSColor", "NSControl", "NSCursor", "NSEvent", "NSGraphics", "NSImage", "NSImageView", "NSPanel", "NSResponder", "NSRunningApplication", "NSScreen", "NSView", "NSWindow", "NSWorkspace", "libc", "objc2-quartz-core"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSData", "NSDate", "NSGeometry", "NSRunLoop", "NSString"] }
 objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["CALayer", "objc2-core-foundation"] }
 

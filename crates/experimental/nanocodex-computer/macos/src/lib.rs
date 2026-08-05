@@ -5,11 +5,12 @@
 
 use std::{
     cell::Cell,
+    collections::VecDeque,
     ffi::c_void,
     path::PathBuf,
     process::{Command, Stdio},
     sync::{
-        Arc,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
     },
     thread::JoinHandle,
@@ -49,6 +50,7 @@ use core_graphics::{
         CGEvent, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
         CGEventType, CallbackResult, EventField,
     },
+    event_source::{CGEventSource, CGEventSourceStateID},
     geometry::{CGPoint, CGRect, CGSize},
     window::{
         copy_window_info, create_image, kCGNullWindowID, kCGWindowBounds,
@@ -61,9 +63,9 @@ use core_graphics::{
 use objc2::{AnyThread, MainThreadMarker, MainThreadOnly, rc::Retained};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy,
-    NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSEventMask, NSFloatingWindowLevel,
-    NSImage, NSImageScaling, NSImageView, NSPanel, NSRunningApplication, NSScreen,
-    NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
+    NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSCursor, NSEventMask,
+    NSFloatingWindowLevel, NSImage, NSImageScaling, NSImageView, NSPanel, NSRunningApplication,
+    NSScreen, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{NSData, NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize, NSString};
 
@@ -496,6 +498,9 @@ pub struct NativePipWindow {
     application: Retained<NSApplication>,
     panel: Retained<NSPanel>,
     image_view: Retained<NSImageView>,
+    cursor_view: Retained<NSImageView>,
+    cursor_source: CGEventSource,
+    source_frame: Cell<Option<CGRect>>,
     presentation_aspect: Cell<Option<f64>>,
 }
 
@@ -535,6 +540,7 @@ impl NativePipWindow {
         panel.setHidesOnDeactivate(false);
         panel.setCanHide(false);
         panel.setMovableByWindowBackground(true);
+        panel.setMinSize(NSSize::new(160.0, 100.0));
         panel.setLevel(NSFloatingWindowLevel);
         panel.setCollectionBehavior(
             NSWindowCollectionBehavior::CanJoinAllSpaces
@@ -557,14 +563,35 @@ impl NativePipWindow {
             NSAutoresizingMaskOptions::ViewWidthSizable
                 | NSAutoresizingMaskOptions::ViewHeightSizable,
         );
+        let cursor_view = NSImageView::initWithFrame(
+            NSImageView::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(18.0, 24.0)),
+        );
+        cursor_view.setImage(Some(&NSCursor::arrowCursor().image()));
+        cursor_view.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
+        cursor_view.setHidden(true);
+        image_view.addSubview(&cursor_view);
         panel.setContentView(Some(&image_view));
+        let cursor_source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
+            .map_err(|()| NativePipWindowError)?;
         application.updateWindows();
         Ok(Self {
             application,
             panel,
             image_view,
+            cursor_view,
+            cursor_source,
+            source_frame: Cell::new(None),
             presentation_aspect: Cell::new(None),
         })
+    }
+
+    /// Updates the global source-window geometry used to place the cursor overlay.
+    pub fn set_source_frame(&self, x: f64, y: f64, width: f64, height: f64) {
+        self.source_frame.set(Some(CGRect::new(
+            &CGPoint::new(x, y),
+            &CGSize::new(width, height),
+        )));
     }
 
     /// Replaces the displayed frame from complete PNG bytes.
@@ -578,24 +605,36 @@ impl NativePipWindow {
         let image_size = image.size();
         if image_size.width > 0.0 && image_size.height > 0.0 {
             let aspect = image_size.width / image_size.height;
-            if self
-                .presentation_aspect
-                .get()
-                .is_none_or(|previous| (previous - aspect).abs() > 0.02)
-            {
-                let scale = (420.0 / image_size.width).min(270.0 / image_size.height);
-                self.panel.setContentSize(NSSize::new(
-                    image_size.width * scale,
-                    image_size.height * scale,
-                ));
-                let frame = self.panel.frame();
-                if let Some(screen) =
-                    NSScreen::mainScreen(MainThreadMarker::new().ok_or(NativePipWindowError)?)
-                {
-                    let visible = screen.visibleFrame();
+            let previous_aspect = self.presentation_aspect.get();
+            if previous_aspect.is_none_or(|previous| (previous - aspect).abs() > 0.02) {
+                let previous_frame = self.panel.frame();
+                let size = if previous_aspect.is_none() {
+                    let scale = (420.0 / image_size.width).min(270.0 / image_size.height);
+                    NSSize::new(image_size.width * scale, image_size.height * scale)
+                } else {
+                    let area = previous_frame.size.width * previous_frame.size.height;
+                    NSSize::new((area * aspect).sqrt(), (area / aspect).sqrt())
+                };
+                self.panel.setContentSize(size);
+                let resized_frame = self.panel.frame();
+                if previous_aspect.is_none() {
+                    if let Some(screen) =
+                        NSScreen::mainScreen(MainThreadMarker::new().ok_or(NativePipWindowError)?)
+                    {
+                        let visible = screen.visibleFrame();
+                        self.panel.setFrameOrigin(NSPoint::new(
+                            visible.origin.x + visible.size.width - resized_frame.size.width - 24.0,
+                            visible.origin.y + visible.size.height
+                                - resized_frame.size.height
+                                - 24.0,
+                        ));
+                    }
+                } else {
                     self.panel.setFrameOrigin(NSPoint::new(
-                        visible.origin.x + visible.size.width - frame.size.width - 24.0,
-                        visible.origin.y + visible.size.height - frame.size.height - 24.0,
+                        previous_frame.origin.x + previous_frame.size.width
+                            - resized_frame.size.width,
+                        previous_frame.origin.y + previous_frame.size.height
+                            - resized_frame.size.height,
                     ));
                 }
                 self.presentation_aspect.set(Some(aspect));
@@ -611,6 +650,7 @@ impl NativePipWindow {
     /// Drains a bounded number of pending AppKit events without blocking.
     pub fn pump(&self) -> Result<(), NativePipWindowError> {
         MainThreadMarker::new().ok_or(NativePipWindowError)?;
+        self.update_cursor();
         let expiration = NSDate::distantPast();
         for _ in 0..32 {
             let Some(event) = self
@@ -629,6 +669,35 @@ impl NativePipWindow {
         }
         self.application.updateWindows();
         Ok(())
+    }
+
+    fn update_cursor(&self) {
+        let Some(source) = self.source_frame.get() else {
+            self.cursor_view.setHidden(true);
+            return;
+        };
+        if source.size.width <= 0.0 || source.size.height <= 0.0 {
+            self.cursor_view.setHidden(true);
+            return;
+        }
+        let Ok(event) = CGEvent::new(self.cursor_source.clone()) else {
+            self.cursor_view.setHidden(true);
+            return;
+        };
+        let cursor = event.location();
+        let relative_x = (cursor.x - source.origin.x) / source.size.width;
+        let relative_y = (cursor.y - source.origin.y) / source.size.height;
+        if !(0.0..=1.0).contains(&relative_x) || !(0.0..=1.0).contains(&relative_y) {
+            self.cursor_view.setHidden(true);
+            return;
+        }
+        let bounds = self.image_view.bounds();
+        let cursor_size = self.cursor_view.frame().size;
+        self.cursor_view.setFrameOrigin(NSPoint::new(
+            bounds.origin.x + relative_x * bounds.size.width,
+            bounds.origin.y + (1.0 - relative_y) * bounds.size.height - cursor_size.height,
+        ));
+        self.cursor_view.setHidden(false);
     }
 
     /// Removes the panel from screen without activating another application.
@@ -662,10 +731,16 @@ struct AccessibilitySignalState {
     tree_revision: AtomicU64,
     window_revision: AtomicU64,
     busy_revision: AtomicU64,
+    wait_lock: Mutex<()>,
+    changed: Condvar,
 }
 
 impl AccessibilitySignalState {
     fn record(&self, notification: &str) {
+        let _guard = self
+            .wait_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.revision.fetch_add(1, Ordering::AcqRel);
         if [
             kAXFocusedWindowChangedNotification,
@@ -680,6 +755,7 @@ impl AccessibilitySignalState {
         } else {
             self.tree_revision.fetch_add(1, Ordering::AcqRel);
         }
+        self.changed.notify_all();
     }
 
     fn snapshot(&self) -> AccessibilitySignalSnapshot {
@@ -689,6 +765,40 @@ impl AccessibilitySignalState {
             window_revision: self.window_revision.load(Ordering::Acquire),
             busy_revision: self.busy_revision.load(Ordering::Acquire),
         }
+    }
+
+    fn wait_for_change(&self, revision: u64, timeout: Duration) -> bool {
+        if self.revision.load(Ordering::Acquire) != revision {
+            return true;
+        }
+        let guard = self
+            .wait_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.revision.load(Ordering::Acquire) != revision {
+            return true;
+        }
+        let (_guard, _) = self
+            .changed
+            .wait_timeout_while(guard, timeout, |_| {
+                self.revision.load(Ordering::Acquire) == revision
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.revision.load(Ordering::Acquire) != revision
+    }
+}
+
+/// Cloneable wait handle for Accessibility-driven observation invalidations.
+#[derive(Clone)]
+pub struct AccessibilitySignalWaiter {
+    signals: Arc<AccessibilitySignalState>,
+}
+
+impl AccessibilitySignalWaiter {
+    /// Blocks until a newer Accessibility revision is observed or the timeout expires.
+    #[must_use]
+    pub fn wait_for_change(&self, revision: u64, timeout: Duration) -> bool {
+        self.signals.wait_for_change(revision, timeout)
     }
 }
 
@@ -813,6 +923,14 @@ impl AccessibilityNotificationMonitor {
     pub fn snapshot(&self) -> AccessibilitySignalSnapshot {
         self.signals.snapshot()
     }
+
+    /// Returns a cloneable handle that can wake a blocking settle wait.
+    #[must_use]
+    pub fn waiter(&self) -> AccessibilitySignalWaiter {
+        AccessibilitySignalWaiter {
+            signals: Arc::clone(&self.signals),
+        }
+    }
 }
 
 impl Drop for AccessibilityNotificationMonitor {
@@ -865,6 +983,14 @@ pub struct HumanInputEvent {
 #[derive(Default)]
 pub struct HumanInputTarget {
     pid: AtomicI32,
+    synthetic_pointer_events: Mutex<VecDeque<SyntheticPointerEvent>>,
+    synthetic_pointer_fallbacks: AtomicU64,
+}
+
+struct SyntheticPointerEvent {
+    kind: u32,
+    location: CGPoint,
+    expires_at: Instant,
 }
 
 impl HumanInputTarget {
@@ -875,6 +1001,62 @@ impl HumanInputTarget {
 
     fn pid(&self) -> i32 {
         self.pid.load(Ordering::Acquire)
+    }
+
+    /// Records a generated pointer event in case macOS strips its user-data marker.
+    pub fn expect_synthetic_pointer_event(&self, event: &CGEvent) {
+        let kind = event.get_type();
+        if !matches!(
+            kind,
+            CGEventType::LeftMouseDown
+                | CGEventType::RightMouseDown
+                | CGEventType::OtherMouseDown
+                | CGEventType::ScrollWheel
+        ) {
+            return;
+        }
+        let now = Instant::now();
+        let mut expected = self
+            .synthetic_pointer_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        expected.retain(|event| event.expires_at > now);
+        if expected.len() == 64 {
+            expected.pop_front();
+        }
+        expected.push_back(SyntheticPointerEvent {
+            kind: kind as u32,
+            location: event.location(),
+            expires_at: now + Duration::from_millis(500),
+        });
+    }
+
+    /// Returns how many generated pointer events required expectation matching.
+    #[must_use]
+    pub fn synthetic_pointer_fallback_count(&self) -> u64 {
+        self.synthetic_pointer_fallbacks.load(Ordering::Acquire)
+    }
+
+    fn consume_synthetic_pointer_event(&self, kind: CGEventType, event: &CGEvent) -> bool {
+        let now = Instant::now();
+        let location = event.location();
+        let mut expected = self
+            .synthetic_pointer_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        expected.retain(|event| event.expires_at > now);
+        let Some(index) = expected.iter().position(|expected| {
+            expected.kind == kind as u32
+                && (kind as u32 == CGEventType::ScrollWheel as u32
+                    || ((expected.location.x - location.x).abs() <= 1.0
+                        && (expected.location.y - location.y).abs() <= 1.0))
+        }) else {
+            return false;
+        };
+        expected.remove(index);
+        self.synthetic_pointer_fallbacks
+            .fetch_add(1, Ordering::AcqRel);
+        true
     }
 }
 
@@ -905,8 +1087,10 @@ impl HumanInputMonitor {
                     ],
                     move |_proxy, kind, event| {
                         let target_pid = target.pid();
-                        if event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA)
-                            != SYNTHETIC_MARKER
+                        let marker =
+                            event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA);
+                        if marker != SYNTHETIC_MARKER
+                            && !target.consume_synthetic_pointer_event(kind, event)
                             && human_event_targets(kind, event, target_pid)
                         {
                             let location = event.location();
