@@ -19,7 +19,7 @@ use nanocodex_oai_api::{Model, Thinking};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest as _, Sha256};
 
-const PREPARATION_RECEIPT_VERSION: u32 = 1;
+const PREPARATION_RECEIPT_VERSION: u32 = 2;
 
 /// Repository-level evaluation configuration parameterized by benchmark recipe.
 #[derive(Clone, Debug, Deserialize)]
@@ -143,6 +143,7 @@ pub struct PreparationReceipt {
     version: u32,
     profile: String,
     manifest_sha256: String,
+    executor_sha256: String,
     tasks: Vec<PreparedTask>,
     harnesses: Vec<PreparedHarness>,
     trials: u16,
@@ -679,6 +680,7 @@ impl PreparationReceipt {
             version: PREPARATION_RECEIPT_VERSION,
             profile: profile.name().to_owned(),
             manifest_sha256: manifest_sha256.into(),
+            executor_sha256: Self::current_executor_sha256()?,
             tasks,
             harnesses,
             trials: profile.trials(),
@@ -696,6 +698,11 @@ impl PreparationReceipt {
     /// Exact manifest content identity used during preparation.
     pub fn manifest_sha256(&self) -> &str {
         &self.manifest_sha256
+    }
+
+    /// Exact executable that prepared the native Nanocodex treatment.
+    pub fn executor_sha256(&self) -> &str {
+        &self.executor_sha256
     }
 
     /// Prepared tasks in deterministic matrix order.
@@ -802,6 +809,15 @@ impl PreparationReceipt {
             tasks,
             sweep: sweep.build()?,
         })
+    }
+
+    fn current_executor_sha256() -> Result<String, PreparationError> {
+        let path = std::env::current_exe().map_err(|source| PreparationError::Io {
+            path: PathBuf::from("<current executable>"),
+            source,
+        })?;
+        let bytes = fs::read(&path).map_err(|source| PreparationError::Io { path, source })?;
+        Ok(hex::encode(Sha256::digest(bytes)))
     }
 }
 
@@ -1028,6 +1044,13 @@ impl PreparationStore {
             return Err(PreparationError::Invalid(format!(
                 "current preparation digest mismatch: expected {}, found {digest}",
                 current.digest
+            )));
+        }
+        let executor_sha256 = PreparationReceipt::current_executor_sha256()?;
+        if receipt.executor_sha256() != executor_sha256 {
+            return Err(PreparationError::Invalid(format!(
+                "prepared native Nanocodex executable changed: expected {}, found {executor_sha256}; run prepare again",
+                receipt.executor_sha256()
             )));
         }
         for harness in receipt.harnesses() {
