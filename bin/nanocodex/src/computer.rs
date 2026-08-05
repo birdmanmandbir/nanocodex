@@ -1,7 +1,8 @@
 use clap::{ArgAction, Args};
 use eyre::{Result, WrapErr};
 use nanocodex_computer::{
-    Computer, ComputerControl, ComputerEvent, ComputerFrames, ComputerPreview, ComputerTool,
+    Computer, ComputerControl, ComputerEvent, ComputerFrames, ComputerPip, ComputerPreview,
+    ComputerTool,
 };
 
 /// Opt-in native computer-use configuration for normal agent sessions.
@@ -16,7 +17,7 @@ pub(crate) struct ComputerArgs {
     )]
     computer: bool,
 
-    /// Open a loopback live preview with pause/resume/takeover controls.
+    /// Open a non-activating native PIP and loopback takeover controls.
     #[arg(
         long,
         env = "NANOCODEX_COMPUTER_PREVIEW",
@@ -34,6 +35,15 @@ pub(crate) struct ComputerArgs {
         requires = "computer"
     )]
     allowed_apps: Vec<String>,
+
+    /// Restrict browser documents and links to these exact HTTP(S) origins.
+    #[arg(
+        long = "computer-allow-url",
+        env = "NANOCODEX_COMPUTER_ALLOW_URL",
+        value_delimiter = ',',
+        requires = "computer"
+    )]
+    allowed_urls: Vec<String>,
 }
 
 impl ComputerArgs {
@@ -50,22 +60,28 @@ impl ComputerArgs {
         for bundle_id in self.allowed_apps {
             builder = builder.allow_bundle_id(bundle_id);
         }
+        for origin in self.allowed_urls {
+            builder = builder.allow_url_origin(origin);
+        }
         let (computer, events) = builder
             .build()
             .wrap_err("failed to configure computer use")?;
-        let preview = if self.computer_preview {
-            Some(
-                ComputerPreview::spawn_and_open(&computer)
-                    .await
-                    .wrap_err("failed to start computer preview")?,
-            )
+        let (preview, pip) = if self.computer_preview {
+            let preview = ComputerPreview::spawn(&computer)
+                .await
+                .wrap_err("failed to start computer preview controls")?;
+            let pip = ComputerPip::spawn(&computer)
+                .await
+                .wrap_err("failed to start native computer PIP")?;
+            (Some(preview), Some(pip))
         } else {
-            None
+            (None, None)
         };
         let event_task = tokio::spawn(trace_events(events));
         Ok(Some(ConfiguredComputer {
             computer,
             preview,
+            pip,
             event_task,
         }))
     }
@@ -74,6 +90,7 @@ impl ComputerArgs {
 pub(crate) struct ConfiguredComputer {
     computer: Computer,
     preview: Option<ComputerPreview>,
+    pip: Option<ComputerPip>,
     event_task: tokio::task::JoinHandle<()>,
 }
 
@@ -96,6 +113,7 @@ impl ConfiguredComputer {
 
     pub(crate) async fn shutdown(self) -> Result<()> {
         self.computer.stop();
+        drop(self.pip);
         drop(self.preview);
         let mut event_task = self.event_task;
         if tokio::time::timeout(std::time::Duration::from_secs(1), &mut event_task)

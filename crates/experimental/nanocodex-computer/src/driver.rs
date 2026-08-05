@@ -236,6 +236,7 @@ pub struct ComputerBuilder {
     backend: Option<Box<dyn Backend>>,
     observe_human_input: bool,
     allowed_bundle_ids: Option<HashSet<String>>,
+    allowed_url_origins: Option<Vec<String>>,
 }
 
 impl Default for ComputerBuilder {
@@ -247,6 +248,7 @@ impl Default for ComputerBuilder {
             backend: None,
             observe_human_input: true,
             allowed_bundle_ids: None,
+            allowed_url_origins: None,
         }
     }
 }
@@ -293,6 +295,16 @@ impl ComputerBuilder {
         self
     }
 
+    /// Restricts browser documents and semantic links to explicitly allowed
+    /// HTTP(S) origins. Calling this at least once enables fail-closed URL mode.
+    #[must_use]
+    pub fn allow_url_origin(mut self, origin: impl Into<String>) -> Self {
+        self.allowed_url_origins
+            .get_or_insert_default()
+            .push(origin.into());
+        self
+    }
+
     /// Builds the actor and returns its independent event stream.
     pub fn build(mut self) -> Result<(Computer, ComputerEvents), ComputerBuildError> {
         if self.maximum_elements == 0 {
@@ -310,6 +322,38 @@ impl ComputerBuilder {
                     .to_owned(),
             });
         }
+        let allowed_url_origins = self
+            .allowed_url_origins
+            .take()
+            .map(|origins| {
+                origins
+                    .into_iter()
+                    .map(|origin| {
+                        let parsed = url::Url::parse(&origin).map_err(|error| {
+                            ComputerBuildError::Configuration {
+                                message: format!("invalid allowed URL origin {origin:?}: {error}"),
+                            }
+                        })?;
+                        if !matches!(parsed.scheme(), "http" | "https")
+                            || parsed.host_str().is_none()
+                            || parsed.cannot_be_a_base()
+                            || !parsed.username().is_empty()
+                            || parsed.password().is_some()
+                            || parsed.path() != "/"
+                            || parsed.query().is_some()
+                            || parsed.fragment().is_some()
+                        {
+                            return Err(ComputerBuildError::Configuration {
+                                message: format!(
+                                    "allowed URL origin must be an absolute HTTP(S) origin: {origin:?}"
+                                ),
+                            });
+                        }
+                        Ok(parsed)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
         let _runtime =
             tokio::runtime::Handle::try_current().map_err(|_| ComputerBuildError::Runtime)?;
         let (artifact_root, owned_artifacts) = match self.artifact_root.take() {
@@ -334,6 +378,7 @@ impl ComputerBuilder {
                 self.maximum_elements,
                 Arc::clone(&intervention_target),
                 self.allowed_bundle_ids.take(),
+                allowed_url_origins,
             )
         });
         let (commands_tx, commands_rx) = mpsc::channel(COMMAND_CAPACITY);
@@ -347,7 +392,16 @@ impl ComputerBuilder {
         };
         let intervention_monitor = self.observe_human_input.then(|| {
             let control = control.clone();
-            platform::intervention_monitor(intervention_target, move || {
+            platform::intervention_monitor(intervention_target, move |event| {
+                tracing::info!(
+                    target: "nanocodex_computer",
+                    event_kind = event.kind,
+                    source_pid = event.source_pid,
+                    target_pid = event.target_pid,
+                    location_x = event.x,
+                    location_y = event.y,
+                    "physical input targeted the attached application"
+                );
                 control.intervene(InterventionReason::HumanInput);
             })
         });

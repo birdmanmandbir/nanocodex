@@ -106,6 +106,8 @@ pub struct Element {
     pub placeholder: Option<String>,
     /// Stable application-provided identifier when present.
     pub identifier: Option<String>,
+    /// URL represented by a link or web document when exposed by Accessibility.
+    pub url: Option<String>,
     /// Global bounds when macOS exposes them.
     pub frame: Option<Rect>,
     /// Whether the element accepts interaction.

@@ -11,10 +11,20 @@ use crate::{
 pub(crate) type InterventionMonitor = nanocodex_computer_macos::HumanInputMonitor;
 #[cfg(target_os = "macos")]
 pub(crate) type InterventionTarget = nanocodex_computer_macos::HumanInputTarget;
+#[cfg(target_os = "macos")]
+pub(crate) type InterventionEvent = nanocodex_computer_macos::HumanInputEvent;
 #[cfg(not(target_os = "macos"))]
 pub(crate) struct InterventionMonitor;
 #[cfg(not(target_os = "macos"))]
 pub(crate) struct InterventionTarget;
+#[cfg(not(target_os = "macos"))]
+pub(crate) struct InterventionEvent {
+    pub(crate) kind: &'static str,
+    pub(crate) source_pid: i64,
+    pub(crate) target_pid: i32,
+    pub(crate) x: f64,
+    pub(crate) y: f64,
+}
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -36,6 +46,7 @@ pub(crate) fn native(
     maximum_elements: usize,
     intervention_target: Arc<InterventionTarget>,
     allowed_bundle_ids: Option<HashSet<String>>,
+    allowed_url_origins: Option<Vec<url::Url>>,
 ) -> Box<dyn Backend> {
     #[cfg(target_os = "macos")]
     {
@@ -45,6 +56,7 @@ pub(crate) fn native(
             maximum_elements,
             intervention_target,
             allowed_bundle_ids,
+            allowed_url_origins,
         ))
     }
     #[cfg(not(target_os = "macos"))]
@@ -55,6 +67,7 @@ pub(crate) fn native(
             maximum_elements,
             intervention_target,
             allowed_bundle_ids,
+            allowed_url_origins,
         );
         Box::new(UnsupportedBackend)
     }
@@ -62,7 +75,7 @@ pub(crate) fn native(
 
 pub(crate) fn intervention_monitor(
     target: Arc<InterventionTarget>,
-    callback: impl Fn() + Send + Sync + 'static,
+    callback: impl Fn(InterventionEvent) + Send + Sync + 'static,
 ) -> Result<InterventionMonitor, &'static str> {
     #[cfg(target_os = "macos")]
     {

@@ -163,10 +163,10 @@ fn try_main() -> Result<()> {
     if let Some(Command::VmRunConfig(command)) = &cli.command {
         return command.run();
     }
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(run(cli))
+        .build()?;
+    tokio::task::LocalSet::new().block_on(&runtime, run(cli))
 }
 
 fn process_exit_code(error: &eyre::Report) -> u8 {
@@ -387,6 +387,8 @@ mod tests {
             "--computer-preview=false",
             "--computer-allow-app",
             "com.apple.TextEdit",
+            "--computer-allow-url",
+            "https://example.com",
         ])
         .unwrap();
         let Some(Command::Run(headless)) = headless.command else {

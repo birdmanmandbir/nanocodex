@@ -23,6 +23,9 @@ human                 -- pause/takeover --> ComputerControl  ----> action gate
 - `ComputerPreview` serves the current target window on an unguessable
   loopback-only URL with Pause, Resume, and Take over controls. It polls the
   coalescing frame stream and never enters the action path.
+- `ComputerPip` renders the same frame stream in a non-activating native
+  floating panel. The CLI hosts it in-process on its main-thread `LocalSet`;
+  no helper application or service is involved.
 - `ComputerTool` registers one always-available typed tool. With the default
   exposure it appears only inside Code Mode as `tools.computer`; callers that
   explicitly select mixed direct exposure also make it a direct Responses tool.
@@ -38,7 +41,7 @@ plus a bounded accessibility tree containing roles, labels, values, actions,
 bounds, and generation-bound references. Capture and accessibility collection
 run concurrently. A reference includes its raw accessibility-tree index and a
 fingerprint; resolving an action rebuilds metadata only for that candidate and
-rejects it if the tree changed or another observation made it stale.
+relocates it only when the fingerprint remains unique in the same generation.
 
 The runtime enables Electron's public manual/enhanced Accessibility attributes
 before traversal, matching the behavior needed for background control of apps
@@ -106,6 +109,9 @@ nanocodex run "Open TextEdit and draft a note" --computer
 nanocodex run "Inspect the current app" --computer --computer-preview=false
 nanocodex run "Draft in TextEdit" --computer \
   --computer-allow-app com.apple.TextEdit
+nanocodex run "Inspect example.com" --computer \
+  --computer-allow-app com.apple.Safari \
+  --computer-allow-url https://example.com
 ```
 
 For a source-tree acceptance run, exercise that same production path rather
@@ -117,7 +123,9 @@ cargo run -p nanocodex-bin -- run \
   --computer --computer-preview=false
 ```
 
-In the Ratatui consumer, the first frame opens an adaptive live computer pane.
+With preview enabled, the CLI opens a non-activating native floating PIP and
+keeps the loopback controls available without foregrounding a browser. In the
+Ratatui consumer, the first frame also opens an adaptive live computer pane.
 Kitty-capable terminals render the captured pixels; other terminals retain a
 compact target/status fallback and can use the loopback preview. Human control
 never passes through the model:
@@ -143,6 +151,9 @@ The host can put a session in allowlist mode with repeated
 Discovery hides other applications and launch or attachment fails closed.
 Computer actions also fail with a typed error while `loginwindow` owns the
 foreground; Nanocodex never attempts to synthesize an unlock.
+Repeated `--computer-allow-url <origin>` arguments enable URL allowlist mode.
+Semantic links are checked before activation, and a browser `AXWebArea` outside
+the allowed origins stops the session before any further computer action.
 
 Cargo examples and the full CLI are distinct executables, so macOS may request
 permission separately for `target/debug/examples/observe` and

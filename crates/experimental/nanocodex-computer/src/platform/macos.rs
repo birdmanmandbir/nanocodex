@@ -7,7 +7,7 @@ use std::{
 
 use accessibility::{AXAttribute, AXUIElement, attribute::AXUIElementAttributes};
 use async_trait::async_trait;
-use core_foundation::{base::TCFType, string::CFString};
+use core_foundation::{base::TCFType, string::CFString, url::CFURL};
 use core_graphics::{
     event::{CGEvent, CGEventFlags, CGEventType, CGMouseButton, KeyCode, ScrollEventUnit},
     event_source::{CGEventSource, CGEventSourceStateID},
@@ -15,13 +15,15 @@ use core_graphics::{
 };
 use image::ImageEncoder as _;
 use nanocodex_computer_macos::{
-    NativeImageData, NativeWindow, PermissionRequest, activate_application, capture_window,
-    element_rect, enable_application_accessibility as enable_native_application_accessibility,
+    AccessibilityNotificationMonitor, AccessibilitySignalSnapshot, NativeImageData, NativeWindow,
+    PermissionRequest, activate_application, capture_window, element_rect,
+    enable_application_accessibility as enable_native_application_accessibility,
     frontmost_application_pid, mark_synthetic, request_accessibility, request_screen_capture,
     screen_locked, window as native_window_by_id,
 };
 use sha2::{Digest as _, Sha256};
 use tracing::{Instrument as _, Span, field::Empty, info, info_span};
+use url::Url;
 
 use super::Backend;
 use crate::{
@@ -99,6 +101,9 @@ pub(super) struct MacosBackend {
     screenshots: VecDeque<PathBuf>,
     intervention_target: Arc<super::InterventionTarget>,
     allowed_bundle_ids: Option<HashSet<String>>,
+    accessibility_monitor: Option<AccessibilityNotificationMonitor>,
+    allowed_url_origins: Option<Vec<Url>>,
+    blocked_url: Option<String>,
 }
 
 impl MacosBackend {
@@ -108,6 +113,7 @@ impl MacosBackend {
         maximum_elements: usize,
         intervention_target: Arc<super::InterventionTarget>,
         allowed_bundle_ids: Option<HashSet<String>>,
+        allowed_url_origins: Option<Vec<Url>>,
     ) -> Self {
         Self {
             artifact_root,
@@ -119,6 +125,9 @@ impl MacosBackend {
             screenshots: VecDeque::new(),
             intervention_target,
             allowed_bundle_ids,
+            accessibility_monitor: None,
+            allowed_url_origins,
+            blocked_url: None,
         }
     }
 
@@ -148,6 +157,27 @@ impl MacosBackend {
             .ok_or_else(|| ComputerError::ApplicationDenied {
                 application: bundle_id.to_owned(),
             })
+    }
+
+    fn authorize_url(&self, raw: &str) -> Result<(), ComputerError> {
+        enforce_url_policy(raw, self.allowed_url_origins.as_deref())
+    }
+
+    fn authorize_observation_urls(
+        &mut self,
+        observed: &ComputerObservation,
+    ) -> Result<(), ComputerError> {
+        let denied = observed
+            .elements
+            .iter()
+            .filter(|element| element.role == "AXWebArea")
+            .filter_map(|element| element.url.as_deref())
+            .find_map(|url| self.authorize_url(url).err());
+        if let Some(ComputerError::UrlDenied { url }) = denied {
+            self.blocked_url = Some(url.clone());
+            return Err(ComputerError::UrlDenied { url });
+        }
+        Ok(())
     }
 
     async fn observe(
@@ -183,6 +213,7 @@ impl MacosBackend {
             computer.accessibility.update.added = Empty,
             computer.accessibility.update.changed = Empty,
             computer.accessibility.update.removed = Empty,
+            computer.accessibility.notification.revision = Empty,
             computer.screenshot.bytes = Empty,
             computer.screenshot.width = Empty,
             computer.screenshot.height = Empty,
@@ -203,6 +234,11 @@ impl MacosBackend {
         .await;
         finish_span(&span, started, &outcome);
         let (mut observed, image) = outcome?;
+        span.record(
+            "computer.accessibility.notification.revision",
+            self.accessibility_signal().revision,
+        );
+        self.authorize_observation_urls(&observed)?;
         self.apply_accessibility_revision(&mut observed);
         record_observation(&span, &observed, image.as_deref());
         self.target = Some(Target {
@@ -242,6 +278,10 @@ impl MacosBackend {
             computer.settle.loading_sample_count = Empty,
             computer.focus.steal_count = Empty,
             computer.focus.restore_count = Empty,
+            computer.accessibility.notification.count = Empty,
+            computer.accessibility.notification.tree_count = Empty,
+            computer.accessibility.notification.window_count = Empty,
+            computer.accessibility.notification.busy_count = Empty,
             computer.settle.settled = Empty,
             duration_ns = Empty,
             status = Empty,
@@ -256,6 +296,13 @@ impl MacosBackend {
         outcome
     }
 
+    fn accessibility_signal(&self) -> AccessibilitySignalSnapshot {
+        self.accessibility_monitor
+            .as_ref()
+            .map(AccessibilityNotificationMonitor::snapshot)
+            .unwrap_or_default()
+    }
+
     async fn settled_observation_inner(
         &mut self,
         sequence: u64,
@@ -267,6 +314,8 @@ impl MacosBackend {
         let started = Instant::now();
         let deadline = started + self.settle.timeout;
         let mut previous: Option<String> = None;
+        let initial_signal = self.accessibility_signal();
+        let mut previous_signal_revision: Option<u64> = None;
         let generation = self.generation.saturating_add(1);
         let mut sample_count = 0_u64;
         let mut loading_sample_count = 0_u64;
@@ -309,7 +358,9 @@ impl MacosBackend {
                 }
             }
             let signature = visual_signature(&sample);
+            let signal = self.accessibility_signal();
             let matched = previous.as_deref() == Some(signature.as_str())
+                && previous_signal_revision == Some(signal.revision)
                 && !sample.loading
                 && started.elapsed() >= self.settle.minimum_duration;
             let timed_out = Instant::now() >= deadline;
@@ -333,6 +384,28 @@ impl MacosBackend {
                 span.record("computer.settle.loading_sample_count", loading_sample_count);
                 span.record("computer.focus.steal_count", focus_steal_count);
                 span.record("computer.focus.restore_count", focus_restore_count);
+                span.record(
+                    "computer.accessibility.notification.count",
+                    signal.revision.saturating_sub(initial_signal.revision),
+                );
+                span.record(
+                    "computer.accessibility.notification.tree_count",
+                    signal
+                        .tree_revision
+                        .saturating_sub(initial_signal.tree_revision),
+                );
+                span.record(
+                    "computer.accessibility.notification.window_count",
+                    signal
+                        .window_revision
+                        .saturating_sub(initial_signal.window_revision),
+                );
+                span.record(
+                    "computer.accessibility.notification.busy_count",
+                    signal
+                        .busy_revision
+                        .saturating_sub(initial_signal.busy_revision),
+                );
                 span.record("computer.settle.settled", matched);
                 let root = self.artifact_root.clone();
                 let maximum = self.maximum_elements;
@@ -373,6 +446,26 @@ impl MacosBackend {
                 })?;
                 finish_span(&verify_span, verify_started, &observed);
                 let mut observed = observed?;
+                let verified_signal = self.accessibility_signal();
+                if matched && verified_signal.revision != signal.revision {
+                    info!(
+                        target: "nanocodex_computer",
+                        candidate_revision = signal.revision,
+                        verified_revision = verified_signal.revision,
+                        "discarded postcondition invalidated by an Accessibility notification"
+                    );
+                    if let Some(screenshot) = &observed.screenshot
+                        && let Err(error) = tokio::fs::remove_file(&screenshot.path).await
+                        && error.kind() != std::io::ErrorKind::NotFound
+                    {
+                        tracing::warn!(path = %screenshot.path.display(), %error, "failed to prune invalidated computer screenshot");
+                    }
+                    previous = Some(signature);
+                    previous_signal_revision = Some(verified_signal.revision);
+                    tokio::time::sleep(self.settle.sample_interval).await;
+                    continue;
+                }
+                self.authorize_observation_urls(&observed)?;
                 self.apply_accessibility_revision(&mut observed);
                 record_observation(&verify_span, &observed, None);
                 drop(verify_span);
@@ -386,6 +479,7 @@ impl MacosBackend {
                 return Ok(observed);
             }
             previous = Some(signature);
+            previous_signal_revision = Some(signal.revision);
             tokio::time::sleep(self.settle.sample_interval).await;
         }
     }
@@ -434,6 +528,7 @@ impl MacosBackend {
         let target = self.target.clone().ok_or(ComputerError::NoTarget)?;
         let generation = self.generation;
         let maximum = self.maximum_elements;
+        let allowed_url_origins = self.allowed_url_origins.clone();
         let protected_frontmost = tokio::task::spawn_blocking(frontmost_application_pid)
             .await
             .map_err(|error| ComputerError::Native {
@@ -455,15 +550,26 @@ impl MacosBackend {
         );
         let started = Instant::now();
         let outcome = async move {
-            tokio::task::spawn_blocking(move || native_action(&target, generation, maximum, action))
-                .await
-                .map_err(|error| ComputerError::Native {
-                    message: format!("input worker panicked: {error}"),
-                })?
+            tokio::task::spawn_blocking(move || {
+                native_action(
+                    &target,
+                    generation,
+                    maximum,
+                    action,
+                    allowed_url_origins.as_deref(),
+                )
+            })
+            .await
+            .map_err(|error| ComputerError::Native {
+                message: format!("input worker panicked: {error}"),
+            })?
         }
         .instrument(span.clone())
         .await;
         finish_span(&span, started, &outcome);
+        if let Err(ComputerError::UrlDenied { url }) = &outcome {
+            self.blocked_url = Some(url.clone());
+        }
         outcome?;
         drop(span);
         Ok(ComputerOutput::State {
@@ -483,6 +589,9 @@ impl Backend for MacosBackend {
         state: Arc<RunState>,
         frames: &mut FrameSink,
     ) -> Result<ComputerOutput, ComputerError> {
+        if let Some(url) = &self.blocked_url {
+            return Err(ComputerError::UrlDenied { url: url.clone() });
+        }
         if tokio::task::spawn_blocking(screen_locked)
             .await
             .map_err(|error| ComputerError::Native {
@@ -613,6 +722,7 @@ impl Backend for MacosBackend {
                     computer.target.requested_window_id = window_id,
                     computer.target.pid = Empty,
                     computer.target.window_id = Empty,
+                    computer.accessibility.notification.enabled = Empty,
                     duration_ns = Empty,
                     status = Empty,
                     otel.status_code = Empty,
@@ -627,8 +737,31 @@ impl Backend for MacosBackend {
                 finish_span(&span, started, &outcome);
                 let target = outcome?;
                 self.authorize_application(&target.application)?;
+                let target_pid = target.application.pid;
+                let monitor = tokio::task::spawn_blocking(move || {
+                    AccessibilityNotificationMonitor::spawn(target_pid)
+                })
+                .await
+                .map_err(|error| ComputerError::Native {
+                    message: format!("Accessibility monitor worker panicked: {error}"),
+                })?;
+                self.accessibility_monitor = match monitor {
+                    Ok(monitor) => Some(monitor),
+                    Err(_) => {
+                        tracing::warn!(
+                            target: "nanocodex_computer",
+                            pid = target.application.pid,
+                            "Accessibility notifications unavailable; retaining polling fallback"
+                        );
+                        None
+                    }
+                };
                 span.record("computer.target.pid", target.application.pid);
                 span.record("computer.target.window_id", target.window.id);
+                span.record(
+                    "computer.accessibility.notification.enabled",
+                    self.accessibility_monitor.is_some(),
+                );
                 drop(span);
                 self.intervention_target.set_pid(target.application.pid);
                 self.target = Some(target);
@@ -1463,6 +1596,7 @@ fn public_element(element: &AXUIElement, generation: u64, index: usize) -> Eleme
         value: scalar_value(element),
         placeholder: string_attribute(element.placeholder_value()),
         identifier: string_attribute(element.identifier()),
+        url: url_attribute(element),
         frame: None,
         enabled: None,
         focused: None,
@@ -1487,6 +1621,7 @@ fn should_include(element: &Element) -> bool {
         || element.value.is_some()
         || element.placeholder.is_some()
         || element.identifier.is_some()
+        || element.url.is_some()
         || matches!(
             element.role.as_str(),
             "AXTextField" | "AXTextArea" | "AXWebArea" | "AXLink" | "AXButton" | "AXMenuItem"
@@ -1510,6 +1645,19 @@ fn string_attribute(value: Result<CFString, accessibility::Error>) -> Option<Str
         .map(|value| truncate(value, MAX_TEXT_CHARS))
 }
 
+fn url_attribute(element: &AXUIElement) -> Option<String> {
+    let attribute = AXAttribute::<core_foundation::base::CFType>::new(&CFString::new("AXURL"));
+    let value = element.attribute(&attribute).ok()?;
+    if value.instance_of::<CFURL>() {
+        return value
+            .downcast::<CFURL>()
+            .map(|url| truncate(url.get_string().to_string(), MAX_TEXT_CHARS));
+    }
+    value
+        .downcast::<CFString>()
+        .map(|url| truncate(url.to_string(), MAX_TEXT_CHARS))
+}
+
 fn truncate(value: String, maximum: usize) -> String {
     if value.chars().count() <= maximum {
         return value;
@@ -1527,8 +1675,8 @@ fn reference_for(generation: u64, index: usize, element: &Element) -> ElementRef
 fn element_hash(element: &Element) -> u64 {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in format!(
-        "{}\0{:?}\0{:?}\0{:?}\0{:?}",
-        element.role, element.identifier, element.label, element.value, element.frame
+        "{}\0{:?}\0{:?}\0{:?}\0{:?}\0{:?}",
+        element.role, element.identifier, element.label, element.value, element.url, element.frame
     )
     .bytes()
     {
@@ -1613,6 +1761,7 @@ fn same_element_state(left: &Element, right: &Element) -> bool {
         && left.value == right.value
         && left.placeholder == right.placeholder
         && left.identifier == right.identifier
+        && left.url == right.url
         && left.frame == right.frame
         && left.enabled == right.enabled
         && left.focused == right.focused
@@ -1714,6 +1863,7 @@ fn native_action(
     generation: u64,
     maximum: usize,
     action: NativeAction,
+    allowed_url_origins: Option<&[Url]>,
 ) -> Result<(), ComputerError> {
     if screen_locked() {
         return Err(ComputerError::ScreenLocked);
@@ -1725,6 +1875,7 @@ fn native_action(
             button: MouseButton::Left,
         } => {
             let (public, element) = resolve_element(target, generation, maximum, &reference)?;
+            authorize_element_url(&public, allowed_url_origins)?;
             if public.actions.iter().any(|action| action == "AXPress") {
                 return element
                     .perform_action(&CFString::new("AXPress"))
@@ -1802,6 +1953,7 @@ fn native_action(
                 });
             }
             let (public, element) = resolve_element(target, generation, maximum, &reference)?;
+            authorize_element_url(&public, allowed_url_origins)?;
             if !public.actions.iter().any(|action| action == &name) {
                 return Err(ComputerError::InvalidAction {
                     message: format!("element {reference} does not advertise {name}"),
@@ -1814,6 +1966,35 @@ fn native_action(
                 })
         }
     }
+}
+
+fn authorize_element_url(
+    element: &Element,
+    allowed_url_origins: Option<&[Url]>,
+) -> Result<(), ComputerError> {
+    let Some(raw) = element.url.as_deref() else {
+        return Ok(());
+    };
+    enforce_url_policy(raw, allowed_url_origins)
+}
+
+fn enforce_url_policy(raw: &str, allowed_url_origins: Option<&[Url]>) -> Result<(), ComputerError> {
+    let Some(allowed) = allowed_url_origins else {
+        return Ok(());
+    };
+    let parsed = Url::parse(raw).map_err(|_| ComputerError::UrlDenied {
+        url: raw.to_owned(),
+    })?;
+    if matches!(parsed.scheme(), "http" | "https")
+        && allowed
+            .iter()
+            .any(|allowed| allowed.origin() == parsed.origin())
+    {
+        return Ok(());
+    }
+    Err(ComputerError::UrlDenied {
+        url: raw.to_owned(),
+    })
 }
 
 fn event_source() -> Result<CGEventSource, ComputerError> {
@@ -2339,6 +2520,7 @@ mod tests {
                 value: Some(value.to_owned()),
                 placeholder: None,
                 identifier: None,
+                url: None,
                 frame: None,
                 enabled: Some(true),
                 focused: Some(false),
@@ -2370,5 +2552,23 @@ mod tests {
                 .map(|element| element.reference.clone())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn url_policy_is_origin_scoped_and_fails_closed() {
+        let allowed = [Url::parse("https://example.com").unwrap()];
+        assert!(enforce_url_policy("https://example.com/inbox", Some(&allowed)).is_ok());
+        assert!(matches!(
+            enforce_url_policy("https://evil.example/inbox", Some(&allowed)),
+            Err(ComputerError::UrlDenied { .. })
+        ));
+        assert!(matches!(
+            enforce_url_policy("mailto:user@example.com", Some(&allowed)),
+            Err(ComputerError::UrlDenied { .. })
+        ));
+        assert!(matches!(
+            enforce_url_policy("not a URL", Some(&allowed)),
+            Err(ComputerError::UrlDenied { .. })
+        ));
     }
 }

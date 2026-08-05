@@ -3,6 +3,7 @@
 
 mod driver;
 mod error;
+mod pip;
 mod platform;
 mod preview;
 mod tool;
@@ -10,6 +11,7 @@ mod types;
 
 pub use driver::{Computer, ComputerBuilder, ComputerControl, ComputerEvents, ComputerFrames};
 pub use error::{ComputerBuildError, ComputerError};
+pub use pip::ComputerPip;
 pub use preview::ComputerPreview;
 pub use tool::ComputerTool;
 pub use types::{

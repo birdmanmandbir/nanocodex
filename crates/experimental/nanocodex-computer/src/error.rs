@@ -41,6 +41,9 @@ pub enum ComputerError {
     /// The embedding application's allowlist excludes the requested app.
     #[error("application {application} is not authorized for this computer session")]
     ApplicationDenied { application: String },
+    /// The attached browser exposed a URL outside caller-owned policy.
+    #[error("computer use stopped after encountering a disallowed URL: {url}")]
+    UrlDenied { url: String },
     /// An application or window could not be found.
     #[error("target not found: {message}")]
     TargetNotFound { message: String },

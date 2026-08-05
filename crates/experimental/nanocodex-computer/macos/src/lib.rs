@@ -4,6 +4,7 @@
 #![cfg(target_os = "macos")]
 
 use std::{
+    cell::Cell,
     ffi::c_void,
     path::PathBuf,
     process::{Command, Stdio},
@@ -17,17 +18,26 @@ use std::{
 
 use accessibility::{AXAttribute, AXUIElement};
 use accessibility_sys::{
-    AXIsProcessTrusted, AXIsProcessTrustedWithOptions, AXValueGetType, AXValueGetTypeID,
-    AXValueGetValue, AXValueRef, kAXPositionAttribute, kAXSizeAttribute,
-    kAXTrustedCheckOptionPrompt, kAXValueTypeCGPoint, kAXValueTypeCGSize,
+    AXIsProcessTrusted, AXIsProcessTrustedWithOptions, AXObserverAddNotification, AXObserverCreate,
+    AXObserverGetRunLoopSource, AXObserverGetTypeID, AXObserverRef, AXUIElementRef, AXValueGetType,
+    AXValueGetTypeID, AXValueGetValue, AXValueRef, kAXCreatedNotification,
+    kAXElementBusyChangedNotification, kAXFocusedUIElementChangedNotification,
+    kAXFocusedWindowChangedNotification, kAXLayoutChangedNotification,
+    kAXMainWindowChangedNotification, kAXMovedNotification, kAXPositionAttribute,
+    kAXResizedNotification, kAXRowCountChangedNotification, kAXSelectedChildrenChangedNotification,
+    kAXSelectedTextChangedNotification, kAXSizeAttribute, kAXTitleChangedNotification,
+    kAXTrustedCheckOptionPrompt, kAXUIElementDestroyedNotification, kAXValueChangedNotification,
+    kAXValueTypeCGPoint, kAXValueTypeCGSize, kAXWindowCreatedNotification,
 };
 use core_foundation::{
     array::CFArray,
     base::{CFType, TCFType},
     boolean::CFBoolean,
+    declare_TCFType,
     dictionary::CFDictionary,
+    impl_CFTypeDescription, impl_TCFType,
     number::CFNumber,
-    runloop::{CFRunLoop, kCFRunLoopDefaultMode},
+    runloop::{CFRunLoop, CFRunLoopSource, kCFRunLoopDefaultMode},
     string::{CFString, CFStringRef},
 };
 use core_graphics::{
@@ -48,7 +58,18 @@ use core_graphics::{
         kCGWindowOwnerPID,
     },
 };
-use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication, NSWorkspace};
+use objc2::{AnyThread, MainThreadMarker, MainThreadOnly, rc::Retained};
+use objc2_app_kit::{
+    NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy,
+    NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSEventMask, NSFloatingWindowLevel,
+    NSImage, NSImageScaling, NSImageView, NSPanel, NSRunningApplication, NSScreen,
+    NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
+};
+use objc2_foundation::{NSData, NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize, NSString};
+
+declare_TCFType!(AccessibilityObserver, AXObserverRef);
+impl_TCFType!(AccessibilityObserver, AXObserverRef, AXObserverGetTypeID);
+impl_CFTypeDescription!(AccessibilityObserver);
 
 /// Result of requesting richer renderer-backed accessibility trees.
 pub struct AccessibilityEnablement {
@@ -466,12 +487,358 @@ pub fn screen_locked() -> bool {
         .is_some_and(|bundle_id| bundle_id.to_string() == "com.apple.loginwindow")
 }
 
+/// A non-activating in-process floating renderer for live computer frames.
+///
+/// Construction and every method must run on the macOS main thread. The safe
+/// wrapper enforces that condition with `MainThreadMarker` before touching
+/// AppKit.
+pub struct NativePipWindow {
+    application: Retained<NSApplication>,
+    panel: Retained<NSPanel>,
+    image_view: Retained<NSImageView>,
+    presentation_aspect: Cell<Option<f64>>,
+}
+
+/// Failure to create or update the native PIP renderer.
+#[derive(Debug)]
+pub struct NativePipWindowError;
+
+impl NativePipWindow {
+    /// Creates a non-key floating panel that the first frame presents.
+    pub fn new() -> Result<Self, NativePipWindowError> {
+        let mtm = MainThreadMarker::new().ok_or(NativePipWindowError)?;
+        let application = NSApplication::sharedApplication(mtm);
+        let _ = application.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+        let size = NSSize::new(420.0, 270.0);
+        let visible = NSScreen::mainScreen(mtm)
+            .map(|screen| screen.visibleFrame())
+            .unwrap_or_else(|| NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1_440.0, 900.0)));
+        let origin = NSPoint::new(
+            visible.origin.x + visible.size.width - size.width - 24.0,
+            visible.origin.y + visible.size.height - size.height - 24.0,
+        );
+        let frame = NSRect::new(origin, size);
+        let style = NSWindowStyleMask::Resizable | NSWindowStyleMask::NonactivatingPanel;
+        let panel = NSPanel::initWithContentRect_styleMask_backing_defer(
+            NSPanel::alloc(mtm),
+            frame,
+            style,
+            NSBackingStoreType::Buffered,
+            false,
+        );
+        panel.setTitle(&NSString::from_str("Nanocodex Computer"));
+        panel.setOpaque(false);
+        panel.setBackgroundColor(Some(&NSColor::clearColor()));
+        panel.setHasShadow(true);
+        panel.setFloatingPanel(true);
+        panel.setBecomesKeyOnlyIfNeeded(true);
+        panel.setHidesOnDeactivate(false);
+        panel.setCanHide(false);
+        panel.setMovableByWindowBackground(true);
+        panel.setLevel(NSFloatingWindowLevel);
+        panel.setCollectionBehavior(
+            NSWindowCollectionBehavior::CanJoinAllSpaces
+                | NSWindowCollectionBehavior::FullScreenAuxiliary,
+        );
+        // SAFETY: The panel remains strongly retained by this wrapper, so AppKit
+        // must not release it implicitly when the user closes it.
+        unsafe { panel.setReleasedWhenClosed(false) };
+        let image_view = NSImageView::initWithFrame(
+            NSImageView::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), size),
+        );
+        image_view.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
+        image_view.setWantsLayer(true);
+        if let Some(layer) = image_view.layer() {
+            layer.setCornerRadius(14.0);
+            layer.setMasksToBounds(true);
+        }
+        image_view.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable
+                | NSAutoresizingMaskOptions::ViewHeightSizable,
+        );
+        panel.setContentView(Some(&image_view));
+        application.updateWindows();
+        Ok(Self {
+            application,
+            panel,
+            image_view,
+            presentation_aspect: Cell::new(None),
+        })
+    }
+
+    /// Replaces the displayed frame from complete PNG bytes.
+    pub fn update_png(&self, png: &[u8]) -> Result<(), NativePipWindowError> {
+        MainThreadMarker::new().ok_or(NativePipWindowError)?;
+        // SAFETY: NSData copies exactly `png.len()` initialized bytes during the
+        // call and does not retain the borrowed Rust pointer.
+        let data =
+            unsafe { NSData::dataWithBytes_length(png.as_ptr().cast::<c_void>(), png.len()) };
+        let image = NSImage::initWithData(NSImage::alloc(), &data).ok_or(NativePipWindowError)?;
+        let image_size = image.size();
+        if image_size.width > 0.0 && image_size.height > 0.0 {
+            let aspect = image_size.width / image_size.height;
+            if self
+                .presentation_aspect
+                .get()
+                .is_none_or(|previous| (previous - aspect).abs() > 0.02)
+            {
+                let scale = (420.0 / image_size.width).min(270.0 / image_size.height);
+                self.panel.setContentSize(NSSize::new(
+                    image_size.width * scale,
+                    image_size.height * scale,
+                ));
+                let frame = self.panel.frame();
+                if let Some(screen) =
+                    NSScreen::mainScreen(MainThreadMarker::new().ok_or(NativePipWindowError)?)
+                {
+                    let visible = screen.visibleFrame();
+                    self.panel.setFrameOrigin(NSPoint::new(
+                        visible.origin.x + visible.size.width - frame.size.width - 24.0,
+                        visible.origin.y + visible.size.height - frame.size.height - 24.0,
+                    ));
+                }
+                self.presentation_aspect.set(Some(aspect));
+            }
+            self.panel.setContentAspectRatio(image_size);
+        }
+        self.image_view.setImage(Some(&image));
+        self.panel.orderFrontRegardless();
+        self.application.updateWindows();
+        Ok(())
+    }
+
+    /// Drains a bounded number of pending AppKit events without blocking.
+    pub fn pump(&self) -> Result<(), NativePipWindowError> {
+        MainThreadMarker::new().ok_or(NativePipWindowError)?;
+        let expiration = NSDate::distantPast();
+        for _ in 0..32 {
+            let Some(event) = self
+                .application
+                .nextEventMatchingMask_untilDate_inMode_dequeue(
+                    NSEventMask::Any,
+                    Some(&expiration),
+                    // SAFETY: NSDefaultRunLoopMode is a process-lifetime Foundation constant.
+                    unsafe { NSDefaultRunLoopMode },
+                    true,
+                )
+            else {
+                break;
+            };
+            self.application.sendEvent(&event);
+        }
+        self.application.updateWindows();
+        Ok(())
+    }
+
+    /// Removes the panel from screen without activating another application.
+    pub fn hide(&self) -> Result<(), NativePipWindowError> {
+        MainThreadMarker::new().ok_or(NativePipWindowError)?;
+        self.panel.orderOut(None);
+        Ok(())
+    }
+}
+
 /// Requests activation of one running graphical application.
 #[must_use]
 pub fn activate_application(pid: i32) -> bool {
     NSRunningApplication::runningApplicationWithProcessIdentifier(pid).is_some_and(|application| {
         application.activateWithOptions(NSApplicationActivationOptions::empty())
     })
+}
+
+/// Monotonic Accessibility notification counters for one application process.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AccessibilitySignalSnapshot {
+    pub revision: u64,
+    pub tree_revision: u64,
+    pub window_revision: u64,
+    pub busy_revision: u64,
+}
+
+#[derive(Default)]
+struct AccessibilitySignalState {
+    revision: AtomicU64,
+    tree_revision: AtomicU64,
+    window_revision: AtomicU64,
+    busy_revision: AtomicU64,
+}
+
+impl AccessibilitySignalState {
+    fn record(&self, notification: &str) {
+        self.revision.fetch_add(1, Ordering::AcqRel);
+        if [
+            kAXFocusedWindowChangedNotification,
+            kAXMainWindowChangedNotification,
+            kAXWindowCreatedNotification,
+        ]
+        .contains(&notification)
+        {
+            self.window_revision.fetch_add(1, Ordering::AcqRel);
+        } else if notification == kAXElementBusyChangedNotification {
+            self.busy_revision.fetch_add(1, Ordering::AcqRel);
+        } else {
+            self.tree_revision.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn snapshot(&self) -> AccessibilitySignalSnapshot {
+        AccessibilitySignalSnapshot {
+            revision: self.revision.load(Ordering::Acquire),
+            tree_revision: self.tree_revision.load(Ordering::Acquire),
+            window_revision: self.window_revision.load(Ordering::Acquire),
+            busy_revision: self.busy_revision.load(Ordering::Acquire),
+        }
+    }
+}
+
+/// Lifecycle-owned AXObserver run-loop thread for one attached process.
+pub struct AccessibilityNotificationMonitor {
+    stopped: Arc<AtomicBool>,
+    signals: Arc<AccessibilitySignalState>,
+    thread: Option<JoinHandle<()>>,
+}
+
+/// Failure to create an Accessibility notification observer.
+#[derive(Debug)]
+pub struct AccessibilityNotificationMonitorError;
+
+impl AccessibilityNotificationMonitor {
+    /// Starts observing window, tree, value, focus, and loading invalidations.
+    pub fn spawn(pid: i32) -> Result<Self, AccessibilityNotificationMonitorError> {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let signals = Arc::new(AccessibilitySignalState::default());
+        let thread_stopped = Arc::clone(&stopped);
+        let thread_signals = Arc::clone(&signals);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let thread = std::thread::Builder::new()
+            .name("nanocodex-ax-monitor".to_owned())
+            .spawn(move || {
+                let application = AXUIElement::application(pid);
+                let mut raw_observer = std::ptr::null_mut();
+                // SAFETY: The out pointer is valid for the call and the callback
+                // retains no AX values. A successful create returns one owned
+                // observer, wrapped below under Core Foundation's create rule.
+                if unsafe {
+                    AXObserverCreate(
+                        pid,
+                        accessibility_notification_callback,
+                        &raw mut raw_observer,
+                    )
+                } != 0
+                    || raw_observer.is_null()
+                {
+                    let _ = ready_tx.send(false);
+                    return;
+                }
+                // SAFETY: AXObserverCreate succeeded and transferred one owned
+                // retain to this thread.
+                let observer =
+                    unsafe { AccessibilityObserver::wrap_under_create_rule(raw_observer) };
+                let notifications = [
+                    kAXFocusedWindowChangedNotification,
+                    kAXMainWindowChangedNotification,
+                    kAXWindowCreatedNotification,
+                    kAXFocusedUIElementChangedNotification,
+                    kAXElementBusyChangedNotification,
+                    kAXLayoutChangedNotification,
+                    kAXCreatedNotification,
+                    kAXUIElementDestroyedNotification,
+                    kAXValueChangedNotification,
+                    kAXTitleChangedNotification,
+                    kAXMovedNotification,
+                    kAXResizedNotification,
+                    kAXRowCountChangedNotification,
+                    kAXSelectedChildrenChangedNotification,
+                    kAXSelectedTextChangedNotification,
+                ];
+                let refcon = Arc::as_ptr(&thread_signals).cast_mut().cast::<c_void>();
+                let accepted = notifications
+                    .iter()
+                    .filter(|notification| {
+                        let notification = CFString::new(notification);
+                        // SAFETY: The observer, application element, notification
+                        // string, and refcon remain valid for the run-loop lifetime.
+                        unsafe {
+                            AXObserverAddNotification(
+                                observer.as_concrete_TypeRef(),
+                                application.as_concrete_TypeRef(),
+                                notification.as_concrete_TypeRef(),
+                                refcon,
+                            ) == 0
+                        }
+                    })
+                    .count();
+                if accepted == 0 {
+                    let _ = ready_tx.send(false);
+                    return;
+                }
+                // SAFETY: The observer owns a valid run-loop source. Wrapping
+                // under the get rule retains it independently for this scope.
+                let source = unsafe {
+                    CFRunLoopSource::wrap_under_get_rule(AXObserverGetRunLoopSource(
+                        observer.as_concrete_TypeRef(),
+                    ))
+                };
+                let run_loop = CFRunLoop::get_current();
+                // SAFETY: kCFRunLoopDefaultMode is a process-lifetime constant.
+                run_loop.add_source(&source, unsafe { kCFRunLoopDefaultMode });
+                let _ = ready_tx.send(true);
+                while !thread_stopped.load(Ordering::Acquire) {
+                    // SAFETY: kCFRunLoopDefaultMode is a process-lifetime constant.
+                    CFRunLoop::run_in_mode(
+                        unsafe { kCFRunLoopDefaultMode },
+                        Duration::from_millis(100),
+                        false,
+                    );
+                }
+            })
+            .map_err(|_| AccessibilityNotificationMonitorError)?;
+        match ready_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(true) => Ok(Self {
+                stopped,
+                signals,
+                thread: Some(thread),
+            }),
+            _ => {
+                stopped.store(true, Ordering::Release);
+                let _ = thread.join();
+                Err(AccessibilityNotificationMonitorError)
+            }
+        }
+    }
+
+    /// Returns the latest lock-free notification counters.
+    #[must_use]
+    pub fn snapshot(&self) -> AccessibilitySignalSnapshot {
+        self.signals.snapshot()
+    }
+}
+
+impl Drop for AccessibilityNotificationMonitor {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+unsafe extern "C" fn accessibility_notification_callback(
+    _observer: AXObserverRef,
+    _element: AXUIElementRef,
+    notification: CFStringRef,
+    refcon: *mut c_void,
+) {
+    if notification.is_null() || refcon.is_null() {
+        return;
+    }
+    // SAFETY: spawn passes an Arc-backed state pointer that outlives the
+    // observer run loop, and the callback only performs atomic operations.
+    let signals = unsafe { &*refcon.cast::<AccessibilitySignalState>() };
+    // SAFETY: Accessibility supplies a valid borrowed CFString for this call.
+    let notification = unsafe { CFString::wrap_under_get_rule(notification) };
+    signals.record(&notification.to_string());
 }
 
 /// A supervised listen-only human input event tap.
@@ -483,6 +850,16 @@ pub struct HumanInputMonitor {
 /// Failure to create the listen-only event tap or its worker thread.
 #[derive(Debug)]
 pub struct HumanInputMonitorError;
+
+/// Structural metadata for a physical input event directed at the target app.
+#[derive(Clone, Copy, Debug)]
+pub struct HumanInputEvent {
+    pub kind: &'static str,
+    pub source_pid: i64,
+    pub target_pid: i32,
+    pub x: f64,
+    pub y: f64,
+}
 
 /// Lock-free target identity shared with the listen-only input monitor.
 #[derive(Default)]
@@ -505,11 +882,11 @@ impl HumanInputMonitor {
     /// Starts observing physical input directed at the selected application.
     pub fn spawn(
         target: Arc<HumanInputTarget>,
-        callback: impl Fn() + Send + Sync + 'static,
+        callback: impl Fn(HumanInputEvent) + Send + Sync + 'static,
     ) -> Result<Self, HumanInputMonitorError> {
         let stopped = Arc::new(AtomicBool::new(false));
         let thread_stopped = Arc::clone(&stopped);
-        let callback: Arc<dyn Fn() + Send + Sync> = Arc::new(callback);
+        let callback: Arc<dyn Fn(HumanInputEvent) + Send + Sync> = Arc::new(callback);
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let thread = std::thread::Builder::new()
             .name("nanocodex-input-monitor".to_owned())
@@ -527,11 +904,21 @@ impl HumanInputMonitor {
                         CGEventType::KeyDown,
                     ],
                     move |_proxy, kind, event| {
+                        let target_pid = target.pid();
                         if event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA)
                             != SYNTHETIC_MARKER
-                            && human_event_targets(kind, event, target.pid())
+                            && human_event_targets(kind, event, target_pid)
                         {
-                            callback();
+                            let location = event.location();
+                            callback(HumanInputEvent {
+                                kind: input_event_kind(kind),
+                                source_pid: event.get_integer_value_field(
+                                    EventField::EVENT_SOURCE_UNIX_PROCESS_ID,
+                                ),
+                                target_pid,
+                                x: location.x,
+                                y: location.y,
+                            });
                         }
                         CallbackResult::Keep
                     },
@@ -570,6 +957,17 @@ impl HumanInputMonitor {
                 Err(HumanInputMonitorError)
             }
         }
+    }
+}
+
+const fn input_event_kind(kind: CGEventType) -> &'static str {
+    match kind {
+        CGEventType::KeyDown => "key_down",
+        CGEventType::LeftMouseDown => "left_mouse_down",
+        CGEventType::RightMouseDown => "right_mouse_down",
+        CGEventType::OtherMouseDown => "other_mouse_down",
+        CGEventType::ScrollWheel => "scroll_wheel",
+        _ => "other",
     }
 }
 

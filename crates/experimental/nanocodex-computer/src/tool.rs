@@ -46,7 +46,8 @@ The human can pause or intervene independently. A paused error means stop
 issuing actions until the host resumes control. Never attempt to bypass macOS
 Accessibility or Screen Recording permission errors. A locked desktop or
 application authorization error is terminal until the human or host changes
-that condition.";
+that condition. URL policy is host-owned: never retry a disallowed URL or try
+to navigate around it.";
 
 /// Nanocodex Code Mode provider for one owned native computer session.
 #[derive(Clone)]
