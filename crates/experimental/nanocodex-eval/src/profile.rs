@@ -19,6 +19,10 @@ use nanocodex_oai_api::{Model, Thinking};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest as _, Sha256};
 
+use crate::profile_run::{
+    ActiveProfileRun, ProfileRunControl, ProfileRunControlError, ProfileRunStatus,
+};
+
 const PREPARATION_RECEIPT_VERSION: u32 = 2;
 
 /// Repository-level evaluation configuration parameterized by benchmark recipe.
@@ -175,7 +179,7 @@ pub struct TaskPreparation {
 /// Complete execution request for one validated preparation receipt.
 pub struct ProfileRunRequest {
     receipt: PreparationReceipt,
-    control_directory: PathBuf,
+    active: Option<ActiveProfileRun>,
     job_directory: PathBuf,
     cache_directory: PathBuf,
     new_tasks: Option<Vec<String>>,
@@ -253,21 +257,21 @@ impl TaskPreparation {
 }
 
 impl ProfileRunRequest {
-    /// Binds one receipt to workspace-owned run and cache directories.
-    #[must_use]
-    pub fn new(
+    /// Acquires the profile coordinator and binds its workspace-owned paths.
+    pub fn begin(
         receipt: PreparationReceipt,
         control_directory: impl Into<PathBuf>,
         job_directory: impl Into<PathBuf>,
         cache_directory: impl Into<PathBuf>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, ProfileRunControlError> {
+        let active = ProfileRunControl::new(control_directory).acquire(receipt.profile(), 0)?;
+        Ok(Self {
             receipt,
-            control_directory: control_directory.into(),
+            active: Some(active),
             job_directory: job_directory.into(),
             cache_directory: cache_directory.into(),
             new_tasks: None,
-        }
+        })
     }
 
     /// Forces a fresh run containing all or a selected subset of prepared tasks.
@@ -282,9 +286,33 @@ impl ProfileRunRequest {
         &self.receipt
     }
 
-    /// Stable profile directory for the coordinator lease and latest status.
-    pub fn control_directory(&self) -> &Path {
-        &self.control_directory
+    /// Publishes the exact finite matrix size after runtime planning.
+    pub fn planned_attempts(
+        &mut self,
+        planned_attempts: usize,
+    ) -> Result<(), ProfileRunControlError> {
+        self.active_mut()?.planned_attempts(planned_attempts)
+    }
+
+    /// Publishes the UUID job directory once the evaluator opens it.
+    pub fn opened_job(
+        &mut self,
+        directory: impl Into<PathBuf>,
+    ) -> Result<(), ProfileRunControlError> {
+        self.active_mut()?.job_directory(directory)
+    }
+
+    /// Waits until another process requests graceful stop.
+    pub async fn wait_for_stop(&self) -> Result<(), ProfileRunControlError> {
+        self.active()?.wait_for_stop().await
+    }
+
+    /// Publishes successful completion and releases the coordinator lease.
+    pub fn complete(mut self) -> Result<ProfileRunStatus, ProfileRunControlError> {
+        self.active
+            .take()
+            .ok_or_else(|| ProfileRunControlError::NotRunning(self.receipt.profile().to_owned()))?
+            .complete()
     }
 
     /// Preparation-scoped parent for durable resumable evaluator jobs.
@@ -300,6 +328,18 @@ impl ProfileRunRequest {
     /// Requested fresh-run task selectors; an empty slice means the full profile.
     pub fn new_tasks(&self) -> Option<&[String]> {
         self.new_tasks.as_deref()
+    }
+
+    fn active(&self) -> Result<&ActiveProfileRun, ProfileRunControlError> {
+        self.active
+            .as_ref()
+            .ok_or_else(|| ProfileRunControlError::NotRunning(self.receipt.profile().to_owned()))
+    }
+
+    fn active_mut(&mut self) -> Result<&mut ActiveProfileRun, ProfileRunControlError> {
+        self.active
+            .as_mut()
+            .ok_or_else(|| ProfileRunControlError::NotRunning(self.receipt.profile().to_owned()))
     }
 }
 

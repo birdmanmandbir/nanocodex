@@ -69,7 +69,7 @@ use crate::{
     profile::{
         PreparationReceipt, PreparedHarness, ProfileRunPlanError, ProfileRunRequest, ProfileRunner,
     },
-    profile_run::{ProfileRunControl, ProfileRunControlError},
+    profile_run::ProfileRunControlError,
 };
 
 const EMBEDDED_GUEST_TOOL_RUNTIME: &str = "/usr/local/bin/nanocodex-vm-guest";
@@ -622,7 +622,7 @@ impl ProfileRunner for VmProfileRunner {
     type Error = VmProfileRunError;
     type Output = VmProfileRunResult;
 
-    async fn run(self, request: ProfileRunRequest) -> Result<Self::Output, Self::Error> {
+    async fn run(self, mut request: ProfileRunRequest) -> Result<Self::Output, Self::Error> {
         let new_tasks = request.new_tasks().map(<[String]>::to_vec);
         let plan = request
             .receipt()
@@ -630,8 +630,7 @@ impl ProfileRunner for VmProfileRunner {
         let tasks = plan.tasks().to_vec();
         let sweep = plan.into_sweep();
         let planned_attempts = sweep.attempt_count();
-        let mut active = ProfileRunControl::new(request.control_directory())
-            .acquire(request.receipt().profile(), planned_attempts)?;
+        request.planned_attempts(planned_attempts)?;
         let (harness_root, harnesses) = PreparedGuestHarness::stage_all(
             request.receipt().harnesses(),
             request.cache_directory(),
@@ -705,7 +704,7 @@ impl ProfileRunner for VmProfileRunner {
             evaluator = evaluator.max_memory_mb(memory_mb);
         }
         let evaluator = evaluator.build()?;
-        active.job_directory(evaluator.directory())?;
+        request.opened_job(evaluator.directory())?;
         Self::reclaim_interrupted_attempt_disks(evaluator.directory())
             .map_err(VmProfileRunError::InterruptedAttemptCleanup)?;
         let remaining = evaluator.remaining_attempts()?;
@@ -722,14 +721,14 @@ impl ProfileRunner for VmProfileRunner {
         tokio::pin!(run);
         let (results, terminal_attempts) = tokio::select! {
             result = &mut run => (result?, remaining),
-            stop = active.wait_for_stop() => {
+            stop = request.wait_for_stop() => {
                 stop?;
                 let admitted = evaluator.begin_drain();
                 (run.await?, admitted)
             }
         };
         let job = recorder.finish_all(terminal_attempts).await?;
-        active.complete()?;
+        request.complete()?;
         Ok(VmProfileRunResult {
             job_directory: job.directory().to_path_buf(),
             attempts: results.attempts().len(),

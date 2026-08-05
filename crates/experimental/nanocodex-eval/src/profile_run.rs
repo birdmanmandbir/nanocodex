@@ -232,6 +232,18 @@ impl ProfileRunControl {
 }
 
 impl ActiveProfileRun {
+    /// Publishes the exact finite matrix size once runtime planning completes.
+    pub fn planned_attempts(
+        &mut self,
+        planned_attempts: usize,
+    ) -> Result<(), ProfileRunControlError> {
+        self.status.planned_attempts = planned_attempts;
+        if self.control.stop_path().is_file() {
+            self.status.phase = ProfileRunPhase::Stopping;
+        }
+        self.control.write_status(&self.status)
+    }
+
     /// Publishes the UUID job directory once the evaluator opens it.
     pub fn job_directory(
         &mut self,

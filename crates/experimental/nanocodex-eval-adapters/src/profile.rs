@@ -356,12 +356,12 @@ impl<P: ProfileRunner + TaskPreparer> EvaluationWorkspace<P> {
         let job_directory = control_directory
             .join("preparations")
             .join(prepared.published.digest());
-        let mut request = ProfileRunRequest::new(
+        let mut request = ProfileRunRequest::begin(
             prepared.receipt,
             control_directory,
             job_directory,
             self.state_directory.join("vm"),
-        );
+        )?;
         if let Some(tasks) = new_tasks {
             request = request.start_new(tasks);
         }
@@ -750,7 +750,7 @@ mod tests {
     }
 
     impl ProfileRunner for RecordingPreparer {
-        type Error = Infallible;
+        type Error = ProfileRunControlError;
         type Output = String;
 
         fn run(
@@ -761,6 +761,7 @@ mod tests {
             let output = request.job_directory().to_path_buf();
             async move {
                 *self.run_output.lock().unwrap() = Some(output);
+                request.complete()?;
                 Ok(profile)
             }
         }
@@ -943,6 +944,10 @@ thinking = ["low"]
             .build()
             .unwrap();
         assert_eq!(runner.run(None).await.unwrap(), "adapter-smoke");
+        assert_eq!(
+            workspace.status(None).unwrap().unwrap().run().phase(),
+            nanocodex_eval::profile_run::ProfileRunPhase::Completed
+        );
         assert_eq!(
             observation.run_output.lock().unwrap().as_deref(),
             Some(
