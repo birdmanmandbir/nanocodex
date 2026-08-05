@@ -268,7 +268,7 @@ pub enum KeyModifier {
 pub enum ComputerAction {
     /// Enumerate visible graphical applications and their windows.
     ListApplications,
-    /// Launch or activate an application by exact bundle identifier.
+    /// Launch an application in the background by exact bundle identifier.
     OpenApplication { bundle_id: String },
     /// Select an already running application and optionally a specific window.
     Attach {
@@ -316,6 +316,25 @@ pub enum ComputerAction {
     PerformAction { reference: ElementRef, name: String },
     /// Wait while continuing to honor pause and intervention controls.
     Wait { milliseconds: u64 },
+}
+
+impl ComputerAction {
+    pub(crate) const fn kind(&self) -> &'static str {
+        match self {
+            Self::ListApplications => "list_applications",
+            Self::OpenApplication { .. } => "open_application",
+            Self::Attach { .. } => "attach",
+            Self::Observe { .. } => "observe",
+            Self::Click { .. } => "click",
+            Self::Drag { .. } => "drag",
+            Self::Scroll { .. } => "scroll",
+            Self::PressKey { .. } => "press_key",
+            Self::TypeText { .. } => "type_text",
+            Self::SetValue { .. } => "set_value",
+            Self::PerformAction { .. } => "perform_action",
+            Self::Wait { .. } => "wait",
+        }
+    }
 }
 
 const fn default_true() -> bool {

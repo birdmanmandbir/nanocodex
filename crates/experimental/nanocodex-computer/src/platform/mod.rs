@@ -9,8 +9,12 @@ use crate::{
 
 #[cfg(target_os = "macos")]
 pub(crate) type InterventionMonitor = nanocodex_computer_macos::HumanInputMonitor;
+#[cfg(target_os = "macos")]
+pub(crate) type InterventionTarget = nanocodex_computer_macos::HumanInputTarget;
 #[cfg(not(target_os = "macos"))]
 pub(crate) struct InterventionMonitor;
+#[cfg(not(target_os = "macos"))]
+pub(crate) struct InterventionTarget;
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -30,6 +34,7 @@ pub(crate) fn native(
     artifact_root: PathBuf,
     settle: SettlePolicy,
     maximum_elements: usize,
+    intervention_target: Arc<InterventionTarget>,
 ) -> Box<dyn Backend> {
     #[cfg(target_os = "macos")]
     {
@@ -37,27 +42,40 @@ pub(crate) fn native(
             artifact_root,
             settle,
             maximum_elements,
+            intervention_target,
         ))
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (artifact_root, settle, maximum_elements);
+        let _ = (artifact_root, settle, maximum_elements, intervention_target);
         Box::new(UnsupportedBackend)
     }
 }
 
 pub(crate) fn intervention_monitor(
+    target: Arc<InterventionTarget>,
     callback: impl Fn() + Send + Sync + 'static,
 ) -> Result<InterventionMonitor, &'static str> {
     #[cfg(target_os = "macos")]
     {
-        nanocodex_computer_macos::HumanInputMonitor::spawn(callback)
+        nanocodex_computer_macos::HumanInputMonitor::spawn(target, callback)
             .map_err(|_| "event tap unavailable")
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = callback;
+        let _ = (target, callback);
         Err("event tap unavailable")
+    }
+}
+
+pub(crate) fn intervention_target() -> Arc<InterventionTarget> {
+    #[cfg(target_os = "macos")]
+    {
+        Arc::new(InterventionTarget::default())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Arc::new(InterventionTarget)
     }
 }
 

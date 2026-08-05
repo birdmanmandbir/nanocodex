@@ -40,12 +40,18 @@ run concurrently. A reference includes its raw accessibility-tree index and a
 fingerprint; resolving an action rebuilds metadata only for that candidate and
 rejects it if the tree changed or another observation made it stale.
 
-Semantic actions use `AXPress`, settable `AXValue`, or another advertised AX
-action first. Coordinate clicks, drags, scrolling, keys, and Unicode text use
-public `CGEventPostToPid`, so they target the attached process without stealing
-clipboard contents. Generated events carry a private marker. A listen-only
-event tap ignores those events and pauses the actor when it observes physical
-clicks, scrolling, or keyboard input from the human.
+The runtime enables Electron's public manual/enhanced Accessibility attributes
+before traversal, matching the behavior needed for background control of apps
+whose renderer tree is otherwise dormant. If a renderer remains dormant, an
+idempotent `open_application` briefly activates it and restores the prior
+frontmost application before returning. Semantic actions use `AXPress`,
+settable `AXValue`, or another advertised AX action first. Coordinate clicks,
+drags, scrolling, keys, and Unicode text use public `CGEventPostToPid`, so they
+target the attached process without stealing clipboard contents. Generated
+events carry a private marker. A listen-only event tap ignores those events and
+pauses the actor only when physical input is directed at the attached
+application; input in other applications can continue alongside background
+work.
 
 After a mutation the backend repeatedly captures visual samples and publishes
 them as shared in-memory `ComputerFrame`s for human observers. It returns after
@@ -100,6 +106,15 @@ nanocodex run "Open TextEdit and draft a note" --computer
 nanocodex run "Inspect the current app" --computer --computer-preview=false
 ```
 
+For a source-tree acceptance run, exercise that same production path rather
+than the backend examples:
+
+```sh
+cargo run -p nanocodex-bin -- run \
+  "Open TextEdit, type Hello from Nanocodex, and verify the text." \
+  --computer --computer-preview=false
+```
+
 In the Ratatui consumer, the first frame opens an adaptive live computer pane.
 Kitty-capable terminals render the captured pixels; other terminals retain a
 compact target/status fallback and can use the loopback preview. Human control
@@ -127,8 +142,8 @@ permission separately for `target/debug/examples/observe` and
 require granting it again; a distributed application should use a stably signed
 app or helper identity.
 
-To exercise the native API directly, including a fresh Accessibility check of
-the typed value:
+The lower-level example is only a backend diagnostic. To inspect the native API
+directly, including a fresh Accessibility check of the typed value:
 
 ```sh
 cargo build -p nanocodex-computer --example observe

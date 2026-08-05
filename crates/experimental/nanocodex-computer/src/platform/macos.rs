@@ -15,10 +15,13 @@ use core_graphics::{
 };
 use image::ImageEncoder as _;
 use nanocodex_computer_macos::{
-    NativeImageData, NativeWindow, PermissionRequest, capture_window, element_rect, mark_synthetic,
-    request_accessibility, request_screen_capture, window as native_window_by_id,
+    NativeImageData, NativeWindow, PermissionRequest, activate_application, capture_window,
+    element_rect, enable_application_accessibility as enable_native_application_accessibility,
+    frontmost_application_pid, mark_synthetic, request_accessibility, request_screen_capture,
+    window as native_window_by_id,
 };
 use sha2::{Digest as _, Sha256};
+use tracing::{Instrument as _, Span, field::Empty, info_span};
 
 use super::Backend;
 use crate::{
@@ -32,6 +35,8 @@ use crate::{
 const MAX_TEXT_CHARS: usize = 2_000;
 const MAX_TREE_DEPTH: usize = 80;
 const MAX_RETAINED_SCREENSHOTS: usize = 16;
+const ACCESSIBILITY_PRIME_ELEMENTS: usize = 64;
+const ACCESSIBILITY_PRIME_THRESHOLD: usize = 12;
 
 #[derive(Clone)]
 struct Target {
@@ -47,6 +52,24 @@ struct VisualSample {
     image: Arc<CapturedImage>,
 }
 
+struct ObservationRequest {
+    target: Target,
+    generation: u64,
+    sequence: u64,
+    screenshot: bool,
+    settled: bool,
+    artifact_root: PathBuf,
+    maximum_elements: usize,
+}
+
+struct ApplicationPriming {
+    pid: i32,
+    initial_elements: usize,
+    final_elements: usize,
+    activated: bool,
+    focus_restored: bool,
+}
+
 pub(super) struct MacosBackend {
     artifact_root: PathBuf,
     settle: SettlePolicy,
@@ -54,6 +77,7 @@ pub(super) struct MacosBackend {
     target: Option<Target>,
     generation: u64,
     screenshots: VecDeque<PathBuf>,
+    intervention_target: Arc<super::InterventionTarget>,
 }
 
 impl MacosBackend {
@@ -61,6 +85,7 @@ impl MacosBackend {
         artifact_root: PathBuf,
         settle: SettlePolicy,
         maximum_elements: usize,
+        intervention_target: Arc<super::InterventionTarget>,
     ) -> Self {
         Self {
             artifact_root,
@@ -69,6 +94,7 @@ impl MacosBackend {
             target: None,
             generation: 0,
             screenshots: VecDeque::new(),
+            intervention_target,
         }
     }
 
@@ -83,17 +109,45 @@ impl MacosBackend {
         let target = self.target.clone().ok_or(ComputerError::NoTarget)?;
         self.generation = self.generation.saturating_add(1);
         let generation = self.generation;
-        let root = self.artifact_root.clone();
         let maximum = self.maximum_elements;
-        let (observed, image) = tokio::task::spawn_blocking(move || {
-            observe_target(
-                target, generation, sequence, screenshot, settled, &root, maximum,
-            )
-        })
-        .await
-        .map_err(|error| ComputerError::Native {
-            message: format!("observation worker panicked: {error}"),
-        })??;
+        let request = ObservationRequest {
+            target,
+            generation,
+            sequence,
+            screenshot,
+            settled,
+            artifact_root: self.artifact_root.clone(),
+            maximum_elements: maximum,
+        };
+        let span = info_span!(
+            target: "nanocodex_computer",
+            "computer.observe",
+            computer.action.sequence = sequence,
+            computer.observation.generation = generation,
+            computer.screenshot.requested = screenshot,
+            computer.accessibility.maximum_elements = maximum,
+            computer.accessibility.element_count = Empty,
+            computer.screenshot.bytes = Empty,
+            computer.screenshot.width = Empty,
+            computer.screenshot.height = Empty,
+            duration_ns = Empty,
+            status = Empty,
+            otel.status_code = Empty,
+        );
+        let worker_parent = span.clone();
+        let started = Instant::now();
+        let outcome = async move {
+            tokio::task::spawn_blocking(move || observe_target(request, &worker_parent))
+                .await
+                .map_err(|error| ComputerError::Native {
+                    message: format!("observation worker panicked: {error}"),
+                })?
+        }
+        .instrument(span.clone())
+        .await;
+        finish_span(&span, started, &outcome);
+        let (observed, image) = outcome?;
+        record_observation(&span, &observed, image.as_deref());
         self.target = Some(Target {
             application: observed.application.clone(),
             window: observed.window.clone(),
@@ -118,17 +172,50 @@ impl MacosBackend {
         state: Arc<RunState>,
         frames: &mut FrameSink,
     ) -> Result<ComputerObservation, ComputerError> {
+        let span = info_span!(
+            target: "nanocodex_computer",
+            "computer.app.settle",
+            computer.action.sequence = sequence,
+            computer.settle.timeout_ms = millis(self.settle.timeout),
+            computer.settle.sample_interval_ms = millis(self.settle.sample_interval),
+            computer.settle.sample_count = Empty,
+            computer.settle.settled = Empty,
+            duration_ns = Empty,
+            status = Empty,
+            otel.status_code = Empty,
+        );
+        let started = Instant::now();
+        let outcome = self
+            .settled_observation_inner(sequence, state, frames, &span)
+            .instrument(span.clone())
+            .await;
+        finish_span(&span, started, &outcome);
+        outcome
+    }
+
+    async fn settled_observation_inner(
+        &mut self,
+        sequence: u64,
+        state: Arc<RunState>,
+        frames: &mut FrameSink,
+        span: &Span,
+    ) -> Result<ComputerObservation, ComputerError> {
         let deadline = Instant::now() + self.settle.timeout;
         let mut previous: Option<String> = None;
         let generation = self.generation.saturating_add(1);
+        let mut sample_count = 0_u64;
         loop {
             state.ensure_running()?;
             let target = self.target.clone().ok_or(ComputerError::NoTarget)?;
-            let sample = tokio::task::spawn_blocking(move || visual_sample(target))
-                .await
-                .map_err(|error| ComputerError::Native {
-                    message: format!("observation worker panicked: {error}"),
-                })??;
+            sample_count = sample_count.saturating_add(1);
+            let sample_parent = span.clone();
+            let sample = tokio::task::spawn_blocking(move || {
+                visual_sample(target, &sample_parent, sample_count)
+            })
+            .await
+            .map_err(|error| ComputerError::Native {
+                message: format!("observation worker panicked: {error}"),
+            })??;
             let signature = visual_signature(&sample);
             let matched = previous.as_deref() == Some(signature.as_str());
             let timed_out = Instant::now() >= deadline;
@@ -148,16 +235,45 @@ impl MacosBackend {
                 image: Arc::clone(&sample.image),
             });
             if matched || timed_out {
+                span.record("computer.settle.sample_count", sample_count);
+                span.record("computer.settle.settled", matched);
                 let root = self.artifact_root.clone();
                 let maximum = self.maximum_elements;
                 let settled = matched;
+                let verify_span = info_span!(
+                    target: "nanocodex_computer",
+                    parent: span,
+                    "computer.postcondition.verify",
+                    computer.action.sequence = sequence,
+                    computer.observation.generation = generation,
+                    computer.accessibility.maximum_elements = maximum,
+                    computer.accessibility.element_count = Empty,
+                    computer.screenshot.bytes = Empty,
+                    duration_ns = Empty,
+                    status = Empty,
+                    otel.status_code = Empty,
+                );
+                let worker_parent = verify_span.clone();
+                let verify_started = Instant::now();
                 let observed = tokio::task::spawn_blocking(move || {
-                    observation_from_visual(sample, generation, sequence, settled, &root, maximum)
+                    observation_from_visual(
+                        sample,
+                        generation,
+                        sequence,
+                        settled,
+                        &root,
+                        maximum,
+                        &worker_parent,
+                    )
                 })
                 .await
                 .map_err(|error| ComputerError::Native {
                     message: format!("semantic observation worker panicked: {error}"),
-                })??;
+                })?;
+                finish_span(&verify_span, verify_started, &observed);
+                let observed = observed?;
+                record_observation(&verify_span, &observed, None);
+                drop(verify_span);
                 self.generation = generation;
                 self.target = Some(Target {
                     application: observed.application.clone(),
@@ -196,11 +312,33 @@ impl MacosBackend {
         let target = self.target.clone().ok_or(ComputerError::NoTarget)?;
         let generation = self.generation;
         let maximum = self.maximum_elements;
-        tokio::task::spawn_blocking(move || native_action(&target, generation, maximum, action))
-            .await
-            .map_err(|error| ComputerError::Native {
-                message: format!("input worker panicked: {error}"),
-            })??;
+        let action_kind = action.kind();
+        let dispatch = action.dispatch();
+        let span = info_span!(
+            target: "nanocodex_computer",
+            "computer.input.dispatch",
+            computer.action.sequence = sequence,
+            computer.input.kind = action_kind,
+            computer.input.dispatch = dispatch,
+            computer.target.pid = target.application.pid,
+            computer.target.window_id = target.window.id,
+            duration_ns = Empty,
+            status = Empty,
+            otel.status_code = Empty,
+        );
+        let started = Instant::now();
+        let outcome = async move {
+            tokio::task::spawn_blocking(move || native_action(&target, generation, maximum, action))
+                .await
+                .map_err(|error| ComputerError::Native {
+                    message: format!("input worker panicked: {error}"),
+                })?
+        }
+        .instrument(span.clone())
+        .await;
+        finish_span(&span, started, &outcome);
+        outcome?;
+        drop(span);
         Ok(ComputerOutput::State {
             state: self.settled_observation(sequence, state, frames).await?,
         })
@@ -218,11 +356,26 @@ impl Backend for MacosBackend {
     ) -> Result<ComputerOutput, ComputerError> {
         match action {
             ComputerAction::ListApplications => {
-                let (applications, windows, _) = tokio::task::spawn_blocking(discover)
+                let span = info_span!(
+                    target: "nanocodex_computer",
+                    "computer.target.discover",
+                    computer.application.count = Empty,
+                    computer.window.count = Empty,
+                    duration_ns = Empty,
+                    status = Empty,
+                    otel.status_code = Empty,
+                );
+                let started = Instant::now();
+                let outcome = tokio::task::spawn_blocking(discover)
                     .await
                     .map_err(|error| ComputerError::Native {
                         message: format!("discovery worker panicked: {error}"),
-                    })??;
+                    })?;
+                finish_span(&span, started, &outcome);
+                let (applications, windows, native) = outcome?;
+                span.record("computer.application.count", applications.len());
+                span.record("computer.window.count", windows.len());
+                drop(native);
                 Ok(ComputerOutput::Applications {
                     applications,
                     windows,
@@ -234,31 +387,105 @@ impl Backend for MacosBackend {
                         message: "bundle_id must be a non-empty exact identifier".to_owned(),
                     });
                 }
-                let status = tokio::process::Command::new("/usr/bin/open")
-                    .arg("-b")
-                    .arg(&bundle_id)
-                    .status()
+                let span = info_span!(
+                    target: "nanocodex_computer",
+                    "computer.application.open",
+                    computer.application.bundle_id = bundle_id.as_str(),
+                    computer.application.pid = Empty,
+                    computer.application.accessibility.initial_elements = Empty,
+                    computer.application.accessibility.final_elements = Empty,
+                    computer.application.activated_for_accessibility = Empty,
+                    computer.application.focus_restored = Empty,
+                    duration_ns = Empty,
+                    status = Empty,
+                    otel.status_code = Empty,
+                );
+                let started = Instant::now();
+                let previous_frontmost = tokio::task::spawn_blocking(frontmost_application_pid)
                     .await
                     .map_err(|error| ComputerError::Native {
-                        message: format!("failed to launch {bundle_id}: {error}"),
+                        message: format!("frontmost application observer panicked: {error}"),
                     })?;
-                if !status.success() {
-                    return Err(ComputerError::Native {
-                        message: format!("LaunchServices rejected {bundle_id} with {status}"),
-                    });
+                let prime_bundle_id = bundle_id.clone();
+                let outcome = async {
+                    tokio::process::Command::new("/usr/bin/open")
+                        .arg("-g")
+                        .arg("-b")
+                        .arg(&bundle_id)
+                        .status()
+                        .await
+                        .map_err(|error| ComputerError::Native {
+                            message: format!("failed to launch {bundle_id}: {error}"),
+                        })
+                        .and_then(|status| {
+                            status
+                                .success()
+                                .then_some(())
+                                .ok_or_else(|| ComputerError::Native {
+                                    message: format!(
+                                        "LaunchServices rejected {bundle_id} with {status}"
+                                    ),
+                                })
+                        })?;
+                    wait_for_application(&bundle_id).await?;
+                    tokio::task::spawn_blocking(move || {
+                        prime_application_accessibility(&prime_bundle_id, previous_frontmost)
+                    })
+                    .await
+                    .map_err(|error| ComputerError::Native {
+                        message: format!("application accessibility primer panicked: {error}"),
+                    })?
                 }
+                .instrument(span.clone())
+                .await;
+                finish_span(&span, started, &outcome);
+                let priming = outcome?;
+                span.record("computer.application.pid", priming.pid);
+                span.record(
+                    "computer.application.accessibility.initial_elements",
+                    priming.initial_elements,
+                );
+                span.record(
+                    "computer.application.accessibility.final_elements",
+                    priming.final_elements,
+                );
+                span.record(
+                    "computer.application.activated_for_accessibility",
+                    priming.activated,
+                );
+                span.record(
+                    "computer.application.focus_restored",
+                    priming.focus_restored,
+                );
                 Ok(ComputerOutput::Opened { bundle_id })
             }
             ComputerAction::Attach {
                 application,
                 window_id,
             } => {
-                let target =
+                let span = info_span!(
+                    target: "nanocodex_computer",
+                    "computer.target.attach",
+                    computer.target.requested_window_id = window_id,
+                    computer.target.pid = Empty,
+                    computer.target.window_id = Empty,
+                    duration_ns = Empty,
+                    status = Empty,
+                    otel.status_code = Empty,
+                );
+                let started = Instant::now();
+                let outcome =
                     tokio::task::spawn_blocking(move || select_target(application, window_id))
                         .await
                         .map_err(|error| ComputerError::Native {
                             message: format!("attach worker panicked: {error}"),
-                        })??;
+                        })?;
+                finish_span(&span, started, &outcome);
+                let target = outcome?;
+                span.record("computer.target.pid", target.application.pid);
+                span.record("computer.target.window_id", target.window.id);
+                drop(span);
+                self.intervention_target.set_pid(target.application.pid);
                 self.target = Some(target);
                 Ok(ComputerOutput::State {
                     state: self
@@ -367,15 +594,33 @@ impl Backend for MacosBackend {
                         message: "one wait is limited to 60000ms".to_owned(),
                     });
                 }
-                let deadline = tokio::time::Instant::now() + Duration::from_millis(milliseconds);
-                while tokio::time::Instant::now() < deadline {
-                    state.ensure_running()?;
-                    tokio::time::sleep(
-                        Duration::from_millis(50)
-                            .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
-                    )
+                let span = info_span!(
+                    target: "nanocodex_computer",
+                    "computer.wait",
+                    computer.wait.requested_ms = milliseconds,
+                    duration_ns = Empty,
+                    status = Empty,
+                    otel.status_code = Empty,
+                );
+                let started = Instant::now();
+                let outcome =
+                    async {
+                        let deadline =
+                            tokio::time::Instant::now() + Duration::from_millis(milliseconds);
+                        while tokio::time::Instant::now() < deadline {
+                            state.ensure_running()?;
+                            tokio::time::sleep(Duration::from_millis(50).min(
+                                deadline.saturating_duration_since(tokio::time::Instant::now()),
+                            ))
+                            .await;
+                        }
+                        Ok::<(), ComputerError>(())
+                    }
+                    .instrument(span.clone())
                     .await;
-                }
+                finish_span(&span, started, &outcome);
+                outcome?;
+                drop(span);
                 if self.target.is_some() {
                     Ok(ComputerOutput::State {
                         state: self
@@ -388,6 +633,72 @@ impl Backend for MacosBackend {
             }
         }
     }
+}
+
+async fn wait_for_application(bundle_id: &str) -> Result<(), ComputerError> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let requested_bundle_id = bundle_id.to_owned();
+        let ready = tokio::task::spawn_blocking(move || {
+            nanocodex_computer_macos::windows()
+                .into_iter()
+                .any(|window| {
+                    window.bundle_id.as_deref() == Some(requested_bundle_id.as_str())
+                        && normal_window_candidate(&window)
+                })
+        })
+        .await
+        .map_err(|error| ComputerError::Native {
+            message: format!("application launch observer panicked: {error}"),
+        })?;
+        if ready {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ComputerError::TargetNotFound {
+                message: format!("{bundle_id} launched but exposed no capturable window within 5s"),
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn prime_application_accessibility(
+    bundle_id: &str,
+    previous_frontmost: Option<i32>,
+) -> Result<ApplicationPriming, ComputerError> {
+    let target = select_target(ApplicationSelector::BundleId(bundle_id.to_owned()), None)?;
+    let pid = target.application.pid;
+    let observation = (|| {
+        let initial_elements = accessibility_elements(&target, ACCESSIBILITY_PRIME_ELEMENTS)?.len();
+        let mut final_elements = initial_elements;
+        let needs_activation = initial_elements <= ACCESSIBILITY_PRIME_THRESHOLD;
+        let activated = needs_activation
+            && frontmost_application_pid() != Some(pid)
+            && activate_application(pid);
+        if needs_activation {
+            let deadline = Instant::now() + Duration::from_millis(750);
+            while final_elements <= ACCESSIBILITY_PRIME_THRESHOLD && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+                final_elements =
+                    accessibility_elements(&target, ACCESSIBILITY_PRIME_ELEMENTS)?.len();
+            }
+        }
+        Ok::<_, ComputerError>((initial_elements, final_elements, activated))
+    })();
+    let focus_restored = previous_frontmost.is_some_and(|previous| {
+        previous != pid
+            && frontmost_application_pid() == Some(pid)
+            && activate_application(previous)
+    });
+    let (initial_elements, final_elements, activated) = observation?;
+    Ok(ApplicationPriming {
+        pid,
+        initial_elements,
+        final_elements,
+        activated,
+        focus_restored,
+    })
 }
 
 enum NativeAction {
@@ -420,6 +731,36 @@ enum NativeAction {
         reference: ElementRef,
         name: String,
     },
+}
+
+impl NativeAction {
+    const fn kind(&self) -> &'static str {
+        match self {
+            Self::Click { .. } => "click",
+            Self::Drag { .. } => "drag",
+            Self::Scroll { .. } => "scroll",
+            Self::PressKey { .. } => "press_key",
+            Self::TypeText { .. } => "type_text",
+            Self::SetValue { .. } => "set_value",
+            Self::PerformAction { .. } => "perform_action",
+        }
+    }
+
+    const fn dispatch(&self) -> &'static str {
+        match self {
+            Self::SetValue { .. } => "accessibility_value",
+            Self::PerformAction { .. } => "accessibility_action",
+            Self::Click {
+                target: InteractionTarget::Element(_),
+                ..
+            } => "accessibility_press_or_cg_event",
+            Self::Click { .. }
+            | Self::Drag { .. }
+            | Self::Scroll { .. }
+            | Self::PressKey { .. }
+            | Self::TypeText { .. } => "cg_event",
+        }
+    }
 }
 
 fn discover() -> Result<Discovery, ComputerError> {
@@ -516,14 +857,18 @@ fn public_window(window: &NativeWindow) -> Window {
 }
 
 fn observe_target(
-    target: Target,
-    generation: u64,
-    sequence: u64,
-    include_screenshot: bool,
-    settled: bool,
-    artifact_root: &Path,
-    maximum_elements: usize,
+    request: ObservationRequest,
+    parent: &Span,
 ) -> Result<(ComputerObservation, Option<Arc<CapturedImage>>), ComputerError> {
+    let ObservationRequest {
+        target,
+        generation,
+        sequence,
+        screenshot: include_screenshot,
+        settled,
+        artifact_root,
+        maximum_elements,
+    } = request;
     let native_window =
         native_window_by_id(target.window.id).ok_or_else(|| ComputerError::TargetNotFound {
             message: format!("window {} is no longer capturable", target.window.id),
@@ -533,8 +878,12 @@ fn observe_target(
         window: public_window(&native_window),
     };
     let (elements, image) = std::thread::scope(|scope| {
-        let capture = include_screenshot.then(|| scope.spawn(|| capture_image(&native_window)));
-        let elements = accessibility_snapshot(&target, generation, maximum_elements)
+        let capture = include_screenshot.then(|| {
+            let capture_parent = parent.clone();
+            let native_window = &native_window;
+            scope.spawn(move || capture_image(native_window, &capture_parent, None))
+        });
+        let elements = accessibility_snapshot(&target, generation, maximum_elements, parent)
             .map(|elements| elements.into_iter().map(|(element, _)| element).collect());
         let image = capture.map(|capture| {
             capture.join().map_err(|_| ComputerError::Native {
@@ -547,7 +896,7 @@ fn observe_target(
     let image = image?;
     let screenshot = image
         .as_deref()
-        .map(|image| persist_image(image, generation, sequence, artifact_root))
+        .map(|image| persist_image(image, generation, sequence, &artifact_root, parent))
         .transpose()?;
     Ok((
         ComputerObservation {
@@ -562,7 +911,11 @@ fn observe_target(
     ))
 }
 
-fn visual_sample(target: Target) -> Result<VisualSample, ComputerError> {
+fn visual_sample(
+    target: Target,
+    parent: &Span,
+    sample_index: u64,
+) -> Result<VisualSample, ComputerError> {
     let native_window =
         native_window_by_id(target.window.id).ok_or_else(|| ComputerError::TargetNotFound {
             message: format!("window {} is no longer capturable", target.window.id),
@@ -570,7 +923,7 @@ fn visual_sample(target: Target) -> Result<VisualSample, ComputerError> {
     Ok(VisualSample {
         application: target.application,
         window: public_window(&native_window),
-        image: capture_image(&native_window)?,
+        image: capture_image(&native_window, parent, Some(sample_index))?,
     })
 }
 
@@ -581,16 +934,17 @@ fn observation_from_visual(
     settled: bool,
     artifact_root: &Path,
     maximum_elements: usize,
+    parent: &Span,
 ) -> Result<ComputerObservation, ComputerError> {
     let target = Target {
         application: sample.application,
         window: sample.window,
     };
-    let elements = accessibility_snapshot(&target, generation, maximum_elements)?
+    let elements = accessibility_snapshot(&target, generation, maximum_elements, parent)?
         .into_iter()
         .map(|(element, _)| element)
         .collect();
-    let screenshot = persist_image(&sample.image, generation, sequence, artifact_root)?;
+    let screenshot = persist_image(&sample.image, generation, sequence, artifact_root, parent)?;
     Ok(ComputerObservation {
         generation,
         application: target.application,
@@ -605,8 +959,34 @@ fn accessibility_snapshot(
     target: &Target,
     generation: u64,
     maximum_elements: usize,
+    parent: &Span,
 ) -> Result<Vec<(Element, AXUIElement)>, ComputerError> {
-    let raw = accessibility_elements(target, maximum_elements)?;
+    let span = info_span!(
+        target: "nanocodex_computer",
+        parent: parent,
+        "computer.accessibility.snapshot",
+        computer.observation.generation = generation,
+        computer.accessibility.maximum_elements = maximum_elements,
+        computer.accessibility.visited_count = Empty,
+        computer.accessibility.element_count = Empty,
+        computer.accessibility.truncated = Empty,
+        duration_ns = Empty,
+        status = Empty,
+        otel.status_code = Empty,
+    );
+    let started = Instant::now();
+    let raw = match span.in_scope(|| accessibility_elements(target, maximum_elements)) {
+        Ok(raw) => raw,
+        Err(error) => {
+            finish_span::<(), _>(&span, started, &Err(&error));
+            return Err(error);
+        }
+    };
+    span.record("computer.accessibility.visited_count", raw.len());
+    span.record(
+        "computer.accessibility.truncated",
+        raw.len() == maximum_elements,
+    );
     let mut output = Vec::with_capacity(raw.len());
     for (raw_index, element) in raw.into_iter().enumerate() {
         let mut public = public_element(&element, generation, raw_index);
@@ -615,6 +995,8 @@ fn accessibility_snapshot(
             output.push((public, element));
         }
     }
+    span.record("computer.accessibility.element_count", output.len());
+    finish_span::<(), ComputerError>(&span, started, &Ok(()));
     Ok(output)
 }
 
@@ -634,10 +1016,23 @@ fn accessibility_elements(
         .map_err(|error| ComputerError::Native {
             message: format!("failed to configure accessibility timeout: {error}"),
         })?;
+    enable_application_accessibility(&application);
     let root = select_accessibility_window(&application, target).unwrap_or(application);
     let mut raw = Vec::with_capacity(maximum_elements.min(256));
     walk_accessibility(&root, 0, maximum_elements, &mut raw);
     Ok(raw)
+}
+
+fn enable_application_accessibility(application: &AXUIElement) {
+    let span = info_span!(
+        target: "nanocodex_computer",
+        "computer.accessibility.enable",
+        computer.accessibility.manual = Empty,
+        computer.accessibility.enhanced = Empty,
+    );
+    let enablement = enable_native_application_accessibility(application);
+    span.record("computer.accessibility.manual", enablement.manual);
+    span.record("computer.accessibility.enhanced", enablement.enhanced);
 }
 
 fn select_accessibility_window(application: &AXUIElement, target: &Target) -> Option<AXUIElement> {
@@ -663,7 +1058,10 @@ fn walk_accessibility(
     maximum: usize,
     output: &mut Vec<AXUIElement>,
 ) {
-    if depth > MAX_TREE_DEPTH || output.len() >= maximum {
+    if depth > MAX_TREE_DEPTH
+        || output.len() >= maximum
+        || output.iter().any(|candidate| candidate == element)
+    {
         return;
     }
     output.push(element.clone());
@@ -1160,7 +1558,46 @@ fn key_code(key: &str) -> Option<u16> {
     })
 }
 
-fn capture_image(window: &NativeWindow) -> Result<Arc<CapturedImage>, ComputerError> {
+fn capture_image(
+    window: &NativeWindow,
+    parent: &Span,
+    sample_index: Option<u64>,
+) -> Result<Arc<CapturedImage>, ComputerError> {
+    let phase = if sample_index.is_some() {
+        "settling"
+    } else {
+        "observation"
+    };
+    let span = info_span!(
+        target: "nanocodex_computer",
+        parent: parent,
+        "computer.screen.capture",
+        computer.target.window_id = window.id,
+        computer.capture.phase = phase,
+        computer.capture.sample_index = sample_index.unwrap_or(0),
+        computer.capture.backend = Empty,
+        computer.screenshot.bytes = Empty,
+        computer.screenshot.width = Empty,
+        computer.screenshot.height = Empty,
+        duration_ns = Empty,
+        status = Empty,
+        otel.status_code = Empty,
+    );
+    let started = Instant::now();
+    let outcome = span.in_scope(|| capture_image_inner(window));
+    finish_span(&span, started, &outcome);
+    if let Ok((image, backend)) = &outcome {
+        span.record("computer.capture.backend", *backend);
+        span.record("computer.screenshot.bytes", image.png().len());
+        span.record("computer.screenshot.width", image.width());
+        span.record("computer.screenshot.height", image.height());
+    }
+    outcome.map(|(image, _)| image)
+}
+
+fn capture_image_inner(
+    window: &NativeWindow,
+) -> Result<(Arc<CapturedImage>, &'static str), ComputerError> {
     if request_screen_capture() == PermissionRequest::Prompted {
         return Err(ComputerError::Permission {
             permission: Permission::ScreenRecording,
@@ -1170,8 +1607,8 @@ fn capture_image(window: &NativeWindow) -> Result<Arc<CapturedImage>, ComputerEr
     let image = capture_window(window.id).map_err(|error| ComputerError::Native {
         message: format!("window {} could not be captured: {error}", window.id),
     })?;
-    let png = match image.data {
-        NativeImageData::Png(png) => png,
+    let (png, backend) = match image.data {
+        NativeImageData::Png(png) => (png, "screencapture_service"),
         NativeImageData::Rgba(rgba) => {
             let mut png = Vec::new();
             image::codecs::png::PngEncoder::new(&mut png)
@@ -1184,16 +1621,19 @@ fn capture_image(window: &NativeWindow) -> Result<Arc<CapturedImage>, ComputerEr
                 .map_err(|error| ComputerError::Native {
                     message: format!("failed to encode screenshot: {error}"),
                 })?;
-            png
+            (png, "core_graphics_fallback")
         }
     };
     let digest = hex_digest(Sha256::digest(&png).as_slice());
-    Ok(Arc::new(CapturedImage::new(
-        image.width,
-        image.height,
-        digest,
-        Arc::from(png),
-    )))
+    Ok((
+        Arc::new(CapturedImage::new(
+            image.width,
+            image.height,
+            digest,
+            Arc::from(png),
+        )),
+        backend,
+    ))
 }
 
 fn persist_image(
@@ -1201,13 +1641,28 @@ fn persist_image(
     generation: u64,
     sequence: u64,
     artifact_root: &Path,
+    parent: &Span,
 ) -> Result<ScreenshotArtifact, ComputerError> {
+    let span = info_span!(
+        target: "nanocodex_computer",
+        parent: parent,
+        "computer.artifact.persist",
+        computer.action.sequence = sequence,
+        computer.observation.generation = generation,
+        computer.screenshot.bytes = image.png().len(),
+        duration_ns = Empty,
+        status = Empty,
+        otel.status_code = Empty,
+    );
+    let started = Instant::now();
     let filename = format!("frame-{sequence:06}-{generation:06}.png");
     let path = artifact_root.join(filename);
-    std::fs::write(&path, image.png()).map_err(|source| ComputerError::Io {
+    let outcome = std::fs::write(&path, image.png()).map_err(|source| ComputerError::Io {
         path: path.clone(),
         source,
-    })?;
+    });
+    finish_span(&span, started, &outcome);
+    outcome?;
     Ok(ScreenshotArtifact {
         path,
         width: image.width(),
@@ -1246,6 +1701,37 @@ fn hex_digest(bytes: &[u8]) -> String {
         output.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     output
+}
+
+fn record_observation(span: &Span, observed: &ComputerObservation, image: Option<&CapturedImage>) {
+    span.record(
+        "computer.accessibility.element_count",
+        observed.elements.len(),
+    );
+    if let Some(image) = image {
+        span.record("computer.screenshot.bytes", image.png().len());
+        span.record("computer.screenshot.width", image.width());
+        span.record("computer.screenshot.height", image.height());
+    }
+}
+
+fn finish_span<T, E>(span: &Span, started: Instant, result: &Result<T, E>) {
+    span.record("duration_ns", elapsed_ns(started.elapsed()));
+    if result.is_ok() {
+        span.record("status", "ok");
+        span.record("otel.status_code", "OK");
+    } else {
+        span.record("status", "failed");
+        span.record("otel.status_code", "ERROR");
+    }
+}
+
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn elapsed_ns(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 fn native_event_error(operation: &str) -> ComputerError {

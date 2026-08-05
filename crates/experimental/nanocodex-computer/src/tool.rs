@@ -8,6 +8,7 @@ use nanocodex_tools::{
     contract::ToolOutputContent,
     runtime::{DynamicToolProvider, schema_for},
 };
+use tracing::{Instrument as _, field::Empty, info_span};
 
 use crate::{Computer, ComputerAction, ComputerActionResult};
 
@@ -16,17 +17,27 @@ const MAX_MODEL_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
 const TOOL_DESCRIPTION: &str = r"Control one user-selected native macOS application.
 
 Call from Code Mode as `await tools.computer({ action: ..., ... })`. This is a
-state-first tool: list applications, attach to one exact app/window, then
-observe before acting. Observations return a screenshot and compact
-accessibility elements with generation-bound references such as `e12_4`.
+state-first tool. When the bundle ID is known, always call open_application
+first even if the app is already running; this primes renderer accessibility
+and restores the previously frontmost app. Then attach to one exact app/window
+and inspect the returned state before acting. Observations return a screenshot
+and compact accessibility elements with generation-bound references such as `e12_4`.
 References expire on the next observation or action; always use fresh ones.
 
 Prefer semantic element click/set_value/perform_action over coordinates.
 Coordinate input is global and is intended only for controls absent from the
-accessibility tree. Mutating actions settle and return fresh state, so inspect
-that state before continuing when the next step depends on the UI. Compose
-sequential operations in one Code Mode cell, but never use Promise.all: one
-session deliberately serializes native input.
+accessibility tree. If screenshot pixels are used, map them to global points as
+`window.x + pixel_x * window.width / screenshot.width` and likewise for y.
+Forward `state.screenshot.model_image` with Code Mode's `image(...)` helper;
+never pass `state.screenshot.path` to `image(...)` and never print the data URL
+as text. Keep state in JavaScript, filter elements by role/label/value, perform
+deterministic semantic actions, and verify their returned state in the same
+cell. Emit only concise candidate summaries when model judgment is actually
+needed; never dump the complete element array. Actions target the attached PID
+and isolated window without requiring it to stay frontmost. Mutating actions
+already settle and return fresh state; do not add wait/observe calls unless
+explicit time must pass. Never use Promise.all: one session deliberately
+serializes native input.
 
 The human can pause or intervene independently. A paused error means stop
 issuing actions until the host resumes control. Never attempt to bypass macOS
@@ -80,10 +91,40 @@ async fn output(result: ComputerActionResult) -> ToolResult {
     if paths.is_empty() {
         return Ok(ToolOutput::json(&result));
     }
+    let span = info_span!(
+        target: "nanocodex_computer",
+        "computer.model_input.prepare",
+        computer.action.sequence = result.sequence,
+        computer.model_input.image_count = paths.len(),
+        computer.model_input.image_bytes = Empty,
+        duration_ns = Empty,
+        status = Empty,
+        otel.status_code = Empty,
+    );
+    let started = std::time::Instant::now();
+    let outcome = output_with_images(result, paths)
+        .instrument(span.clone())
+        .await;
+    span.record("duration_ns", elapsed_ns(started.elapsed()));
+    if outcome.is_ok() {
+        span.record("status", "ok");
+        span.record("otel.status_code", "OK");
+    } else {
+        span.record("status", "failed");
+        span.record("otel.status_code", "ERROR");
+    }
+    outcome
+}
+
+async fn output_with_images(
+    result: ComputerActionResult,
+    paths: Vec<std::path::PathBuf>,
+) -> ToolResult {
     let mut content = vec![ToolOutputContent::InputText {
         text: serde_json::to_string(&result)?,
     }];
     let mut code_mode_value = serde_json::to_value(&result)?;
+    let mut image_bytes = 0_u64;
     for path in paths {
         let metadata = tokio::fs::metadata(&path).await?;
         if metadata.len() > MAX_MODEL_IMAGE_BYTES {
@@ -92,6 +133,7 @@ async fn output(result: ComputerActionResult) -> ToolResult {
                 path.display()
             )));
         }
+        image_bytes = image_bytes.saturating_add(metadata.len());
         let image_url = format!(
             "data:image/png;base64,{}",
             STANDARD.encode(tokio::fs::read(&path).await?)
@@ -109,7 +151,12 @@ async fn output(result: ComputerActionResult) -> ToolResult {
             );
         }
     }
+    tracing::Span::current().record("computer.model_input.image_bytes", image_bytes);
     Ok(ToolOutput::content(content).with_code_mode_value(code_mode_value))
+}
+
+fn elapsed_ns(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 #[async_trait]

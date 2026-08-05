@@ -8,6 +8,7 @@ use std::{
 };
 
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tracing::{Instrument as _, Span, field::Empty, info_span};
 use uuid::Uuid;
 
 use crate::{
@@ -220,6 +221,8 @@ enum ControlNotice {
 enum Command {
     Execute {
         action: ComputerAction,
+        parent: Span,
+        queued_at: Instant,
         reply: oneshot::Sender<Result<ComputerActionResult, ComputerError>>,
     },
 }
@@ -267,8 +270,9 @@ impl ComputerBuilder {
         self
     }
 
-    /// Selects whether physical clicks, scrolls, and key presses automatically
-    /// pause computer actions. Synthetic Nanocodex input is ignored.
+    /// Selects whether physical input directed at the attached application
+    /// automatically pauses computer actions. Synthetic Nanocodex input and
+    /// input targeting other applications are ignored.
     #[must_use]
     pub const fn observe_human_input(mut self, enabled: bool) -> Self {
         self.observe_human_input = enabled;
@@ -298,8 +302,14 @@ impl ComputerBuilder {
             }
         })?;
 
+        let intervention_target = platform::intervention_target();
         let backend = self.backend.take().unwrap_or_else(|| {
-            platform::native(artifact_root.clone(), self.settle, self.maximum_elements)
+            platform::native(
+                artifact_root.clone(),
+                self.settle,
+                self.maximum_elements,
+                Arc::clone(&intervention_target),
+            )
         });
         let (commands_tx, commands_rx) = mpsc::channel(COMMAND_CAPACITY);
         let (events_tx, events_rx) = broadcast::channel(EVENT_CAPACITY);
@@ -312,7 +322,7 @@ impl ComputerBuilder {
         };
         let intervention_monitor = self.observe_human_input.then(|| {
             let control = control.clone();
-            platform::intervention_monitor(move || {
+            platform::intervention_monitor(intervention_target, move || {
                 control.intervene(InterventionReason::HumanInput);
             })
         });
@@ -408,9 +418,16 @@ impl Computer {
     ) -> Result<ComputerActionResult, ComputerError> {
         self.inner.control.state.ensure_running()?;
         let (reply, result) = oneshot::channel();
+        let parent = Span::current();
+        let queued_at = Instant::now();
         self.inner
             .commands
-            .send(Command::Execute { action, reply })
+            .send(Command::Execute {
+                action,
+                parent,
+                queued_at,
+                reply,
+            })
             .await
             .map_err(|_| ComputerError::DriverExited)?;
         result.await.map_err(|_| ComputerError::DriverExited)?
@@ -441,7 +458,12 @@ async fn run_driver(
         events: events.clone(),
         last_target: None,
     };
-    send(&events, ComputerEvent::SessionStarted { session_id });
+    send(
+        &events,
+        ComputerEvent::SessionStarted {
+            session_id: session_id.clone(),
+        },
+    );
     if let Some(event) = startup_permission {
         send(&events, event);
     }
@@ -460,7 +482,12 @@ async fn run_driver(
                 }
             }
             command = commands.recv() => {
-                let Some(Command::Execute { action, reply }) = command else { break };
+                let Some(Command::Execute {
+                    action,
+                    parent,
+                    queued_at,
+                    reply,
+                }) = command else { break };
                 sequence = sequence.saturating_add(1);
                 if let Err(error) = state.ensure_running() {
                     let _ = reply.send(Err(error));
@@ -470,10 +497,32 @@ async fn run_driver(
                     sequence,
                     action: action.clone(),
                 });
+                let span = info_span!(
+                    target: "nanocodex_computer",
+                    parent: &parent,
+                    "computer.action",
+                    computer.session.id = session_id.as_str(),
+                    computer.action.sequence = sequence,
+                    computer.action.kind = action.kind(),
+                    computer.action.queue.duration_ns = Empty,
+                    duration_ns = Empty,
+                    status = Empty,
+                    otel.status_code = Empty,
+                );
+                span.record(
+                    "computer.action.queue.duration_ns",
+                    elapsed_ns(queued_at.elapsed()),
+                );
                 let started = Instant::now();
-                let outcome = backend
-                    .execute(action, sequence, Arc::clone(&state), &mut frame_sink)
-                    .await;
+                let outcome = async {
+                    trace_content("computer.action.input", &action);
+                    backend
+                        .execute(action, sequence, Arc::clone(&state), &mut frame_sink)
+                        .await
+                }
+                .instrument(span.clone())
+                .await;
+                span.record("duration_ns", elapsed_ns(started.elapsed()));
                 match outcome {
                     Ok(output) => {
                         let result = ComputerActionResult {
@@ -484,9 +533,15 @@ async fn run_driver(
                         send(&events, ComputerEvent::ActionCompleted {
                             result: result.clone(),
                         });
+                        span.record("status", "ok");
+                        span.record("otel.status_code", "OK");
+                        span.in_scope(|| trace_content("computer.action.output", &result));
                         let _ = reply.send(Ok(result));
                     }
                     Err(error) => {
+                        span.record("status", "failed");
+                        span.record("otel.status_code", "ERROR");
+                        span.in_scope(|| tracing::error!(%error, "computer action failed"));
                         if let ComputerError::Permission { permission, guidance } = &error {
                             send(&events, ComputerEvent::PermissionRequired {
                                 permission: *permission,
@@ -513,6 +568,27 @@ fn send(events: &broadcast::Sender<ComputerEvent>, event: ComputerEvent) {
 
 fn millis(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn elapsed_ns(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn trace_content(name: &'static str, value: &impl serde::Serialize) {
+    match serde_json::to_string(value) {
+        Ok(content) => tracing::info!(
+            target: "nanocodex_computer",
+            event_name = name,
+            content,
+            "computer observed ordered content"
+        ),
+        Err(error) => tracing::warn!(
+            target: "nanocodex_computer",
+            event_name = name,
+            %error,
+            "failed to serialize computer content"
+        ),
+    }
 }
 
 #[cfg(test)]

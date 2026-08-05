@@ -35,6 +35,7 @@ async fn main() -> Result<()> {
                 Some(VoiceEvent::Started { voice }) => {
                     eprintln!("listening with {voice}");
                 }
+                Some(VoiceEvent::UserSpeechStarted) => eprintln!("user started speaking"),
                 Some(VoiceEvent::Transcript { speaker, text }) => {
                     println!("{speaker}: {text}");
                 }

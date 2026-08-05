@@ -9,7 +9,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
     },
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -48,7 +48,30 @@ use core_graphics::{
         kCGWindowOwnerPID,
     },
 };
-use objc2_app_kit::NSRunningApplication;
+use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication, NSWorkspace};
+
+/// Result of requesting richer renderer-backed accessibility trees.
+pub struct AccessibilityEnablement {
+    pub manual: bool,
+    pub enhanced: bool,
+}
+
+/// Enables public manual/enhanced Accessibility attributes when an app
+/// supports them. Unsupported native apps simply report `false`.
+pub fn enable_application_accessibility(application: &AXUIElement) -> AccessibilityEnablement {
+    let manual = AXAttribute::<CFType>::new(&CFString::new("AXManualAccessibility"));
+    let enhanced = AXAttribute::<CFType>::new(&CFString::new("AXEnhancedUserInterface"));
+    let true_value = CFBoolean::true_value();
+    // SAFETY: `CFBoolean::true_value()` is a valid immortal Core Foundation
+    // object. Wrapping under the get rule retains it as a type-erased value.
+    let true_value = unsafe { CFType::wrap_under_get_rule(true_value.as_CFTypeRef()) };
+    AccessibilityEnablement {
+        manual: application
+            .set_attribute(&manual, true_value.clone())
+            .is_ok(),
+        enhanced: application.set_attribute(&enhanced, true_value).is_ok(),
+    }
+}
 
 const SYNTHETIC_MARKER: i64 = 0x004e_414e_4f43_4458;
 const MAX_CAPTURE_PIXELS: usize = 25_000_000;
@@ -424,6 +447,22 @@ fn running_application(pid: i32) -> (Option<String>, Option<String>) {
     )
 }
 
+/// Returns the process identifier of the application currently owning focus.
+#[must_use]
+pub fn frontmost_application_pid() -> Option<i32> {
+    NSWorkspace::sharedWorkspace()
+        .frontmostApplication()
+        .map(|application| application.processIdentifier())
+}
+
+/// Requests activation of one running graphical application.
+#[must_use]
+pub fn activate_application(pid: i32) -> bool {
+    NSRunningApplication::runningApplicationWithProcessIdentifier(pid).is_some_and(|application| {
+        application.activateWithOptions(NSApplicationActivationOptions::empty())
+    })
+}
+
 /// A supervised listen-only human input event tap.
 pub struct HumanInputMonitor {
     stopped: Arc<AtomicBool>,
@@ -434,9 +473,27 @@ pub struct HumanInputMonitor {
 #[derive(Debug)]
 pub struct HumanInputMonitorError;
 
+/// Lock-free target identity shared with the listen-only input monitor.
+#[derive(Default)]
+pub struct HumanInputTarget {
+    pid: AtomicI32,
+}
+
+impl HumanInputTarget {
+    /// Replaces the process currently owned by the computer actor.
+    pub fn set_pid(&self, pid: i32) {
+        self.pid.store(pid, Ordering::Release);
+    }
+
+    fn pid(&self) -> i32 {
+        self.pid.load(Ordering::Acquire)
+    }
+}
+
 impl HumanInputMonitor {
-    /// Starts observing physical clicks, scrolls, and key presses.
+    /// Starts observing physical input directed at the selected application.
     pub fn spawn(
+        target: Arc<HumanInputTarget>,
         callback: impl Fn() + Send + Sync + 'static,
     ) -> Result<Self, HumanInputMonitorError> {
         let stopped = Arc::new(AtomicBool::new(false));
@@ -458,9 +515,10 @@ impl HumanInputMonitor {
                         CGEventType::ScrollWheel,
                         CGEventType::KeyDown,
                     ],
-                    move |_proxy, _kind, event| {
+                    move |_proxy, kind, event| {
                         if event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA)
                             != SYNTHETIC_MARKER
+                            && human_event_targets(kind, event, target.pid())
                         {
                             callback();
                         }
@@ -502,6 +560,35 @@ impl HumanInputMonitor {
             }
         }
     }
+}
+
+fn human_event_targets(kind: CGEventType, event: &CGEvent, target_pid: i32) -> bool {
+    if target_pid <= 0 {
+        return false;
+    }
+    match kind {
+        CGEventType::KeyDown => frontmost_application_pid() == Some(target_pid),
+        CGEventType::LeftMouseDown
+        | CGEventType::RightMouseDown
+        | CGEventType::OtherMouseDown
+        | CGEventType::ScrollWheel => topmost_window_pid(event.location()) == Some(target_pid),
+        _ => false,
+    }
+}
+
+fn topmost_window_pid(point: CGPoint) -> Option<i32> {
+    windows()
+        .into_iter()
+        .find(|window| {
+            window.on_screen
+                && window.width > 0.0
+                && window.height > 0.0
+                && point.x >= window.x
+                && point.x < window.x + window.width
+                && point.y >= window.y
+                && point.y < window.y + window.height
+        })
+        .map(|window| window.pid)
 }
 
 impl Drop for HumanInputMonitor {

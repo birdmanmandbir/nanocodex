@@ -14,7 +14,7 @@ accessibility = "0.2.0"
 accessibility-sys = "0.2.0"
 core-foundation = "0.10.1"
 core-graphics = { version = "0.25.0", features = ["elcapitan", "highsierra"] }
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSRunningApplication", "libc"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSRunningApplication", "NSWorkspace", "libc"] }
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }

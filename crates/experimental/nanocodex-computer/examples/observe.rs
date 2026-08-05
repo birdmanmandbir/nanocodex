@@ -10,6 +10,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .cloned()
         .unwrap_or_else(|| "com.apple.finder".to_owned());
     let open_preview = arguments.iter().any(|argument| argument == "--preview");
+    let open_application = arguments.iter().any(|argument| argument == "--open");
+    let print_json = arguments.iter().any(|argument| argument == "--json");
+    let artifact_root = arguments
+        .windows(2)
+        .find(|pair| pair[0] == "--artifacts")
+        .map(|pair| std::path::PathBuf::from(&pair[1]));
     let press = arguments
         .windows(2)
         .find(|pair| pair[0] == "--press")
@@ -18,12 +24,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .windows(2)
         .find(|pair| pair[0] == "--type-text")
         .map(|pair| pair[1].clone());
-    let (computer, _events) = Computer::builder().observe_human_input(false).build()?;
+    let mut builder = Computer::builder().observe_human_input(false);
+    if let Some(path) = artifact_root {
+        builder = builder.artifact_root(path);
+    }
+    let (computer, _events) = builder.build()?;
     let preview = if open_preview {
         Some(ComputerPreview::spawn_and_open(&computer).await?)
     } else {
         None
     };
+    if open_application {
+        computer
+            .execute(ComputerAction::OpenApplication {
+                bundle_id: bundle_id.clone(),
+            })
+            .await?;
+    }
     let result = computer
         .execute(ComputerAction::Attach {
             application: ApplicationSelector::BundleId(bundle_id),
@@ -44,6 +61,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         result.elapsed_ms,
     );
+    if print_json {
+        println!("{}", serde_json::to_string_pretty(&state)?);
+    }
     if let Some(text) = type_text {
         let result = computer
             .execute(ComputerAction::TypeText { text: text.clone() })
@@ -61,6 +81,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             text.chars().count(),
             result.elapsed_ms
         );
+        if print_json {
+            println!("{}", serde_json::to_string_pretty(&result.output)?);
+        }
     }
     if let Some(key) = press {
         let result = computer
@@ -70,6 +93,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .await?;
         println!("pressed {key} and settled in {} ms", result.elapsed_ms);
+        if print_json {
+            println!("{}", serde_json::to_string_pretty(&result.output)?);
+        }
     }
     if let Some(preview) = preview {
         println!("preview: {} (press Return to close)", preview.url());
