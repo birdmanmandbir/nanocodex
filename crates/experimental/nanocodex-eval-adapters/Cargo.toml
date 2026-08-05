@@ -17,6 +17,7 @@ description = "Third-party benchmark adapters for nanocodex-eval"
 hex.workspace = true
 ignore.workspace = true
 nanocodex-eval.workspace = true
+parquet.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true

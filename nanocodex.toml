@@ -29,3 +29,9 @@ tasks = ["deep-swe-v1.1/aiomonitor-task-snapshots-diff"]
 trials = 1
 model = ["gpt-5.6-sol"]
 thinking = ["low"]
+
+[profiles.graphwalks-smoke]
+tasks = ["graphwalks/128k-and-shorter-000000"]
+trials = 1
+model = ["gpt-5.6-sol"]
+thinking = ["low"]

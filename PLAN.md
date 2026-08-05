@@ -336,6 +336,25 @@ explicitly unavailable until authoritative task material and grading semantics
 can be acquired; an `external` manifest is a transport for an official harness,
 not permission to invent a substitute benchmark.
 
+The first Milestone two coding slice is retained under preparation
+`c24c10a651b463470d7395caf13bf7b13d668ac83ea88222eb4e69e5841fae08`.
+The official 113-task DeepSWE v1.1 package prepared and its selected
+`aiomonitor-task-snapshots-diff` case completed without infrastructure,
+cleanup, overlay, or resume errors. Its official artifact phase retained a
+26,034-byte patch and the pristine verifier scored 51/53 fail-to-pass tests,
+8/8 pass-to-pass tests, 0.967213 partial reward, and 0 exact reward because the
+candidate omitted two `/api/snapshot` endpoints. A second ordinary `run`
+resumed the coordinate without model spend. This is valid failed-candidate
+evidence and a successful runner/verifier result.
+
+LifeSciBench is currently recorded as described but unavailable: OpenAI has
+published the 750-task protocol and paper, but not the task records, 1,062
+artifacts, 19,020 rubric criteria, or automated rubric grader required for a
+faithful run. GraphWalks is the next public slice. Its catalog recipe pins
+OpenAI's February 2026 corrected Parquet release and published set-F1 contract;
+the retained evidence must call out the public extractor's still-open prefix
+bug rather than silently repairing it or claiming exact internal-launch parity.
+
 Each built-in catalog entry owns its stable user-facing name, authoritative
 source location, pinned revision, adapter choice, official verifier assets,
 default task environment, and any acquisition or credential requirements. The
@@ -692,8 +711,10 @@ may hide missing coordinates or mix incompatible preparation identities.
     July 2026 audit: automatic
     multi-harness/model/thinking matrices, durable monitoring,
     interruption/resume/new-sample runs, and website-ready reporting behind
-    `nanocodex eval prepare` and `nanocodex eval run`. Enrich reconstructed
-    reports with retained run timing before treating them as website-ready.
+    `nanocodex eval prepare` and `nanocodex eval run`. DeepSWE's first official
+    case is complete; continue with the public GraphWalks long-context shape.
+    Enrich reconstructed reports with retained run timing before treating them
+    as website-ready.
 11. [ ] Run the coordinator/runner architecture with one saturated remote
     runner on `dev-georgios`, retaining all heavyweight state on its verified
     3.5 TB drive. Add cross-host sharding only after measurements show that

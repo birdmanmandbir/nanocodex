@@ -8,6 +8,7 @@
 mod arena_hard;
 mod external;
 mod genebench_pro;
+mod graphwalks;
 mod harbor;
 mod openai_evals;
 pub mod profile;
@@ -19,6 +20,7 @@ use std::{fs, path::Path};
 pub use arena_hard::ArenaHard;
 pub use external::ExternalHarness;
 pub use genebench_pro::GeneBenchPro;
+pub use graphwalks::GraphWalks;
 pub use harbor::HarborDataset;
 use nanocodex_eval::import::ImportError;
 pub use openai_evals::OpenAiEvals;

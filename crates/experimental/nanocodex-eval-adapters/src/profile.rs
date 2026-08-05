@@ -20,8 +20,8 @@ use nanocodex_eval::{
 use serde::Deserialize;
 
 use crate::{
-    ArenaHard, BuiltinSourceError, BuiltinSources, ExternalHarness, GeneBenchPro, HarborDataset,
-    OpenAiEvals, SweBench,
+    ArenaHard, BuiltinSourceError, BuiltinSources, ExternalHarness, GeneBenchPro, GraphWalks,
+    HarborDataset, OpenAiEvals, SweBench,
 };
 
 /// A complete manifest using Nanocodex's concrete third-party benchmark recipes.
@@ -144,6 +144,18 @@ pub enum Benchmark {
         environment: PathBuf,
         /// Wrapper around the official deterministic reference grader.
         harness: PathBuf,
+    },
+    /// OpenAI's public GraphWalks Parquet release and published F1 grader.
+    Graphwalks {
+        /// Directory containing both official Parquet partitions.
+        source: PathBuf,
+        /// Pinned dataset revision.
+        revision: String,
+        /// Wrapper around the published deterministic F1 grader.
+        harness: PathBuf,
+        /// Candidate environment.
+        #[serde(default = "default_image")]
+        image: String,
     },
     /// Benchmark-owned executable manifest.
     External {
@@ -488,6 +500,7 @@ impl BenchmarkCatalog {
             "swe-bench-verified-smoke" => "swe-bench",
             "genebench-pro-public" => "genebench-pro",
             "deep-swe-v1.1" => "harbor",
+            "graphwalks" => "graphwalks",
             _ => return None,
         };
         Some(Builtin { adapter })
@@ -617,6 +630,17 @@ impl<'a> ProfileImporter<'a> {
                 revision,
                 Environment::Dockerfile(resolve_path(root, environment)),
                 Harness::directory(resolve_path(root, harness))?,
+            )),
+            Benchmark::Graphwalks {
+                source,
+                revision,
+                harness,
+                image,
+            } => store.import(&GraphWalks::new(
+                resolve_path(root, source),
+                revision,
+                Environment::OciImage(image.clone()),
+                resolve_path(root, harness),
             )),
             Benchmark::External { manifest } => {
                 store.import(&ExternalHarness::new(resolve_path(root, manifest)))
@@ -787,6 +811,7 @@ mod tests {
             "swe-bench-verified-smoke",
             "genebench-pro-public",
             "deep-swe-v1.1",
+            "graphwalks",
         ] {
             assert!(BenchmarkCatalog::new().contains(benchmark), "{benchmark}");
         }

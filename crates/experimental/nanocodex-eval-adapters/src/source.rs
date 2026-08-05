@@ -24,6 +24,11 @@ const GENEBENCH_PRO_MANIFEST_SHA256: &str =
 const GENEBENCH_PRO_GRADER_SHA256: &str =
     "81a50853d1348237300ce90a7b48a9230b4edb5d1af30207c37f17f0de8bbb28";
 const DEEP_SWE_REVISION: &str = "e016041a6ccf8da29906afc9a3f5a8df940a1f78";
+const GRAPHWALKS_REVISION: &str = "f338bb265735a56a79f4b0f5def722c9c3268ead";
+const GRAPHWALKS_SHORT_SHA256: &str =
+    "54036036c91d8e04bb2a5fcd9e36f8e2a852cacece5dfc2b1ee40e3a6182b516";
+const GRAPHWALKS_LONG_SHA256: &str =
+    "537879431c72a42e3b500f80efc3047e7facb90390b6063d33679b4320985911";
 const GENEBENCH_PRO_BASE: &str =
     "https://huggingface.co/datasets/openai/genebench-pro-public-package/resolve";
 
@@ -140,6 +145,12 @@ impl BuiltinSources {
                 source: self.root.join("deep-swe/tasks"),
                 revision: format!("datacurve-ai/deep-swe@{DEEP_SWE_REVISION}"),
             }),
+            "graphwalks" => Ok(Benchmark::Graphwalks {
+                source: self.root.join("graphwalks"),
+                revision: format!("openai/graphwalks@{GRAPHWALKS_REVISION}"),
+                harness: assets.join("graphwalks"),
+                image: "python:3.12-slim".to_owned(),
+            }),
             other => Err(BuiltinSourceError::Unsupported(other.to_owned())),
         }
     }
@@ -153,6 +164,7 @@ impl BuiltinSources {
                 | "swe-bench-verified-smoke"
                 | "genebench-pro-public"
                 | "deep-swe-v1.1"
+                | "graphwalks"
         )
     }
 
@@ -242,8 +254,25 @@ impl BuiltinSources {
                 "https://github.com/datacurve-ai/deep-swe.git",
                 DEEP_SWE_REVISION,
             ),
+            "graphwalks" => self.materialize_graphwalks(),
             other => Err(BuiltinSourceError::Unsupported(other.to_owned())),
         }
+    }
+
+    fn materialize_graphwalks(&self) -> Result<(), BuiltinSourceError> {
+        let base = format!(
+            "https://huggingface.co/datasets/openai/graphwalks/resolve/{GRAPHWALKS_REVISION}"
+        );
+        self.download(
+            "graphwalks/graphwalks_128k_and_shorter.parquet",
+            &format!("{base}/graphwalks_128k_and_shorter.parquet"),
+            GRAPHWALKS_SHORT_SHA256,
+        )?;
+        self.download(
+            "graphwalks/graphwalks_256k_to_1mil.parquet",
+            &format!("{base}/graphwalks_256k_to_1mil.parquet"),
+            GRAPHWALKS_LONG_SHA256,
+        )
     }
 
     fn materialize_genebench_pro(&self) -> Result<(), BuiltinSourceError> {
