@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use nanocodex_agent::events::AgentEvent;
 #[cfg(unix)]
 use nix::{
     errno::Errno,
@@ -27,15 +28,19 @@ use tokio::{
 };
 
 use crate::{
-    AgentMetadata, AgentResult, AgentStatus, AtifAgent, AtifAgentExtra, AtifObservation,
-    AtifObservationExtra, AtifObservationResult, AtifSource, AtifStep, AtifToolCall,
-    AtifToolCallExtra, AtifTrajectory, BillingCompleteness, CleanupPhase, MeasurementCompleteness,
-    UsageTotals, atif::finish_projected_trajectory,
+    AgentMetadata, AgentResult, AgentStatus, AtifAgent, AtifAgentExtra, AtifBuilder,
+    AtifObservation, AtifObservationExtra, AtifObservationResult, AtifSource, AtifStep,
+    AtifToolCall, AtifToolCallExtra, AtifTrajectory, BillingCompleteness, CleanupPhase,
+    MeasurementCompleteness, UsageTotals, atif::finish_projected_trajectory,
 };
 
 const EVENTS_FILE: &str = "agent/codex-events.jsonl";
 const STDERR_FILE: &str = "agent/codex-stderr.log";
 const SUMMARY_FILE: &str = "agent/codex-summary.json";
+const NANOCODEX_EVENTS_FILE: &str = "agent/harness-native.jsonl";
+const NANOCODEX_NORMALIZED_EVENTS_FILE: &str = "agent/harness-normalized.jsonl";
+const NANOCODEX_STDERR_FILE: &str = "agent/harness-native.stderr.log";
+const NANOCODEX_SUMMARY_FILE: &str = "agent/harness-summary.json";
 const STDERR_TAIL_BYTES: usize = 32 * 1024;
 const SUMMARY_ITEM_LIMIT: usize = 10_000;
 const SUMMARY_LABEL_BYTES: usize = 4 * 1024;
@@ -61,22 +66,44 @@ pub struct CodexExec {
     identity: CodexExecutionIdentity,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CodexExecutionIdentity {
+    name: &'static str,
+    version: &'static str,
     transport: &'static str,
     orchestration: &'static str,
 }
 
 impl CodexExecutionIdentity {
     const STOCK_CODEX: Self = Self {
+        name: "codex",
+        version: "unknown",
         transport: "codex_exec_jsonl",
         orchestration: "stock_codex_cli",
     };
 
     const NANOCODEX_CLI: Self = Self {
+        name: "nanocodex",
+        version: "unknown",
         transport: "nanocodex_jsonl_v1",
         orchestration: "nanocodex_cli",
     };
+
+    fn captured_events_file(self) -> &'static str {
+        if self == Self::NANOCODEX_CLI {
+            NANOCODEX_NORMALIZED_EVENTS_FILE
+        } else {
+            EVENTS_FILE
+        }
+    }
+
+    fn captured_stderr_file(self) -> &'static str {
+        if self == Self::NANOCODEX_CLI {
+            NANOCODEX_STDERR_FILE
+        } else {
+            STDERR_FILE
+        }
+    }
 }
 
 /// Stock Codex's model-visible tool exposure for a controlled evaluation.
@@ -313,6 +340,53 @@ impl CodexExec {
         }
     }
 
+    pub(crate) fn project_atif(
+        &self,
+        attempt_directory: &Path,
+        prompt: &str,
+        result: &AgentResult,
+    ) -> Result<AtifTrajectory, CodexExecError> {
+        if self.identity == CodexExecutionIdentity::NANOCODEX_CLI {
+            let path = attempt_directory.join(NANOCODEX_EVENTS_FILE);
+            let input = SyncFile::open(path)?;
+            let mut projection = AtifBuilder::default();
+            for (offset, line) in SyncBufReader::new(input).lines().enumerate() {
+                let line_number = u64::try_from(offset + 1).unwrap_or(u64::MAX);
+                let event = serde_json::from_str::<AgentEvent>(&line?).map_err(|source| {
+                    CodexExecError::EventJson {
+                        line: line_number,
+                        source,
+                    }
+                })?;
+                projection
+                    .apply(&event)
+                    .map_err(|source| CodexExecError::EventJson {
+                        line: line_number,
+                        source,
+                    })?;
+            }
+            return Ok(projection.finish_projected(
+                prompt,
+                AtifAgent {
+                    name: self.identity.name.to_owned(),
+                    version: self.identity.version.to_owned(),
+                    model_name: result.model.clone(),
+                    extra: AtifAgentExtra {
+                        transport: result.metadata.transport.clone(),
+                        orchestration: result.metadata.orchestration.clone(),
+                    },
+                },
+                result,
+            ));
+        }
+        project_codex_atif(
+            &attempt_directory.join(EVENTS_FILE),
+            prompt,
+            result,
+            self.identity.version,
+        )
+    }
+
     async fn run_with_command_runner(
         &self,
         runner: &dyn CodexCommandRunner,
@@ -335,8 +409,8 @@ impl CodexExec {
         if let Err(error) = fs::create_dir_all(&agent_directory).await {
             return CodexExecution::setup_failed(error.into());
         }
-        let events_path = attempt_directory.join(EVENTS_FILE);
-        let stderr_path = attempt_directory.join(STDERR_FILE);
+        let events_path = attempt_directory.join(self.identity.captured_events_file());
+        let stderr_path = attempt_directory.join(self.identity.captured_stderr_file());
         let (transcript, stderr_tail) = tokio::join!(
             capture_stdout(&output.stdout[..], events_path),
             capture_stderr(&output.stderr[..], stderr_path),
@@ -1514,7 +1588,11 @@ async fn write_summary(events_path: &Path, transcript: &CodexTranscript) -> io::
         .parent()
         .and_then(Path::parent)
         .ok_or_else(|| io::Error::other("Codex events path has no attempt root"))?
-        .join(SUMMARY_FILE);
+        .join(if events_path.ends_with(NANOCODEX_NORMALIZED_EVENTS_FILE) {
+            NANOCODEX_SUMMARY_FILE
+        } else {
+            SUMMARY_FILE
+        });
     let mut encoded = serde_json::to_vec_pretty(transcript).map_err(io::Error::other)?;
     encoded.push(b'\n');
     fs::write(summary, encoded).await
@@ -1730,6 +1808,60 @@ mod tests {
             trajectory.final_metrics.extra.billing_completeness,
             Some(BillingCompleteness::Unknown)
         );
+    }
+
+    #[test]
+    fn external_nanocodex_projects_native_tool_events() {
+        let temporary = tempdir().unwrap();
+        let agent = temporary.path().join("agent");
+        fs::create_dir(&agent).unwrap();
+        let events = concat!(
+            "{\"protocol_version\":1,\"request_id\":\"nano-session\",\"seq\":1,\"type\":\"model.call.started\",\"payload\":{\"call_index\":1,\"model\":\"gpt-5.6-sol\",\"effort\":\"low\"}}\n",
+            "{\"protocol_version\":1,\"request_id\":\"nano-session\",\"seq\":2,\"type\":\"tool.call\",\"payload\":{\"call_id\":\"call-1\",\"tool\":\"exec\",\"arguments\":\"pwd\",\"model_call_index\":1}}\n",
+            "{\"protocol_version\":1,\"request_id\":\"nano-session\",\"seq\":3,\"type\":\"tool.result\",\"payload\":{\"call_id\":\"call-1\",\"status\":\"completed\",\"duration_ns\":7,\"result\":\"/workspace\"}}\n",
+            "{\"protocol_version\":1,\"request_id\":\"nano-session\",\"seq\":4,\"type\":\"assistant.message\",\"payload\":{\"model_call_index\":1,\"phase\":\"final\",\"text\":\"done\"}}\n",
+        );
+        fs::write(agent.join("harness-native.jsonl"), events).unwrap();
+        let config = CodexExec::new(std::env::current_exe().unwrap(), "gpt-5.6-sol", "low")
+            .unwrap()
+            .nanocodex_cli();
+        let mut transcript = CodexTranscript::new();
+        transcript
+            .observe(
+                1,
+                &json!({
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": "done"}
+                }),
+            )
+            .unwrap();
+        transcript
+            .observe(
+                2,
+                &json!({
+                    "type": "turn.completed",
+                    "usage": {"input_tokens": 2, "cached_input_tokens": 0, "output_tokens": 1}
+                }),
+            )
+            .unwrap();
+        let result = transcript
+            .agent_result(
+                &config,
+                Duration::from_millis(1),
+                AgentStatus::Completed,
+                BillingCompleteness::Complete,
+            )
+            .unwrap();
+
+        let trajectory = config
+            .project_atif(temporary.path(), "complete the task", &result)
+            .unwrap();
+
+        assert_eq!(trajectory.agent.name, "nanocodex");
+        assert_eq!(trajectory.session_id, "nano-session");
+        assert_eq!(trajectory.tool_call_count(), 1);
+        assert_eq!(trajectory.observation_count(), 1);
+        assert_eq!(trajectory.steps.last().unwrap().message, "done");
     }
 
     #[test]

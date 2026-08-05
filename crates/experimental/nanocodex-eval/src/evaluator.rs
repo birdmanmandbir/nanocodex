@@ -842,6 +842,7 @@ impl Evaluator {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_task_inner(
         &self,
         task: Task,
@@ -913,7 +914,10 @@ impl Evaluator {
                 verifier_cleanup,
             ));
         }
-        let trajectory = emitter.finish_trajectory(&task, agent.result.as_ref());
+        let trajectory = agent
+            .trajectory
+            .take()
+            .unwrap_or_else(|| emitter.finish_trajectory(&task, agent.result.as_ref()));
         let trajectory = serde_json::to_vec(&trajectory)
             .map_err(EvalError::Json)
             .map_err(AttemptRunFailure::new)?;
@@ -1343,6 +1347,7 @@ impl Evaluator {
         Ok(AgentExecution {
             result: outcome.result,
             error,
+            trajectory: None,
             verifier,
             readiness_timing,
             setup_timing,
@@ -1387,11 +1392,22 @@ impl Evaluator {
             .instrument(span.clone())
             .await;
         let execution_timing = PhaseTiming::finished(execution_started);
-        let error = execution.error.map(|error| {
+        let mut error = execution.error.map(|error| {
             RecordedEvalError::now(match error {
                 CodexRunError::Timeout(timeout) => EvalError::AgentTimeout(timeout),
                 CodexRunError::Execution(error) => EvalError::Codex(error),
             })
+        });
+        let trajectory = execution.result.as_ref().and_then(|result| {
+            match codex.project_atif(&attempt.paths.root, task.prompt(), result) {
+                Ok(trajectory) => Some(trajectory),
+                Err(projection_error) => {
+                    if error.is_none() {
+                        error = Some(RecordedEvalError::now(EvalError::Codex(projection_error)));
+                    }
+                    None
+                }
+            }
         });
         if let Some(error) = &error {
             span.record("status", "failed");
@@ -1405,6 +1421,7 @@ impl Evaluator {
         Ok(AgentExecution {
             result: execution.result,
             error,
+            trajectory,
             verifier,
             readiness_timing,
             setup_timing,
@@ -1542,6 +1559,7 @@ async fn shutdown_attempt_verifier(
 struct AgentExecution {
     result: Option<AgentResult>,
     error: Option<RecordedEvalError>,
+    trajectory: Option<crate::atif::AtifTrajectory>,
     verifier: Option<Box<dyn AttemptVerifier>>,
     readiness_timing: PhaseTiming,
     setup_timing: PhaseTiming,

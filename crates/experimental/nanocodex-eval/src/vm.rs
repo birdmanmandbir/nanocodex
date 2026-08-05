@@ -328,6 +328,9 @@ pub enum VmProfileRunError {
     /// A selected guest CLI treatment could not be staged or configured.
     #[error("guest harness preparation failed: {0}")]
     Harness(String),
+    /// Disposable VM disks from an interrupted invocation could not be reclaimed.
+    #[error("failed to reclaim interrupted profile attempt disks: {0}")]
+    InterruptedAttemptCleanup(#[source] io::Error),
 }
 
 #[derive(Clone)]
@@ -573,6 +576,46 @@ impl VmProfileRunner {
         self.harness_auth = Some(auth);
         self
     }
+
+    fn reclaim_interrupted_attempt_disks(job: &Path) -> Result<usize, io::Error> {
+        let mut removed = 0_usize;
+        for entry in fs::read_dir(job)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let attempt = entry.path();
+            if attempt.join("result.json").is_file() {
+                continue;
+            }
+            for disk in [
+                attempt.join("rootfs.ext4"),
+                attempt.join("rootfs.upper.ext4"),
+                attempt.join("verifier-rootfs.ext4"),
+                attempt.join("verifier-rootfs.upper.ext4"),
+                attempt.join("verifier/cache.ext4"),
+            ] {
+                match fs::symlink_metadata(&disk) {
+                    Ok(metadata) if metadata.file_type().is_file() => {
+                        fs::remove_file(&disk)?;
+                        removed = removed.saturating_add(1);
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        if removed > 0 {
+            info!(
+                target: "nanocodex_eval",
+                job_directory = %job.display(),
+                vm_disks_removed = removed,
+                "reclaimed writable VM disks from interrupted profile attempts"
+            );
+        }
+        Ok(removed)
+    }
 }
 
 impl ProfileRunner for VmProfileRunner {
@@ -662,6 +705,8 @@ impl ProfileRunner for VmProfileRunner {
         }
         let evaluator = evaluator.build()?;
         active.job_directory(evaluator.directory())?;
+        Self::reclaim_interrupted_attempt_disks(evaluator.directory())
+            .map_err(VmProfileRunError::InterruptedAttemptCleanup)?;
         let remaining = evaluator.remaining_attempts()?;
         if remaining > 0 {
             let resources = VmResources::builder(self.vmm, self.runtime_image)
@@ -841,7 +886,7 @@ impl GuestTreatment {
     ) -> Result<AttemptAgent, VmAttemptError> {
         let session = runtime.session_handle()?;
         let workspace = runtime.verifier.launch.workspace.clone();
-        let mut environment = base_guest_environment(attempt.task(), &workspace);
+        let mut environment = runtime.verifier.launch.guest_environment(attempt.task());
         environment.push(("CODEX_HOME".to_owned(), GUEST_HARNESS_HOME.to_owned()));
         environment.push(("SSL_CERT_FILE".to_owned(), GUEST_HARNESS_CA_FILE.to_owned()));
         if let PreparedGuestAuth::ApiKey(key) = &auth {
@@ -1820,9 +1865,7 @@ impl VmEnvironment {
     /// guest, including task and verifier variables.
     #[must_use]
     pub fn guest_environment(&self, task: &Task) -> BTreeMap<String, String> {
-        let mut environment = self.environment.clone();
-        environment.extend(base_guest_environment(task, &self.workspace));
-        environment
+        guest_environment(&self.environment, task, &self.workspace)
     }
 }
 
@@ -2976,6 +3019,12 @@ fn spawn_preparation_network(
 }
 
 impl VmLaunch {
+    fn guest_environment(&self, task: &Task) -> Vec<(String, String)> {
+        guest_environment(&self.environment, task, &self.workspace)
+            .into_iter()
+            .collect()
+    }
+
     fn spawn(
         &self,
         verifier_cache: Option<&AttemptVerifierCache>,
@@ -3274,7 +3323,7 @@ impl VerifierCache {
                     VmCommand::new(&launch.shell)
                         .arg(VERIFIER_CACHE_PREPARE_SCRIPT)
                         .current_directory(&launch.workspace)
-                        .environment(base_guest_environment(task, &launch.workspace))
+                        .environment(launch.guest_environment(task))
                         .timeout(task.verifier().timeout()),
                 )
                 .await?;
@@ -3515,7 +3564,7 @@ impl VmVerifier {
                         .arg("-c")
                         .arg(collect.command())
                         .current_directory(&launch.workspace)
-                        .environment(base_guest_environment(task, &launch.workspace))
+                        .environment(launch.guest_environment(task))
                         .timeout(task.verifier().timeout()),
                 )
                 .await?;
@@ -3708,6 +3757,7 @@ impl VmVerifier {
                     Err(error) => return Err(error),
                 }
             };
+            Self::stage_verifier_logs(&verifier_session, &verifier_directory).await?;
             fs::write(verifier_directory.join(reward_name), &reward_bytes)?;
             if let Ok(ctrf) = verifier_session.read_file("/logs/verifier/ctrf.json").await {
                 fs::write(verifier_directory.join("ctrf.json"), ctrf)?;
@@ -4165,13 +4215,66 @@ impl VmVerifier {
         } else {
             VmCommand::new(verifier_shell(&launch.shell, skip_setup)).arg("/tests/test.sh")
         };
-        let mut environment = base_guest_environment(task, &launch.workspace);
+        let mut environment = launch.guest_environment(task);
         environment.extend(self.verifier_environment.clone());
         command = command
             .current_directory(&launch.workspace)
             .environment(environment)
             .timeout(task.verifier().timeout());
         Ok(command)
+    }
+
+    async fn stage_verifier_logs(
+        session: &VmToolSession,
+        destination: &Path,
+    ) -> Result<(), VmAttemptError> {
+        let listed = session
+            .command(
+                VmCommand::new("/bin/sh")
+                    .arg("-c")
+                    .arg("find /logs/verifier -type f -printf '%P\\0'")
+                    .max_output_bytes(1024 * 1024)
+                    .timeout(Duration::from_secs(30)),
+            )
+            .await?;
+        if listed.exit_code != 0 {
+            return Err(io::Error::other(format!(
+                "listing verifier evidence exited {}: {}",
+                listed.exit_code,
+                String::from_utf8_lossy(&listed.stderr)
+            ))
+            .into());
+        }
+        for encoded in listed
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+        {
+            let relative = std::str::from_utf8(encoded)
+                .map_err(|_| io::Error::other("verifier evidence path is not UTF-8"))?;
+            let relative = Path::new(relative);
+            if relative.is_absolute()
+                || relative
+                    .components()
+                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            {
+                return Err(io::Error::other(format!(
+                    "verifier evidence path is unsafe: {}",
+                    relative.display()
+                ))
+                .into());
+            }
+            let target = destination.join(relative);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let guest = Path::new("/logs/verifier")
+                .join(relative)
+                .to_string_lossy()
+                .into_owned();
+            fs::write(target, session.read_file(guest).await?)?;
+        }
+        Ok(())
     }
 
     fn copy_directory<'a>(
@@ -4320,13 +4423,19 @@ const fn verifier_shell(configured: &str, skip_setup: bool) -> &str {
     if skip_setup { "/bin/bash" } else { configured }
 }
 
-fn base_guest_environment(task: &Task, workspace: &str) -> Vec<(String, String)> {
-    let mut environment = BTreeMap::from([
-        (
-            "PATH".to_owned(),
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned(),
-        ),
-        ("HOME".to_owned(), "/root".to_owned()),
+fn guest_environment(
+    image: &BTreeMap<String, String>,
+    task: &Task,
+    workspace: &str,
+) -> BTreeMap<String, String> {
+    let mut environment = image.clone();
+    environment.entry("PATH".to_owned()).or_insert_with(|| {
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned()
+    });
+    environment
+        .entry("HOME".to_owned())
+        .or_insert_with(|| "/root".to_owned());
+    environment.extend([
         ("NANOCODEX_EVAL_WORKSPACE".to_owned(), workspace.to_owned()),
         (
             "NANOCODEX_EVAL_VERIFIER_LOGS".to_owned(),
@@ -4342,7 +4451,7 @@ fn base_guest_environment(task: &Task, workspace: &str) -> Vec<(String, String)>
     ]);
     environment.extend(task.environment().clone());
     environment.extend(task.verifier().environment().clone());
-    environment.into_iter().collect()
+    environment
 }
 
 fn record_operation<T, E>(span: &tracing::Span, started_at: Instant, result: &Result<T, E>)

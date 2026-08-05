@@ -11,6 +11,10 @@ use nanocodex_eval::{
 
 use crate::{read_json_lines, safe_case_id, sha256_file};
 
+const FINAL_RESPONSE_INSTRUCTIONS: &str = "Return the complete answer in the final assistant \
+message. The benchmark judge sees only that message and cannot inspect files in the workspace, \
+so do not refer to local artifacts as the answer.";
+
 /// Arena-Hard prompt importer using a caller-packaged official judge harness.
 #[derive(Clone, Debug)]
 pub struct ArenaHard {
@@ -98,6 +102,7 @@ impl DatasetImporter for ArenaHard {
                 self.environment.clone(),
                 self.harness.clone(),
             )?
+            .instructions(FINAL_RESPONSE_INSTRUCTIONS)
             .output(TaskOutput::FinalMessage)
             .harness_file("case.json", metadata, 0o600)?;
             if let Some(baseline) = baselines.get(&uid) {

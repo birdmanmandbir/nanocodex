@@ -25,6 +25,40 @@ fn evaluator_vm_builder_records_the_backend_environment() {
 }
 
 #[test]
+fn profile_resume_reclaims_only_nonterminal_attempt_disks() {
+    let job = tempfile::tempdir().unwrap();
+    let interrupted = job.path().join("interrupted");
+    let completed = job.path().join("completed");
+    fs::create_dir_all(interrupted.join("verifier")).unwrap();
+    fs::create_dir_all(completed.join("verifier")).unwrap();
+    for relative in [
+        "rootfs.ext4",
+        "rootfs.upper.ext4",
+        "verifier-rootfs.ext4",
+        "verifier-rootfs.upper.ext4",
+        "verifier/cache.ext4",
+    ] {
+        fs::write(interrupted.join(relative), b"disk").unwrap();
+        fs::write(completed.join(relative), b"evidence").unwrap();
+    }
+    fs::write(completed.join("result.json"), b"{}").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        completed.join("rootfs.ext4"),
+        interrupted.join("linked.ext4"),
+    )
+    .unwrap();
+
+    assert_eq!(
+        VmProfileRunner::reclaim_interrupted_attempt_disks(job.path()).unwrap(),
+        5
+    );
+    assert!(completed.join("rootfs.ext4").is_file());
+    assert!(interrupted.join("linked.ext4").is_symlink());
+    assert!(!interrupted.join("rootfs.ext4").exists());
+}
+
+#[test]
 fn eval_guest_memory_cap_only_reduces_large_task_allocations() {
     assert_eq!(effective_guest_memory_mb(8_192, None), 8_192);
     assert_eq!(effective_guest_memory_mb(8_192, Some(1_024)), 1_024);
@@ -33,6 +67,37 @@ fn eval_guest_memory_cap_only_reduces_large_task_allocations() {
     assert_eq!(
         effective_guest_memory_mb(u64::MAX, None),
         u64::from(u32::MAX)
+    );
+}
+
+#[test]
+fn guest_commands_preserve_the_prepared_image_path() {
+    let task =
+        Task::load(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tasks/write-greeting"))
+            .unwrap();
+    let image = BTreeMap::from([
+        (
+            "PATH".to_owned(),
+            "/opt/benchmark/bin:/usr/local/bin:/usr/bin".to_owned(),
+        ),
+        ("BENCHMARK_ENV".to_owned(), "present".to_owned()),
+    ]);
+
+    let environment = guest_environment(&image, &task, "/workspace");
+
+    assert_eq!(
+        environment.get("PATH").map(String::as_str),
+        Some("/opt/benchmark/bin:/usr/local/bin:/usr/bin")
+    );
+    assert_eq!(
+        environment.get("BENCHMARK_ENV").map(String::as_str),
+        Some("present")
+    );
+    assert_eq!(
+        environment
+            .get("NANOCODEX_EVAL_WORKSPACE")
+            .map(String::as_str),
+        Some("/workspace")
     );
 }
 

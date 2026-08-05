@@ -667,6 +667,7 @@ fn trial_lock_keeps_harbors_hash_separate_from_internal_materialization_identity
     let task_content_hash = super::packager_content_hash(task.root()).unwrap();
     let lock = super::HarborTrialLock::new(
         &task,
+        "nanocodex",
         "gpt-test",
         "high",
         &task_content_hash,
@@ -1445,6 +1446,7 @@ fn write_retained_trial(
         &directory.join("lock.json"),
         &super::HarborTrialLock::new(
             task,
+            "nanocodex",
             "gpt-test",
             "high",
             &super::packager_content_hash(task.root()).unwrap(),

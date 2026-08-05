@@ -669,7 +669,7 @@ impl HarborArtifacts {
             },
             trial_name: &result.trial_name,
             trials_dir: &self.root,
-            agent: harbor_agent_config(model, effort),
+            agent: harbor_agent_config(&trajectory.agent.name, model, effort),
             environment: HarborEnvironmentConfig::from(result.environment),
             verifier: HarborVerifierConfig::native(),
             artifacts: Vec::new(),
@@ -696,8 +696,8 @@ impl HarborArtifacts {
             cleanup: &result.cleanup,
             config,
             agent_info: HarborAgentInfo {
-                name: "nanocodex",
-                version: env!("CARGO_PKG_VERSION"),
+                name: &trajectory.agent.name,
+                version: &trajectory.agent.version,
                 model_info: HarborModelInfo {
                     name: model,
                     provider: "openai",
@@ -744,6 +744,7 @@ impl HarborArtifacts {
 
         let lock = HarborTrialLock::new(
             task,
+            &trajectory.agent.name,
             model,
             effort,
             &task_content_hash,
@@ -778,7 +779,7 @@ impl HarborArtifacts {
                     path: task.root().to_path_buf(),
                     source: Some("nanocodex/local".to_owned()),
                 },
-                agent: harbor_agent_config(model, effort),
+                agent: harbor_agent_config(&trajectory.agent.name, model, effort),
                 lock,
             });
         }
@@ -818,7 +819,7 @@ impl HarborArtifacts {
             },
             trial_name: &failure.trial_name,
             trials_dir: &self.root,
-            agent: harbor_agent_config(model, effort),
+            agent: harbor_agent_config(&trajectory.agent.name, model, effort),
             environment: HarborEnvironmentConfig::from(failure.environment),
             verifier: HarborVerifierConfig::native(),
             artifacts: Vec::new(),
@@ -845,8 +846,8 @@ impl HarborArtifacts {
             cleanup: &failure.cleanup,
             config,
             agent_info: HarborAgentInfo {
-                name: "nanocodex",
-                version: env!("CARGO_PKG_VERSION"),
+                name: &trajectory.agent.name,
+                version: &trajectory.agent.version,
                 model_info: HarborModelInfo {
                     name: model,
                     provider: "openai",
@@ -889,6 +890,7 @@ impl HarborArtifacts {
 
         let lock = HarborTrialLock::new(
             task,
+            &trajectory.agent.name,
             model,
             effort,
             &task_content_hash,
@@ -922,7 +924,7 @@ impl HarborArtifacts {
                     path: task.root().to_path_buf(),
                     source: Some("nanocodex/local".to_owned()),
                 },
-                agent: harbor_agent_config(model, effort),
+                agent: harbor_agent_config(&trajectory.agent.name, model, effort),
                 lock,
             });
         }
@@ -1208,9 +1210,9 @@ fn require_durable_directory_sync() -> std::io::Result<()> {
     ))
 }
 
-fn harbor_agent_config(model: &str, effort: &str) -> HarborAgentConfig {
+fn harbor_agent_config(name: &str, model: &str, effort: &str) -> HarborAgentConfig {
     HarborAgentConfig {
-        name: "nanocodex".to_owned(),
+        name: name.to_owned(),
         model_name: format!("openai/{model}"),
         kwargs: HarborAgentKwargs {
             effort: effort.to_owned(),
@@ -1321,6 +1323,7 @@ struct HarborTrialLock {
 impl HarborTrialLock {
     fn new(
         task: &Task,
+        agent_name: &str,
         model: &str,
         effort: &str,
         task_content_hash: &str,
@@ -1359,7 +1362,7 @@ impl HarborTrialLock {
             install_only: false,
             timeout_multiplier: 1.0,
             agent: HarborAgentConfig {
-                name: "nanocodex".to_owned(),
+                name: agent_name.to_owned(),
                 model_name: format!("openai/{model}"),
                 kwargs: HarborAgentKwargs {
                     effort: effort.to_owned(),
@@ -1538,8 +1541,8 @@ struct HarborTaskId {
 
 #[derive(Serialize)]
 struct HarborAgentInfo<'a> {
-    name: &'static str,
-    version: &'static str,
+    name: &'a str,
+    version: &'a str,
     model_info: HarborModelInfo<'a>,
 }
 

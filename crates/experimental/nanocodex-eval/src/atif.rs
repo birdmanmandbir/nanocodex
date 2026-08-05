@@ -406,6 +406,27 @@ impl AtifBuilder {
     /// terminal agent payload to the final agent step.
     #[must_use]
     pub fn finish(self, task: &Task, result: &AgentResult) -> AtifTrajectory {
+        self.finish_projected(
+            task.prompt(),
+            AtifAgent {
+                name: "nanocodex".to_owned(),
+                version: env!("CARGO_PKG_VERSION").to_owned(),
+                model_name: result.model.clone(),
+                extra: AtifAgentExtra {
+                    transport: result.metadata.transport.clone(),
+                    orchestration: result.metadata.orchestration.clone(),
+                },
+            },
+            result,
+        )
+    }
+
+    pub(crate) fn finish_projected(
+        self,
+        prompt: &str,
+        agent: AtifAgent,
+        result: &AgentResult,
+    ) -> AtifTrajectory {
         let mut steps = Vec::with_capacity(self.turns.len());
         for (offset, turn) in self.turns.into_values().enumerate() {
             let step_id = u32::try_from(offset + 2).unwrap_or(u32::MAX);
@@ -420,17 +441,9 @@ impl AtifBuilder {
             last.message.clone_from(&result.final_message);
         }
         finish_projected_trajectory(
-            task.prompt(),
+            prompt,
             self.session_id.unwrap_or_default(),
-            AtifAgent {
-                name: "nanocodex".to_owned(),
-                version: env!("CARGO_PKG_VERSION").to_owned(),
-                model_name: result.model.clone(),
-                extra: AtifAgentExtra {
-                    transport: result.metadata.transport.clone(),
-                    orchestration: result.metadata.orchestration.clone(),
-                },
-            },
+            agent,
             steps,
             result,
         )

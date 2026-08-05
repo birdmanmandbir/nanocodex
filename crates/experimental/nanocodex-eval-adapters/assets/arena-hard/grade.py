@@ -94,6 +94,7 @@ candidate = (workspace / "answer.txt").read_text()
 baseline_first = judge(case["prompt"], baseline_answer, candidate)
 candidate_first = judge(case["prompt"], candidate, baseline_answer)
 reward = (1.0 - score_for_a(baseline_first["label"]) + score_for_a(candidate_first["label"])) / 2.0
+passed = reward > 0.0
 evidence = {
     "judge_model": os.environ.get("ARENA_HARD_JUDGE", "gpt-5.6-sol"),
     "baseline_model": baseline["model"],
@@ -109,8 +110,8 @@ evidence = {
                 "tool": {"name": "arena-hard-auto", "version": "v2"},
                 "summary": {
                     "tests": 1,
-                    "passed": 1,
-                    "failed": 0,
+                    "passed": int(passed),
+                    "failed": int(not passed),
                     "pending": 0,
                     "skipped": 0,
                     "other": 0,
@@ -118,7 +119,7 @@ evidence = {
                 "tests": [
                     {
                         "name": case["uid"],
-                        "status": "passed",
+                        "status": "passed" if passed else "failed",
                         "duration": 0,
                         "extra": evidence,
                     }
