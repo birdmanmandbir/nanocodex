@@ -22,12 +22,21 @@ first even if the app is already running; this primes renderer accessibility
 and restores the previously frontmost app. Then attach to one exact app/window
 and inspect the returned state before acting. Observations return a screenshot
 and compact accessibility elements with generation-bound references such as `e12_4`.
+Use this tool for native applications and user-visible desktop state. For normal
+website navigation or inspection, prefer `tools.browser`, which exposes DOM and
+browser diagnostics directly. Do not recreate native app control with shell,
+AppleScript, Node, or an ad hoc Accessibility client.
 References expire on the next observation or action; always use fresh ones.
 After the first state for an exact window, `state.accessibility_update` describes
 only unambiguous added, changed, and removed elements relative to its base
 generation; `state.elements` remains the authoritative complete current tree.
 
 Prefer semantic element click/set_value/perform_action over coordinates.
+For whole-field replacement, use set_value directly. If a workflow explicitly
+uses a background selection shortcut such as Command-A, inspect the returned
+element's selected_text before typing; keyboard delivery can succeed without a
+native app changing its selection. Fall back to set_value instead of repeating
+an unverified shortcut.
 Coordinate input is global and is intended only for controls absent from the
 accessibility tree. If screenshot pixels are used, map them to global points as
 `window.x + pixel_x * window.width / screenshot.width` and likewise for y.

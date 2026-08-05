@@ -5,15 +5,20 @@ use nanocodex_computer::{
     ComputerTool,
 };
 
-/// Opt-in native computer-use configuration for normal agent sessions.
-#[derive(Args, Default)]
+/// Native computer-use configuration for normal agent sessions.
+#[derive(Args)]
 pub(crate) struct ComputerArgs {
     /// Expose the local macOS desktop to Code Mode as `tools.computer`.
+    ///
+    /// Enabled by default on macOS. Pass `--computer=false` to disable it.
     #[arg(
         long,
         env = "NANOCODEX_COMPUTER",
-        default_value_t = false,
-        action = ArgAction::SetTrue
+        default_value_t = default_computer_enabled(),
+        action = ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true
     )]
     computer: bool,
 
@@ -22,8 +27,7 @@ pub(crate) struct ComputerArgs {
         long,
         env = "NANOCODEX_COMPUTER_PREVIEW",
         default_value_t = true,
-        action = ArgAction::Set,
-        requires = "computer"
+        action = ArgAction::Set
     )]
     computer_preview: bool,
 
@@ -31,8 +35,7 @@ pub(crate) struct ComputerArgs {
     #[arg(
         long = "computer-allow-app",
         env = "NANOCODEX_COMPUTER_ALLOW_APP",
-        value_delimiter = ',',
-        requires = "computer"
+        value_delimiter = ','
     )]
     allowed_apps: Vec<String>,
 
@@ -40,10 +43,24 @@ pub(crate) struct ComputerArgs {
     #[arg(
         long = "computer-allow-url",
         env = "NANOCODEX_COMPUTER_ALLOW_URL",
-        value_delimiter = ',',
-        requires = "computer"
+        value_delimiter = ','
     )]
     allowed_urls: Vec<String>,
+}
+
+impl Default for ComputerArgs {
+    fn default() -> Self {
+        Self {
+            computer: default_computer_enabled(),
+            computer_preview: true,
+            allowed_apps: Vec::new(),
+            allowed_urls: Vec::new(),
+        }
+    }
+}
+
+const fn default_computer_enabled() -> bool {
+    cfg!(target_os = "macos")
 }
 
 impl ComputerArgs {
@@ -54,6 +71,11 @@ impl ComputerArgs {
 
     pub(crate) async fn configure(self) -> Result<Option<ConfiguredComputer>> {
         if !self.computer {
+            if !self.allowed_apps.is_empty() || !self.allowed_urls.is_empty() {
+                return Err(eyre::eyre!(
+                    "computer allowlists require computer use to be enabled"
+                ));
+            }
             return Ok(None);
         }
         let mut builder = Computer::builder();

@@ -87,6 +87,12 @@ pub use session::{BraveSession, BraveSessionError, BrowserProfileKind};
 const TOOL_DESCRIPTION: &str = r#"Control one server-managed browser session.
 
 Call this tool from Code Mode as `await tools.browser({ action: ..., ... })`.
+Use it for websites and browser-only workflows because it exposes semantic DOM,
+network, console, storage, and rendering state directly. Prefer it over driving a
+native browser through `tools.computer`, and never recreate browser control with
+Node, shell scripts, or an ad hoc DevTools client. Use `tools.computer` only when
+the task specifically depends on a user's visible native browser window or on UI
+outside the managed browser session.
 Each call performs exactly one browser action against the session's active page.
 Before guessing an action's fields, inspect the exact deferred input contract with
 `toolSchema("browser").inputSchema` and filter its `oneOf` variants by the
@@ -3819,7 +3825,7 @@ impl DynamicToolProvider for BrowserTool {
     fn code_mode_tool_summaries(&self) -> Vec<(String, String)> {
         vec![(
             "browser".to_owned(),
-            "Control the host-managed browser session one typed action at a time.".to_owned(),
+            "Control websites through the host-managed browser session; prefer this semantic tool over Node, shell, or native computer automation for web tasks.".to_owned(),
         )]
     }
 

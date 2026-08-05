@@ -510,9 +510,18 @@ pub struct NativePipWindow {
     panel: Retained<NSPanel>,
     image_view: Retained<NSImageView>,
     cursor_view: Retained<NSImageView>,
+    agent_cursor_view: Retained<NSImageView>,
     cursor_source: CGEventSource,
     source_frame: Cell<Option<CGRect>>,
+    agent_cursor: Cell<Option<AgentCursor>>,
     presentation_aspect: Cell<Option<f64>>,
+}
+
+#[derive(Clone, Copy)]
+struct AgentCursor {
+    x: f64,
+    y: f64,
+    pressed_until: Option<Instant>,
 }
 
 /// Failure to create or update the native PIP renderer.
@@ -582,6 +591,14 @@ impl NativePipWindow {
         cursor_view.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
         cursor_view.setHidden(true);
         image_view.addSubview(&cursor_view);
+        let agent_cursor_view = NSImageView::initWithFrame(
+            NSImageView::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(22.0, 29.0)),
+        );
+        agent_cursor_view.setImage(Some(&NSCursor::arrowCursor().image()));
+        agent_cursor_view.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
+        agent_cursor_view.setHidden(true);
+        image_view.addSubview(&agent_cursor_view);
         panel.setContentView(Some(&image_view));
         let cursor_source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .map_err(|()| NativePipWindowError)?;
@@ -591,8 +608,10 @@ impl NativePipWindow {
             panel,
             image_view,
             cursor_view,
+            agent_cursor_view,
             cursor_source,
             source_frame: Cell::new(None),
+            agent_cursor: Cell::new(None),
             presentation_aspect: Cell::new(None),
         })
     }
@@ -603,6 +622,24 @@ impl NativePipWindow {
             &CGPoint::new(x, y),
             &CGSize::new(width, height),
         )));
+    }
+
+    /// Updates the independent logical cursor used by background agent input.
+    pub fn set_agent_cursor(&self, x: f64, y: f64, pressed: bool) {
+        let now = Instant::now();
+        let pressed_until = if pressed {
+            Some(now + Duration::from_millis(180))
+        } else {
+            self.agent_cursor
+                .get()
+                .and_then(|cursor| cursor.pressed_until)
+                .filter(|deadline| *deadline > now)
+        };
+        self.agent_cursor.set(Some(AgentCursor {
+            x,
+            y,
+            pressed_until,
+        }));
     }
 
     /// Replaces the displayed frame from complete PNG bytes.
@@ -715,6 +752,7 @@ impl NativePipWindow {
     pub fn pump(&self) -> Result<(), NativePipWindowError> {
         MainThreadMarker::new().ok_or(NativePipWindowError)?;
         self.update_cursor();
+        self.update_agent_cursor();
         let expiration = NSDate::distantPast();
         for _ in 0..32 {
             let Some(event) = self
@@ -762,6 +800,42 @@ impl NativePipWindow {
             bounds.origin.y + (1.0 - relative_y) * bounds.size.height - cursor_size.height,
         ));
         self.cursor_view.setHidden(false);
+    }
+
+    fn update_agent_cursor(&self) {
+        let Some(cursor) = self.agent_cursor.get() else {
+            self.agent_cursor_view.setHidden(true);
+            return;
+        };
+        let Some(source) = self.source_frame.get() else {
+            self.agent_cursor_view.setHidden(true);
+            return;
+        };
+        if source.size.width <= 0.0 || source.size.height <= 0.0 {
+            self.agent_cursor_view.setHidden(true);
+            return;
+        }
+        let relative_x = (cursor.x - source.origin.x) / source.size.width;
+        let relative_y = (cursor.y - source.origin.y) / source.size.height;
+        if !(0.0..=1.0).contains(&relative_x) || !(0.0..=1.0).contains(&relative_y) {
+            self.agent_cursor_view.setHidden(true);
+            return;
+        }
+        let pressed = cursor
+            .pressed_until
+            .is_some_and(|deadline| deadline > Instant::now());
+        let size = if pressed {
+            NSSize::new(26.0, 34.0)
+        } else {
+            NSSize::new(22.0, 29.0)
+        };
+        self.agent_cursor_view.setFrameSize(size);
+        let bounds = self.image_view.bounds();
+        self.agent_cursor_view.setFrameOrigin(NSPoint::new(
+            bounds.origin.x + relative_x * bounds.size.width,
+            bounds.origin.y + (1.0 - relative_y) * bounds.size.height - size.height,
+        ));
+        self.agent_cursor_view.setHidden(false);
     }
 
     /// Removes the panel from screen without activating another application.

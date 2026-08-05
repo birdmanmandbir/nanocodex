@@ -372,12 +372,15 @@ mod tests {
     }
 
     #[test]
-    fn computer_tool_and_preview_are_opt_in() {
+    fn computer_tool_defaults_on_for_supported_macos_hosts() {
         let baseline = Cli::try_parse_from(["nanocodex"]).unwrap();
-        assert!(!baseline.agent.computer_enabled());
+        assert_eq!(baseline.agent.computer_enabled(), cfg!(target_os = "macos"));
 
         let tui = Cli::try_parse_from(["nanocodex", "--computer"]).unwrap();
         assert!(tui.agent.computer_enabled());
+
+        let disabled = Cli::try_parse_from(["nanocodex", "--computer=false"]).unwrap();
+        assert!(!disabled.agent.computer_enabled());
 
         let headless = Cli::try_parse_from([
             "nanocodex",

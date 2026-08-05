@@ -4,7 +4,7 @@ use async_trait::async_trait;
 
 use crate::{
     ComputerAction, ComputerError, ComputerOutput, SettlePolicy,
-    driver::{FrameSink, RunState},
+    driver::{FrameSink, PointerSink, RunState},
 };
 
 #[cfg(target_os = "macos")]
@@ -37,6 +37,7 @@ pub(crate) trait Backend: Send {
         sequence: u64,
         state: Arc<RunState>,
         frames: &mut FrameSink,
+        pointers: &PointerSink,
     ) -> Result<ComputerOutput, ComputerError>;
 }
 
@@ -112,6 +113,7 @@ impl Backend for UnsupportedBackend {
         _sequence: u64,
         _state: Arc<RunState>,
         _frames: &mut FrameSink,
+        _pointers: &PointerSink,
     ) -> Result<ComputerOutput, ComputerError> {
         Err(ComputerError::Unsupported {
             platform: std::env::consts::OS,

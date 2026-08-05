@@ -45,6 +45,7 @@ impl ComputerPip {
     #[cfg(target_os = "macos")]
     pub async fn spawn(computer: &Computer) -> Result<Self, ComputerError> {
         let mut frames = computer.frames();
+        let mut pointers = computer.pointers();
         let (source_tx, source_rx) = tokio::sync::watch::channel(None);
         let (live_tx, mut live_rx) = tokio::sync::watch::channel(None);
         let live_task = tokio::spawn(capture_live_frames(source_rx, live_tx));
@@ -99,6 +100,19 @@ impl ComputerPip {
                                 tracing::warn!(target: "nanocodex_computer", window_id = source.window_id, "native computer PIP live frame rendering failed");
                                 break;
                             }
+                        }
+                        changed = pointers.changed() => {
+                            if changed.is_err() {
+                                break;
+                            }
+                            let Some(pointer) = *pointers.borrow_and_update() else {
+                                continue;
+                            };
+                            window.set_agent_cursor(
+                                pointer.point.x,
+                                pointer.point.y,
+                                pointer.pressed,
+                            );
                         }
                         _ = &mut stop_rx => break,
                     }

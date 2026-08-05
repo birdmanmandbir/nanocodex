@@ -102,6 +102,9 @@ pub struct Element {
     pub label: Option<String>,
     /// Current scalar value when it is useful and bounded.
     pub value: Option<String>,
+    /// Current selected text for editable controls when macOS exposes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_text: Option<String>,
     /// Placeholder text for editable controls.
     pub placeholder: Option<String>,
     /// Stable application-provided identifier when present.

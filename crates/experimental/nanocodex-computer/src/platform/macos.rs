@@ -31,7 +31,7 @@ use crate::{
     ComputerError, ComputerFrame, ComputerFramePhase, ComputerObservation, ComputerOutput, Element,
     ElementRef, InteractionTarget, KeyModifier, MouseButton, Permission, Point, Rect,
     ScreenshotArtifact, SettlePolicy, Window,
-    driver::{FrameSink, RunState},
+    driver::{FrameSink, PointerSink, RunState},
 };
 
 const MAX_TEXT_CHARS: usize = 2_000;
@@ -573,6 +573,7 @@ impl MacosBackend {
         sequence: u64,
         state: Arc<RunState>,
         frames: &mut FrameSink,
+        pointers: &PointerSink,
     ) -> Result<ComputerOutput, ComputerError> {
         state.ensure_running()?;
         let target = self.target.clone().ok_or(ComputerError::NoTarget)?;
@@ -588,6 +589,7 @@ impl MacosBackend {
         let dispatch = action.dispatch();
         let initial_pointer_fallbacks = self.intervention_target.synthetic_pointer_fallback_count();
         let intervention_target = Arc::clone(&self.intervention_target);
+        let pointers = pointers.clone();
         let span = info_span!(
             target: "nanocodex_computer",
             "computer.input.dispatch",
@@ -611,6 +613,7 @@ impl MacosBackend {
                     action,
                     allowed_url_origins.as_deref(),
                     &intervention_target,
+                    &pointers,
                 )
             })
             .await
@@ -648,6 +651,7 @@ impl Backend for MacosBackend {
         sequence: u64,
         state: Arc<RunState>,
         frames: &mut FrameSink,
+        pointers: &PointerSink,
     ) -> Result<ComputerOutput, ComputerError> {
         if let Some(url) = &self.blocked_url {
             return Err(ComputerError::UrlDenied { url: url.clone() });
@@ -848,6 +852,7 @@ impl Backend for MacosBackend {
                     sequence,
                     state,
                     frames,
+                    pointers,
                 )
                 .await
             }
@@ -870,6 +875,7 @@ impl Backend for MacosBackend {
                     sequence,
                     state,
                     frames,
+                    pointers,
                 )
                 .await
             }
@@ -887,6 +893,7 @@ impl Backend for MacosBackend {
                     sequence,
                     state,
                     frames,
+                    pointers,
                 )
                 .await
             }
@@ -896,6 +903,7 @@ impl Backend for MacosBackend {
                     sequence,
                     state,
                     frames,
+                    pointers,
                 )
                 .await
             }
@@ -905,8 +913,14 @@ impl Backend for MacosBackend {
                         message: "type_text is limited to 100000 Unicode scalar values".to_owned(),
                     });
                 }
-                self.mutate(NativeAction::TypeText { text }, sequence, state, frames)
-                    .await
+                self.mutate(
+                    NativeAction::TypeText { text },
+                    sequence,
+                    state,
+                    frames,
+                    pointers,
+                )
+                .await
             }
             ComputerAction::SetValue { reference, value } => {
                 self.mutate(
@@ -914,6 +928,7 @@ impl Backend for MacosBackend {
                     sequence,
                     state,
                     frames,
+                    pointers,
                 )
                 .await
             }
@@ -923,6 +938,7 @@ impl Backend for MacosBackend {
                     sequence,
                     state,
                     frames,
+                    pointers,
                 )
                 .await
             }
@@ -1654,6 +1670,7 @@ fn public_element(element: &AXUIElement, generation: u64, index: usize) -> Eleme
         subrole: string_attribute(element.subrole()),
         label,
         value: scalar_value(element),
+        selected_text: selected_text(element),
         placeholder: string_attribute(element.placeholder_value()),
         identifier: string_attribute(element.identifier()),
         url: url_attribute(element),
@@ -1679,6 +1696,7 @@ fn should_include(element: &Element) -> bool {
     !element.actions.is_empty()
         || element.label.is_some()
         || element.value.is_some()
+        || element.selected_text.is_some()
         || element.placeholder.is_some()
         || element.identifier.is_some()
         || element.url.is_some()
@@ -1695,6 +1713,14 @@ fn scalar_value(element: &AXUIElement) -> Option<String> {
     }
     let value = value.downcast::<CFString>()?.to_string();
     Some(truncate(value, MAX_TEXT_CHARS))
+}
+
+fn selected_text(element: &AXUIElement) -> Option<String> {
+    let attribute =
+        AXAttribute::<core_foundation::base::CFType>::new(&CFString::new("AXSelectedText"));
+    let value = element.attribute(&attribute).ok()?;
+    let value = value.downcast::<CFString>()?.to_string();
+    (!value.is_empty()).then(|| truncate(value, MAX_TEXT_CHARS))
 }
 
 fn string_attribute(value: Result<CFString, accessibility::Error>) -> Option<String> {
@@ -1735,8 +1761,14 @@ fn reference_for(generation: u64, index: usize, element: &Element) -> ElementRef
 fn element_hash(element: &Element) -> u64 {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in format!(
-        "{}\0{:?}\0{:?}\0{:?}\0{:?}\0{:?}",
-        element.role, element.identifier, element.label, element.value, element.url, element.frame
+        "{}\0{:?}\0{:?}\0{:?}\0{:?}\0{:?}\0{:?}",
+        element.role,
+        element.identifier,
+        element.label,
+        element.value,
+        element.selected_text,
+        element.url,
+        element.frame
     )
     .bytes()
     {
@@ -1819,6 +1851,7 @@ fn same_element_state(left: &Element, right: &Element) -> bool {
         && left.subrole == right.subrole
         && left.label == right.label
         && left.value == right.value
+        && left.selected_text == right.selected_text
         && left.placeholder == right.placeholder
         && left.identifier == right.identifier
         && left.url == right.url
@@ -1925,6 +1958,7 @@ fn native_action(
     action: NativeAction,
     allowed_url_origins: Option<&[Url]>,
     intervention_target: &super::InterventionTarget,
+    pointers: &PointerSink,
 ) -> Result<(), ComputerError> {
     if screen_locked() {
         return Err(ComputerError::ScreenLocked);
@@ -1933,6 +1967,7 @@ fn native_action(
     let input = NativeInput {
         pid,
         intervention_target,
+        pointers,
     };
     match action {
         NativeAction::Click {
@@ -1942,11 +1977,19 @@ fn native_action(
             let (public, element) = resolve_element(target, generation, maximum, &reference)?;
             authorize_element_url(&public, allowed_url_origins)?;
             if public.actions.iter().any(|action| action == "AXPress") {
-                return element
+                let point = public.frame.map(Rect::center);
+                if let Some(point) = point {
+                    pointers.publish(point, true);
+                }
+                let result = element
                     .perform_action(&CFString::new("AXPress"))
                     .map_err(|error| ComputerError::Native {
                         message: format!("AXPress failed for {reference}: {error}"),
                     });
+                if let Some(point) = point {
+                    pointers.publish(point, false);
+                }
+                return result;
             }
             post_click(
                 &input,
@@ -2024,11 +2067,21 @@ fn native_action(
                     message: format!("element {reference} does not advertise {name}"),
                 });
             }
-            element
+            let point = (name == "AXPress")
+                .then(|| public.frame.map(Rect::center))
+                .flatten();
+            if let Some(point) = point {
+                pointers.publish(point, true);
+            }
+            let result = element
                 .perform_action(&CFString::new(&name))
                 .map_err(|error| ComputerError::Native {
                     message: format!("{name} failed for {reference}: {error}"),
-                })
+                });
+            if let Some(point) = point {
+                pointers.publish(point, false);
+            }
+            result
         }
     }
 }
@@ -2070,6 +2123,7 @@ fn event_source() -> Result<CGEventSource, ComputerError> {
 struct NativeInput<'a> {
     pid: i32,
     intervention_target: &'a super::InterventionTarget,
+    pointers: &'a PointerSink,
 }
 
 impl NativeInput<'_> {
@@ -2077,6 +2131,30 @@ impl NativeInput<'_> {
         mark_synthetic(event);
         self.intervention_target
             .expect_synthetic_pointer_event(event);
+        let kind = event.get_type();
+        let pressed = match kind {
+            CGEventType::LeftMouseDown
+            | CGEventType::RightMouseDown
+            | CGEventType::OtherMouseDown
+            | CGEventType::LeftMouseDragged
+            | CGEventType::RightMouseDragged
+            | CGEventType::OtherMouseDragged => Some(true),
+            CGEventType::MouseMoved
+            | CGEventType::LeftMouseUp
+            | CGEventType::RightMouseUp
+            | CGEventType::OtherMouseUp => Some(false),
+            _ => None,
+        };
+        if let Some(pressed) = pressed {
+            let point = event.location();
+            self.pointers.publish(
+                Point {
+                    x: point.x,
+                    y: point.y,
+                },
+                pressed,
+            );
+        }
         event.post_to_pid(self.pid);
     }
 }
@@ -2605,6 +2683,7 @@ mod tests {
                 subrole: None,
                 label: Some(label.to_owned()),
                 value: Some(value.to_owned()),
+                selected_text: None,
                 placeholder: None,
                 identifier: None,
                 url: None,

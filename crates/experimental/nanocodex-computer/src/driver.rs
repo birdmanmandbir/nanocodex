@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::{
     Application, ComputerAction, ComputerActionResult, ComputerBuildError, ComputerError,
-    ComputerEvent, ComputerFrame, InterventionReason, SettlePolicy, Window,
+    ComputerEvent, ComputerFrame, InterventionReason, Point, SettlePolicy, Window,
     platform::{self, Backend},
 };
 
@@ -58,9 +58,27 @@ struct Inner {
     control: ComputerControl,
     events: broadcast::Sender<ComputerEvent>,
     frames: watch::Receiver<Option<Arc<ComputerFrame>>>,
+    pointers: watch::Receiver<Option<AgentPointer>>,
     artifact_root: PathBuf,
     owned_artifacts: bool,
     _intervention_monitor: Option<platform::InterventionMonitor>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct AgentPointer {
+    pub(crate) point: Point,
+    pub(crate) pressed: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct PointerSink {
+    pointers: watch::Sender<Option<AgentPointer>>,
+}
+
+impl PointerSink {
+    pub(crate) fn publish(&self, point: Point, pressed: bool) {
+        let _ = self.pointers.send(Some(AgentPointer { point, pressed }));
+    }
 }
 
 impl Drop for Inner {
@@ -384,6 +402,7 @@ impl ComputerBuilder {
         let (commands_tx, commands_rx) = mpsc::channel(COMMAND_CAPACITY);
         let (events_tx, events_rx) = broadcast::channel(EVENT_CAPACITY);
         let (frames_tx, frames_rx) = watch::channel(None);
+        let (pointers_tx, pointers_rx) = watch::channel(None);
         let (notices_tx, notices_rx) = mpsc::unbounded_channel();
         let state = Arc::new(RunState::new());
         let control = ComputerControl {
@@ -425,6 +444,9 @@ impl ComputerBuilder {
             notices_rx,
             events_tx.clone(),
             frames_tx,
+            PointerSink {
+                pointers: pointers_tx,
+            },
             state,
             startup_permission,
         ));
@@ -435,6 +457,7 @@ impl ComputerBuilder {
                     control,
                     events: events_tx,
                     frames: frames_rx,
+                    pointers: pointers_rx,
                     artifact_root,
                     owned_artifacts,
                     _intervention_monitor: intervention_monitor,
@@ -471,6 +494,10 @@ impl Computer {
         ComputerFrames {
             receiver: self.inner.frames.clone(),
         }
+    }
+
+    pub(crate) fn pointers(&self) -> watch::Receiver<Option<AgentPointer>> {
+        self.inner.pointers.clone()
     }
 
     /// Subscribes to the ordered lifecycle stream.
@@ -529,6 +556,7 @@ async fn run_driver(
     mut notices: mpsc::UnboundedReceiver<ControlNotice>,
     events: broadcast::Sender<ComputerEvent>,
     frames: watch::Sender<Option<Arc<ComputerFrame>>>,
+    pointers: PointerSink,
     state: Arc<RunState>,
     startup_permission: Option<ComputerEvent>,
 ) {
@@ -596,7 +624,13 @@ async fn run_driver(
                 let outcome = async {
                     trace_content("computer.action.input", &action);
                     backend
-                        .execute(action, sequence, Arc::clone(&state), &mut frame_sink)
+                        .execute(
+                            action,
+                            sequence,
+                            Arc::clone(&state),
+                            &mut frame_sink,
+                            &pointers,
+                        )
                         .await
                 }
                 .instrument(span.clone())
@@ -700,6 +734,7 @@ impl Backend for RecordingBackend {
         sequence: u64,
         _state: Arc<RunState>,
         frames: &mut FrameSink,
+        _pointers: &PointerSink,
     ) -> Result<ComputerOutput, ComputerError> {
         if matches!(action, ComputerAction::Observe { .. }) {
             frames.publish(ComputerFrame {
