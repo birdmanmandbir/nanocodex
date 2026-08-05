@@ -265,6 +265,10 @@ fn aggregate_reconstructs_every_durable_trial_with_sweep_provenance() {
     assert_eq!(aggregate.attempts[0].configuration.id, "recipe__variant");
     assert_eq!(aggregate.attempts[0].repetition, 1);
     assert!(aggregate.attempts[0].passed);
+    assert_eq!(
+        aggregate.attempts[0].task.prompt_chars,
+        Some(task.prompt_chars())
+    );
     assert_eq!(aggregate.attempts[0].cost_usd, Some(0.25));
     assert_eq!(
         aggregate.attempts[0].task.package_digest_schema,

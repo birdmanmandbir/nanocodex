@@ -74,6 +74,8 @@ pub struct AttemptTaskIdentity {
     pub dataset_revision: Option<String>,
     /// Stable qualified task name.
     pub name: String,
+    /// Complete normalized prompt length in Unicode scalar values, when retained.
+    pub prompt_chars: Option<u64>,
     /// Canonical source task root.
     pub root: PathBuf,
     /// Nanocodex package-digest schema.
@@ -697,6 +699,7 @@ impl AttemptTaskIdentity {
             dataset: dataset_name(task.name()),
             dataset_revision: None,
             name: task.name().to_owned(),
+            prompt_chars: Some(task.prompt_chars()),
             root: task.root().to_path_buf(),
             package_digest_schema: PACKAGE_DIGEST_SCHEMA.to_owned(),
             package_digest: format!("sha256:{}", task.content_digest()),
@@ -869,7 +872,7 @@ impl AggregateDataset {
             .map(|attempts| ConfigurationAggregate::new(&attempts))
             .collect();
         Self {
-            schema_version: 4,
+            schema_version: 5,
             attempts,
             run_timing: None,
             configurations,
@@ -1202,6 +1205,7 @@ fn default_task() -> AttemptTaskIdentity {
         dataset: None,
         dataset_revision: None,
         name: String::new(),
+        prompt_chars: None,
         root: PathBuf::new(),
         package_digest_schema: String::new(),
         package_digest: String::new(),
@@ -1278,6 +1282,7 @@ mod tests {
                 dataset: Some("fixture".to_owned()),
                 dataset_revision: Some("fixture-2026-07-28".to_owned()),
                 name: task.to_owned(),
+                prompt_chars: Some(42),
                 root: PathBuf::from(task),
                 package_digest_schema: "fixture-v1".to_owned(),
                 package_digest: format!("sha256:{task}"),
@@ -1395,7 +1400,7 @@ mod tests {
             Some("fixture-tools")
         );
         let encoded = serde_json::to_value(&dataset).unwrap();
-        assert_eq!(encoded["schema_version"], 4);
+        assert_eq!(encoded["schema_version"], 5);
         assert_eq!(
             encoded["attempts"][0]["task"]["package_digest_schema"],
             "fixture-v1"

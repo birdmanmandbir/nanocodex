@@ -31,7 +31,11 @@ model = ["gpt-5.6-sol"]
 thinking = ["low"]
 
 [profiles.graphwalks-smoke]
-tasks = ["graphwalks/128k-and-shorter-000000"]
+tasks = [
+  "graphwalks/128k-and-shorter-000749",
+  "graphwalks/256k-to-1mil-000000",
+  "graphwalks/256k-to-1mil-000200",
+]
 trials = 1
 model = ["gpt-5.6-sol"]
 thinking = ["low"]

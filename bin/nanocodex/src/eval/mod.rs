@@ -270,6 +270,7 @@ struct TaskOutput<'a> {
     description: &'a str,
     root: &'a Path,
     prompt: &'a str,
+    prompt_chars: u64,
     image: &'a str,
     agent_timeout_sec: f64,
     verifier: VerifierOutput<'a>,
@@ -305,6 +306,7 @@ impl<'a> From<&'a Task> for TaskOutput<'a> {
             description: task.description(),
             root: task.root(),
             prompt: task.prompt(),
+            prompt_chars: task.prompt_chars(),
             image: task.image().reference(),
             agent_timeout_sec: task.agent_timeout().as_secs_f64(),
             verifier: VerifierOutput {
@@ -334,7 +336,12 @@ impl TaskOutput<'_> {
         writeln!(output, "{}", self.name)?;
         writeln!(output, "  root: {}", self.root.display())?;
         writeln!(output, "  image: {}", self.image)?;
-        writeln!(output, "  prompt: {} bytes", self.prompt.len())?;
+        writeln!(
+            output,
+            "  prompt: {} chars, {} bytes",
+            self.prompt_chars,
+            self.prompt.len()
+        )?;
         writeln!(
             output,
             "  timeout: {}s agent, {}s verifier",

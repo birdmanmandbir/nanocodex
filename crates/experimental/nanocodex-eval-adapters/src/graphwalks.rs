@@ -134,6 +134,8 @@ impl GraphWalksCase {
         };
         let prompt_index = field("prompt")?;
         let answer_index = field("answer_nodes").or_else(|_| field("answer"))?;
+        let prompt_chars_index = field("prompt_chars")?;
+        let problem_type_index = field("problem_type")?;
         let prompt = row.get_string(prompt_index).map_err(|error| {
             ImportError::Invalid(format!(
                 "{} row {} prompt is not text: {error}",
@@ -141,6 +143,35 @@ impl GraphWalksCase {
                 index + 1
             ))
         })?;
+        let prompt_chars = row.get_long(prompt_chars_index).map_err(|error| {
+            ImportError::Invalid(format!(
+                "{} row {} prompt_chars is not an integer: {error}",
+                path.display(),
+                index + 1
+            ))
+        })?;
+        let observed_chars = i64::try_from(prompt.chars().count()).unwrap_or(i64::MAX);
+        if prompt_chars != observed_chars {
+            return Err(ImportError::Invalid(format!(
+                "{} row {} declares {prompt_chars} prompt chars but contains {observed_chars}",
+                path.display(),
+                index + 1
+            )));
+        }
+        let problem_type = row.get_string(problem_type_index).map_err(|error| {
+            ImportError::Invalid(format!(
+                "{} row {} problem_type is not text: {error}",
+                path.display(),
+                index + 1
+            ))
+        })?;
+        if problem_type != "parents" {
+            return Err(ImportError::Invalid(format!(
+                "{} row {} has unsupported GraphWalks problem type {problem_type:?}",
+                path.display(),
+                index + 1
+            )));
+        }
         let answers = row.get_list(answer_index).map_err(|error| {
             ImportError::Invalid(format!(
                 "{} row {} answer is not a string list: {error}",

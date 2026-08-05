@@ -25,6 +25,7 @@ pub struct Task {
     name: Box<str>,
     description: Box<str>,
     prompt: Box<str>,
+    prompt_chars: u64,
     agent_instructions: Option<Box<str>>,
     image: OciImage,
     agent_timeout: Duration,
@@ -275,6 +276,7 @@ impl Task {
             package: Arc::new(package),
             name: name.into_boxed_str(),
             description: raw.task.description.into_boxed_str(),
+            prompt_chars: u64::try_from(prompt.chars().count()).unwrap_or(u64::MAX),
             prompt: prompt.into_boxed_str(),
             agent_instructions: raw
                 .agent
@@ -459,6 +461,12 @@ impl Task {
     #[must_use]
     pub fn prompt(&self) -> &str {
         &self.prompt
+    }
+
+    /// Returns the number of Unicode scalar values in the complete prompt.
+    #[must_use]
+    pub const fn prompt_chars(&self) -> u64 {
+        self.prompt_chars
     }
 
     /// Benchmark-owned model instructions applied independently of the user prompt.
@@ -1085,6 +1093,7 @@ MODE = "test"
 
         assert_eq!(task.name(), "terminal-bench/example");
         assert_eq!(task.prompt(), "Fix the task.");
+        assert_eq!(task.prompt_chars(), 13);
         assert_eq!(task.image().reference(), "example/task:20251031");
         assert_eq!(task.resources().cpus, 2);
         assert_eq!(task.network(), NetworkPolicy::Disabled);

@@ -1371,6 +1371,7 @@ impl HarborTrialLock {
             nanocodex: NanocodexTrialLock {
                 materialization_digest_schema: PACKAGE_DIGEST_SCHEMA.to_owned(),
                 materialization_digest: format!("sha256:{materialization_digest}"),
+                prompt_chars: Some(task.prompt_chars()),
                 image_reference: task.image().reference().to_owned(),
                 verifier_script: task
                     .verifier()
@@ -1403,6 +1404,8 @@ impl HarborTrialLock {
 struct NanocodexTrialLock {
     materialization_digest_schema: String,
     materialization_digest: String,
+    #[serde(default)]
+    prompt_chars: Option<u64>,
     image_reference: String,
     verifier_script: PathBuf,
     verifier_environment_mode: String,
@@ -1806,6 +1809,7 @@ impl DurableHarborTrial {
                 .map(|(dataset, _)| dataset.to_owned()),
             dataset_revision: None,
             name: self.result.task_name.clone(),
+            prompt_chars: nanocodex_lock.prompt_chars,
             root: self.lock.task.path.clone(),
             package_digest_schema: nanocodex_lock.materialization_digest_schema.clone(),
             package_digest: nanocodex_lock.materialization_digest.clone(),
