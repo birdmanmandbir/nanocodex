@@ -14,6 +14,7 @@ const TASK_CONFIG: &str = "task.toml";
 const TASK_INSTRUCTION: &str = "instruction.md";
 const TASK_ENVIRONMENT: &str = "environment";
 const VERIFIER_SCRIPT: &str = "tests/test.sh";
+const PRE_ARTIFACTS_SCRIPT: &str = "pre_artifacts.sh";
 
 /// One immutable benchmark task loaded from a Terminal-Bench task directory.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -247,6 +248,7 @@ impl Task {
             });
         }
 
+        let network = raw.network_policy(&config_path)?;
         let name = required_string(&config_path, "task.name", raw.task.name)?;
         let image = raw
             .environment
@@ -305,11 +307,7 @@ impl Task {
                 )?,
                 gpus: raw.environment.gpus,
             },
-            network: if raw.environment.allow_internet {
-                NetworkPolicy::Public
-            } else {
-                NetworkPolicy::Disabled
-            },
+            network,
             environment: raw.environment.env,
             requires_compose: raw.environment.custom_docker_compose
                 || (raw.metadata.custom_docker_compose
@@ -486,6 +484,25 @@ impl Task {
         &self.artifacts
     }
 
+    /// Reads the optional benchmark-owned artifact capture phase.
+    ///
+    /// The script runs in the candidate VM after agent tools have stopped and
+    /// before declared artifacts are copied into a separate verifier VM.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskLoadError`] when the captured script changed or became
+    /// unreadable after the task was loaded.
+    #[doc(hidden)]
+    pub fn pre_artifacts_script_bytes(&self) -> Result<Option<Vec<u8>>, TaskLoadError> {
+        self.package
+            .read_file(Path::new(PRE_ARTIFACTS_SCRIPT))
+            .map_err(|source| TaskLoadError::Read {
+                path: self.root.join(PRE_ARTIFACTS_SCRIPT),
+                source,
+            })
+    }
+
     /// Returns the candidate value consumed by the verifier.
     #[must_use]
     pub const fn output(&self) -> TaskOutput {
@@ -652,6 +669,25 @@ struct RawTask {
     environment: RawEnvironment,
 }
 
+impl RawTask {
+    fn network_policy(&self, config: &Path) -> Result<NetworkPolicy, TaskLoadError> {
+        let environment = self.environment.network_policy(config)?;
+        let agent = self.agent.network_mode.unwrap_or(environment);
+        let verifier = self.verifier.network_mode.unwrap_or(environment);
+        if agent != verifier {
+            return Err(TaskLoadError::Invalid {
+                path: config.to_path_buf(),
+                message: format!(
+                    "distinct agent ({}) and verifier ({}) network modes are unsupported",
+                    agent.as_str(),
+                    verifier.as_str()
+                ),
+            });
+        }
+        agent.policy(config)
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum RawTaskArtifact {
@@ -742,6 +778,8 @@ struct RawPhase {
     timeout_sec: f64,
     #[serde(default)]
     instructions: Option<String>,
+    #[serde(default)]
+    network_mode: Option<RawNetworkMode>,
 }
 
 #[derive(Deserialize)]
@@ -753,6 +791,8 @@ struct RawVerifier {
     environment_mode: VerifierEnvironmentMode,
     #[serde(default)]
     collect: Vec<VerifierCollect>,
+    #[serde(default)]
+    network_mode: Option<RawNetworkMode>,
 }
 
 #[derive(Deserialize)]
@@ -767,9 +807,55 @@ struct RawEnvironment {
     #[serde(default = "enabled")]
     allow_internet: bool,
     #[serde(default)]
+    network_mode: Option<RawNetworkMode>,
+    #[serde(default)]
     custom_docker_compose: bool,
     #[serde(default)]
     env: BTreeMap<String, String>,
+}
+
+impl RawEnvironment {
+    fn network_policy(&self, config: &Path) -> Result<RawNetworkMode, TaskLoadError> {
+        let compatibility = if self.allow_internet {
+            RawNetworkMode::Public
+        } else {
+            RawNetworkMode::NoNetwork
+        };
+        let policy = self.network_mode.unwrap_or(compatibility);
+        policy.policy(config)?;
+        Ok(policy)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum RawNetworkMode {
+    Public,
+    NoNetwork,
+    Allowlist,
+}
+
+impl RawNetworkMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::NoNetwork => "no-network",
+            Self::Allowlist => "allowlist",
+        }
+    }
+
+    fn policy(self, config: &Path) -> Result<NetworkPolicy, TaskLoadError> {
+        match self {
+            Self::Public => Ok(NetworkPolicy::Public),
+            Self::NoNetwork => Ok(NetworkPolicy::Disabled),
+            Self::Allowlist => Err(TaskLoadError::Invalid {
+                path: config.to_path_buf(),
+                message:
+                    "allowlist network mode is not implemented; refusing to widen it to public"
+                        .to_owned(),
+            }),
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for VerifierEnvironmentMode {
@@ -1089,10 +1175,12 @@ name = "terminal-bench/frontier-example"
 
 [agent]
 timeout_sec = 900.0
+network_mode = "no-network"
 
 [verifier]
 timeout_sec = 600.0
 environment_mode = "separate"
+network_mode = "no-network"
 
 [[verifier.collect]]
 command = "cp /app/output.txt /tmp/output.txt"
@@ -1112,10 +1200,16 @@ storage_mb = 10240
         .unwrap();
         fs::write(directory.path().join("tests/Dockerfile"), "FROM scratch\n").unwrap();
         fs::write(directory.path().join("tests/test.sh"), "#!/bin/sh\n").unwrap();
+        fs::write(
+            directory.path().join("pre_artifacts.sh"),
+            "#!/bin/sh\ncp /app/output.txt /tmp/output.txt\n",
+        )
+        .unwrap();
 
         let task = Task::load(directory.path()).unwrap();
 
         assert_eq!(task.image().reference(), "local-dockerfile");
+        assert_eq!(task.network(), NetworkPolicy::Disabled);
         assert_eq!(
             task.verifier().environment_mode(),
             VerifierEnvironmentMode::Separate
@@ -1127,6 +1221,10 @@ storage_mb = 10240
         assert_eq!(
             task.verifier().collect()[0].command(),
             "cp /app/output.txt /tmp/output.txt"
+        );
+        assert_eq!(
+            task.pre_artifacts_script_bytes().unwrap().unwrap(),
+            b"#!/bin/sh\ncp /app/output.txt /tmp/output.txt\n"
         );
     }
 

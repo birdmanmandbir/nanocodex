@@ -23,6 +23,7 @@ const GENEBENCH_PRO_MANIFEST_SHA256: &str =
     "0e80d5dca9ac5211fb9dfa5c0ea8d26e9d557e2039c8f20b0f5a328ea3cd6c58";
 const GENEBENCH_PRO_GRADER_SHA256: &str =
     "81a50853d1348237300ce90a7b48a9230b4edb5d1af30207c37f17f0de8bbb28";
+const DEEP_SWE_REVISION: &str = "e016041a6ccf8da29906afc9a3f5a8df940a1f78";
 const GENEBENCH_PRO_BASE: &str =
     "https://huggingface.co/datasets/openai/genebench-pro-public-package/resolve";
 
@@ -135,6 +136,10 @@ impl BuiltinSources {
                 environment: assets.join("genebench-pro/environment"),
                 harness: assets.join("genebench-pro/verifier"),
             }),
+            "deep-swe-v1.1" => Ok(Benchmark::Harbor {
+                source: self.root.join("deep-swe/tasks"),
+                revision: format!("datacurve-ai/deep-swe@{DEEP_SWE_REVISION}"),
+            }),
             other => Err(BuiltinSourceError::Unsupported(other.to_owned())),
         }
     }
@@ -147,6 +152,7 @@ impl BuiltinSources {
                 | "openai-evals"
                 | "swe-bench-verified-smoke"
                 | "genebench-pro-public"
+                | "deep-swe-v1.1"
         )
     }
 
@@ -231,6 +237,11 @@ impl BuiltinSources {
                 Ok(())
             }
             "genebench-pro-public" => self.materialize_genebench_pro(),
+            "deep-swe-v1.1" => self.git_checkout(
+                "deep-swe",
+                "https://github.com/datacurve-ai/deep-swe.git",
+                DEEP_SWE_REVISION,
+            ),
             other => Err(BuiltinSourceError::Unsupported(other.to_owned())),
         }
     }

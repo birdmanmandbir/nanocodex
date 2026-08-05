@@ -309,13 +309,25 @@ through PR #72's existing concrete importers:
 The release coverage target is every benchmark family recorded from OpenAI's
 GPT-5.6 reports, not only the suites that happen to have native import formats:
 
-- Terminal-Bench 2.1;
-- SWE-Bench Pro;
-- Agents' Last Exam, GDPval-AA, Artificial Analysis, and FrontierMath;
-- OSWorld and BenchCAD;
-- CTF, SEC-Bench, ExploitBench, ExploitGym, and GeneBench Pro;
-- KernelBench/KernelGen, NanoGPT, and PostTrainBench; and
-- MMMU Pro, Toolathlon, MRCR, GraphWalks, and ARC-AGI.
+- professional and coding: Agents' Last Exam, GDPval-AA v2, Big Finance Bench,
+  the Artificial Analysis Coding Agent Index, DeepSWE v1.1, and Terminal-Bench
+  2.1;
+- science and health: GeneBench Pro, LifeSciBench, HealthBench Professional,
+  GPQA Diamond, and FrontierMath v2;
+- computer, multimodal, and tool use: OSWorld 2.0, BrowseComp, BenchCAD,
+  MMMU Pro, gdp.pdf, AutomationBench, and Toolathlon;
+- cybersecurity: CTF challenges, SEC-Bench Pro, ExploitBench, and ExploitGym;
+- self-improvement: KernelGen 1P, NanoGPT, PostTrainBench Lite, and other
+  obtainable public components of the reported RSI suite;
+- long context and abstract reasoning: OpenAI MRCR v2, GraphWalks, and
+  ARC-AGI-3.
+
+SWE-Bench Pro remains useful historical evidence for reproducing the launch
+table, but it is not a release anchor: OpenAI's July 8, 2026 audit estimated
+roughly 30% of the public tasks were broken and retracted the recommendation to
+adopt it. Internal Management Consulting, MedChemBench, and Internal Research
+Debugging evaluations are recorded as unavailable rather than replaced with
+lookalikes.
 
 Milestone one proves every importer route with one real local task. Milestone
 two adds a stable built-in catalog entry and retained official-verifier evidence
@@ -675,8 +687,9 @@ may hide missing coordinates or mix incompatible preparation identities.
    the next normal `run` resumed all 18 coordinates without model spend.
 10. [ ] Extend the same PR #72 workflow from the completed adapter smoke and
     official GeneBench Pro public package to complete local profiles covering
-    the recorded GPT-5.6 benchmark families, beginning with SWE-Bench Pro:
-    automatic
+    the recorded GPT-5.6 benchmark families, beginning with DeepSWE v1.1 and
+    explicitly excluding SWE-Bench Pro from release anchoring after OpenAI's
+    July 2026 audit: automatic
     multi-harness/model/thinking matrices, durable monitoring,
     interruption/resume/new-sample runs, and website-ready reporting behind
     `nanocodex eval prepare` and `nanocodex eval run`. Enrich reconstructed

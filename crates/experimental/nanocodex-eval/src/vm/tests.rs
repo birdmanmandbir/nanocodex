@@ -541,6 +541,7 @@ fn verifier_with_launch_root(root: VmLaunchRoot, retain_failed_rootfs: bool) -> 
         _network: None,
         _verifier_network: None,
         verifier_environment: BTreeMap::new(),
+        artifact_directory: directory.join("verifier"),
     }
 }
 
@@ -854,6 +855,7 @@ done
         _network: None,
         _verifier_network: None,
         verifier_environment: BTreeMap::new(),
+        artifact_directory: control.path().join("verifier"),
     };
 
     let (_, session) = verifier

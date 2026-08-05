@@ -112,6 +112,7 @@ const OVERLAY_VERIFIER_CACHE_BLOCK_DEVICE: &str = "/dev/vdd";
 const VERIFIER_CACHE_MOUNT: &str = "/run/nanoeval-verifier-cache";
 const CACHED_VERIFIER_SCRIPT: &str = "/tmp/nanoeval-verifier.sh";
 const VERIFIER_CACHE_PREPARE_SCRIPT: &str = "/tmp/nanoeval-prepare-verifier.sh";
+const PRE_ARTIFACTS_GUEST_SCRIPT: &str = "/tmp/nanoeval-pre-artifacts.sh";
 const GUEST_PUBLIC_RESOLV_CONF: &str =
     "nameserver 192.168.127.1\\nnameserver 1.1.1.1\\noptions timeout:2 attempts:5\\n";
 const DEFAULT_IMAGE_NETWORK_RETRIES: usize = 2;
@@ -2654,6 +2655,7 @@ struct VmVerifier {
     _network: Option<AttemptGvproxy>,
     _verifier_network: Option<AttemptGvproxy>,
     verifier_environment: BTreeMap<String, String>,
+    artifact_directory: PathBuf,
 }
 
 struct VmAttemptSetupGuard {
@@ -2857,6 +2859,7 @@ fn vm_attempt_inner(
         _network: network,
         _verifier_network: verifier_network,
         verifier_environment: host.verifier_environment.clone(),
+        artifact_directory: verifier_directory,
     };
     setup_guard.disarm();
     Ok(VmAttempt {
@@ -3589,11 +3592,52 @@ impl AttemptVerifier for VmVerifier {
 }
 
 impl VmVerifier {
+    async fn run_pre_artifacts(
+        &self,
+        session: &VmToolSession,
+        task: &Task,
+        launch: &VmLaunch,
+    ) -> Result<(), VmAttemptError> {
+        let Some(script) = task.pre_artifacts_script_bytes()? else {
+            return Ok(());
+        };
+        session
+            .write_file(PRE_ARTIFACTS_GUEST_SCRIPT, script, 0o700)
+            .await?;
+        let output = session
+            .command(
+                VmCommand::new(PRE_ARTIFACTS_GUEST_SCRIPT)
+                    .current_directory(&launch.workspace)
+                    .environment(launch.guest_environment(task))
+                    .timeout(task.verifier().timeout()),
+            )
+            .await?;
+        fs::write(
+            self.artifact_directory.join("pre-artifacts-stdout.log"),
+            &output.stdout,
+        )?;
+        fs::write(
+            self.artifact_directory.join("pre-artifacts-stderr.log"),
+            &output.stderr,
+        )?;
+        if output.exit_code != 0 {
+            return Err(io::Error::other(format!(
+                "pre-artifact capture exited {}: {}",
+                output.exit_code,
+                String::from_utf8_lossy(&output.stderr)
+            ))
+            .into());
+        }
+        Ok(())
+    }
+
     async fn collect_artifacts(
+        &self,
         session: &VmToolSession,
         task: &Task,
         launch: &VmLaunch,
     ) -> Result<Option<Vec<u8>>, VmAttemptError> {
+        self.run_pre_artifacts(session, task, launch).await?;
         for collect in task.verifier().collect() {
             let output = session
                 .command(
@@ -3911,7 +3955,9 @@ impl VmVerifier {
             .clone()
             .unwrap_or_else(|| self.launch.clone());
         let session = if self.separate_launch.is_some() {
-            let artifacts = match Self::collect_artifacts(&agent_session, task, &self.launch).await
+            let artifacts = match self
+                .collect_artifacts(&agent_session, task, &self.launch)
+                .await
             {
                 Ok(artifacts) => artifacts,
                 Err(primary) => {

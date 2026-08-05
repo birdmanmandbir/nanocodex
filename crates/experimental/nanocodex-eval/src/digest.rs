@@ -7,7 +7,12 @@ use std::{
 use filetime::FileTime;
 use sha2::{Digest, Sha256};
 
-const PACKAGE_FILES: [&str; 3] = ["task.toml", "instruction.md", "README.md"];
+const PACKAGE_FILES: [&str; 4] = [
+    "task.toml",
+    "instruction.md",
+    "README.md",
+    "pre_artifacts.sh",
+];
 const PACKAGE_DIRECTORIES: [&str; 4] = ["environment", "tests", "solution", "steps"];
 pub(crate) const PACKAGE_DIGEST_SCHEMA: &str = "nanocodex-task-package-v1";
 const PACKAGE_DIGEST_DOMAIN: &[u8] = b"nanocodex-task-package-v1\0";
@@ -439,6 +444,19 @@ mod tests {
         let first = TaskPackage::load(task.path()).unwrap();
 
         fs::write(ignored, "second\n").unwrap();
+        let second = TaskPackage::load(task.path()).unwrap();
+
+        assert_ne!(first.digest(), second.digest());
+    }
+
+    #[test]
+    fn pre_artifact_capture_is_an_execution_input() {
+        let task = package();
+        let script = task.path().join("pre_artifacts.sh");
+        fs::write(&script, "#!/bin/sh\necho first\n").unwrap();
+        let first = TaskPackage::load(task.path()).unwrap();
+
+        fs::write(script, "#!/bin/sh\necho second\n").unwrap();
         let second = TaskPackage::load(task.path()).unwrap();
 
         assert_ne!(first.digest(), second.digest());

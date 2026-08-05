@@ -34,7 +34,7 @@ evidence have no benchmark-specific branches.
 
 | Source | Adapter behavior | Grading authority |
 | --- | --- | --- |
-| Harbor, Terminal-Bench, Frontier-Bench, StableBench | Snapshots schema 1.1/1.3 packages without rewriting instructions, images, tests, or artifacts | Packaged `tests/test.sh` |
+| Harbor, Terminal-Bench, DeepSWE, Frontier-Bench, StableBench | Snapshots schema 1.1/1.3 packages without rewriting instructions, images, tests, or artifacts; preserves optional pre-verifier artifact capture | Packaged `tests/test.sh` |
 | Arena-Hard | Converts each question to a final-message case | Caller-packaged official Arena judge harness |
 | OpenAI Evals `Match` / `Includes` | Reads registry YAML and JSONL; preserves their starts-with / substring behavior | Snapshotted deterministic harness |
 | Other OpenAI Evals classes | Refused by the declarative adapter | Official code through `ExternalHarness` |
@@ -52,10 +52,19 @@ routes rather than VM modes:
 | Family | Import route |
 | --- | --- |
 | Terminal-Bench 2.1 | `harbor` |
-| SWE-Bench Pro | `swe-bench` with its official instance images and harness |
+| DeepSWE v1.1 | installed `deep-swe-v1.1` Harbor recipe |
+| SWE-Bench Pro | Historical/reference-only: OpenAI retracted its recommendation after its July 2026 task audit |
 | GeneBench Pro public package | installed `genebench-pro-public` recipe |
-| Agents' Last Exam, GDPval-AA, Artificial Analysis, FrontierMath, OSWorld, BenchCAD, CTF, SEC-Bench, ExploitBench, ExploitGym, KernelBench/KernelGen, NanoGPT, PostTrainBench, MMMU Pro, Toolathlon, MRCR, GraphWalks, and ARC-AGI | Not installed until a dedicated recipe or caller-supplied official `external` manifest exists |
+| Agents' Last Exam, GDPval-AA, Big Finance Bench, LifeSciBench, HealthBench Professional, BrowseComp, GPQA, FrontierMath, OSWorld, BenchCAD, CTF, SEC-Bench, ExploitBench, ExploitGym, KernelGen, NanoGPT, PostTrainBench, MMMU Pro, gdp.pdf, AutomationBench, Toolathlon, MRCR, GraphWalks, and ARC-AGI-3 | Not installed until a dedicated recipe or caller-supplied official `external` manifest exists |
 | OpenAI-internal or unreleased suites | Not importable until the owner supplies tasks and grading semantics |
+
+DeepSWE uses one lifecycle feature beyond ordinary same-VM Harbor tasks:
+`pre_artifacts.sh` runs after agent tools are terminated, and its declared
+artifacts are then copied into a pristine verifier VM. Nanocodex retains that
+phase's stdout and stderr beside the verifier evidence. The native-only
+`deep-swe-smoke` profile preserves DeepSWE's no-network candidate policy;
+guest CLI harness comparisons remain blocked until their model control-plane
+egress can be isolated from candidate shell egress.
 
 An `external` route means the normalized execution contract can preserve and
 run a supplied official harness. It does not claim that a private dataset,

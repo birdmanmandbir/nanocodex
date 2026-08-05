@@ -487,6 +487,7 @@ impl BenchmarkCatalog {
             "openai-evals" => "openai-evals",
             "swe-bench-verified-smoke" => "swe-bench",
             "genebench-pro-public" => "genebench-pro",
+            "deep-swe-v1.1" => "harbor",
             _ => return None,
         };
         Some(Builtin { adapter })
@@ -664,6 +665,10 @@ impl<'a> ProfileImporter<'a> {
                 && normalized
                     .strip_prefix("terminal-bench/")
                     .is_some_and(|task| task == selected))
+            || (benchmark == "deep-swe-v1.1"
+                && normalized
+                    .strip_prefix("datacurve/")
+                    .is_some_and(|task| task == selected))
     }
 }
 
@@ -781,12 +786,18 @@ mod tests {
             "openai-evals",
             "swe-bench-verified-smoke",
             "genebench-pro-public",
+            "deep-swe-v1.1",
         ] {
             assert!(BenchmarkCatalog::new().contains(benchmark), "{benchmark}");
         }
         for benchmark in ["swe-bench-pro", "exploitbench", "kernelgen", "arc-agi"] {
             assert!(!BenchmarkCatalog::new().contains(benchmark), "{benchmark}");
         }
+        assert!(ProfileImporter::matches_task(
+            "deep-swe-v1.1",
+            "aiomonitor-task-snapshots-diff",
+            "datacurve/aiomonitor-task-snapshots-diff",
+        ));
     }
 
     #[tokio::test]
