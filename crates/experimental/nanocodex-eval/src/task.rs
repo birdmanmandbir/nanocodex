@@ -26,6 +26,7 @@ pub struct Task {
     description: Box<str>,
     prompt: Box<str>,
     prompt_chars: u64,
+    benchmark_prompt_chars: Option<u64>,
     agent_instructions: Option<Box<str>>,
     image: OciImage,
     agent_timeout: Duration,
@@ -263,6 +264,12 @@ impl Task {
 
         let network = raw.network_policy(&config_path)?;
         let name = required_string(&config_path, "task.name", raw.task.name)?;
+        if raw.task.benchmark_prompt_chars == Some(0) {
+            return Err(TaskLoadError::Invalid {
+                path: config_path,
+                message: "task.benchmark_prompt_chars must be positive when present".to_owned(),
+            });
+        }
         let image = raw
             .environment
             .docker_image
@@ -277,6 +284,7 @@ impl Task {
             name: name.into_boxed_str(),
             description: raw.task.description.into_boxed_str(),
             prompt_chars: u64::try_from(prompt.chars().count()).unwrap_or(u64::MAX),
+            benchmark_prompt_chars: raw.task.benchmark_prompt_chars,
             prompt: prompt.into_boxed_str(),
             agent_instructions: raw
                 .agent
@@ -467,6 +475,12 @@ impl Task {
     #[must_use]
     pub const fn prompt_chars(&self) -> u64 {
         self.prompt_chars
+    }
+
+    /// Returns the source benchmark's declared prompt-size dimension, when present.
+    #[must_use]
+    pub const fn benchmark_prompt_chars(&self) -> Option<u64> {
+        self.benchmark_prompt_chars
     }
 
     /// Benchmark-owned model instructions applied independently of the user prompt.
@@ -820,6 +834,8 @@ struct RawTaskInfo {
     name: String,
     #[serde(default)]
     description: String,
+    #[serde(default)]
+    benchmark_prompt_chars: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1056,6 +1072,7 @@ schema_version = "1.1"
 [task]
 name = "terminal-bench/example"
 description = "Example task"
+benchmark_prompt_chars = 12
 
 [metadata]
 custom_docker_compose = true
@@ -1094,6 +1111,7 @@ MODE = "test"
         assert_eq!(task.name(), "terminal-bench/example");
         assert_eq!(task.prompt(), "Fix the task.");
         assert_eq!(task.prompt_chars(), 13);
+        assert_eq!(task.benchmark_prompt_chars(), Some(12));
         assert_eq!(task.image().reference(), "example/task:20251031");
         assert_eq!(task.resources().cpus, 2);
         assert_eq!(task.network(), NetworkPolicy::Disabled);

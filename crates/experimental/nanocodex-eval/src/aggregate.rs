@@ -76,6 +76,8 @@ pub struct AttemptTaskIdentity {
     pub name: String,
     /// Complete normalized prompt length in Unicode scalar values, when retained.
     pub prompt_chars: Option<u64>,
+    /// Source benchmark's declared prompt-size dimension, when retained.
+    pub benchmark_prompt_chars: Option<u64>,
     /// Canonical source task root.
     pub root: PathBuf,
     /// Nanocodex package-digest schema.
@@ -700,6 +702,7 @@ impl AttemptTaskIdentity {
             dataset_revision: None,
             name: task.name().to_owned(),
             prompt_chars: Some(task.prompt_chars()),
+            benchmark_prompt_chars: task.benchmark_prompt_chars(),
             root: task.root().to_path_buf(),
             package_digest_schema: PACKAGE_DIGEST_SCHEMA.to_owned(),
             package_digest: format!("sha256:{}", task.content_digest()),
@@ -1206,6 +1209,7 @@ fn default_task() -> AttemptTaskIdentity {
         dataset_revision: None,
         name: String::new(),
         prompt_chars: None,
+        benchmark_prompt_chars: None,
         root: PathBuf::new(),
         package_digest_schema: String::new(),
         package_digest: String::new(),
@@ -1283,6 +1287,7 @@ mod tests {
                 dataset_revision: Some("fixture-2026-07-28".to_owned()),
                 name: task.to_owned(),
                 prompt_chars: Some(42),
+                benchmark_prompt_chars: Some(40),
                 root: PathBuf::from(task),
                 package_digest_schema: "fixture-v1".to_owned(),
                 package_digest: format!("sha256:{task}"),

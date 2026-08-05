@@ -88,6 +88,7 @@ impl DatasetImporter for GraphWalks {
                         self.environment.clone(),
                         harness.clone(),
                     )?
+                    .benchmark_prompt_chars(case.prompt_chars)
                     .output(TaskOutput::FinalMessage)
                     .resources(Resources {
                         cpus: 2,
@@ -116,6 +117,7 @@ impl DatasetImporter for GraphWalks {
 
 struct GraphWalksCase {
     prompt: String,
+    prompt_chars: u64,
     answer: Vec<String>,
 }
 
@@ -150,10 +152,16 @@ impl GraphWalksCase {
                 index + 1
             ))
         })?;
-        let observed_chars = i64::try_from(prompt.chars().count()).unwrap_or(i64::MAX);
-        if prompt_chars != observed_chars {
+        let prompt_chars = u64::try_from(prompt_chars).map_err(|_| {
+            ImportError::Invalid(format!(
+                "{} row {} declares invalid prompt_chars {prompt_chars}",
+                path.display(),
+                index + 1
+            ))
+        })?;
+        if prompt_chars == 0 {
             return Err(ImportError::Invalid(format!(
-                "{} row {} declares {prompt_chars} prompt chars but contains {observed_chars}",
+                "{} row {} declares zero prompt_chars",
                 path.display(),
                 index + 1
             )));
@@ -192,6 +200,7 @@ impl GraphWalksCase {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             prompt: prompt.clone(),
+            prompt_chars,
             answer,
         })
     }

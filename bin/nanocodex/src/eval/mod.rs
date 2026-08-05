@@ -271,6 +271,7 @@ struct TaskOutput<'a> {
     root: &'a Path,
     prompt: &'a str,
     prompt_chars: u64,
+    benchmark_prompt_chars: Option<u64>,
     image: &'a str,
     agent_timeout_sec: f64,
     verifier: VerifierOutput<'a>,
@@ -307,6 +308,7 @@ impl<'a> From<&'a Task> for TaskOutput<'a> {
             root: task.root(),
             prompt: task.prompt(),
             prompt_chars: task.prompt_chars(),
+            benchmark_prompt_chars: task.benchmark_prompt_chars(),
             image: task.image().reference(),
             agent_timeout_sec: task.agent_timeout().as_secs_f64(),
             verifier: VerifierOutput {
@@ -342,6 +344,9 @@ impl TaskOutput<'_> {
             self.prompt_chars,
             self.prompt.len()
         )?;
+        if let Some(chars) = self.benchmark_prompt_chars {
+            writeln!(output, "  benchmark prompt dimension: {chars} chars")?;
+        }
         writeln!(
             output,
             "  timeout: {}s agent, {}s verifier",

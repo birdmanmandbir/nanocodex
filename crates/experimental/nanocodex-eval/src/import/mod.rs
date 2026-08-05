@@ -91,6 +91,7 @@ enum CasePackage {
 #[derive(Debug)]
 struct HermeticCase {
     prompt: String,
+    benchmark_prompt_chars: Option<u64>,
     environment: Environment,
     environment_files: Vec<GeneratedFile>,
     harness: Harness,
@@ -685,6 +686,7 @@ impl CasePlan {
             id: id.into_boxed_str(),
             case: HermeticCase {
                 prompt,
+                benchmark_prompt_chars: None,
                 environment,
                 environment_files: Vec::new(),
                 harness,
@@ -707,6 +709,13 @@ impl CasePlan {
 }
 
 impl HermeticCasePlan {
+    /// Retains the source benchmark's prompt-size dimension for official binning.
+    #[must_use]
+    pub const fn benchmark_prompt_chars(mut self, chars: u64) -> Self {
+        self.case.benchmark_prompt_chars = Some(chars);
+        self
+    }
+
     /// Adds one case-specific file to the candidate environment.
     ///
     /// Native attempts copy this file into the disposable workspace. A
@@ -869,7 +878,10 @@ fn materialize_hermetic_case(
             TaskOutput::Workspace => "workspace",
             TaskOutput::FinalMessage => "final_message",
         },
-        task: GeneratedTaskInfo { name: id },
+        task: GeneratedTaskInfo {
+            name: id,
+            benchmark_prompt_chars: case.benchmark_prompt_chars,
+        },
         agent: GeneratedPhase {
             timeout_sec: case.agent_timeout.as_secs_f64(),
             instructions: case.agent_instructions.as_deref(),
@@ -929,6 +941,8 @@ struct GeneratedTaskManifest<'a> {
 #[derive(Serialize)]
 struct GeneratedTaskInfo<'a> {
     name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    benchmark_prompt_chars: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -1175,6 +1189,7 @@ mod tests {
                     Environment::Dockerfile(self.environment.to_path_buf()),
                     Harness::directory(self.harness)?,
                 )?
+                .benchmark_prompt_chars(21)
                 .scoring_policy(self.scoring_policy)
                 .environment_file("data_files/input.csv", self.contents, 0o644)?,
             ))
@@ -1253,6 +1268,7 @@ mod tests {
             first.tasks()[0].verifier().scoring_policy(),
             ScoringPolicy::AllRewardsOne
         );
+        assert_eq!(first.tasks()[0].benchmark_prompt_chars(), Some(21));
         assert_ne!(first.digest(), changed.digest());
 
         let changed_policy = ImportStore::new(store.path())
