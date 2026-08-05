@@ -55,7 +55,7 @@ routes rather than VM modes:
 | Terminal-Bench 2.1 | `harbor` |
 | BrowseComp, HealthBench Professional, GPQA Diamond | `openai-simple-evals` |
 | SWE-Bench Pro | `swe-bench` with its official instance images and harness |
-| Agents' Last Exam, GDPval-AA, Artificial Analysis, FrontierMath, OSWorld, BenchCAD, CTF, SEC-Bench, ExploitBench, ExploitGym, KernelBench/KernelGen, NanoGPT, PostTrainBench, MMMU Pro, Toolathlon, MRCR, GraphWalks, and ARC-AGI | `external` with the benchmark owner's pinned image/Dockerfile and grader |
+| Agents' Last Exam, GDPval-AA, Artificial Analysis, FrontierMath, OSWorld, BenchCAD, CTF, SEC-Bench, ExploitBench, ExploitGym, GeneBench v1, KernelBench/KernelGen, NanoGPT, PostTrainBench, MMMU Pro, Toolathlon, MRCR, GraphWalks, and ARC-AGI | `external` with the benchmark owner's pinned image/Dockerfile and grader |
 | OpenAI-internal or unreleased suites | Not importable until the owner supplies tasks and grading semantics |
 
 An `external` route means the normalized execution contract can preserve and
@@ -127,33 +127,20 @@ existing runner:
 nanocodex eval --suite <printed-tasks-directory> --trials 5
 ```
 
-The preparation commands deliberately leave source acquisition outside the
-Rust adapter: clone or download the authoritative source at a selected
-revision, then import it. This keeps network and credential policy out of the
-library while making the resulting dataset independent of those source paths.
+Custom imports take caller-pinned local source. Manifest built-ins instead let
+`EvaluationWorkspace::prepare` acquire their versioned authoritative inputs
+under the evaluator state directory before invoking these network-free
+importers. The deprecated `simple-evals` checkout is only a frozen internal
+reference source for stable `browsecomp`, `gpqa-diamond`, and `healthbench`
+catalog entries; it is not a profile-facing benchmark or execution framework.
 
-For an authenticated official judge, pass host environment variables by name;
-their values are exposed only to verifier commands and only a domain-separated
-digest enters durable run identity:
-
-```sh
-nanocodex eval --suite <tasks> --verifier-env OPENAI_API_KEY
-```
-
-StableBench's RewardKit judge is selected the same way as in its Harbor job
-configuration. To use an OpenAI API judge:
-
-```sh
-export REWARDKIT_JUDGE=openai/gpt-4.1-2025-04-14
-
-nanocodex eval --suite <stable-bench-tasks> \
-  --verifier-env REWARDKIT_JUDGE \
-  --verifier-env OPENAI_API_KEY
-```
-
-The model identifier is explicit rather than a Nanocodex default. These are
-run-level verifier settings: the imported benchmark package, its correctness
-checks, and the generic VM layer remain unchanged.
+Model judges use an explicit benchmark-owned OpenAI model through the
+evaluator-owned judge runtime. That runtime uses the operator's local OpenAI
+subscription by default and the explicitly selected API-key authentication as
+a fallback. Only a run-scoped endpoint and bearer token enter the isolated
+verifier; neither candidate guests nor durable evidence receive provider
+credentials. The imported benchmark package and generic VM layer remain
+unchanged.
 
 ## External harness manifest
 

@@ -314,7 +314,7 @@ GPT-5.6 reports, not only the suites that happen to have native import formats:
 - SWE-Bench Pro;
 - Agents' Last Exam, GDPval-AA, Artificial Analysis, and FrontierMath;
 - OSWorld and BenchCAD;
-- CTF, SEC-Bench, ExploitBench, and ExploitGym;
+- CTF, SEC-Bench, ExploitBench, ExploitGym, and GeneBench v1;
 - KernelBench/KernelGen, NanoGPT, and PostTrainBench; and
 - MMMU Pro, Toolathlon, MRCR, GraphWalks, and ARC-AGI.
 
@@ -335,13 +335,28 @@ and a gated dataset fails with an actionable preparation error instead of
 requiring users to restate adapter plumbing in TOML.
 
 Model-based verifiers, including RewardKit-backed judges, use an explicit
-pinned OpenAI grader model and OpenAI API credentials on the verifier side.
-The built-in recipe declares the grader model and required credential names;
-preparation validates availability and binds the non-secret effective grader
-configuration into identity, while execution passes secret values only to the
+pinned OpenAI grader model. Authentication defaults to the evaluator's local
+OpenAI subscription and uses an API key only when the operator explicitly
+selects that fallback. An evaluator-owned judge runtime stays outside the
+candidate guest and exposes only a run-scoped authenticated endpoint to the
 isolated verifier process. Candidate agents and additional harness CLIs never
-receive grader credentials, judge responses, or rubric internals. Changing a
-candidate profile's `model` sweep never changes the grader model implicitly.
+receive grader credentials, judge responses, or rubric internals; no secret is
+written to the preparation receipt or report. Changing a candidate profile's
+`model` sweep never changes the grader model implicitly.
+
+OpenAI's GPT-5.6 system card is a preparedness inventory, not a claim that all
+of OpenAI's internal suites are available. Publicly obtainable families such
+as CVE-Bench, MLE-Bench Revised, KernelGen, NanoGPT, PostTrainBench Lite, and
+published biology/safety suites enter milestone two only after their exact
+tasks and grading semantics are pinned. Internal Research Debugging, METR
+private evaluations, irregular external cyber evaluations, and other private
+or unpublished suites remain explicitly unavailable.
+
+The deprecated `simple-evals` repository is never a user-facing runner or
+profile name. A pinned frozen checkout may be consumed internally as reference
+source for BrowseComp, GPQA, and HealthBench semantics that OpenAI continues to
+publish there; source acquisition and normalization hide that implementation
+detail behind stable benchmark names.
 
 For custom sources, `[benchmark.<name>].adapter` must deserialize through the
 same closed, typed adapter configuration with unknown fields denied, construct

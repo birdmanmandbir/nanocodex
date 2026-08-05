@@ -54,9 +54,29 @@ pub struct CodexExec {
     effort: String,
     web_search: bool,
     tool_mode: Option<CodexToolMode>,
+    developer_instructions: Option<String>,
     api_base_url: Option<String>,
     auth: CodexAuth,
     command_runner: Option<Arc<dyn CodexCommandRunner>>,
+    identity: CodexExecutionIdentity,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CodexExecutionIdentity {
+    transport: &'static str,
+    orchestration: &'static str,
+}
+
+impl CodexExecutionIdentity {
+    const STOCK_CODEX: Self = Self {
+        transport: "codex_exec_jsonl",
+        orchestration: "stock_codex_cli",
+    };
+
+    const NANOCODEX_CLI: Self = Self {
+        transport: "nanocodex_jsonl_v1",
+        orchestration: "nanocodex_cli",
+    };
 }
 
 /// Stock Codex's model-visible tool exposure for a controlled evaluation.
@@ -96,6 +116,10 @@ impl fmt::Debug for CodexExec {
             .field("effort", &self.effort)
             .field("web_search", &self.web_search)
             .field("tool_mode", &self.tool_mode)
+            .field(
+                "developer_instructions",
+                &self.developer_instructions.as_ref().map(|_| "configured"),
+            )
             .field("api_base_url", &self.api_base_url)
             .field("auth", &"[redacted]")
             .field(
@@ -134,9 +158,11 @@ impl CodexExec {
             effort: effort.into(),
             web_search: false,
             tool_mode: None,
+            developer_instructions: None,
             api_base_url: None,
             auth: CodexAuth::Inherit,
             command_runner: None,
+            identity: CodexExecutionIdentity::STOCK_CODEX,
         })
     }
 
@@ -176,6 +202,14 @@ impl CodexExec {
         self
     }
 
+    /// Replaces stock Codex's developer instructions for this treatment.
+    #[doc(hidden)]
+    #[must_use]
+    pub(crate) fn developer_instructions(mut self, instructions: impl Into<String>) -> Self {
+        self.developer_instructions = Some(instructions.into());
+        self
+    }
+
     /// Supplies an API key to the child without writing it to retained
     /// artifacts.
     #[cfg(test)]
@@ -191,6 +225,14 @@ impl CodexExec {
     #[must_use]
     pub fn command_runner(mut self, runner: Arc<dyn CodexCommandRunner>) -> Self {
         self.command_runner = Some(runner);
+        self
+    }
+
+    /// Labels a portable transcript as an external Nanocodex CLI treatment.
+    #[doc(hidden)]
+    #[must_use]
+    pub(crate) const fn nanocodex_cli(mut self) -> Self {
+        self.identity = CodexExecutionIdentity::NANOCODEX_CLI;
         self
     }
 
@@ -391,6 +433,12 @@ impl CodexExec {
             arguments.extend([
                 "--config".to_owned(),
                 format!("openai_base_url={}", toml_string(api_base_url)),
+            ]);
+        }
+        if let Some(instructions) = &self.developer_instructions {
+            arguments.extend([
+                "--config".to_owned(),
+                format!("developer_instructions={}", toml_string(instructions)),
             ]);
         }
         if let Some(tool_mode) = self.tool_mode {
@@ -1011,8 +1059,8 @@ impl CodexTranscript {
             model: config.model.clone(),
             effort: config.effort.clone(),
             reasoning_mode: None,
-            transport: "codex_exec_jsonl".to_owned(),
-            orchestration: "stock_codex_cli".to_owned(),
+            transport: config.identity.transport.to_owned(),
+            orchestration: config.identity.orchestration.to_owned(),
             runtime_completeness: MeasurementCompleteness::ObservedLowerBound,
             duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
             duration_ns,

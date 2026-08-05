@@ -1,0 +1,26 @@
+default = "adapter-smoke"
+
+[harness.codex]
+command = "codex"
+
+[harness.nanocodex]
+command = "target/x86_64-unknown-linux-musl/debug/nanocodex"
+
+[benchmark.external-smoke]
+adapter = "external"
+manifest = "evals/adapter-smoke/external/manifest.toml"
+
+[profiles.adapter-smoke]
+harnesses = ["codex", "nanocodex"]
+tasks = [
+  "terminal-bench-2.1/fix-git",
+  "arena-hard-v2/2edbb5f36f5b42be",
+  "openai-evals/computer-science-problems.s1.simple-v0-000000",
+  "gpqa-diamond/gpqa_diamond-000000",
+  "swe-bench-verified-smoke/astropy__astropy-12907",
+  "external-smoke/exact-answer",
+]
+trials = 1
+model = ["gpt-5.6-sol"]
+thinking = ["low"]
+web_search = false

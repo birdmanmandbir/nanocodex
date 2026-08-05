@@ -104,12 +104,16 @@ impl DatasetImporter for OpenAiEvals {
                 source,
             })?;
             let id = format!("{}-{index:06}", safe_case_id(&self.eval));
-            plan = plan.case(
-                CasePlan::hermetic(id, prompt, self.environment.clone(), harness.clone())?
-                    .output(TaskOutput::FinalMessage)
+            plan = plan.case({
+                let mut case =
+                    CasePlan::hermetic(id, prompt.user, self.environment.clone(), harness.clone())?;
+                if let Some(instructions) = prompt.instructions {
+                    case = case.instructions(instructions);
+                }
+                case.output(TaskOutput::FinalMessage)
                     .harness_file("expected.json", expected, 0o600)?
-                    .harness_file("mode", mode.as_bytes().to_vec(), 0o600)?,
-            );
+                    .harness_file("mode", mode.as_bytes().to_vec(), 0o600)?
+            });
         }
         Ok(plan)
     }
@@ -203,32 +207,62 @@ struct EvalSample {
 }
 
 impl EvalSample {
-    fn prompt(&self) -> Result<String, ImportError> {
+    fn prompt(&self) -> Result<EvalPrompt, ImportError> {
         if let Some(prompt) = self.input.as_str() {
-            return Ok(prompt.to_owned());
+            return Ok(EvalPrompt {
+                instructions: None,
+                user: prompt.to_owned(),
+            });
         }
         let messages = self.input.as_array().ok_or_else(|| {
-            ImportError::Invalid("OpenAI Evals input must be text or one user message".to_owned())
+            ImportError::Invalid(
+                "OpenAI Evals input must be text or one system message followed by one user message"
+                    .to_owned(),
+            )
         })?;
-        if messages.len() != 1 {
+        if messages.is_empty() || messages.len() > 2 {
             return Err(ImportError::Invalid(
-                "multi-message OpenAI Evals inputs require an official external harness".to_owned(),
-            ));
-        }
-        let message = messages[0].as_object().ok_or_else(|| {
-            ImportError::Invalid("OpenAI Evals chat input must contain objects".to_owned())
-        })?;
-        if message.get("role").and_then(serde_json::Value::as_str) != Some("user") {
-            return Err(ImportError::Invalid(
-                "non-user OpenAI Evals messages cannot be represented by one Nanocodex turn"
+                "OpenAI Evals conversations beyond one system and one user message require an official external harness"
                     .to_owned(),
             ));
         }
-        message
+        let user = messages
+            .last()
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| {
+                ImportError::Invalid("OpenAI Evals chat input must contain objects".to_owned())
+            })?;
+        if user.get("role").and_then(serde_json::Value::as_str) != Some("user") {
+            return Err(ImportError::Invalid(
+                "OpenAI Evals final message must be user".to_owned(),
+            ));
+        }
+        let user = user
             .get("content")
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
-            .ok_or_else(|| ImportError::Invalid("chat content must be text".to_owned()))
+            .ok_or_else(|| ImportError::Invalid("chat content must be text".to_owned()))?;
+        let instructions = if messages.len() == 2 {
+            let system = messages[0].as_object().ok_or_else(|| {
+                ImportError::Invalid("OpenAI Evals chat input must contain objects".to_owned())
+            })?;
+            if system.get("role").and_then(serde_json::Value::as_str) != Some("system") {
+                return Err(ImportError::Invalid(
+                    "OpenAI Evals first message must be system when two messages are present"
+                        .to_owned(),
+                ));
+            }
+            Some(
+                system
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| ImportError::Invalid("chat content must be text".to_owned()))?
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
+        Ok(EvalPrompt { instructions, user })
     }
 
     fn ideal_strings(&self) -> Result<Vec<String>, ImportError> {
@@ -249,4 +283,9 @@ impl EvalSample {
                 ImportError::Invalid("OpenAI Evals ideal must be text or text array".to_owned())
             })
     }
+}
+
+struct EvalPrompt {
+    instructions: Option<String>,
+    user: String,
 }

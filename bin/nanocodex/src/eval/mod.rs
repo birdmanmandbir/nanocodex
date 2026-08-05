@@ -169,8 +169,8 @@ impl ProfileRunner for NativeEvaluationRuntime {
         let agent = self.agent.ok_or_else(|| {
             NativeTaskPreparationError("profile runner has no agent configuration".to_owned())
         })?;
-        let configured = agent
-            .builder(Thinking::default(), request.receipt().web_search())
+        let (builder, shared_auth) = agent
+            .shared_builder(Thinking::default(), request.receipt().web_search())
             .map_err(|error| NativeTaskPreparationError(format!("{error:#}")))?;
         let vmm = std::env::current_exe()
             .map_err(|error| NativeTaskPreparationError(error.to_string()))?;
@@ -178,14 +178,21 @@ impl ProfileRunner for NativeEvaluationRuntime {
             .await
             .map_err(|error| NativeTaskPreparationError(format!("{error:#}")))?;
         let (concurrency, max_memory_mb) = run::automatic_scheduling_defaults(95);
-        let verifier_environment = std::env::var("OPENAI_API_KEY")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| BTreeMap::from([("OPENAI_API_KEY".to_owned(), value)]))
-            .unwrap_or_default();
-        VmProfileRunner::new(vmm, runtime, configured.builder)
-            .additional_tools(configured.additional_tools)
-            .verifier_environment(verifier_environment)
+        let judge =
+            nanocodex_eval::judge::JudgeRuntime::start(builder.clone().thinking(Thinking::Low))
+                .await
+                .map_err(|error| NativeTaskPreparationError(error.to_string()))?;
+        let harness_auth = match shared_auth {
+            crate::config::SharedAuth::ApiKey(key) => {
+                nanocodex_eval::vm::GuestHarnessAuth::ApiKey(key)
+            }
+            crate::config::SharedAuth::AuthFile(path) => {
+                nanocodex_eval::vm::GuestHarnessAuth::AuthFile(path)
+            }
+        };
+        VmProfileRunner::new(vmm, runtime, builder)
+            .verifier_environment(judge.verifier_environment())
+            .guest_harness_auth(harness_auth)
             .max_concurrency(usize::from(concurrency))
             .max_memory_mb(max_memory_mb)
             .run(request)

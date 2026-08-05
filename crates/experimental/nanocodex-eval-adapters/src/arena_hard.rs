@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +20,7 @@ pub struct ArenaHard {
     environment: Environment,
     harness: Harness,
     limit: Option<usize>,
+    baseline_answers: Option<PathBuf>,
 }
 
 impl ArenaHard {
@@ -39,7 +40,15 @@ impl ArenaHard {
             environment,
             harness,
             limit: None,
+            baseline_answers: None,
         }
+    }
+
+    /// Binds the benchmark's published baseline answers into every judged case.
+    #[must_use]
+    pub fn baseline_answers(mut self, path: impl Into<PathBuf>) -> Self {
+        self.baseline_answers = Some(path.into());
+        self
     }
 
     /// Restricts import to a deterministic prefix for smoke validation.
@@ -61,27 +70,52 @@ impl DatasetImporter for ArenaHard {
             }
             questions.truncate(limit);
         }
-        let source = SourceIdentity::new(
-            "arena-hard",
-            self.revision.as_ref(),
-            sha256_file(&self.questions)?,
-        )?;
+        let baselines = self
+            .baseline_answers
+            .as_ref()
+            .map(|path| read_json_lines::<ArenaAnswer>(path))
+            .transpose()?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|answer| (answer.uid.clone(), answer))
+            .collect::<BTreeMap<_, _>>();
+        let source_digest = if let Some(path) = &self.baseline_answers {
+            crate::sha256_values([sha256_file(&self.questions)?, sha256_file(path)?])
+        } else {
+            sha256_file(&self.questions)?
+        };
+        let source = SourceIdentity::new("arena-hard", self.revision.as_ref(), source_digest)?;
         let mut plan = DatasetPlan::new(self.name.as_ref(), source)?;
         for question in questions {
             let metadata = serde_json::to_vec(&question).map_err(|source| ImportError::Json {
                 path: self.questions.clone(),
                 source,
             })?;
-            plan = plan.case(
-                CasePlan::hermetic(
-                    safe_case_id(&question.uid),
-                    question.prompt.clone(),
-                    self.environment.clone(),
-                    self.harness.clone(),
-                )?
-                .output(TaskOutput::FinalMessage)
-                .harness_file("case.json", metadata, 0o600)?,
-            );
+            let uid = question.uid.clone();
+            let mut case = CasePlan::hermetic(
+                safe_case_id(&question.uid),
+                question.prompt.clone(),
+                self.environment.clone(),
+                self.harness.clone(),
+            )?
+            .output(TaskOutput::FinalMessage)
+            .harness_file("case.json", metadata, 0o600)?;
+            if let Some(baseline) = baselines.get(&uid) {
+                let baseline =
+                    serde_json::to_vec(baseline).map_err(|source| ImportError::Json {
+                        path: self
+                            .baseline_answers
+                            .clone()
+                            .unwrap_or_else(|| self.questions.clone()),
+                        source,
+                    })?;
+                case = case.harness_file("baseline.json", baseline, 0o600)?;
+            } else if self.baseline_answers.is_some() {
+                return Err(ImportError::Invalid(format!(
+                    "Arena-Hard baseline answer is missing for {uid}"
+                )));
+            }
+            plan = plan.case(case);
         }
         Ok(plan)
     }
@@ -94,4 +128,11 @@ struct ArenaQuestion {
     #[serde(default)]
     subcategory: Option<String>,
     prompt: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct ArenaAnswer {
+    uid: String,
+    model: String,
+    messages: Vec<serde_json::Value>,
 }

@@ -277,6 +277,7 @@ struct SweepCoordinate {
 /// Immutable paths and task metadata available while configuring one attempt.
 #[derive(Clone, Copy)]
 pub(crate) struct EvalAttempt<'a> {
+    agent: Option<&'a AgentId>,
     task: &'a Task,
     directory: &'a Path,
     workspace: &'a Path,
@@ -813,6 +814,9 @@ impl Evaluator {
             .run_task_inner(
                 task.clone(),
                 nanocodex,
+                coordinate
+                    .as_ref()
+                    .map(|coordinate| coordinate.agent.clone()),
                 attempt_id,
                 trial_name.clone(),
                 queue_wait.clone(),
@@ -841,6 +845,7 @@ impl Evaluator {
         &self,
         task: Task,
         nanocodex: NanocodexBuilder,
+        agent_id: Option<AgentId>,
         attempt_id: Uuid,
         trial_name: String,
         queue_wait: PhaseTiming,
@@ -876,7 +881,7 @@ impl Evaluator {
             workspace: attempt.paths.workspace.clone(),
         });
         let mut agent = self
-            .execute_agent(emitter, &task, &attempt, nanocodex)
+            .execute_agent(emitter, &task, &attempt, nanocodex, agent_id.as_ref())
             .await
             .map_err(|failure| AttemptRunFailure::from_agent(&attempt, failure))?;
 
@@ -1027,6 +1032,7 @@ impl Evaluator {
                     .verify(
                         task,
                         EvalAttempt {
+                            agent: None,
                             task,
                             directory: &attempt.paths.root,
                             workspace: &attempt.paths.workspace,
@@ -1106,13 +1112,16 @@ impl Evaluator {
         task: &Task,
         attempt: &NativeAttempt,
         nanocodex: NanocodexBuilder,
+        agent_id: Option<&AgentId>,
     ) -> Result<AgentExecution, AgentExecutionFailure> {
         let AgentSetup {
             agent,
             verifier,
             readiness_timing,
             timing: setup_timing,
-        } = self.setup_agent(emitter, task, attempt, nanocodex).await?;
+        } = self
+            .setup_agent(emitter, task, attempt, nanocodex, agent_id)
+            .await?;
         match agent {
             PreparedAgent::Nanocodex { agent, events } => {
                 self.execute_nanocodex_agent(
@@ -1409,6 +1418,7 @@ impl Evaluator {
         task: &Task,
         attempt: &NativeAttempt,
         nanocodex: NanocodexBuilder,
+        agent_id: Option<&AgentId>,
     ) -> Result<AgentSetup, AgentExecutionFailure> {
         let readiness_started = Utc::now();
         let span = info_span!(
@@ -1425,8 +1435,11 @@ impl Evaluator {
         );
         let trace_started = Instant::now();
         let result = async {
-            let builder = nanocodex
-                .workspace(&attempt.paths.workspace)
+            let mut builder = nanocodex.workspace(&attempt.paths.workspace);
+            if let Some(instructions) = task.agent_instructions() {
+                builder = builder.instructions(instructions);
+            }
+            let builder = builder
                 .session_id(emitter.session_id)
                 .prompt_cache_key(format!(
                     "nanoeval:{}:{:x}",
@@ -1436,6 +1449,7 @@ impl Evaluator {
             let configured = if let Some(factory) = &self.inner.attempt_agent {
                 match factory(
                     EvalAttempt {
+                        agent: agent_id,
                         task,
                         directory: &attempt.paths.root,
                         workspace: &attempt.paths.workspace,
@@ -2601,6 +2615,12 @@ impl AttemptAgent {
 }
 
 impl EvalAttempt<'_> {
+    /// Returns the finite-sweep treatment selected for this attempt.
+    #[must_use]
+    pub(crate) const fn agent_id(&self) -> Option<&AgentId> {
+        self.agent
+    }
+
     /// Returns the immutable task definition.
     #[must_use]
     pub(crate) const fn task(&self) -> &Task {

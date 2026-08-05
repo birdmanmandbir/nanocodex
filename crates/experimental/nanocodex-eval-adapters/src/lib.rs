@@ -11,6 +11,7 @@ mod harbor;
 mod openai_evals;
 mod openai_simple_evals;
 pub mod profile;
+mod source;
 mod swe_bench;
 
 use std::{fs, path::Path};
@@ -23,6 +24,7 @@ pub use openai_evals::OpenAiEvals;
 pub use openai_simple_evals::{OpenAiSimpleEval, OpenAiSimpleEvals};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+pub use source::{BuiltinSourceError, BuiltinSources};
 pub use swe_bench::SweBench;
 
 fn sha256_file(path: &Path) -> Result<String, ImportError> {
@@ -333,7 +335,7 @@ mod tests {
         let instances = source.path().join("instances.jsonl");
         fs::write(
             &instances,
-            r#"{"instance_id":"django__django-123","problem_statement":"Fix it.","repo":"django/django","base_commit":"abc","FAIL_TO_PASS":["test"],"PASS_TO_PASS":[]}
+            r#"{"instance_id":"django__django-123","problem_statement":"Fix it.","repo":"django/django","base_commit":"abc","version":"5.0","patch":"diff","test_patch":"tests","FAIL_TO_PASS":["test"],"PASS_TO_PASS":[]}
 "#,
         )
         .unwrap();

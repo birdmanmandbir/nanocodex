@@ -20,8 +20,8 @@ use nanocodex_eval::{
 use serde::Deserialize;
 
 use crate::{
-    ArenaHard, ExternalHarness, HarborDataset, OpenAiEvals, OpenAiSimpleEval, OpenAiSimpleEvals,
-    SweBench,
+    ArenaHard, BuiltinSourceError, BuiltinSources, ExternalHarness, HarborDataset, OpenAiEvals,
+    OpenAiSimpleEval, OpenAiSimpleEvals, SweBench,
 };
 
 /// A complete manifest using Nanocodex's concrete third-party benchmark recipes.
@@ -36,6 +36,7 @@ pub struct ProfileImporter<'a> {
     catalog: BenchmarkCatalog,
     manifest: &'a EvalManifest,
     store: &'a ImportStore,
+    sources: &'a BuiltinSources,
 }
 
 /// Builder for one manifest-driven evaluation workspace.
@@ -52,6 +53,7 @@ pub struct EvaluationWorkspace<P> {
     manifest: EvalManifest,
     state_directory: PathBuf,
     preparer: P,
+    sources: BuiltinSources,
 }
 
 /// Builder marker requiring callers to install one task preparation strategy.
@@ -87,6 +89,9 @@ pub enum Benchmark {
         questions: PathBuf,
         /// Official judge wrapper directory.
         harness: PathBuf,
+        /// Official baseline model answers used by the pairwise judge.
+        #[serde(default)]
+        baseline: Option<PathBuf>,
         /// Pinned source revision.
         revision: String,
         /// Candidate environment.
@@ -202,6 +207,9 @@ pub enum ProfileImportError {
     /// Retained Harbor evidence could not be loaded or aggregated.
     #[error(transparent)]
     Harbor(#[from] HarborError),
+    /// Pinned built-in source acquisition failed.
+    #[error(transparent)]
+    Source(#[from] BuiltinSourceError),
 }
 
 impl EvaluationWorkspace<TaskPreparationRequired> {
@@ -307,8 +315,9 @@ impl<P: TaskPreparer> EvaluationWorkspace<P> {
             ));
         }
         let imports = ImportStore::new(self.state_directory.join("imports"));
-        let selected =
-            ProfileImporter::new(self.catalog, &self.manifest, &imports).import(&profile)?;
+        self.sources.prepare(&profile).await?;
+        let selected = ProfileImporter::new(self.catalog, &self.manifest, &imports, &self.sources)
+            .import(&profile)?;
         self.preparer
             .prepare(TaskPreparation::new(
                 selected
@@ -413,11 +422,13 @@ impl<P: TaskPreparer> EvaluationWorkspaceBuilder<P> {
                     )
                 })?,
         };
+        let sources = BuiltinSources::new(state_directory.join("source/upstream"));
         Ok(EvaluationWorkspace {
             catalog: BenchmarkCatalog::new(),
             manifest: EvalManifest::load(manifest)?,
             state_directory,
             preparer: self.preparer,
+            sources,
         })
     }
 }
@@ -472,7 +483,7 @@ impl BenchmarkCatalog {
             "browsecomp" | "healthbench" | "healthbench-professional" | "gpqa-diamond" => {
                 "openai-simple-evals"
             }
-            "swe-bench-pro" => "swe-bench",
+            "swe-bench-pro" | "swe-bench-verified-smoke" => "swe-bench",
             "agents-last-exam"
             | "gdpval-aa"
             | "artificial-analysis"
@@ -483,6 +494,7 @@ impl BenchmarkCatalog {
             | "sec-bench"
             | "exploitbench"
             | "exploitgym"
+            | "genebench"
             | "kernelbench"
             | "kernelgen"
             | "nanogpt"
@@ -504,11 +516,13 @@ impl<'a> ProfileImporter<'a> {
         catalog: BenchmarkCatalog,
         manifest: &'a EvalManifest,
         store: &'a ImportStore,
+        sources: &'a BuiltinSources,
     ) -> Self {
         Self {
             catalog,
             manifest,
             store,
+            sources,
         }
     }
 
@@ -519,16 +533,22 @@ impl<'a> ProfileImporter<'a> {
     ) -> Result<Vec<SelectedTask>, ProfileImportError> {
         let mut selected = Vec::new();
         for (name, selection) in profile.selections() {
-            let benchmark = self.manifest.benchmark(name).ok_or_else(|| {
-                let built_in = self
-                    .catalog
-                    .recipe(name)
-                    .expect("resolved built-in benchmark");
-                ProfileImportError::BuiltinUnavailable(format!(
-                    "built-in benchmark {name:?} uses the {} adapter, but its pinned acquisition recipe is not installed yet",
-                    built_in.adapter
-                ))
-            })?;
+            let builtin;
+            let benchmark = if let Some(benchmark) = self.manifest.benchmark(name) {
+                benchmark
+            } else {
+                builtin = self.sources.benchmark(name).map_err(|error| {
+                    let built_in = self
+                        .catalog
+                        .recipe(name)
+                        .expect("resolved built-in benchmark");
+                    ProfileImportError::BuiltinUnavailable(format!(
+                        "built-in benchmark {name:?} uses the {} adapter: {error}",
+                        built_in.adapter
+                    ))
+                })?;
+                &builtin
+            };
             let dataset = self.import_benchmark(name, benchmark)?;
             self.select_tasks(name, selection, &dataset, &mut selected)?;
         }
@@ -551,6 +571,7 @@ impl<'a> ProfileImporter<'a> {
             Benchmark::ArenaHard {
                 questions,
                 harness,
+                baseline,
                 revision,
                 image,
                 limit,
@@ -562,6 +583,9 @@ impl<'a> ProfileImporter<'a> {
                     Environment::OciImage(image.clone()),
                     Harness::directory(resolve_path(root, harness))?,
                 );
+                if let Some(baseline) = baseline {
+                    importer = importer.baseline_answers(resolve_path(root, baseline));
+                }
                 if let Some(limit) = limit {
                     importer = importer.limit(*limit);
                 }
@@ -637,10 +661,19 @@ impl<'a> ProfileImporter<'a> {
     ) -> Result<(), ProfileImportError> {
         let mut missing = selection.tasks().clone();
         for task in dataset.tasks() {
-            if selection.is_all() || selection.tasks().contains(task.name()) {
-                missing.remove(task.name());
+            let selected_name = selection
+                .tasks()
+                .iter()
+                .find(|selected| Self::matches_task(benchmark, selected, task.name()));
+            if selection.is_all() || selected_name.is_some() {
+                if let Some(selected_name) = selected_name {
+                    missing.remove(selected_name);
+                }
                 output.push(SelectedTask {
-                    selector: format!("{benchmark}/{}", task.name()),
+                    selector: format!(
+                        "{benchmark}/{}",
+                        selected_name.map_or_else(|| task.name(), String::as_str)
+                    ),
                     task: task.clone(),
                 });
             }
@@ -652,6 +685,14 @@ impl<'a> ProfileImporter<'a> {
             )));
         }
         Ok(())
+    }
+
+    fn matches_task(benchmark: &str, selected: &str, normalized: &str) -> bool {
+        selected == normalized
+            || (benchmark == "terminal-bench-2.1"
+                && normalized
+                    .strip_prefix("terminal-bench/")
+                    .is_some_and(|task| task == selected))
     }
 }
 
@@ -788,6 +829,7 @@ mod tests {
             "sec-bench",
             "exploitbench",
             "exploitgym",
+            "genebench",
             "kernelbench",
             "kernelgen",
             "nanogpt",
@@ -841,7 +883,7 @@ mod tests {
 
         fs::write(
             sources.join("swe.jsonl"),
-            "{\"instance_id\":\"owner__repo-1\",\"problem_statement\":\"Fix it.\",\"repo\":\"owner/repo\",\"base_commit\":\"abc\",\"FAIL_TO_PASS\":[],\"PASS_TO_PASS\":[]}\n",
+            "{\"instance_id\":\"owner__repo-1\",\"problem_statement\":\"Fix it.\",\"repo\":\"owner/repo\",\"base_commit\":\"abc\",\"version\":\"1\",\"patch\":\"diff\",\"test_patch\":\"tests\",\"FAIL_TO_PASS\":[],\"PASS_TO_PASS\":[]}\n",
         )
         .unwrap();
 

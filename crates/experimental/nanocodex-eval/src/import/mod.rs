@@ -96,6 +96,7 @@ struct HermeticCase {
     output: TaskOutput,
     resources: Resources,
     agent_timeout: Duration,
+    agent_instructions: Option<String>,
     verifier_timeout: Duration,
     allow_internet: bool,
 }
@@ -487,6 +488,7 @@ impl CasePlan {
                     gpus: 0,
                 },
                 agent_timeout: Duration::from_secs(900),
+                agent_instructions: None,
                 verifier_timeout: Duration::from_secs(300),
                 allow_internet: true,
             },
@@ -495,6 +497,13 @@ impl CasePlan {
 }
 
 impl HermeticCasePlan {
+    /// Applies benchmark-owned model instructions separately from the user prompt.
+    #[must_use]
+    pub fn instructions(mut self, instructions: impl Into<String>) -> Self {
+        self.case.agent_instructions = Some(instructions.into());
+        self
+    }
+
     /// Selects which candidate value the verifier consumes.
     #[must_use]
     pub const fn output(mut self, output: TaskOutput) -> Self {
@@ -615,6 +624,7 @@ fn materialize_hermetic_case(
         task: GeneratedTaskInfo { name: id },
         agent: GeneratedPhase {
             timeout_sec: case.agent_timeout.as_secs_f64(),
+            instructions: case.agent_instructions.as_deref(),
         },
         verifier: GeneratedVerifier {
             timeout_sec: case.verifier_timeout.as_secs_f64(),
@@ -662,7 +672,7 @@ struct GeneratedTaskManifest<'a> {
     schema_version: &'a str,
     output: &'a str,
     task: GeneratedTaskInfo<'a>,
-    agent: GeneratedPhase,
+    agent: GeneratedPhase<'a>,
     verifier: GeneratedVerifier<'a>,
     environment: GeneratedEnvironment<'a>,
 }
@@ -673,8 +683,10 @@ struct GeneratedTaskInfo<'a> {
 }
 
 #[derive(Serialize)]
-struct GeneratedPhase {
+struct GeneratedPhase<'a> {
     timeout_sec: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<&'a str>,
 }
 
 #[derive(Serialize)]

@@ -24,6 +24,7 @@ pub struct Task {
     name: Box<str>,
     description: Box<str>,
     prompt: Box<str>,
+    agent_instructions: Option<Box<str>>,
     image: OciImage,
     agent_timeout: Duration,
     verifier: Verifier,
@@ -261,6 +262,14 @@ impl Task {
             name: name.into_boxed_str(),
             description: raw.task.description.into_boxed_str(),
             prompt: prompt.into_boxed_str(),
+            agent_instructions: raw
+                .agent
+                .instructions
+                .map(|instructions| {
+                    required_string(&config_path, "agent.instructions", instructions)
+                        .map(String::into_boxed_str)
+                })
+                .transpose()?,
             image: OciImage {
                 reference: image.into_boxed_str(),
             },
@@ -439,6 +448,12 @@ impl Task {
     #[must_use]
     pub fn prompt(&self) -> &str {
         &self.prompt
+    }
+
+    /// Benchmark-owned model instructions applied independently of the user prompt.
+    #[must_use]
+    pub fn agent_instructions(&self) -> Option<&str> {
+        self.agent_instructions.as_deref()
     }
 
     /// Files copied into the disposable native workspace before an attempt.
@@ -725,6 +740,8 @@ struct RawTaskInfo {
 #[derive(Deserialize)]
 struct RawPhase {
     timeout_sec: f64,
+    #[serde(default)]
+    instructions: Option<String>,
 }
 
 #[derive(Deserialize)]

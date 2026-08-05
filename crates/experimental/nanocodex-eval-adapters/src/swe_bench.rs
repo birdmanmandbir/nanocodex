@@ -98,6 +98,9 @@ struct SweInstance {
     problem_statement: String,
     repo: String,
     base_commit: String,
+    version: String,
+    patch: String,
+    test_patch: String,
     #[serde(default)]
     hints_text: String,
     #[serde(default, rename = "FAIL_TO_PASS")]

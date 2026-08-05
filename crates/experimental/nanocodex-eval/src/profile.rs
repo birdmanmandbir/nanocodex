@@ -191,7 +191,7 @@ pub trait ProfileRunner: Sized {
     ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send;
 }
 
-/// Validated Nanocodex-only task/model/thinking sweep derived from a receipt.
+/// Validated task/treatment/model/thinking sweep derived from a receipt.
 pub struct NanocodexRunPlan {
     tasks: Vec<crate::Task>,
     sweep: crate::Sweep,
@@ -503,7 +503,7 @@ impl<B> LoadedManifest<B> {
         Ok(ResolvedHarness {
             name: selection.to_owned(),
             driver: harness.driver.clone().unwrap_or_else(|| name.to_owned()),
-            command: resolve_path(&self.root, &harness.command),
+            command: resolve_command(&self.root, &harness.command)?,
             args,
         })
     }
@@ -717,20 +717,11 @@ impl PreparationReceipt {
         self.web_search
     }
 
-    /// Builds the exact Nanocodex task/model/thinking/trial sweep in this receipt.
+    /// Builds the exact native and guest-harness sweep in this receipt.
     pub fn nanocodex_plan(
         &self,
         base: &NanocodexBuilder,
     ) -> Result<NanocodexRunPlan, ProfileRunPlanError> {
-        if !self.harnesses.is_empty() {
-            return Err(ProfileRunPlanError::UnsupportedHarnesses(
-                self.harnesses
-                    .iter()
-                    .map(|harness| harness.name().to_owned())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            ));
-        }
         let tasks = self
             .tasks
             .iter()
@@ -748,6 +739,12 @@ impl PreparationReceipt {
                     format!("nanocodex.{model}.{thinking}"),
                     base.clone().model(parsed_model).thinking(parsed_thinking),
                 )?;
+                for harness in &self.harnesses {
+                    sweep = sweep.agent(
+                        format!("harness.{}.{model}.{thinking}", harness.name()),
+                        base.clone().model(parsed_model).thinking(parsed_thinking),
+                    )?;
+                }
             }
         }
         Ok(NanocodexRunPlan {
@@ -759,17 +756,94 @@ impl PreparationReceipt {
 
 impl PreparedHarness {
     fn from_resolved(harness: &ResolvedHarness) -> Result<Self, PreparationError> {
-        let bytes = fs::read(harness.command()).map_err(|source| PreparationError::Io {
-            path: harness.command().to_path_buf(),
+        let command = Self::resolve_guest_executable(harness)?;
+        let bytes = fs::read(&command).map_err(|source| PreparationError::Io {
+            path: command.clone(),
             source,
         })?;
+        if !matches!(harness.driver(), "codex" | "nanocodex") {
+            return Err(PreparationError::Invalid(format!(
+                "unknown harness driver {:?}; expected codex or nanocodex",
+                harness.driver()
+            )));
+        }
+        Self::validate_guest_elf(&command, &bytes)?;
         Ok(Self {
             name: harness.name().to_owned(),
             driver: harness.driver().to_owned(),
-            command: harness.command().to_path_buf(),
+            command,
             args: harness.args().to_vec(),
             executable_sha256: hex::encode(Sha256::digest(bytes)),
         })
+    }
+
+    fn resolve_guest_executable(harness: &ResolvedHarness) -> Result<PathBuf, PreparationError> {
+        let command = harness.command();
+        let bytes = fs::read(command).map_err(|source| PreparationError::Io {
+            path: command.to_path_buf(),
+            source,
+        })?;
+        if bytes.starts_with(b"\x7fELF") {
+            return Ok(command.to_path_buf());
+        }
+        if harness.driver() != "codex" {
+            return Ok(command.to_path_buf());
+        }
+        let launcher = command
+            .canonicalize()
+            .map_err(|source| PreparationError::Io {
+                path: command.to_path_buf(),
+                source,
+            })?;
+        let package = launcher.parent().and_then(Path::parent).ok_or_else(|| {
+            PreparationError::Invalid(format!(
+                "cannot locate the Codex package containing {}",
+                launcher.display()
+            ))
+        })?;
+        #[cfg(target_arch = "x86_64")]
+        let platform = ("codex-linux-x64", "x86_64-unknown-linux-musl");
+        #[cfg(target_arch = "aarch64")]
+        let platform = ("codex-linux-arm64", "aarch64-unknown-linux-musl");
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let platform = ("unsupported", "unsupported");
+        let payload = package
+            .join("node_modules/@openai")
+            .join(platform.0)
+            .join("vendor")
+            .join(platform.1)
+            .join("bin/codex");
+        if !payload.is_file() {
+            return Err(PreparationError::Invalid(format!(
+                "Codex launcher {} does not contain the guest executable {}; configure command with the exact Linux payload",
+                launcher.display(),
+                payload.display()
+            )));
+        }
+        Ok(payload)
+    }
+
+    fn validate_guest_elf(path: &Path, bytes: &[u8]) -> Result<(), PreparationError> {
+        let Some(header) = bytes.get(..20) else {
+            return Err(PreparationError::Invalid(format!(
+                "harness executable {} is too short to be an ELF binary",
+                path.display()
+            )));
+        };
+        let machine = u16::from_le_bytes([header[18], header[19]]);
+        #[cfg(target_arch = "x86_64")]
+        let expected = 62;
+        #[cfg(target_arch = "aarch64")]
+        let expected = 183;
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let expected = u16::MAX;
+        if &header[..4] != b"\x7fELF" || header[4] != 2 || header[5] != 1 || machine != expected {
+            return Err(PreparationError::Invalid(format!(
+                "harness executable {} is not a guest-architecture ELF binary",
+                path.display()
+            )));
+        }
+        Ok(())
     }
 
     /// Stable treatment name.
@@ -790,6 +864,11 @@ impl PreparedHarness {
     /// Exact argv suffix.
     pub fn args(&self) -> &[String] {
         &self.args
+    }
+
+    /// SHA-256 of the exact executable validated during preparation.
+    pub fn executable_sha256(&self) -> &str {
+        &self.executable_sha256
     }
 
     fn validate(&self) -> Result<(), PreparationError> {
@@ -1020,6 +1099,27 @@ fn resolve_path(root: &Path, path: &Path) -> PathBuf {
     }
 }
 
+fn resolve_command(root: &Path, command: &Path) -> Result<PathBuf, ProfileError> {
+    if command.components().count() != 1 {
+        return Ok(resolve_path(root, command));
+    }
+    let Some(path) = std::env::var_os("PATH") else {
+        return Err(invalid(format!(
+            "cannot resolve harness command {:?} because PATH is unavailable",
+            command.display()
+        )));
+    };
+    std::env::split_paths(&path)
+        .map(|directory| directory.join(command))
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| {
+            invalid(format!(
+                "harness command {:?} is not on PATH",
+                command.display()
+            ))
+        })
+}
+
 fn invalid(message: impl Into<String>) -> ProfileError {
     ProfileError::Invalid(message.into())
 }
@@ -1134,7 +1234,13 @@ thinking = ["low"]
     fn preparation_store_is_idempotent_and_rejects_changed_tasks() {
         let root = tempfile::tempdir().unwrap();
         let harness = root.path().join("codex");
-        fs::write(&harness, "fixture binary").unwrap();
+        let mut executable = vec![0_u8; 32];
+        executable[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        #[cfg(target_arch = "x86_64")]
+        executable[18..20].copy_from_slice(&62_u16.to_le_bytes());
+        #[cfg(target_arch = "aarch64")]
+        executable[18..20].copy_from_slice(&183_u16.to_le_bytes());
+        fs::write(&harness, &executable).unwrap();
         let task_root = root.path().join("task");
         fs::create_dir(&task_root).unwrap();
         fs::create_dir(task_root.join("environment")).unwrap();
@@ -1183,6 +1289,10 @@ allow_internet = false
             vec![PreparedTask::new("fixture/task", &task)],
         )
         .unwrap();
+        let plan = receipt
+            .nanocodex_plan(&Nanocodex::builder(OpenAi::new("test-key").unwrap()))
+            .unwrap();
+        assert_eq!(plan.into_sweep().attempt_count(), 8);
         let mut nanocodex_receipt = receipt.clone();
         nanocodex_receipt.harnesses.clear();
         let plan = nanocodex_receipt
@@ -1200,7 +1310,7 @@ allow_internet = false
         let error = store.load_current("smoke").unwrap_err();
         assert!(error.to_string().contains("prepared harness codex changed"));
 
-        fs::write(&harness, "fixture binary").unwrap();
+        fs::write(&harness, executable).unwrap();
         fs::write(task_root.join("instruction.md"), "Changed after prepare.\n").unwrap();
         let error = store.load_current("smoke").unwrap_err();
         assert!(error.to_string().contains("changed"));

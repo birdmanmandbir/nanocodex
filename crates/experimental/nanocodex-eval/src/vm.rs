@@ -59,13 +59,16 @@ pub use nanocodex_vm::{
 };
 
 use crate::{
-    CleanupPhase, CodexExec, EvalEnvironment, Evaluator, EvaluatorBuilder, NetworkPolicy, Task,
-    TaskLoadError, TaskOutput, VerifierEnvironmentMode, VerifierResult,
+    CleanupPhase, CodexCommandOutput, CodexCommandRunner, CodexCommandRunnerError,
+    CodexCommandStatus, CodexExec, EvalEnvironment, Evaluator, EvaluatorBuilder, NetworkPolicy,
+    Task, TaskLoadError, TaskOutput, VerifierEnvironmentMode, VerifierResult,
     evaluator::{
         AttemptAgent, AttemptVerification, AttemptVerificationFailure, AttemptVerifier, EvalAttempt,
     },
     harbor::{Harbor, HarborError},
-    profile::{ProfileRunPlanError, ProfileRunRequest, ProfileRunner},
+    profile::{
+        PreparationReceipt, PreparedHarness, ProfileRunPlanError, ProfileRunRequest, ProfileRunner,
+    },
     profile_run::{ProfileRunControl, ProfileRunControlError},
 };
 
@@ -74,6 +77,11 @@ const BLOCK_GUEST_TOOL_RUNTIME: &str = "/run/nanoeval/nanocodex-vm-guest";
 const GUEST_RUNTIME_BLOCK_ID: &str = "nanoeval-runtime";
 const GUEST_RUNTIME_BLOCK_DEVICE: &str = "/dev/vdb";
 const GUEST_RUNTIME_MOUNT: &str = "/run/nanoeval";
+const GUEST_HARNESS_SHARE_TAG: &str = "nanocodex-harnesses";
+const GUEST_HARNESS_MOUNT: &str = "/run/nanocodex-harnesses";
+const GUEST_HARNESS_HOME: &str = "/run/nanocodex-harness-home";
+const GUEST_HARNESS_AUTH_FILE: &str = "/run/nanocodex-harness-home/auth.json";
+const GUEST_HARNESS_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_VM_CACHE: &str = ".cache/vm";
 const DEFAULT_KRUNFW_DIRECTORY: &str = ".cache/libkrunfw/libkrunfw";
 #[cfg(target_os = "linux")]
@@ -223,6 +231,63 @@ pub struct VmProfileRunner {
     verifier_environment: BTreeMap<String, String>,
     max_concurrency: usize,
     max_memory_mb: Option<u64>,
+    harness_auth: Option<GuestHarnessAuth>,
+}
+
+/// OpenAI credentials staged only into selected guest CLI harness attempts.
+#[derive(Clone, Debug)]
+pub enum GuestHarnessAuth {
+    /// Explicit API-key authentication.
+    ApiKey(Arc<str>),
+    /// Local OpenAI subscription credential file.
+    AuthFile(PathBuf),
+}
+
+#[derive(Clone)]
+struct PreparedGuestHarness {
+    name: String,
+    driver: GuestHarnessDriver,
+    host_command: PathBuf,
+    guest_command: String,
+    args: Vec<String>,
+}
+
+#[derive(Clone)]
+struct GuestTreatment {
+    harness: PreparedGuestHarness,
+    model: String,
+    effort: String,
+    web_search: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GuestHarnessDriver {
+    Codex,
+    Nanocodex,
+}
+
+#[derive(Clone)]
+enum PreparedGuestAuth {
+    ApiKey(Arc<str>),
+    AuthFile(Arc<[u8]>),
+}
+
+struct GuestCliRunner {
+    session: VmToolSessionHandle,
+    workspace: String,
+    environment: Vec<(String, String)>,
+    command: String,
+    mount_tag: &'static str,
+    mount: &'static str,
+    auth: PreparedGuestAuth,
+    driver: GuestHarnessDriver,
+    model: String,
+    effort: String,
+    web_search: bool,
+    args: Vec<String>,
+    prompt: String,
+    instructions: Option<String>,
+    native_output: PathBuf,
 }
 
 /// Typed summary of one completed or fully resumed profile run.
@@ -251,6 +316,9 @@ pub enum VmProfileRunError {
     /// Cross-process lease, status, or stop coordination failed.
     #[error(transparent)]
     Control(#[from] ProfileRunControlError),
+    /// A selected guest CLI treatment could not be staged or configured.
+    #[error("guest harness preparation failed: {0}")]
+    Harness(String),
 }
 
 #[derive(Clone)]
@@ -458,6 +526,7 @@ impl VmProfileRunner {
             verifier_environment: BTreeMap::new(),
             max_concurrency: 1,
             max_memory_mb: None,
+            harness_auth: None,
         }
     }
 
@@ -488,6 +557,13 @@ impl VmProfileRunner {
         self.max_memory_mb = memory_mb;
         self
     }
+
+    /// Selects credentials available only inside configured guest CLI drivers.
+    #[must_use]
+    pub fn guest_harness_auth(mut self, auth: GuestHarnessAuth) -> Self {
+        self.harness_auth = Some(auth);
+        self
+    }
 }
 
 impl ProfileRunner for VmProfileRunner {
@@ -495,6 +571,23 @@ impl ProfileRunner for VmProfileRunner {
     type Output = VmProfileRunResult;
 
     async fn run(self, request: ProfileRunRequest) -> Result<Self::Output, Self::Error> {
+        let (harness_root, harnesses) = PreparedGuestHarness::stage_all(
+            request.receipt().harnesses(),
+            request.cache_directory(),
+        )?;
+        let treatments = Arc::new(GuestTreatment::matrix(request.receipt(), &harnesses)?);
+        let harness_auth = if harnesses.is_empty() {
+            None
+        } else {
+            Some(PreparedGuestAuth::load(self.harness_auth.ok_or_else(
+                || {
+                    VmProfileRunError::Harness(
+                        "profile selects guest harnesses but no OpenAI credentials were installed"
+                            .to_owned(),
+                    )
+                },
+            )?)?)
+        };
         let plan = request.receipt().nanocodex_plan(&self.nanocodex)?;
         let tasks = plan.tasks().to_vec();
         let sweep = plan.into_sweep();
@@ -504,6 +597,12 @@ impl ProfileRunner for VmProfileRunner {
         let mut backend = VmBackend::builder()
             .web_search(request.receipt().web_search())
             .verifier_environment(self.verifier_environment);
+        if !harnesses.is_empty() {
+            backend = backend.shared_directory(SharedDirectory::read_only(
+                GUEST_HARNESS_SHARE_TAG,
+                harness_root,
+            ));
+        }
         if let Some(tools) = self.additional_tools {
             backend = backend.additional_agent_tools(tools);
         }
@@ -515,7 +614,27 @@ impl ProfileRunner for VmProfileRunner {
             .await?;
         resources.configure(&backend).await?;
 
-        let mut evaluator = Evaluator::builder(self.nanocodex, backend)
+        let treatment_map = Arc::clone(&treatments);
+        let evaluator_auth = harness_auth.clone();
+        let mut evaluator = Evaluator::new_builder(self.nanocodex)
+            .vm_with(backend, move |attempt, builder, runtime| {
+                let Some(agent) = attempt.agent_id() else {
+                    return runtime.nanocodex(builder);
+                };
+                if agent.as_str().starts_with("nanocodex.") {
+                    return runtime.nanocodex(builder);
+                }
+                let treatment = treatment_map.get(agent.as_str()).ok_or_else(|| {
+                    VmAttemptError::Harness(format!("unknown prepared treatment {agent}"))
+                })?;
+                treatment.attempt(
+                    runtime,
+                    attempt,
+                    evaluator_auth
+                        .clone()
+                        .ok_or_else(|| VmAttemptError::Harness("missing guest auth".to_owned()))?,
+                )
+            })
             .output_directory(request.output_directory())
             .max_concurrency(self.max_concurrency)
             .resume_incomplete(sweep);
@@ -542,6 +661,361 @@ impl ProfileRunner for VmProfileRunner {
             job_directory: job.directory().to_path_buf(),
             attempts: results.attempts().len(),
             skipped: results.skipped(),
+        })
+    }
+}
+
+impl PreparedGuestHarness {
+    fn stage_all(
+        harnesses: &[PreparedHarness],
+        cache: &Path,
+    ) -> Result<(PathBuf, Vec<Self>), VmProfileRunError> {
+        let root = cache.join("harnesses");
+        fs::create_dir_all(&root).map_err(|error| VmProfileRunError::Harness(error.to_string()))?;
+        let mut prepared = Vec::with_capacity(harnesses.len());
+        for harness in harnesses {
+            let driver = match harness.driver() {
+                "codex" => GuestHarnessDriver::Codex,
+                "nanocodex" => GuestHarnessDriver::Nanocodex,
+                other => {
+                    return Err(VmProfileRunError::Harness(format!(
+                        "unknown harness driver {other:?}; expected codex or nanocodex"
+                    )));
+                }
+            };
+            let directory = root.join(harness.executable_sha256());
+            let command = directory.join("command");
+            if !command.is_file() {
+                fs::create_dir_all(&directory)
+                    .map_err(|error| VmProfileRunError::Harness(error.to_string()))?;
+                let temporary = directory.join(format!("command.{}.tmp", std::process::id()));
+                reflink_or_sparse_copy(harness.command(), &temporary)
+                    .map_err(|error| VmProfileRunError::Harness(error.to_string()))?;
+                fs::set_permissions(&temporary, fs::Permissions::from_mode(0o755))
+                    .map_err(|error| VmProfileRunError::Harness(error.to_string()))?;
+                Self::validate_executable(&temporary)?;
+                fs::rename(&temporary, &command)
+                    .map_err(|error| VmProfileRunError::Harness(error.to_string()))?;
+            } else {
+                Self::validate_executable(&command)?;
+            }
+            prepared.push(Self {
+                name: harness.name().to_owned(),
+                driver,
+                host_command: command,
+                guest_command: format!(
+                    "{GUEST_HARNESS_MOUNT}/{}/command",
+                    harness.executable_sha256()
+                ),
+                args: harness.args().to_vec(),
+            });
+        }
+        Ok((root, prepared))
+    }
+
+    fn validate_executable(path: &Path) -> Result<(), VmProfileRunError> {
+        let mut header = [0_u8; 20];
+        fs::File::open(path)
+            .and_then(|mut file| file.read_exact(&mut header))
+            .map_err(|error| VmProfileRunError::Harness(error.to_string()))?;
+        let machine = u16::from_le_bytes([header[18], header[19]]);
+        let expected = if cfg!(target_arch = "x86_64") {
+            62
+        } else {
+            183
+        };
+        if &header[..4] != b"\x7fELF" || header[4] != 2 || header[5] != 1 || machine != expected {
+            return Err(VmProfileRunError::Harness(format!(
+                "{} is not a 64-bit little-endian {VM_GUEST_TARGET} ELF executable",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl PreparedGuestAuth {
+    fn load(auth: GuestHarnessAuth) -> Result<Self, VmProfileRunError> {
+        match auth {
+            GuestHarnessAuth::ApiKey(key) => Ok(Self::ApiKey(key)),
+            GuestHarnessAuth::AuthFile(path) => fs::read(&path)
+                .map(|bytes| Self::AuthFile(bytes.into()))
+                .map_err(|error| {
+                    VmProfileRunError::Harness(format!(
+                        "failed to read subscription credentials {}: {error}",
+                        path.display()
+                    ))
+                }),
+        }
+    }
+}
+
+impl GuestTreatment {
+    fn matrix(
+        receipt: &PreparationReceipt,
+        harnesses: &[PreparedGuestHarness],
+    ) -> Result<BTreeMap<String, Self>, VmProfileRunError> {
+        let mut matrix = BTreeMap::new();
+        for model in receipt.models() {
+            for effort in receipt.thinking() {
+                for harness in harnesses {
+                    let id = format!("harness.{}.{model}.{effort}", harness.name);
+                    if matrix
+                        .insert(
+                            id.clone(),
+                            Self {
+                                harness: harness.clone(),
+                                model: model.clone(),
+                                effort: effort.clone(),
+                                web_search: receipt.web_search(),
+                            },
+                        )
+                        .is_some()
+                    {
+                        return Err(VmProfileRunError::Harness(format!(
+                            "duplicate harness treatment {id}"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(matrix)
+    }
+
+    fn attempt(
+        &self,
+        runtime: VmAttempt,
+        attempt: EvalAttempt<'_>,
+        auth: PreparedGuestAuth,
+    ) -> Result<AttemptAgent, VmAttemptError> {
+        let session = runtime.session_handle()?;
+        let workspace = runtime.verifier.launch.workspace.clone();
+        let mut environment = base_guest_environment(attempt.task(), &workspace);
+        environment.push(("CODEX_HOME".to_owned(), GUEST_HARNESS_HOME.to_owned()));
+        if let PreparedGuestAuth::ApiKey(key) = &auth {
+            environment.push(("OPENAI_API_KEY".to_owned(), key.to_string()));
+        }
+        let prompt = attempt.task().prompt().to_owned();
+        let instructions = attempt.task().agent_instructions().map(str::to_owned);
+        let runner = Arc::new(GuestCliRunner {
+            session,
+            workspace,
+            environment: environment.into_iter().collect(),
+            command: self.harness.guest_command.clone(),
+            mount_tag: GUEST_HARNESS_SHARE_TAG,
+            mount: GUEST_HARNESS_MOUNT,
+            auth,
+            driver: self.harness.driver,
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+            web_search: self.web_search,
+            args: self.harness.args.clone(),
+            prompt,
+            instructions: instructions.clone(),
+            native_output: attempt.directory().join("agent/harness-native.jsonl"),
+        });
+        let readiness = Arc::clone(&runner);
+        let mut codex = CodexExec::new(&self.harness.host_command, &self.model, &self.effort)
+            .map_err(|error| VmAttemptError::Harness(error.to_string()))?
+            .web_search(self.web_search);
+        if let Some(instructions) = instructions {
+            codex = codex.developer_instructions(instructions);
+        }
+        if self.harness.driver == GuestHarnessDriver::Nanocodex {
+            codex = codex.nanocodex_cli();
+        }
+        let codex = codex.command_runner(runner);
+        Ok(runtime
+            .codex(codex)
+            .ready(async move { readiness.prepare().await }))
+    }
+}
+
+impl GuestCliRunner {
+    async fn prepare(&self) -> Result<(), VmAttemptError> {
+        self.session.ready().await?;
+        self.session
+            .create_directory(self.mount, 0o755, None)
+            .await?;
+        let mounted = self
+            .session
+            .command(
+                VmCommand::new("/bin/mount")
+                    .arg("-t")
+                    .arg("virtiofs")
+                    .arg("-o")
+                    .arg("ro")
+                    .arg(self.mount_tag)
+                    .arg(self.mount)
+                    .environment(self.environment.clone())
+                    .timeout(Duration::from_secs(30)),
+            )
+            .await?;
+        if mounted.exit_code != 0 {
+            return Err(VmAttemptError::Harness(format!(
+                "failed to mount harness executable: {}",
+                String::from_utf8_lossy(&mounted.stderr).trim()
+            )));
+        }
+        self.session
+            .create_directory(GUEST_HARNESS_HOME, 0o700, None)
+            .await?;
+        if let PreparedGuestAuth::AuthFile(bytes) = &self.auth {
+            self.session
+                .write_file(GUEST_HARNESS_AUTH_FILE, bytes.to_vec(), 0o600)
+                .await?;
+        }
+        let version = self
+            .session
+            .command(
+                VmCommand::new(&self.command)
+                    .arg("--version")
+                    .current_directory(&self.workspace)
+                    .environment(self.environment.clone())
+                    .timeout(Duration::from_secs(30)),
+            )
+            .await?;
+        if version.exit_code != 0 {
+            return Err(VmAttemptError::Harness(format!(
+                "guest harness --version exited {}: {}",
+                version.exit_code,
+                String::from_utf8_lossy(&version.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
+
+    fn command(&self, codex_arguments: Vec<String>, timeout: Duration) -> VmCommand {
+        let mut command = VmCommand::new(&self.command)
+            .current_directory(&self.workspace)
+            .environment(self.environment.clone())
+            .timeout(timeout)
+            .max_output_bytes(GUEST_HARNESS_OUTPUT_BYTES);
+        match self.driver {
+            GuestHarnessDriver::Codex => {
+                let split = codex_arguments
+                    .iter()
+                    .position(|argument| argument == "--")
+                    .unwrap_or(codex_arguments.len());
+                for argument in &codex_arguments[..split] {
+                    command = command.arg(argument);
+                }
+                for argument in &self.args {
+                    command = command.arg(argument);
+                }
+                for argument in &codex_arguments[split..] {
+                    command = command.arg(argument);
+                }
+            }
+            GuestHarnessDriver::Nanocodex => {
+                command = command
+                    .arg("run")
+                    .arg("--model")
+                    .arg(&self.model)
+                    .arg("--thinking")
+                    .arg(&self.effort)
+                    .arg("--web-search")
+                    .arg(self.web_search.to_string())
+                    .arg("--cwd")
+                    .arg(&self.workspace);
+                if let Some(instructions) = &self.instructions {
+                    command = command.arg("--instructions").arg(instructions);
+                }
+                for argument in &self.args {
+                    command = command.arg(argument);
+                }
+                command = command.arg(&self.prompt);
+            }
+        }
+        command
+    }
+
+    async fn normalize_nanocodex(&self, output: &[u8]) -> Result<Vec<u8>, io::Error> {
+        if let Some(parent) = self.native_output.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(&self.native_output, output).await?;
+        let mut final_message = None;
+        let mut completed = None;
+        for line in output
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+        {
+            let event: serde_json::Value =
+                serde_json::from_slice(line).map_err(io::Error::other)?;
+            match event.get("type").and_then(serde_json::Value::as_str) {
+                Some("assistant.message") => {
+                    final_message = event
+                        .pointer("/payload/text")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned);
+                }
+                Some("run.completed") => completed = Some(event),
+                _ => {}
+            }
+        }
+        let completed = completed
+            .ok_or_else(|| io::Error::other("Nanocodex CLI emitted no run.completed event"))?;
+        let message = final_message
+            .ok_or_else(|| io::Error::other("Nanocodex CLI emitted no final assistant message"))?;
+        let usage = completed
+            .pointer("/payload/usage")
+            .cloned()
+            .unwrap_or_else(|| {
+                serde_json::json!({
+                    "input_tokens": 0,
+                    "cached_input_tokens": 0,
+                    "output_tokens": 0
+                })
+            });
+        let mut normalized = serde_json::to_vec(&serde_json::json!({
+            "type": "item.completed",
+            "item": {"id": "nanocodex-final", "type": "agent_message", "text": message}
+        }))
+        .map_err(io::Error::other)?;
+        normalized.push(b'\n');
+        normalized.extend(
+            serde_json::to_vec(&serde_json::json!({"type": "turn.completed", "usage": usage}))
+                .map_err(io::Error::other)?,
+        );
+        normalized.push(b'\n');
+        Ok(normalized)
+    }
+}
+
+impl CodexCommandRunner for GuestCliRunner {
+    fn run<'a>(
+        &'a self,
+        arguments: Vec<String>,
+        timeout: Duration,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<CodexCommandOutput, CodexCommandRunnerError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let result = self.session.command(self.command(arguments, timeout)).await;
+            let (status, stdout, stderr) = match result {
+                Ok(output) => (
+                    CodexCommandStatus::Exited(output.exit_code),
+                    output.stdout,
+                    output.stderr,
+                ),
+                Err(VmToolSessionError::GuestTimeout { output, .. }) => {
+                    (CodexCommandStatus::TimedOut, output.stdout, output.stderr)
+                }
+                Err(error) => return Err(CodexCommandRunnerError::new(error.to_string())),
+            };
+            let stdout = if self.driver == GuestHarnessDriver::Nanocodex {
+                self.normalize_nanocodex(&stdout)
+                    .await
+                    .map_err(|error| CodexCommandRunnerError::new(error.to_string()))?
+            } else {
+                stdout
+            };
+            Ok(CodexCommandOutput {
+                status,
+                stdout,
+                stderr,
+            })
         })
     }
 }
@@ -1773,6 +2247,9 @@ pub enum VmAttemptError {
     /// The isolated userspace network process failed.
     #[error(transparent)]
     Network(#[from] VmGvproxyError),
+    /// Guest CLI treatment staging or execution configuration was invalid.
+    #[error("guest harness failed: {0}")]
+    Harness(String),
 }
 
 /// One materialized VM attempt with its guest session and owned verifier.

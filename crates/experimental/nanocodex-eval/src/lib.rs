@@ -85,6 +85,8 @@ pub mod harbor;
 /// Content-addressed importers for third-party evaluation datasets.
 pub mod import;
 mod job;
+/// Evaluator-owned model judge endpoint for isolated verifier processes.
+pub mod judge;
 mod native;
 /// Typed manifest profiles and resolved evaluation matrices.
 pub mod profile;
