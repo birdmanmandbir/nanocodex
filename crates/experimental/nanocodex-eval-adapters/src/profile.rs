@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ArenaHard, BuiltinSourceError, BuiltinSources, ExternalHarness, GeneBenchPro, GraphWalks,
-    HarborDataset, Mrcr, OpenAiEvals, SweBench,
+    HarborDataset, HealthBenchProfessional, Mrcr, OpenAiEvals, SweBench,
 };
 
 /// A complete manifest using Nanocodex's concrete third-party benchmark recipes.
@@ -164,6 +164,18 @@ pub enum Benchmark {
         /// Pinned dataset revision.
         revision: String,
         /// Wrapper around the published deterministic similarity grader.
+        harness: PathBuf,
+        /// Candidate environment.
+        #[serde(default = "default_image")]
+        image: String,
+    },
+    /// OpenAI's public HealthBench Professional conversations and rubrics.
+    HealthbenchProfessional {
+        /// Official JSONL release.
+        source: PathBuf,
+        /// Pinned dataset revision.
+        revision: String,
+        /// Evaluator-owned rubric judge wrapper.
         harness: PathBuf,
         /// Candidate environment.
         #[serde(default = "default_image")]
@@ -516,6 +528,7 @@ impl BenchmarkCatalog {
             "deep-swe-v1.1" => "harbor",
             "graphwalks" => "graphwalks",
             "mrcr-v2" => "mrcr",
+            "healthbench-professional" => "healthbench-professional",
             _ => return None,
         };
         Some(Builtin { adapter })
@@ -663,6 +676,17 @@ impl<'a> ProfileImporter<'a> {
                 harness,
                 image,
             } => store.import(&Mrcr::new(
+                resolve_path(root, source),
+                revision,
+                Environment::OciImage(image.clone()),
+                resolve_path(root, harness),
+            )),
+            Benchmark::HealthbenchProfessional {
+                source,
+                revision,
+                harness,
+                image,
+            } => store.import(&HealthBenchProfessional::new(
                 resolve_path(root, source),
                 revision,
                 Environment::OciImage(image.clone()),
@@ -839,6 +863,7 @@ mod tests {
             "deep-swe-v1.1",
             "graphwalks",
             "mrcr-v2",
+            "healthbench-professional",
         ] {
             assert!(BenchmarkCatalog::new().contains(benchmark), "{benchmark}");
         }
@@ -1086,6 +1111,7 @@ thinking = ["low"]
                 "external-smoke",
                 "genebench-pro-public",
                 "graphwalks",
+                "healthbench-professional",
                 "mrcr-v2",
                 "openai-evals",
                 "swe-bench-verified-smoke",

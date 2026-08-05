@@ -90,6 +90,8 @@ pub struct AttemptTaskIdentity {
     pub harbor_checksum: Option<String>,
     /// Declared OCI image reference, when retained.
     pub image_reference: Option<String>,
+    /// Candidate environment network policy, when retained.
+    pub network: Option<String>,
     /// Verifier recipe and scoring-policy identity.
     pub verifier: AttemptVerifierIdentity,
 }
@@ -105,6 +107,8 @@ pub struct AttemptVerifierIdentity {
     pub timeout_ns: Option<u64>,
     /// Stable reward-to-pass classification policy.
     pub scoring_policy: String,
+    /// Verifier environment network policy, when retained.
+    pub network: Option<String>,
 }
 
 /// Structured identity for one swept agent configuration.
@@ -704,7 +708,7 @@ impl AttemptTaskIdentity {
                 .dataset()
                 .map(str::to_owned)
                 .or_else(|| dataset_name(task.name())),
-            dataset_revision: None,
+            dataset_revision: task.dataset_revision().map(str::to_owned),
             name: task.name().to_owned(),
             prompt_chars: Some(task.prompt_chars()),
             benchmark_prompt_chars: task.benchmark_prompt_chars(),
@@ -714,6 +718,7 @@ impl AttemptTaskIdentity {
             package_digest: format!("sha256:{}", task.content_digest()),
             harbor_checksum: None,
             image_reference: Some(task.image().reference().to_owned()),
+            network: Some(task.network().as_str().to_owned()),
             verifier: AttemptVerifierIdentity {
                 script: Some(
                     task.verifier()
@@ -725,6 +730,7 @@ impl AttemptTaskIdentity {
                 environment_mode: Some(task.verifier().environment_mode().as_str().to_owned()),
                 timeout_ns: Some(duration_ns_saturating(task.verifier().timeout())),
                 scoring_policy: task.verifier().scoring_policy().as_str().to_owned(),
+                network: Some(task.verifier().network().as_str().to_owned()),
             },
         }
     }
@@ -1222,11 +1228,13 @@ fn default_task() -> AttemptTaskIdentity {
         package_digest: String::new(),
         harbor_checksum: None,
         image_reference: None,
+        network: None,
         verifier: AttemptVerifierIdentity {
             script: None,
             environment_mode: None,
             timeout_ns: None,
             scoring_policy: "all_rewards_positive-v1".to_owned(),
+            network: None,
         },
     }
 }
@@ -1301,11 +1309,13 @@ mod tests {
                 package_digest: format!("sha256:{task}"),
                 harbor_checksum: None,
                 image_reference: Some("fixture:latest".to_owned()),
+                network: Some("no-network".to_owned()),
                 verifier: AttemptVerifierIdentity {
                     script: Some(PathBuf::from("tests/test.sh")),
                     environment_mode: Some("same".to_owned()),
                     timeout_ns: Some(1_000_000_000),
                     scoring_policy: "all_rewards_positive-v1".to_owned(),
+                    network: Some("public".to_owned()),
                 },
             },
             configuration: AttemptConfigurationIdentity {

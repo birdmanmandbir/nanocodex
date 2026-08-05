@@ -1386,10 +1386,10 @@ impl VmResourcesBuilder {
             .iter()
             .map(|task| (task.root().to_path_buf(), Arc::new(AsyncOnceCell::new())))
             .collect();
-        let public_network = self
-            .tasks
-            .iter()
-            .any(|task| task.network() == NetworkPolicy::Public);
+        let public_network = self.tasks.iter().any(|task| {
+            task.network() == NetworkPolicy::Public
+                || task.verifier().network() == NetworkPolicy::Public
+        });
         let gvproxy = if public_network {
             match self.gvproxy {
                 Some(path) if path.is_file() => Some(path),
@@ -2810,7 +2810,7 @@ fn vm_attempt_inner(
     };
     let verifier_network = if environment.verifier.is_some() {
         spawn_attempt_network(
-            attempt.task().network(),
+            attempt.task().verifier().network(),
             host.gvproxy,
             &attempt.directory().join("verifier-vm").join("gvproxy.log"),
         )?
@@ -3328,7 +3328,7 @@ impl VerifierCache {
             AttemptRootPolicy::DisposableOverlay,
         )?;
         let network = spawn_preparation_network(
-            task.network(),
+            task.verifier().network(),
             gvproxy,
             &temporary.path().join("gvproxy.log"),
         )?;

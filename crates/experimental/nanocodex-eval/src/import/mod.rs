@@ -106,6 +106,7 @@ struct HermeticCase {
     verifier_timeout: Duration,
     scoring_policy: ScoringPolicy,
     allow_internet: bool,
+    verifier_allow_internet: bool,
 }
 
 /// Agent environment used by a generated case.
@@ -455,6 +456,7 @@ impl DatasetPlan {
                         case.agent_instructions.as_deref().unwrap_or("").as_bytes(),
                     );
                     Self::update_digest(&mut digest, &[u8::from(case.allow_internet)]);
+                    Self::update_digest(&mut digest, &[u8::from(case.verifier_allow_internet)]);
                 }
             }
         }
@@ -554,7 +556,7 @@ impl ImportedDataset {
                     entry.id
                 )));
             }
-            tasks.push(task);
+            tasks.push(task.attach_dataset(&manifest.name, Some(manifest.source.revision())));
         }
         Ok(Self {
             root,
@@ -728,6 +730,7 @@ impl CasePlan {
                 verifier_timeout: Duration::from_secs(300),
                 scoring_policy: ScoringPolicy::AllRewardsPositive,
                 allow_internet: true,
+                verifier_allow_internet: true,
             },
         })
     }
@@ -819,6 +822,17 @@ impl HermeticCasePlan {
     #[must_use]
     pub const fn allow_internet(mut self, allow: bool) -> Self {
         self.case.allow_internet = allow;
+        self.case.verifier_allow_internet = allow;
+        self
+    }
+
+    /// Selects whether a separate verifier environment has a network device.
+    ///
+    /// This may differ from the agent policy only when the harness supplies a
+    /// separate verifier Dockerfile.
+    #[must_use]
+    pub const fn verifier_allow_internet(mut self, allow: bool) -> Self {
+        self.case.verifier_allow_internet = allow;
         self
     }
 
@@ -938,6 +952,13 @@ fn materialize_hermetic_case(
             timeout_sec: case.verifier_timeout.as_secs_f64(),
             environment_mode: if separate { "separate" } else { "same" },
             scoring_policy: case.scoring_policy,
+            network_mode: (case.verifier_allow_internet != case.allow_internet).then_some(
+                if case.verifier_allow_internet {
+                    "public"
+                } else {
+                    "no-network"
+                },
+            ),
         },
         environment: GeneratedEnvironment {
             docker_image: image.as_deref(),
@@ -1012,6 +1033,8 @@ struct GeneratedVerifier<'a> {
     timeout_sec: f64,
     environment_mode: &'a str,
     scoring_policy: ScoringPolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    network_mode: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -1271,6 +1294,8 @@ mod tests {
         assert_eq!(first.digest(), second.digest());
         assert_eq!(first.tasks().len(), 1);
         assert_eq!(first.tasks()[0].prompt(), "first");
+        assert_eq!(first.tasks()[0].dataset(), Some("fixture"));
+        assert_eq!(first.tasks()[0].dataset_revision(), Some("upstream@1"));
         let manifest = fs::read_to_string(first.root().join("dataset.json")).unwrap();
         assert!(!manifest.contains(&source.path().display().to_string()));
 

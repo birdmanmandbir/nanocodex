@@ -25,6 +25,7 @@ pub struct Task {
     content_digest: Box<str>,
     package: Arc<TaskPackage>,
     dataset: Option<Box<str>>,
+    dataset_revision: Option<Box<str>>,
     name: Box<str>,
     description: Box<str>,
     prompt: Box<str>,
@@ -59,6 +60,7 @@ pub struct Verifier {
     environment_mode: VerifierEnvironmentMode,
     collect: Vec<VerifierCollect>,
     scoring_policy: ScoringPolicy,
+    network: NetworkPolicy,
 }
 
 /// Binary classification applied to benchmark-owned numeric rewards.
@@ -301,7 +303,7 @@ impl Task {
             });
         }
 
-        let network = raw.network_policy(&config_path)?;
+        let (network, verifier_network) = raw.network_policies(&config_path)?;
         let name = required_string(&config_path, "task.name", raw.task.name)?;
         if raw.task.benchmark_prompt_chars == Some(0) {
             return Err(TaskLoadError::Invalid {
@@ -327,6 +329,7 @@ impl Task {
             content_digest,
             package: Arc::new(package),
             dataset: None,
+            dataset_revision: None,
             name: name.into_boxed_str(),
             description: raw.task.description.into_boxed_str(),
             prompt_chars: u64::try_from(
@@ -364,6 +367,7 @@ impl Task {
                 environment_mode: raw.verifier.environment_mode,
                 collect: raw.verifier.collect,
                 scoring_policy: raw.verifier.scoring_policy,
+                network: verifier_network,
             },
             artifacts: raw
                 .artifacts
@@ -520,8 +524,15 @@ impl Task {
         self.dataset.as_deref()
     }
 
-    pub(crate) fn attach_dataset(mut self, dataset: &str) -> Self {
+    /// Returns the pinned upstream revision attached by an imported dataset.
+    #[must_use]
+    pub fn dataset_revision(&self) -> Option<&str> {
+        self.dataset_revision.as_deref()
+    }
+
+    pub(crate) fn attach_dataset(mut self, dataset: &str, revision: Option<&str>) -> Self {
         self.dataset = Some(dataset.to_owned().into_boxed_str());
+        self.dataset_revision = revision.map(|revision| revision.to_owned().into_boxed_str());
         self
     }
 
@@ -745,6 +756,12 @@ impl Verifier {
     pub const fn scoring_policy(&self) -> ScoringPolicy {
         self.scoring_policy
     }
+
+    /// Returns the verifier VM's network policy.
+    #[must_use]
+    pub const fn network(&self) -> NetworkPolicy {
+        self.network
+    }
 }
 
 impl ScoringPolicy {
@@ -824,21 +841,22 @@ struct RawTask {
 }
 
 impl RawTask {
-    fn network_policy(&self, config: &Path) -> Result<NetworkPolicy, TaskLoadError> {
+    fn network_policies(
+        &self,
+        config: &Path,
+    ) -> Result<(NetworkPolicy, NetworkPolicy), TaskLoadError> {
         let environment = self.environment.network_policy(config)?;
         let agent = self.agent.network_mode.unwrap_or(environment);
         let verifier = self.verifier.network_mode.unwrap_or(environment);
-        if agent != verifier {
+        if agent != verifier && self.verifier.environment_mode != VerifierEnvironmentMode::Separate
+        {
             return Err(TaskLoadError::Invalid {
                 path: config.to_path_buf(),
-                message: format!(
-                    "distinct agent ({}) and verifier ({}) network modes are unsupported",
-                    agent.as_str(),
-                    verifier.as_str()
-                ),
+                message: "distinct agent and verifier network modes require a separate verifier environment"
+                    .to_owned(),
             });
         }
-        agent.policy(config)
+        Ok((agent.policy(config)?, verifier.policy(config)?))
     }
 }
 
@@ -996,14 +1014,6 @@ enum RawNetworkMode {
 }
 
 impl RawNetworkMode {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Public => "public",
-            Self::NoNetwork => "no-network",
-            Self::Allowlist => "allowlist",
-        }
-    }
-
     fn policy(self, config: &Path) -> Result<NetworkPolicy, TaskLoadError> {
         match self {
             Self::Public => Ok(NetworkPolicy::Public),
@@ -1411,7 +1421,7 @@ network_mode = "no-network"
 [verifier]
 timeout_sec = 600.0
 environment_mode = "separate"
-network_mode = "no-network"
+network_mode = "public"
 
 [[verifier.collect]]
 command = "cp /app/output.txt /tmp/output.txt"
@@ -1441,6 +1451,7 @@ storage_mb = 10240
 
         assert_eq!(task.image().reference(), "local-dockerfile");
         assert_eq!(task.network(), NetworkPolicy::Disabled);
+        assert_eq!(task.verifier().network(), NetworkPolicy::Public);
         assert_eq!(
             task.verifier().environment_mode(),
             VerifierEnvironmentMode::Separate

@@ -140,6 +140,10 @@ pub struct PreparedTask {
     selector: String,
     root: PathBuf,
     digest: String,
+    #[serde(default)]
+    dataset: Option<String>,
+    #[serde(default)]
+    dataset_revision: Option<String>,
 }
 
 /// One exact additional harness bound into a preparation receipt.
@@ -760,6 +764,8 @@ impl PreparedTask {
             selector: selector.into(),
             root: task.root().to_path_buf(),
             digest: task.content_digest().to_owned(),
+            dataset: task.dataset().map(str::to_owned),
+            dataset_revision: task.dataset_revision().map(str::to_owned),
         }
     }
 
@@ -780,11 +786,17 @@ impl PreparedTask {
 
     fn load(&self) -> Result<crate::Task, crate::TaskLoadError> {
         let task = crate::Task::load(&self.root)?;
-        Ok(if let Some((dataset, _)) = self.selector.split_once('/') {
-            task.attach_dataset(dataset)
-        } else {
-            task
-        })
+        Ok(
+            if let Some(dataset) = self
+                .dataset
+                .as_deref()
+                .or_else(|| self.selector.split_once('/').map(|(dataset, _)| dataset))
+            {
+                task.attach_dataset(dataset, self.dataset_revision.as_deref())
+            } else {
+                task
+            },
+        )
     }
 }
 
@@ -1520,7 +1532,9 @@ allow_internet = false
 "#,
         )
         .unwrap();
-        let task = crate::Task::load(&task_root).unwrap();
+        let task = crate::Task::load(&task_root)
+            .unwrap()
+            .attach_dataset("fixture", Some("fixture@1"));
         let profile = ResolvedProfile {
             name: "smoke".to_owned(),
             hosts: Vec::new(),
@@ -1546,6 +1560,7 @@ allow_internet = false
             .run_plan(&Nanocodex::builder(OpenAi::new("test-key").unwrap()))
             .unwrap();
         assert_eq!(plan.tasks()[0].dataset(), Some("fixture"));
+        assert_eq!(plan.tasks()[0].dataset_revision(), Some("fixture@1"));
         assert_eq!(plan.into_sweep().attempt_count(), 8);
         let plan = receipt
             .run_plan_for(

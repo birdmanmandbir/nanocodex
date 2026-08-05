@@ -1372,10 +1372,12 @@ impl HarborTrialLock {
                 materialization_digest_schema: PACKAGE_DIGEST_SCHEMA.to_owned(),
                 materialization_digest: format!("sha256:{materialization_digest}"),
                 dataset: task.dataset().map(str::to_owned),
+                dataset_revision: task.dataset_revision().map(str::to_owned),
                 prompt_chars: Some(task.prompt_chars()),
                 benchmark_prompt_chars: task.benchmark_prompt_chars(),
                 benchmark_case_type: task.benchmark_case_type().map(str::to_owned),
                 image_reference: task.image().reference().to_owned(),
+                network: Some(task.network().as_str().to_owned()),
                 verifier_script: task
                     .verifier()
                     .script()
@@ -1386,6 +1388,7 @@ impl HarborTrialLock {
                 verifier_timeout_ns: u64::try_from(task.verifier().timeout().as_nanos())
                     .unwrap_or(u64::MAX),
                 scoring_policy: task.verifier().scoring_policy().as_str().to_owned(),
+                verifier_network: Some(task.verifier().network().as_str().to_owned()),
             },
             install_only: false,
             timeout_multiplier: 1.0,
@@ -1410,16 +1413,22 @@ struct NanocodexTrialLock {
     #[serde(default)]
     dataset: Option<String>,
     #[serde(default)]
+    dataset_revision: Option<String>,
+    #[serde(default)]
     prompt_chars: Option<u64>,
     #[serde(default)]
     benchmark_prompt_chars: Option<u64>,
     #[serde(default)]
     benchmark_case_type: Option<String>,
     image_reference: String,
+    #[serde(default)]
+    network: Option<String>,
     verifier_script: PathBuf,
     verifier_environment_mode: String,
     verifier_timeout_ns: u64,
     scoring_policy: String,
+    #[serde(default)]
+    verifier_network: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -1817,7 +1826,7 @@ impl DurableHarborTrial {
                     .split_once('/')
                     .map(|(dataset, _)| dataset.to_owned())
             }),
-            dataset_revision: None,
+            dataset_revision: nanocodex_lock.dataset_revision.clone(),
             name: self.result.task_name.clone(),
             prompt_chars: nanocodex_lock.prompt_chars,
             benchmark_prompt_chars: nanocodex_lock.benchmark_prompt_chars,
@@ -1827,11 +1836,13 @@ impl DurableHarborTrial {
             package_digest: nanocodex_lock.materialization_digest.clone(),
             harbor_checksum: Some(self.result.task_checksum.clone()),
             image_reference: Some(nanocodex_lock.image_reference.clone()),
+            network: nanocodex_lock.network.clone(),
             verifier: AttemptVerifierIdentity {
                 script: Some(nanocodex_lock.verifier_script.clone()),
                 environment_mode: Some(nanocodex_lock.verifier_environment_mode.clone()),
                 timeout_ns: Some(nanocodex_lock.verifier_timeout_ns),
                 scoring_policy: nanocodex_lock.scoring_policy.clone(),
+                network: nanocodex_lock.verifier_network.clone(),
             },
         };
         let configuration = AttemptConfigurationIdentity {

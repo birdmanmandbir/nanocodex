@@ -308,6 +308,9 @@ through PR #72's existing concrete importers:
 - `mrcr`: OpenAI's pinned corrected multi-turn release, typed synthetic
   transcript, needle/context dimensions, and published prefix-constrained
   `SequenceMatcher` grader; and
+- `healthbench-professional`: OpenAI's pinned 525-case public release, typed
+  conversation history, isolated rubric evidence, and published raw/length-
+  adjusted scoring contract; and
 - `external`: a benchmark-owned hermetic manifest for PaperBench, MLE-style,
   private, or otherwise executable benchmark semantics.
 
@@ -394,6 +397,28 @@ similarity reward. The native smoke profile is required because stock prompt
 CLI drivers cannot faithfully seed an existing assistant transcript; such a
 driver must reject the task before model spend rather than flattening it.
 
+HealthBench Professional is the next completed public benchmark shape. Its
+catalog recipe pins OpenAI's 525-case JSONL release and exact object hash,
+preserves every alternating conversation as typed transcript state, and keeps
+physician responses, rubrics, and the canary outside the candidate VM. The
+candidate VM has no network device; only its separate verifier can reach the
+run-scoped evaluator judge. The public reproduction applies the published raw
+rubric equation and per-character length adjustment and retains every rubric
+decision. OpenAI's exact internal grader is unavailable, so the evaluator-owned
+GPT-5.6 Sol low judge is explicitly differential evidence rather than a claim
+of score parity. Individual adjusted scores remain unclipped; the official
+full-benchmark statistic clips their mean to `[0, 1]`.
+
+The first live HealthBench Professional lifecycle is retained under preparation
+`d66fe523f27437304f954351e96eae2328c0a211409ded3d224c7e5785b200f9`
+and job `019fd332-b589-78b2-8d9f-32db755e810f`. The selected three-message
+red-team case completed one model call and one rubric judgment in 20.09 seconds,
+with complete billing, no tools, clean agent/verifier shutdown, and no leaked
+VM, gvproxy, or overlay processes. It scored 1.0 raw and 1.0336924 after the
+published adjustment for its 854-character response. The next ordinary `run`
+resumed the coordinate with zero model calls and reconstructed a schema-v5
+report. This is adapter/lifecycle evidence, not a release benchmark score.
+
 Each built-in catalog entry owns its stable user-facing name, authoritative
 source location, pinned revision, adapter choice, official verifier assets,
 default task environment, and any acquisition or credential requirements. The
@@ -425,6 +450,8 @@ or unpublished suites remain explicitly unavailable.
 OpenAI's deprecated `simple-evals` repository and its BrowseComp, GPQA, and
 HealthBench recipes are explicitly outside the supported catalog. They are not
 acquired during preparation and do not remain as hidden adapter or CLI routes.
+The HealthBench Professional adapter instead consumes OpenAI's direct official
+dataset and published scoring methodology.
 
 For custom sources, `[benchmark.<name>].adapter` must deserialize through the
 same closed, typed adapter configuration with unknown fields denied, construct
@@ -764,7 +791,9 @@ may hide missing coordinates or mix incompatible preparation identities.
     run exposed and fixed terminal context-window retry classification; MRCR v2
     now supplies the first faithfully normalized multi-turn shape. Continue by
     accepting clean reruns and implementing the next obtainable benchmark
-    family.
+    family. HealthBench Professional now has a pinned direct-source adapter,
+    isolated subscription-backed judge, live smoke, clean resume, and retained
+    report evidence; continue with the next obtainable family.
 11. [ ] Run the coordinator/runner architecture with one saturated remote
     runner on `dev-georgios`, retaining all heavyweight state on its verified
     3.5 TB drive. Add cross-host sharding only after measurements show that

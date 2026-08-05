@@ -33,6 +33,7 @@ tasks = [
   "genebench-pro-public/multiparent_qtl_hmm_lmm",
   "graphwalks/128k-and-shorter-000749",
   "mrcr-v2/8needle-0-000000",
+  "healthbench-professional/e339f34a3a35f3f067422b5768287f7c",
   "external-smoke/exact-answer",
 ]
 trials = 1
@@ -60,3 +61,15 @@ tasks = ["mrcr-v2/8needle-0-000000"]
 trials = 1
 model = ["gpt-5.6-sol"]
 thinking = ["low"]
+
+[profiles.healthbench-professional-smoke]
+tasks = ["healthbench-professional/e339f34a3a35f3f067422b5768287f7c"]
+trials = 1
+model = ["gpt-5.6-sol"]
+thinking = ["low"]
+
+[profiles.healthbench-professional-full]
+tasks = ["healthbench-professional"]
+trials = 8
+model = ["gpt-5.6-sol"]
+thinking = ["max"]

@@ -30,6 +30,9 @@ const GRAPHWALKS_SHORT_SHA256: &str =
 const GRAPHWALKS_LONG_SHA256: &str =
     "537879431c72a42e3b500f80efc3047e7facb90390b6063d33679b4320985911";
 const MRCR_REVISION: &str = "f4c69fae7cf81f7ca26b9fee34b392a50f6b8a1d";
+const HEALTHBENCH_PROFESSIONAL_REVISION: &str = "349962fd46dd02343a0d8a606491baf59154ea1a";
+const HEALTHBENCH_PROFESSIONAL_SHA256: &str =
+    "d44b08e6e952e04c945e2c406f02533d9e7a989a84e35820ee7efdff20c9e4e2";
 const MRCR_FILES: [(&str, &str); 6] = [
     (
         "2needle/2needle_0.parquet",
@@ -184,6 +187,16 @@ impl BuiltinSources {
                 harness: assets.join("mrcr"),
                 image: "python:3.12-slim".to_owned(),
             }),
+            "healthbench-professional" => Ok(Benchmark::HealthbenchProfessional {
+                source: self
+                    .root
+                    .join("healthbench-professional/healthbench_professional_eval.jsonl"),
+                revision: format!(
+                    "openai/healthbench-professional@{HEALTHBENCH_PROFESSIONAL_REVISION}"
+                ),
+                harness: assets.join("healthbench-professional"),
+                image: "python:3.12-slim".to_owned(),
+            }),
             other => Err(BuiltinSourceError::Unsupported(other.to_owned())),
         }
     }
@@ -199,6 +212,7 @@ impl BuiltinSources {
                 | "deep-swe-v1.1"
                 | "graphwalks"
                 | "mrcr-v2"
+                | "healthbench-professional"
         )
     }
 
@@ -290,6 +304,13 @@ impl BuiltinSources {
             ),
             "graphwalks" => self.materialize_graphwalks(),
             "mrcr-v2" => self.materialize_mrcr(),
+            "healthbench-professional" => self.download(
+                "healthbench-professional/healthbench_professional_eval.jsonl",
+                &format!(
+                    "https://huggingface.co/datasets/openai/healthbench-professional/resolve/{HEALTHBENCH_PROFESSIONAL_REVISION}/healthbench_professional_eval.jsonl"
+                ),
+                HEALTHBENCH_PROFESSIONAL_SHA256,
+            ),
             other => Err(BuiltinSourceError::Unsupported(other.to_owned())),
         }
     }
