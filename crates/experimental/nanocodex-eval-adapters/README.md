@@ -37,8 +37,8 @@ evidence have no benchmark-specific branches.
 | Arena-Hard | Converts each question to a final-message case | Caller-packaged official Arena judge harness |
 | OpenAI Evals `Match` / `Includes` | Reads registry YAML and JSONL; preserves their starts-with / substring behavior | Snapshotted deterministic harness |
 | OpenAI `simple-evals` BrowseComp and GPQA Diamond | Reproduces the published prompt/data preparation and snapshots the pinned upstream implementation | OpenAI reference grader or answer extraction |
-| HealthBench | Preserves the complete grader conversation and rubric metadata for single-turn cases | OpenAI `simple-evals` GPT-4.1 rubric grader |
-| HealthBench Professional | Converts the public dataset shape and uses GPT-5.4-low plus the published length adjustment for single-turn cases | OpenAI's external reference settings; OpenAI's reported internal harness is not public |
+| HealthBench | Preserves the complete grader conversation and rubric metadata for single-turn cases | OpenAI reference rubric grader through the evaluator-pinned OpenAI judge |
+| HealthBench Professional | Converts the public dataset shape and applies the published length adjustment for single-turn cases | OpenAI external reference grader through the evaluator-pinned OpenAI judge; OpenAI's reported internal harness is not public |
 | Other OpenAI Evals classes | Refused by the declarative adapter | Official code through `ExternalHarness` |
 | SWE-bench | Preserves problem statements and official instance-image naming; packages exact instance metadata | Caller-packaged official SWE-bench harness |
 | MLE-bench, PaperBench, and private suites | Reads a prepared generic external manifest | Benchmark-owned harness |
@@ -134,13 +134,16 @@ importers. The deprecated `simple-evals` checkout is only a frozen internal
 reference source for stable `browsecomp`, `gpqa-diamond`, and `healthbench`
 catalog entries; it is not a profile-facing benchmark or execution framework.
 
-Model judges use an explicit benchmark-owned OpenAI model through the
-evaluator-owned judge runtime. That runtime uses the operator's local OpenAI
-subscription by default and the explicitly selected API-key authentication as
-a fallback. Only a run-scoped endpoint and bearer token enter the isolated
-verifier; neither candidate guests nor durable evidence receive provider
-credentials. The imported benchmark package and generic VM layer remain
-unchanged.
+Model judges use GPT-5.6 Sol through the evaluator-owned judge runtime. That
+runtime uses the operator's local OpenAI subscription by default and the
+explicitly selected API-key authentication as a fallback. It exposes the
+Responses and Chat Completions protocol shapes needed by the pinned reference
+graders, and records the effective grader model with their evidence. Only a
+run-scoped endpoint and bearer token enter the isolated verifier; neither
+candidate guests nor durable evidence receive provider credentials. Because
+HealthBench Professional's published external setting uses GPT-5.4-low, a
+GPT-5.6-Sol-graded smoke proves adapter behavior but is not labeled as a
+directly comparable official HealthBench Professional score.
 
 ## External harness manifest
 

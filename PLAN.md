@@ -334,15 +334,20 @@ deterministic and network-free. Catalog entries are versioned with Nanocodex,
 and a gated dataset fails with an actionable preparation error instead of
 requiring users to restate adapter plumbing in TOML.
 
-Model-based verifiers, including RewardKit-backed judges, use an explicit
-pinned OpenAI grader model. Authentication defaults to the evaluator's local
-OpenAI subscription and uses an API key only when the operator explicitly
-selects that fallback. An evaluator-owned judge runtime stays outside the
-candidate guest and exposes only a run-scoped authenticated endpoint to the
-isolated verifier process. Candidate agents and additional harness CLIs never
-receive grader credentials, judge responses, or rubric internals; no secret is
-written to the preparation receipt or report. Changing a candidate profile's
-`model` sweep never changes the grader model implicitly.
+Model-based verifiers, including RewardKit-backed judges, use evaluator-pinned
+GPT-5.6 Sol. Authentication defaults to the evaluator's local OpenAI
+subscription and uses an API key only when the operator explicitly selects
+that fallback. An evaluator-owned judge runtime stays outside the candidate
+guest and exposes the authenticated Responses and Chat Completions shapes
+needed by pinned reference graders. Candidate agents and additional harness
+CLIs never receive grader credentials, judge responses, or rubric internals;
+no provider secret is written to the preparation receipt or report. Changing
+a candidate profile's `model` sweep never changes the grader model implicitly.
+The effective grader model is retained with verifier evidence. A benchmark
+whose published score uses another grader model, currently HealthBench
+Professional's GPT-5.4-low external setting, is an adapter smoke rather than a
+directly comparable official score until that exact grader can run through the
+same subscription-or-API boundary.
 
 OpenAI's GPT-5.6 system card is a preparedness inventory, not a claim that all
 of OpenAI's internal suites are available. Publicly obtainable families such
@@ -443,18 +448,22 @@ manifest = "eval/fixtures/external-smoke/benchmark.toml"
 
 [profiles.adapter-smoke]
 # No hosts: run locally.
-harnesses = ["codex.code-mode-only", "nanocodex"]
+harnesses = ["codex", "nanocodex"]
 tasks = [
   "terminal-bench-2.1/fix-git",
-  "arena-hard-v2/<question-id>",
-  "openai-evals/<eval-id>/<case-id>",
-  "gpqa-diamond/<case-id>",
-  "swe-bench/<instance-id>",
-  "external-smoke/<case-id>",
+  "arena-hard-v2/2edbb5f36f5b42be",
+  "browsecomp/browsecomp-000000",
+  "healthbench/healthbench-000000",
+  "healthbench-professional/healthbench_professional-000000",
+  "openai-evals/computer-science-problems.s1.simple-v0-000000",
+  "gpqa-diamond/gpqa_diamond-000000",
+  "swe-bench-verified-smoke/astropy__astropy-12907",
+  "external-smoke/exact-answer",
 ]
 trials = 1
 model = ["gpt-5.6-sol"]
 thinking = ["low"]
+web_search = true
 ```
 
 The implementation PR must replace the illustrative task placeholders with
@@ -661,12 +670,16 @@ may hide missing coordinates or mix incompatible preparation identities.
    cleanup before exposing it as normal CLI policy.
 8. [ ] Rebase and decide PR #79, then review PR #89 against the stable-core and
    application-policy boundaries above.
-9. [x] Complete the first profile-driven evaluation milestone directly in PR
-   #72, using its normalized benchmark imports as the only evaluation path. The
-   local `adapter-smoke` profile prepares, runs, verifies, monitors, and reports
-   one real task through every built-in benchmark adapter with current
-   Nanocodex and every implemented guest harness CLI driver, including durable
-   hard-kill recovery and a zero-spend completed-run no-op.
+9. [ ] Complete the first profile-driven evaluation milestone directly in PR
+   #72, using its normalized benchmark imports as the only evaluation path.
+   The evidence audit reopened this gate after finding verifier-environment and
+   differential-trajectory loss in nominally completed runs. The
+   `adapter-smoke` profile now covers nine real shapes, including BrowseComp,
+   HealthBench Chat Completions judging, HealthBench Professional Responses
+   judging, and SWE-bench. Close the milestone only after all 27 current
+   Nanocodex/stock-Codex/external-Nanocodex coordinates retain canonical
+   trajectories, identities, verifier artifacts, subscription-backed judge
+   evidence, hard-kill recovery, cleanup, and a zero-spend completed-run no-op.
 10. [ ] Extend the same PR #72 workflow from that smoke gate to complete local
     profiles covering the recorded GPT-5.6 benchmark families: automatic
     multi-harness/model/thinking matrices, durable monitoring,

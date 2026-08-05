@@ -1,4 +1,12 @@
-#!/bin/sh
-set -eu
+#!/bin/bash
+set -euo pipefail
 
-python3 /tests/grade.py
+if [[ -f /opt/miniconda3/etc/profile.d/conda.sh ]]; then
+  source /opt/miniconda3/etc/profile.d/conda.sh
+  conda activate testbed
+elif [[ -f /root/miniconda3/etc/profile.d/conda.sh ]]; then
+  source /root/miniconda3/etc/profile.d/conda.sh
+  conda activate testbed
+fi
+
+python /tests/grade.py

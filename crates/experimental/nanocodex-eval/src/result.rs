@@ -5,7 +5,7 @@ use nanocodex_oai_api::pricing::EstimatedUsdCost;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{AgentId, Task};
+use crate::{AgentId, AtifTrajectory, Task};
 
 /// Execution environment used for one evaluation attempt.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -288,6 +288,10 @@ pub struct EvalResult {
     pub cleanup: EvalCleanup,
     /// Retained attempt artifact paths.
     pub artifacts: EvalArtifacts,
+    /// Complete normalized candidate trajectory used by the verifier and
+    /// retained report writer.
+    #[serde(skip)]
+    pub trajectory: AtifTrajectory,
     #[serde(skip)]
     pub(crate) task: Task,
 }
@@ -450,6 +454,12 @@ impl EvalResult {
     #[must_use]
     pub const fn task(&self) -> &Task {
         &self.task
+    }
+
+    /// Complete normalized candidate trajectory used for this score.
+    #[must_use]
+    pub const fn trajectory(&self) -> &AtifTrajectory {
+        &self.trajectory
     }
 }
 

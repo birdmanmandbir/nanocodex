@@ -918,7 +918,7 @@ impl Evaluator {
             .trajectory
             .take()
             .unwrap_or_else(|| emitter.finish_trajectory(&task, agent.result.as_ref()));
-        let trajectory = serde_json::to_vec(&trajectory)
+        let trajectory_json = serde_json::to_vec(&trajectory)
             .map_err(EvalError::Json)
             .map_err(AttemptRunFailure::new)?;
         emitter.emit(EvalEventKind::VerifierStarted);
@@ -931,7 +931,7 @@ impl Evaluator {
                 &task,
                 &attempt,
                 final_message,
-                &trajectory,
+                &trajectory_json,
                 agent.verifier.take(),
             )
             .await
@@ -998,6 +998,7 @@ impl Evaluator {
                 workspace: attempt.paths.workspace.clone(),
                 verifier_output: attempt.paths.verifier_output.clone(),
             },
+            trajectory,
             task,
         };
         emitter.emit(EvalEventKind::Completed(Box::new(result.clone())));

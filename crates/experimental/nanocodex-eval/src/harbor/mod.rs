@@ -474,10 +474,7 @@ async fn record(
                         attempt.events.flush()?;
                         attempt.events.get_ref().sync_all()?;
                         let result = result.as_ref().clone();
-                        let trajectory = match &result.agent {
-                            Some(agent) => attempt.atif.finish(result.task(), agent),
-                            None => attempt.atif.finish_failure(result.task()),
-                        };
+                        let trajectory = result.trajectory().clone();
                         artifacts.write_trial(&result, &trajectory)?;
                         completed.insert(result.attempt_id);
                         artifacts.write_job(completed.len(), attempts.len())?;

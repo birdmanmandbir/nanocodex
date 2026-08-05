@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     process::{Command, Output},
@@ -15,6 +16,12 @@ const OPENAI_EVALS_REVISION: &str = "8eac7a7de5215c907fbddc30efdaf316913eccdd";
 const OPENAI_EVALS_SMOKE_DATA_SHA256: &str =
     "a15177151c46b4526e67e84f3292a036b6d5441d9eddc8a88403337395745866";
 const SIMPLE_EVALS_REVISION: &str = "652c89d0ca9df547706735883097e9537d40dc47";
+const HEALTHBENCH_REVISION: &str = "40ee1968852fc57f625934251ac22be47077a8fb";
+const HEALTHBENCH_PROFESSIONAL_REVISION: &str = "349962fd46dd02343a0d8a606491baf59154ea1a";
+const BROWSECOMP_SHA256: &str = "7b24471cd5b3eb2a46830a14802b5c029ea62f488ff75a0f88af7923d1454abf";
+const HEALTHBENCH_SHA256: &str = "e99dd3c6372c10d6fcc5e385c5fae69d0dd40392dae56836ef9493ae324ecd2f";
+const HEALTHBENCH_PROFESSIONAL_SHA256: &str =
+    "d44b08e6e952e04c945e2c406f02533d9e7a989a84e35820ee7efdff20c9e4e2";
 const GPQA_SHA256: &str = "41d1213cd7a4998605a26c2798500652572007161b3a92817ba46b35befcd305";
 const SWE_BENCH_REVISION: &str = "f7bbbb2ccdf479001d6467c9e34af59e44a840f9";
 const SWE_VERIFIED_ROW_RESPONSE_SHA256: &str =
@@ -63,12 +70,33 @@ impl BuiltinSources {
             .keys()
             .filter(|name| Self::is_materialized(name))
             .cloned()
-            .collect::<Vec<_>>();
+            .collect::<BTreeSet<_>>();
         fs::create_dir_all(&self.root).map_err(|source| BuiltinSourceError::Io {
             path: self.root.clone(),
             source,
         })?;
         let mut jobs = tokio::task::JoinSet::new();
+        if selected.iter().any(|name| Self::is_simple_eval(name)) {
+            let this = self.clone();
+            jobs.spawn_blocking(move || {
+                tracing::info!(
+                    source = "openai/simple-evals",
+                    "preparing shared benchmark source"
+                );
+                let result = this.git_checkout(
+                    "simple-evals",
+                    "https://github.com/openai/simple-evals.git",
+                    SIMPLE_EVALS_REVISION,
+                );
+                if result.is_ok() {
+                    tracing::info!(
+                        source = "openai/simple-evals",
+                        "prepared shared benchmark source"
+                    );
+                }
+                result
+            });
+        }
         for name in selected {
             let this = self.clone();
             jobs.spawn_blocking(move || {
@@ -122,6 +150,37 @@ impl BuiltinSources {
                 image: "debian:bookworm-slim".to_owned(),
                 limit: None,
             }),
+            "browsecomp" => Ok(Benchmark::OpenaiSimpleEvals {
+                checkout: self.root.join("simple-evals"),
+                harness: assets.join("openai-simple-evals"),
+                data: self.root.join("data/browse_comp_test_set.csv"),
+                eval: SimpleEval::BrowseComp,
+                revision: format!("openai/simple-evals@{SIMPLE_EVALS_REVISION}"),
+                image: "debian:bookworm-slim".to_owned(),
+                limit: None,
+            }),
+            "healthbench" => Ok(Benchmark::OpenaiSimpleEvals {
+                checkout: self.root.join("simple-evals"),
+                harness: assets.join("openai-simple-evals"),
+                data: self.root.join("data/healthbench.jsonl"),
+                eval: SimpleEval::HealthBench,
+                revision: format!(
+                    "openai/simple-evals@{SIMPLE_EVALS_REVISION}+openai/healthbench@{HEALTHBENCH_REVISION}"
+                ),
+                image: "debian:bookworm-slim".to_owned(),
+                limit: None,
+            }),
+            "healthbench-professional" => Ok(Benchmark::OpenaiSimpleEvals {
+                checkout: self.root.join("simple-evals"),
+                harness: assets.join("openai-simple-evals"),
+                data: self.root.join("data/healthbench-professional.jsonl"),
+                eval: SimpleEval::HealthBenchProfessional,
+                revision: format!(
+                    "openai/simple-evals@{SIMPLE_EVALS_REVISION}+openai/healthbench-professional@{HEALTHBENCH_PROFESSIONAL_REVISION}"
+                ),
+                image: "debian:bookworm-slim".to_owned(),
+                limit: None,
+            }),
             "swe-bench-verified-smoke" => Ok(Benchmark::SweBench {
                 instances: self.root.join("data/swe-bench-verified-smoke.jsonl"),
                 harness: assets.join("swe-bench"),
@@ -142,8 +201,18 @@ impl BuiltinSources {
             "terminal-bench-2.1"
                 | "arena-hard-v2"
                 | "openai-evals"
+                | "browsecomp"
+                | "healthbench"
+                | "healthbench-professional"
                 | "gpqa-diamond"
                 | "swe-bench-verified-smoke"
+        )
+    }
+
+    fn is_simple_eval(name: &str) -> bool {
+        matches!(
+            name,
+            "browsecomp" | "healthbench" | "healthbench-professional" | "gpqa-diamond"
         )
     }
 
@@ -172,17 +241,31 @@ impl BuiltinSources {
                 )
             }
             "gpqa-diamond" => {
-                self.git_checkout(
-                    "simple-evals",
-                    "https://github.com/openai/simple-evals.git",
-                    SIMPLE_EVALS_REVISION,
-                )?;
                 self.download(
                     "data/gpqa_diamond.csv",
                     "https://openaipublic.blob.core.windows.net/simple-evals/gpqa_diamond.csv",
                     GPQA_SHA256,
                 )
             }
+            "browsecomp" => self.download(
+                "data/browse_comp_test_set.csv",
+                "https://openaipublic.blob.core.windows.net/simple-evals/browse_comp_test_set.csv",
+                BROWSECOMP_SHA256,
+            ),
+            "healthbench" => self.download(
+                "data/healthbench.jsonl",
+                &format!(
+                    "https://huggingface.co/datasets/openai/healthbench/resolve/{HEALTHBENCH_REVISION}/2025-05-07-06-14-12_oss_eval.jsonl"
+                ),
+                HEALTHBENCH_SHA256,
+            ),
+            "healthbench-professional" => self.download(
+                "data/healthbench-professional.jsonl",
+                &format!(
+                    "https://huggingface.co/datasets/openai/healthbench-professional/resolve/{HEALTHBENCH_PROFESSIONAL_REVISION}/healthbench_professional_eval.jsonl"
+                ),
+                HEALTHBENCH_PROFESSIONAL_SHA256,
+            ),
             "swe-bench-verified-smoke" => {
                 self.git_checkout(
                     "swe-bench",

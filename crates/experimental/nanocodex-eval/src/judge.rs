@@ -39,6 +39,22 @@ struct JudgeRequest {
     input: Value,
 }
 
+#[derive(Debug, Deserialize)]
+struct ChatCompletionRequest {
+    model: String,
+    messages: Value,
+}
+
+struct JudgeAnswer {
+    model: Model,
+    message: String,
+}
+
+struct JudgeFailure {
+    status: StatusCode,
+    message: String,
+}
+
 #[derive(Debug, Serialize)]
 struct JudgeError {
     error: JudgeErrorBody,
@@ -72,6 +88,7 @@ impl JudgeRuntime {
         };
         let application = Router::new()
             .route("/v1/responses", post(Self::respond))
+            .route("/v1/chat/completions", post(Self::chat_completion))
             .with_state(state);
         let (shutdown, receiver) = oneshot::channel();
         let task = tokio::spawn(async move {
@@ -95,12 +112,16 @@ impl JudgeRuntime {
     /// Returns verifier-only values that route through the guest host gateway.
     #[must_use]
     pub fn verifier_environment(&self) -> BTreeMap<String, String> {
+        let base_url = format!("http://{GUEST_HOST}:{}/v1", self.port);
         BTreeMap::from([
-            (
-                "NANOCODEX_JUDGE_BASE_URL".to_owned(),
-                format!("http://{GUEST_HOST}:{}/v1", self.port),
-            ),
+            ("NANOCODEX_JUDGE_BASE_URL".to_owned(), base_url.clone()),
             ("NANOCODEX_JUDGE_TOKEN".to_owned(), self.token.to_string()),
+            ("OPENAI_BASE_URL".to_owned(), base_url),
+            ("OPENAI_API_KEY".to_owned(), self.token.to_string()),
+            (
+                "NANOCODEX_EVAL_GRADER_MODEL".to_owned(),
+                Model::Sol.to_string(),
+            ),
         ])
     }
 
@@ -109,60 +130,60 @@ impl JudgeRuntime {
         headers: HeaderMap,
         Json(request): Json<JudgeRequest>,
     ) -> Response {
-        let authorized = headers
-            .get("authorization")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-            == Some(state.token.as_ref());
-        if !authorized {
-            return Self::error(StatusCode::UNAUTHORIZED, "invalid judge token");
-        }
-        let model = match Model::from_str(&request.model) {
-            Ok(model) => model,
-            Err(error) => return Self::error(StatusCode::BAD_REQUEST, error),
+        let answer = match state.answer(&headers, request.model, request.input).await {
+            Ok(answer) => answer,
+            Err(error) => return Self::error(error.status, error.message),
         };
-        let (instructions, prompt) = match Self::prompt(request.input) {
-            Ok(prompt) => prompt,
-            Err(error) => return Self::error(StatusCode::BAD_REQUEST, error),
-        };
-        let mut builder = state.builder.model(model);
-        if let Some(instructions) = instructions {
-            builder = builder.instructions(instructions);
-        }
-        let (agent, events) = match builder.build() {
-            Ok(agent) => agent,
-            Err(error) => {
-                return Self::error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("judge agent build failed: {error}"),
-                );
-            }
-        };
-        drop(events);
-        let result = match agent.prompt(prompt).await {
-            Ok(turn) => turn.result().await,
-            Err(error) => Err(error),
-        };
-        let message = match result {
-            Ok(result) => result.into_final_message(),
-            Err(error) => {
-                return Self::error(
-                    StatusCode::BAD_GATEWAY,
-                    format!("OpenAI judge failed: {error}"),
-                );
-            }
-        };
-        let _ = agent.shutdown().await;
         Json(json!({
             "id": format!("judge_{}", Uuid::now_v7().simple()),
             "object": "response",
             "status": "completed",
-            "model": model,
+            "model": answer.model,
             "output": [{
                 "type": "message",
                 "role": "assistant",
-                "content": [{"type": "output_text", "text": message}]
-            }]
+                "content": [{"type": "output_text", "text": answer.message}]
+            }],
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0
+            }
+        }))
+        .into_response()
+    }
+
+    async fn chat_completion(
+        State(state): State<JudgeState>,
+        headers: HeaderMap,
+        Json(request): Json<ChatCompletionRequest>,
+    ) -> Response {
+        let answer = match state
+            .answer(&headers, request.model, request.messages)
+            .await
+        {
+            Ok(answer) => answer,
+            Err(error) => return Self::error(error.status, error.message),
+        };
+        Json(json!({
+            "id": format!("judge_{}", Uuid::now_v7().simple()),
+            "object": "chat.completion",
+            "created": 0,
+            "model": answer.model,
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": answer.message,
+                    "refusal": null
+                }
+            }],
+            "usage": {
+                "completion_tokens": 0,
+                "prompt_tokens": 0,
+                "total_tokens": 0
+            }
         }))
         .into_response()
     }
@@ -180,10 +201,10 @@ impl JudgeRuntime {
                         .ok_or_else(|| "judge input message has no role".to_owned())?;
                     let content = message
                         .get("content")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| "judge input message content must be text".to_owned())?;
+                        .ok_or_else(|| "judge input message has no content".to_owned())?;
+                    let content = Self::text_content(content)?;
                     if role == "system" || role == "developer" {
-                        instructions.push(content.to_owned());
+                        instructions.push(content);
                     } else {
                         prompt.push(format!("{role}:\n{content}"));
                     }
@@ -200,6 +221,24 @@ impl JudgeRuntime {
         }
     }
 
+    fn text_content(content: &Value) -> Result<String, String> {
+        if let Some(content) = content.as_str() {
+            return Ok(content.to_owned());
+        }
+        let parts = content
+            .as_array()
+            .ok_or_else(|| "judge input message content must be text".to_owned())?;
+        let text = parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.is_empty() {
+            return Err("judge input message contains no text".to_owned());
+        }
+        Ok(text)
+    }
+
     fn error(status: StatusCode, message: impl Into<String>) -> Response {
         (
             status,
@@ -213,11 +252,121 @@ impl JudgeRuntime {
     }
 }
 
+impl JudgeState {
+    async fn answer(
+        &self,
+        headers: &HeaderMap,
+        requested_model: String,
+        input: Value,
+    ) -> Result<JudgeAnswer, JudgeFailure> {
+        if !self.authorized(headers) {
+            return Err(JudgeFailure {
+                status: StatusCode::UNAUTHORIZED,
+                message: "invalid judge token".to_owned(),
+            });
+        }
+        let model = Model::from_str(&requested_model).map_err(|message| JudgeFailure {
+            status: StatusCode::BAD_REQUEST,
+            message,
+        })?;
+        let (instructions, prompt) =
+            JudgeRuntime::prompt(input).map_err(|message| JudgeFailure {
+                status: StatusCode::BAD_REQUEST,
+                message,
+            })?;
+        let mut builder = self.builder.clone().model(model);
+        if let Some(instructions) = instructions {
+            builder = builder.instructions(instructions);
+        }
+        let (agent, events) = match builder.build() {
+            Ok(agent) => agent,
+            Err(error) => {
+                return Err(JudgeFailure {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    message: format!("judge agent build failed: {error}"),
+                });
+            }
+        };
+        drop(events);
+        let result = match agent.prompt(prompt).await {
+            Ok(turn) => turn.result().await,
+            Err(error) => Err(error),
+        };
+        let message = match result {
+            Ok(result) => result.into_final_message(),
+            Err(error) => {
+                return Err(JudgeFailure {
+                    status: StatusCode::BAD_GATEWAY,
+                    message: format!("OpenAI judge failed: {error}"),
+                });
+            }
+        };
+        let _ = agent.shutdown().await;
+        Ok(JudgeAnswer { model, message })
+    }
+
+    fn authorized(&self, headers: &HeaderMap) -> bool {
+        headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            == Some(self.token.as_ref())
+    }
+}
+
 impl Drop for JudgeRuntime {
     fn drop(&mut self) {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
         self.task.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_accepts_openai_chat_and_responses_text_shapes() {
+        let (instructions, prompt) = JudgeRuntime::prompt(json!([
+            {"role": "system", "content": "Grade precisely."},
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "candidate answer"}]
+            }
+        ]))
+        .unwrap();
+
+        assert_eq!(instructions.as_deref(), Some("Grade precisely."));
+        assert_eq!(prompt, "user:\ncandidate answer");
+    }
+
+    #[tokio::test]
+    async fn verifier_environment_routes_both_openai_protocols_through_proxy() {
+        let (shutdown, _receiver) = oneshot::channel();
+        let runtime = JudgeRuntime {
+            port: 43123,
+            token: Arc::from("judge-token"),
+            shutdown: Some(shutdown),
+            task: tokio::spawn(std::future::pending()),
+        };
+
+        let environment = runtime.verifier_environment();
+
+        assert_eq!(
+            environment.get("OPENAI_BASE_URL").map(String::as_str),
+            Some("http://192.168.127.254:43123/v1")
+        );
+        assert_eq!(
+            environment.get("OPENAI_API_KEY").map(String::as_str),
+            Some("judge-token")
+        );
+        assert_eq!(
+            environment
+                .get("NANOCODEX_EVAL_GRADER_MODEL")
+                .map(String::as_str),
+            Some("gpt-5.6-sol")
+        );
     }
 }

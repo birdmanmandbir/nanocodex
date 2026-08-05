@@ -49,9 +49,9 @@ const ADAPTER_FILES: &[&str] = &["Dockerfile", "test.sh", "grade.py", "gpqa_prep
 pub enum OpenAiSimpleEval {
     /// BrowseComp with the official model grader.
     BrowseComp,
-    /// HealthBench with the official rubric grader.
+    /// Single-turn HealthBench cases with the official rubric grader.
     HealthBench,
-    /// HealthBench Professional with GPT-5.4-low rubric grading and the
+    /// Single-turn HealthBench Professional cases with rubric grading and the
     /// published response-length adjustment.
     HealthBenchProfessional,
     /// GPQA Diamond with the official answer extraction pattern.
@@ -277,39 +277,41 @@ fn healthbench_cases(path: &Path, limit: usize) -> Result<Vec<PreparedCase>, Imp
         path: path.to_path_buf(),
         source,
     })?;
-    text.lines()
+    let mut cases = Vec::new();
+    for (index, line) in text
+        .lines()
         .enumerate()
         .filter(|(_, line)| !line.trim().is_empty())
-        .take(limit)
-        .map(|(index, line)| {
-            let row: HealthRow = serde_json::from_str(line).map_err(|source| {
-                ImportError::Invalid(format!(
-                    "failed to decode {} line {}: {source}",
-                    path.display(),
-                    index + 1
-                ))
-            })?;
-            if row.prompt.len() != 1 || row.prompt[0].role != "user" {
-                return Err(ImportError::Invalid(format!(
-                    "HealthBench row {} is not one user message and cannot be represented by one evaluator turn",
-                    index + 1
-                )));
-            }
-            let prompt = row.prompt[0].content.clone();
-            let metadata = serde_json::to_value(&row).map_err(|source| ImportError::Json {
-                path: path.to_path_buf(),
-                source,
-            })?;
-            let mut metadata = metadata.as_object().cloned().ok_or_else(|| {
-                ImportError::Invalid("HealthBench row did not encode as an object".to_owned())
-            })?;
-            metadata.insert("kind".to_owned(), serde_json::json!("healthbench"));
-            Ok(PreparedCase {
-                prompt,
-                metadata: metadata.into(),
-            })
-        })
-        .collect()
+    {
+        let row: HealthRow = serde_json::from_str(line).map_err(|source| {
+            ImportError::Invalid(format!(
+                "failed to decode {} line {}: {source}",
+                path.display(),
+                index + 1
+            ))
+        })?;
+        if row.prompt.len() != 1 || row.prompt[0].role != "user" {
+            continue;
+        }
+        let prompt = row.prompt[0].content.clone();
+        let metadata = serde_json::to_value(&row).map_err(|source| ImportError::Json {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let mut metadata = metadata.as_object().cloned().ok_or_else(|| {
+            ImportError::Invalid("HealthBench row did not encode as an object".to_owned())
+        })?;
+        metadata.insert("kind".to_owned(), serde_json::json!("healthbench"));
+        metadata.insert("source_index".to_owned(), serde_json::json!(index));
+        cases.push(PreparedCase {
+            prompt,
+            metadata: metadata.into(),
+        });
+        if cases.len() == limit {
+            break;
+        }
+    }
+    Ok(cases)
 }
 
 fn healthbench_professional_cases(
@@ -320,54 +322,54 @@ fn healthbench_professional_cases(
         path: path.to_path_buf(),
         source,
     })?;
-    text.lines()
+    let mut cases = Vec::new();
+    for (index, line) in text
+        .lines()
         .enumerate()
         .filter(|(_, line)| !line.trim().is_empty())
-        .take(limit)
-        .map(|(index, line)| {
-            let row: ProfessionalHealthRow = serde_json::from_str(line).map_err(|source| {
-                ImportError::Invalid(format!(
-                    "failed to decode {} line {}: {source}",
-                    path.display(),
-                    index + 1
-                ))
-            })?;
-            if row.conversation.messages.len() != 1
-                || row.conversation.messages[0].role != "user"
-            {
-                return Err(ImportError::Invalid(format!(
-                    "HealthBench Professional row {} has prior conversation turns, which the evaluator cannot seed without changing their roles",
-                    index + 1
-                )));
-            }
-            let prompt = row.conversation.messages[0].content.clone();
-            let rubrics = row
-                .rubric_items
-                .iter()
-                .map(|item| {
-                    serde_json::json!({
-                        "criterion": item.criterion_text,
-                        "points": item.points,
-                        "tags": [],
-                    })
+    {
+        let row: ProfessionalHealthRow = serde_json::from_str(line).map_err(|source| {
+            ImportError::Invalid(format!(
+                "failed to decode {} line {}: {source}",
+                path.display(),
+                index + 1
+            ))
+        })?;
+        if row.conversation.messages.len() != 1 || row.conversation.messages[0].role != "user" {
+            continue;
+        }
+        let prompt = row.conversation.messages[0].content.clone();
+        let rubrics = row
+            .rubric_items
+            .iter()
+            .map(|item| {
+                serde_json::json!({
+                    "criterion": item.criterion_text,
+                    "points": item.points,
+                    "tags": [],
                 })
-                .collect::<Vec<_>>();
-            Ok(PreparedCase {
-                prompt,
-                metadata: serde_json::json!({
-                    "kind": "healthbench_professional",
-                    "prompt": row.conversation.messages,
-                    "rubrics": rubrics,
-                    "example_tags": [],
-                    "id": row.id,
-                    "use_case": row.use_case,
-                    "type": row.r#type,
-                    "difficulty": row.difficulty,
-                    "specialty": row.specialty,
-                }),
             })
-        })
-        .collect()
+            .collect::<Vec<_>>();
+        cases.push(PreparedCase {
+            prompt,
+            metadata: serde_json::json!({
+                "kind": "healthbench_professional",
+                "prompt": row.conversation.messages,
+                "rubrics": rubrics,
+                "example_tags": [],
+                "id": row.id,
+                "use_case": row.use_case,
+                "type": row.r#type,
+                "difficulty": row.difficulty,
+                "specialty": row.specialty,
+                "source_index": index,
+            }),
+        });
+        if cases.len() == limit {
+            break;
+        }
+    }
+    Ok(cases)
 }
 
 #[derive(Deserialize)]

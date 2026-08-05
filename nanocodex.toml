@@ -15,6 +15,9 @@ harnesses = ["codex", "nanocodex"]
 tasks = [
   "terminal-bench-2.1/fix-git",
   "arena-hard-v2/2edbb5f36f5b42be",
+  "browsecomp/browsecomp-000000",
+  "healthbench/healthbench-000000",
+  "healthbench-professional/healthbench_professional-000000",
   "openai-evals/computer-science-problems.s1.simple-v0-000000",
   "gpqa-diamond/gpqa_diamond-000000",
   "swe-bench-verified-smoke/astropy__astropy-12907",
@@ -23,4 +26,4 @@ tasks = [
 trials = 1
 model = ["gpt-5.6-sol"]
 thinking = ["low"]
-web_search = false
+web_search = true

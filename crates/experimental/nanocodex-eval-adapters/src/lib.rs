@@ -188,22 +188,26 @@ mod tests {
         let health = source.path().join("health.jsonl");
         fs::write(
             &health,
-            r#"{"prompt":[{"role":"user","content":"How should I proceed?"}],"rubrics":[{"criterion":"Is helpful","points":1,"tags":[]}],"example_tags":[],"prompt_id":"health-1"}
+            r#"{"prompt":[{"role":"user","content":"First question"},{"role":"assistant","content":"First answer"},{"role":"user","content":"Follow-up"}],"rubrics":[],"example_tags":[],"prompt_id":"multi-turn"}
+{"prompt":[{"role":"user","content":"How should I proceed?"}],"rubrics":[{"criterion":"Is helpful","points":1,"tags":[]}],"example_tags":[],"prompt_id":"health-1"}
 "#,
         )
         .unwrap();
         let store = tempdir().unwrap();
 
         let dataset = ImportStore::new(store.path())
-            .import(&OpenAiSimpleEvals::new(
-                "healthbench",
-                source.path(),
-                openai_simple_evals_harness(),
-                health,
-                "openai/simple-evals@abc",
-                OpenAiSimpleEval::HealthBench,
-                Environment::OciImage("debian:bookworm-slim".to_owned()),
-            ))
+            .import(
+                &OpenAiSimpleEvals::new(
+                    "healthbench",
+                    source.path(),
+                    openai_simple_evals_harness(),
+                    health,
+                    "openai/simple-evals@abc",
+                    OpenAiSimpleEval::HealthBench,
+                    Environment::OciImage("debian:bookworm-slim".to_owned()),
+                )
+                .limit(1),
+            )
             .unwrap();
 
         let task = &dataset.tasks()[0];
@@ -213,6 +217,13 @@ mod tests {
             task.root()
                 .join("tests/official/healthbench_eval.py")
                 .is_file()
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &fs::read(task.root().join("tests/case.json")).unwrap()
+            )
+            .unwrap()["source_index"],
+            1
         );
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(
@@ -294,22 +305,26 @@ mod tests {
         let data = source.path().join("healthbench-professional.jsonl");
         fs::write(
             &data,
-            r#"{"id":"case-1","conversation":{"messages":[{"role":"user","content":"Draft a clinical note."}]},"rubric_items":[{"criterion_text":"Includes an assessment.","points":8}],"use_case":"writing","type":"good_faith","difficulty":"typical","specialty":"general"}
+            r#"{"id":"multi-turn","conversation":{"messages":[{"role":"user","content":"First question"},{"role":"assistant","content":"First answer"},{"role":"user","content":"Follow-up"}]},"rubric_items":[],"use_case":"consult","type":"good_faith","difficulty":"typical","specialty":"general"}
+{"id":"case-1","conversation":{"messages":[{"role":"user","content":"Draft a clinical note."}]},"rubric_items":[{"criterion_text":"Includes an assessment.","points":8}],"use_case":"writing","type":"good_faith","difficulty":"typical","specialty":"general"}
 "#,
         )
         .unwrap();
         let store = tempdir().unwrap();
 
         let dataset = ImportStore::new(store.path())
-            .import(&OpenAiSimpleEvals::new(
-                "healthbench-professional",
-                source.path(),
-                openai_simple_evals_harness(),
-                data,
-                "openai/simple-evals@abc",
-                OpenAiSimpleEval::HealthBenchProfessional,
-                Environment::OciImage("debian:bookworm-slim".to_owned()),
-            ))
+            .import(
+                &OpenAiSimpleEvals::new(
+                    "healthbench-professional",
+                    source.path(),
+                    openai_simple_evals_harness(),
+                    data,
+                    "openai/simple-evals@abc",
+                    OpenAiSimpleEval::HealthBenchProfessional,
+                    Environment::OciImage("debian:bookworm-slim".to_owned()),
+                )
+                .limit(1),
+            )
             .unwrap();
 
         let metadata: serde_json::Value = serde_json::from_slice(
@@ -317,6 +332,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(metadata["kind"], "healthbench_professional");
+        assert_eq!(metadata["source_index"], 1);
         assert_eq!(
             metadata["rubrics"][0]["criterion"],
             "Includes an assessment."

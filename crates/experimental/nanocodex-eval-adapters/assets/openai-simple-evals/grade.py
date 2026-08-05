@@ -22,6 +22,8 @@ if kind == "gpqa_diamond":
         {"correct_answer": case["correct_answer"], "extracted_answer": extracted}
     )
 else:
+    grader_model = os.environ["NANOCODEX_EVAL_GRADER_MODEL"]
+    evidence["grader_model"] = grader_model
     if kind == "browsecomp":
         from official.sampler.chat_completion_sampler import (
             OPENAI_SYSTEM_MESSAGE_API,
@@ -30,9 +32,7 @@ else:
         from official.browsecomp_eval import BrowseCompEval
 
         grader = ChatCompletionSampler(
-            model=os.environ.get(
-                "NANOCODEX_EVAL_GRADER_MODEL", "gpt-4.1-2025-04-14"
-            ),
+            model=grader_model,
             system_message=OPENAI_SYSTEM_MESSAGE_API,
             max_tokens=2048,
         )
@@ -50,9 +50,7 @@ else:
             from official.sampler.responses_sampler import ResponsesSampler
 
             grader = ResponsesSampler(
-                model=os.environ.get(
-                    "NANOCODEX_EVAL_GRADER_MODEL", "gpt-5.4-2026-03-05"
-                ),
+                model=grader_model,
                 reasoning_model=True,
                 reasoning_effort="low",
             )
@@ -65,9 +63,7 @@ else:
             )
 
             grader = ChatCompletionSampler(
-                model=os.environ.get(
-                    "NANOCODEX_EVAL_GRADER_MODEL", "gpt-4.1-2025-04-14"
-                ),
+                model=grader_model,
                 system_message=OPENAI_SYSTEM_MESSAGE_API,
                 max_tokens=2048,
             )
