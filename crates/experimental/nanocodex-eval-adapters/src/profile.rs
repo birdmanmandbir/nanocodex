@@ -21,7 +21,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ArenaHard, BuiltinSourceError, BuiltinSources, ExternalHarness, Gdpval, GeneBenchPro,
-    GpqaDiamond, GraphWalks, HarborDataset, HealthBenchProfessional, Mrcr, OpenAiEvals, SweBench,
+    GpqaDiamond, GraphWalks, HarborDataset, HealthBenchProfessional, Mrcr, OpenAiEvals,
+    SweAtlasQna, SweBench,
 };
 
 /// A complete manifest using Nanocodex's concrete third-party benchmark recipes.
@@ -79,6 +80,13 @@ pub enum Benchmark {
     /// Harbor-family task packages.
     Harbor {
         /// Task or suite directory.
+        source: PathBuf,
+        /// Pinned source revision.
+        revision: String,
+    },
+    /// Scale's Codebase QnA packages plus its harness-level network policy.
+    SweAtlasQna {
+        /// Pinned official `data/qa` directory.
         source: PathBuf,
         /// Pinned source revision.
         revision: String,
@@ -546,7 +554,7 @@ impl BenchmarkCatalog {
             "terminal-bench-2.1" => "harbor",
             "arena-hard-v2" => "arena-hard",
             "swe-bench-verified-smoke" => "swe-bench",
-            "swe-atlas-qna" => "harbor",
+            "swe-atlas-qna" => "swe-atlas-qna",
             "genebench-pro-public" => "genebench-pro",
             "deep-swe-v1.1" => "harbor",
             "graphwalks" => "graphwalks",
@@ -619,6 +627,9 @@ impl<'a> ProfileImporter<'a> {
                 resolve_path(root, source),
                 revision,
             )),
+            Benchmark::SweAtlasQna { source, revision } => {
+                store.import(&SweAtlasQna::new(resolve_path(root, source), revision))
+            }
             Benchmark::ArenaHard {
                 questions,
                 harness,

@@ -105,8 +105,15 @@ struct HermeticCase {
     agent_instructions: Option<String>,
     verifier_timeout: Duration,
     scoring_policy: ScoringPolicy,
+    artifacts: Vec<HermeticArtifact>,
     allow_internet: bool,
     verifier_allow_internet: bool,
+}
+
+#[derive(Debug)]
+struct HermeticArtifact {
+    source: PathBuf,
+    exclude: Vec<PathBuf>,
 }
 
 /// Agent environment used by a generated case.
@@ -457,6 +464,18 @@ impl DatasetPlan {
                         &case.verifier_timeout.as_nanos().to_le_bytes(),
                     );
                     Self::update_digest(&mut digest, case.scoring_policy.as_str().as_bytes());
+                    for artifact in &case.artifacts {
+                        Self::update_digest(
+                            &mut digest,
+                            artifact.source.to_string_lossy().as_bytes(),
+                        );
+                        for excluded in &artifact.exclude {
+                            Self::update_digest(
+                                &mut digest,
+                                normalized_relative(excluded)?.as_bytes(),
+                            );
+                        }
+                    }
                     Self::update_digest(
                         &mut digest,
                         case.agent_instructions.as_deref().unwrap_or("").as_bytes(),
@@ -763,6 +782,7 @@ impl CasePlan {
                 agent_instructions: None,
                 verifier_timeout: Duration::from_secs(300),
                 scoring_policy: ScoringPolicy::AllRewardsPositive,
+                artifacts: Vec::new(),
                 allow_internet: true,
                 verifier_allow_internet: true,
             },
@@ -872,6 +892,26 @@ impl HermeticCasePlan {
     pub const fn scoring_policy(mut self, policy: ScoringPolicy) -> Self {
         self.case.scoring_policy = policy;
         self
+    }
+
+    /// Captures one absolute guest path after agent execution for a separate verifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ImportError`] when the source is not a safe absolute guest path.
+    pub fn artifact(mut self, source: impl Into<PathBuf>) -> Result<Self, ImportError> {
+        let source = source.into();
+        if source.to_str().is_none() || !safe_absolute_guest_path(&source) {
+            return Err(ImportError::Invalid(format!(
+                "unsafe generated artifact source: {}",
+                source.display()
+            )));
+        }
+        self.case.artifacts.push(HermeticArtifact {
+            source,
+            exclude: Vec::new(),
+        });
+        Ok(self)
     }
 
     /// Selects whether the agent environment has a network device.
@@ -1034,17 +1074,27 @@ fn materialize_hermetic_case(
     materialize_generated_files(case.harness_files, &destination.join("tests"))?;
 
     let separate = destination.join("tests/Dockerfile").is_file();
-    let artifacts =
-        (separate && case.output == TaskOutput::Workspace).then_some([GeneratedTaskArtifact {
-            source: "/workspace",
-            exclude: &[
-                "Dockerfile",
-                "instruction.md",
-                "reference_files",
-                ".git",
-                ".nanocodex",
-            ],
-        }]);
+    let mut artifacts = case
+        .artifacts
+        .iter()
+        .map(|artifact| GeneratedTaskArtifact {
+            source: &artifact.source,
+            exclude: &artifact.exclude,
+        })
+        .collect::<Vec<_>>();
+    let workspace_excludes = [
+        PathBuf::from("Dockerfile"),
+        PathBuf::from("instruction.md"),
+        PathBuf::from("reference_files"),
+        PathBuf::from(".git"),
+        PathBuf::from(".nanocodex"),
+    ];
+    if separate && case.output == TaskOutput::Workspace {
+        artifacts.push(GeneratedTaskArtifact {
+            source: Path::new("/workspace"),
+            exclude: &workspace_excludes,
+        });
+    }
     let raw = GeneratedTaskManifest {
         schema_version: "1.3",
         output: match case.output {
@@ -1080,7 +1130,7 @@ fn materialize_hermetic_case(
             gpus: case.resources.gpus,
             allow_internet: case.allow_internet,
         },
-        artifacts: artifacts.as_ref(),
+        artifacts: (!artifacts.is_empty()).then_some(artifacts.as_slice()),
     };
     let manifest = toml::to_string(&raw).map_err(|source| {
         ImportError::Invalid(format!("failed to encode generated task {id}: {source}"))
@@ -1131,13 +1181,13 @@ struct GeneratedTaskManifest<'a> {
     verifier: GeneratedVerifier<'a>,
     environment: GeneratedEnvironment<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    artifacts: Option<&'a [GeneratedTaskArtifact<'a>; 1]>,
+    artifacts: Option<&'a [GeneratedTaskArtifact<'a>]>,
 }
 
 #[derive(Serialize)]
 struct GeneratedTaskArtifact<'a> {
-    source: &'a str,
-    exclude: &'a [&'a str],
+    source: &'a Path,
+    exclude: &'a [PathBuf],
 }
 
 #[derive(Serialize)]
@@ -1306,6 +1356,16 @@ fn normalized_relative(path: &Path) -> Result<String, ImportError> {
         .join("/"))
 }
 
+fn safe_absolute_guest_path(path: &Path) -> bool {
+    path.is_absolute()
+        && path.strip_prefix("/").is_ok_and(|relative| {
+            !relative.as_os_str().is_empty()
+                && relative
+                    .components()
+                    .all(|component| matches!(component, Component::Normal(_)))
+        })
+}
+
 fn validate_component(label: &str, value: &str) -> Result<(), ImportError> {
     let valid = !value.is_empty()
         && value != "."
@@ -1356,8 +1416,8 @@ mod tests {
     use crate::ScoringPolicy;
 
     use super::{
-        CasePlan, DatasetImporter, DatasetPlan, Environment, Harness, ImportError, ImportStore,
-        SourceIdentity,
+        CasePackage, CasePlan, DatasetImporter, DatasetPlan, Environment, Harness, ImportError,
+        ImportStore, SourceIdentity, materialize_hermetic_case,
     };
 
     struct FixtureImporter {
@@ -1582,6 +1642,60 @@ mod tests {
                 Path::new(".git").to_path_buf(),
                 Path::new(".nanocodex").to_path_buf(),
             ]
+        );
+    }
+
+    #[test]
+    fn generated_case_can_capture_an_explicit_guest_artifact() {
+        let environment = tempdir().unwrap();
+        fs::write(
+            environment.path().join("Dockerfile"),
+            "FROM debian:bookworm-slim\nWORKDIR /workspace\n",
+        )
+        .unwrap();
+        let harness = tempdir().unwrap();
+        fs::write(
+            harness.path().join("Dockerfile"),
+            "FROM debian:bookworm-slim\n",
+        )
+        .unwrap();
+        fs::write(
+            harness.path().join("test.sh"),
+            "#!/bin/sh\nprintf '1\\n' > /logs/verifier/reward.txt\n",
+        )
+        .unwrap();
+        let plan = DatasetPlan::new(
+            "artifact-input",
+            SourceIdentity::new("fixture", "fixture@1", "d".repeat(64)).unwrap(),
+        )
+        .unwrap()
+        .case(
+            CasePlan::hermetic(
+                "case-1",
+                "Write the answer artifact.",
+                Environment::Dockerfile(environment.path().to_path_buf()),
+                Harness::directory(harness.path()).unwrap(),
+            )
+            .unwrap()
+            .output(crate::TaskOutput::FinalMessage)
+            .artifact("/logs/agent/answer.txt")
+            .unwrap(),
+        );
+        let destination = tempdir().unwrap();
+        let temporary = tempfile::Builder::new()
+            .prefix("artifact-case-")
+            .tempdir_in(destination.path())
+            .unwrap();
+        let CasePackage::Hermetic(case) = plan.cases.into_iter().next().unwrap().package else {
+            panic!("expected generated case");
+        };
+        materialize_hermetic_case("case-1", case, temporary.path()).unwrap();
+        let task = crate::Task::load(temporary.path()).unwrap();
+
+        assert_eq!(task.artifacts().len(), 1);
+        assert_eq!(
+            task.artifacts()[0].source(),
+            Path::new("/logs/agent/answer.txt")
         );
     }
 

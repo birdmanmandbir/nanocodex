@@ -167,7 +167,7 @@ impl BuiltinSources {
                 architecture: "x86_64".to_owned(),
                 image_tag: "latest".to_owned(),
             }),
-            "swe-atlas-qna" => Ok(Benchmark::Harbor {
+            "swe-atlas-qna" => Ok(Benchmark::SweAtlasQna {
                 source: self.root.join("swe-atlas/data/qa"),
                 revision: format!("scaleapi/SWE-Atlas@{SWE_ATLAS_REVISION}"),
             }),

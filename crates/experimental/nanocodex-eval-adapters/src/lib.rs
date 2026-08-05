@@ -17,6 +17,7 @@ mod mrcr;
 mod openai_evals;
 pub mod profile;
 mod source;
+mod swe_atlas_qna;
 mod swe_bench;
 
 use std::{
@@ -39,6 +40,7 @@ pub use openai_evals::OpenAiEvals;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 pub use source::{BuiltinSourceError, BuiltinSources};
+pub use swe_atlas_qna::SweAtlasQna;
 pub use swe_bench::SweBench;
 
 fn sha256_file(path: &Path) -> Result<String, ImportError> {

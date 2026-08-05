@@ -314,9 +314,10 @@ through PR #72's existing concrete importers:
 - `gdpval`: OpenAI's pinned 220-task public release, candidate-visible reference
   files, verifier-only expert deliverables and rubrics, and a public pairwise
   reproduction score; and
-- `swe-atlas-qna`: Scale's pinned 124-task QnA split, imported losslessly as
-  Harbor packages and graded by its benchmark-owned rubric verifier through
-  the evaluator's subscription-backed OpenAI-compatible judge endpoint; and
+- `swe-atlas-qna`: Scale's pinned 124-task QnA split, preserving official
+  prompts/images while encoding the runner-level candidate network restriction,
+  transferring only the declared answer artifact, and grading in a pristine VM
+  through the evaluator's subscription-backed OpenAI-compatible judge; and
 - `gpqa-diamond`: the authors' pinned 198-question Diamond release, preserving
   their continuous CPython seed-0 answer permutation, zero-shot prompt, and
   deterministic answer parser without acquiring deprecated `simple-evals`; and
@@ -569,7 +570,6 @@ tasks = [
   "terminal-bench-2.1/fix-git",
   "arena-hard-v2/2edbb5f36f5b42be",
   "swe-bench-verified-smoke/astropy__astropy-12907",
-  "swe-atlas-qna/task-6905333b74f22949d97ba9c2",
   "gpqa-diamond/rec06pnAkLOr2t2mp",
   "genebench-pro-public/multiparent_qtl_hmm_lmm",
   "external-smoke/exact-answer",
@@ -822,10 +822,17 @@ may hide missing coordinates or mix incompatible preparation identities.
     isolated subscription-backed judge, live smoke, clean resume, and retained
     report evidence; continue with the next obtainable family.
     The public GDPval adapter now has a clean local workspace/judge lifecycle,
-    exact retained evidence, and zero-spend resume. SWE-Atlas QnA and the
-    authors' direct GPQA Diamond release are now pinned adapter routes; finish
-    their native and remote Nanocodex/Codex smoke gates and the remaining GDPval
-    differential before accepting any release result.
+    exact retained evidence, and zero-spend resume. GPQA Diamond preparation
+    `10216415a24209a051a2c80a162663c8ce29204af5a699f455a302c13c40baf4`
+    imported all 198 direct-author rows; native job
+    `019fd3cd-bbef-78d2-ab21-03a4c1f0b0ee` passed its exact seeded answer,
+    retained complete schema-v5 evidence, cleaned both VMs, and resumed 1/1
+    without model spend. SWE-Atlas QnA's first audit exposed that its checked-in
+    `allow_internet = true` is narrowed by the official runner only during the
+    agent phase. The dedicated route now preserves that restriction for native
+    Nanocodex and isolates its answer-only verifier artifact. Finish its native
+    smoke, add model-control-plane-only guest egress before any Codex claim, and
+    run the remaining GPQA/GDPval differential before accepting release results.
 11. [ ] Run the coordinator/runner architecture with one saturated remote
     runner on `dev-georgios`, retaining all heavyweight state on its verified
     3.5 TB drive. Add cross-host sharding only after measurements show that
