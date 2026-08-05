@@ -29,7 +29,7 @@ use arcbox_ext4::{
 use chrono::{DateTime, Utc};
 use fs2::FileExt as _;
 use jiff::{Timestamp, tz::TimeZone};
-use nanocodex_agent::{ExecutionEnvironment, NanocodexBuilder};
+use nanocodex_agent::{AgentHandle, ExecutionEnvironment, NanocodexBuilder, session::SessionId};
 use nanocodex_tools::{ToolExposure, Tools, ToolsBuildError, standard::UpdatePlanTool};
 use nanocodex_vm::{
     host::{
@@ -61,7 +61,7 @@ pub use nanocodex_vm::{
 };
 
 use crate::{
-    CleanupPhase, CodexCommandOutput, CodexCommandRunner, CodexCommandRunnerError,
+    AgentId, CleanupPhase, CodexCommandOutput, CodexCommandRunner, CodexCommandRunnerError,
     CodexCommandStatus, CodexExec, EvalEnvironment, Evaluator, EvaluatorBuilder, NetworkPolicy,
     Task, TaskLoadError, TaskOutput, VerifierEnvironmentMode, VerifierResult,
     evaluator::{
@@ -2069,7 +2069,17 @@ pub struct VmBackend {
     shared_directories: Arc<[SharedDirectory]>,
     verifier_environment: Arc<BTreeMap<String, String>>,
     additional_agent_tools: Option<Tools>,
+    agent_tools_factory: Option<VmAgentToolsFactory>,
+    attempt_finalizer: Option<VmAttemptFinalizerFactory>,
 }
+
+type VmAgentToolsFactory = Arc<
+    dyn Fn(Option<&AgentId>, Tools, AgentHandle) -> Result<Tools, ToolsBuildError> + Send + Sync,
+>;
+type VmAttemptFinalizerFuture =
+    Pin<Box<dyn Future<Output = Result<(), VmAttemptError>> + Send + 'static>>;
+type VmAttemptFinalizerFactory =
+    Arc<dyn Fn(Option<AgentId>, SessionId, PathBuf) -> VmAttemptFinalizerFuture + Send + Sync>;
 
 /// Deliberate policy for a [`VmBackend`].
 pub struct VmBackendBuilder {
@@ -2079,6 +2089,8 @@ pub struct VmBackendBuilder {
     shared_directories: Vec<SharedDirectory>,
     verifier_environment: BTreeMap<String, String>,
     additional_agent_tools: Option<Tools>,
+    agent_tools_factory: Option<VmAgentToolsFactory>,
+    attempt_finalizer: Option<VmAttemptFinalizerFactory>,
 }
 
 impl Default for VmBackendBuilder {
@@ -2090,6 +2102,8 @@ impl Default for VmBackendBuilder {
             shared_directories: Vec::new(),
             verifier_environment: BTreeMap::new(),
             additional_agent_tools: None,
+            agent_tools_factory: None,
+            attempt_finalizer: None,
         }
     }
 }
@@ -2182,6 +2196,8 @@ impl VmBackend {
                 shared_directories: &self.shared_directories,
                 verifier_environment: &self.verifier_environment,
                 additional_agent_tools: self.additional_agent_tools.as_ref(),
+                agent_tools_factory: self.agent_tools_factory.as_ref(),
+                attempt_finalizer: self.attempt_finalizer.as_ref(),
             },
             attempt,
         )
@@ -2249,6 +2265,50 @@ impl VmBackendBuilder {
         self
     }
 
+    /// Composes agent-relative application tools after each VM attempt builds
+    /// its canonical guest workspace tools.
+    ///
+    /// The factory receives a fresh [`AgentHandle`] for roots and clean
+    /// children, so recursive or otherwise agent-relative tools never retain a
+    /// capability targeting a different driver. The callback is immutable
+    /// backend policy and must be included in the caller's treatment identity.
+    #[must_use]
+    pub fn agent_tools_factory<F>(mut self, factory: F) -> Self
+    where
+        F: Fn(Option<&AgentId>, Tools, AgentHandle) -> Result<Tools, ToolsBuildError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.agent_tools_factory = Some(Arc::new(factory));
+        self
+    }
+
+    /// Installs application-owned cleanup that runs after the agent is joined
+    /// and before the verifier starts.
+    ///
+    /// The callback receives the selected treatment, root session ID, and
+    /// retained attempt directory. Recursive runtimes use this boundary to
+    /// stop all descendants and freeze their evidence before verification
+    /// observes the workspace.
+    #[must_use]
+    pub fn attempt_finalizer<F, Fut, E>(mut self, factory: F) -> Self
+    where
+        F: Fn(Option<AgentId>, SessionId, PathBuf) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), E>> + Send + 'static,
+        E: fmt::Display + Send + Sync + 'static,
+    {
+        self.attempt_finalizer = Some(Arc::new(move |agent, session_id, directory| {
+            let finalizer = factory(agent, session_id, directory);
+            Box::pin(async move {
+                finalizer
+                    .await
+                    .map_err(|error| VmAttemptError::AttemptFinalizer(error.to_string()))
+            })
+        }));
+        self
+    }
+
     /// Builds a cloneable backend handle.
     #[must_use]
     pub fn build(self) -> VmBackend {
@@ -2260,6 +2320,8 @@ impl VmBackendBuilder {
             shared_directories: self.shared_directories.into(),
             verifier_environment: Arc::new(self.verifier_environment),
             additional_agent_tools: self.additional_agent_tools,
+            agent_tools_factory: self.agent_tools_factory,
+            attempt_finalizer: self.attempt_finalizer,
         }
     }
 }
@@ -2338,6 +2400,8 @@ struct VmAttemptHost<'a> {
     shared_directories: &'a [SharedDirectory],
     verifier_environment: &'a BTreeMap<String, String>,
     additional_agent_tools: Option<&'a Tools>,
+    agent_tools_factory: Option<&'a VmAgentToolsFactory>,
+    attempt_finalizer: Option<&'a VmAttemptFinalizerFactory>,
 }
 
 struct AttemptGvproxy {
@@ -2420,6 +2484,14 @@ pub enum VmAttemptError {
     #[error(transparent)]
     Tools(#[from] ToolsBuildError),
 
+    /// The attempt factory did not receive the root session identity.
+    #[error("the VM attempt is missing its root agent session identity")]
+    MissingSessionId,
+
+    /// Application-owned post-agent cleanup failed.
+    #[error("attempt finalizer failed: {0}")]
+    AttemptFinalizer(String),
+
     /// The task package changed or could not be materialized.
     #[error(transparent)]
     TaskPackage(#[from] TaskLoadError),
@@ -2447,6 +2519,9 @@ pub enum VmAttemptError {
 /// One materialized VM attempt with its guest session and owned verifier.
 pub(crate) struct VmAttempt {
     tools: Tools,
+    agent_tools_factory: Option<VmAgentToolsFactory>,
+    agent_id: Option<AgentId>,
+    attempt_finalizer: Option<VmAttemptFinalizerFuture>,
     timezone: String,
     verifier: VmVerifier,
 }
@@ -2583,8 +2658,15 @@ impl VmAttempt {
             None => self.tools,
         };
         let timezone = self.timezone;
-        let builder = builder.tools(tools);
-        Ok(AttemptAgent::preparing_nanocodex(async move {
+        let builder = match &self.agent_tools_factory {
+            Some(factory) => {
+                let factory = Arc::clone(factory);
+                let agent_id = self.agent_id.clone();
+                builder.tools_factory(move |agent| factory(agent_id.as_ref(), tools.clone(), agent))
+            }
+            None => builder.tools(tools),
+        };
+        let attempt = AttemptAgent::preparing_nanocodex(async move {
             let project_instructions =
                 load_guest_project_instructions(&context_session, &guest_workspace).await?;
             let mut environment = ExecutionEnvironment::new(current_date, timezone);
@@ -2594,13 +2676,21 @@ impl VmAttempt {
             Ok::<_, VmAttemptError>(builder.execution_environment(environment))
         })
         .ready(async move { readiness.ready().await })
-        .verifier(self.verifier))
+        .verifier(self.verifier);
+        Ok(match self.attempt_finalizer {
+            Some(finalizer) => attempt.finalize_after_agent(finalizer),
+            None => attempt,
+        })
     }
 
     /// Attaches the owned VM verifier to a stock-Codex attempt driver.
     #[must_use]
     pub(crate) fn codex(self, codex: CodexExec) -> AttemptAgent {
-        AttemptAgent::codex(codex).verifier(self.verifier)
+        let attempt = AttemptAgent::codex(codex).verifier(self.verifier);
+        match self.attempt_finalizer {
+            Some(finalizer) => attempt.finalize_after_agent(finalizer),
+            None => attempt,
+        }
     }
 }
 
@@ -2892,8 +2982,24 @@ fn vm_attempt_inner(
         artifact_directory: verifier_directory,
     };
     setup_guard.disarm();
+    let attempt_finalizer = host
+        .attempt_finalizer
+        .map(|factory| {
+            let session_id = attempt
+                .session_id()
+                .ok_or(VmAttemptError::MissingSessionId)?;
+            Ok::<_, VmAttemptError>(factory(
+                attempt.agent_id().cloned(),
+                session_id,
+                attempt.directory().to_path_buf(),
+            ))
+        })
+        .transpose()?;
     Ok(VmAttempt {
         tools,
+        agent_tools_factory: host.agent_tools_factory.cloned(),
+        agent_id: attempt.agent_id().cloned(),
+        attempt_finalizer,
         timezone: environment.timezone.clone(),
         verifier,
     })

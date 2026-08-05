@@ -5245,6 +5245,7 @@ dependencies = [
  "nanocodex-egress",
  "nanocodex-eval",
  "nanocodex-eval-adapters",
+ "nanocodex-rlm",
  "nanocodex-vm",
  "nanocodex-voice",
  "reflink-copy",
@@ -5336,6 +5337,22 @@ dependencies = [
  "reqwest",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "nanocodex-rlm"
+version = "0.3.0"
+dependencies = [
+ "hex",
+ "nanocodex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "uuid",
 ]
 
 [[package]]

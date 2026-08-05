@@ -39,10 +39,10 @@ use uuid::Uuid;
 
 use crate::{
     AgentId, AgentMetadata, AgentResult, AgentStatus, BillingCompleteness, CleanupPhase,
-    EvalArtifacts, EvalAttemptOutcome, EvalCleanup, EvalEnvironment, EvalEvent, EvalEventAttempt,
-    EvalEventKind, EvalEvents, EvalException, EvalExceptionKind, EvalFailure, EvalFailureTiming,
-    EvalOutcome, EvalResult, EvalStatus, EvalTiming, PhaseTiming, Sweep, SweepAttemptResult,
-    SweepResults, Task, TaskLoadError, UsageTotals, VerifierResult,
+    CleanupStatus, EvalArtifacts, EvalAttemptOutcome, EvalCleanup, EvalEnvironment, EvalEvent,
+    EvalEventAttempt, EvalEventKind, EvalEvents, EvalException, EvalExceptionKind, EvalFailure,
+    EvalFailureTiming, EvalOutcome, EvalResult, EvalStatus, EvalTiming, PhaseTiming, Sweep,
+    SweepAttemptResult, SweepResults, Task, TaskLoadError, UsageTotals, VerifierResult,
     atif::AtifBuilder,
     codex::{CodexExec, CodexRunError},
     job::EvalJob,
@@ -161,12 +161,22 @@ type AttemptReadinessFuture =
     Pin<Box<dyn Future<Output = Result<(), AttemptError>> + Send + 'static>>;
 type AttemptDriverPreparationFuture =
     Pin<Box<dyn Future<Output = Result<AttemptDriver, AttemptError>> + Send + 'static>>;
+type AttemptFinalizerFuture =
+    Pin<Box<dyn Future<Output = Result<(), AttemptError>> + Send + 'static>>;
 
 /// The Nanocodex configuration and resources owned by one attempt.
 pub(crate) struct AttemptAgent {
     driver: AttemptDriverSetup,
     readiness: Option<AttemptReadinessFuture>,
     verifier: Option<Box<dyn AttemptVerifier>>,
+    finalizer: Option<AttemptFinalizerFuture>,
+}
+
+struct AttemptAgentParts {
+    driver: AttemptDriverSetup,
+    readiness: Option<AttemptReadinessFuture>,
+    verifier: Option<Box<dyn AttemptVerifier>>,
+    finalizer: Option<AttemptFinalizerFuture>,
 }
 
 enum AttemptDriverSetup {
@@ -279,6 +289,7 @@ struct SweepCoordinate {
 #[derive(Clone, Copy)]
 pub(crate) struct EvalAttempt<'a> {
     agent: Option<&'a AgentId>,
+    session_id: Option<SessionId>,
     task: &'a Task,
     directory: &'a Path,
     workspace: &'a Path,
@@ -1073,6 +1084,7 @@ impl Evaluator {
                         task,
                         EvalAttempt {
                             agent: None,
+                            session_id: None,
                             task,
                             directory: &attempt.paths.root,
                             workspace: &attempt.paths.workspace,
@@ -1160,6 +1172,7 @@ impl Evaluator {
         let AgentSetup {
             agent,
             verifier,
+            finalizer,
             readiness_timing,
             timing: setup_timing,
         } = self
@@ -1173,6 +1186,7 @@ impl Evaluator {
                     agent,
                     events,
                     verifier,
+                    finalizer,
                     readiness_timing,
                     setup_timing,
                 )
@@ -1185,6 +1199,7 @@ impl Evaluator {
                     attempt,
                     codex,
                     verifier,
+                    finalizer,
                     readiness_timing,
                     setup_timing,
                 )
@@ -1201,6 +1216,7 @@ impl Evaluator {
         agent: Nanocodex,
         mut events: AgentEvents,
         verifier: Option<Box<dyn AttemptVerifier>>,
+        finalizer: Option<AttemptFinalizerFuture>,
         readiness_timing: PhaseTiming,
         setup_timing: PhaseTiming,
     ) -> Result<AgentExecution, AgentExecutionFailure> {
@@ -1294,14 +1310,10 @@ impl Evaluator {
             outcome.apply_lower_bound_duration(phase_timing_ns(&execution_timing));
         }
         let cleanup_started = Utc::now();
-        let (outcome, cleanup) = match result {
+        let (outcome, shutdown) = match result {
             Ok(AgentRunState::Finished(outcome)) => {
                 let shutdown = agent.shutdown().await;
-                let cleanup = match shutdown {
-                    Ok(()) => CleanupPhase::completed(cleanup_started),
-                    Err(error) => CleanupPhase::failed(cleanup_started, &error),
-                };
-                (outcome, cleanup)
+                (outcome, shutdown.map_err(|error| error.to_string()))
             }
             Ok(AgentRunState::TimedOut {
                 primary,
@@ -1313,10 +1325,7 @@ impl Evaluator {
                     receive_agent_terminal(&mut events, emitter, &mut observation),
                 )
                 .await;
-                let cleanup = match recovery.shutdown {
-                    Ok(()) => CleanupPhase::completed(cleanup_started),
-                    Err(error) => CleanupPhase::failed(cleanup_started, &error),
-                };
+                let shutdown = recovery.shutdown.map_err(|error| error.to_string());
                 if recovery.grace_elapsed && recovery.terminal.is_none() {
                     tracing::warn!(
                         target: "nanocodex_eval",
@@ -1358,24 +1367,25 @@ impl Evaluator {
                 };
                 let mut outcome = outcome;
                 outcome.apply_lower_bound_duration(phase_timing_ns(&execution_timing));
-                (outcome, cleanup)
+                (outcome, shutdown)
             }
             Err(error) => {
                 let shutdown = agent.shutdown().await;
-                let cleanup = match shutdown {
-                    Ok(()) => CleanupPhase::completed(cleanup_started),
-                    Err(error) => CleanupPhase::failed(cleanup_started, &error),
-                };
                 (
                     AgentTurnOutcome {
                         primary: Some(error),
                         result: None,
                         result_is_lower_bound: false,
                     },
-                    cleanup,
+                    shutdown.map_err(|error| error.to_string()),
                 )
             }
         };
+        let finalized = match finalizer {
+            Some(finalizer) => finalizer.await.map_err(|error| error.to_string()),
+            None => Ok(()),
+        };
+        let cleanup = attempt_agent_cleanup(cleanup_started, shutdown, finalized);
         let error = outcome.primary.or_else(|| {
             outcome
                 .result
@@ -1402,6 +1412,7 @@ impl Evaluator {
         attempt: &NativeAttempt,
         codex: CodexExec,
         verifier: Option<Box<dyn AttemptVerifier>>,
+        finalizer: Option<AttemptFinalizerFuture>,
         readiness_timing: PhaseTiming,
         setup_timing: PhaseTiming,
     ) -> Result<AgentExecution, AgentExecutionFailure> {
@@ -1456,6 +1467,19 @@ impl Evaluator {
             span.record("otel.status_code", "OK");
         }
         span.record("duration_ns", elapsed_ns(trace_started));
+        let cleanup = match finalizer {
+            Some(finalizer) => {
+                let cleanup_started = execution
+                    .cleanup
+                    .timing
+                    .as_ref()
+                    .map_or_else(Utc::now, |timing| timing.started_at);
+                let driver_cleanup = cleanup_result(&execution.cleanup);
+                let finalized = finalizer.await.map_err(|error| error.to_string());
+                attempt_agent_cleanup(cleanup_started, driver_cleanup, finalized)
+            }
+            None => execution.cleanup,
+        };
         Ok(AgentExecution {
             result: execution.result,
             error,
@@ -1464,7 +1488,7 @@ impl Evaluator {
             readiness_timing,
             setup_timing,
             execution_timing,
-            cleanup: execution.cleanup,
+            cleanup,
         })
     }
 
@@ -1506,6 +1530,7 @@ impl Evaluator {
                 match factory(
                     EvalAttempt {
                         agent: agent_id,
+                        session_id: Some(emitter.session_id),
                         task,
                         directory: &attempt.paths.root,
                         workspace: &attempt.paths.workspace,
@@ -1527,7 +1552,12 @@ impl Evaluator {
             } else {
                 AttemptAgent::new(builder)
             };
-            let (driver, readiness, mut verifier) = configured.into_parts();
+            let AttemptAgentParts {
+                driver,
+                readiness,
+                mut verifier,
+                finalizer,
+            } = configured.into_parts();
             if let Some(readiness) = readiness
                 && let Err(error) = readiness.await
             {
@@ -1557,6 +1587,7 @@ impl Evaluator {
                     Ok((agent, events)) => Ok(AgentSetup {
                         agent: PreparedAgent::Nanocodex { agent, events },
                         verifier,
+                        finalizer,
                         readiness_timing,
                         timing: PhaseTiming::finished(setup_started),
                     }),
@@ -1587,6 +1618,7 @@ impl Evaluator {
                     Ok(AgentSetup {
                         agent: PreparedAgent::Codex(codex),
                         verifier,
+                        finalizer,
                         readiness_timing,
                         timing: PhaseTiming::finished(setup_started),
                     })
@@ -1607,6 +1639,36 @@ async fn shutdown_attempt_verifier(
         return CleanupPhase::not_required();
     };
     verifier.shutdown().await
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct AttemptAgentCleanupError(String);
+
+fn cleanup_result(cleanup: &CleanupPhase) -> Result<(), String> {
+    match cleanup.status {
+        CleanupStatus::Failed => Err(cleanup.diagnostic.as_ref().map_or_else(
+            || "agent driver cleanup failed".to_owned(),
+            |diagnostic| diagnostic.traceback.clone(),
+        )),
+        CleanupStatus::Completed | CleanupStatus::NotRequired => Ok(()),
+    }
+}
+
+fn attempt_agent_cleanup(
+    started_at: DateTime<Utc>,
+    driver: Result<(), String>,
+    finalizer: Result<(), String>,
+) -> CleanupPhase {
+    let error = match (driver, finalizer) {
+        (Ok(()), Ok(())) => return CleanupPhase::completed(started_at),
+        (Err(driver), Ok(())) => driver,
+        (Ok(()), Err(finalizer)) => finalizer,
+        (Err(driver), Err(finalizer)) => {
+            format!("agent driver cleanup failed: {driver}; attempt finalizer failed: {finalizer}")
+        }
+    };
+    CleanupPhase::failed(started_at, &AttemptAgentCleanupError(error))
 }
 
 struct AgentExecution {
@@ -2311,6 +2373,7 @@ impl UsageTotals {
 struct AgentSetup {
     agent: PreparedAgent,
     verifier: Option<Box<dyn AttemptVerifier>>,
+    finalizer: Option<AttemptFinalizerFuture>,
     readiness_timing: PhaseTiming,
     timing: PhaseTiming,
 }
@@ -2627,6 +2690,7 @@ impl AttemptAgent {
             driver: AttemptDriverSetup::Ready(AttemptDriver::Nanocodex(nanocodex)),
             readiness: None,
             verifier: None,
+            finalizer: None,
         }
     }
 
@@ -2644,6 +2708,7 @@ impl AttemptAgent {
             })),
             readiness: None,
             verifier: None,
+            finalizer: None,
         }
     }
 
@@ -2658,6 +2723,7 @@ impl AttemptAgent {
             driver: AttemptDriverSetup::Ready(AttemptDriver::Codex(codex)),
             readiness: None,
             verifier: None,
+            finalizer: None,
         }
     }
 
@@ -2688,14 +2754,28 @@ impl AttemptAgent {
         self
     }
 
-    fn into_parts(
-        self,
-    ) -> (
-        AttemptDriverSetup,
-        Option<AttemptReadinessFuture>,
-        Option<Box<dyn AttemptVerifier>>,
-    ) {
-        (self.driver, self.readiness, self.verifier)
+    /// Installs application-owned cleanup that must join before verification.
+    #[must_use]
+    pub(crate) fn finalize_after_agent<F, E>(mut self, finalizer: F) -> Self
+    where
+        F: Future<Output = Result<(), E>> + Send + 'static,
+        E: Error + Send + Sync + 'static,
+    {
+        self.finalizer = Some(Box::pin(async move {
+            finalizer
+                .await
+                .map_err(|error| Box::new(error) as AttemptError)
+        }));
+        self
+    }
+
+    fn into_parts(self) -> AttemptAgentParts {
+        AttemptAgentParts {
+            driver: self.driver,
+            readiness: self.readiness,
+            verifier: self.verifier,
+            finalizer: self.finalizer,
+        }
     }
 }
 
@@ -2704,6 +2784,12 @@ impl EvalAttempt<'_> {
     #[must_use]
     pub(crate) const fn agent_id(&self) -> Option<&AgentId> {
         self.agent
+    }
+
+    /// Returns the root agent session while configuring an agent attempt.
+    #[must_use]
+    pub(crate) const fn session_id(&self) -> Option<SessionId> {
+        self.session_id
     }
 
     /// Returns the immutable task definition.

@@ -1,0 +1,6 @@
+spawn = "Start one clean recursive subagent and return its identity immediately without waiting for its answer."
+list = "List retained subagents in the caller's recursive task family."
+send = "Send a bounded message to a retained subagent or, from a child, to its parent."
+wait = "Wait for selected subagent lifecycle changes or messages addressed to the caller."
+interrupt = "Interrupt active work for a retained subagent and its active descendants without deleting them."
+close = "Close a retained subagent and its descendant subtree and wait for cleanup."

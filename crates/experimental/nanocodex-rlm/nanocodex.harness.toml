@@ -1,0 +1,14 @@
+version = 1
+revision = 0
+
+[[prompt_notes]]
+id = "delegate-independent-work"
+text = "Delegate independent investigations concurrently when their work does not overlap."
+enabled = true
+
+[[subagents]]
+id = "general"
+name = "General subagent"
+description = "Handles one focused investigation or implementation task in a clean context."
+instructions = "Inspect concrete evidence, preserve unrelated work, and report concise findings."
+enabled = true

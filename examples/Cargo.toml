@@ -21,12 +21,13 @@ nanocodex-egress.workspace = true
 nanocodex-voice.workspace = true
 nanocodex-eval.workspace = true
 nanocodex-eval-adapters.workspace = true
+nanocodex-rlm.workspace = true
 nanocodex-vm.workspace = true
 reqwest.workspace = true
 reflink-copy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-tungstenite.workspace = true
 tower.workspace = true
 tempfile.workspace = true
@@ -106,6 +107,10 @@ path = "src/bin/eval_task.rs"
 [[bin]]
 name = "eval-sweep"
 path = "src/bin/eval_sweep.rs"
+
+[[bin]]
+name = "eval-rlm"
+path = "src/bin/eval_rlm.rs"
 
 [[bin]]
 name = "eval-differential"

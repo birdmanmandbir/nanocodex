@@ -14,6 +14,8 @@ being exercised and revised:
 - [`nanocodex-eval`](nanocodex-eval/README.md): VM-backed benchmark
   scheduling, verification, durable evidence, and live stock-Codex
   differential analysis.
+- [`nanocodex-rlm`](nanocodex-rlm/README.md): application-owned recursive
+  subagents, launch-loaded orchestration prompts, and frozen harness snapshots.
 
 Experimental means API stability, not reduced engineering standards. These
 packages remain workspace members and must pass the normal formatting, Clippy,

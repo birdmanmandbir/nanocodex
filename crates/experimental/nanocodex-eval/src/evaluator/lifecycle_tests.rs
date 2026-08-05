@@ -100,6 +100,7 @@ impl DynamicToolProvider for PackageMutatingProvider {
 
 struct ResourceProbeVerifier {
     live_resources: Arc<AtomicUsize>,
+    finalizations: Arc<AtomicUsize>,
 }
 
 struct ResourceCheckedVerifier<V> {
@@ -207,6 +208,11 @@ impl AttemptVerifier for ResourceProbeVerifier {
             self.live_resources.load(Ordering::Acquire),
             0,
             "attempt-owned agent resources must be joined before verification starts"
+        );
+        assert_eq!(
+            self.finalizations.load(Ordering::Acquire),
+            1,
+            "attempt finalization must complete before verification starts"
         );
         Box::pin(async {
             let cleanup_started = chrono::Utc::now();
@@ -328,12 +334,24 @@ async fn agent_resources_are_joined_before_attempt_verifier() {
     });
     let output = tempdir().unwrap();
     let verifier_resources = Arc::clone(&live_resources);
+    let finalizations = Arc::new(AtomicUsize::new(0));
+    let verifier_finalizations = Arc::clone(&finalizations);
+    let attempt_finalizations = Arc::clone(&finalizations);
     let evaluator = Evaluator::new_builder(nanocodex)
         .output_directory(output.path())
         .attempt_agent(move |_attempt, builder| {
-            Ok::<_, Infallible>(AttemptAgent::new(builder).verifier(ResourceProbeVerifier {
-                live_resources: Arc::clone(&verifier_resources),
-            }))
+            let finalizations = Arc::clone(&attempt_finalizations);
+            Ok::<_, Infallible>(
+                AttemptAgent::new(builder)
+                    .finalize_after_agent(async move {
+                        finalizations.fetch_add(1, Ordering::AcqRel);
+                        Ok::<_, Infallible>(())
+                    })
+                    .verifier(ResourceProbeVerifier {
+                        live_resources: Arc::clone(&verifier_resources),
+                        finalizations: Arc::clone(&verifier_finalizations),
+                    }),
+            )
         })
         .build()
         .unwrap();
@@ -353,6 +371,7 @@ async fn agent_resources_are_joined_before_attempt_verifier() {
     assert_eq!(result.cleanup.agent.status, CleanupStatus::Completed);
     assert_eq!(result.cleanup.verifier.status, CleanupStatus::Failed);
     assert_eq!(live_resources.load(Ordering::Acquire), 0);
+    assert_eq!(finalizations.load(Ordering::Acquire), 1);
     server.await.unwrap();
 }
 
