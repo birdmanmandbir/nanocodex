@@ -661,15 +661,16 @@ may hide missing coordinates or mix incompatible preparation identities.
    cleanup before exposing it as normal CLI policy.
 8. [ ] Rebase and decide PR #79, then review PR #89 against the stable-core and
    application-policy boundaries above.
-9. [ ] Continue the profile-driven evaluation UX directly in PR #72, using its
-   normalized benchmark imports as the only evaluation path. The first
-   milestone is a local `adapter-smoke` profile that prepares, runs, verifies,
-   monitors, and reports one real task through every built-in benchmark adapter
-   with current Nanocodex and every implemented guest harness CLI driver.
+9. [x] Complete the first profile-driven evaluation milestone directly in PR
+   #72, using its normalized benchmark imports as the only evaluation path. The
+   local `adapter-smoke` profile prepares, runs, verifies, monitors, and reports
+   one real task through every built-in benchmark adapter with current
+   Nanocodex and every implemented guest harness CLI driver, including durable
+   hard-kill recovery and a zero-spend completed-run no-op.
 10. [ ] Extend the same PR #72 workflow from that smoke gate to complete local
     profiles covering the recorded GPT-5.6 benchmark families: automatic
     multi-harness/model/thinking matrices, durable monitoring,
-    interruption/resume/rerun, and website-ready reporting behind
+    interruption/resume/new-sample runs, and website-ready reporting behind
     `nanocodex eval prepare` and `nanocodex eval run`.
 11. [ ] Run the coordinator/runner architecture with one saturated remote
     runner on `dev-georgios`, retaining all heavyweight state on its verified
