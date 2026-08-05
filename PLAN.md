@@ -830,9 +830,16 @@ may hide missing coordinates or mix incompatible preparation identities.
     without model spend. SWE-Atlas QnA's first audit exposed that its checked-in
     `allow_internet = true` is narrowed by the official runner only during the
     agent phase. The dedicated route now preserves that restriction for native
-    Nanocodex and isolates its answer-only verifier artifact. Finish its native
-    smoke, add model-control-plane-only guest egress before any Codex claim, and
-    run the remaining GPQA/GDPval differential before accepting release results.
+    Nanocodex and isolates its answer-only verifier artifact. Its first local
+    smoke job `019fd3db-c1fe-7aa3-8549-c2c7fec710a9` was correctly rejected as
+    invalid evidence after all four attempts failed before model spend with an
+    amd64-on-arm64 `Exec format error`. OCI preparation now validates the image
+    configuration before downloading layers, invalidates pre-validation cache
+    records, and fails the local profile directly during `prepare` with the
+    exact unsupported platform instead of publishing a runnable receipt. Run
+    this amd64-only smoke on `dev-georgios`, add model-control-plane-only guest
+    egress before any Codex claim, and run the remaining GPQA/GDPval
+    differential before accepting release results.
 11. [ ] Run the coordinator/runner architecture with one saturated remote
     runner on `dev-georgios`, retaining all heavyweight state on its verified
     3.5 TB drive. Add cross-host sharding only after measurements show that

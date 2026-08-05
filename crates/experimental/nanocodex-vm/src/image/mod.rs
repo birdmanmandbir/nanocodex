@@ -794,7 +794,6 @@ struct ReferenceRecord {
     image_reference: String,
     manifest_digest: String,
     layers: Vec<LayerRecord>,
-    #[serde(default)]
     config: ImageRuntimeConfig,
 }
 
@@ -2887,6 +2886,62 @@ mod tests {
                 && actual_os == "linux"
                 && actual_architecture == OTHER_GUEST_ARCHITECTURE
         ));
+    }
+
+    #[test]
+    fn image_configuration_rejects_a_non_linux_image() {
+        let config = format!(
+            r#"{{"architecture":"{}","os":"windows","config":{{}},"rootfs":{{"type":"layers","diff_ids":[]}}}}"#,
+            super::GUEST_ARCHITECTURE
+        );
+
+        let Err(error) = ImageRuntimeConfig::parse(FIXTURE_IMAGE, &config) else {
+            panic!("non-Linux image unexpectedly accepted");
+        };
+
+        assert!(matches!(
+            error,
+            ImageError::UnsupportedPlatform {
+                actual_os,
+                actual_architecture,
+                ..
+            } if actual_os == "windows" && actual_architecture == super::GUEST_ARCHITECTURE
+        ));
+    }
+
+    #[test]
+    fn image_configuration_requires_platform_fields() {
+        for config in [
+            r#"{"os":"linux","config":{},"rootfs":{"type":"layers","diff_ids":[]}}"#,
+            r#"{"architecture":"amd64","config":{},"rootfs":{"type":"layers","diff_ids":[]}}"#,
+        ] {
+            assert!(matches!(
+                ImageRuntimeConfig::parse(FIXTURE_IMAGE, config),
+                Err(ImageError::Json(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_validation_reference_cache_is_ignored() {
+        let directory = tempfile::tempdir().unwrap();
+        let record = ReferenceRecord {
+            version: CACHE_RECORD_VERSION - 1,
+            image_reference: FIXTURE_IMAGE.to_owned(),
+            manifest_digest: FIXTURE_MANIFEST.to_owned(),
+            layers: vec![LayerRecord {
+                digest: FIXTURE_MANIFEST.to_owned(),
+                media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_owned(),
+            }],
+            config: ImageRuntimeConfig::default(),
+        };
+
+        assert!(
+            super::local_image(FIXTURE_IMAGE, directory.path(), record)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
