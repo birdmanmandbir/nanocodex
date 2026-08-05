@@ -81,6 +81,10 @@ const GUEST_HARNESS_SHARE_TAG: &str = "nanocodex-harnesses";
 const GUEST_HARNESS_MOUNT: &str = "/run/nanocodex-harnesses";
 const GUEST_HARNESS_HOME: &str = "/run/nanocodex-harness-home";
 const GUEST_HARNESS_AUTH_FILE: &str = "/run/nanocodex-harness-home/auth.json";
+const GUEST_HARNESS_CLOUD_CONFIG_FILE: &str =
+    "/run/nanocodex-harness-home/cloud-config-bundle-cache.json";
+const GUEST_HARNESS_CA_FILE: &str = "/run/nanocodex-harness-home/ca-certificates.crt";
+const HOST_CA_FILE: &str = "/etc/ssl/certs/ca-certificates.crt";
 const GUEST_HARNESS_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_VM_CACHE: &str = ".cache/vm";
 const DEFAULT_KRUNFW_DIRECTORY: &str = ".cache/libkrunfw/libkrunfw";
@@ -269,7 +273,10 @@ enum GuestHarnessDriver {
 #[derive(Clone)]
 enum PreparedGuestAuth {
     ApiKey(Arc<str>),
-    AuthFile(Arc<[u8]>),
+    Subscription {
+        auth: Arc<[u8]>,
+        cloud_config: Option<Arc<[u8]>>,
+    },
 }
 
 struct GuestCliRunner {
@@ -288,6 +295,8 @@ struct GuestCliRunner {
     prompt: String,
     instructions: Option<String>,
     native_output: PathBuf,
+    native_stderr: PathBuf,
+    ca_certificates: Arc<[u8]>,
 }
 
 /// Typed summary of one completed or fully resumed profile run.
@@ -588,6 +597,11 @@ impl ProfileRunner for VmProfileRunner {
                 },
             )?)?)
         };
+        let ca_certificates = if harnesses.is_empty() {
+            None
+        } else {
+            Some(PreparedGuestAuth::load_ca_certificates()?)
+        };
         let plan = request.receipt().nanocodex_plan(&self.nanocodex)?;
         let tasks = plan.tasks().to_vec();
         let sweep = plan.into_sweep();
@@ -616,6 +630,7 @@ impl ProfileRunner for VmProfileRunner {
 
         let treatment_map = Arc::clone(&treatments);
         let evaluator_auth = harness_auth.clone();
+        let evaluator_ca = ca_certificates.clone();
         let mut evaluator = Evaluator::new_builder(self.nanocodex)
             .vm_with(backend, move |attempt, builder, runtime| {
                 let Some(agent) = attempt.agent_id() else {
@@ -633,6 +648,9 @@ impl ProfileRunner for VmProfileRunner {
                     evaluator_auth
                         .clone()
                         .ok_or_else(|| VmAttemptError::Harness("missing guest auth".to_owned()))?,
+                    evaluator_ca.clone().ok_or_else(|| {
+                        VmAttemptError::Harness("missing guest CA certificates".to_owned())
+                    })?,
                 )
             })
             .output_directory(request.output_directory())
@@ -738,15 +756,38 @@ impl PreparedGuestAuth {
     fn load(auth: GuestHarnessAuth) -> Result<Self, VmProfileRunError> {
         match auth {
             GuestHarnessAuth::ApiKey(key) => Ok(Self::ApiKey(key)),
-            GuestHarnessAuth::AuthFile(path) => fs::read(&path)
-                .map(|bytes| Self::AuthFile(bytes.into()))
-                .map_err(|error| {
+            GuestHarnessAuth::AuthFile(path) => {
+                let auth = fs::read(&path).map_err(|error| {
                     VmProfileRunError::Harness(format!(
                         "failed to read subscription credentials {}: {error}",
                         path.display()
                     ))
-                }),
+                })?;
+                let cloud_config_path = path.with_file_name("cloud-config-bundle-cache.json");
+                let cloud_config = match fs::read(&cloud_config_path) {
+                    Ok(bytes) => Some(Arc::from(bytes)),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                    Err(error) => {
+                        return Err(VmProfileRunError::Harness(format!(
+                            "failed to read subscription cloud configuration {}: {error}",
+                            cloud_config_path.display()
+                        )));
+                    }
+                };
+                Ok(Self::Subscription {
+                    auth: auth.into(),
+                    cloud_config,
+                })
+            }
         }
+    }
+
+    fn load_ca_certificates() -> Result<Arc<[u8]>, VmProfileRunError> {
+        fs::read(HOST_CA_FILE).map(Arc::from).map_err(|error| {
+            VmProfileRunError::Harness(format!(
+                "failed to read host CA bundle {HOST_CA_FILE}: {error}"
+            ))
+        })
     }
 }
 
@@ -787,11 +828,13 @@ impl GuestTreatment {
         runtime: VmAttempt,
         attempt: EvalAttempt<'_>,
         auth: PreparedGuestAuth,
+        ca_certificates: Arc<[u8]>,
     ) -> Result<AttemptAgent, VmAttemptError> {
         let session = runtime.session_handle()?;
         let workspace = runtime.verifier.launch.workspace.clone();
         let mut environment = base_guest_environment(attempt.task(), &workspace);
         environment.push(("CODEX_HOME".to_owned(), GUEST_HARNESS_HOME.to_owned()));
+        environment.push(("SSL_CERT_FILE".to_owned(), GUEST_HARNESS_CA_FILE.to_owned()));
         if let PreparedGuestAuth::ApiKey(key) = &auth {
             environment.push(("OPENAI_API_KEY".to_owned(), key.to_string()));
         }
@@ -813,6 +856,8 @@ impl GuestTreatment {
             prompt,
             instructions: instructions.clone(),
             native_output: attempt.directory().join("agent/harness-native.jsonl"),
+            native_stderr: attempt.directory().join("agent/harness-native.stderr.log"),
+            ca_certificates,
         });
         let readiness = Arc::clone(&runner);
         let mut codex = CodexExec::new(&self.harness.host_command, &self.model, &self.effort)
@@ -860,10 +905,22 @@ impl GuestCliRunner {
         self.session
             .create_directory(GUEST_HARNESS_HOME, 0o700, None)
             .await?;
-        if let PreparedGuestAuth::AuthFile(bytes) = &self.auth {
+        self.session
+            .write_file(GUEST_HARNESS_CA_FILE, self.ca_certificates.to_vec(), 0o600)
+            .await?;
+        if let PreparedGuestAuth::Subscription { auth, cloud_config } = &self.auth {
             self.session
-                .write_file(GUEST_HARNESS_AUTH_FILE, bytes.to_vec(), 0o600)
+                .write_file(GUEST_HARNESS_AUTH_FILE, auth.to_vec(), 0o600)
                 .await?;
+            if let Some(cloud_config) = cloud_config {
+                self.session
+                    .write_file(
+                        GUEST_HARNESS_CLOUD_CONFIG_FILE,
+                        cloud_config.to_vec(),
+                        0o600,
+                    )
+                    .await?;
+            }
         }
         let version = self
             .session
@@ -930,11 +987,15 @@ impl GuestCliRunner {
         command
     }
 
-    async fn normalize_nanocodex(&self, output: &[u8]) -> Result<Vec<u8>, io::Error> {
+    async fn retain_native_output(&self, stdout: &[u8], stderr: &[u8]) -> Result<(), io::Error> {
         if let Some(parent) = self.native_output.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        tokio::fs::write(&self.native_output, output).await?;
+        tokio::fs::write(&self.native_output, stdout).await?;
+        tokio::fs::write(&self.native_stderr, stderr).await
+    }
+
+    fn normalize_nanocodex(&self, output: &[u8]) -> Result<Vec<u8>, io::Error> {
         let mut final_message = None;
         let mut completed = None;
         for line in output
@@ -1004,10 +1065,21 @@ impl CodexCommandRunner for GuestCliRunner {
                 }
                 Err(error) => return Err(CodexCommandRunnerError::new(error.to_string())),
             };
-            let stdout = if self.driver == GuestHarnessDriver::Nanocodex {
-                self.normalize_nanocodex(&stdout)
+            if self.driver == GuestHarnessDriver::Nanocodex {
+                self.retain_native_output(&stdout, &stderr)
                     .await
-                    .map_err(|error| CodexCommandRunnerError::new(error.to_string()))?
+                    .map_err(|error| CodexCommandRunnerError::new(error.to_string()))?;
+            }
+            let stdout = if self.driver == GuestHarnessDriver::Nanocodex
+                && matches!(status, CodexCommandStatus::Exited(0))
+            {
+                self.normalize_nanocodex(&stdout).map_err(|error| {
+                    let stderr = String::from_utf8_lossy(&stderr);
+                    CodexCommandRunnerError::new(format!(
+                        "{error}; native stderr: {}",
+                        stderr.trim()
+                    ))
+                })?
             } else {
                 stdout
             };
