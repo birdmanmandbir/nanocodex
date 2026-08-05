@@ -17,6 +17,7 @@ use std::{
     time::Duration,
 };
 
+use nanocodex_oai_api::PromptMessage;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -91,6 +92,7 @@ enum CasePackage {
 #[derive(Debug)]
 struct HermeticCase {
     prompt: String,
+    transcript: Vec<PromptMessage>,
     benchmark_prompt_chars: Option<u64>,
     benchmark_case_type: Option<String>,
     environment: Environment,
@@ -382,6 +384,15 @@ impl DatasetPlan {
                 CasePackage::Hermetic(case) => {
                     Self::update_digest(&mut digest, b"hermetic");
                     Self::update_digest(&mut digest, case.prompt.as_bytes());
+                    Self::update_digest(
+                        &mut digest,
+                        &serde_json::to_vec(&case.transcript).map_err(|source| {
+                            ImportError::Json {
+                                path: PathBuf::from("<import-plan>"),
+                                source,
+                            }
+                        })?,
+                    );
                     Self::update_digest(
                         &mut digest,
                         &case
@@ -698,6 +709,7 @@ impl CasePlan {
             id: id.into_boxed_str(),
             case: HermeticCase {
                 prompt,
+                transcript: Vec::new(),
                 benchmark_prompt_chars: None,
                 benchmark_case_type: None,
                 environment,
@@ -722,6 +734,13 @@ impl CasePlan {
 }
 
 impl HermeticCasePlan {
+    /// Prepends a synthetic text-only conversation to the final user prompt.
+    #[must_use]
+    pub fn transcript(mut self, messages: impl IntoIterator<Item = PromptMessage>) -> Self {
+        self.case.transcript = messages.into_iter().collect();
+        self
+    }
+
     /// Retains the source benchmark's prompt-size dimension for official binning.
     #[must_use]
     pub const fn benchmark_prompt_chars(mut self, chars: u64) -> Self {
@@ -878,6 +897,14 @@ fn materialize_hermetic_case(
     create_dir_all(destination)?;
     fs::write(destination.join("instruction.md"), case.prompt)
         .map_err(|source| io_error(destination.join("instruction.md"), source))?;
+    if !case.transcript.is_empty() {
+        write_json(
+            &destination.join("transcript.json"),
+            &TaskTranscript {
+                messages: &case.transcript,
+            },
+        )?;
+    }
     let environment = destination.join("environment");
     let image = match &case.environment {
         Environment::OciImage(image) => Some(image.clone()),
@@ -927,6 +954,11 @@ fn materialize_hermetic_case(
     fs::write(destination.join("task.toml"), manifest)
         .map_err(|source| io_error(destination.join("task.toml"), source))?;
     Ok(())
+}
+
+#[derive(Serialize)]
+struct TaskTranscript<'a> {
+    messages: &'a [PromptMessage],
 }
 
 fn materialize_harness(harness: Harness, destination: &Path) -> Result<(), ImportError> {

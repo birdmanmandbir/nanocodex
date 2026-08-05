@@ -6,12 +6,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+use nanocodex_oai_api::{Prompt, PromptMessage};
 use serde::{Deserialize, Serialize};
 
 use crate::digest::TaskPackage;
 
 const TASK_CONFIG: &str = "task.toml";
 const TASK_INSTRUCTION: &str = "instruction.md";
+const TASK_TRANSCRIPT: &str = "transcript.json";
 const TASK_ENVIRONMENT: &str = "environment";
 const VERIFIER_SCRIPT: &str = "tests/test.sh";
 const PRE_ARTIFACTS_SCRIPT: &str = "pre_artifacts.sh";
@@ -26,6 +28,7 @@ pub struct Task {
     name: Box<str>,
     description: Box<str>,
     prompt: Box<str>,
+    transcript: Vec<PromptMessage>,
     prompt_chars: u64,
     benchmark_prompt_chars: Option<u64>,
     benchmark_case_type: Option<Box<str>>,
@@ -161,6 +164,16 @@ pub enum TaskLoadError {
         source: toml::de::Error,
     },
 
+    /// `transcript.json` was not valid JSON.
+    #[error("failed to parse task transcript {path}: {source}")]
+    TranscriptParse {
+        /// Transcript path.
+        path: PathBuf,
+        /// JSON parser failure.
+        #[source]
+        source: serde_json::Error,
+    },
+
     /// The manifest declares an unsupported schema revision.
     #[error("unsupported task schema version {found:?}; expected \"1.1\" or \"1.3\"")]
     UnsupportedSchema {
@@ -254,6 +267,30 @@ impl Task {
                 message: "instruction is empty".to_owned(),
             });
         }
+        let transcript_path = root.join(TASK_TRANSCRIPT);
+        let transcript = package
+            .read_file(Path::new(TASK_TRANSCRIPT))
+            .map_err(|source| TaskLoadError::Read {
+                path: transcript_path.clone(),
+                source,
+            })?
+            .map(|bytes| {
+                serde_json::from_slice::<TaskTranscript>(&bytes).map_err(|source| {
+                    TaskLoadError::TranscriptParse {
+                        path: transcript_path.clone(),
+                        source,
+                    }
+                })
+            })
+            .transpose()?
+            .map_or_else(Vec::new, |transcript| transcript.messages);
+        Prompt::new(prompt.clone())
+            .with_transcript(transcript.clone())
+            .validate()
+            .map_err(|error| TaskLoadError::Invalid {
+                path: transcript_path,
+                message: error.to_string(),
+            })?;
 
         let verifier_script = root.join(VERIFIER_SCRIPT);
         require_file(&verifier_script)?;
@@ -292,10 +329,18 @@ impl Task {
             dataset: None,
             name: name.into_boxed_str(),
             description: raw.task.description.into_boxed_str(),
-            prompt_chars: u64::try_from(prompt.chars().count()).unwrap_or(u64::MAX),
+            prompt_chars: u64::try_from(
+                transcript
+                    .iter()
+                    .map(|message| message.content().chars().count())
+                    .sum::<usize>()
+                    .saturating_add(prompt.chars().count()),
+            )
+            .unwrap_or(u64::MAX),
             benchmark_prompt_chars: raw.task.benchmark_prompt_chars,
             benchmark_case_type,
             prompt: prompt.into_boxed_str(),
+            transcript,
             agent_instructions: raw
                 .agent
                 .instructions
@@ -492,7 +537,20 @@ impl Task {
         &self.prompt
     }
 
-    /// Returns the number of Unicode scalar values in the complete prompt.
+    /// Returns the synthetic conversation preceding the final user prompt.
+    #[must_use]
+    pub fn transcript(&self) -> &[PromptMessage] {
+        &self.transcript
+    }
+
+    /// Builds the complete typed prompt accepted by the native agent.
+    #[must_use]
+    pub fn agent_prompt(&self) -> Prompt {
+        Prompt::new(self.prompt.to_string()).with_transcript(self.transcript.clone())
+    }
+
+    /// Returns the number of Unicode scalar values across the complete
+    /// transcript and final user prompt.
     #[must_use]
     pub const fn prompt_chars(&self) -> u64 {
         self.prompt_chars
@@ -624,6 +682,12 @@ impl Task {
             })?;
         self.validate_package()
     }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TaskTranscript {
+    messages: Vec<PromptMessage>,
 }
 
 impl OciImage {
@@ -1158,6 +1222,57 @@ MODE = "test"
         assert_eq!(
             fs::read_to_string(materialized.path().join("Dockerfile")).unwrap(),
             "FROM example/task:20251031\n"
+        );
+    }
+
+    #[test]
+    fn loads_and_fingerprints_a_synthetic_transcript() {
+        let directory = tempdir().unwrap();
+        fs::create_dir(directory.path().join("tests")).unwrap();
+        fs::create_dir(directory.path().join("environment")).unwrap();
+        fs::write(
+            directory.path().join("task.toml"),
+            r#"schema_version = "1.3"
+[task]
+name = "mrcr/example"
+[agent]
+timeout_sec = 10.0
+[verifier]
+timeout_sec = 10.0
+[environment]
+docker_image = "debian:bookworm-slim"
+cpus = 1
+memory_mb = 1024
+storage_mb = 1024
+"#,
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("instruction.md"),
+            "Return the second answer.",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("transcript.json"),
+            r#"{"messages":[{"role":"user","content":"first"},{"role":"assistant","content":"one"},{"role":"user","content":"second"},{"role":"assistant","content":"two"}]}"#,
+        )
+        .unwrap();
+        fs::write(directory.path().join("tests/test.sh"), "#!/bin/sh\n").unwrap();
+
+        let task = Task::load(directory.path()).unwrap();
+
+        assert_eq!(task.transcript().len(), 4);
+        assert_eq!(task.agent_prompt().transcript(), task.transcript());
+        assert_eq!(task.prompt_chars(), 42);
+        let digest = task.content_digest().to_owned();
+        fs::write(
+            directory.path().join("transcript.json"),
+            r#"{"messages":[{"role":"user","content":"first"},{"role":"assistant","content":"changed"}]}"#,
+        )
+        .unwrap();
+        assert_ne!(
+            Task::load(directory.path()).unwrap().content_digest(),
+            digest
         );
     }
 

@@ -318,6 +318,17 @@ pub enum EvalError {
         reason: &'static str,
     },
 
+    /// A selected harness cannot preserve the normalized task input shape.
+    #[error("task {task} cannot run with harness {harness}: {reason}")]
+    UnsupportedHarnessTask {
+        /// Stable task name.
+        task: String,
+        /// Selected harness driver.
+        harness: &'static str,
+        /// Unsupported task requirement.
+        reason: &'static str,
+    },
+
     /// Filesystem or process I/O failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -1208,7 +1219,7 @@ impl Evaluator {
         );
         let trace_started = Instant::now();
         let result = async {
-            let turn = agent.prompt(task.prompt()).await?;
+            let turn = agent.prompt(task.agent_prompt()).await?;
             let mut observation = AgentObservation::default();
             let event_result = timeout(
                 task.agent_timeout(),
@@ -1559,12 +1570,27 @@ impl Evaluator {
                         ))
                     }
                 },
-                AttemptDriver::Codex(codex) => Ok(AgentSetup {
-                    agent: PreparedAgent::Codex(codex),
-                    verifier,
-                    readiness_timing,
-                    timing: PhaseTiming::finished(setup_started),
-                }),
+                AttemptDriver::Codex(codex) => {
+                    if !task.transcript().is_empty() {
+                        let error = RecordedEvalError::now(EvalError::UnsupportedHarnessTask {
+                            task: task.name().to_owned(),
+                            harness: "codex-cli",
+                            reason: "the CLI driver accepts one user prompt and cannot preserve a synthetic user/assistant transcript",
+                        });
+                        let verifier_cleanup = shutdown_attempt_verifier(&mut verifier).await;
+                        return Err(AgentExecutionFailure::setup(
+                            error,
+                            verifier_cleanup,
+                            Some(readiness_timing),
+                        ));
+                    }
+                    Ok(AgentSetup {
+                        agent: PreparedAgent::Codex(codex),
+                        verifier,
+                        readiness_timing,
+                        timing: PhaseTiming::finished(setup_started),
+                    })
+                }
             }
         }
         .instrument(span.clone())
@@ -2974,6 +3000,7 @@ fn failure_kind(error: &EvalError) -> EvalExceptionKind {
         | EvalError::AgentTerminal(_) => EvalExceptionKind::Agent,
         EvalError::AttemptVerifier(_) | EvalError::ParseReward(_) => EvalExceptionKind::Verifier,
         EvalError::UnsupportedNativeTask { .. }
+        | EvalError::UnsupportedHarnessTask { .. }
         | EvalError::TaskPackage(_)
         | EvalError::OutputOverlapsTask { .. }
         | EvalError::AttemptAgent(_) => EvalExceptionKind::Environment,

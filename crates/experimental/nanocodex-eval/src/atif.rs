@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use nanocodex_agent::events::{AgentEvent, AgentEventKind};
-use nanocodex_oai_api::{MODEL, responses::Usage};
+use nanocodex_oai_api::{MODEL, PromptMessageRole, responses::Usage};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
@@ -43,6 +43,25 @@ impl AtifTrajectory {
             .filter_map(|step| step.observation.as_ref())
             .map(|observation| observation.results.len())
             .sum()
+    }
+
+    fn with_task_transcript(mut self, task: &Task) -> Self {
+        if task.transcript().is_empty() {
+            return self;
+        }
+        let mut steps = Vec::with_capacity(self.steps.len() + task.transcript().len());
+        steps.extend(
+            task.transcript()
+                .iter()
+                .map(|message| AtifStep::synthetic(message.role(), message.content())),
+        );
+        steps.append(&mut self.steps);
+        for (offset, step) in steps.iter_mut().enumerate() {
+            step.step_id = u32::try_from(offset + 1).unwrap_or(u32::MAX);
+        }
+        self.final_metrics.total_steps = u32::try_from(steps.len()).unwrap_or(u32::MAX);
+        self.steps = steps;
+        self
     }
 }
 
@@ -419,6 +438,7 @@ impl AtifBuilder {
             },
             result,
         )
+        .with_task_transcript(task)
     }
 
     pub(crate) fn finish_projected(
@@ -529,6 +549,7 @@ impl AtifBuilder {
                 },
             },
         }
+        .with_task_transcript(task)
     }
 }
 
@@ -644,6 +665,25 @@ impl AtifTurn {
 }
 
 impl AtifStep {
+    fn synthetic(role: PromptMessageRole, message: &str) -> Self {
+        Self {
+            step_id: 0,
+            source: match role {
+                PromptMessageRole::User => AtifSource::User,
+                PromptMessageRole::Assistant => AtifSource::Agent,
+            },
+            model_name: None,
+            reasoning_effort: None,
+            message: message.to_owned(),
+            reasoning_content: None,
+            tool_calls: None,
+            observation: None,
+            metrics: None,
+            llm_call_count: None,
+            extra: None,
+        }
+    }
+
     fn user(step_id: u32, message: &str) -> Self {
         Self {
             step_id,
@@ -790,13 +830,14 @@ struct ToolResultPayload {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{fs, path::Path};
 
     use crate::{
         AgentMetadata, AgentResult, AgentStatus, AtifSource, BillingCompleteness,
         MeasurementCompleteness, Task,
     };
     use nanocodex_agent::events::AgentEvent;
+    use tempfile::tempdir;
 
     use super::AtifBuilder;
 
@@ -910,6 +951,28 @@ mod tests {
             decoded.final_metrics.extra.usage_completeness,
             Some(MeasurementCompleteness::Complete)
         );
+        let transcript_package = tempdir().unwrap();
+        let transcript_root = transcript_package.path().join("task");
+        task.materialize_package(&transcript_root).unwrap();
+        fs::write(
+            transcript_root.join("transcript.json"),
+            r#"{"messages":[{"role":"user","content":"first"},{"role":"assistant","content":"one"},{"role":"user","content":"second"},{"role":"assistant","content":"two"}]}"#,
+        )
+        .unwrap();
+        let transcript_task = Task::load(transcript_root).unwrap();
+        let transcript_trajectory = AtifBuilder::default().finish(&transcript_task, &result);
+        assert_eq!(transcript_trajectory.steps.len(), 6);
+        assert!(matches!(
+            transcript_trajectory.steps[0].source,
+            AtifSource::User
+        ));
+        assert!(matches!(
+            transcript_trajectory.steps[1].source,
+            AtifSource::Agent
+        ));
+        assert_eq!(transcript_trajectory.steps[4].message, task.prompt());
+        assert_eq!(transcript_trajectory.steps[5].message, "Finished.");
+        assert_eq!(transcript_trajectory.final_metrics.total_steps, 6);
         let mut partial_builder = AtifBuilder::default();
         for event in &events {
             partial_builder.apply(event).unwrap();

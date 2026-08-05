@@ -120,6 +120,7 @@ pub use evaluator::{EvalError, EvalRun, Evaluator, EvaluatorBuilder};
 pub use event::{
     EvalEvent, EvalEventAttempt, EvalEventKind, EvalEventStream, EvalEventStreamError, EvalEvents,
 };
+pub use nanocodex_oai_api::{PromptMessage, PromptMessageRole};
 pub use result::{
     AgentMetadata, AgentResult, AgentStatus, BillingCompleteness, CleanupDiagnostic, CleanupPhase,
     CleanupStatus, EvalArtifacts, EvalAttemptOutcome, EvalCleanup, EvalEnvironment, EvalException,

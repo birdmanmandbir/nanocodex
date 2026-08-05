@@ -7,9 +7,10 @@ use std::{
 use filetime::FileTime;
 use sha2::{Digest, Sha256};
 
-const PACKAGE_FILES: [&str; 4] = [
+const PACKAGE_FILES: [&str; 5] = [
     "task.toml",
     "instruction.md",
+    "transcript.json",
     "README.md",
     "pre_artifacts.sh",
 ];

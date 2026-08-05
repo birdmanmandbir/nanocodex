@@ -270,6 +270,7 @@ struct TaskOutput<'a> {
     description: &'a str,
     root: &'a Path,
     prompt: &'a str,
+    transcript: &'a [nanocodex_eval::PromptMessage],
     prompt_chars: u64,
     benchmark_prompt_chars: Option<u64>,
     benchmark_case_type: Option<&'a str>,
@@ -308,6 +309,7 @@ impl<'a> From<&'a Task> for TaskOutput<'a> {
             description: task.description(),
             root: task.root(),
             prompt: task.prompt(),
+            transcript: task.transcript(),
             prompt_chars: task.prompt_chars(),
             benchmark_prompt_chars: task.benchmark_prompt_chars(),
             benchmark_case_type: task.benchmark_case_type(),
@@ -342,8 +344,9 @@ impl TaskOutput<'_> {
         writeln!(output, "  image: {}", self.image)?;
         writeln!(
             output,
-            "  prompt: {} chars, {} bytes",
+            "  model input: {} chars, {} transcript messages, {} final-prompt bytes",
             self.prompt_chars,
+            self.transcript.len(),
             self.prompt.len()
         )?;
         if let Some(chars) = self.benchmark_prompt_chars {
@@ -375,7 +378,10 @@ impl TaskOutput<'_> {
         writeln!(output, "  artifacts: {}", self.artifacts.len())?;
         writeln!(output, "  requires compose: {}", self.requires_compose)?;
         if include_prompt {
-            writeln!(output, "\n{}", self.prompt)?;
+            for message in self.transcript {
+                writeln!(output, "\n{:?}: {}", message.role(), message.content())?;
+            }
+            writeln!(output, "\nUser: {}", self.prompt)?;
         }
         Ok(())
     }
