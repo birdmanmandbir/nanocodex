@@ -14,6 +14,16 @@ pub(crate) struct DurableTrial {
     directory: PathBuf,
     result_path: PathBuf,
     coordinate: RunCoordinate,
+    outcome: DurableTrialOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum DurableTrialOutcome {
+    InfrastructureError,
+    #[default]
+    #[serde(other)]
+    Terminal,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -120,6 +130,8 @@ struct RetainedTrialIdentity {
     trial_name: String,
     task_id: RetainedTaskPath,
     config: RetainedTrialConfig,
+    #[serde(default)]
+    outcome: DurableTrialOutcome,
 }
 
 #[derive(Deserialize)]
@@ -163,6 +175,10 @@ impl DurableTrial {
 
     pub(crate) const fn coordinate(&self) -> &RunCoordinate {
         &self.coordinate
+    }
+
+    pub(crate) const fn is_infrastructure_error(&self) -> bool {
+        matches!(self.outcome, DurableTrialOutcome::InfrastructureError)
     }
 }
 
@@ -306,6 +322,7 @@ pub(crate) fn scan_manifest_trials(
             directory,
             result_path,
             coordinate,
+            outcome: result.outcome,
         });
     }
     Ok(trials)

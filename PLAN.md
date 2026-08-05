@@ -611,8 +611,11 @@ The live view must show at least:
 their atomic boundary, and leaves the profile resumable. An explicit immediate
 stop may cancel active attempts and remove only disposable overlays. Re-running
 `run` with the same profile converges the exact prepared matrix and skips every
-valid checkpoint, including when that matrix is already complete. Repeating it
-is therefore a safe no-op that never starts another sample or duplicates model
+valid checkpoint, including when that matrix is already complete. Infrastructure
+terminals are retained in a retry archive and replaced in the same job with a
+small evaluator-owned bound; verifier failures and other valid scored terminals
+are never retried to improve a score. Repeating `run` after convergence is
+therefore a safe no-op that never starts another sample or duplicates model
 spend. `run --new` explicitly creates a fresh retained sample matrix; optional
 task names select prepared tasks without overwriting the original evidence.
 The normal task-selector form remains Foundry-like

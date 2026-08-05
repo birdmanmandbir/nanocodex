@@ -17,6 +17,8 @@ use crate::{
     sweep::{RunCoordinate, RunManifest},
 };
 
+const INFRASTRUCTURE_RETRIES_DIRECTORY: &str = "infrastructure-retries";
+
 const JOB_FILE: &str = "job.json";
 const LOCK_FILE: &str = ".nanocodex-eval.lock";
 const RUN_FILE: &str = "run.json";
@@ -206,6 +208,42 @@ impl EvalJob {
                     .collect()
             })
             .map_err(|error| EvalError::InvalidDurableTrial(error.to_string()))
+    }
+
+    pub fn archive_infrastructure_failures(&self, run: &RunManifest) -> Result<usize, EvalError> {
+        let trials = scan_manifest_trials(&self.directory, self.id, run)
+            .map_err(|error| EvalError::InvalidDurableTrial(error.to_string()))?;
+        let retryable = trials
+            .into_iter()
+            .filter(|trial| trial.is_infrastructure_error())
+            .collect::<Vec<_>>();
+        if retryable.is_empty() {
+            return Ok(0);
+        }
+        let archive = self.directory.join(INFRASTRUCTURE_RETRIES_DIRECTORY);
+        fs::create_dir_all(&archive)?;
+        for trial in &retryable {
+            let name = trial.directory().file_name().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "durable trial has no directory name",
+                )
+            })?;
+            let destination = archive.join(name);
+            if destination.exists() {
+                return Err(EvalError::Io(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "infrastructure retry archive already contains {}",
+                        destination.display()
+                    ),
+                )));
+            }
+            fs::rename(trial.directory(), &destination)?;
+        }
+        sync_directory(&archive)?;
+        sync_directory(&self.directory)?;
+        Ok(retryable.len())
     }
 
     fn verify_run(path: &Path, expected: &RunManifest) -> Result<(), EvalError> {
@@ -664,6 +702,29 @@ mod tests {
         assert!(completed.contains(&coordinate));
     }
 
+    #[test]
+    fn archives_infrastructure_evidence_and_reopens_its_coordinate() {
+        let output = tempdir().unwrap();
+        let job = EvalJob::create(output.path()).unwrap();
+        let sweep = sweep(1);
+        let run = sweep.manifest();
+        job.bind_run(&run).unwrap();
+        let trial = write_trial_with_outcome(&job, &sweep, "infrastructure_error");
+        let name = trial.file_name().unwrap().to_owned();
+
+        assert_eq!(job.archive_infrastructure_failures(&run).unwrap(), 1);
+
+        assert!(!trial.exists());
+        assert!(
+            job.directory()
+                .join(INFRASTRUCTURE_RETRIES_DIRECTORY)
+                .join(name)
+                .join("result.json")
+                .is_file()
+        );
+        assert!(job.completed_coordinates(&run).unwrap().is_empty());
+    }
+
     fn sweep(trials: u16) -> Sweep {
         sweep_for_task(
             Task::load(
@@ -695,6 +756,10 @@ mod tests {
     }
 
     fn write_terminal_trial(job: &EvalJob, sweep: &Sweep) -> PathBuf {
+        write_trial_with_outcome(job, sweep, "passed")
+    }
+
+    fn write_trial_with_outcome(job: &EvalJob, sweep: &Sweep, outcome: &str) -> PathBuf {
         let id = Uuid::now_v7();
         let compact_id = id.simple().to_string();
         let coordinate = sweep.attempts().next().unwrap().coordinate();
@@ -728,6 +793,7 @@ mod tests {
                 "id": id,
                 "task_name": task.name(),
                 "trial_name": trial_name,
+                "outcome": outcome,
                 "task_id": {
                     "path": task.root(),
                 },

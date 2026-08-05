@@ -305,7 +305,10 @@ pub struct VmProfileRunResult {
     job_directory: PathBuf,
     attempts: usize,
     skipped: usize,
+    infrastructure_retries: usize,
 }
+
+const PROFILE_INFRASTRUCTURE_RETRY_ROUNDS: usize = 3;
 
 /// VM-backed profile execution failed.
 #[derive(Debug, thiserror::Error)]
@@ -707,8 +710,11 @@ impl ProfileRunner for VmProfileRunner {
         request.opened_job(evaluator.directory())?;
         Self::reclaim_interrupted_attempt_disks(evaluator.directory())
             .map_err(VmProfileRunError::InterruptedAttemptCleanup)?;
-        let remaining = evaluator.remaining_attempts()?;
-        if remaining > 0 {
+        let mut infrastructure_retries = evaluator.archive_infrastructure_failures()?;
+        let mut retry_rounds = usize::from(infrastructure_retries > 0);
+        let initial_remaining = evaluator.remaining_attempts()?;
+        let initial_skipped = planned_attempts.saturating_sub(initial_remaining);
+        if initial_remaining > 0 {
             let resources = VmResources::builder(self.vmm, self.runtime_image)
                 .tasks(tasks)
                 .cache_directory(request.cache_directory())
@@ -716,23 +722,41 @@ impl ProfileRunner for VmProfileRunner {
                 .await?;
             resources.configure(&backend).await?;
         }
-        let run = evaluator.sweep();
-        let recorder = Harbor::new(&evaluator)?.record(run.events().subscribe())?;
-        tokio::pin!(run);
-        let (results, terminal_attempts) = tokio::select! {
-            result = &mut run => (result?, remaining),
-            stop = request.wait_for_stop() => {
-                stop?;
-                let admitted = evaluator.begin_drain();
-                (run.await?, admitted)
+        let mut attempts = 0usize;
+        let job_directory = loop {
+            let remaining = evaluator.remaining_attempts()?;
+            let run = evaluator.sweep();
+            let recorder = Harbor::new(&evaluator)?.record(run.events().subscribe())?;
+            tokio::pin!(run);
+            let mut stopped = false;
+            let (results, terminal_attempts) = tokio::select! {
+                result = &mut run => (result?, remaining),
+                stop = request.wait_for_stop() => {
+                    stop?;
+                    stopped = true;
+                    let admitted = evaluator.begin_drain();
+                    (run.await?, admitted)
+                }
+            };
+            attempts = attempts.saturating_add(results.attempts().len());
+            let job = recorder.finish_all(terminal_attempts).await?;
+            let current_job = job.directory().to_path_buf();
+            if stopped || retry_rounds >= PROFILE_INFRASTRUCTURE_RETRY_ROUNDS {
+                break current_job;
             }
+            let retryable = evaluator.archive_infrastructure_failures()?;
+            if retryable == 0 {
+                break current_job;
+            }
+            infrastructure_retries = infrastructure_retries.saturating_add(retryable);
+            retry_rounds = retry_rounds.saturating_add(1);
         };
-        let job = recorder.finish_all(terminal_attempts).await?;
         request.complete()?;
         Ok(VmProfileRunResult {
-            job_directory: job.directory().to_path_buf(),
-            attempts: results.attempts().len(),
-            skipped: results.skipped(),
+            job_directory,
+            attempts,
+            skipped: initial_skipped,
+            infrastructure_retries,
         })
     }
 }
@@ -1171,15 +1195,28 @@ impl VmProfileRunResult {
     pub const fn skipped(&self) -> usize {
         self.skipped
     }
+
+    /// Infrastructure-error attempts retained and replaced by this invocation.
+    pub const fn infrastructure_retries(&self) -> usize {
+        self.infrastructure_retries
+    }
 }
 
 impl fmt::Display for VmProfileRunResult {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(
+        write!(
             formatter,
-            "completed {} attempt(s) ({} resumed)",
+            "completed {} attempt(s) ({} resumed",
             self.attempts, self.skipped
         )?;
+        if self.infrastructure_retries > 0 {
+            write!(
+                formatter,
+                "; {} infrastructure retry attempt(s)",
+                self.infrastructure_retries
+            )?;
+        }
+        writeln!(formatter, ")")?;
         write!(formatter, "artifacts: {}", self.job_directory.display())
     }
 }

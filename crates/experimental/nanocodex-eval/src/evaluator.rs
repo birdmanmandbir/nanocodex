@@ -642,6 +642,23 @@ impl Evaluator {
         Ok(remaining)
     }
 
+    /// Retains infrastructure-error evidence outside canonical coordinate
+    /// coverage so the same finite sweep can retry those coordinates.
+    ///
+    /// Verifier failures, safety refusals, timeouts, and scored cleanup errors
+    /// remain terminal evidence and are never selected by this operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the evaluator has no finite sweep or retained
+    /// trial evidence is invalid or cannot be moved durably.
+    pub fn archive_infrastructure_failures(&self) -> Result<usize, EvalError> {
+        let sweep = self.inner.sweep.as_ref().ok_or(EvalError::MissingSweep)?;
+        let manifest = sweep.manifest();
+        self.inner.job.bind_run(&manifest)?;
+        self.inner.job.archive_infrastructure_failures(&manifest)
+    }
+
     async fn run_tasks(&self, tasks: Vec<AttemptInput>) -> Result<Vec<AttemptOutput>, EvalError> {
         let task_count = tasks.len();
         let mut pending = tasks.into_iter().enumerate().collect::<VecDeque<_>>();
