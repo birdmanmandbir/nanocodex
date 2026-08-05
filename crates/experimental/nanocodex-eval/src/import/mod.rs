@@ -425,6 +425,7 @@ impl DatasetPlan {
                         &mut digest,
                         &case.verifier_timeout.as_nanos().to_le_bytes(),
                     );
+                    Self::update_digest(&mut digest, case.scoring_policy.as_str().as_bytes());
                     Self::update_digest(
                         &mut digest,
                         case.agent_instructions.as_deref().unwrap_or("").as_bytes(),
@@ -1148,6 +1149,7 @@ mod tests {
         environment: &'a Path,
         harness: &'a Path,
         contents: &'a [u8],
+        scoring_policy: ScoringPolicy,
     }
 
     impl DatasetImporter for FixtureImporter {
@@ -1173,7 +1175,7 @@ mod tests {
                     Environment::Dockerfile(self.environment.to_path_buf()),
                     Harness::directory(self.harness)?,
                 )?
-                .scoring_policy(ScoringPolicy::AllRewardsOne)
+                .scoring_policy(self.scoring_policy)
                 .environment_file("data_files/input.csv", self.contents, 0o644)?,
             ))
         }
@@ -1226,6 +1228,7 @@ mod tests {
                 environment: source.path(),
                 harness: harness.path(),
                 contents: b"value\n1\n",
+                scoring_policy: ScoringPolicy::AllRewardsOne,
             })
             .unwrap();
         let changed = ImportStore::new(store.path())
@@ -1233,6 +1236,7 @@ mod tests {
                 environment: source.path(),
                 harness: harness.path(),
                 contents: b"value\n2\n",
+                scoring_policy: ScoringPolicy::AllRewardsOne,
             })
             .unwrap();
 
@@ -1250,6 +1254,16 @@ mod tests {
             ScoringPolicy::AllRewardsOne
         );
         assert_ne!(first.digest(), changed.digest());
+
+        let changed_policy = ImportStore::new(store.path())
+            .import(&WorkspaceImporter {
+                environment: source.path(),
+                harness: harness.path(),
+                contents: b"value\n1\n",
+                scoring_policy: ScoringPolicy::AllRewardsPositive,
+            })
+            .unwrap();
+        assert_ne!(first.digest(), changed_policy.digest());
     }
 
     fn make_task(root: &Path, prompt: &str) {
