@@ -602,7 +602,10 @@ impl ProfileRunner for VmProfileRunner {
         } else {
             Some(PreparedGuestAuth::load_ca_certificates()?)
         };
-        let plan = request.receipt().nanocodex_plan(&self.nanocodex)?;
+        let rerun_tasks = request.rerun_tasks().map(<[String]>::to_vec);
+        let plan = request
+            .receipt()
+            .run_plan_for(&self.nanocodex, rerun_tasks.as_deref())?;
         let tasks = plan.tasks().to_vec();
         let sweep = plan.into_sweep();
         let planned_attempts = sweep.attempt_count();
@@ -654,8 +657,12 @@ impl ProfileRunner for VmProfileRunner {
                 )
             })
             .output_directory(request.output_directory())
-            .max_concurrency(self.max_concurrency)
-            .resume_incomplete(sweep);
+            .max_concurrency(self.max_concurrency);
+        evaluator = if rerun_tasks.is_some() {
+            evaluator.fresh_run(sweep)
+        } else {
+            evaluator.resume_incomplete(sweep)
+        };
         if let Some(memory_mb) = self.max_memory_mb {
             evaluator = evaluator.max_memory_mb(memory_mb);
         }

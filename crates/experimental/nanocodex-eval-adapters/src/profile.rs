@@ -366,14 +366,35 @@ impl<P: TaskPreparer> EvaluationWorkspace<P> {
 impl<P: ProfileRunner + TaskPreparer> EvaluationWorkspace<P> {
     /// Opens the mandatory preparation and executes or resumes its full matrix.
     pub async fn run(self, profile: Option<&str>) -> Result<P::Output, ProfileImportError> {
+        self.execute(profile, None).await
+    }
+
+    /// Opens the mandatory preparation and starts a fresh selected matrix.
+    pub async fn rerun(
+        self,
+        profile: Option<&str>,
+        tasks: Vec<String>,
+    ) -> Result<P::Output, ProfileImportError> {
+        self.execute(profile, Some(tasks)).await
+    }
+
+    async fn execute(
+        self,
+        profile: Option<&str>,
+        rerun: Option<Vec<String>>,
+    ) -> Result<P::Output, ProfileImportError> {
         let prepared = self.prepared(profile)?;
         let profile = prepared.receipt.profile().to_owned();
+        let mut request = ProfileRunRequest::new(
+            prepared.receipt,
+            self.state_directory.join("runs").join(profile),
+            self.state_directory.join("vm"),
+        );
+        if let Some(tasks) = rerun {
+            request = request.rerun(tasks);
+        }
         self.preparer
-            .run(ProfileRunRequest::new(
-                prepared.receipt,
-                self.state_directory.join("runs").join(profile),
-                self.state_directory.join("vm"),
-            ))
+            .run(request)
             .await
             .map_err(|source| ProfileImportError::RuntimePreparation(Box::new(source)))
     }

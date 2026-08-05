@@ -175,6 +175,7 @@ pub struct ProfileRunRequest {
     receipt: PreparationReceipt,
     output_directory: PathBuf,
     cache_directory: PathBuf,
+    rerun_tasks: Option<Vec<String>>,
 }
 
 /// Runtime boundary that executes one prepared profile.
@@ -192,7 +193,7 @@ pub trait ProfileRunner: Sized {
 }
 
 /// Validated task/treatment/model/thinking sweep derived from a receipt.
-pub struct NanocodexRunPlan {
+pub struct ProfileRunPlan {
     tasks: Vec<crate::Task>,
     sweep: crate::Sweep,
 }
@@ -200,9 +201,6 @@ pub struct NanocodexRunPlan {
 /// A preparation receipt could not become an executable Nanocodex sweep.
 #[derive(Debug, thiserror::Error)]
 pub enum ProfileRunPlanError {
-    /// Additional CLI harness treatments need their installed driver.
-    #[error("profile selects CLI harnesses that are not installed in the Nanocodex runner: {0}")]
-    UnsupportedHarnesses(String),
     /// A retained normalized task no longer loads.
     #[error(transparent)]
     Task(#[from] crate::TaskLoadError),
@@ -263,7 +261,15 @@ impl ProfileRunRequest {
             receipt,
             output_directory: output_directory.into(),
             cache_directory: cache_directory.into(),
+            rerun_tasks: None,
         }
+    }
+
+    /// Forces a fresh run containing all or a selected subset of prepared tasks.
+    #[must_use]
+    pub fn rerun(mut self, tasks: Vec<String>) -> Self {
+        self.rerun_tasks = Some(tasks);
+        self
     }
 
     /// Validated immutable preparation receipt.
@@ -280,9 +286,14 @@ impl ProfileRunRequest {
     pub fn cache_directory(&self) -> &Path {
         &self.cache_directory
     }
+
+    /// Requested fresh-run task selectors; an empty slice means the full profile.
+    pub fn rerun_tasks(&self) -> Option<&[String]> {
+        self.rerun_tasks.as_deref()
+    }
 }
 
-impl NanocodexRunPlan {
+impl ProfileRunPlan {
     /// Prepared normalized tasks in deterministic order.
     pub fn tasks(&self) -> &[crate::Task] {
         &self.tasks
@@ -718,15 +729,55 @@ impl PreparationReceipt {
     }
 
     /// Builds the exact native and guest-harness sweep in this receipt.
-    pub fn nanocodex_plan(
+    pub fn run_plan(&self, base: &NanocodexBuilder) -> Result<ProfileRunPlan, ProfileRunPlanError> {
+        self.run_plan_for(base, None)
+    }
+
+    /// Builds a fresh-run plan for exact prepared selectors or task names.
+    pub fn run_plan_for(
         &self,
         base: &NanocodexBuilder,
-    ) -> Result<NanocodexRunPlan, ProfileRunPlanError> {
-        let tasks = self
+        requested: Option<&[String]>,
+    ) -> Result<ProfileRunPlan, ProfileRunPlanError> {
+        let loaded = self
             .tasks
             .iter()
-            .map(|prepared| crate::Task::load(prepared.root()))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|prepared| Ok((prepared, crate::Task::load(prepared.root())?)))
+            .collect::<Result<Vec<_>, ProfileRunPlanError>>()?;
+        let tasks = match requested {
+            None | Some([]) => loaded.into_iter().map(|(_, task)| task).collect(),
+            Some(requested) => {
+                let mut selected = Vec::with_capacity(requested.len());
+                for request in requested {
+                    let matches = loaded
+                        .iter()
+                        .filter(|(prepared, task)| {
+                            prepared.selector() == request
+                                || prepared
+                                    .selector()
+                                    .rsplit_once('/')
+                                    .is_some_and(|(_, name)| name == request)
+                                || task.name() == request
+                        })
+                        .collect::<Vec<_>>();
+                    match matches.as_slice() {
+                        [(_, task)] => selected.push(task.clone()),
+                        [] => {
+                            return Err(ProfileRunPlanError::Invalid(format!(
+                                "rerun task {request:?} is not in prepared profile {:?}",
+                                self.profile
+                            )));
+                        }
+                        _ => {
+                            return Err(ProfileRunPlanError::Invalid(format!(
+                                "rerun task {request:?} is ambiguous; use its complete benchmark/task selector"
+                            )));
+                        }
+                    }
+                }
+                selected
+            }
+        };
         let mut sweep = crate::Sweep::builder()
             .tasks(tasks.clone())
             .trials(self.trials);
@@ -747,7 +798,7 @@ impl PreparationReceipt {
                 }
             }
         }
-        Ok(NanocodexRunPlan {
+        Ok(ProfileRunPlan {
             tasks,
             sweep: sweep.build()?,
         })
@@ -1290,13 +1341,27 @@ allow_internet = false
         )
         .unwrap();
         let plan = receipt
-            .nanocodex_plan(&Nanocodex::builder(OpenAi::new("test-key").unwrap()))
+            .run_plan(&Nanocodex::builder(OpenAi::new("test-key").unwrap()))
             .unwrap();
         assert_eq!(plan.into_sweep().attempt_count(), 8);
+        let plan = receipt
+            .run_plan_for(
+                &Nanocodex::builder(OpenAi::new("test-key").unwrap()),
+                Some(&["fixture/task".to_owned()]),
+            )
+            .unwrap();
+        assert_eq!(plan.into_sweep().attempt_count(), 8);
+        let Err(error) = receipt.run_plan_for(
+            &Nanocodex::builder(OpenAi::new("test-key").unwrap()),
+            Some(&["missing".to_owned()]),
+        ) else {
+            panic!("missing rerun task must fail");
+        };
+        assert!(error.to_string().contains("is not in prepared profile"));
         let mut nanocodex_receipt = receipt.clone();
         nanocodex_receipt.harnesses.clear();
         let plan = nanocodex_receipt
-            .nanocodex_plan(&Nanocodex::builder(OpenAi::new("test-key").unwrap()))
+            .run_plan(&Nanocodex::builder(OpenAi::new("test-key").unwrap()))
             .unwrap();
         assert_eq!(plan.into_sweep().attempt_count(), 4);
         let store = PreparationStore::new(root.path().join("prepared"));

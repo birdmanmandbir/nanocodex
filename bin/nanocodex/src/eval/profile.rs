@@ -23,6 +23,10 @@ pub(super) struct Run {
 
     #[command(flatten)]
     agent: crate::config::EvalAgentArgs,
+
+    /// Start a fresh run. Optional values select exact prepared tasks.
+    #[arg(long, num_args = 0.., value_name = "TASK")]
+    rerun: Option<Vec<String>>,
 }
 
 #[derive(Args)]
@@ -75,7 +79,14 @@ impl Run {
         let workspace = self
             .target
             .workspace(NativeEvaluationRuntime::for_run(self.agent))?;
-        let result = workspace.run(self.target.profile.as_deref()).await?;
+        let result = match self.rerun {
+            Some(tasks) => {
+                workspace
+                    .rerun(self.target.profile.as_deref(), tasks)
+                    .await?
+            }
+            None => workspace.run(self.target.profile.as_deref()).await?,
+        };
         println!("{result}");
         Ok(())
     }
@@ -222,6 +233,41 @@ mod tests {
         assert_eq!(profile.as_deref(), Some("adapter-smoke"));
         assert_eq!(config, Path::new("eval.toml"));
         assert_eq!(dir.as_deref(), Some(Path::new("/mnt/evals")));
+    }
+
+    #[test]
+    fn rerun_accepts_zero_or_more_prepared_task_selectors() {
+        for (arguments, expected) in [
+            (
+                vec!["nanocodex", "eval", "run", "adapter-smoke", "--rerun"],
+                Vec::new(),
+            ),
+            (
+                vec![
+                    "nanocodex",
+                    "eval",
+                    "run",
+                    "adapter-smoke",
+                    "--rerun",
+                    "exact-answer",
+                    "terminal-bench-2.1/fix-git",
+                ],
+                vec![
+                    "exact-answer".to_owned(),
+                    "terminal-bench-2.1/fix-git".to_owned(),
+                ],
+            ),
+        ] {
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            let Some(Command::Eval(Eval {
+                command: Some(EvalCommand::Run(Run { rerun, .. })),
+                ..
+            })) = cli.command
+            else {
+                panic!("expected profile rerun command");
+            };
+            assert_eq!(rerun, Some(expected));
+        }
     }
 
     #[test]
