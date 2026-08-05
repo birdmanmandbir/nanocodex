@@ -5,6 +5,7 @@
 //! scores. Adapters either preserve an existing task package, translate a
 //! declarative format exactly, or require a benchmark-owned hermetic harness.
 
+mod agents_last_exam;
 mod arc_agi_3;
 mod arena_hard;
 mod browsecomp;
@@ -28,6 +29,7 @@ use std::{
     path::Path,
 };
 
+pub use agents_last_exam::AgentsLastExam;
 pub use arc_agi_3::ArcAgi3;
 pub use arena_hard::ArenaHard;
 pub use browsecomp::BrowseComp;

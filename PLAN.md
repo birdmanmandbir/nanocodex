@@ -331,6 +331,14 @@ through PR #72's existing concrete importers:
   but it is never labeled RHAE or reported as an official benchmark score. A
   comparable run remains gated on an evaluator-owned per-frame model-turn loop,
   authoritative state and credential isolation, and cleanup on every exit; and
+- `agents-last-exam`: Berkeley RDI's pinned framework, gated official task-data
+  revision, published Linux environment digest, and hidden-reference scoring
+  boundary. The first vertical slice is the CLI-compatible
+  `computing_math/branch_bound_atsp` task; preparation acquires the 44.4 GB
+  gated data archive once, stages only candidate-visible `input/` and
+  `software/`, and keeps `reference/` plus the official scorer in the pristine
+  verifier. Expanding the remaining CLI-compatible Linux tasks requires
+  translating each published scorer without exposing references; and
 - `external`: a benchmark-owned hermetic manifest for PaperBench, MLE-style,
   private, or otherwise executable benchmark semantics.
 
@@ -363,6 +371,19 @@ for every public or obtainable suite above. Gated or unpublished suites remain
 explicitly unavailable until authoritative task material and grading semantics
 can be acquired; an `external` manifest is a transport for an official harness,
 not permission to invent a substitute benchmark.
+
+The next two runtime shapes are driven by official benchmark contracts rather
+than benchmark-specific CLI scripts. ExploitBench needs a fresh task-owned MCP
+server per attempt, with the same tool interface, capability ladder, transcript,
+grade-call log, replay audit, and cleanup for native Nanocodex and guest CLI
+harnesses. Its gate is the official `sample-stack-bof` plumbing smoke followed
+by the documented 20-turn `v8-cve-2024-1939` smoke; only the latter is benchmark
+evidence. ExploitGym then adds evaluator-owned controller, firewall, scoped
+model proxy, target lifecycle, and per-family scorer services. Its first gate is
+one userspace task on the x86_64 dev box; V8 follows, while kernel/QEMU tasks are
+deferred until nested virtualization and cleanup have been brutalized. Neither
+suite may be flattened into a static terminal prompt or run without its
+published isolation boundary.
 
 The first Milestone two coding slice is retained under preparation
 `c24c10a651b463470d7395caf13bf7b13d668ac83ea88222eb4e69e5841fae08`.

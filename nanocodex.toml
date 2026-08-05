@@ -89,6 +89,13 @@ trials = 1
 model = ["gpt-5.6-sol"]
 thinking = ["low"]
 
+[profiles.agents-last-exam-smoke]
+harnesses = ["codex", "nanocodex"]
+tasks = ["agents-last-exam/branch_bound_atsp"]
+trials = 1
+model = ["gpt-5.6-sol"]
+thinking = ["low"]
+
 [profiles.graphwalks-smoke]
 tasks = [
   "graphwalks/128k-and-shorter-000749",

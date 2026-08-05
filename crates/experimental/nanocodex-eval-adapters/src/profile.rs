@@ -20,9 +20,9 @@ use nanocodex_eval::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ArcAgi3, ArenaHard, BrowseComp, BuiltinSourceError, BuiltinSources, ExternalHarness, Gdpval,
-    GeneBenchPro, GpqaDiamond, GraphWalks, HarborDataset, HealthBenchProfessional, Mrcr,
-    OpenAiEvals, SweAtlasQna, SweBench,
+    AgentsLastExam, ArcAgi3, ArenaHard, BrowseComp, BuiltinSourceError, BuiltinSources,
+    ExternalHarness, Gdpval, GeneBenchPro, GpqaDiamond, GraphWalks, HarborDataset,
+    HealthBenchProfessional, Mrcr, OpenAiEvals, SweAtlasQna, SweBench,
 };
 
 /// A complete manifest using Nanocodex's concrete third-party benchmark recipes.
@@ -237,6 +237,20 @@ pub enum Benchmark {
         /// Task-owned scoped interaction client image.
         environment: PathBuf,
         /// Official-scorecard verifier wrapper.
+        harness: PathBuf,
+    },
+    /// Berkeley RDI's Agents' Last Exam Linux CLI subset.
+    #[serde(rename = "agents-last-exam")]
+    AgentsLastExam {
+        /// Pinned official framework and task-source checkout.
+        source: PathBuf,
+        /// Separately staged gated official task-data tree.
+        task_data: PathBuf,
+        /// Combined code and task-data revisions.
+        revision: String,
+        /// Pinned published ALE Linux environment image.
+        image: String,
+        /// Wrapper around the official task scorer.
         harness: PathBuf,
     },
     /// Benchmark-owned executable manifest.
@@ -591,6 +605,7 @@ impl BenchmarkCatalog {
             "gpqa-diamond" => "gpqa-diamond",
             "browsecomp" => "browsecomp",
             "arc-agi-3-public-smoke" => "arc-agi-3",
+            "agents-last-exam" => "agents-last-exam",
             _ => return None,
         };
         Some(Builtin { adapter })
@@ -810,6 +825,19 @@ impl<'a> ProfileImporter<'a> {
                 Environment::Dockerfile(resolve_path(root, environment)),
                 Harness::directory(resolve_path(root, harness))?,
             )),
+            Benchmark::AgentsLastExam {
+                source,
+                task_data,
+                revision,
+                image,
+                harness,
+            } => store.import(&AgentsLastExam::new(
+                resolve_path(root, source),
+                resolve_path(root, task_data),
+                revision,
+                Environment::OciImage(image.clone()),
+                Harness::directory(resolve_path(root, harness))?,
+            )),
             Benchmark::External { manifest } => {
                 store.import(&ExternalHarness::new(resolve_path(root, manifest)))
             }
@@ -990,6 +1018,7 @@ mod tests {
             "gpqa-diamond",
             "browsecomp",
             "arc-agi-3-public-smoke",
+            "agents-last-exam",
         ] {
             assert!(BenchmarkCatalog::new().contains(benchmark), "{benchmark}");
         }
@@ -1232,17 +1261,22 @@ thinking = ["low"]
         let (_, browsing) = BenchmarkCatalog::new()
             .load_profile(&manifest, Some("browsecomp-smoke"))
             .unwrap();
+        let (_, ale) = BenchmarkCatalog::new()
+            .load_profile(&manifest, Some("agents-last-exam-smoke"))
+            .unwrap();
         let mut selected = native
             .selections()
             .keys()
             .map(String::as_str)
             .collect::<Vec<_>>();
         selected.extend(browsing.selections().keys().map(String::as_str));
+        selected.extend(ale.selections().keys().map(String::as_str));
         selected.sort_unstable();
 
         assert_eq!(
             selected,
             [
+                "agents-last-exam",
                 "arc-agi-3-public-smoke",
                 "arena-hard-v2",
                 "browsecomp",

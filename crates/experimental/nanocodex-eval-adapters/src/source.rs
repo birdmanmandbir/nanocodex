@@ -43,6 +43,9 @@ const BROWSECOMP_REVISION: &str = "652c89d0ca9df547706735883097e9537d40dc47";
 const BROWSECOMP_SHA256: &str = "7b24471cd5b3eb2a46830a14802b5c029ea62f488ff75a0f88af7923d1454abf";
 const ARC_AGI_REVISION: &str = "f12822c4d550121c35a275008d964afbbed47d2f";
 const ARC_AGI_3_BENCHMARKING_REVISION: &str = "86d72170ce3155551712a9fafd290bab471d6eee";
+const AGENTS_LAST_EXAM_REVISION: &str = "1e615e456de7cef57706680613cb80ee13c7fc76";
+const AGENTS_LAST_EXAM_DATA_REVISION: &str = "5ae9b719a901c14a9ccec7b3bd156d663e3eedcb";
+const AGENTS_LAST_EXAM_IMAGE: &str = "agentslastexam/ale-ubuntu22-docker@sha256:78ec11afeb0008ed8bc2b59cf9c90c05e63d1ac66b9d3e7cb0fada10695fca6f";
 pub(crate) const GDPVAL_REVISION: &str = "11e7900cdcac61bc4daf59e65feb238acda98fbf";
 const GDPVAL_PARQUET_SHA256: &str =
     "f8422fab9b21d90c0ee5f0659842ab666d418cb8940842918f9f4b0df7ae0202";
@@ -234,6 +237,15 @@ impl BuiltinSources {
                 environment: assets.join("arc-agi-3/environment"),
                 harness: assets.join("arc-agi-3/verifier"),
             }),
+            "agents-last-exam" => Ok(Benchmark::AgentsLastExam {
+                source: self.root.join("agents-last-exam"),
+                task_data: self.root.join("agents-last-exam-task-data"),
+                revision: format!(
+                    "rdi-berkeley/agents-last-exam@{AGENTS_LAST_EXAM_REVISION}+agents-last-exam-data-archive@{AGENTS_LAST_EXAM_DATA_REVISION}"
+                ),
+                image: AGENTS_LAST_EXAM_IMAGE.to_owned(),
+                harness: assets.join("agents-last-exam"),
+            }),
             other => Err(BuiltinSourceError::Unsupported(other.to_owned())),
         }
     }
@@ -254,6 +266,7 @@ impl BuiltinSources {
                 | "gdpval"
                 | "browsecomp"
                 | "arc-agi-3-public-smoke"
+                | "agents-last-exam"
         )
     }
 
@@ -368,8 +381,81 @@ impl BuiltinSources {
                     ARC_AGI_REVISION,
                 )
             }
+            "agents-last-exam" => self.materialize_agents_last_exam(),
             other => Err(BuiltinSourceError::Unsupported(other.to_owned())),
         }
+    }
+
+    fn materialize_agents_last_exam(&self) -> Result<(), BuiltinSourceError> {
+        self.git_checkout(
+            "agents-last-exam",
+            "https://github.com/rdi-berkeley/agents-last-exam.git",
+            AGENTS_LAST_EXAM_REVISION,
+        )?;
+        let task_data = self.root.join("agents-last-exam-task-data");
+        let marker = task_data.join(".nanocodex-source-revision");
+        if task_data.is_dir()
+            && fs::read_to_string(&marker)
+                .is_ok_and(|revision| revision.trim() == AGENTS_LAST_EXAM_DATA_REVISION)
+        {
+            return Ok(());
+        }
+
+        let download = self.root.join("agents-last-exam-data-archive");
+        fs::create_dir_all(&download).map_err(|source| BuiltinSourceError::Io {
+            path: download.clone(),
+            source,
+        })?;
+        let executable = if Command::new("hf").arg("--help").output().is_ok() {
+            "hf"
+        } else if Command::new("huggingface-cli")
+            .arg("--help")
+            .output()
+            .is_ok()
+        {
+            "huggingface-cli"
+        } else {
+            return Err(BuiltinSourceError::Command(
+                "Agents' Last Exam preparation needs the Hugging Face CLI and approved access to agents-last-exam/agents-last-exam-data-archive; install `huggingface_hub`, authenticate, and prepare again".to_owned(),
+            ));
+        };
+        command_status(
+            Command::new(executable)
+                .arg("download")
+                .arg("agents-last-exam/agents-last-exam-data-archive")
+                .arg("ale-tasks-data.tar.gz")
+                .args([
+                    "--repo-type",
+                    "dataset",
+                    "--revision",
+                    AGENTS_LAST_EXAM_DATA_REVISION,
+                ])
+                .arg("--local-dir")
+                .arg(&download),
+        )?;
+        fs::create_dir_all(&task_data).map_err(|source| BuiltinSourceError::Io {
+            path: task_data.clone(),
+            source,
+        })?;
+        let archive = download.join("ale-tasks-data.tar.gz");
+        command_status(
+            Command::new("tar")
+                .args(["-xzf"])
+                .arg(&archive)
+                .arg("--directory")
+                .arg(&task_data),
+        )?;
+        fs::write(&marker, format!("{AGENTS_LAST_EXAM_DATA_REVISION}\n")).map_err(|source| {
+            BuiltinSourceError::Io {
+                path: marker,
+                source,
+            }
+        })?;
+        fs::remove_file(&archive).map_err(|source| BuiltinSourceError::Io {
+            path: archive,
+            source,
+        })?;
+        Ok(())
     }
 
     fn materialize_graphwalks(&self) -> Result<(), BuiltinSourceError> {

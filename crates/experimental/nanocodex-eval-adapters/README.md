@@ -87,7 +87,8 @@ routes rather than VM modes:
 | GPQA Diamond | installed `gpqa-diamond` recipe pinned directly to the authors' 198-question release; it does not depend on deprecated `simple-evals` |
 | BrowseComp | installed dedicated `browsecomp` recipe pinned to OpenAI's encrypted 1,266-row release; the generic deprecated `simple-evals` suite is not installed, and grading is labeled as a subscription-judge reproduction |
 | ARC-AGI-3 | installed `arc-agi-3-public-smoke` recipe pinned to the official toolkit and benchmarking agent; `ls20` exercises the live action/frame/scorecard plumbing with an anonymous key and a three-action cap. Its environment score is evidence-only: an official-comparable run still requires the evaluator-owned per-frame model-turn topology |
-| Agents' Last Exam, Big Finance Bench, LifeSciBench, FrontierMath, OSWorld, BenchCAD, CTF, SEC-Bench, ExploitBench, ExploitGym, KernelGen, NanoGPT, PostTrainBench, MMMU Pro, gdp.pdf, AutomationBench, Toolathlon, and ARC-AGI-3 | Not installed until a dedicated recipe or caller-supplied official `external` manifest exists |
+| Agents' Last Exam | installed `agents-last-exam` initial recipe for the official CLI-compatible `branch_bound_atsp` task; preparation pins the framework, gated task-data revision, and amd64 image digest, while import separates candidate-visible inputs/software from hidden references and the official scorer |
+| Big Finance Bench, LifeSciBench, FrontierMath, OSWorld, BenchCAD, CTF, SEC-Bench, ExploitBench, ExploitGym, KernelGen, NanoGPT, PostTrainBench, MMMU Pro, gdp.pdf, AutomationBench, Toolathlon, and ARC-AGI-3 | Not installed until a dedicated recipe or caller-supplied official `external` manifest exists |
 | OpenAI-internal or unreleased suites | Not importable until the owner supplies tasks and grading semantics |
 
 DeepSWE uses one lifecycle feature beyond ordinary same-VM Harbor tasks:
