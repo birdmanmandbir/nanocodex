@@ -20,9 +20,9 @@ use nanocodex_eval::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ArenaHard, BuiltinSourceError, BuiltinSources, ExternalHarness, Gdpval, GeneBenchPro,
-    GpqaDiamond, GraphWalks, HarborDataset, HealthBenchProfessional, Mrcr, OpenAiEvals,
-    SweAtlasQna, SweBench,
+    ArcAgi3, ArenaHard, BrowseComp, BuiltinSourceError, BuiltinSources, ExternalHarness, Gdpval,
+    GeneBenchPro, GpqaDiamond, GraphWalks, HarborDataset, HealthBenchProfessional, Mrcr,
+    OpenAiEvals, SweAtlasQna, SweBench,
 };
 
 /// A complete manifest using Nanocodex's concrete third-party benchmark recipes.
@@ -211,6 +211,33 @@ pub enum Benchmark {
         /// Candidate environment.
         #[serde(default = "default_image")]
         image: String,
+    },
+    /// OpenAI's public encrypted BrowseComp release and evaluator-owned judge.
+    #[serde(rename = "browsecomp")]
+    BrowseComp {
+        /// Official encrypted CSV snapshot.
+        source: PathBuf,
+        /// Pinned source revision.
+        revision: String,
+        /// Subscription-backed judge wrapper.
+        harness: PathBuf,
+        /// Candidate environment.
+        #[serde(default = "default_image")]
+        image: String,
+    },
+    /// ARC Prize's public ARC-AGI-3 interactive environment and scorecard.
+    #[serde(rename = "arc-agi-3")]
+    ArcAgi3 {
+        /// Pinned official benchmarking-agent checkout.
+        benchmarking: PathBuf,
+        /// Pinned official ARC-AGI toolkit checkout.
+        toolkit: PathBuf,
+        /// Combined pinned upstream revision.
+        revision: String,
+        /// Task-owned scoped interaction client image.
+        environment: PathBuf,
+        /// Official-scorecard verifier wrapper.
+        harness: PathBuf,
     },
     /// Benchmark-owned executable manifest.
     External {
@@ -562,6 +589,8 @@ impl BenchmarkCatalog {
             "healthbench-professional" => "healthbench-professional",
             "gdpval" => "gdpval",
             "gpqa-diamond" => "gpqa-diamond",
+            "browsecomp" => "browsecomp",
+            "arc-agi-3-public-smoke" => "arc-agi-3",
             _ => return None,
         };
         Some(Builtin { adapter })
@@ -757,6 +786,30 @@ impl<'a> ProfileImporter<'a> {
                 Environment::OciImage(image.clone()),
                 resolve_path(root, harness),
             )),
+            Benchmark::BrowseComp {
+                source,
+                revision,
+                harness,
+                image,
+            } => store.import(&BrowseComp::new(
+                resolve_path(root, source),
+                revision,
+                Environment::OciImage(image.clone()),
+                resolve_path(root, harness),
+            )),
+            Benchmark::ArcAgi3 {
+                benchmarking,
+                toolkit,
+                revision,
+                environment,
+                harness,
+            } => store.import(&ArcAgi3::new(
+                resolve_path(root, benchmarking),
+                resolve_path(root, toolkit),
+                revision,
+                Environment::Dockerfile(resolve_path(root, environment)),
+                Harness::directory(resolve_path(root, harness))?,
+            )),
             Benchmark::External { manifest } => {
                 store.import(&ExternalHarness::new(resolve_path(root, manifest)))
             }
@@ -935,6 +988,8 @@ mod tests {
             "healthbench-professional",
             "gdpval",
             "gpqa-diamond",
+            "browsecomp",
+            "arc-agi-3-public-smoke",
         ] {
             assert!(BenchmarkCatalog::new().contains(benchmark), "{benchmark}");
         }
@@ -1169,21 +1224,28 @@ thinking = ["low"]
     }
 
     #[test]
-    fn repository_native_smoke_selects_every_installed_adapter_shape() {
+    fn repository_smoke_profiles_select_every_installed_adapter_shape() {
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../nanocodex.toml");
-        let (_, profile) = BenchmarkCatalog::new()
-            .load_profile(manifest, Some("adapter-smoke-native"))
+        let (_, native) = BenchmarkCatalog::new()
+            .load_profile(&manifest, Some("adapter-smoke-native"))
             .unwrap();
-        let selected = profile
+        let (_, browsing) = BenchmarkCatalog::new()
+            .load_profile(&manifest, Some("browsecomp-smoke"))
+            .unwrap();
+        let mut selected = native
             .selections()
             .keys()
             .map(String::as_str)
             .collect::<Vec<_>>();
+        selected.extend(browsing.selections().keys().map(String::as_str));
+        selected.sort_unstable();
 
         assert_eq!(
             selected,
             [
+                "arc-agi-3-public-smoke",
                 "arena-hard-v2",
+                "browsecomp",
                 "external-smoke",
                 "gdpval",
                 "genebench-pro-public",
@@ -1196,7 +1258,8 @@ thinking = ["low"]
                 "terminal-bench-2.1",
             ]
         );
-        assert!(profile.harnesses().is_empty());
+        assert!(native.harnesses().is_empty());
+        assert!(browsing.web_search());
     }
 
     fn make_harness(path: &Path) -> PathBuf {

@@ -36,6 +36,7 @@ tasks = [
   "mrcr-v2/8needle-0-000000",
   "healthbench-professional/e339f34a3a35f3f067422b5768287f7c",
   "gdpval/854f3814-681c-4950-91ac-55b0db0e3781",
+  "arc-agi-3-public-smoke/ls20-9607627b",
   "external-smoke/exact-answer",
 ]
 trials = 1
@@ -63,6 +64,27 @@ thinking = ["low"]
 
 [profiles.gpqa-diamond-smoke-native]
 tasks = ["gpqa-diamond/rec06pnAkLOr2t2mp"]
+trials = 1
+model = ["gpt-5.6-sol"]
+thinking = ["low"]
+
+[profiles.browsecomp-smoke]
+harnesses = ["codex"]
+tasks = ["browsecomp/000788-b1fa2bf2323cd70e"]
+trials = 1
+model = ["gpt-5.6-sol"]
+thinking = ["low"]
+web_search = true
+
+[profiles.arc-agi-3-smoke]
+harnesses = ["codex", "nanocodex"]
+tasks = ["arc-agi-3-public-smoke/ls20-9607627b"]
+trials = 1
+model = ["gpt-5.6-sol"]
+thinking = ["low"]
+
+[profiles.arc-agi-3-smoke-native]
+tasks = ["arc-agi-3-public-smoke/ls20-9607627b"]
 trials = 1
 model = ["gpt-5.6-sol"]
 thinking = ["low"]

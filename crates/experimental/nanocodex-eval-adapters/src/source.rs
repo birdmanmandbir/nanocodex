@@ -39,6 +39,10 @@ const MRCR_REVISION: &str = "f4c69fae7cf81f7ca26b9fee34b392a50f6b8a1d";
 const HEALTHBENCH_PROFESSIONAL_REVISION: &str = "349962fd46dd02343a0d8a606491baf59154ea1a";
 const HEALTHBENCH_PROFESSIONAL_SHA256: &str =
     "d44b08e6e952e04c945e2c406f02533d9e7a989a84e35820ee7efdff20c9e4e2";
+const BROWSECOMP_REVISION: &str = "652c89d0ca9df547706735883097e9537d40dc47";
+const BROWSECOMP_SHA256: &str = "7b24471cd5b3eb2a46830a14802b5c029ea62f488ff75a0f88af7923d1454abf";
+const ARC_AGI_REVISION: &str = "f12822c4d550121c35a275008d964afbbed47d2f";
+const ARC_AGI_3_BENCHMARKING_REVISION: &str = "86d72170ce3155551712a9fafd290bab471d6eee";
 pub(crate) const GDPVAL_REVISION: &str = "11e7900cdcac61bc4daf59e65feb238acda98fbf";
 const GDPVAL_PARQUET_SHA256: &str =
     "f8422fab9b21d90c0ee5f0659842ab666d418cb8940842918f9f4b0df7ae0202";
@@ -215,6 +219,21 @@ impl BuiltinSources {
                 environment: assets.join("gdpval/environment"),
                 harness: assets.join("gdpval/verifier"),
             }),
+            "browsecomp" => Ok(Benchmark::BrowseComp {
+                source: self.root.join("browsecomp/browse_comp_test_set.csv"),
+                revision: format!("openai/simple-evals@{BROWSECOMP_REVISION}"),
+                harness: assets.join("browsecomp"),
+                image: "python:3.12-slim".to_owned(),
+            }),
+            "arc-agi-3-public-smoke" => Ok(Benchmark::ArcAgi3 {
+                benchmarking: self.root.join("arc-agi-3-benchmarking"),
+                toolkit: self.root.join("arc-agi"),
+                revision: format!(
+                    "arcprize/arc-agi-3-benchmarking@{ARC_AGI_3_BENCHMARKING_REVISION}+arcprize/arc-agi@{ARC_AGI_REVISION}"
+                ),
+                environment: assets.join("arc-agi-3/environment"),
+                harness: assets.join("arc-agi-3/verifier"),
+            }),
             other => Err(BuiltinSourceError::Unsupported(other.to_owned())),
         }
     }
@@ -233,6 +252,8 @@ impl BuiltinSources {
                 | "mrcr-v2"
                 | "healthbench-professional"
                 | "gdpval"
+                | "browsecomp"
+                | "arc-agi-3-public-smoke"
         )
     }
 
@@ -330,6 +351,23 @@ impl BuiltinSources {
                 HEALTHBENCH_PROFESSIONAL_SHA256,
             ),
             "gdpval" => self.materialize_gdpval(selection),
+            "browsecomp" => self.download(
+                "browsecomp/browse_comp_test_set.csv",
+                "https://openaipublic.blob.core.windows.net/simple-evals/browse_comp_test_set.csv",
+                BROWSECOMP_SHA256,
+            ),
+            "arc-agi-3-public-smoke" => {
+                self.git_checkout(
+                    "arc-agi-3-benchmarking",
+                    "https://github.com/arcprize/arc-agi-3-benchmarking.git",
+                    ARC_AGI_3_BENCHMARKING_REVISION,
+                )?;
+                self.git_checkout(
+                    "arc-agi",
+                    "https://github.com/arcprize/arc-agi.git",
+                    ARC_AGI_REVISION,
+                )
+            }
             other => Err(BuiltinSourceError::Unsupported(other.to_owned())),
         }
     }

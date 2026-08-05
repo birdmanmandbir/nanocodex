@@ -85,7 +85,9 @@ routes rather than VM modes:
 | GDPval public release | installed `gdpval` recipe pinned to OpenAI's 220-task release; a public pairwise reproduction, not the unavailable GDPval-AA v2 pipeline |
 | SWE-Atlas QnA | installed `swe-atlas-qna` recipe pinned to Scale's public 124-task QnA split; native Nanocodex runs with candidate networking disabled, while guest-CLI comparison awaits model-control-plane-only egress |
 | GPQA Diamond | installed `gpqa-diamond` recipe pinned directly to the authors' 198-question release; it does not depend on deprecated `simple-evals` |
-| Agents' Last Exam, Big Finance Bench, LifeSciBench, BrowseComp, FrontierMath, OSWorld, BenchCAD, CTF, SEC-Bench, ExploitBench, ExploitGym, KernelGen, NanoGPT, PostTrainBench, MMMU Pro, gdp.pdf, AutomationBench, Toolathlon, and ARC-AGI-3 | Not installed until a dedicated recipe or caller-supplied official `external` manifest exists |
+| BrowseComp | installed dedicated `browsecomp` recipe pinned to OpenAI's encrypted 1,266-row release; the generic deprecated `simple-evals` suite is not installed, and grading is labeled as a subscription-judge reproduction |
+| ARC-AGI-3 | installed `arc-agi-3-public-smoke` recipe pinned to the official toolkit and benchmarking agent; `ls20` exercises the live action/frame/scorecard plumbing with an anonymous key and a three-action cap. Its environment score is evidence-only: an official-comparable run still requires the evaluator-owned per-frame model-turn topology |
+| Agents' Last Exam, Big Finance Bench, LifeSciBench, FrontierMath, OSWorld, BenchCAD, CTF, SEC-Bench, ExploitBench, ExploitGym, KernelGen, NanoGPT, PostTrainBench, MMMU Pro, gdp.pdf, AutomationBench, Toolathlon, and ARC-AGI-3 | Not installed until a dedicated recipe or caller-supplied official `external` manifest exists |
 | OpenAI-internal or unreleased suites | Not importable until the owner supplies tasks and grading semantics |
 
 DeepSWE uses one lifecycle feature beyond ordinary same-VM Harbor tasks:
@@ -132,9 +134,11 @@ nanocodex eval run adapter-smoke
 Custom imports take caller-pinned local source. Manifest built-ins instead let
 `EvaluationWorkspace::prepare` acquire their versioned authoritative inputs
 under the evaluator state directory before invoking these network-free
-importers. Deprecated OpenAI `simple-evals` recipes are intentionally outside
-the supported catalog; HealthBench Professional uses its direct official
-dataset release and an evaluator-owned judge rather than that repository.
+importers. Deprecated generic OpenAI `simple-evals` recipes are intentionally
+outside the supported catalog. BrowseComp has a dedicated direct-data adapter
+because OpenAI retains it as a reference implementation; HealthBench
+Professional uses its direct official dataset release and an evaluator-owned
+judge.
 
 ## External harness manifest
 

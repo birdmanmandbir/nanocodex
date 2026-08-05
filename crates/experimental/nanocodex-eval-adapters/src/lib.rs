@@ -5,7 +5,9 @@
 //! scores. Adapters either preserve an existing task package, translate a
 //! declarative format exactly, or require a benchmark-owned hermetic harness.
 
+mod arc_agi_3;
 mod arena_hard;
+mod browsecomp;
 mod external;
 mod gdpval;
 mod genebench_pro;
@@ -26,7 +28,9 @@ use std::{
     path::Path,
 };
 
+pub use arc_agi_3::ArcAgi3;
 pub use arena_hard::ArenaHard;
+pub use browsecomp::BrowseComp;
 pub use external::ExternalHarness;
 pub use gdpval::Gdpval;
 pub use genebench_pro::GeneBenchPro;

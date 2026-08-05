@@ -321,6 +321,16 @@ through PR #72's existing concrete importers:
 - `gpqa-diamond`: the authors' pinned 198-question Diamond release, preserving
   their continuous CPython seed-0 answer permutation, zero-shot prompt, and
   deterministic answer parser without acquiring deprecated `simple-evals`; and
+- `browsecomp`: OpenAI's pinned encrypted 1,266-question release, exact public
+  prompt and intended judge parser, verifier-only decrypted answer, browsing
+  capability, and explicitly labeled subscription-judge reproduction without
+  installing the generic deprecated `simple-evals` suite; and
+- `arc-agi-3`: ARC Prize's pinned public interactive API and scorecard contract.
+  The initial task-owned `ls20` command is a deliberately action-capped adapter
+  plumbing smoke: its official environment scorecard is retained as evidence,
+  but it is never labeled RHAE or reported as an official benchmark score. A
+  comparable run remains gated on an evaluator-owned per-frame model-turn loop,
+  authoritative state and credential isolation, and cleanup on every exit; and
 - `external`: a benchmark-owned hermetic manifest for PaperBench, MLE-style,
   private, or otherwise executable benchmark semantics.
 
@@ -473,12 +483,15 @@ tasks and grading semantics are pinned. Internal Research Debugging, METR
 private evaluations, irregular external cyber evaluations, and other private
 or unpublished suites remain explicitly unavailable.
 
-OpenAI's deprecated `simple-evals` repository and its BrowseComp, GPQA, and
-HealthBench recipes are explicitly outside the supported catalog. They are not
-acquired during preparation and do not remain as hidden adapter or CLI routes.
-The HealthBench Professional adapter instead consumes OpenAI's direct official
-dataset and published scoring methodology. GPQA Diamond likewise consumes the
-authors' direct release and baseline implementation, not the deprecated wrapper.
+OpenAI's deprecated generic `simple-evals` suite and its GPQA and HealthBench
+routes are explicitly outside the supported catalog. The repository is not
+acquired during preparation and does not remain as a hidden adapter or CLI
+route. BrowseComp is the narrow exception because OpenAI continues to maintain
+that benchmark's reference implementation: its dedicated adapter acquires only
+the encrypted official dataset and implements the published contract directly.
+HealthBench Professional consumes OpenAI's direct official dataset and
+published scoring methodology. GPQA Diamond consumes the authors' direct
+release and baseline implementation, not the deprecated wrapper.
 
 For custom sources, `[benchmark.<name>].adapter` must deserialize through the
 same closed, typed adapter configuration with unknown fields denied, construct
