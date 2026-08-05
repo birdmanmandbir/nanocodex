@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -234,6 +235,7 @@ pub struct ComputerBuilder {
     settle: SettlePolicy,
     backend: Option<Box<dyn Backend>>,
     observe_human_input: bool,
+    allowed_bundle_ids: Option<HashSet<String>>,
 }
 
 impl Default for ComputerBuilder {
@@ -244,6 +246,7 @@ impl Default for ComputerBuilder {
             settle: SettlePolicy::default(),
             backend: None,
             observe_human_input: true,
+            allowed_bundle_ids: None,
         }
     }
 }
@@ -279,11 +282,32 @@ impl ComputerBuilder {
         self
     }
 
+    /// Restricts discovery, launch, and attachment to explicitly allowed
+    /// bundle identifiers. Calling this at least once changes the session from
+    /// unrestricted to allowlist mode.
+    #[must_use]
+    pub fn allow_bundle_id(mut self, bundle_id: impl Into<String>) -> Self {
+        self.allowed_bundle_ids
+            .get_or_insert_default()
+            .insert(bundle_id.into());
+        self
+    }
+
     /// Builds the actor and returns its independent event stream.
     pub fn build(mut self) -> Result<(Computer, ComputerEvents), ComputerBuildError> {
         if self.maximum_elements == 0 {
             return Err(ComputerBuildError::Configuration {
                 message: "maximum_elements must be non-zero".to_owned(),
+            });
+        }
+        if self.allowed_bundle_ids.as_ref().is_some_and(|bundle_ids| {
+            bundle_ids
+                .iter()
+                .any(|bundle_id| bundle_id.trim().is_empty() || bundle_id.starts_with('-'))
+        }) {
+            return Err(ComputerBuildError::Configuration {
+                message: "allowed bundle identifiers must be non-empty exact identifiers"
+                    .to_owned(),
             });
         }
         let _runtime =
@@ -309,6 +333,7 @@ impl ComputerBuilder {
                 self.settle,
                 self.maximum_elements,
                 Arc::clone(&intervention_target),
+                self.allowed_bundle_ids.take(),
             )
         });
         let (commands_tx, commands_rx) = mpsc::channel(COMMAND_CAPACITY);

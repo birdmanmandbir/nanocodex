@@ -385,6 +385,8 @@ mod tests {
             "inspect TextEdit",
             "--computer",
             "--computer-preview=false",
+            "--computer-allow-app",
+            "com.apple.TextEdit",
         ])
         .unwrap();
         let Some(Command::Run(headless)) = headless.command else {

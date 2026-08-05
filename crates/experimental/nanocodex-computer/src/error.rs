@@ -35,6 +35,12 @@ pub enum ComputerError {
     /// No application/window has been attached.
     #[error("no target is attached; run list_applications and attach first")]
     NoTarget,
+    /// The desktop is locked; native observation and input fail closed.
+    #[error("the macOS desktop is locked; unlock it manually before using computer control")]
+    ScreenLocked,
+    /// The embedding application's allowlist excludes the requested app.
+    #[error("application {application} is not authorized for this computer session")]
+    ApplicationDenied { application: String },
     /// An application or window could not be found.
     #[error("target not found: {message}")]
     TargetNotFound { message: String },

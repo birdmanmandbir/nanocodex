@@ -25,6 +25,15 @@ pub(crate) struct ComputerArgs {
         requires = "computer"
     )]
     computer_preview: bool,
+
+    /// Restrict native computer use to these exact application bundle IDs.
+    #[arg(
+        long = "computer-allow-app",
+        env = "NANOCODEX_COMPUTER_ALLOW_APP",
+        value_delimiter = ',',
+        requires = "computer"
+    )]
+    allowed_apps: Vec<String>,
 }
 
 impl ComputerArgs {
@@ -37,7 +46,13 @@ impl ComputerArgs {
         if !self.computer {
             return Ok(None);
         }
-        let (computer, events) = Computer::new().wrap_err("failed to configure computer use")?;
+        let mut builder = Computer::builder();
+        for bundle_id in self.allowed_apps {
+            builder = builder.allow_bundle_id(bundle_id);
+        }
+        let (computer, events) = builder
+            .build()
+            .wrap_err("failed to configure computer use")?;
         let preview = if self.computer_preview {
             Some(
                 ComputerPreview::spawn_and_open(&computer)

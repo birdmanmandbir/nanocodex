@@ -13,10 +13,10 @@ pub use error::{ComputerBuildError, ComputerError};
 pub use preview::ComputerPreview;
 pub use tool::ComputerTool;
 pub use types::{
-    Application, ApplicationSelector, CapturedImage, ComputerAction, ComputerActionResult,
-    ComputerEvent, ComputerFrame, ComputerFramePhase, ComputerObservation, ComputerOutput, Element,
-    ElementRef, InteractionTarget, InterventionReason, KeyModifier, MouseButton, Permission, Point,
-    Rect, ScreenshotArtifact, SettlePolicy, Window,
+    AccessibilityUpdate, Application, ApplicationSelector, CapturedImage, ComputerAction,
+    ComputerActionResult, ComputerEvent, ComputerFrame, ComputerFramePhase, ComputerObservation,
+    ComputerOutput, Element, ElementRef, InteractionTarget, InterventionReason, KeyModifier,
+    MouseButton, Permission, Point, Rect, ScreenshotArtifact, SettlePolicy, Window,
 };
 
 #[cfg(test)]

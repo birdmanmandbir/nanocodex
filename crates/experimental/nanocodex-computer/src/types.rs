@@ -116,6 +116,23 @@ pub struct Element {
     pub actions: Vec<String>,
 }
 
+/// Incremental accessibility-tree revision relative to the preceding state.
+///
+/// The complete current tree remains available in [`ComputerObservation::elements`].
+/// This revision is a compact hint for consumers that can process unchanged
+/// application state without retransmitting or rescanning the whole tree.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
+pub struct AccessibilityUpdate {
+    /// Generation of the complete tree used as the revision base.
+    pub base_generation: u64,
+    /// Current elements that did not have an unambiguous prior identity.
+    pub added: Vec<Element>,
+    /// Current elements whose observable attributes changed.
+    pub changed: Vec<Element>,
+    /// Prior generation references whose elements disappeared.
+    pub removed: Vec<ElementRef>,
+}
+
 /// A persisted PNG artifact included in a model-facing observation.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
 pub struct ScreenshotArtifact {
@@ -140,6 +157,9 @@ pub struct ComputerObservation {
     pub window: Window,
     /// Compact actionable accessibility tree, in depth-first order.
     pub elements: Vec<Element>,
+    /// Incremental update from the preceding state for this exact window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accessibility_update: Option<AccessibilityUpdate>,
     /// Fresh screenshot when requested and permitted.
     pub screenshot: Option<ScreenshotArtifact>,
     /// Whether the post-action state reached two equal samples before timeout.
@@ -450,6 +470,8 @@ pub enum ComputerEvent {
 pub struct SettlePolicy {
     /// Delay between samples.
     pub sample_interval: Duration,
+    /// Minimum time a mutation must remain visually stable and non-loading.
+    pub minimum_duration: Duration,
     /// Maximum time spent waiting for two equal semantic/visual samples.
     pub timeout: Duration,
 }
@@ -458,6 +480,7 @@ impl Default for SettlePolicy {
     fn default() -> Self {
         Self {
             sample_interval: Duration::from_millis(50),
+            minimum_duration: Duration::from_millis(500),
             timeout: Duration::from_secs(5),
         }
     }

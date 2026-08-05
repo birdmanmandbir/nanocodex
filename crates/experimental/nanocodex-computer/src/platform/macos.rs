@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -18,17 +18,17 @@ use nanocodex_computer_macos::{
     NativeImageData, NativeWindow, PermissionRequest, activate_application, capture_window,
     element_rect, enable_application_accessibility as enable_native_application_accessibility,
     frontmost_application_pid, mark_synthetic, request_accessibility, request_screen_capture,
-    window as native_window_by_id,
+    screen_locked, window as native_window_by_id,
 };
 use sha2::{Digest as _, Sha256};
 use tracing::{Instrument as _, Span, field::Empty, info, info_span};
 
 use super::Backend;
 use crate::{
-    Application, ApplicationSelector, CapturedImage, ComputerAction, ComputerError, ComputerFrame,
-    ComputerFramePhase, ComputerObservation, ComputerOutput, Element, ElementRef,
-    InteractionTarget, KeyModifier, MouseButton, Permission, Point, Rect, ScreenshotArtifact,
-    SettlePolicy, Window,
+    AccessibilityUpdate, Application, ApplicationSelector, CapturedImage, ComputerAction,
+    ComputerError, ComputerFrame, ComputerFramePhase, ComputerObservation, ComputerOutput, Element,
+    ElementRef, InteractionTarget, KeyModifier, MouseButton, Permission, Point, Rect,
+    ScreenshotArtifact, SettlePolicy, Window,
     driver::{FrameSink, RunState},
 };
 
@@ -44,6 +44,14 @@ const APPLICATION_ACTIVATION_TIMEOUT: Duration = Duration::from_millis(750);
 struct Target {
     application: Application,
     window: Window,
+    follow_key_window: bool,
+}
+
+impl Target {
+    fn with_native_window(mut self, window: &NativeWindow) -> Self {
+        self.window = public_window(window);
+        self
+    }
 }
 
 type Discovery = (Vec<Application>, Vec<Window>, Vec<NativeWindow>);
@@ -52,6 +60,15 @@ struct VisualSample {
     application: Application,
     window: Window,
     image: Arc<CapturedImage>,
+    loading: bool,
+    follow_key_window: bool,
+}
+
+struct AccessibilityRevision {
+    generation: u64,
+    pid: i32,
+    window_id: u32,
+    elements: Vec<Element>,
 }
 
 struct ObservationRequest {
@@ -78,8 +95,10 @@ pub(super) struct MacosBackend {
     maximum_elements: usize,
     target: Option<Target>,
     generation: u64,
+    accessibility_revision: Option<AccessibilityRevision>,
     screenshots: VecDeque<PathBuf>,
     intervention_target: Arc<super::InterventionTarget>,
+    allowed_bundle_ids: Option<HashSet<String>>,
 }
 
 impl MacosBackend {
@@ -88,6 +107,7 @@ impl MacosBackend {
         settle: SettlePolicy,
         maximum_elements: usize,
         intervention_target: Arc<super::InterventionTarget>,
+        allowed_bundle_ids: Option<HashSet<String>>,
     ) -> Self {
         Self {
             artifact_root,
@@ -95,9 +115,39 @@ impl MacosBackend {
             maximum_elements,
             target: None,
             generation: 0,
+            accessibility_revision: None,
             screenshots: VecDeque::new(),
             intervention_target,
+            allowed_bundle_ids,
         }
+    }
+
+    fn authorize_application(&self, application: &Application) -> Result<(), ComputerError> {
+        let Some(allowed) = &self.allowed_bundle_ids else {
+            return Ok(());
+        };
+        let authorized = application
+            .bundle_id
+            .as_ref()
+            .is_some_and(|bundle_id| allowed.contains(bundle_id));
+        authorized
+            .then_some(())
+            .ok_or_else(|| ComputerError::ApplicationDenied {
+                application: application
+                    .bundle_id
+                    .clone()
+                    .unwrap_or_else(|| application.name.clone()),
+            })
+    }
+
+    fn authorize_bundle_id(&self, bundle_id: &str) -> Result<(), ComputerError> {
+        self.allowed_bundle_ids
+            .as_ref()
+            .is_none_or(|allowed| allowed.contains(bundle_id))
+            .then_some(())
+            .ok_or_else(|| ComputerError::ApplicationDenied {
+                application: bundle_id.to_owned(),
+            })
     }
 
     async fn observe(
@@ -109,6 +159,7 @@ impl MacosBackend {
         frames: &mut FrameSink,
     ) -> Result<ComputerObservation, ComputerError> {
         let target = self.target.clone().ok_or(ComputerError::NoTarget)?;
+        let follow_key_window = target.follow_key_window;
         self.generation = self.generation.saturating_add(1);
         let generation = self.generation;
         let maximum = self.maximum_elements;
@@ -129,6 +180,9 @@ impl MacosBackend {
             computer.screenshot.requested = screenshot,
             computer.accessibility.maximum_elements = maximum,
             computer.accessibility.element_count = Empty,
+            computer.accessibility.update.added = Empty,
+            computer.accessibility.update.changed = Empty,
+            computer.accessibility.update.removed = Empty,
             computer.screenshot.bytes = Empty,
             computer.screenshot.width = Empty,
             computer.screenshot.height = Empty,
@@ -148,11 +202,13 @@ impl MacosBackend {
         .instrument(span.clone())
         .await;
         finish_span(&span, started, &outcome);
-        let (observed, image) = outcome?;
+        let (mut observed, image) = outcome?;
+        self.apply_accessibility_revision(&mut observed);
         record_observation(&span, &observed, image.as_deref());
         self.target = Some(Target {
             application: observed.application.clone(),
             window: observed.window.clone(),
+            follow_key_window,
         });
         if let Some(image) = image {
             frames.publish(ComputerFrame {
@@ -173,6 +229,7 @@ impl MacosBackend {
         sequence: u64,
         state: Arc<RunState>,
         frames: &mut FrameSink,
+        protected_frontmost: Option<i32>,
     ) -> Result<ComputerObservation, ComputerError> {
         let span = info_span!(
             target: "nanocodex_computer",
@@ -180,7 +237,11 @@ impl MacosBackend {
             computer.action.sequence = sequence,
             computer.settle.timeout_ms = millis(self.settle.timeout),
             computer.settle.sample_interval_ms = millis(self.settle.sample_interval),
+            computer.settle.minimum_duration_ms = millis(self.settle.minimum_duration),
             computer.settle.sample_count = Empty,
+            computer.settle.loading_sample_count = Empty,
+            computer.focus.steal_count = Empty,
+            computer.focus.restore_count = Empty,
             computer.settle.settled = Empty,
             duration_ns = Empty,
             status = Empty,
@@ -188,7 +249,7 @@ impl MacosBackend {
         );
         let started = Instant::now();
         let outcome = self
-            .settled_observation_inner(sequence, state, frames, &span)
+            .settled_observation_inner(sequence, state, frames, &span, protected_frontmost)
             .instrument(span.clone())
             .await;
         finish_span(&span, started, &outcome);
@@ -201,11 +262,16 @@ impl MacosBackend {
         state: Arc<RunState>,
         frames: &mut FrameSink,
         span: &Span,
+        protected_frontmost: Option<i32>,
     ) -> Result<ComputerObservation, ComputerError> {
-        let deadline = Instant::now() + self.settle.timeout;
+        let started = Instant::now();
+        let deadline = started + self.settle.timeout;
         let mut previous: Option<String> = None;
         let generation = self.generation.saturating_add(1);
         let mut sample_count = 0_u64;
+        let mut loading_sample_count = 0_u64;
+        let mut focus_steal_count = 0_u64;
+        let mut focus_restore_count = 0_u64;
         loop {
             state.ensure_running()?;
             let target = self.target.clone().ok_or(ComputerError::NoTarget)?;
@@ -218,8 +284,34 @@ impl MacosBackend {
             .map_err(|error| ComputerError::Native {
                 message: format!("observation worker panicked: {error}"),
             })??;
+            self.target = Some(Target {
+                application: sample.application.clone(),
+                window: sample.window.clone(),
+                follow_key_window: sample.follow_key_window,
+            });
+            if sample.loading {
+                loading_sample_count = loading_sample_count.saturating_add(1);
+            }
+            if let Some(previous_frontmost) = protected_frontmost
+                && previous_frontmost != sample.application.pid
+            {
+                let target_pid = sample.application.pid;
+                let focus_restored = tokio::task::spawn_blocking(move || {
+                    suppress_focus_steal(previous_frontmost, target_pid)
+                })
+                .await
+                .map_err(|error| ComputerError::Native {
+                    message: format!("focus observer panicked: {error}"),
+                })?;
+                if let Some(restored) = focus_restored {
+                    focus_steal_count = focus_steal_count.saturating_add(1);
+                    focus_restore_count = focus_restore_count.saturating_add(u64::from(restored));
+                }
+            }
             let signature = visual_signature(&sample);
-            let matched = previous.as_deref() == Some(signature.as_str());
+            let matched = previous.as_deref() == Some(signature.as_str())
+                && !sample.loading
+                && started.elapsed() >= self.settle.minimum_duration;
             let timed_out = Instant::now() >= deadline;
             let phase = if matched {
                 ComputerFramePhase::Settled
@@ -238,10 +330,14 @@ impl MacosBackend {
             });
             if matched || timed_out {
                 span.record("computer.settle.sample_count", sample_count);
+                span.record("computer.settle.loading_sample_count", loading_sample_count);
+                span.record("computer.focus.steal_count", focus_steal_count);
+                span.record("computer.focus.restore_count", focus_restore_count);
                 span.record("computer.settle.settled", matched);
                 let root = self.artifact_root.clone();
                 let maximum = self.maximum_elements;
                 let settled = matched;
+                let follow_key_window = sample.follow_key_window;
                 let verify_span = info_span!(
                     target: "nanocodex_computer",
                     parent: span,
@@ -250,6 +346,9 @@ impl MacosBackend {
                     computer.observation.generation = generation,
                     computer.accessibility.maximum_elements = maximum,
                     computer.accessibility.element_count = Empty,
+                    computer.accessibility.update.added = Empty,
+                    computer.accessibility.update.changed = Empty,
+                    computer.accessibility.update.removed = Empty,
                     computer.screenshot.bytes = Empty,
                     duration_ns = Empty,
                     status = Empty,
@@ -273,13 +372,15 @@ impl MacosBackend {
                     message: format!("semantic observation worker panicked: {error}"),
                 })?;
                 finish_span(&verify_span, verify_started, &observed);
-                let observed = observed?;
+                let mut observed = observed?;
+                self.apply_accessibility_revision(&mut observed);
                 record_observation(&verify_span, &observed, None);
                 drop(verify_span);
                 self.generation = generation;
                 self.target = Some(Target {
                     application: observed.application.clone(),
                     window: observed.window.clone(),
+                    follow_key_window,
                 });
                 self.retain_screenshot(&observed).await;
                 return Ok(observed);
@@ -303,6 +404,25 @@ impl MacosBackend {
         }
     }
 
+    fn apply_accessibility_revision(&mut self, observed: &mut ComputerObservation) {
+        observed.accessibility_update = self.accessibility_revision.as_ref().and_then(|previous| {
+            (previous.pid == observed.application.pid && previous.window_id == observed.window.id)
+                .then(|| {
+                    accessibility_update(
+                        previous.generation,
+                        &previous.elements,
+                        &observed.elements,
+                    )
+                })
+        });
+        self.accessibility_revision = Some(AccessibilityRevision {
+            generation: observed.generation,
+            pid: observed.application.pid,
+            window_id: observed.window.id,
+            elements: observed.elements.clone(),
+        });
+    }
+
     async fn mutate(
         &mut self,
         action: NativeAction,
@@ -314,6 +434,11 @@ impl MacosBackend {
         let target = self.target.clone().ok_or(ComputerError::NoTarget)?;
         let generation = self.generation;
         let maximum = self.maximum_elements;
+        let protected_frontmost = tokio::task::spawn_blocking(frontmost_application_pid)
+            .await
+            .map_err(|error| ComputerError::Native {
+                message: format!("frontmost application observer panicked: {error}"),
+            })?;
         let action_kind = action.kind();
         let dispatch = action.dispatch();
         let span = info_span!(
@@ -342,7 +467,9 @@ impl MacosBackend {
         outcome?;
         drop(span);
         Ok(ComputerOutput::State {
-            state: self.settled_observation(sequence, state, frames).await?,
+            state: self
+                .settled_observation(sequence, state, frames, protected_frontmost)
+                .await?,
         })
     }
 }
@@ -356,6 +483,14 @@ impl Backend for MacosBackend {
         state: Arc<RunState>,
         frames: &mut FrameSink,
     ) -> Result<ComputerOutput, ComputerError> {
+        if tokio::task::spawn_blocking(screen_locked)
+            .await
+            .map_err(|error| ComputerError::Native {
+                message: format!("lock-screen observer panicked: {error}"),
+            })?
+        {
+            return Err(ComputerError::ScreenLocked);
+        }
         match action {
             ComputerAction::ListApplications => {
                 let span = info_span!(
@@ -374,7 +509,13 @@ impl Backend for MacosBackend {
                         message: format!("discovery worker panicked: {error}"),
                     })?;
                 finish_span(&span, started, &outcome);
-                let (applications, windows, native) = outcome?;
+                let (mut applications, mut windows, native) = outcome?;
+                applications.retain(|application| self.authorize_application(application).is_ok());
+                let allowed_pids = applications
+                    .iter()
+                    .map(|application| application.pid)
+                    .collect::<HashSet<_>>();
+                windows.retain(|window| allowed_pids.contains(&window.pid));
                 span.record("computer.application.count", applications.len());
                 span.record("computer.window.count", windows.len());
                 drop(native);
@@ -389,6 +530,7 @@ impl Backend for MacosBackend {
                         message: "bundle_id must be a non-empty exact identifier".to_owned(),
                     });
                 }
+                self.authorize_bundle_id(&bundle_id)?;
                 let span = info_span!(
                     target: "nanocodex_computer",
                     "computer.application.open",
@@ -484,6 +626,7 @@ impl Backend for MacosBackend {
                         })?;
                 finish_span(&span, started, &outcome);
                 let target = outcome?;
+                self.authorize_application(&target.application)?;
                 span.record("computer.target.pid", target.application.pid);
                 span.record("computer.target.window_id", target.window.id);
                 drop(span);
@@ -811,6 +954,7 @@ fn select_target(
     selector: ApplicationSelector,
     window_id: Option<u32>,
 ) -> Result<Target, ComputerError> {
+    let follow_key_window = window_id.is_none();
     let (applications, _, native_windows) = discover()?;
     let application = applications
         .into_iter()
@@ -850,6 +994,7 @@ fn select_target(
     Ok(Target {
         application,
         window: public_window(native_window),
+        follow_key_window,
     })
 }
 
@@ -876,6 +1021,133 @@ fn public_window(window: &NativeWindow) -> Window {
     }
 }
 
+fn refresh_target_window(target: Target) -> Result<Target, ComputerError> {
+    let native_windows = nanocodex_computer_macos::windows()
+        .into_iter()
+        .filter(|window| window.pid == target.application.pid)
+        .collect::<Vec<_>>();
+    if !target.follow_key_window {
+        let native = native_windows
+            .iter()
+            .find(|window| window.id == target.window.id)
+            .ok_or_else(|| ComputerError::TargetNotFound {
+                message: format!("window {} is no longer capturable", target.window.id),
+            })?;
+        return Ok(target.with_native_window(native));
+    }
+
+    let application = AXUIElement::application(target.application.pid);
+    let _ = application.set_messaging_timeout(0.5);
+    let mut accessibility_windows = Vec::with_capacity(2);
+    if let Ok(window) = application.focused_window()
+        && accessibility_window_candidate(&window)
+    {
+        accessibility_windows.push(window);
+    }
+    if let Ok(window) = application.main_window()
+        && accessibility_window_candidate(&window)
+        && !accessibility_windows
+            .iter()
+            .any(|candidate| candidate == &window)
+    {
+        accessibility_windows.push(window);
+    }
+    for accessibility_window in accessibility_windows {
+        let Some((x, y, width, height)) = element_rect(&accessibility_window) else {
+            continue;
+        };
+        let accessibility_frame = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+        if let Some(native) = native_windows
+            .iter()
+            .filter(|window| normal_window_candidate(window))
+            .filter_map(|window| {
+                let frame = public_window(window).frame;
+                matching_window_frames(accessibility_frame, frame)
+                    .then_some((window, window_frame_distance(accessibility_frame, frame)))
+            })
+            .min_by(|(_, left), (_, right)| left.total_cmp(right))
+            .map(|(window, _)| window)
+        {
+            if native.id != target.window.id {
+                info!(
+                    target: "nanocodex_computer",
+                    pid = target.application.pid,
+                    previous_window_id = target.window.id,
+                    window_id = native.id,
+                    "followed the application's focused accessibility window"
+                );
+            }
+            return Ok(target.with_native_window(native));
+        }
+    }
+
+    if let Some(native) = native_windows
+        .iter()
+        .find(|window| window.id == target.window.id)
+    {
+        return Ok(target.with_native_window(native));
+    }
+    let native = native_windows
+        .iter()
+        .find(|window| primary_window_candidate(window))
+        .or_else(|| {
+            native_windows
+                .iter()
+                .find(|window| normal_window_candidate(window))
+        })
+        .ok_or_else(|| ComputerError::TargetNotFound {
+            message: format!(
+                "application {} has no remaining capturable window",
+                target.application.name
+            ),
+        })?;
+    Ok(target.with_native_window(native))
+}
+
+fn accessibility_loading(target: &Target) -> Result<bool, ComputerError> {
+    if request_accessibility() == PermissionRequest::Prompted {
+        return Err(ComputerError::Permission {
+            permission: Permission::Accessibility,
+            guidance: permission_guidance(Permission::Accessibility),
+        });
+    }
+    let application = AXUIElement::application(target.application.pid);
+    application
+        .set_messaging_timeout(0.5)
+        .map_err(|error| ComputerError::Native {
+            message: format!("failed to configure accessibility timeout: {error}"),
+        })?;
+    let Some((root, _)) = select_accessibility_window(&application, target) else {
+        return Ok(false);
+    };
+    let mut elements = Vec::with_capacity(64);
+    walk_accessibility(&root, 0, 256, &mut elements);
+    Ok(elements.iter().any(|element| {
+        element.element_busy().ok().is_some_and(bool::from)
+            || string_attribute(element.role()).as_deref() == Some("AXBusyIndicator")
+    }))
+}
+
+fn suppress_focus_steal(previous_frontmost: i32, target_pid: i32) -> Option<bool> {
+    if frontmost_application_pid() != Some(target_pid) {
+        return None;
+    }
+    let restored = restore_frontmost_application(previous_frontmost, target_pid, false);
+    info!(
+        target: "nanocodex_computer",
+        previous_frontmost,
+        target_pid,
+        restored,
+        "suppressed target application focus steal"
+    );
+    Some(restored)
+}
+
 fn observe_target(
     request: ObservationRequest,
     parent: &Span,
@@ -889,14 +1161,11 @@ fn observe_target(
         artifact_root,
         maximum_elements,
     } = request;
+    let target = refresh_target_window(target)?;
     let native_window =
         native_window_by_id(target.window.id).ok_or_else(|| ComputerError::TargetNotFound {
             message: format!("window {} is no longer capturable", target.window.id),
         })?;
-    let target = Target {
-        application: target.application,
-        window: public_window(&native_window),
-    };
     let (elements, image) = std::thread::scope(|scope| {
         let capture = include_screenshot.then(|| {
             let capture_parent = parent.clone();
@@ -924,6 +1193,7 @@ fn observe_target(
             application: target.application,
             window: target.window,
             elements,
+            accessibility_update: None,
             screenshot,
             settled,
         },
@@ -936,14 +1206,21 @@ fn visual_sample(
     parent: &Span,
     sample_index: u64,
 ) -> Result<VisualSample, ComputerError> {
+    if screen_locked() {
+        return Err(ComputerError::ScreenLocked);
+    }
+    let target = refresh_target_window(target)?;
     let native_window =
         native_window_by_id(target.window.id).ok_or_else(|| ComputerError::TargetNotFound {
             message: format!("window {} is no longer capturable", target.window.id),
         })?;
+    let loading = accessibility_loading(&target)?;
     Ok(VisualSample {
         application: target.application,
         window: public_window(&native_window),
         image: capture_image(&native_window, parent, Some(sample_index))?,
+        loading,
+        follow_key_window: target.follow_key_window,
     })
 }
 
@@ -959,6 +1236,7 @@ fn observation_from_visual(
     let target = Target {
         application: sample.application,
         window: sample.window,
+        follow_key_window: sample.follow_key_window,
     };
     let elements = accessibility_snapshot(&target, generation, maximum_elements, parent)?
         .into_iter()
@@ -970,6 +1248,7 @@ fn observation_from_visual(
         application: target.application,
         window: target.window,
         elements,
+        accessibility_update: None,
         screenshot: Some(screenshot),
         settled,
     })
@@ -1259,6 +1538,87 @@ fn element_hash(element: &Element) -> u64 {
     hash
 }
 
+fn accessibility_update(
+    base_generation: u64,
+    previous: &[Element],
+    current: &[Element],
+) -> AccessibilityUpdate {
+    let mut previous_by_identity = HashMap::<String, Vec<usize>>::new();
+    let mut current_by_identity = HashMap::<String, Vec<usize>>::new();
+    for (index, element) in previous.iter().enumerate() {
+        previous_by_identity
+            .entry(element_identity(element))
+            .or_default()
+            .push(index);
+    }
+    for (index, element) in current.iter().enumerate() {
+        current_by_identity
+            .entry(element_identity(element))
+            .or_default()
+            .push(index);
+    }
+
+    let mut matched_previous = HashSet::new();
+    let mut matched_current = HashSet::new();
+    let mut changed = Vec::new();
+    for (identity, current_indices) in &current_by_identity {
+        let Some(previous_indices) = previous_by_identity.get(identity) else {
+            continue;
+        };
+        if previous_indices.len() != 1 || current_indices.len() != 1 {
+            continue;
+        }
+        let previous_index = previous_indices[0];
+        let current_index = current_indices[0];
+        matched_previous.insert(previous_index);
+        matched_current.insert(current_index);
+        if !same_element_state(&previous[previous_index], &current[current_index]) {
+            changed.push(current[current_index].clone());
+        }
+    }
+
+    AccessibilityUpdate {
+        base_generation,
+        added: current
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !matched_current.contains(index))
+            .map(|(_, element)| element.clone())
+            .collect(),
+        changed,
+        removed: previous
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !matched_previous.contains(index))
+            .map(|(_, element)| element.reference.clone())
+            .collect(),
+    }
+}
+
+fn element_identity(element: &Element) -> String {
+    let mut identity = format!(
+        "{}\0{:?}\0{:?}\0{:?}\0{:?}",
+        element.role, element.subrole, element.identifier, element.label, element.placeholder
+    );
+    if element.identifier.is_none() && element.label.is_none() && element.placeholder.is_none() {
+        identity.push_str(&format!("\0{:?}", element.frame));
+    }
+    identity
+}
+
+fn same_element_state(left: &Element, right: &Element) -> bool {
+    left.role == right.role
+        && left.subrole == right.subrole
+        && left.label == right.label
+        && left.value == right.value
+        && left.placeholder == right.placeholder
+        && left.identifier == right.identifier
+        && left.frame == right.frame
+        && left.enabled == right.enabled
+        && left.focused == right.focused
+        && left.actions == right.actions
+}
+
 fn resolve_element(
     target: &Target,
     generation: u64,
@@ -1355,6 +1715,9 @@ fn native_action(
     maximum: usize,
     action: NativeAction,
 ) -> Result<(), ComputerError> {
+    if screen_locked() {
+        return Err(ComputerError::ScreenLocked);
+    }
     let pid = target.application.pid;
     match action {
         NativeAction::Click {
@@ -1829,6 +2192,17 @@ fn record_observation(span: &Span, observed: &ComputerObservation, image: Option
         "computer.accessibility.element_count",
         observed.elements.len(),
     );
+    if let Some(update) = &observed.accessibility_update {
+        span.record("computer.accessibility.update.added", update.added.len());
+        span.record(
+            "computer.accessibility.update.changed",
+            update.changed.len(),
+        );
+        span.record(
+            "computer.accessibility.update.removed",
+            update.removed.len(),
+        );
+    }
     if let Some(image) = image {
         span.record("computer.screenshot.bytes", image.png().len());
         span.record("computer.screenshot.width", image.width());
@@ -1952,5 +2326,49 @@ mod tests {
         );
         assert_eq!(reference_parts(&reference, 8), None);
         assert_eq!(reference_parts(&ElementRef("e7_42".to_owned()), 7), None);
+    }
+
+    #[test]
+    fn accessibility_revision_correlates_only_unambiguous_elements() {
+        fn element(reference: &str, label: &str, value: &str) -> Element {
+            Element {
+                reference: ElementRef(reference.to_owned()),
+                role: "AXButton".to_owned(),
+                subrole: None,
+                label: Some(label.to_owned()),
+                value: Some(value.to_owned()),
+                placeholder: None,
+                identifier: None,
+                frame: None,
+                enabled: Some(true),
+                focused: Some(false),
+                actions: vec!["AXPress".to_owned()],
+            }
+        }
+
+        let previous = vec![
+            element("e1_0_a", "Save", "off"),
+            element("e1_1_b", "Gone", "old"),
+            element("e1_2_c", "Duplicate", "one"),
+            element("e1_3_d", "Duplicate", "two"),
+        ];
+        let current = vec![
+            element("e2_0_e", "Save", "on"),
+            element("e2_1_f", "New", "new"),
+            element("e2_2_g", "Duplicate", "one"),
+            element("e2_3_h", "Duplicate", "two"),
+        ];
+        let update = accessibility_update(1, &previous, &current);
+
+        assert_eq!(update.base_generation, 1);
+        assert_eq!(update.changed, vec![current[0].clone()]);
+        assert_eq!(update.added, current[1..].to_vec());
+        assert_eq!(
+            update.removed,
+            previous[1..]
+                .iter()
+                .map(|element| element.reference.clone())
+                .collect::<Vec<_>>()
+        );
     }
 }

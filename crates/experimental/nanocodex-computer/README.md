@@ -104,6 +104,8 @@ The CLI integration is opt-in:
 nanocodex --computer
 nanocodex run "Open TextEdit and draft a note" --computer
 nanocodex run "Inspect the current app" --computer --computer-preview=false
+nanocodex run "Draft in TextEdit" --computer \
+  --computer-allow-app com.apple.TextEdit
 ```
 
 For a source-tree acceptance run, exercise that same production path rather
@@ -135,6 +137,12 @@ then fully quit and relaunch it when the system prompt requests that. Automatic
 takeover detection separately requires Input Monitoring. Permission denial is
 typed and does not trigger a bypass. The loopback preview remains usable for
 manual pause/takeover if Input Monitoring is unavailable.
+
+The host can put a session in allowlist mode with repeated
+`--computer-allow-app <bundle-id>` arguments (or `ComputerBuilder::allow_bundle_id`).
+Discovery hides other applications and launch or attachment fails closed.
+Computer actions also fail with a typed error while `loginwindow` owns the
+foreground; Nanocodex never attempts to synthesize an unlock.
 
 Cargo examples and the full CLI are distinct executables, so macOS may request
 permission separately for `target/debug/examples/observe` and

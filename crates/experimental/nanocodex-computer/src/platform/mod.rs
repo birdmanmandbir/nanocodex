@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 
@@ -35,6 +35,7 @@ pub(crate) fn native(
     settle: SettlePolicy,
     maximum_elements: usize,
     intervention_target: Arc<InterventionTarget>,
+    allowed_bundle_ids: Option<HashSet<String>>,
 ) -> Box<dyn Backend> {
     #[cfg(target_os = "macos")]
     {
@@ -43,11 +44,18 @@ pub(crate) fn native(
             settle,
             maximum_elements,
             intervention_target,
+            allowed_bundle_ids,
         ))
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (artifact_root, settle, maximum_elements, intervention_target);
+        let _ = (
+            artifact_root,
+            settle,
+            maximum_elements,
+            intervention_target,
+            allowed_bundle_ids,
+        );
         Box::new(UnsupportedBackend)
     }
 }

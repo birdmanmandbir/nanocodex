@@ -455,6 +455,17 @@ pub fn frontmost_application_pid() -> Option<i32> {
         .map(|application| application.processIdentifier())
 }
 
+/// Returns whether the public workspace API identifies macOS loginwindow as
+/// the foreground application. Nanocodex treats that state as locked and never
+/// attempts to synthesize an unlock.
+#[must_use]
+pub fn screen_locked() -> bool {
+    NSWorkspace::sharedWorkspace()
+        .frontmostApplication()
+        .and_then(|application| application.bundleIdentifier())
+        .is_some_and(|bundle_id| bundle_id.to_string() == "com.apple.loginwindow")
+}
+
 /// Requests activation of one running graphical application.
 #[must_use]
 pub fn activate_application(pid: i32) -> bool {

@@ -23,6 +23,9 @@ and restores the previously frontmost app. Then attach to one exact app/window
 and inspect the returned state before acting. Observations return a screenshot
 and compact accessibility elements with generation-bound references such as `e12_4`.
 References expire on the next observation or action; always use fresh ones.
+After the first state for an exact window, `state.accessibility_update` describes
+only unambiguous added, changed, and removed elements relative to its base
+generation; `state.elements` remains the authoritative complete current tree.
 
 Prefer semantic element click/set_value/perform_action over coordinates.
 Coordinate input is global and is intended only for controls absent from the
@@ -41,7 +44,9 @@ serializes native input.
 
 The human can pause or intervene independently. A paused error means stop
 issuing actions until the host resumes control. Never attempt to bypass macOS
-Accessibility or Screen Recording permission errors.";
+Accessibility or Screen Recording permission errors. A locked desktop or
+application authorization error is terminal until the human or host changes
+that condition.";
 
 /// Nanocodex Code Mode provider for one owned native computer session.
 #[derive(Clone)]
