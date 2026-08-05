@@ -816,8 +816,14 @@ impl Evaluator {
             finished_at: admitted_at,
         };
         let started_at = queued_at;
-        let mut emitter =
-            AttemptEmitter::new(run, session_id, prompt_cache_cohort, &task, &trial_name);
+        let mut emitter = AttemptEmitter::new(
+            run,
+            session_id,
+            prompt_cache_cohort,
+            &task,
+            &trial_name,
+            coordinate.as_ref().map(|coordinate| &coordinate.agent),
+        );
         let span = attempt_span(
             self,
             &task,
@@ -2791,6 +2797,7 @@ struct AttemptEmitter {
     prompt_cache_cohort: u64,
     task_name: String,
     trial_name: String,
+    configuration: Option<String>,
     sequence: u64,
     atif: AtifBuilder,
 }
@@ -2802,6 +2809,7 @@ impl AttemptEmitter {
         prompt_cache_cohort: u64,
         task: &Task,
         trial_name: &str,
+        configuration: Option<&AgentId>,
     ) -> Self {
         Self {
             run,
@@ -2810,6 +2818,7 @@ impl AttemptEmitter {
             prompt_cache_cohort,
             task_name: task.name().to_owned(),
             trial_name: trial_name.to_owned(),
+            configuration: configuration.map(|configuration| configuration.as_str().to_owned()),
             sequence: 0,
             atif: AtifBuilder::default(),
         }
@@ -2822,6 +2831,7 @@ impl AttemptEmitter {
                 id: self.attempt_id,
                 task_name: self.task_name.clone(),
                 trial_name: self.trial_name.clone(),
+                configuration: self.configuration.clone(),
                 sequence: self.sequence,
             }),
             kind,

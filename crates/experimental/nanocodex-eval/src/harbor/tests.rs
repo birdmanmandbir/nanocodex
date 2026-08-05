@@ -732,6 +732,62 @@ async fn finite_job_moves_one_trial_from_pending_to_running_to_completed() {
 }
 
 #[tokio::test]
+async fn finite_trial_retains_sweep_treatment_separately_from_agent_implementation() {
+    let output = tempdir().unwrap();
+    let task = write_greeting_task();
+    let treatment = "harness.nanocodex.gpt-test.low";
+    let sweep = Sweep::builder()
+        .task(task.clone())
+        .trials(1)
+        .agent(
+            treatment,
+            Nanocodex::builder(OpenAi::new("test-key").unwrap()),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+    let eval = Evaluator::new_builder(Nanocodex::builder(OpenAi::new("test-key").unwrap()))
+        .output_directory(output.path())
+        .fresh_run(sweep)
+        .build()
+        .unwrap();
+    let (events, recorder) = test_recorder(&eval);
+    let attempt_id = Uuid::now_v7();
+    let trial_name = finite_trial_name(&task, treatment, 1, attempt_id);
+
+    events
+        .send(started_event_with_configuration(
+            &eval,
+            &task,
+            attempt_id,
+            &trial_name,
+            Some(treatment),
+        ))
+        .unwrap();
+    events
+        .send(failed_event_with_configuration(
+            &eval,
+            task,
+            attempt_id,
+            trial_name.clone(),
+            2,
+            Some(treatment),
+        ))
+        .unwrap();
+    let job = recorder.finish_all(1).await.unwrap();
+
+    let result: serde_json::Value = serde_json::from_slice(
+        &fs::read(job.directory().join(trial_name).join("result.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result["config"]["agent"]["name"], treatment);
+    assert_eq!(result["agent_info"]["name"], "nanocodex");
+    let config: serde_json::Value =
+        serde_json::from_slice(&fs::read(job.directory().join("config.json")).unwrap()).unwrap();
+    assert_eq!(config["agents"][0]["name"], treatment);
+}
+
+#[tokio::test]
 async fn unplanned_job_counts_running_attempt_in_observed_total() {
     let output = tempdir().unwrap();
     let task = write_greeting_task();
@@ -1130,6 +1186,16 @@ fn started_event(
     attempt_id: Uuid,
     trial_name: &str,
 ) -> Arc<EvalEvent> {
+    started_event_with_configuration(eval, task, attempt_id, trial_name, None)
+}
+
+fn started_event_with_configuration(
+    eval: &Evaluator,
+    task: &Task,
+    attempt_id: Uuid,
+    trial_name: &str,
+    configuration: Option<&str>,
+) -> Arc<EvalEvent> {
     Arc::new(EvalEvent {
         run_id: eval.id(),
         invocation_id: Uuid::nil(),
@@ -1138,6 +1204,7 @@ fn started_event(
             id: attempt_id,
             task_name: task.name().to_owned(),
             trial_name: trial_name.to_owned(),
+            configuration: configuration.map(str::to_owned),
             sequence: 1,
         }),
         kind: EvalEventKind::AttemptStarted {
@@ -1154,6 +1221,17 @@ fn failed_event(
     trial_name: String,
     sequence: u64,
 ) -> Arc<EvalEvent> {
+    failed_event_with_configuration(eval, task, attempt_id, trial_name, sequence, None)
+}
+
+fn failed_event_with_configuration(
+    eval: &Evaluator,
+    task: Task,
+    attempt_id: Uuid,
+    trial_name: String,
+    sequence: u64,
+    configuration: Option<&str>,
+) -> Arc<EvalEvent> {
     let occurred_at = Utc::now();
     let root = eval.directory().join(&trial_name);
     Arc::new(EvalEvent {
@@ -1164,6 +1242,7 @@ fn failed_event(
             id: attempt_id,
             task_name: task.name().to_owned(),
             trial_name: trial_name.clone(),
+            configuration: configuration.map(str::to_owned),
             sequence,
         }),
         kind: EvalEventKind::Failed(Box::new(EvalFailure {

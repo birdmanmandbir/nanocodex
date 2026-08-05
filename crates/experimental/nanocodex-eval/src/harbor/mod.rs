@@ -475,7 +475,11 @@ async fn record(
                         attempt.events.get_ref().sync_all()?;
                         let result = result.as_ref().clone();
                         let trajectory = result.trajectory().clone();
-                        artifacts.write_trial(&result, &trajectory)?;
+                        artifacts.write_trial(
+                            &result,
+                            &trajectory,
+                            identity.configuration.as_deref(),
+                        )?;
                         completed.insert(result.attempt_id);
                         artifacts.write_job(completed.len(), attempts.len())?;
                     }
@@ -508,7 +512,11 @@ async fn record(
                             }
                         };
                         let failure = failure.as_ref().clone();
-                        artifacts.write_failure(&failure, &trajectory)?;
+                        artifacts.write_failure(
+                            &failure,
+                            &trajectory,
+                            identity.configuration.as_deref(),
+                        )?;
                         completed.insert(failure.attempt_id);
                         artifacts.write_job(completed.len(), attempts.len())?;
                     }
@@ -626,6 +634,7 @@ impl HarborArtifacts {
         &self,
         result: &EvalResult,
         trajectory: &AtifTrajectory,
+        configuration: Option<&str>,
     ) -> Result<(), HarborError> {
         let task = result.task();
         let (task_checksum, task_content_hash) = validated_task_identity(task)?;
@@ -659,6 +668,7 @@ impl HarborArtifacts {
                     .find_map(|step| step.reasoning_effort.as_deref())
             })
             .unwrap_or("unknown");
+        let treatment = configuration.unwrap_or(&trajectory.agent.name);
         let config = HarborTrialConfig {
             task: HarborTaskConfig {
                 path: task_path.clone(),
@@ -666,7 +676,7 @@ impl HarborArtifacts {
             },
             trial_name: &result.trial_name,
             trials_dir: &self.root,
-            agent: harbor_agent_config(&trajectory.agent.name, model, effort),
+            agent: harbor_agent_config(treatment, model, effort),
             environment: HarborEnvironmentConfig::from(result.environment),
             verifier: HarborVerifierConfig::native(),
             artifacts: Vec::new(),
@@ -741,7 +751,7 @@ impl HarborArtifacts {
 
         let lock = HarborTrialLock::new(
             task,
-            &trajectory.agent.name,
+            treatment,
             model,
             effort,
             &task_content_hash,
@@ -776,7 +786,7 @@ impl HarborArtifacts {
                     path: task.root().to_path_buf(),
                     source: Some("nanocodex/local".to_owned()),
                 },
-                agent: harbor_agent_config(&trajectory.agent.name, model, effort),
+                agent: harbor_agent_config(treatment, model, effort),
                 lock,
             });
         }
@@ -787,6 +797,7 @@ impl HarborArtifacts {
         &self,
         failure: &EvalFailure,
         trajectory: &AtifTrajectory,
+        configuration: Option<&str>,
     ) -> Result<(), HarborError> {
         let task = failure.task();
         let (task_checksum, task_content_hash) = validated_task_identity(task)?;
@@ -809,6 +820,7 @@ impl HarborArtifacts {
             .iter()
             .find_map(|step| step.reasoning_effort.as_deref())
             .unwrap_or(&failure.effort);
+        let treatment = configuration.unwrap_or(&trajectory.agent.name);
         let config = HarborTrialConfig {
             task: HarborTaskConfig {
                 path: task_path.clone(),
@@ -816,7 +828,7 @@ impl HarborArtifacts {
             },
             trial_name: &failure.trial_name,
             trials_dir: &self.root,
-            agent: harbor_agent_config(&trajectory.agent.name, model, effort),
+            agent: harbor_agent_config(treatment, model, effort),
             environment: HarborEnvironmentConfig::from(failure.environment),
             verifier: HarborVerifierConfig::native(),
             artifacts: Vec::new(),
@@ -887,7 +899,7 @@ impl HarborArtifacts {
 
         let lock = HarborTrialLock::new(
             task,
-            &trajectory.agent.name,
+            treatment,
             model,
             effort,
             &task_content_hash,
@@ -921,7 +933,7 @@ impl HarborArtifacts {
                     path: task.root().to_path_buf(),
                     source: Some("nanocodex/local".to_owned()),
                 },
-                agent: harbor_agent_config(&trajectory.agent.name, model, effort),
+                agent: harbor_agent_config(treatment, model, effort),
                 lock,
             });
         }

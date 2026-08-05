@@ -36,6 +36,9 @@ pub struct EvalEventAttempt {
     pub task_name: String,
     /// Filesystem-safe unique trial name.
     pub trial_name: String,
+    /// Stable sweep treatment identity, absent for one-off task runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub configuration: Option<String>,
     /// One-based monotonic sequence within this attempt.
     pub sequence: u64,
 }
@@ -193,6 +196,7 @@ mod tests {
                 id: Uuid::nil(),
                 task_name: "task".to_owned(),
                 trial_name: "task__attempt".to_owned(),
+                configuration: None,
                 sequence,
             }),
             kind: EvalEventKind::VerifierStarted,
