@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 use crate::{Resources, Task, TaskLoadError, TaskOutput};
 
 const IMPORT_SCHEMA: &str = "nanocodex-import-v1";
+const PLAN_INDEX_SCHEMA: &str = "nanocodex-import-plan-index-v1";
 const MANIFEST_FILE: &str = "dataset.json";
 
 /// A format-specific reader that describes a deterministic dataset import.
@@ -175,6 +176,13 @@ struct ManifestTask {
     digest: Box<str>,
 }
 
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct PlanIndex {
+    schema: Box<str>,
+    key: Box<str>,
+    dataset: Box<str>,
+}
+
 #[derive(Serialize)]
 struct DigestManifest<'a> {
     schema: &'a str,
@@ -207,6 +215,10 @@ impl ImportStore {
             ));
         }
         create_dir_all(&self.root)?;
+        let plan_key = plan.fingerprint()?;
+        if let Some(dataset) = self.load_plan(&plan_key)? {
+            return Ok(dataset);
+        }
         let temporary = tempfile::Builder::new()
             .prefix(".import-")
             .tempdir_in(&self.root)
@@ -255,25 +267,210 @@ impl ImportStore {
         let dataset_parent = self.root.join(plan.name.as_ref());
         create_dir_all(&dataset_parent)?;
         let destination = dataset_parent.join(&digest);
-        if destination.exists() {
-            return load_matching_dataset(&destination, &manifest);
-        }
-        if let Err(source) = fs::rename(&staged, &destination) {
+        let imported = if destination.exists() {
+            load_matching_dataset(&destination, &manifest)?
+        } else if let Err(source) = fs::rename(&staged, &destination) {
             // Another importer may have published the same digest after the
             // existence check. Accept only an identical, fully valid result.
             if destination.exists() {
-                return load_matching_dataset(&destination, &manifest);
+                load_matching_dataset(&destination, &manifest)?
+            } else {
+                return Err(io_error(&destination, source));
             }
-            return Err(io_error(&destination, source));
-        }
-        sync_directory(&dataset_parent)?;
-        ImportedDataset::load(destination)
+        } else {
+            sync_directory(&dataset_parent)?;
+            ImportedDataset::load(destination)?
+        };
+        self.publish_plan(&plan_key, &imported)?;
+        Ok(imported)
     }
 
     /// Returns the root containing all imported datasets.
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    fn load_plan(&self, key: &str) -> Result<Option<ImportedDataset>, ImportError> {
+        let path = self.root.join(".plans").join(format!("{key}.json"));
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(io_error(&path, source)),
+        };
+        let index: PlanIndex =
+            serde_json::from_slice(&bytes).map_err(|source| ImportError::Json { path, source })?;
+        if index.schema.as_ref() != PLAN_INDEX_SCHEMA || index.key.as_ref() != key {
+            return Err(ImportError::Invalid(format!(
+                "import plan index {key} has an incompatible identity"
+            )));
+        }
+        let relative = safe_manifest_path(&index.dataset)?;
+        Ok(Some(ImportedDataset::load(self.root.join(relative))?))
+    }
+
+    fn publish_plan(&self, key: &str, dataset: &ImportedDataset) -> Result<(), ImportError> {
+        let directory = self.root.join(".plans");
+        create_dir_all(&directory)?;
+        let relative = dataset
+            .root
+            .strip_prefix(
+                fs::canonicalize(&self.root).map_err(|source| io_error(&self.root, source))?,
+            )
+            .map_err(|error| ImportError::Invalid(error.to_string()))?;
+        let relative = normalized_relative(relative)?;
+        let index = PlanIndex {
+            schema: PLAN_INDEX_SCHEMA.into(),
+            key: key.into(),
+            dataset: relative.into_boxed_str(),
+        };
+        let path = directory.join(format!("{key}.json"));
+        if path.is_file() {
+            let bytes = fs::read(&path).map_err(|source| io_error(&path, source))?;
+            let retained: PlanIndex =
+                serde_json::from_slice(&bytes).map_err(|source| ImportError::Json {
+                    path: path.clone(),
+                    source,
+                })?;
+            if retained == index {
+                return Ok(());
+            }
+            return Err(ImportError::Collision(path));
+        }
+        let temporary = tempfile::NamedTempFile::new_in(&directory)
+            .map_err(|source| io_error(&directory, source))?;
+        serde_json::to_writer_pretty(temporary.as_file(), &index).map_err(|source| {
+            ImportError::Json {
+                path: path.clone(),
+                source,
+            }
+        })?;
+        temporary
+            .as_file()
+            .sync_all()
+            .map_err(|source| io_error(&path, source))?;
+        match temporary.persist_noclobber(&path) {
+            Ok(_) => sync_directory(&directory),
+            Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+                self.publish_plan(key, dataset)
+            }
+            Err(error) => Err(io_error(&path, error.error)),
+        }
+    }
+}
+
+impl DatasetPlan {
+    fn fingerprint(&self) -> Result<String, ImportError> {
+        let mut digest = Sha256::new();
+        Self::update_digest(&mut digest, PLAN_INDEX_SCHEMA.as_bytes());
+        Self::update_digest(&mut digest, self.name.as_bytes());
+        Self::update_digest(&mut digest, self.source.kind.as_bytes());
+        Self::update_digest(&mut digest, self.source.revision.as_bytes());
+        Self::update_digest(&mut digest, self.source.digest.as_bytes());
+        for case in &self.cases {
+            Self::update_digest(&mut digest, case.id.as_bytes());
+            match &case.package {
+                CasePackage::Existing(root) => {
+                    Self::update_digest(&mut digest, b"existing");
+                    let task = Task::load(root)?;
+                    Self::update_digest(&mut digest, task.content_digest().as_bytes());
+                }
+                CasePackage::Hermetic(case) => {
+                    Self::update_digest(&mut digest, b"hermetic");
+                    Self::update_digest(&mut digest, case.prompt.as_bytes());
+                    match &case.environment {
+                        Environment::OciImage(image) => {
+                            Self::update_digest(&mut digest, b"oci");
+                            Self::update_digest(&mut digest, image.as_bytes());
+                        }
+                        Environment::Dockerfile(root) => {
+                            Self::update_digest(&mut digest, b"dockerfile");
+                            Self::update_directory(&mut digest, root)?;
+                        }
+                    }
+                    Self::update_directory(&mut digest, &case.harness.directory)?;
+                    for file in &case.harness_files {
+                        Self::update_digest(
+                            &mut digest,
+                            normalized_relative(&file.path)?.as_bytes(),
+                        );
+                        Self::update_digest(&mut digest, &file.mode.to_le_bytes());
+                        Self::update_digest(&mut digest, &file.bytes);
+                    }
+                    Self::update_digest(
+                        &mut digest,
+                        serde_json::to_string(&case.output)
+                            .map_err(|source| ImportError::Json {
+                                path: PathBuf::from("<import-plan>"),
+                                source,
+                            })?
+                            .as_bytes(),
+                    );
+                    Self::update_digest(&mut digest, &case.resources.cpus.to_le_bytes());
+                    Self::update_digest(&mut digest, &case.resources.memory_mb.to_le_bytes());
+                    Self::update_digest(&mut digest, &case.resources.storage_mb.to_le_bytes());
+                    Self::update_digest(&mut digest, &case.resources.gpus.to_le_bytes());
+                    Self::update_digest(&mut digest, &case.agent_timeout.as_nanos().to_le_bytes());
+                    Self::update_digest(
+                        &mut digest,
+                        &case.verifier_timeout.as_nanos().to_le_bytes(),
+                    );
+                    Self::update_digest(
+                        &mut digest,
+                        case.agent_instructions.as_deref().unwrap_or("").as_bytes(),
+                    );
+                    Self::update_digest(&mut digest, &[u8::from(case.allow_internet)]);
+                }
+            }
+        }
+        Ok(hex::encode(digest.finalize()))
+    }
+
+    fn update_directory(digest: &mut Sha256, root: &Path) -> Result<(), ImportError> {
+        let root = fs::canonicalize(root).map_err(|source| io_error(root, source))?;
+        let mut entries = ignore::WalkBuilder::new(&root)
+            .hidden(false)
+            .ignore(false)
+            .git_ignore(false)
+            .git_exclude(false)
+            .parents(false)
+            .follow_links(false)
+            .build()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| ImportError::Invalid(error.to_string()))?;
+        entries.sort_unstable_by(|left, right| left.path().cmp(right.path()));
+        for entry in entries {
+            if entry.path() == root {
+                continue;
+            }
+            let relative = entry
+                .path()
+                .strip_prefix(&root)
+                .map_err(|error| ImportError::Invalid(error.to_string()))?;
+            Self::update_digest(digest, normalized_relative(relative)?.as_bytes());
+            let metadata = fs::symlink_metadata(entry.path())
+                .map_err(|source| io_error(entry.path(), source))?;
+            Self::update_digest(digest, &metadata.permissions().mode().to_le_bytes());
+            if metadata.is_file() {
+                Self::update_digest(digest, b"file");
+                let bytes =
+                    fs::read(entry.path()).map_err(|source| io_error(entry.path(), source))?;
+                Self::update_digest(digest, &bytes);
+            } else if metadata.is_dir() {
+                Self::update_digest(digest, b"directory");
+            } else {
+                return Err(ImportError::Invalid(format!(
+                    "unsupported import-plan entry: {}",
+                    entry.path().display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn update_digest(digest: &mut Sha256, value: &[u8]) {
+        digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_le_bytes());
+        digest.update(value);
     }
 }
 
