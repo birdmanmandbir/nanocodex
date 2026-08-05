@@ -143,6 +143,7 @@ pub struct PreparationReceipt {
     version: u32,
     profile: String,
     manifest_sha256: String,
+    #[serde(default)]
     executor_sha256: String,
     tasks: Vec<PreparedTask>,
     harnesses: Vec<PreparedHarness>,
@@ -1034,6 +1035,12 @@ impl PreparationStore {
             )));
         }
         let receipt = read_receipt(&current.receipt)?;
+        if receipt.version != PREPARATION_RECEIPT_VERSION {
+            return Err(PreparationError::Invalid(format!(
+                "prepared receipt version {} is incompatible with evaluator version {PREPARATION_RECEIPT_VERSION}; run prepare again",
+                receipt.version
+            )));
+        }
         let digest = hex::encode(Sha256::digest(serde_json::to_vec(&receipt).map_err(
             |source| PreparationError::Json {
                 path: current.receipt.clone(),
