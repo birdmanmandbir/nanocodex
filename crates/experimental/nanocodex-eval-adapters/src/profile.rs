@@ -17,7 +17,7 @@ use nanocodex_eval::{
     },
     profile_run::{ProfileRunControl, ProfileRunControlError, ProfileRunStatus},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     ArenaHard, BuiltinSourceError, BuiltinSources, ExternalHarness, GeneBenchPro, GraphWalks,
@@ -73,7 +73,7 @@ pub struct EvaluationStatus {
 }
 
 /// One custom benchmark source configured in a manifest.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "adapter", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Benchmark {
     /// Harbor-family task packages.
@@ -323,7 +323,8 @@ impl<P: TaskPreparer> EvaluationWorkspace<P> {
             .iter()
             .map(|selected| PreparedTask::new(selected.selector(), selected.task()))
             .collect();
-        let receipt = PreparationReceipt::new(self.manifest.sha256(), &profile, tasks)?;
+        let receipt =
+            PreparationReceipt::new(self.manifest.profile_sha256(&profile)?, &profile, tasks)?;
         let published =
             PreparationStore::new(self.state_directory.join("prepared")).publish(&receipt)?;
         Ok(PreparedEvaluation { receipt, published })
@@ -339,13 +340,14 @@ impl<P: TaskPreparer> EvaluationWorkspace<P> {
             .resolve_profile(profile, |name| self.catalog.contains(name))?;
         let (receipt, published) = PreparationStore::new(self.state_directory.join("prepared"))
             .open_current(profile.name())?;
-        if receipt.manifest_sha256() != self.manifest.sha256() {
+        let profile_sha256 = self.manifest.profile_sha256(&profile)?;
+        if receipt.profile_sha256() != profile_sha256 {
             return Err(ProfileImportError::Preparation(PreparationError::Invalid(
                 format!(
-                    "profile {:?} was prepared from manifest {}, but the current manifest is {}; run `nanocodex eval prepare {}` again",
+                    "profile {:?} was prepared from profile identity {}, but the current profile identity is {}; run `nanocodex eval prepare {}` again",
                     profile.name(),
-                    receipt.manifest_sha256(),
-                    self.manifest.sha256(),
+                    receipt.profile_sha256(),
+                    profile_sha256,
                     profile.name()
                 ),
             )));
@@ -1016,13 +1018,26 @@ thinking = ["low"]
         )
         .unwrap();
         let changed = EvaluationWorkspace::builder()
+            .manifest(&manifest)
+            .state_directory(&state)
+            .task_preparer(RecordingPreparer::default())
+            .build()
+            .unwrap();
+        assert_eq!(
+            changed.prepared(None).unwrap().published(),
+            prepared.published()
+        );
+
+        let contents = fs::read_to_string(&manifest).unwrap();
+        fs::write(&manifest, contents.replace("trials = 1", "trials = 2")).unwrap();
+        let changed = EvaluationWorkspace::builder()
             .manifest(manifest)
             .state_directory(state)
             .task_preparer(RecordingPreparer::default())
             .build()
             .unwrap();
         let Err(error) = changed.prepared(None) else {
-            panic!("changed manifest must invalidate preparation");
+            panic!("changed selected profile must invalidate preparation");
         };
         assert!(error.to_string().contains("run `nanocodex eval prepare"));
     }

@@ -23,10 +23,10 @@ use crate::profile_run::{
     ActiveProfileRun, ProfileRunControl, ProfileRunControlError, ProfileRunStatus,
 };
 
-const PREPARATION_RECEIPT_VERSION: u32 = 2;
+const PREPARATION_RECEIPT_VERSION: u32 = 3;
 
 /// Repository-level evaluation configuration parameterized by benchmark recipe.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, bound(deserialize = "B: Deserialize<'de>"))]
 pub struct Manifest<B> {
     default: Option<String>,
@@ -41,7 +41,7 @@ pub struct Manifest<B> {
 }
 
 /// One SSH-reachable heavyweight evaluator runner.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Host {
     ssh: String,
@@ -50,7 +50,7 @@ pub struct Host {
 }
 
 /// One additional agent CLI and its named argument variants.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Harness {
     command: PathBuf,
@@ -63,7 +63,7 @@ pub struct Harness {
 }
 
 /// Arguments appended to one harness treatment without shell parsing.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessVariant {
     #[serde(default)]
@@ -71,7 +71,7 @@ pub struct HarnessVariant {
 }
 
 /// One complete reusable evaluation matrix preset.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     #[serde(default)]
@@ -92,6 +92,17 @@ pub struct LoadedManifest<B> {
     root: PathBuf,
     sha256: String,
     manifest: Manifest<B>,
+}
+
+#[derive(Serialize)]
+struct ProfileManifestIdentity<'a, B> {
+    version: u32,
+    root: &'a Path,
+    name: &'a str,
+    profile: &'a Profile,
+    hosts: BTreeMap<&'a str, &'a Host>,
+    harnesses: BTreeMap<&'a str, &'a Harness>,
+    benchmarks: BTreeMap<&'a str, &'a B>,
 }
 
 /// A validated profile whose references and sweep values are typed.
@@ -146,7 +157,8 @@ pub struct PreparedHarness {
 pub struct PreparationReceipt {
     version: u32,
     profile: String,
-    manifest_sha256: String,
+    #[serde(alias = "manifest_sha256")]
+    profile_sha256: String,
     #[serde(default)]
     executor_sha256: String,
     tasks: Vec<PreparedTask>,
@@ -536,6 +548,65 @@ impl<B> LoadedManifest<B> {
         &self.sha256
     }
 
+    /// Returns the identity of one profile and only the manifest entries it references.
+    pub fn profile_sha256(&self, profile: &ResolvedProfile) -> Result<String, ProfileError>
+    where
+        B: Serialize,
+    {
+        let raw = self
+            .manifest
+            .profiles
+            .get(profile.name())
+            .ok_or_else(|| invalid(format!("unknown profile {:?}", profile.name())))?;
+        let hosts = raw
+            .hosts
+            .iter()
+            .map(|name| {
+                self.manifest
+                    .hosts
+                    .get(name)
+                    .map(|host| (name.as_str(), host))
+                    .ok_or_else(|| invalid(format!("unknown host {name:?}")))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let harnesses = raw
+            .harnesses
+            .iter()
+            .map(|selection| {
+                let name = selection
+                    .split_once('.')
+                    .map_or(selection.as_str(), |(name, _)| name);
+                self.manifest
+                    .harness
+                    .get(name)
+                    .map(|harness| (name, harness))
+                    .ok_or_else(|| invalid(format!("unknown harness {name:?}")))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let benchmarks = profile
+            .selections()
+            .keys()
+            .filter_map(|name| {
+                self.manifest
+                    .benchmarks
+                    .get(name)
+                    .map(|benchmark| (name.as_str(), benchmark))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let identity = ProfileManifestIdentity {
+            version: 1,
+            root: &self.root,
+            name: profile.name(),
+            profile: raw,
+            hosts,
+            harnesses,
+            benchmarks,
+        };
+        let bytes = serde_json::to_vec(&identity)
+            .map_err(|error| invalid(format!("failed to encode profile identity: {error}")))?;
+        Ok(hex::encode(Sha256::digest(bytes)))
+    }
+
     /// Returns one custom benchmark recipe by name.
     pub fn benchmark(&self, name: &str) -> Option<&B> {
         self.manifest.benchmarks.get(name)
@@ -720,7 +791,7 @@ impl PreparedTask {
 impl PreparationReceipt {
     /// Creates a receipt after task/image preparation and harness validation.
     pub fn new(
-        manifest_sha256: impl Into<String>,
+        profile_sha256: impl Into<String>,
         profile: &ResolvedProfile,
         tasks: Vec<PreparedTask>,
     ) -> Result<Self, PreparationError> {
@@ -737,7 +808,7 @@ impl PreparationReceipt {
         Ok(Self {
             version: PREPARATION_RECEIPT_VERSION,
             profile: profile.name().to_owned(),
-            manifest_sha256: manifest_sha256.into(),
+            profile_sha256: profile_sha256.into(),
             executor_sha256: Self::current_executor_sha256()?,
             tasks,
             harnesses,
@@ -753,9 +824,9 @@ impl PreparationReceipt {
         &self.profile
     }
 
-    /// Exact manifest content identity used during preparation.
-    pub fn manifest_sha256(&self) -> &str {
-        &self.manifest_sha256
+    /// Selected profile and referenced-manifest identity used during preparation.
+    pub fn profile_sha256(&self) -> &str {
+        &self.profile_sha256
     }
 
     /// Exact executable that prepared the native Nanocodex treatment.
@@ -1277,10 +1348,54 @@ mod tests {
 
     use super::*;
 
-    #[derive(Clone, Debug, Deserialize)]
+    #[derive(Clone, Debug, Deserialize, Serialize)]
     #[serde(deny_unknown_fields)]
     struct Benchmark {
         adapter: String,
+    }
+
+    #[test]
+    fn profile_identity_ignores_unreferenced_manifest_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("nanocodex.toml");
+        let smoke = r#"default = "smoke"
+
+[profiles.smoke]
+tasks = ["graphwalks/task"]
+trials = 1
+model = ["gpt-5.6-sol"]
+thinking = ["low"]
+"#;
+        fs::write(&path, smoke).unwrap();
+        let first = LoadedManifest::<Benchmark>::load(&path).unwrap();
+        let profile = first
+            .resolve_profile(None, |name| name == "graphwalks")
+            .unwrap();
+        let first_hash = first.profile_sha256(&profile).unwrap();
+
+        fs::write(
+            &path,
+            format!(
+                "{smoke}\n[profiles.unrelated]\ntasks = [\"graphwalks/other\"]\ntrials = 2\nmodel = [\"gpt-5.6-sol\"]\nthinking = [\"high\"]\n"
+            ),
+        )
+        .unwrap();
+        let unrelated = LoadedManifest::<Benchmark>::load(&path).unwrap();
+        let profile = unrelated
+            .resolve_profile(Some("smoke"), |name| name == "graphwalks")
+            .unwrap();
+        assert_eq!(unrelated.profile_sha256(&profile).unwrap(), first_hash);
+
+        fs::write(
+            &path,
+            smoke.replace("thinking = [\"low\"]", "thinking = [\"high\"]"),
+        )
+        .unwrap();
+        let changed = LoadedManifest::<Benchmark>::load(&path).unwrap();
+        let profile = changed
+            .resolve_profile(Some("smoke"), |name| name == "graphwalks")
+            .unwrap();
+        assert_ne!(changed.profile_sha256(&profile).unwrap(), first_hash);
     }
 
     #[test]
