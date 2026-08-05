@@ -460,6 +460,18 @@ pub enum ComputerEvent {
     },
     Paused,
     Resumed,
+    /// Physical input started targeting the attached application. Agent input
+    /// yields until the quiet period elapses without changing sticky pause state.
+    HumanActivityStarted {
+        target_pid: i32,
+        quiet_period_ms: u64,
+    },
+    /// The attached application has remained free of physical input long
+    /// enough for queued actions to continue.
+    HumanActivityEnded {
+        target_pid: i32,
+        requires_requery: bool,
+    },
     UserIntervened {
         reason: InterventionReason,
     },

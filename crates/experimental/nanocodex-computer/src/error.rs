@@ -50,6 +50,11 @@ pub enum ComputerError {
     /// An element reference belongs to an old state generation.
     #[error("stale element reference {reference}; observe again and use a fresh reference")]
     StaleReference { reference: String },
+    /// Physical human input invalidated the state used to choose an action.
+    #[error(
+        "human input changed the attached application; call observe before the next mutating action"
+    )]
+    RequeryRequired,
     /// The action was rejected while the human owns control.
     #[error("computer use is paused; resume it through ComputerControl")]
     Paused,

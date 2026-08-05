@@ -2,10 +2,10 @@ use std::{
     collections::HashSet,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicU8, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -14,27 +14,72 @@ use uuid::Uuid;
 
 use crate::{
     Application, ComputerAction, ComputerActionResult, ComputerBuildError, ComputerError,
-    ComputerEvent, ComputerFrame, InterventionReason, Point, SettlePolicy, Window,
+    ComputerEvent, ComputerFrame, ComputerOutput, InterventionReason, Point, SettlePolicy, Window,
     platform::{self, Backend},
 };
-
-#[cfg(test)]
-use crate::ComputerOutput;
 
 const RUNNING: u8 = 0;
 const PAUSED: u8 = 1;
 const STOPPED: u8 = 2;
 const COMMAND_CAPACITY: usize = 16;
 const EVENT_CAPACITY: usize = 256;
+const HUMAN_ACTIVITY_QUIET_PERIOD: Duration = Duration::from_secs(1);
 
 pub(crate) struct RunState {
     status: AtomicU8,
+    human: Mutex<HumanState>,
+    human_changed: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct HumanState {
+    revision: u64,
+    dirty_target: Option<TargetRevision>,
+    activity: Option<HumanActivity>,
+    active_action: Option<TargetRevision>,
+}
+
+#[derive(Clone, Copy)]
+struct HumanActivity {
+    target_pid: i32,
+    revision: u64,
+    quiet_at: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct TargetRevision {
+    target_pid: i32,
+    revision: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ActionContext {
+    revision: u64,
+}
+
+enum BeginActionError {
+    HumanActive,
+    Lifecycle(ComputerError),
+}
+
+#[derive(Clone, Copy)]
+struct ActivityTransition {
+    started: bool,
+    replaced_target: Option<i32>,
+}
+
+#[derive(Clone, Copy)]
+struct QuietedActivity {
+    target_pid: i32,
+    requires_requery: bool,
 }
 
 impl RunState {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
             status: AtomicU8::new(RUNNING),
+            human: Mutex::new(HumanState::default()),
+            human_changed: tokio::sync::Notify::new(),
         }
     }
 
@@ -44,6 +89,135 @@ impl RunState {
             PAUSED => Err(ComputerError::Paused),
             _ => Err(ComputerError::Stopped),
         }
+    }
+
+    pub(crate) fn ensure_action_current(&self) -> Result<(), ComputerError> {
+        self.ensure_running()?;
+        let human = self.human();
+        if human.active_action.is_some_and(|action| {
+            human.dirty_target.is_some_and(|dirty| {
+                dirty.target_pid == action.target_pid && dirty.revision > action.revision
+            })
+        }) {
+            return Err(ComputerError::RequeryRequired);
+        }
+        Ok(())
+    }
+
+    fn begin_action(
+        &self,
+        target_pid: Option<i32>,
+        coordinates_with_human_activity: bool,
+        requires_fresh_observation: bool,
+    ) -> Result<ActionContext, BeginActionError> {
+        self.ensure_running().map_err(BeginActionError::Lifecycle)?;
+        let mut human = self.human();
+        if coordinates_with_human_activity && human.activity.is_some() {
+            return Err(BeginActionError::HumanActive);
+        }
+        if requires_fresh_observation
+            && target_pid.is_some_and(|pid| {
+                human
+                    .dirty_target
+                    .is_some_and(|dirty| dirty.target_pid == pid)
+            })
+        {
+            return Err(BeginActionError::Lifecycle(ComputerError::RequeryRequired));
+        }
+        let context = ActionContext {
+            revision: human.revision,
+        };
+        human.active_action = target_pid.map(|target_pid| TargetRevision {
+            target_pid,
+            revision: context.revision,
+        });
+        Ok(context)
+    }
+
+    fn finish_action(&self) {
+        self.human().active_action = None;
+    }
+
+    fn reconcile_observation(&self, target_pid: i32, context: ActionContext) -> bool {
+        let mut human = self.human();
+        let invalidated = human.dirty_target.is_some_and(|dirty| {
+            dirty.target_pid == target_pid && dirty.revision > context.revision
+        });
+        if !invalidated {
+            human.dirty_target = None;
+        }
+        !invalidated
+    }
+
+    fn record_human_activity(&self, target_pid: i32, quiet_period: Duration) -> ActivityTransition {
+        let now = Instant::now();
+        let mut human = self.human();
+        human.revision = human.revision.saturating_add(1);
+        let revision = human.revision;
+        human.dirty_target = Some(TargetRevision {
+            target_pid,
+            revision,
+        });
+        let replaced_target = human
+            .activity
+            .filter(|activity| activity.target_pid != target_pid || activity.quiet_at <= now)
+            .map(|activity| activity.target_pid);
+        let started = human
+            .activity
+            .is_none_or(|activity| activity.target_pid != target_pid || activity.quiet_at <= now);
+        human.activity = Some(HumanActivity {
+            target_pid,
+            revision,
+            quiet_at: now + quiet_period,
+        });
+        drop(human);
+        self.human_changed.notify_waiters();
+        ActivityTransition {
+            started,
+            replaced_target,
+        }
+    }
+
+    fn has_human_activity(&self) -> bool {
+        self.human().activity.is_some()
+    }
+
+    async fn wait_for_human_quiet(&self) -> Result<Option<QuietedActivity>, ComputerError> {
+        loop {
+            self.ensure_running()?;
+            let notified = self.human_changed.notified();
+            let Some(activity) = self.human().activity else {
+                return Ok(None);
+            };
+            let now = Instant::now();
+            if activity.quiet_at <= now {
+                let mut human = self.human();
+                if human.activity.is_some_and(|current| {
+                    current.revision == activity.revision && current.quiet_at <= Instant::now()
+                }) {
+                    human.activity = None;
+                    let requires_requery = human
+                        .dirty_target
+                        .is_some_and(|dirty| dirty.target_pid == activity.target_pid);
+                    return Ok(Some(QuietedActivity {
+                        target_pid: activity.target_pid,
+                        requires_requery,
+                    }));
+                }
+                continue;
+            }
+            tokio::select! {
+                () = tokio::time::sleep_until(tokio::time::Instant::from_std(activity.quiet_at)) => {}
+                () = notified => {}
+            }
+        }
+    }
+
+    fn human(&self) -> MutexGuard<'_, HumanState> {
+        self.human.lock().unwrap_or_else(|poisoned| {
+            tracing::error!(target: "nanocodex_computer", "human activity state lock was poisoned");
+            poisoned.into_inner()
+        })
     }
 }
 
@@ -189,6 +363,7 @@ impl ComputerControl {
             .is_ok()
         {
             let _ = self.notices.send(ControlNotice::Paused);
+            self.state.human_changed.notify_waiters();
         }
     }
 
@@ -201,6 +376,7 @@ impl ComputerControl {
             .is_ok()
         {
             let _ = self.notices.send(ControlNotice::Resumed);
+            self.state.human_changed.notify_waiters();
         }
     }
 
@@ -213,6 +389,7 @@ impl ComputerControl {
             .is_ok()
         {
             let _ = self.notices.send(ControlNotice::Intervened(reason));
+            self.state.human_changed.notify_waiters();
         }
     }
 
@@ -220,6 +397,7 @@ impl ComputerControl {
     pub fn stop(&self) {
         if self.state.status.swap(STOPPED, Ordering::AcqRel) != STOPPED {
             let _ = self.notices.send(ControlNotice::Stopped);
+            self.state.human_changed.notify_waiters();
         }
     }
 
@@ -234,6 +412,7 @@ enum ControlNotice {
     Paused,
     Resumed,
     Intervened(InterventionReason),
+    HumanActivityChanged,
     Stopped,
 }
 
@@ -253,6 +432,7 @@ pub struct ComputerBuilder {
     settle: SettlePolicy,
     backend: Option<Box<dyn Backend>>,
     observe_human_input: bool,
+    human_input_quiet_period: Duration,
     allowed_bundle_ids: Option<HashSet<String>>,
     allowed_url_origins: Option<Vec<String>>,
 }
@@ -265,6 +445,7 @@ impl Default for ComputerBuilder {
             settle: SettlePolicy::default(),
             backend: None,
             observe_human_input: true,
+            human_input_quiet_period: HUMAN_ACTIVITY_QUIET_PERIOD,
             allowed_bundle_ids: None,
             allowed_url_origins: None,
         }
@@ -294,11 +475,20 @@ impl ComputerBuilder {
     }
 
     /// Selects whether physical input directed at the attached application
-    /// automatically pauses computer actions. Synthetic Nanocodex input and
-    /// input targeting other applications are ignored.
+    /// temporarily yields control and invalidates its last observation.
+    /// Synthetic Nanocodex input and input targeting other applications are
+    /// ignored.
     #[must_use]
     pub const fn observe_human_input(mut self, enabled: bool) -> Self {
         self.observe_human_input = enabled;
+        self
+    }
+
+    /// Selects how long the attached application must remain free of physical
+    /// input before queued computer actions may continue.
+    #[must_use]
+    pub const fn human_input_quiet_period(mut self, duration: Duration) -> Self {
+        self.human_input_quiet_period = duration;
         self
     }
 
@@ -328,6 +518,11 @@ impl ComputerBuilder {
         if self.maximum_elements == 0 {
             return Err(ComputerBuildError::Configuration {
                 message: "maximum_elements must be non-zero".to_owned(),
+            });
+        }
+        if self.human_input_quiet_period.is_zero() {
+            return Err(ComputerBuildError::Configuration {
+                message: "human_input_quiet_period must be non-zero".to_owned(),
             });
         }
         if self.allowed_bundle_ids.as_ref().is_some_and(|bundle_ids| {
@@ -411,6 +606,8 @@ impl ComputerBuilder {
         };
         let intervention_monitor = self.observe_human_input.then(|| {
             let control = control.clone();
+            let events = events_tx.clone();
+            let quiet_period = self.human_input_quiet_period;
             platform::intervention_monitor(intervention_target, move |event| {
                 tracing::info!(
                     target: "nanocodex_computer",
@@ -421,7 +618,7 @@ impl ComputerBuilder {
                     location_y = event.y,
                     "physical input targeted the attached application"
                 );
-                control.intervene(InterventionReason::HumanInput);
+                record_human_activity(&control, &events, event.target_pid, quiet_period);
             })
         });
         let (intervention_monitor, startup_permission) = match intervention_monitor {
@@ -430,7 +627,7 @@ impl ComputerBuilder {
                 None,
                 Some(ComputerEvent::PermissionRequired {
                     permission: crate::Permission::InputMonitoring,
-                    guidance: "enable Input Monitoring for automatic human takeover; manual preview controls remain available"
+                    guidance: "enable Input Monitoring for automatic human activity coordination; manual preview controls remain available"
                         .to_owned(),
                 }),
             ),
@@ -498,6 +695,16 @@ impl Computer {
 
     pub(crate) fn pointers(&self) -> watch::Receiver<Option<AgentPointer>> {
         self.inner.pointers.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn simulate_human_input(&self, target_pid: i32, quiet_period: Duration) {
+        record_human_activity(
+            &self.inner.control,
+            &self.inner.events,
+            target_pid,
+            quiet_period,
+        );
     }
 
     /// Subscribes to the ordered lifecycle stream.
@@ -575,7 +782,8 @@ async fn run_driver(
         send(&events, event);
     }
     let mut sequence = 0_u64;
-    loop {
+    let mut current_target_pid = None;
+    'driver: loop {
         tokio::select! {
             biased;
             notice = notices.recv() => {
@@ -585,7 +793,17 @@ async fn run_driver(
                     Some(ControlNotice::Intervened(reason)) => {
                         send(&events, ComputerEvent::UserIntervened { reason });
                     }
+                    Some(ControlNotice::HumanActivityChanged) => {}
                     Some(ControlNotice::Stopped) | None => break,
+                }
+            }
+            quieted = state.wait_for_human_quiet(), if state.has_human_activity() => {
+                match quieted {
+                    Ok(Some(quieted)) => send_human_activity_ended(&events, quieted),
+                    Ok(None) => {}
+                    Err(ComputerError::Stopped) => break,
+                    Err(ComputerError::Paused) => {}
+                    Err(error) => tracing::warn!(target: "nanocodex_computer", %error, "human activity gate failed"),
                 }
             }
             command = commands.recv() => {
@@ -600,6 +818,33 @@ async fn run_driver(
                     let _ = reply.send(Err(error));
                     continue;
                 }
+                let action_context = loop {
+                    match state.begin_action(
+                        current_target_pid,
+                        coordinates_with_human_activity(&action),
+                        requires_fresh_observation(&action),
+                    ) {
+                        Ok(context) => break context,
+                        Err(BeginActionError::HumanActive) => {
+                            match state.wait_for_human_quiet().await {
+                                Ok(Some(quieted)) => send_human_activity_ended(&events, quieted),
+                                Ok(None) => {}
+                                Err(error) => {
+                                    let _ = reply.send(Err(error));
+                                    continue 'driver;
+                                }
+                            }
+                        }
+                        Err(BeginActionError::Lifecycle(error)) => {
+                            send(&events, ComputerEvent::Failed {
+                                sequence: Some(sequence),
+                                message: error.to_string(),
+                            });
+                            let _ = reply.send(Err(error));
+                            continue 'driver;
+                        }
+                    }
+                };
                 send(&events, ComputerEvent::ActionStarted {
                     sequence,
                     action: action.clone(),
@@ -635,6 +880,17 @@ async fn run_driver(
                 }
                 .instrument(span.clone())
                 .await;
+                state.finish_action();
+                let outcome = outcome.and_then(|output| {
+                    let ComputerOutput::State { state: observed } = &output else {
+                        return Ok(output);
+                    };
+                    if !state.reconcile_observation(observed.application.pid, action_context) {
+                        return Err(ComputerError::RequeryRequired);
+                    }
+                    current_target_pid = Some(observed.application.pid);
+                    Ok(output)
+                });
                 span.record("duration_ns", elapsed_ns(started.elapsed()));
                 match outcome {
                     Ok(output) => {
@@ -677,6 +933,66 @@ async fn run_driver(
 
 fn send(events: &broadcast::Sender<ComputerEvent>, event: ComputerEvent) {
     let _ = events.send(event);
+}
+
+fn record_human_activity(
+    control: &ComputerControl,
+    events: &broadcast::Sender<ComputerEvent>,
+    target_pid: i32,
+    quiet_period: Duration,
+) {
+    let transition = control
+        .state
+        .record_human_activity(target_pid, quiet_period);
+    let _ = control.notices.send(ControlNotice::HumanActivityChanged);
+    if let Some(target_pid) = transition.replaced_target {
+        send(
+            events,
+            ComputerEvent::HumanActivityEnded {
+                target_pid,
+                requires_requery: true,
+            },
+        );
+    }
+    if transition.started {
+        send(
+            events,
+            ComputerEvent::HumanActivityStarted {
+                target_pid,
+                quiet_period_ms: millis(quiet_period),
+            },
+        );
+    }
+}
+
+fn send_human_activity_ended(events: &broadcast::Sender<ComputerEvent>, quieted: QuietedActivity) {
+    send(
+        events,
+        ComputerEvent::HumanActivityEnded {
+            target_pid: quieted.target_pid,
+            requires_requery: quieted.requires_requery,
+        },
+    );
+}
+
+const fn coordinates_with_human_activity(action: &ComputerAction) -> bool {
+    !matches!(
+        action,
+        ComputerAction::ListApplications | ComputerAction::OpenApplication { .. }
+    )
+}
+
+const fn requires_fresh_observation(action: &ComputerAction) -> bool {
+    matches!(
+        action,
+        ComputerAction::Click { .. }
+            | ComputerAction::Drag { .. }
+            | ComputerAction::Scroll { .. }
+            | ComputerAction::PressKey { .. }
+            | ComputerAction::TypeText { .. }
+            | ComputerAction::SetValue { .. }
+            | ComputerAction::PerformAction { .. }
+    )
 }
 
 fn millis(duration: std::time::Duration) -> u64 {
@@ -737,26 +1053,28 @@ impl Backend for RecordingBackend {
         _pointers: &PointerSink,
     ) -> Result<ComputerOutput, ComputerError> {
         if matches!(action, ComputerAction::Observe { .. }) {
+            let application = Application {
+                pid: 1,
+                name: "Fixture".to_owned(),
+                bundle_id: Some("dev.nanocodex.fixture".to_owned()),
+            };
+            let window = Window {
+                id: 1,
+                pid: 1,
+                title: Some("Fixture window".to_owned()),
+                frame: crate::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                },
+                on_screen: true,
+            };
             frames.publish(ComputerFrame {
                 sequence,
                 generation: sequence,
-                application: Application {
-                    pid: 1,
-                    name: "Fixture".to_owned(),
-                    bundle_id: Some("dev.nanocodex.fixture".to_owned()),
-                },
-                window: Window {
-                    id: 1,
-                    pid: 1,
-                    title: Some("Fixture window".to_owned()),
-                    frame: crate::Rect {
-                        x: 0.0,
-                        y: 0.0,
-                        width: 1.0,
-                        height: 1.0,
-                    },
-                    on_screen: true,
-                },
+                application: application.clone(),
+                window: window.clone(),
                 phase: crate::ComputerFramePhase::Observed,
                 image: Arc::new(crate::CapturedImage::new(
                     1,
@@ -764,6 +1082,18 @@ impl Backend for RecordingBackend {
                     "fixture-digest".to_owned(),
                     Arc::from(&b"fixture-png"[..]),
                 )),
+            });
+            self.actions.lock().unwrap().push(action);
+            return Ok(ComputerOutput::State {
+                state: crate::ComputerObservation {
+                    generation: sequence,
+                    application,
+                    window,
+                    elements: Vec::new(),
+                    accessibility_update: None,
+                    screenshot: None,
+                    settled: true,
+                },
             });
         }
         self.actions.lock().unwrap().push(action);

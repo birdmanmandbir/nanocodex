@@ -53,11 +53,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn intervention_rejects_actions_until_resume() {
+    async fn manual_takeover_rejects_actions_until_resume() {
         let (builder, _) = crate::driver::recording_builder();
         let (computer, _events) = builder.build().unwrap();
         let control = computer.control();
-        control.intervene(InterventionReason::HumanInput);
+        control.intervene(InterventionReason::Caller("test takeover".to_owned()));
         assert!(matches!(
             computer.execute(ComputerAction::ListApplications).await,
             Err(ComputerError::Paused)
@@ -67,6 +67,54 @@ mod tests {
             .execute(ComputerAction::ListApplications)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn human_activity_yields_then_requires_one_fresh_observation() {
+        let (builder, actions) = crate::driver::recording_builder();
+        let (computer, mut events) = builder.build().unwrap();
+        computer
+            .execute(ComputerAction::Observe { screenshot: true })
+            .await
+            .unwrap();
+
+        computer.simulate_human_input(1, Duration::from_millis(10));
+        assert!(!computer.control().is_paused());
+        let stale = computer
+            .execute(ComputerAction::TypeText {
+                text: "stale".to_owned(),
+            })
+            .await;
+        assert!(
+            matches!(stale, Err(ComputerError::RequeryRequired)),
+            "unexpected stale action result: {stale:?}"
+        );
+
+        let ended = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(ComputerEvent::HumanActivityEnded {
+                    target_pid: 1,
+                    requires_requery: true,
+                }) = events.recv().await
+                {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(ended.is_ok());
+
+        computer
+            .execute(ComputerAction::Observe { screenshot: true })
+            .await
+            .unwrap();
+        computer
+            .execute(ComputerAction::TypeText {
+                text: "fresh".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(actions.lock().unwrap().len(), 3);
     }
 
     #[tokio::test]

@@ -355,7 +355,7 @@ impl MacosBackend {
         let mut focus_steal_count = 0_u64;
         let mut focus_restore_count = 0_u64;
         loop {
-            state.ensure_running()?;
+            state.ensure_action_current()?;
             let target = self.target.clone().ok_or(ComputerError::NoTarget)?;
             sample_count = sample_count.saturating_add(1);
             let sample_parent = span.clone();
@@ -575,7 +575,7 @@ impl MacosBackend {
         frames: &mut FrameSink,
         pointers: &PointerSink,
     ) -> Result<ComputerOutput, ComputerError> {
-        state.ensure_running()?;
+        state.ensure_action_current()?;
         let target = self.target.clone().ok_or(ComputerError::NoTarget)?;
         let generation = self.generation;
         let maximum = self.maximum_elements;
@@ -590,6 +590,7 @@ impl MacosBackend {
         let initial_pointer_fallbacks = self.intervention_target.synthetic_pointer_fallback_count();
         let intervention_target = Arc::clone(&self.intervention_target);
         let pointers = pointers.clone();
+        let action_state = Arc::clone(&state);
         let span = info_span!(
             target: "nanocodex_computer",
             "computer.input.dispatch",
@@ -606,14 +607,19 @@ impl MacosBackend {
         let started = Instant::now();
         let outcome = async move {
             tokio::task::spawn_blocking(move || {
+                let input = NativeInput {
+                    pid: target.application.pid,
+                    intervention_target: &intervention_target,
+                    pointers: &pointers,
+                    state: &action_state,
+                };
                 native_action(
                     &target,
                     generation,
                     maximum,
                     action,
                     allowed_url_origins.as_deref(),
-                    &intervention_target,
-                    &pointers,
+                    &input,
                 )
             })
             .await
@@ -962,7 +968,7 @@ impl Backend for MacosBackend {
                         let deadline =
                             tokio::time::Instant::now() + Duration::from_millis(milliseconds);
                         while tokio::time::Instant::now() < deadline {
-                            state.ensure_running()?;
+                            state.ensure_action_current()?;
                             tokio::time::sleep(Duration::from_millis(50).min(
                                 deadline.saturating_duration_since(tokio::time::Instant::now()),
                             ))
@@ -1957,18 +1963,12 @@ fn native_action(
     maximum: usize,
     action: NativeAction,
     allowed_url_origins: Option<&[Url]>,
-    intervention_target: &super::InterventionTarget,
-    pointers: &PointerSink,
+    input: &NativeInput<'_>,
 ) -> Result<(), ComputerError> {
+    input.ensure_current()?;
     if screen_locked() {
         return Err(ComputerError::ScreenLocked);
     }
-    let pid = target.application.pid;
-    let input = NativeInput {
-        pid,
-        intervention_target,
-        pointers,
-    };
     match action {
         NativeAction::Click {
             target: InteractionTarget::Element(reference),
@@ -1979,7 +1979,7 @@ fn native_action(
             if public.actions.iter().any(|action| action == "AXPress") {
                 let point = public.frame.map(Rect::center);
                 if let Some(point) = point {
-                    pointers.publish(point, true);
+                    input.pointers.publish(point, true);
                 }
                 let result = element
                     .perform_action(&CFString::new("AXPress"))
@@ -1987,12 +1987,12 @@ fn native_action(
                         message: format!("AXPress failed for {reference}: {error}"),
                     });
                 if let Some(point) = point {
-                    pointers.publish(point, false);
+                    input.pointers.publish(point, false);
                 }
                 return result;
             }
             post_click(
-                &input,
+                input,
                 public
                     .frame
                     .map(Rect::center)
@@ -2006,7 +2006,7 @@ fn native_action(
             target: point,
             button,
         } => post_click(
-            &input,
+            input,
             resolve_point(target, generation, maximum, point)?,
             button,
         ),
@@ -2015,7 +2015,7 @@ fn native_action(
             to,
             duration_ms,
         } => post_drag(
-            &input,
+            input,
             resolve_point(target, generation, maximum, from)?,
             resolve_point(target, generation, maximum, to)?,
             duration_ms,
@@ -2026,7 +2026,7 @@ fn native_action(
             at,
         } => {
             if let Some(at) = at {
-                post_move(&input, resolve_point(target, generation, maximum, at)?)?;
+                post_move(input, resolve_point(target, generation, maximum, at)?)?;
             }
             let source = event_source()?;
             let event =
@@ -2035,8 +2035,8 @@ fn native_action(
             input.post(&event);
             Ok(())
         }
-        NativeAction::PressKey { key, modifiers } => post_key(&input, &key, &modifiers),
-        NativeAction::TypeText { text } => post_text(&input, &text),
+        NativeAction::PressKey { key, modifiers } => post_key(input, &key, &modifiers),
+        NativeAction::TypeText { text } => post_text(input, &text),
         NativeAction::SetValue { reference, value } => {
             let (_, element) = resolve_element(target, generation, maximum, &reference)?;
             let attribute =
@@ -2071,7 +2071,7 @@ fn native_action(
                 .then(|| public.frame.map(Rect::center))
                 .flatten();
             if let Some(point) = point {
-                pointers.publish(point, true);
+                input.pointers.publish(point, true);
             }
             let result = element
                 .perform_action(&CFString::new(&name))
@@ -2079,7 +2079,7 @@ fn native_action(
                     message: format!("{name} failed for {reference}: {error}"),
                 });
             if let Some(point) = point {
-                pointers.publish(point, false);
+                input.pointers.publish(point, false);
             }
             result
         }
@@ -2124,9 +2124,14 @@ struct NativeInput<'a> {
     pid: i32,
     intervention_target: &'a super::InterventionTarget,
     pointers: &'a PointerSink,
+    state: &'a RunState,
 }
 
 impl NativeInput<'_> {
+    fn ensure_current(&self) -> Result<(), ComputerError> {
+        self.state.ensure_action_current()
+    }
+
     fn post(&self, event: &CGEvent) {
         mark_synthetic(event);
         self.intervention_target
@@ -2223,14 +2228,25 @@ fn post_drag(
     let steps = (duration_ms / 16).clamp(2, 240);
     for step in 1..=steps {
         let progress = step as f64 / steps as f64;
-        let point = CGPoint::new(
+        let current = CGPoint::new(
             from.x + (to.x - from.x) * progress,
             from.y + (to.y - from.y) * progress,
         );
+        if let Err(error) = input.ensure_current() {
+            let up = CGEvent::new_mouse_event(
+                source,
+                CGEventType::LeftMouseUp,
+                current,
+                CGMouseButton::Left,
+            )
+            .map_err(|()| native_event_error("interrupted drag up"))?;
+            input.post(&up);
+            return Err(error);
+        }
         let event = CGEvent::new_mouse_event(
             source.clone(),
             CGEventType::LeftMouseDragged,
-            point,
+            current,
             CGMouseButton::Left,
         )
         .map_err(|()| native_event_error("drag move"))?;
@@ -2273,6 +2289,7 @@ fn post_key(
 fn post_text(input: &NativeInput<'_>, text: &str) -> Result<(), ComputerError> {
     let source = event_source()?;
     for chunk in unicode_chunks(text, 20) {
+        input.ensure_current()?;
         let down = CGEvent::new_keyboard_event(source.clone(), 0, true)
             .map_err(|()| native_event_error("Unicode key down"))?;
         let up = CGEvent::new_keyboard_event(source.clone(), 0, false)
@@ -2507,7 +2524,7 @@ fn permission_guidance(permission: Permission) -> String {
             .to_owned(),
         Permission::ScreenRecording => "macOS opened its Screen Recording request. Enable this executable in System Settings > Privacy & Security > Screen & System Audio Recording, then fully quit and relaunch it"
             .to_owned(),
-        Permission::InputMonitoring => "enable Input Monitoring in System Settings > Privacy & Security to detect human takeover automatically"
+        Permission::InputMonitoring => "enable Input Monitoring in System Settings > Privacy & Security to coordinate physical input automatically"
             .to_owned(),
     }
 }

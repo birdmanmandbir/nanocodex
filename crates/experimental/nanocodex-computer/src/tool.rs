@@ -51,12 +51,14 @@ already settle and return fresh state; do not add wait/observe calls unless
 explicit time must pass. Never use Promise.all: one session deliberately
 serializes native input.
 
-The human can pause or intervene independently. A paused error means stop
-issuing actions until the host resumes control. Never attempt to bypass macOS
-Accessibility or Screen Recording permission errors. A locked desktop or
-application authorization error is terminal until the human or host changes
-that condition. URL policy is host-owned: never retry a disallowed URL or try
-to navigate around it.";
+Physical input in the attached app temporarily yields to the human and makes
+the prior state stale without pausing the session. If an action reports that a
+requery is required, call observe once and continue from that fresh state. An
+explicit paused error instead means stop issuing actions until the host resumes
+control. Never attempt to bypass macOS Accessibility or Screen Recording
+permission errors. A locked desktop or application authorization error is
+terminal until the human or host changes that condition. URL policy is
+host-owned: never retry a disallowed URL or try to navigate around it.";
 
 /// Nanocodex Code Mode provider for one owned native computer session.
 #[derive(Clone)]

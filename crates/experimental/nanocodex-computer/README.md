@@ -9,7 +9,7 @@ The public boundary is deliberately split into three planes:
 ```text
 agent / direct caller  -- ComputerAction --> serial native actor --> target PID
 preview / observer    <-- events + frames -- observation actor <-- AX + capture
-human                 -- pause/takeover --> ComputerControl  ----> action gate
+human          -- activity lease / takeover --> RunState    ----> action gate
 ```
 
 - `Computer` is a cheap cloneable action handle. One private actor owns target
@@ -52,9 +52,13 @@ settable `AXValue`, or another advertised AX action first. Coordinate clicks,
 drags, scrolling, keys, and Unicode text use public `CGEventPostToPid`, so they
 target the attached process without stealing clipboard contents. Generated
 events carry a private marker. A listen-only event tap ignores those events and
-pauses the actor only when physical input is directed at the attached
-application; input in other applications can continue alongside background
-work.
+yields only when physical input is directed at the attached application; input
+in other applications can continue alongside background work. Physical input
+starts a per-target quiet-period lease and invalidates the last observation
+without changing sticky pause state. After one second without more physical
+input, queued actions continue automatically, but a mutating action must first
+obtain a fresh observation. Explicit Pause and Take over remain sticky until
+Resume.
 
 After a mutation the backend repeatedly captures visual samples and publishes
 them as shared in-memory `ComputerFrame`s for human observers. It returns after
@@ -148,9 +152,9 @@ never passes through the model:
 On first use, Nanocodex invokes the public macOS prompts for Screen & System
 Audio Recording and Accessibility. Enable the executable macOS identifies,
 then fully quit and relaunch it when the system prompt requests that. Automatic
-takeover detection separately requires Input Monitoring. Permission denial is
-typed and does not trigger a bypass. The loopback preview remains usable for
-manual pause/takeover if Input Monitoring is unavailable.
+human-activity coordination separately requires Input Monitoring. Permission
+denial is typed and does not trigger a bypass. The loopback preview remains
+usable for manual pause/takeover if Input Monitoring is unavailable.
 
 The host can put a session in allowlist mode with repeated
 `--computer-allow-app <bundle-id>` arguments (or `ComputerBuilder::allow_bundle_id`).
