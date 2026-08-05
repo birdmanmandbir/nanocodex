@@ -355,6 +355,20 @@ OpenAI's February 2026 corrected Parquet release and published set-F1 contract;
 the retained evidence must call out the public extractor's still-open prefix
 bug rather than silently repairing it or claiming exact internal-launch parity.
 
+The GraphWalks public lifecycle is retained under preparation
+`569e1b0ebfcd1147516b97daf0bd21e4ec3c5de872befe204b6deb6630408d15`
+and job `019fd2d2-436b-7fc2-ab79-30cb28b58357`. Preparation acquired and
+normalized all 1,150 official tasks. The selected short-context shape completed
+without infrastructure, cleanup, disk, or process leakage and retained one
+canonical trajectory. Nanocodex returned exactly the three gold parent nodes;
+OpenAI's published extractor retained `Final Answer:` on the first node and
+therefore produced F1 0.6666667. The task-owned `all_rewards_one-v1` policy
+correctly records that as `verifier_failed`/`passed: false` while preserving raw
+F1 as the benchmark metric. The schema-v4 reconstructed report retains
+220,864,038 ns of shared cold preparation and the next ordinary `run` resumed
+the completed coordinate in 4.18 seconds without model spend or overwriting
+that timing.
+
 Each built-in catalog entry owns its stable user-facing name, authoritative
 source location, pinned revision, adapter choice, official verifier assets,
 default task environment, and any acquisition or credential requirements. The
@@ -712,9 +726,10 @@ may hide missing coordinates or mix incompatible preparation identities.
     multi-harness/model/thinking matrices, durable monitoring,
     interruption/resume/new-sample runs, and website-ready reporting behind
     `nanocodex eval prepare` and `nanocodex eval run`. DeepSWE's first official
-    case is complete; continue with the public GraphWalks long-context shape.
-    Enrich reconstructed reports with retained run timing before treating them
-    as website-ready.
+    case and the first public GraphWalks shape are complete, and reconstructed
+    reports now retain shared cold preparation timing. Continue by expanding
+    GraphWalks across real long-context bins and implementing the next
+    obtainable benchmark family.
 11. [ ] Run the coordinator/runner architecture with one saturated remote
     runner on `dev-georgios`, retaining all heavyweight state on its verified
     3.5 TB drive. Add cross-host sharding only after measurements show that

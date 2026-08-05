@@ -48,6 +48,12 @@ Unsupported semantics fail during import. The adapters do not flatten
 multi-message prompts, invent reference answers, translate custom Python
 graders, or modify tasks to make a candidate pass.
 
+Continuous benchmark rewards keep their raw named dimensions and declare a
+task-owned binary classification policy. GraphWalks retains `f1` for plots and
+uses exact-one classification for the generic pass axis; partial overlap is not
+silently promoted to a passing attempt. The policy is part of import identity,
+the immutable task package, each trial lock, and reconstructed reports.
+
 The GPT-5.6 report's public benchmark families map onto the same small set of
 routes rather than VM modes:
 

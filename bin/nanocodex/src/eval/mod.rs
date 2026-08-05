@@ -16,7 +16,7 @@ use clap::{Args, Subcommand};
 use eyre::Result;
 use nanocodex::Thinking;
 use nanocodex_eval::{
-    Task, TaskArtifact, VerifierCollect, VerifierEnvironmentMode,
+    ScoringPolicy, Task, TaskArtifact, VerifierCollect, VerifierEnvironmentMode,
     profile::{ProfileRunRequest, ProfileRunner, TaskPreparation, TaskPreparer},
     vm::{CachePolicy, VmProfileRunResult, VmProfileRunner, VmTaskPreparer},
 };
@@ -287,6 +287,7 @@ struct VerifierOutput<'a> {
     environment: &'a BTreeMap<String, String>,
     environment_mode: VerifierEnvironmentMode,
     collect: &'a [VerifierCollect],
+    scoring_policy: ScoringPolicy,
 }
 
 #[derive(Serialize)]
@@ -312,6 +313,7 @@ impl<'a> From<&'a Task> for TaskOutput<'a> {
                 environment: task.verifier().environment(),
                 environment_mode: task.verifier().environment_mode(),
                 collect: task.verifier().collect(),
+                scoring_policy: task.verifier().scoring_policy(),
             },
             artifacts: task.artifacts(),
             resources: ResourcesOutput {
