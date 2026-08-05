@@ -63,9 +63,10 @@ use core_graphics::{
 use objc2::{AnyThread, MainThreadMarker, MainThreadOnly, rc::Retained};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy,
-    NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSCursor, NSEventMask,
-    NSFloatingWindowLevel, NSImage, NSImageScaling, NSImageView, NSPanel, NSRunningApplication,
-    NSScreen, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
+    NSAutoresizingMaskOptions, NSBackingStoreType, NSBitmapImageRep, NSColor, NSCursor,
+    NSDeviceRGBColorSpace, NSEventMask, NSFloatingWindowLevel, NSImage, NSImageScaling,
+    NSImageView, NSPanel, NSRunningApplication, NSScreen, NSWindowCollectionBehavior,
+    NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{NSData, NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize, NSString};
 
@@ -294,6 +295,16 @@ pub fn capture_window(window_id: u32) -> Result<NativeImage, CaptureWindowError>
                 "macOS screenshot service failed ({service_error}); the in-process Quartz fallback also returned no image"
             ),
         })
+    })
+}
+
+/// Captures one window through the in-process Quartz path without spawning a helper.
+///
+/// This is intended for live human-facing previews. Model observations use
+/// [`capture_window`] so they retain the more reliable screenshot-service fallback.
+pub fn capture_window_in_process(window_id: u32) -> Result<NativeImage, CaptureWindowError> {
+    capture_window_legacy(window_id).ok_or_else(|| CaptureWindowError {
+        message: format!("window {window_id} is unavailable to in-process capture"),
     })
 }
 
@@ -602,6 +613,59 @@ impl NativePipWindow {
         let data =
             unsafe { NSData::dataWithBytes_length(png.as_ptr().cast::<c_void>(), png.len()) };
         let image = NSImage::initWithData(NSImage::alloc(), &data).ok_or(NativePipWindowError)?;
+        self.present_image(&image)
+    }
+
+    /// Replaces the displayed frame from tightly packed premultiplied RGBA8 pixels.
+    pub fn update_rgba(
+        &self,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<(), NativePipWindowError> {
+        MainThreadMarker::new().ok_or(NativePipWindowError)?;
+        let width = usize::try_from(width).map_err(|_| NativePipWindowError)?;
+        let height = usize::try_from(height).map_err(|_| NativePipWindowError)?;
+        let bytes_per_row = width.checked_mul(4).ok_or(NativePipWindowError)?;
+        let expected = bytes_per_row
+            .checked_mul(height)
+            .ok_or(NativePipWindowError)?;
+        if rgba.len() != expected {
+            return Err(NativePipWindowError);
+        }
+        // SAFETY: A null planes pointer asks AppKit to allocate the bitmap.
+        // The validated dimensions and row stride describe the complete RGBA8
+        // buffer copied immediately below.
+        let representation = unsafe {
+            NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+                NSBitmapImageRep::alloc(),
+                std::ptr::null_mut(),
+                width as isize,
+                height as isize,
+                8,
+                4,
+                true,
+                false,
+                NSDeviceRGBColorSpace,
+                bytes_per_row as isize,
+                32,
+            )
+        }
+        .ok_or(NativePipWindowError)?;
+        let bitmap = representation.bitmapData();
+        if bitmap.is_null() {
+            return Err(NativePipWindowError);
+        }
+        // SAFETY: AppKit allocated at least `bytes_per_row * height` bytes for
+        // the representation and both slices are valid and non-overlapping.
+        unsafe { std::ptr::copy_nonoverlapping(rgba.as_ptr(), bitmap, rgba.len()) };
+        let image =
+            NSImage::initWithSize(NSImage::alloc(), NSSize::new(width as f64, height as f64));
+        image.addRepresentation(&representation);
+        self.present_image(&image)
+    }
+
+    fn present_image(&self, image: &NSImage) -> Result<(), NativePipWindowError> {
         let image_size = image.size();
         if image_size.width > 0.0 && image_size.height > 0.0 {
             let aspect = image_size.width / image_size.height;
@@ -641,7 +705,7 @@ impl NativePipWindow {
             }
             self.panel.setContentAspectRatio(image_size);
         }
-        self.image_view.setImage(Some(&image));
+        self.image_view.setImage(Some(image));
         self.panel.orderFrontRegardless();
         self.application.updateWindows();
         Ok(())
@@ -1170,18 +1234,34 @@ fn human_event_targets(kind: CGEventType, event: &CGEvent, target_pid: i32) -> b
 }
 
 fn topmost_window_pid(point: CGPoint) -> Option<i32> {
-    windows()
-        .into_iter()
-        .find(|window| {
-            window.on_screen
-                && window.width > 0.0
-                && window.height > 0.0
-                && point.x >= window.x
-                && point.x < window.x + window.width
-                && point.y >= window.y
-                && point.y < window.y + window.height
-        })
-        .map(|window| window.pid)
+    let raw = copy_window_info(
+        kCGWindowListOptionAll | kCGWindowListExcludeDesktopElements,
+        kCGNullWindowID,
+    )?;
+    let reference = raw.as_concrete_TypeRef();
+    std::mem::forget(raw);
+    // SAFETY: Quartz documents every element returned by
+    // CGWindowListCopyWindowInfo as CFDictionary<CFString, CFType>, ordered
+    // front to back. Unlike target discovery, this deliberately retains
+    // floating layers so clicks on the PIP do not fall through to its source.
+    let dictionaries =
+        unsafe { CFArray::<CFDictionary<CFString, CFType>>::wrap_under_create_rule(reference) };
+    dictionaries.iter().find_map(|dictionary| {
+        if !boolean(&dictionary, unsafe { kCGWindowIsOnscreen }).unwrap_or(false) {
+            return None;
+        }
+        let bounds = dictionary_value(&dictionary, unsafe { kCGWindowBounds })?
+            .downcast::<CFDictionary>()?;
+        let frame = CGRect::from_dict_representation(&bounds)?;
+        (frame.size.width > 0.0
+            && frame.size.height > 0.0
+            && point.x >= frame.origin.x
+            && point.x < frame.origin.x + frame.size.width
+            && point.y >= frame.origin.y
+            && point.y < frame.origin.y + frame.size.height)
+            .then(|| number(&dictionary, unsafe { kCGWindowOwnerPID })?.to_i32())
+            .flatten()
+    })
 }
 
 impl Drop for HumanInputMonitor {
