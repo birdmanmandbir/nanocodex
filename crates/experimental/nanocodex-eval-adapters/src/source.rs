@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::Write as _,
     path::{Path, PathBuf},
     process::{Command, Output},
 };
@@ -17,6 +18,10 @@ const TERMINAL_BENCH_REVISION: &str = "5c8eadf1f393183288fa08b8f73ca9a469cc5e00"
 const ARENA_HARD_REVISION: &str = "196f6b826783b3da7310e361a805fa36f0be83f3";
 const SWE_BENCH_REVISION: &str = "f7bbbb2ccdf479001d6467c9e34af59e44a840f9";
 const SWE_ATLAS_REVISION: &str = "6de82c3603fb9e254170b440d7560441eb257176";
+const GPQA_REVISION: &str = "56686c06f5e19865c153de0fdb11be3890014df7";
+const GPQA_ZIP_SHA256: &str = "461ae7329f15a3e35f8184d2dac24b990f34fdf12f366ca4062d8e6638cd08dc";
+const GPQA_DIAMOND_SHA256: &str =
+    "41d1213cd7a4998605a26c2798500652572007161b3a92817ba46b35befcd305";
 const SWE_VERIFIED_ROW_RESPONSE_SHA256: &str =
     "7c62220a467830a3a330dda51211ab4c1ba099124dffc8371fbec057933c47b8";
 const GENEBENCH_PRO_REVISION: &str = "eb75a3c0996b3cedcc9af685bad02fd166848fa2";
@@ -166,6 +171,12 @@ impl BuiltinSources {
                 source: self.root.join("swe-atlas/data/qa"),
                 revision: format!("scaleapi/SWE-Atlas@{SWE_ATLAS_REVISION}"),
             }),
+            "gpqa-diamond" => Ok(Benchmark::GpqaDiamond {
+                source: self.root.join("gpqa-data/gpqa_diamond.csv"),
+                revision: format!("idavidrein/gpqa@{GPQA_REVISION}"),
+                harness: assets.join("gpqa-diamond"),
+                image: "python:3.12-slim".to_owned(),
+            }),
             "genebench-pro-public" => Ok(Benchmark::GeneBenchPro {
                 package: self.root.join("genebench-pro-public-package"),
                 revision: format!("openai/genebench-pro-public-package@{GENEBENCH_PRO_REVISION}"),
@@ -215,6 +226,7 @@ impl BuiltinSources {
                 | "arena-hard-v2"
                 | "swe-bench-verified-smoke"
                 | "swe-atlas-qna"
+                | "gpqa-diamond"
                 | "genebench-pro-public"
                 | "deep-swe-v1.1"
                 | "graphwalks"
@@ -301,6 +313,7 @@ impl BuiltinSources {
                 "https://github.com/scaleapi/SWE-Atlas.git",
                 SWE_ATLAS_REVISION,
             ),
+            "gpqa-diamond" => self.materialize_gpqa_diamond(),
             "genebench-pro-public" => self.materialize_genebench_pro(),
             "deep-swe-v1.1" => self.git_checkout(
                 "deep-swe",
@@ -455,6 +468,64 @@ impl BuiltinSources {
             }
             Ok(())
         })
+    }
+
+    fn materialize_gpqa_diamond(&self) -> Result<(), BuiltinSourceError> {
+        self.git_checkout(
+            "gpqa",
+            "https://github.com/idavidrein/gpqa.git",
+            GPQA_REVISION,
+        )?;
+        let archive = self.root.join("gpqa/dataset.zip");
+        validate_sha256(&archive, GPQA_ZIP_SHA256)?;
+        let destination = self.root.join("gpqa-data/gpqa_diamond.csv");
+        if destination.is_file() {
+            return validate_sha256(&destination, GPQA_DIAMOND_SHA256);
+        }
+        let output = Command::new("unzip")
+            .args(["-p", "-P", "deserted-untie-orchid"])
+            .arg(&archive)
+            .arg("dataset/gpqa_diamond.csv")
+            .output()
+            .map_err(|error| {
+                BuiltinSourceError::Command(format!("failed to run unzip: {error}"))
+            })?;
+        if !output.status.success() {
+            return Err(BuiltinSourceError::Command(format!(
+                "unzip exited {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        if hex::encode(Sha256::digest(&output.stdout)) != GPQA_DIAMOND_SHA256 {
+            return Err(BuiltinSourceError::Stale(
+                "extracted GPQA Diamond CSV does not match the pinned object".to_owned(),
+            ));
+        }
+        let parent = destination.parent().unwrap_or(&self.root);
+        fs::create_dir_all(parent).map_err(|source| BuiltinSourceError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+        let mut temporary =
+            tempfile::NamedTempFile::new_in(parent).map_err(|source| BuiltinSourceError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        temporary
+            .write_all(&output.stdout)
+            .and_then(|()| temporary.as_file().sync_all())
+            .map_err(|source| BuiltinSourceError::Io {
+                path: temporary.path().to_path_buf(),
+                source,
+            })?;
+        temporary
+            .persist(&destination)
+            .map_err(|error| BuiltinSourceError::Io {
+                path: destination,
+                source: error.error,
+            })?;
+        Ok(())
     }
 
     fn git_checkout(

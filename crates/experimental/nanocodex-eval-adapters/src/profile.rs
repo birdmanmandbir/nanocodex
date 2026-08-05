@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ArenaHard, BuiltinSourceError, BuiltinSources, ExternalHarness, Gdpval, GeneBenchPro,
-    GraphWalks, HarborDataset, HealthBenchProfessional, Mrcr, OpenAiEvals, SweBench,
+    GpqaDiamond, GraphWalks, HarborDataset, HealthBenchProfessional, Mrcr, OpenAiEvals, SweBench,
 };
 
 /// A complete manifest using Nanocodex's concrete third-party benchmark recipes.
@@ -191,6 +191,18 @@ pub enum Benchmark {
         environment: PathBuf,
         /// Evaluator-owned public-reproduction verifier.
         harness: PathBuf,
+    },
+    /// The authors' GPQA Diamond CSV and deterministic multiple-choice grader.
+    GpqaDiamond {
+        /// Extracted official `gpqa_diamond.csv`.
+        source: PathBuf,
+        /// Pinned authors' repository revision.
+        revision: String,
+        /// Deterministic exact-answer verifier.
+        harness: PathBuf,
+        /// Candidate environment.
+        #[serde(default = "default_image")]
+        image: String,
     },
     /// Benchmark-owned executable manifest.
     External {
@@ -541,6 +553,7 @@ impl BenchmarkCatalog {
             "mrcr-v2" => "mrcr",
             "healthbench-professional" => "healthbench-professional",
             "gdpval" => "gdpval",
+            "gpqa-diamond" => "gpqa-diamond",
             _ => return None,
         };
         Some(Builtin { adapter })
@@ -722,6 +735,17 @@ impl<'a> ProfileImporter<'a> {
                 }
                 store.import(&importer)
             }
+            Benchmark::GpqaDiamond {
+                source,
+                revision,
+                harness,
+                image,
+            } => store.import(&GpqaDiamond::new(
+                resolve_path(root, source),
+                revision,
+                Environment::OciImage(image.clone()),
+                resolve_path(root, harness),
+            )),
             Benchmark::External { manifest } => {
                 store.import(&ExternalHarness::new(resolve_path(root, manifest)))
             }
@@ -899,6 +923,7 @@ mod tests {
             "mrcr-v2",
             "healthbench-professional",
             "gdpval",
+            "gpqa-diamond",
         ] {
             assert!(BenchmarkCatalog::new().contains(benchmark), "{benchmark}");
         }
@@ -1151,6 +1176,7 @@ thinking = ["low"]
                 "external-smoke",
                 "gdpval",
                 "genebench-pro-public",
+                "gpqa-diamond",
                 "graphwalks",
                 "healthbench-professional",
                 "mrcr-v2",

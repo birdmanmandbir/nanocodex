@@ -317,6 +317,9 @@ through PR #72's existing concrete importers:
 - `swe-atlas-qna`: Scale's pinned 124-task QnA split, imported losslessly as
   Harbor packages and graded by its benchmark-owned rubric verifier through
   the evaluator's subscription-backed OpenAI-compatible judge endpoint; and
+- `gpqa-diamond`: the authors' pinned 198-question Diamond release, preserving
+  their continuous CPython seed-0 answer permutation, zero-shot prompt, and
+  deterministic answer parser without acquiring deprecated `simple-evals`; and
 - `external`: a benchmark-owned hermetic manifest for PaperBench, MLE-style,
   private, or otherwise executable benchmark semantics.
 
@@ -473,7 +476,8 @@ OpenAI's deprecated `simple-evals` repository and its BrowseComp, GPQA, and
 HealthBench recipes are explicitly outside the supported catalog. They are not
 acquired during preparation and do not remain as hidden adapter or CLI routes.
 The HealthBench Professional adapter instead consumes OpenAI's direct official
-dataset and published scoring methodology.
+dataset and published scoring methodology. GPQA Diamond likewise consumes the
+authors' direct release and baseline implementation, not the deprecated wrapper.
 
 For custom sources, `[benchmark.<name>].adapter` must deserialize through the
 same closed, typed adapter configuration with unknown fields denied, construct
@@ -566,6 +570,7 @@ tasks = [
   "arena-hard-v2/2edbb5f36f5b42be",
   "swe-bench-verified-smoke/astropy__astropy-12907",
   "swe-atlas-qna/task-6905333b74f22949d97ba9c2",
+  "gpqa-diamond/rec06pnAkLOr2t2mp",
   "genebench-pro-public/multiparent_qtl_hmm_lmm",
   "external-smoke/exact-answer",
 ]
@@ -817,9 +822,10 @@ may hide missing coordinates or mix incompatible preparation identities.
     isolated subscription-backed judge, live smoke, clean resume, and retained
     report evidence; continue with the next obtainable family.
     The public GDPval adapter now has a clean local workspace/judge lifecycle,
-    exact retained evidence, and zero-spend resume. SWE-Atlas QnA is the next
-    pinned Harbor-family route; finish its remote Nanocodex/Codex smoke and the
-    remaining GDPval differential before accepting either release result.
+    exact retained evidence, and zero-spend resume. SWE-Atlas QnA and the
+    authors' direct GPQA Diamond release are now pinned adapter routes; finish
+    their native and remote Nanocodex/Codex smoke gates and the remaining GDPval
+    differential before accepting any release result.
 11. [ ] Run the coordinator/runner architecture with one saturated remote
     runner on `dev-georgios`, retaining all heavyweight state on its verified
     3.5 TB drive. Add cross-host sharding only after measurements show that

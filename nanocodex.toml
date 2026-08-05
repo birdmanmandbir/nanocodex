@@ -17,6 +17,7 @@ tasks = [
   "arena-hard-v2/2edbb5f36f5b42be",
   "swe-bench-verified-smoke/astropy__astropy-12907",
   "swe-atlas-qna/task-6905333b74f22949d97ba9c2",
+  "gpqa-diamond/rec06pnAkLOr2t2mp",
   "genebench-pro-public/multiparent_qtl_hmm_lmm",
   "external-smoke/exact-answer",
 ]
@@ -30,6 +31,7 @@ tasks = [
   "arena-hard-v2/2edbb5f36f5b42be",
   "swe-bench-verified-smoke/astropy__astropy-12907",
   "swe-atlas-qna/task-6905333b74f22949d97ba9c2",
+  "gpqa-diamond/rec06pnAkLOr2t2mp",
   "genebench-pro-public/multiparent_qtl_hmm_lmm",
   "graphwalks/128k-and-shorter-000749",
   "mrcr-v2/8needle-0-000000",
@@ -50,6 +52,19 @@ thinking = ["low"]
 [profiles.swe-atlas-qna-smoke]
 harnesses = ["codex", "nanocodex"]
 tasks = ["swe-atlas-qna/task-6905333b74f22949d97ba9c2"]
+trials = 1
+model = ["gpt-5.6-sol"]
+thinking = ["low"]
+
+[profiles.gpqa-diamond-smoke]
+harnesses = ["codex", "nanocodex"]
+tasks = ["gpqa-diamond/rec06pnAkLOr2t2mp"]
+trials = 1
+model = ["gpt-5.6-sol"]
+thinking = ["low"]
+
+[profiles.gpqa-diamond-smoke-native]
+tasks = ["gpqa-diamond/rec06pnAkLOr2t2mp"]
 trials = 1
 model = ["gpt-5.6-sol"]
 thinking = ["low"]
