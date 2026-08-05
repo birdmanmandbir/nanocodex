@@ -21,7 +21,7 @@ use serde::Deserialize;
 
 use crate::{
     ArenaHard, BuiltinSourceError, BuiltinSources, ExternalHarness, HarborDataset, OpenAiEvals,
-    OpenAiSimpleEval, OpenAiSimpleEvals, SweBench,
+    SweBench,
 };
 
 /// A complete manifest using Nanocodex's concrete third-party benchmark recipes.
@@ -115,25 +115,6 @@ pub enum Benchmark {
         #[serde(default = "default_image")]
         image: String,
     },
-    /// OpenAI simple-evals source and official grader implementation.
-    OpenaiSimpleEvals {
-        /// Pinned simple-evals checkout.
-        checkout: PathBuf,
-        /// Official grader wrapper.
-        harness: PathBuf,
-        /// Official CSV or JSONL data.
-        data: PathBuf,
-        /// Published eval semantics.
-        eval: SimpleEval,
-        /// Pinned source revision.
-        revision: String,
-        /// Candidate environment.
-        #[serde(default = "default_image")]
-        image: String,
-        /// Optional deterministic prefix used by smoke profiles.
-        #[serde(default)]
-        limit: Option<usize>,
-    },
     /// SWE-bench instances and official verifier wrapper.
     SweBench {
         /// Instance JSONL.
@@ -157,20 +138,6 @@ pub enum Benchmark {
         /// External harness manifest.
         manifest: PathBuf,
     },
-}
-
-/// OpenAI simple-evals format selected by a custom benchmark recipe.
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum SimpleEval {
-    /// BrowseComp.
-    BrowseComp,
-    /// HealthBench.
-    HealthBench,
-    /// HealthBench Professional.
-    HealthBenchProfessional,
-    /// GPQA Diamond.
-    GpqaDiamond,
 }
 
 /// One selected normalized task and its stable profile selector.
@@ -506,9 +473,6 @@ impl BenchmarkCatalog {
             "terminal-bench-2.1" | "frontier-bench" | "stable-bench" => "harbor",
             "arena-hard-v2" => "arena-hard",
             "openai-evals" => "openai-evals",
-            "browsecomp" | "healthbench" | "healthbench-professional" | "gpqa-diamond" => {
-                "openai-simple-evals"
-            }
             "swe-bench-pro" | "swe-bench-verified-smoke" => "swe-bench",
             "agents-last-exam"
             | "gdpval-aa"
@@ -631,29 +595,6 @@ impl<'a> ProfileImporter<'a> {
                 revision,
                 Environment::OciImage(image.clone()),
             )),
-            Benchmark::OpenaiSimpleEvals {
-                checkout,
-                harness,
-                data,
-                eval,
-                revision,
-                image,
-                limit,
-            } => {
-                let mut importer = OpenAiSimpleEvals::new(
-                    name,
-                    resolve_path(root, checkout),
-                    resolve_path(root, harness),
-                    resolve_path(root, data),
-                    revision,
-                    (*eval).into(),
-                    Environment::OciImage(image.clone()),
-                );
-                if let Some(limit) = limit {
-                    importer = importer.limit(*limit);
-                }
-                store.import(&importer)
-            }
             Benchmark::SweBench {
                 instances,
                 harness,
@@ -736,17 +677,6 @@ impl SelectedTask {
     /// Consumes the selection and returns its task.
     pub fn into_task(self) -> Task {
         self.task
-    }
-}
-
-impl From<SimpleEval> for OpenAiSimpleEval {
-    fn from(value: SimpleEval) -> Self {
-        match value {
-            SimpleEval::BrowseComp => Self::BrowseComp,
-            SimpleEval::HealthBench => Self::HealthBench,
-            SimpleEval::HealthBenchProfessional => Self::HealthBenchProfessional,
-            SimpleEval::GpqaDiamond => Self::GpqaDiamond,
-        }
     }
 }
 
@@ -840,10 +770,6 @@ mod tests {
     fn catalog_covers_recorded_gpt_5_6_families() {
         for benchmark in [
             "terminal-bench-2.1",
-            "browsecomp",
-            "healthbench",
-            "healthbench-professional",
-            "gpqa-diamond",
             "swe-bench-pro",
             "agents-last-exam",
             "gdpval-aa",
@@ -896,14 +822,6 @@ mod tests {
         fs::write(
             registry.join("data/demo/samples.jsonl"),
             "{\"input\":[{\"role\":\"user\",\"content\":\"2 + 2?\"}],\"ideal\":[\"4\"]}\n",
-        )
-        .unwrap();
-
-        let simple = sources.join("simple-evals");
-        make_simple_evals_checkout(&simple);
-        fs::write(
-            sources.join("health.jsonl"),
-            "{\"prompt\":[{\"role\":\"user\",\"content\":\"Be helpful.\"}],\"rubrics\":[{\"criterion\":\"Helpful\",\"points\":1,\"tags\":[]}],\"example_tags\":[],\"prompt_id\":\"health-case\"}\n",
         )
         .unwrap();
 
@@ -961,15 +879,6 @@ harness = {harness:?}
 eval = "demo.match-v1"
 revision = "openai-evals@1"
 
-[benchmark.simple-evals-smoke]
-adapter = "openai-simple-evals"
-checkout = {simple:?}
-harness = {harness:?}
-data = {health:?}
-eval = "health-bench"
-revision = "simple-evals@1"
-limit = 1
-
 [benchmark.swe-smoke]
 adapter = "swe-bench"
 instances = {swe:?}
@@ -981,7 +890,7 @@ adapter = "external"
 manifest = {external_manifest:?}
 
 [profiles.adapter-smoke]
-tasks = ["harbor-smoke", "arena-smoke", "openai-evals-smoke", "simple-evals-smoke", "swe-smoke", "external-smoke"]
+tasks = ["harbor-smoke", "arena-smoke", "openai-evals-smoke", "swe-smoke", "external-smoke"]
 trials = 1
 model = ["gpt-5.6-sol"]
 thinking = ["low"]
@@ -990,8 +899,6 @@ thinking = ["low"]
                 arena = sources.join("arena.jsonl"),
                 harness = harness,
                 registry = registry,
-                simple = simple,
-                health = sources.join("health.jsonl"),
                 swe = sources.join("swe.jsonl"),
                 external_manifest = external.join("manifest.toml"),
             ),
@@ -1016,7 +923,7 @@ thinking = ["low"]
 
         {
             let tasks = observation.tasks.lock().unwrap();
-            assert_eq!(tasks.len(), 6);
+            assert_eq!(tasks.len(), 5);
         }
         assert_eq!(
             observation.cache.lock().unwrap().as_deref(),
@@ -1070,7 +977,6 @@ thinking = ["low"]
         fs::create_dir_all(path).unwrap();
         fs::write(path.join("Dockerfile"), "FROM debian:bookworm-slim\n").unwrap();
         fs::write(path.join("grade.py"), "# smoke grader\n").unwrap();
-        fs::write(path.join("gpqa_prepare.py"), "# smoke preparation\n").unwrap();
         fs::write(
             path.join("test.sh"),
             "#!/bin/sh\nprintf '1\\n' > /logs/verifier/reward.txt\n",
@@ -1108,21 +1014,5 @@ allow_internet = false
 "#,
         )
         .unwrap();
-    }
-
-    fn make_simple_evals_checkout(path: &Path) {
-        fs::create_dir_all(path.join("sampler")).unwrap();
-        for relative in [
-            "LICENSE",
-            "browsecomp_eval.py",
-            "common.py",
-            "gpqa_eval.py",
-            "healthbench_eval.py",
-            "types.py",
-            "sampler/chat_completion_sampler.py",
-            "sampler/responses_sampler.py",
-        ] {
-            fs::write(path.join(relative), format!("# fixture {relative}\n")).unwrap();
-        }
     }
 }

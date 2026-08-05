@@ -14,8 +14,6 @@ categories.workspace = true
 description = "Third-party benchmark adapters for nanocodex-eval"
 
 [dependencies]
-base64.workspace = true
-csv.workspace = true
 hex.workspace = true
 ignore.workspace = true
 nanocodex-eval.workspace = true

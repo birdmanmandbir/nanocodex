@@ -9,7 +9,6 @@ mod arena_hard;
 mod external;
 mod harbor;
 mod openai_evals;
-mod openai_simple_evals;
 pub mod profile;
 mod source;
 mod swe_bench;
@@ -21,7 +20,6 @@ pub use external::ExternalHarness;
 pub use harbor::HarborDataset;
 use nanocodex_eval::import::ImportError;
 pub use openai_evals::OpenAiEvals;
-pub use openai_simple_evals::{OpenAiSimpleEval, OpenAiSimpleEvals};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 pub use source::{BuiltinSourceError, BuiltinSources};
@@ -91,17 +89,13 @@ fn read_json_lines<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>, 
 mod tests {
     use std::{fs, path::Path};
 
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use nanocodex_eval::{
         TaskOutput,
         import::{DatasetImporter, Environment, Harness, ImportStore},
     };
     use tempfile::tempdir;
 
-    use crate::{
-        ArenaHard, ExternalHarness, OpenAiEvals, OpenAiSimpleEval, OpenAiSimpleEvals, SweBench,
-    };
-    use sha2::{Digest, Sha256};
+    use crate::{ArenaHard, ExternalHarness, OpenAiEvals, SweBench};
 
     #[test]
     fn imports_arena_final_message_cases() {
@@ -177,170 +171,6 @@ mod tests {
             dataset.tasks()[0]
                 .root()
                 .join("tests/expected.json")
-                .is_file()
-        );
-    }
-
-    #[test]
-    fn imports_openai_simple_evals_with_official_grader_sources() {
-        let source = tempdir().unwrap();
-        make_simple_evals_checkout(source.path());
-        let health = source.path().join("health.jsonl");
-        fs::write(
-            &health,
-            r#"{"prompt":[{"role":"user","content":"First question"},{"role":"assistant","content":"First answer"},{"role":"user","content":"Follow-up"}],"rubrics":[],"example_tags":[],"prompt_id":"multi-turn"}
-{"prompt":[{"role":"user","content":"How should I proceed?"}],"rubrics":[{"criterion":"Is helpful","points":1,"tags":[]}],"example_tags":[],"prompt_id":"health-1"}
-"#,
-        )
-        .unwrap();
-        let store = tempdir().unwrap();
-
-        let dataset = ImportStore::new(store.path())
-            .import(
-                &OpenAiSimpleEvals::new(
-                    "healthbench",
-                    source.path(),
-                    openai_simple_evals_harness(),
-                    health,
-                    "openai/simple-evals@abc",
-                    OpenAiSimpleEval::HealthBench,
-                    Environment::OciImage("debian:bookworm-slim".to_owned()),
-                )
-                .limit(1),
-            )
-            .unwrap();
-
-        let task = &dataset.tasks()[0];
-        assert_eq!(task.prompt(), "How should I proceed?");
-        assert_eq!(task.output(), TaskOutput::FinalMessage);
-        assert!(
-            task.root()
-                .join("tests/official/healthbench_eval.py")
-                .is_file()
-        );
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(
-                &fs::read(task.root().join("tests/case.json")).unwrap()
-            )
-            .unwrap()["source_index"],
-            1
-        );
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(
-                &fs::read(task.root().join("tests/case.json")).unwrap()
-            )
-            .unwrap()["kind"],
-            "healthbench"
-        );
-    }
-
-    #[test]
-    fn imports_browsecomp_and_gpqa_reference_prompt_shapes() {
-        let source = tempdir().unwrap();
-        make_simple_evals_checkout(source.path());
-        let browse = source.path().join("browse.csv");
-        let canary = "fixture-canary";
-        fs::write(
-            &browse,
-            format!(
-                "problem,answer,problem_topic,canary\n{},{},fixture,{}\n",
-                encrypt("Who wrote Hamlet?", canary),
-                encrypt("William Shakespeare", canary),
-                canary
-            ),
-        )
-        .unwrap();
-        let gpqa = source.path().join("gpqa.csv");
-        fs::write(
-            &gpqa,
-            "Question,Correct Answer,Incorrect Answer 1,Incorrect Answer 2,Incorrect Answer 3\nWhat is 2+2?,4,3,5,6\n",
-        )
-        .unwrap();
-        let store = tempdir().unwrap();
-
-        let browse = ImportStore::new(store.path())
-            .import(&OpenAiSimpleEvals::new(
-                "browsecomp",
-                source.path(),
-                openai_simple_evals_harness(),
-                browse,
-                "openai/simple-evals@abc",
-                OpenAiSimpleEval::BrowseComp,
-                Environment::OciImage("debian:bookworm-slim".to_owned()),
-            ))
-            .unwrap();
-        let gpqa = ImportStore::new(store.path())
-            .import(&OpenAiSimpleEvals::new(
-                "gpqa",
-                source.path(),
-                openai_simple_evals_harness(),
-                gpqa,
-                "openai/simple-evals@abc",
-                OpenAiSimpleEval::GpqaDiamond,
-                Environment::OciImage("debian:bookworm-slim".to_owned()),
-            ))
-            .unwrap();
-
-        assert!(browse.tasks()[0].prompt().contains("Who wrote Hamlet?"));
-        assert!(
-            browse.tasks()[0]
-                .prompt()
-                .contains("Exact Answer: {your succinct, final answer}")
-        );
-        assert!(gpqa.tasks()[0].prompt().contains("Answer: $LETTER"));
-        assert!(gpqa.tasks()[0].prompt().contains("A)"));
-        assert_eq!(gpqa.tasks().len(), 4);
-        assert!(
-            gpqa.tasks()[0]
-                .root()
-                .join("tests/official/gpqa_eval.py")
-                .is_file()
-        );
-    }
-
-    #[test]
-    fn imports_healthbench_professional_with_published_scoring_mode() {
-        let source = tempdir().unwrap();
-        make_simple_evals_checkout(source.path());
-        let data = source.path().join("healthbench-professional.jsonl");
-        fs::write(
-            &data,
-            r#"{"id":"multi-turn","conversation":{"messages":[{"role":"user","content":"First question"},{"role":"assistant","content":"First answer"},{"role":"user","content":"Follow-up"}]},"rubric_items":[],"use_case":"consult","type":"good_faith","difficulty":"typical","specialty":"general"}
-{"id":"case-1","conversation":{"messages":[{"role":"user","content":"Draft a clinical note."}]},"rubric_items":[{"criterion_text":"Includes an assessment.","points":8}],"use_case":"writing","type":"good_faith","difficulty":"typical","specialty":"general"}
-"#,
-        )
-        .unwrap();
-        let store = tempdir().unwrap();
-
-        let dataset = ImportStore::new(store.path())
-            .import(
-                &OpenAiSimpleEvals::new(
-                    "healthbench-professional",
-                    source.path(),
-                    openai_simple_evals_harness(),
-                    data,
-                    "openai/simple-evals@abc",
-                    OpenAiSimpleEval::HealthBenchProfessional,
-                    Environment::OciImage("debian:bookworm-slim".to_owned()),
-                )
-                .limit(1),
-            )
-            .unwrap();
-
-        let metadata: serde_json::Value = serde_json::from_slice(
-            &fs::read(dataset.tasks()[0].root().join("tests/case.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(metadata["kind"], "healthbench_professional");
-        assert_eq!(metadata["source_index"], 1);
-        assert_eq!(
-            metadata["rubrics"][0]["criterion"],
-            "Includes an assessment."
-        );
-        assert!(
-            dataset.tasks()[0]
-                .root()
-                .join("tests/official/sampler/responses_sampler.py")
                 .is_file()
         );
     }
@@ -467,36 +297,5 @@ harness = {:?}
         )
         .unwrap();
         harness
-    }
-
-    fn make_simple_evals_checkout(root: &Path) {
-        fs::create_dir(root.join("sampler")).unwrap();
-        for relative in [
-            "LICENSE",
-            "browsecomp_eval.py",
-            "common.py",
-            "gpqa_eval.py",
-            "healthbench_eval.py",
-            "types.py",
-            "sampler/chat_completion_sampler.py",
-            "sampler/responses_sampler.py",
-        ] {
-            fs::write(root.join(relative), format!("# fixture {relative}\n")).unwrap();
-        }
-    }
-
-    fn openai_simple_evals_harness() -> std::path::PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/openai-simple-evals")
-    }
-
-    fn encrypt(value: &str, password: &str) -> String {
-        let key = Sha256::digest(password.as_bytes());
-        let encrypted = value
-            .as_bytes()
-            .iter()
-            .enumerate()
-            .map(|(index, byte)| byte ^ key[index % key.len()])
-            .collect::<Vec<_>>();
-        BASE64.encode(encrypted)
     }
 }

@@ -623,6 +623,15 @@ impl ProfileRunner for VmProfileRunner {
     type Output = VmProfileRunResult;
 
     async fn run(self, request: ProfileRunRequest) -> Result<Self::Output, Self::Error> {
+        let new_tasks = request.new_tasks().map(<[String]>::to_vec);
+        let plan = request
+            .receipt()
+            .run_plan_for(&self.nanocodex, new_tasks.as_deref())?;
+        let tasks = plan.tasks().to_vec();
+        let sweep = plan.into_sweep();
+        let planned_attempts = sweep.attempt_count();
+        let mut active = ProfileRunControl::new(request.control_directory())
+            .acquire(request.receipt().profile(), planned_attempts)?;
         let (harness_root, harnesses) = PreparedGuestHarness::stage_all(
             request.receipt().harnesses(),
             request.cache_directory(),
@@ -645,17 +654,9 @@ impl ProfileRunner for VmProfileRunner {
         } else {
             Some(PreparedGuestAuth::load_ca_certificates()?)
         };
-        let new_tasks = request.new_tasks().map(<[String]>::to_vec);
-        let plan = request
-            .receipt()
-            .run_plan_for(&self.nanocodex, new_tasks.as_deref())?;
-        let tasks = plan.tasks().to_vec();
-        let sweep = plan.into_sweep();
-        let planned_attempts = sweep.attempt_count();
-        let mut active = ProfileRunControl::new(request.control_directory())
-            .acquire(request.receipt().profile(), planned_attempts)?;
         let mut backend = VmBackend::builder()
             .web_search(request.receipt().web_search())
+            .retain_failed_rootfs(false)
             .verifier_environment(self.verifier_environment);
         if !harnesses.is_empty() {
             backend = backend.shared_directory(SharedDirectory::read_only(

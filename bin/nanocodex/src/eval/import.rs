@@ -1,12 +1,9 @@
 use std::{num::NonZeroUsize, path::PathBuf};
 
-use clap::{Args, Subcommand, ValueEnum};
+use clap::{Args, Subcommand};
 use eyre::Result;
 use nanocodex_eval::import::{Environment, Harness, ImportStore};
-use nanocodex_eval_adapters::{
-    ArenaHard, ExternalHarness, HarborDataset, OpenAiEvals, OpenAiSimpleEval, OpenAiSimpleEvals,
-    SweBench,
-};
+use nanocodex_eval_adapters::{ArenaHard, ExternalHarness, HarborDataset, OpenAiEvals, SweBench};
 use serde::Serialize;
 
 #[derive(Args)]
@@ -31,8 +28,6 @@ enum ImportSource {
     ArenaHard(Arena),
     /// Import a declarative OpenAI Evals Match or Includes eval.
     OpenaiEvals(OpenAi),
-    /// Import BrowseComp, HealthBench, HealthBench Professional, or GPQA.
-    OpenaiSimpleEvals(OpenAiSimple),
     /// Import SWE-bench instances with official images and harness.
     SweBench(Swe),
     /// Import MLE-bench, PaperBench, or another benchmark-owned harness.
@@ -74,48 +69,6 @@ struct OpenAi {
     /// OCI image used for the candidate turn.
     #[arg(long, default_value = "debian:bookworm-slim")]
     image: String,
-}
-
-#[derive(Args)]
-struct OpenAiSimple {
-    #[command(flatten)]
-    identity: Identity,
-    /// Pinned OpenAI simple-evals checkout.
-    checkout: PathBuf,
-    /// Verifier harness containing Dockerfile, test.sh, grade.py, and
-    /// gpqa_prepare.py. These files are snapshotted during import rather than
-    /// embedded in the Nanocodex binary.
-    #[arg(long)]
-    harness: PathBuf,
-    /// Official CSV or JSONL dataset file.
-    data: PathBuf,
-    /// Reference eval and grading implementation to package.
-    #[arg(long, value_enum)]
-    eval: SimpleEval,
-    /// OCI image used for the candidate turn.
-    #[arg(long, default_value = "debian:bookworm-slim")]
-    image: String,
-    #[command(flatten)]
-    selection: Selection,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum SimpleEval {
-    BrowseComp,
-    HealthBench,
-    HealthBenchProfessional,
-    GpqaDiamond,
-}
-
-impl From<SimpleEval> for OpenAiSimpleEval {
-    fn from(value: SimpleEval) -> Self {
-        match value {
-            SimpleEval::BrowseComp => Self::BrowseComp,
-            SimpleEval::HealthBench => Self::HealthBench,
-            SimpleEval::HealthBenchProfessional => Self::HealthBenchProfessional,
-            SimpleEval::GpqaDiamond => Self::GpqaDiamond,
-        }
-    }
 }
 
 #[derive(Args)]
@@ -198,21 +151,6 @@ impl Import {
                 arguments.identity.revision,
                 Environment::OciImage(arguments.image),
             ))?,
-            ImportSource::OpenaiSimpleEvals(arguments) => {
-                let mut importer = OpenAiSimpleEvals::new(
-                    arguments.identity.name,
-                    arguments.checkout,
-                    arguments.harness,
-                    arguments.data,
-                    arguments.identity.revision,
-                    arguments.eval.into(),
-                    Environment::OciImage(arguments.image),
-                );
-                if let Some(limit) = arguments.selection.limit {
-                    importer = importer.limit(limit.get());
-                }
-                store.import(&importer)?
-            }
             ImportSource::SweBench(arguments) => store.import(
                 &SweBench::new(
                     arguments.identity.name,

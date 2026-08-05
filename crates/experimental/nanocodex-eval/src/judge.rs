@@ -39,12 +39,6 @@ struct JudgeRequest {
     input: Value,
 }
 
-#[derive(Debug, Deserialize)]
-struct ChatCompletionRequest {
-    model: String,
-    messages: Value,
-}
-
 struct JudgeAnswer {
     model: Model,
     message: String,
@@ -88,7 +82,6 @@ impl JudgeRuntime {
         };
         let application = Router::new()
             .route("/v1/responses", post(Self::respond))
-            .route("/v1/chat/completions", post(Self::chat_completion))
             .with_state(state);
         let (shutdown, receiver) = oneshot::channel();
         let task = tokio::spawn(async move {
@@ -114,14 +107,8 @@ impl JudgeRuntime {
     pub fn verifier_environment(&self) -> BTreeMap<String, String> {
         let base_url = format!("http://{GUEST_HOST}:{}/v1", self.port);
         BTreeMap::from([
-            ("NANOCODEX_JUDGE_BASE_URL".to_owned(), base_url.clone()),
+            ("NANOCODEX_JUDGE_BASE_URL".to_owned(), base_url),
             ("NANOCODEX_JUDGE_TOKEN".to_owned(), self.token.to_string()),
-            ("OPENAI_BASE_URL".to_owned(), base_url),
-            ("OPENAI_API_KEY".to_owned(), self.token.to_string()),
-            (
-                "NANOCODEX_EVAL_GRADER_MODEL".to_owned(),
-                Model::Sol.to_string(),
-            ),
         ])
     }
 
@@ -147,41 +134,6 @@ impl JudgeRuntime {
             "usage": {
                 "input_tokens": 0,
                 "output_tokens": 0,
-                "total_tokens": 0
-            }
-        }))
-        .into_response()
-    }
-
-    async fn chat_completion(
-        State(state): State<JudgeState>,
-        headers: HeaderMap,
-        Json(request): Json<ChatCompletionRequest>,
-    ) -> Response {
-        let answer = match state
-            .answer(&headers, request.model, request.messages)
-            .await
-        {
-            Ok(answer) => answer,
-            Err(error) => return Self::error(error.status, error.message),
-        };
-        Json(json!({
-            "id": format!("judge_{}", Uuid::now_v7().simple()),
-            "object": "chat.completion",
-            "created": 0,
-            "model": answer.model,
-            "choices": [{
-                "index": 0,
-                "finish_reason": "stop",
-                "message": {
-                    "role": "assistant",
-                    "content": answer.message,
-                    "refusal": null
-                }
-            }],
-            "usage": {
-                "completion_tokens": 0,
-                "prompt_tokens": 0,
                 "total_tokens": 0
             }
         }))
@@ -328,7 +280,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prompt_accepts_openai_chat_and_responses_text_shapes() {
+    fn prompt_accepts_responses_text_shapes() {
         let (instructions, prompt) = JudgeRuntime::prompt(json!([
             {"role": "system", "content": "Grade precisely."},
             {
@@ -343,7 +295,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verifier_environment_routes_both_openai_protocols_through_proxy() {
+    async fn verifier_environment_exposes_only_the_run_scoped_judge_endpoint() {
         let (shutdown, _receiver) = oneshot::channel();
         let runtime = JudgeRuntime {
             port: 43123,
@@ -355,18 +307,11 @@ mod tests {
         let environment = runtime.verifier_environment();
 
         assert_eq!(
-            environment.get("OPENAI_BASE_URL").map(String::as_str),
+            environment
+                .get("NANOCODEX_JUDGE_BASE_URL")
+                .map(String::as_str),
             Some("http://192.168.127.254:43123/v1")
         );
-        assert_eq!(
-            environment.get("OPENAI_API_KEY").map(String::as_str),
-            Some("judge-token")
-        );
-        assert_eq!(
-            environment
-                .get("NANOCODEX_EVAL_GRADER_MODEL")
-                .map(String::as_str),
-            Some("gpt-5.6-sol")
-        );
+        assert_eq!(environment.len(), 2);
     }
 }

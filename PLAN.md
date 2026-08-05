@@ -232,7 +232,7 @@ The fields have narrow meanings:
   complete argv is validated during preparation and bound into retained
   identity.
 - Stable built-in benchmark names such as `terminal-bench-2.1`,
-  `arena-hard-v2`, `openai-evals`, `gpqa-diamond`, and `swe-bench` need no
+  `arena-hard-v2`, `openai-evals`, and `swe-bench` need no
   configuration. Each installed Nanocodex version owns a reviewed catalog of
   pinned acquisition and adapter recipes for the upstream benchmarks it
   supports. Preparation fetches or reuses the exact source, invokes the PR #72
@@ -299,10 +299,10 @@ through PR #72's existing concrete importers:
   package;
 - `openai-evals`: supported declarative Match/Includes definitions plus the
   snapshotted deterministic grader;
-- `openai-simple-evals`: BrowseComp, GPQA Diamond, HealthBench, and HealthBench
-  Professional with the pinned official source used by PR #72;
 - `swe-bench`: official instances, instance-image identity, and verifier
   package; and
+- `genebench-pro`: OpenAI's official public case-study package, workspace data,
+  structured answer contract, and deterministic reference grader; and
 - `external`: a benchmark-owned hermetic manifest for PaperBench, MLE-style,
   private, or otherwise executable benchmark semantics.
 
@@ -310,11 +310,10 @@ The release coverage target is every benchmark family recorded from OpenAI's
 GPT-5.6 reports, not only the suites that happen to have native import formats:
 
 - Terminal-Bench 2.1;
-- BrowseComp, HealthBench, HealthBench Professional, and GPQA Diamond;
 - SWE-Bench Pro;
 - Agents' Last Exam, GDPval-AA, Artificial Analysis, and FrontierMath;
 - OSWorld and BenchCAD;
-- CTF, SEC-Bench, ExploitBench, ExploitGym, and GeneBench v1;
+- CTF, SEC-Bench, ExploitBench, ExploitGym, and GeneBench Pro;
 - KernelBench/KernelGen, NanoGPT, and PostTrainBench; and
 - MMMU Pro, Toolathlon, MRCR, GraphWalks, and ARC-AGI.
 
@@ -338,16 +337,12 @@ Model-based verifiers, including RewardKit-backed judges, use evaluator-pinned
 GPT-5.6 Sol. Authentication defaults to the evaluator's local OpenAI
 subscription and uses an API key only when the operator explicitly selects
 that fallback. An evaluator-owned judge runtime stays outside the candidate
-guest and exposes the authenticated Responses and Chat Completions shapes
-needed by pinned reference graders. Candidate agents and additional harness
-CLIs never receive grader credentials, judge responses, or rubric internals;
-no provider secret is written to the preparation receipt or report. Changing
-a candidate profile's `model` sweep never changes the grader model implicitly.
-The effective grader model is retained with verifier evidence. A benchmark
-whose published score uses another grader model, currently HealthBench
-Professional's GPT-5.4-low external setting, is an adapter smoke rather than a
-directly comparable official score until that exact grader can run through the
-same subscription-or-API boundary.
+guest and exposes the authenticated protocol required by the pinned grader.
+Candidate agents and additional harness CLIs never receive grader credentials,
+judge responses, or rubric internals; no provider secret is written to the
+preparation receipt or report. Changing a candidate profile's `model` sweep
+never changes the grader model implicitly. The effective grader model is
+retained with verifier evidence.
 
 OpenAI's GPT-5.6 system card is a preparedness inventory, not a claim that all
 of OpenAI's internal suites are available. Publicly obtainable families such
@@ -357,11 +352,9 @@ tasks and grading semantics are pinned. Internal Research Debugging, METR
 private evaluations, irregular external cyber evaluations, and other private
 or unpublished suites remain explicitly unavailable.
 
-The deprecated `simple-evals` repository is never a user-facing runner or
-profile name. A pinned frozen checkout may be consumed internally as reference
-source for BrowseComp, GPQA, and HealthBench semantics that OpenAI continues to
-publish there; source acquisition and normalization hide that implementation
-detail behind stable benchmark names.
+OpenAI's deprecated `simple-evals` repository and its BrowseComp, GPQA, and
+HealthBench recipes are explicitly outside the supported catalog. They are not
+acquired during preparation and do not remain as hidden adapter or CLI routes.
 
 For custom sources, `[benchmark.<name>].adapter` must deserialize through the
 same closed, typed adapter configuration with unknown fields denied, construct
@@ -452,23 +445,19 @@ harnesses = ["codex", "nanocodex"]
 tasks = [
   "terminal-bench-2.1/fix-git",
   "arena-hard-v2/2edbb5f36f5b42be",
-  "browsecomp/browsecomp-000000",
-  "healthbench/healthbench-000000",
-  "healthbench-professional/healthbench_professional-000000",
   "openai-evals/computer-science-problems.s1.simple-v0-000000",
-  "gpqa-diamond/gpqa_diamond-000000",
   "swe-bench-verified-smoke/astropy__astropy-12907",
   "external-smoke/exact-answer",
 ]
 trials = 1
 model = ["gpt-5.6-sol"]
 thinking = ["low"]
-web_search = true
 ```
 
 The implementation PR must replace the illustrative task placeholders with
-stable IDs from its pinned real smoke sources. The smoke matrix is one selected
-task from every benchmark adapter by current host-native Nanocodex and one
+stable IDs from its pinned real smoke sources. The initial 15-attempt smoke
+matrix is one selected task from every benchmark adapter by current host-native
+Nanocodex and one
 variant of every implemented guest harness CLI driver, exactly one valid trial
 each. As benchmark adapters or CLI drivers are added, this profile and its
 completeness test must be updated together. `prepare adapter-smoke` must import,
@@ -674,14 +663,17 @@ may hide missing coordinates or mix incompatible preparation identities.
    #72, using its normalized benchmark imports as the only evaluation path.
    The evidence audit reopened this gate after finding verifier-environment and
    differential-trajectory loss in nominally completed runs. The
-   `adapter-smoke` profile now covers nine real shapes, including BrowseComp,
-   HealthBench Chat Completions judging, HealthBench Professional Responses
-   judging, and SWE-bench. Close the milestone only after all 27 current
+   Deprecated `simple-evals` routes have been removed rather than carried as
+   hidden compatibility code. The `adapter-smoke` profile now covers five real
+   shapes, including RewardKit judging and SWE-bench. Close the milestone only
+   after all 15 current
    Nanocodex/stock-Codex/external-Nanocodex coordinates retain canonical
    trajectories, identities, verifier artifacts, subscription-backed judge
    evidence, hard-kill recovery, cleanup, and a zero-spend completed-run no-op.
-10. [ ] Extend the same PR #72 workflow from that smoke gate to complete local
-    profiles covering the recorded GPT-5.6 benchmark families: automatic
+10. [ ] Add the official GeneBench Pro public package as the first modern
+    CPU-only expansion, then extend the same PR #72 workflow from that smoke
+    gate to complete local profiles covering the recorded GPT-5.6 benchmark
+    families: automatic
     multi-harness/model/thinking matrices, durable monitoring,
     interruption/resume/new-sample runs, and website-ready reporting behind
     `nanocodex eval prepare` and `nanocodex eval run`.
