@@ -55,6 +55,12 @@ struct JudgeRequest {
     input: Value,
 }
 
+#[derive(Debug, Deserialize)]
+struct ChatCompletionRequest {
+    model: String,
+    messages: Value,
+}
+
 #[derive(Clone)]
 struct JudgeAnswer {
     model: Model,
@@ -110,6 +116,7 @@ impl JudgeRuntime {
             .route("/v1/responses", post(Self::respond))
             .route("/v1/responses/async", post(Self::submit))
             .route("/v1/responses/async/{id}", get(Self::poll))
+            .route("/v1/chat/completions", post(Self::chat_completion))
             .with_state(state);
         let (shutdown, receiver) = oneshot::channel();
         let task = tokio::spawn(async move {
@@ -136,9 +143,30 @@ impl JudgeRuntime {
     pub fn verifier_environment(&self) -> BTreeMap<String, String> {
         let base_url = format!("http://{GUEST_HOST}:{}/v1", self.port);
         BTreeMap::from([
-            ("NANOCODEX_JUDGE_BASE_URL".to_owned(), base_url),
+            ("NANOCODEX_JUDGE_BASE_URL".to_owned(), base_url.clone()),
             ("NANOCODEX_JUDGE_TOKEN".to_owned(), self.token.to_string()),
+            ("EVAL_BASE_URL".to_owned(), base_url.clone()),
+            ("EVAL_API_KEY".to_owned(), self.token.to_string()),
+            ("EVAL_MODEL".to_owned(), "gpt-5.6-sol".to_owned()),
+            ("OPENAI_BASE_URL".to_owned(), base_url.clone()),
+            ("OPENAI_API_BASE".to_owned(), base_url),
+            ("OPENAI_API_KEY".to_owned(), self.token.to_string()),
         ])
+    }
+
+    async fn chat_completion(
+        State(state): State<JudgeState>,
+        headers: HeaderMap,
+        Json(request): Json<ChatCompletionRequest>,
+    ) -> Response {
+        if !state.authorized(&headers) {
+            return Self::error(StatusCode::UNAUTHORIZED, "invalid judge token");
+        }
+        let answer = match state.answer(request.model, request.messages).await {
+            Ok(answer) => answer,
+            Err(error) => return Self::error(error.status, error.message),
+        };
+        Self::chat_answer(format!("chatcmpl_{}", Uuid::now_v7().simple()), answer)
     }
 
     async fn respond(
@@ -247,6 +275,26 @@ impl JudgeRuntime {
             "usage": {
                 "input_tokens": 0,
                 "output_tokens": 0,
+                "total_tokens": 0
+            }
+        }))
+        .into_response()
+    }
+
+    fn chat_answer(id: String, answer: JudgeAnswer) -> Response {
+        Json(json!({
+            "id": id,
+            "object": "chat.completion",
+            "created": 0,
+            "model": answer.model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": answer.message},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
                 "total_tokens": 0
             }
         }))
@@ -460,7 +508,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verifier_environment_exposes_only_the_run_scoped_judge_endpoint() {
+    async fn verifier_environment_exposes_responses_and_openai_compatible_judges() {
         let (shutdown, _receiver) = oneshot::channel();
         let runtime = JudgeRuntime {
             port: 43123,
@@ -478,7 +526,34 @@ mod tests {
                 .map(String::as_str),
             Some("http://192.168.127.254:43123/v1")
         );
-        assert_eq!(environment.len(), 2);
+        assert_eq!(
+            environment["EVAL_BASE_URL"],
+            "http://192.168.127.254:43123/v1"
+        );
+        assert_eq!(environment["EVAL_API_KEY"], "judge-token");
+        assert_eq!(environment["EVAL_MODEL"], "gpt-5.6-sol");
+        assert_eq!(environment["OPENAI_API_KEY"], "judge-token");
+        assert_eq!(
+            environment["OPENAI_BASE_URL"],
+            "http://192.168.127.254:43123/v1"
+        );
+        assert_eq!(environment.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn chat_completion_answer_uses_openai_compatible_shape() {
+        let response = JudgeRuntime::chat_answer(
+            "chatcmpl_test".to_owned(),
+            JudgeAnswer {
+                model: Model::from_str("gpt-5.6-sol").unwrap(),
+                message: "judge result".to_owned(),
+            },
+        );
+
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let document: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(document["object"], "chat.completion");
+        assert_eq!(document["choices"][0]["message"]["content"], "judge result");
     }
 
     #[tokio::test]

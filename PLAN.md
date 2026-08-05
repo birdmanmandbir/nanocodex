@@ -232,7 +232,7 @@ The fields have narrow meanings:
   complete argv is validated during preparation and bound into retained
   identity.
 - Stable built-in benchmark names such as `terminal-bench-2.1`,
-  `arena-hard-v2`, `openai-evals`, and `swe-bench` need no
+  `arena-hard-v2`, `swe-bench`, and `swe-atlas-qna` need no
   configuration. Each installed Nanocodex version owns a reviewed catalog of
   pinned acquisition and adapter recipes for the upstream benchmarks it
   supports. Preparation fetches or reuses the exact source, invokes the PR #72
@@ -314,6 +314,9 @@ through PR #72's existing concrete importers:
 - `gdpval`: OpenAI's pinned 220-task public release, candidate-visible reference
   files, verifier-only expert deliverables and rubrics, and a public pairwise
   reproduction score; and
+- `swe-atlas-qna`: Scale's pinned 124-task QnA split, imported losslessly as
+  Harbor packages and graded by its benchmark-owned rubric verifier through
+  the evaluator's subscription-backed OpenAI-compatible judge endpoint; and
 - `external`: a benchmark-owned hermetic manifest for PaperBench, MLE-style,
   private, or otherwise executable benchmark semantics.
 
@@ -431,9 +434,12 @@ grader performs order-swapped pairwise comparison and retains both judgments.
 Artificial Analysis has not published the exact GDPval-AA v2 judge panel,
 office-format patches, or Elo pipeline, so the resulting `public_score` is
 differential evidence and must never be represented as an AA-v2 score. The
-current smoke has already exposed and fixed workspace-output assumptions,
-large judge-transport fragility, and a retry-round stop accounting bug; a clean
-one-physical-attempt lifecycle and remote Codex differential remain the gate.
+clean local lifecycle under preparation
+`84b48249b3d0e82ea5cdbb8981b2ca51d188ebc7156f051f8f8c5f4e46fce01f`
+judged exactly the candidate's two deliverables in both presentation orders,
+with no infrastructure retries, leaked processes, or cleanup failures. A
+normal rerun resumed the coordinate with zero model spend. The legitimate
+public score was zero; remote Codex differential evidence remains the gate.
 
 Each built-in catalog entry owns its stable user-facing name, authoritative
 source location, pinned revision, adapter choice, official verifier assets,
@@ -558,8 +564,8 @@ harnesses = ["codex", "nanocodex"]
 tasks = [
   "terminal-bench-2.1/fix-git",
   "arena-hard-v2/2edbb5f36f5b42be",
-  "openai-evals/computer-science-problems.s1.simple-v0-000000",
   "swe-bench-verified-smoke/astropy__astropy-12907",
+  "swe-atlas-qna/task-6905333b74f22949d97ba9c2",
   "genebench-pro-public/multiparent_qtl_hmm_lmm",
   "external-smoke/exact-answer",
 ]
@@ -810,9 +816,10 @@ may hide missing coordinates or mix incompatible preparation identities.
     family. HealthBench Professional now has a pinned direct-source adapter,
     isolated subscription-backed judge, live smoke, clean resume, and retained
     report evidence; continue with the next obtainable family.
-    The public GDPval adapter and smoke profile are implemented and under live
-    durability validation; finish its clean local lifecycle and remote
-    Nanocodex/Codex comparison before accepting the next adapter as complete.
+    The public GDPval adapter now has a clean local workspace/judge lifecycle,
+    exact retained evidence, and zero-spend resume. SWE-Atlas QnA is the next
+    pinned Harbor-family route; finish its remote Nanocodex/Codex smoke and the
+    remaining GDPval differential before accepting either release result.
 11. [ ] Run the coordinator/runner architecture with one saturated remote
     runner on `dev-georgios`, retaining all heavyweight state on its verified
     3.5 TB drive. Add cross-host sharding only after measurements show that

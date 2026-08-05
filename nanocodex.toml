@@ -15,8 +15,8 @@ harnesses = ["codex", "nanocodex"]
 tasks = [
   "terminal-bench-2.1/fix-git",
   "arena-hard-v2/2edbb5f36f5b42be",
-  "openai-evals/computer-science-problems.s1.simple-v0-000000",
   "swe-bench-verified-smoke/astropy__astropy-12907",
+  "swe-atlas-qna/task-6905333b74f22949d97ba9c2",
   "genebench-pro-public/multiparent_qtl_hmm_lmm",
   "external-smoke/exact-answer",
 ]
@@ -28,8 +28,8 @@ thinking = ["low"]
 tasks = [
   "terminal-bench-2.1/fix-git",
   "arena-hard-v2/2edbb5f36f5b42be",
-  "openai-evals/computer-science-problems.s1.simple-v0-000000",
   "swe-bench-verified-smoke/astropy__astropy-12907",
+  "swe-atlas-qna/task-6905333b74f22949d97ba9c2",
   "genebench-pro-public/multiparent_qtl_hmm_lmm",
   "graphwalks/128k-and-shorter-000749",
   "mrcr-v2/8needle-0-000000",
@@ -43,6 +43,13 @@ thinking = ["low"]
 
 [profiles.deep-swe-smoke]
 tasks = ["deep-swe-v1.1/aiomonitor-task-snapshots-diff"]
+trials = 1
+model = ["gpt-5.6-sol"]
+thinking = ["low"]
+
+[profiles.swe-atlas-qna-smoke]
+harnesses = ["codex", "nanocodex"]
+tasks = ["swe-atlas-qna/task-6905333b74f22949d97ba9c2"]
 trials = 1
 model = ["gpt-5.6-sol"]
 thinking = ["low"]

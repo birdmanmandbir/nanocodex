@@ -48,6 +48,7 @@ evidence have no benchmark-specific branches.
 | MRCR v2 | Reads all six corrected official Parquet partitions and preserves alternating user/assistant messages as a hashed typed transcript | OpenAI's published prefix check and `difflib.SequenceMatcher` ratio; raw `similarity` is authoritative |
 | HealthBench Professional | Reads OpenAI's pinned 525-case release, preserves complete conversations, and keeps physician responses, canary, and rubrics outside the candidate VM | Published rubric equation and length adjustment with an evaluator-owned GPT-5.6 Sol low judge; this is a public reproduction, not the unavailable internal grader |
 | GDPval public release | Reads OpenAI's pinned 220-task Parquet release, exposes only task reference files to the candidate, and keeps expert deliverables and 10,453 human-authored rubric items verifier-only | Order-swapped pairwise comparison against the expert deliverable with an evaluator-owned GPT-5.6 Sol low judge; this is a public reproduction, not Artificial Analysis GDPval-AA v2 |
+| SWE-Atlas QnA | Losslessly snapshots the pinned 124-task Harbor split and its official repository/image identities | Benchmark-owned rubric verifier through the evaluator's subscription-backed OpenAI-compatible judge endpoint |
 | MLE-bench, PaperBench, and private suites | Reads a prepared generic external manifest | Benchmark-owned harness |
 
 Unsupported semantics fail during import. The adapters do not flatten
@@ -80,6 +81,7 @@ routes rather than VM modes:
 | MRCR v2 | installed `mrcr-v2` recipe pinned to OpenAI's corrected December 2025 data and published continuous grader |
 | HealthBench Professional | installed `healthbench-professional` recipe pinned to OpenAI's 525-case public release and published scoring equation; exact internal-grader parity is unavailable |
 | GDPval public release | installed `gdpval` recipe pinned to OpenAI's 220-task release; a public pairwise reproduction, not the unavailable GDPval-AA v2 pipeline |
+| SWE-Atlas QnA | installed `swe-atlas-qna` Harbor recipe pinned to Scale's public 124-task QnA split |
 | Agents' Last Exam, Big Finance Bench, LifeSciBench, BrowseComp, GPQA, FrontierMath, OSWorld, BenchCAD, CTF, SEC-Bench, ExploitBench, ExploitGym, KernelGen, NanoGPT, PostTrainBench, MMMU Pro, gdp.pdf, AutomationBench, Toolathlon, and ARC-AGI-3 | Not installed until a dedicated recipe or caller-supplied official `external` manifest exists |
 | OpenAI-internal or unreleased suites | Not importable until the owner supplies tasks and grading semantics |
 

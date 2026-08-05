@@ -15,10 +15,8 @@ use crate::{
 
 const TERMINAL_BENCH_REVISION: &str = "5c8eadf1f393183288fa08b8f73ca9a469cc5e00";
 const ARENA_HARD_REVISION: &str = "196f6b826783b3da7310e361a805fa36f0be83f3";
-const OPENAI_EVALS_REVISION: &str = "8eac7a7de5215c907fbddc30efdaf316913eccdd";
-const OPENAI_EVALS_SMOKE_DATA_SHA256: &str =
-    "a15177151c46b4526e67e84f3292a036b6d5441d9eddc8a88403337395745866";
 const SWE_BENCH_REVISION: &str = "f7bbbb2ccdf479001d6467c9e34af59e44a840f9";
+const SWE_ATLAS_REVISION: &str = "6de82c3603fb9e254170b440d7560441eb257176";
 const SWE_VERIFIED_ROW_RESPONSE_SHA256: &str =
     "7c62220a467830a3a330dda51211ab4c1ba099124dffc8371fbec057933c47b8";
 const GENEBENCH_PRO_REVISION: &str = "eb75a3c0996b3cedcc9af685bad02fd166848fa2";
@@ -154,13 +152,6 @@ impl BuiltinSources {
                 image: "debian:bookworm-slim".to_owned(),
                 limit: None,
             }),
-            "openai-evals" => Ok(Benchmark::OpenaiEvals {
-                registry: self.root.join("openai-evals/evals/registry"),
-                harness: assets.join("openai-evals"),
-                eval: "computer-science-problems.s1.simple-v0".to_owned(),
-                revision: format!("openai/evals@{OPENAI_EVALS_REVISION}"),
-                image: "debian:bookworm-slim".to_owned(),
-            }),
             "swe-bench-verified-smoke" => Ok(Benchmark::SweBench {
                 instances: self.root.join("data/swe-bench-verified-smoke.jsonl"),
                 harness: assets.join("swe-bench"),
@@ -170,6 +161,10 @@ impl BuiltinSources {
                 namespace: "swebench".to_owned(),
                 architecture: "x86_64".to_owned(),
                 image_tag: "latest".to_owned(),
+            }),
+            "swe-atlas-qna" => Ok(Benchmark::Harbor {
+                source: self.root.join("swe-atlas/data/qa"),
+                revision: format!("scaleapi/SWE-Atlas@{SWE_ATLAS_REVISION}"),
             }),
             "genebench-pro-public" => Ok(Benchmark::GeneBenchPro {
                 package: self.root.join("genebench-pro-public-package"),
@@ -218,8 +213,8 @@ impl BuiltinSources {
             name,
             "terminal-bench-2.1"
                 | "arena-hard-v2"
-                | "openai-evals"
                 | "swe-bench-verified-smoke"
+                | "swe-atlas-qna"
                 | "genebench-pro-public"
                 | "deep-swe-v1.1"
                 | "graphwalks"
@@ -245,18 +240,6 @@ impl BuiltinSources {
                 "https://github.com/lm-sys/arena-hard-auto.git",
                 ARENA_HARD_REVISION,
             ),
-            "openai-evals" => {
-                self.git_checkout(
-                    "openai-evals",
-                    "https://github.com/openai/evals.git",
-                    OPENAI_EVALS_REVISION,
-                )?;
-                self.materialize_lfs_file(
-                    "openai-evals/evals/registry/data/test_comp_sci/questions.jsonl",
-                    "https://media.githubusercontent.com/media/openai/evals/8eac7a7de5215c907fbddc30efdaf316913eccdd/evals/registry/data/test_comp_sci/questions.jsonl",
-                    OPENAI_EVALS_SMOKE_DATA_SHA256,
-                )
-            }
             "swe-bench-verified-smoke" => {
                 self.git_checkout(
                     "swe-bench",
@@ -313,6 +296,11 @@ impl BuiltinSources {
                 }
                 Ok(())
             }
+            "swe-atlas-qna" => self.git_checkout(
+                "swe-atlas",
+                "https://github.com/scaleapi/SWE-Atlas.git",
+                SWE_ATLAS_REVISION,
+            ),
             "genebench-pro-public" => self.materialize_genebench_pro(),
             "deep-swe-v1.1" => self.git_checkout(
                 "deep-swe",
@@ -587,17 +575,6 @@ impl BuiltinSources {
             .split('\0')
             .filter(|record| !record.is_empty())
             .collect::<Vec<_>>();
-        if checkout == "openai-evals" {
-            if records != [" M evals/registry/data/test_comp_sci/questions.jsonl"] {
-                return Ok(false);
-            }
-            let path = self
-                .root
-                .join("openai-evals/evals/registry/data/test_comp_sci/questions.jsonl");
-            let bytes =
-                fs::read(&path).map_err(|source| BuiltinSourceError::Io { path, source })?;
-            return Ok(hex::encode(Sha256::digest(bytes)) == OPENAI_EVALS_SMOKE_DATA_SHA256);
-        }
         if checkout != "gdpval" || records.is_empty() {
             return Ok(false);
         }
@@ -693,36 +670,6 @@ impl BuiltinSources {
                 git_bytes: Some(bytes),
             })
         }
-    }
-
-    fn materialize_lfs_file(
-        &self,
-        relative: &str,
-        url: &str,
-        sha256: &str,
-    ) -> Result<(), BuiltinSourceError> {
-        let destination = self.root.join(relative);
-        let retained = fs::read(&destination).map_err(|source| BuiltinSourceError::Io {
-            path: destination.clone(),
-            source,
-        })?;
-        if hex::encode(Sha256::digest(&retained)) == sha256 {
-            return Ok(());
-        }
-        let pointer = String::from_utf8_lossy(&retained);
-        if !pointer.starts_with("version https://git-lfs.github.com/spec/v1\n")
-            || !pointer.contains(&format!("oid sha256:{sha256}\n"))
-        {
-            return Err(BuiltinSourceError::Stale(format!(
-                "{} is neither the pinned Git LFS pointer nor its materialized object",
-                destination.display()
-            )));
-        }
-        fs::remove_file(&destination).map_err(|source| BuiltinSourceError::Io {
-            path: destination.clone(),
-            source,
-        })?;
-        self.download(relative, url, sha256)
     }
 }
 

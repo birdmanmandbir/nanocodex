@@ -533,8 +533,8 @@ impl BenchmarkCatalog {
         let adapter = match name {
             "terminal-bench-2.1" => "harbor",
             "arena-hard-v2" => "arena-hard",
-            "openai-evals" => "openai-evals",
             "swe-bench-verified-smoke" => "swe-bench",
+            "swe-atlas-qna" => "harbor",
             "genebench-pro-public" => "genebench-pro",
             "deep-swe-v1.1" => "harbor",
             "graphwalks" => "graphwalks",
@@ -773,6 +773,10 @@ impl<'a> ProfileImporter<'a> {
                 && normalized
                     .strip_prefix("datacurve/")
                     .is_some_and(|task| task == selected))
+            || (benchmark == "swe-atlas-qna"
+                && normalized
+                    .strip_prefix("scale-ai-")
+                    .is_some_and(|task| task == selected))
     }
 }
 
@@ -887,8 +891,8 @@ mod tests {
         for benchmark in [
             "terminal-bench-2.1",
             "arena-hard-v2",
-            "openai-evals",
             "swe-bench-verified-smoke",
+            "swe-atlas-qna",
             "genebench-pro-public",
             "deep-swe-v1.1",
             "graphwalks",
@@ -905,6 +909,11 @@ mod tests {
             "deep-swe-v1.1",
             "aiomonitor-task-snapshots-diff",
             "datacurve/aiomonitor-task-snapshots-diff",
+        ));
+        assert!(ProfileImporter::matches_task(
+            "swe-atlas-qna",
+            "task-6905333b74f22949d97ba9c2",
+            "scale-ai-task-6905333b74f22949d97ba9c2",
         ));
     }
 
@@ -1145,7 +1154,7 @@ thinking = ["low"]
                 "graphwalks",
                 "healthbench-professional",
                 "mrcr-v2",
-                "openai-evals",
+                "swe-atlas-qna",
                 "swe-bench-verified-smoke",
                 "terminal-bench-2.1",
             ]
