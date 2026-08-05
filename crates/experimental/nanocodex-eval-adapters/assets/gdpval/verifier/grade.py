@@ -76,6 +76,7 @@ OFFICE_EXTENSIONS = {
     ".xlsx",
 }
 MAX_ARTIFACT_CHARS = 120_000
+MAX_SUBMISSION_CHARS = 240_000
 
 
 def response_text(response):
@@ -102,14 +103,24 @@ def call_judge(prompt, model, validator, rubric_ids):
         response_document = {}
         text = ""
         poll_errors = []
-        body = gzip.compress(
+        uncompressed = json.dumps(
+            {
+                "model": model,
+                "input": [{"role": "user", "content": prompt}],
+            }
+        ).encode()
+        body = gzip.compress(uncompressed, compresslevel=1)
+        print(
             json.dumps(
                 {
-                    "model": model,
-                    "input": [{"role": "user", "content": prompt}],
+                    "judge_request": {
+                        "attempt": attempt,
+                        "uncompressed_bytes": len(uncompressed),
+                        "compressed_bytes": len(body),
+                    }
                 }
-            ).encode(),
-            compresslevel=1,
+            ),
+            flush=True,
         )
         request = urllib.request.Request(
             f"{os.environ['NANOCODEX_JUDGE_BASE_URL']}/responses/async",
@@ -230,20 +241,30 @@ def artifact_text(path):
 def render_submission(root, deliverables):
     rendered = []
     missing = []
+    remaining = MAX_SUBMISSION_CHARS
     for deliverable in deliverables:
         name = Path(deliverable["path"]).name
         path = root / name
         if not path.is_file():
             missing.append(name)
-            rendered.append(f"## {name}\n[MISSING]")
+            content = "[MISSING]"
         else:
-            rendered.append(f"## {name}\n{artifact_text(path)}")
+            content = artifact_text(path)
+        retained = content[:remaining]
+        rendered.append(f"## {name}\n{retained}")
+        remaining -= len(retained)
+        if len(retained) != len(content):
+            rendered.append("[submission text truncated by public reproduction grader]")
+        if remaining == 0:
+            break
     return "\n\n".join(rendered), missing
 
 
 def render_workspace(root):
     rendered = []
     files = []
+    remaining = MAX_SUBMISSION_CHARS
+    truncated = False
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
@@ -254,7 +275,16 @@ def render_workspace(root):
         ):
             continue
         files.append(str(relative))
-        rendered.append(f"## {relative}\n{artifact_text(path)}")
+        if remaining == 0:
+            truncated = True
+            continue
+        content = artifact_text(path)
+        retained = content[:remaining]
+        rendered.append(f"## {relative}\n{retained}")
+        remaining -= len(retained)
+        truncated = truncated or len(retained) != len(content)
+    if truncated:
+        rendered.append("[submission text truncated by public reproduction grader]")
     return "\n\n".join(rendered), files
 
 
@@ -305,7 +335,9 @@ def pairwise_score(winner, candidate_label):
     return 1.0 if winner == candidate_label else 0.0
 
 
-workspace = Path(os.environ["NANOCODEX_EVAL_WORKSPACE"])
+# Generated workspace-output tasks stage the candidate tree at this canonical
+# path even when the isolated verifier image has a different working directory.
+workspace = Path("/workspace")
 logs = Path(os.environ.get("NANOCODEX_EVAL_VERIFIER_LOGS", "/logs/verifier"))
 logs.mkdir(parents=True, exist_ok=True)
 case = json.loads(Path(os.environ.get("NANOCODEX_EVAL_CASE", "/tests/case.json")).read_text())

@@ -1034,6 +1034,17 @@ fn materialize_hermetic_case(
     materialize_generated_files(case.harness_files, &destination.join("tests"))?;
 
     let separate = destination.join("tests/Dockerfile").is_file();
+    let artifacts =
+        (separate && case.output == TaskOutput::Workspace).then_some([GeneratedTaskArtifact {
+            source: "/workspace",
+            exclude: &[
+                "Dockerfile",
+                "instruction.md",
+                "reference_files",
+                ".git",
+                ".nanocodex",
+            ],
+        }]);
     let raw = GeneratedTaskManifest {
         schema_version: "1.3",
         output: match case.output {
@@ -1069,6 +1080,7 @@ fn materialize_hermetic_case(
             gpus: case.resources.gpus,
             allow_internet: case.allow_internet,
         },
+        artifacts: artifacts.as_ref(),
     };
     let manifest = toml::to_string(&raw).map_err(|source| {
         ImportError::Invalid(format!("failed to encode generated task {id}: {source}"))
@@ -1118,6 +1130,14 @@ struct GeneratedTaskManifest<'a> {
     agent: GeneratedPhase<'a>,
     verifier: GeneratedVerifier<'a>,
     environment: GeneratedEnvironment<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    artifacts: Option<&'a [GeneratedTaskArtifact<'a>; 1]>,
+}
+
+#[derive(Serialize)]
+struct GeneratedTaskArtifact<'a> {
+    source: &'a str,
+    exclude: &'a [&'a str],
 }
 
 #[derive(Serialize)]
@@ -1516,6 +1536,53 @@ mod tests {
             })
             .unwrap();
         assert_ne!(first.digest(), changed_dimensions.digest());
+    }
+
+    #[test]
+    fn generated_workspace_output_is_transferred_to_a_separate_verifier() {
+        let environment = tempdir().unwrap();
+        fs::write(
+            environment.path().join("Dockerfile"),
+            "FROM debian:bookworm-slim\nWORKDIR /workspace\n",
+        )
+        .unwrap();
+        let harness = tempdir().unwrap();
+        fs::write(
+            harness.path().join("Dockerfile"),
+            "FROM debian:bookworm-slim\nWORKDIR /workspace\n",
+        )
+        .unwrap();
+        fs::write(
+            harness.path().join("test.sh"),
+            "#!/bin/sh\nprintf '1\\n' > \"$NANOCODEX_EVAL_VERIFIER_LOGS/reward.txt\"\n",
+        )
+        .unwrap();
+        let store = tempdir().unwrap();
+
+        let imported = ImportStore::new(store.path())
+            .import(&WorkspaceImporter {
+                environment: environment.path(),
+                harness: harness.path(),
+                contents: b"value\n1\n",
+                scoring_policy: ScoringPolicy::AllRewardsPositive,
+                benchmark_prompt_chars: 21,
+                benchmark_case_type: "fixture",
+            })
+            .unwrap();
+        let task = &imported.tasks()[0];
+
+        assert_eq!(task.artifacts().len(), 1);
+        assert_eq!(task.artifacts()[0].source(), Path::new("/workspace"));
+        assert_eq!(
+            task.artifacts()[0].exclude(),
+            &[
+                Path::new("Dockerfile").to_path_buf(),
+                Path::new("instruction.md").to_path_buf(),
+                Path::new("reference_files").to_path_buf(),
+                Path::new(".git").to_path_buf(),
+                Path::new(".nanocodex").to_path_buf(),
+            ]
+        );
     }
 
     #[test]
