@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ArenaHard, BuiltinSourceError, BuiltinSources, ExternalHarness, GeneBenchPro, GraphWalks,
-    HarborDataset, OpenAiEvals, SweBench,
+    HarborDataset, Mrcr, OpenAiEvals, SweBench,
 };
 
 /// A complete manifest using Nanocodex's concrete third-party benchmark recipes.
@@ -152,6 +152,18 @@ pub enum Benchmark {
         /// Pinned dataset revision.
         revision: String,
         /// Wrapper around the published deterministic F1 grader.
+        harness: PathBuf,
+        /// Candidate environment.
+        #[serde(default = "default_image")]
+        image: String,
+    },
+    /// OpenAI's public MRCR Parquet release and SequenceMatcher grader.
+    Mrcr {
+        /// Directory containing all six official Parquet partitions.
+        source: PathBuf,
+        /// Pinned dataset revision.
+        revision: String,
+        /// Wrapper around the published deterministic similarity grader.
         harness: PathBuf,
         /// Candidate environment.
         #[serde(default = "default_image")]
@@ -503,6 +515,7 @@ impl BenchmarkCatalog {
             "genebench-pro-public" => "genebench-pro",
             "deep-swe-v1.1" => "harbor",
             "graphwalks" => "graphwalks",
+            "mrcr-v2" => "mrcr",
             _ => return None,
         };
         Some(Builtin { adapter })
@@ -639,6 +652,17 @@ impl<'a> ProfileImporter<'a> {
                 harness,
                 image,
             } => store.import(&GraphWalks::new(
+                resolve_path(root, source),
+                revision,
+                Environment::OciImage(image.clone()),
+                resolve_path(root, harness),
+            )),
+            Benchmark::Mrcr {
+                source,
+                revision,
+                harness,
+                image,
+            } => store.import(&Mrcr::new(
                 resolve_path(root, source),
                 revision,
                 Environment::OciImage(image.clone()),
@@ -814,6 +838,7 @@ mod tests {
             "genebench-pro-public",
             "deep-swe-v1.1",
             "graphwalks",
+            "mrcr-v2",
         ] {
             assert!(BenchmarkCatalog::new().contains(benchmark), "{benchmark}");
         }
@@ -828,7 +853,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adapter_smoke_prepares_every_installed_route_as_one_profile() {
+    async fn custom_adapter_smoke_prepares_every_fixture_route_as_one_profile() {
         let root = tempfile::tempdir().unwrap();
         let sources = root.path().join("sources");
         let harness = make_harness(&sources.join("harness"));
@@ -1040,6 +1065,34 @@ thinking = ["low"]
             panic!("changed selected profile must invalidate preparation");
         };
         assert!(error.to_string().contains("run `nanocodex eval prepare"));
+    }
+
+    #[test]
+    fn repository_native_smoke_selects_every_installed_adapter_shape() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../nanocodex.toml");
+        let (_, profile) = BenchmarkCatalog::new()
+            .load_profile(manifest, Some("adapter-smoke-native"))
+            .unwrap();
+        let selected = profile
+            .selections()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            selected,
+            [
+                "arena-hard-v2",
+                "external-smoke",
+                "genebench-pro-public",
+                "graphwalks",
+                "mrcr-v2",
+                "openai-evals",
+                "swe-bench-verified-smoke",
+                "terminal-bench-2.1",
+            ]
+        );
+        assert!(profile.harnesses().is_empty());
     }
 
     fn make_harness(path: &Path) -> PathBuf {

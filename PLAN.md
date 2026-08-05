@@ -300,9 +300,14 @@ through PR #72's existing concrete importers:
 - `openai-evals`: supported declarative Match/Includes definitions plus the
   snapshotted deterministic grader;
 - `swe-bench`: official instances, instance-image identity, and verifier
-  package; and
+  package;
 - `genebench-pro`: OpenAI's official public case-study package, workspace data,
-  structured answer contract, and deterministic reference grader; and
+  structured answer contract, and deterministic reference grader;
+- `graphwalks`: OpenAI's pinned public Parquet release, source dimensions, and
+  published set-F1 grader;
+- `mrcr`: OpenAI's pinned corrected multi-turn release, typed synthetic
+  transcript, needle/context dimensions, and published prefix-constrained
+  `SequenceMatcher` grader; and
 - `external`: a benchmark-owned hermetic manifest for PaperBench, MLE-style,
   private, or otherwise executable benchmark semantics.
 
@@ -355,7 +360,7 @@ OpenAI's February 2026 corrected Parquet release and published set-F1 contract;
 the retained evidence must call out the public extractor's still-open prefix
 bug rather than silently repairing it or claiming exact internal-launch parity.
 
-The GraphWalks public lifecycle is retained under preparation
+The first GraphWalks public lifecycle is retained under preparation
 `569e1b0ebfcd1147516b97daf0bd21e4ec3c5de872befe204b6deb6630408d15`
 and job `019fd2d2-436b-7fc2-ab79-30cb28b58357`. Preparation acquired and
 normalized all 1,150 official tasks. The selected short-context shape completed
@@ -364,10 +369,30 @@ canonical trajectory. Nanocodex returned exactly the three gold parent nodes;
 OpenAI's published extractor retained `Final Answer:` on the first node and
 therefore produced F1 0.6666667. The task-owned `all_rewards_one-v1` policy
 correctly records that as `verifier_failed`/`passed: false` while preserving raw
-F1 as the benchmark metric. The schema-v4 reconstructed report retains
-220,864,038 ns of shared cold preparation and the next ordinary `run` resumed
-the completed coordinate in 4.18 seconds without model spend or overwriting
-that timing.
+F1 as the benchmark metric. The reconstructed report retains 220,864,038 ns of
+shared cold preparation and the next ordinary `run` resumed the completed
+coordinate in 4.18 seconds without model spend or overwriting that timing.
+
+The expanded GraphWalks shape run is retained under preparation
+`376390d161a679b7a7511cfeb077a77947a311d55908ba7b08eb5596c144be27`
+and job `019fd2ea-6edd-7772-b0e3-b716383c032f`. The 219,562-character BFS case
+scored F1 1.0; the 437,557-character parent case scored F1 0.5; and the
+1,748,257-character parent case was rejected by the model context window. That
+last coordinate exposed a runner bug: a terminal model-capacity result was
+misclassified as infrastructure and physically retried three times. The typed
+outcome is now `context_window_exceeded`, is retained as scored failure when a
+verifier runs, and never consumes infrastructure-replacement budget. A clean
+rerun of the three-coordinate profile remains required before this evidence is
+used as a release result.
+
+MRCR v2 is the next implemented benchmark shape. Its catalog recipe pins
+OpenAI's corrected 2,400-row revision and all six Parquet object hashes,
+downloads independent partitions concurrently, preserves each alternating
+user/assistant transcript as a hashed normalized task artifact, and retains the
+official needle count, character dimension, answer prefix, and continuous
+similarity reward. The native smoke profile is required because stock prompt
+CLI drivers cannot faithfully seed an existing assistant transcript; such a
+driver must reject the task before model spend rather than flattening it.
 
 Each built-in catalog entry owns its stable user-facing name, authoritative
 source location, pinned revision, adapter choice, official verifier assets,
@@ -523,6 +548,14 @@ available. Expansion changes only profile selectors or built-in catalog
 revisions; it must not introduce per-benchmark scripts, runner modes, or state
 layouts. Reports label exact task coverage at every stage so partial slices are
 never presented as full-benchmark results.
+
+`adapter-smoke-native` extends the original six-shape differential gate with
+the GraphWalks long-prompt and MRCR synthetic-transcript routes. It runs every
+installed adapter once through the current host-native Nanocodex. The original
+`adapter-smoke` remains the cross-harness gate for shapes representable by the
+stock Codex and external Nanocodex prompt CLIs; transcript tasks do not enter a
+dishonest Cartesian arm until a harness driver owns a versioned transcript
+input protocol.
 
 Every milestone ends with an adversarial durability and optimization gate:
 
@@ -727,9 +760,11 @@ may hide missing coordinates or mix incompatible preparation identities.
     interruption/resume/new-sample runs, and website-ready reporting behind
     `nanocodex eval prepare` and `nanocodex eval run`. DeepSWE's first official
     case and the first public GraphWalks shape are complete, and reconstructed
-    reports now retain shared cold preparation timing. Continue by expanding
-    GraphWalks across real long-context bins and implementing the next
-    obtainable benchmark family.
+    reports now retain shared cold preparation timing. The expanded GraphWalks
+    run exposed and fixed terminal context-window retry classification; MRCR v2
+    now supplies the first faithfully normalized multi-turn shape. Continue by
+    accepting clean reruns and implementing the next obtainable benchmark
+    family.
 11. [ ] Run the coordinator/runner architecture with one saturated remote
     runner on `dev-georgios`, retaining all heavyweight state on its verified
     3.5 TB drive. Add cross-host sharding only after measurements show that

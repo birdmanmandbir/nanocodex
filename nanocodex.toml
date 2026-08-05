@@ -24,6 +24,21 @@ trials = 1
 model = ["gpt-5.6-sol"]
 thinking = ["low"]
 
+[profiles.adapter-smoke-native]
+tasks = [
+  "terminal-bench-2.1/fix-git",
+  "arena-hard-v2/2edbb5f36f5b42be",
+  "openai-evals/computer-science-problems.s1.simple-v0-000000",
+  "swe-bench-verified-smoke/astropy__astropy-12907",
+  "genebench-pro-public/multiparent_qtl_hmm_lmm",
+  "graphwalks/128k-and-shorter-000749",
+  "mrcr-v2/8needle-0-000000",
+  "external-smoke/exact-answer",
+]
+trials = 1
+model = ["gpt-5.6-sol"]
+thinking = ["low"]
+
 [profiles.deep-swe-smoke]
 tasks = ["deep-swe-v1.1/aiomonitor-task-snapshots-diff"]
 trials = 1
@@ -36,6 +51,12 @@ tasks = [
   "graphwalks/256k-to-1mil-000000",
   "graphwalks/256k-to-1mil-000200",
 ]
+trials = 1
+model = ["gpt-5.6-sol"]
+thinking = ["low"]
+
+[profiles.mrcr-smoke]
+tasks = ["mrcr-v2/8needle-0-000000"]
 trials = 1
 model = ["gpt-5.6-sol"]
 thinking = ["low"]

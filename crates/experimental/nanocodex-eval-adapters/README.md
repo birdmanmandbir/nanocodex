@@ -12,6 +12,7 @@ third-party source at a pinned revision
 ├── SWE-bench adapter ──────────── official instance images + harness
 ├── GeneBench-Pro adapter ──────── staged scientific data + reference grader
 ├── GraphWalks adapter ─────────── official Parquet + published F1 grader
+├── MRCR adapter ───────────────── typed transcript + similarity grader
 └── external harness adapter ───── benchmark-owned executable semantics
                  │
                  ▼
@@ -42,6 +43,7 @@ evidence have no benchmark-specific branches.
 | SWE-bench | Preserves problem statements and official instance-image naming; packages exact instance metadata | Caller-packaged official SWE-bench harness |
 | GeneBench-Pro public package | Makes only problem `data_files/` candidate-visible and retains config, ground truth, tolerances, and grader outside the candidate VM | OpenAI's pinned `reference_grader.py`; `passed` is authoritative |
 | GraphWalks | Reads both official Parquet partitions without flattening prompts and retains expected node sets outside the candidate VM | OpenAI's published final-line extraction and set-F1 contract; raw `f1` is authoritative |
+| MRCR v2 | Reads all six corrected official Parquet partitions and preserves alternating user/assistant messages as a hashed typed transcript | OpenAI's published prefix check and `difflib.SequenceMatcher` ratio; raw `similarity` is authoritative |
 | MLE-bench, PaperBench, and private suites | Reads a prepared generic external manifest | Benchmark-owned harness |
 
 Unsupported semantics fail during import. The adapters do not flatten
@@ -49,10 +51,11 @@ multi-message prompts, invent reference answers, translate custom Python
 graders, or modify tasks to make a candidate pass.
 
 Continuous benchmark rewards keep their raw named dimensions and declare a
-task-owned binary classification policy. GraphWalks retains `f1` for plots and
-uses exact-one classification for the generic pass axis; partial overlap is not
-silently promoted to a passing attempt. The policy is part of import identity,
-the immutable task package, each trial lock, and reconstructed reports.
+task-owned binary classification policy. GraphWalks retains `f1` and MRCR
+retains `similarity` for plots; both use exact-one classification for the
+generic pass axis so partial credit is not silently promoted to a passing
+attempt. The policy is part of import identity, the immutable task package,
+each trial lock, and reconstructed reports.
 
 The GPT-5.6 report's public benchmark families map onto the same small set of
 routes rather than VM modes:
@@ -64,7 +67,8 @@ routes rather than VM modes:
 | SWE-Bench Pro | Historical/reference-only: OpenAI retracted its recommendation after its July 2026 task audit |
 | GeneBench Pro public package | installed `genebench-pro-public` recipe |
 | GraphWalks | installed `graphwalks` recipe pinned to OpenAI's corrected February 2026 data; the public extractor's known prefix bug is intentionally preserved and reported |
-| Agents' Last Exam, GDPval-AA, Big Finance Bench, LifeSciBench, HealthBench Professional, BrowseComp, GPQA, FrontierMath, OSWorld, BenchCAD, CTF, SEC-Bench, ExploitBench, ExploitGym, KernelGen, NanoGPT, PostTrainBench, MMMU Pro, gdp.pdf, AutomationBench, Toolathlon, MRCR, and ARC-AGI-3 | Not installed until a dedicated recipe or caller-supplied official `external` manifest exists |
+| MRCR v2 | installed `mrcr-v2` recipe pinned to OpenAI's corrected December 2025 data and published continuous grader |
+| Agents' Last Exam, GDPval-AA, Big Finance Bench, LifeSciBench, HealthBench Professional, BrowseComp, GPQA, FrontierMath, OSWorld, BenchCAD, CTF, SEC-Bench, ExploitBench, ExploitGym, KernelGen, NanoGPT, PostTrainBench, MMMU Pro, gdp.pdf, AutomationBench, Toolathlon, and ARC-AGI-3 | Not installed until a dedicated recipe or caller-supplied official `external` manifest exists |
 | OpenAI-internal or unreleased suites | Not importable until the owner supplies tasks and grading semantics |
 
 DeepSWE uses one lifecycle feature beyond ordinary same-VM Harbor tasks:
