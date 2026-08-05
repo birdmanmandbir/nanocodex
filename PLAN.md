@@ -663,24 +663,24 @@ may hide missing coordinates or mix incompatible preparation identities.
    cleanup before exposing it as normal CLI policy.
 8. [ ] Rebase and decide PR #79, then review PR #89 against the stable-core and
    application-policy boundaries above.
-9. [ ] Complete the first profile-driven evaluation milestone directly in PR
+9. [x] Complete the first profile-driven evaluation milestone directly in PR
    #72, using its normalized benchmark imports as the only evaluation path.
-   The evidence audit reopened this gate after finding verifier-environment and
-   differential-trajectory loss in nominally completed runs. The
-   Deprecated `simple-evals` routes have been removed rather than carried as
-   hidden compatibility code. The `adapter-smoke` profile now covers six real
-   shapes, including RewardKit judging, SWE-bench, and GeneBench Pro. Close the
-   milestone only after all 18 current
-   Nanocodex/stock-Codex/external-Nanocodex coordinates retain canonical
-   trajectories, identities, verifier artifacts, subscription-backed judge
-   evidence, hard-kill recovery, cleanup, and a zero-spend completed-run no-op.
-10. [ ] Add the official GeneBench Pro public package as the first modern
-    CPU-only expansion, then extend the same PR #72 workflow from that smoke
-    gate to complete local profiles covering the recorded GPT-5.6 benchmark
-    families: automatic
+   Deprecated `simple-evals` routes were removed rather than carried as hidden
+   compatibility code. The six-shape `adapter-smoke` gate passed on
+   `dev-georgios` under preparation `94c273315417cc1f2e555f53302ad28122dd7ccd314bca36095313c2f1b8fe77`:
+   all 18 current Nanocodex/stock-Codex/external-Nanocodex coordinates retained
+   distinct treatment identities, canonical trajectories, verifier artifacts,
+   and subscription-backed evidence; hard-kill recovery converged without
+   losing completed work; cleanup left no overlays or agent/VM processes; and
+   the next normal `run` resumed all 18 coordinates without model spend.
+10. [ ] Extend the same PR #72 workflow from the completed adapter smoke and
+    official GeneBench Pro public package to complete local profiles covering
+    the recorded GPT-5.6 benchmark families, beginning with SWE-Bench Pro:
+    automatic
     multi-harness/model/thinking matrices, durable monitoring,
     interruption/resume/new-sample runs, and website-ready reporting behind
-    `nanocodex eval prepare` and `nanocodex eval run`.
+    `nanocodex eval prepare` and `nanocodex eval run`. Enrich reconstructed
+    reports with retained run timing before treating them as website-ready.
 11. [ ] Run the coordinator/runner architecture with one saturated remote
     runner on `dev-georgios`, retaining all heavyweight state on its verified
     3.5 TB drive. Add cross-host sharding only after measurements show that
