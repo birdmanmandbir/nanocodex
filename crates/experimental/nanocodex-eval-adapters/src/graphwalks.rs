@@ -89,6 +89,7 @@ impl DatasetImporter for GraphWalks {
                         harness.clone(),
                     )?
                     .benchmark_prompt_chars(case.prompt_chars)
+                    .benchmark_case_type(case.problem_type)
                     .output(TaskOutput::FinalMessage)
                     .resources(Resources {
                         cpus: 2,
@@ -118,6 +119,7 @@ impl DatasetImporter for GraphWalks {
 struct GraphWalksCase {
     prompt: String,
     prompt_chars: u64,
+    problem_type: String,
     answer: Vec<String>,
 }
 
@@ -173,9 +175,9 @@ impl GraphWalksCase {
                 index + 1
             ))
         })?;
-        if problem_type != "parents" {
+        if problem_type.trim().is_empty() {
             return Err(ImportError::Invalid(format!(
-                "{} row {} has unsupported GraphWalks problem type {problem_type:?}",
+                "{} row {} has an empty GraphWalks problem type",
                 path.display(),
                 index + 1
             )));
@@ -201,6 +203,7 @@ impl GraphWalksCase {
         Ok(Self {
             prompt: prompt.clone(),
             prompt_chars,
+            problem_type: problem_type.clone(),
             answer,
         })
     }

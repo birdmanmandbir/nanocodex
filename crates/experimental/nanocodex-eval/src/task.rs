@@ -27,6 +27,7 @@ pub struct Task {
     prompt: Box<str>,
     prompt_chars: u64,
     benchmark_prompt_chars: Option<u64>,
+    benchmark_case_type: Option<Box<str>>,
     agent_instructions: Option<Box<str>>,
     image: OciImage,
     agent_timeout: Duration,
@@ -270,6 +271,12 @@ impl Task {
                 message: "task.benchmark_prompt_chars must be positive when present".to_owned(),
             });
         }
+        let benchmark_case_type = raw
+            .task
+            .benchmark_case_type
+            .map(|value| required_string(&config_path, "task.benchmark_case_type", value))
+            .transpose()?
+            .map(String::into_boxed_str);
         let image = raw
             .environment
             .docker_image
@@ -285,6 +292,7 @@ impl Task {
             description: raw.task.description.into_boxed_str(),
             prompt_chars: u64::try_from(prompt.chars().count()).unwrap_or(u64::MAX),
             benchmark_prompt_chars: raw.task.benchmark_prompt_chars,
+            benchmark_case_type,
             prompt: prompt.into_boxed_str(),
             agent_instructions: raw
                 .agent
@@ -481,6 +489,12 @@ impl Task {
     #[must_use]
     pub const fn benchmark_prompt_chars(&self) -> Option<u64> {
         self.benchmark_prompt_chars
+    }
+
+    /// Returns the source benchmark's case-type dimension, when present.
+    #[must_use]
+    pub fn benchmark_case_type(&self) -> Option<&str> {
+        self.benchmark_case_type.as_deref()
     }
 
     /// Benchmark-owned model instructions applied independently of the user prompt.
@@ -836,6 +850,8 @@ struct RawTaskInfo {
     description: String,
     #[serde(default)]
     benchmark_prompt_chars: Option<u64>,
+    #[serde(default)]
+    benchmark_case_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1073,6 +1089,7 @@ schema_version = "1.1"
 name = "terminal-bench/example"
 description = "Example task"
 benchmark_prompt_chars = 12
+benchmark_case_type = "fixture"
 
 [metadata]
 custom_docker_compose = true
@@ -1112,6 +1129,7 @@ MODE = "test"
         assert_eq!(task.prompt(), "Fix the task.");
         assert_eq!(task.prompt_chars(), 13);
         assert_eq!(task.benchmark_prompt_chars(), Some(12));
+        assert_eq!(task.benchmark_case_type(), Some("fixture"));
         assert_eq!(task.image().reference(), "example/task:20251031");
         assert_eq!(task.resources().cpus, 2);
         assert_eq!(task.network(), NetworkPolicy::Disabled);

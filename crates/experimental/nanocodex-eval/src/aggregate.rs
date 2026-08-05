@@ -78,6 +78,8 @@ pub struct AttemptTaskIdentity {
     pub prompt_chars: Option<u64>,
     /// Source benchmark's declared prompt-size dimension, when retained.
     pub benchmark_prompt_chars: Option<u64>,
+    /// Source benchmark's case-type dimension, when retained.
+    pub benchmark_case_type: Option<String>,
     /// Canonical source task root.
     pub root: PathBuf,
     /// Nanocodex package-digest schema.
@@ -703,6 +705,7 @@ impl AttemptTaskIdentity {
             name: task.name().to_owned(),
             prompt_chars: Some(task.prompt_chars()),
             benchmark_prompt_chars: task.benchmark_prompt_chars(),
+            benchmark_case_type: task.benchmark_case_type().map(str::to_owned),
             root: task.root().to_path_buf(),
             package_digest_schema: PACKAGE_DIGEST_SCHEMA.to_owned(),
             package_digest: format!("sha256:{}", task.content_digest()),
@@ -1210,6 +1213,7 @@ fn default_task() -> AttemptTaskIdentity {
         name: String::new(),
         prompt_chars: None,
         benchmark_prompt_chars: None,
+        benchmark_case_type: None,
         root: PathBuf::new(),
         package_digest_schema: String::new(),
         package_digest: String::new(),
@@ -1288,6 +1292,7 @@ mod tests {
                 name: task.to_owned(),
                 prompt_chars: Some(42),
                 benchmark_prompt_chars: Some(40),
+                benchmark_case_type: Some("fixture".to_owned()),
                 root: PathBuf::from(task),
                 package_digest_schema: "fixture-v1".to_owned(),
                 package_digest: format!("sha256:{task}"),

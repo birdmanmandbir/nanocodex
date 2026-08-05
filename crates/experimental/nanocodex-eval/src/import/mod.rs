@@ -92,6 +92,7 @@ enum CasePackage {
 struct HermeticCase {
     prompt: String,
     benchmark_prompt_chars: Option<u64>,
+    benchmark_case_type: Option<String>,
     environment: Environment,
     environment_files: Vec<GeneratedFile>,
     harness: Harness,
@@ -687,6 +688,7 @@ impl CasePlan {
             case: HermeticCase {
                 prompt,
                 benchmark_prompt_chars: None,
+                benchmark_case_type: None,
                 environment,
                 environment_files: Vec::new(),
                 harness,
@@ -713,6 +715,13 @@ impl HermeticCasePlan {
     #[must_use]
     pub const fn benchmark_prompt_chars(mut self, chars: u64) -> Self {
         self.case.benchmark_prompt_chars = Some(chars);
+        self
+    }
+
+    /// Retains the source benchmark's case-type dimension for official grouping.
+    #[must_use]
+    pub fn benchmark_case_type(mut self, case_type: impl Into<String>) -> Self {
+        self.case.benchmark_case_type = Some(case_type.into());
         self
     }
 
@@ -881,6 +890,7 @@ fn materialize_hermetic_case(
         task: GeneratedTaskInfo {
             name: id,
             benchmark_prompt_chars: case.benchmark_prompt_chars,
+            benchmark_case_type: case.benchmark_case_type.as_deref(),
         },
         agent: GeneratedPhase {
             timeout_sec: case.agent_timeout.as_secs_f64(),
@@ -943,6 +953,8 @@ struct GeneratedTaskInfo<'a> {
     name: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     benchmark_prompt_chars: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    benchmark_case_type: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -1190,6 +1202,7 @@ mod tests {
                     Harness::directory(self.harness)?,
                 )?
                 .benchmark_prompt_chars(21)
+                .benchmark_case_type("fixture")
                 .scoring_policy(self.scoring_policy)
                 .environment_file("data_files/input.csv", self.contents, 0o644)?,
             ))
@@ -1269,6 +1282,7 @@ mod tests {
             ScoringPolicy::AllRewardsOne
         );
         assert_eq!(first.tasks()[0].benchmark_prompt_chars(), Some(21));
+        assert_eq!(first.tasks()[0].benchmark_case_type(), Some("fixture"));
         assert_ne!(first.digest(), changed.digest());
 
         let changed_policy = ImportStore::new(store.path())
