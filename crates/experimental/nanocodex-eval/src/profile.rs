@@ -706,6 +706,15 @@ impl PreparedTask {
     pub fn digest(&self) -> &str {
         &self.digest
     }
+
+    fn load(&self) -> Result<crate::Task, crate::TaskLoadError> {
+        let task = crate::Task::load(&self.root)?;
+        Ok(if let Some((dataset, _)) = self.selector.split_once('/') {
+            task.attach_dataset(dataset)
+        } else {
+            task
+        })
+    }
 }
 
 impl PreparationReceipt {
@@ -798,7 +807,7 @@ impl PreparationReceipt {
         let loaded = self
             .tasks
             .iter()
-            .map(|prepared| Ok((prepared, crate::Task::load(prepared.root())?)))
+            .map(|prepared| Ok((prepared, prepared.load()?)))
             .collect::<Result<Vec<_>, ProfileRunPlanError>>()?;
         let tasks = match requested {
             None | Some([]) => loaded.into_iter().map(|(_, task)| task).collect(),
@@ -1421,6 +1430,7 @@ allow_internet = false
         let plan = receipt
             .run_plan(&Nanocodex::builder(OpenAi::new("test-key").unwrap()))
             .unwrap();
+        assert_eq!(plan.tasks()[0].dataset(), Some("fixture"));
         assert_eq!(plan.into_sweep().attempt_count(), 8);
         let plan = receipt
             .run_plan_for(

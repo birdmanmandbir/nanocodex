@@ -700,7 +700,10 @@ impl AttemptFact {
 impl AttemptTaskIdentity {
     fn from_task(task: &Task) -> Self {
         Self {
-            dataset: dataset_name(task.name()),
+            dataset: task
+                .dataset()
+                .map(str::to_owned)
+                .or_else(|| dataset_name(task.name())),
             dataset_revision: None,
             name: task.name().to_owned(),
             prompt_chars: Some(task.prompt_chars()),

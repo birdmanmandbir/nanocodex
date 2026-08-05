@@ -1371,6 +1371,7 @@ impl HarborTrialLock {
             nanocodex: NanocodexTrialLock {
                 materialization_digest_schema: PACKAGE_DIGEST_SCHEMA.to_owned(),
                 materialization_digest: format!("sha256:{materialization_digest}"),
+                dataset: task.dataset().map(str::to_owned),
                 prompt_chars: Some(task.prompt_chars()),
                 benchmark_prompt_chars: task.benchmark_prompt_chars(),
                 benchmark_case_type: task.benchmark_case_type().map(str::to_owned),
@@ -1406,6 +1407,8 @@ impl HarborTrialLock {
 struct NanocodexTrialLock {
     materialization_digest_schema: String,
     materialization_digest: String,
+    #[serde(default)]
+    dataset: Option<String>,
     #[serde(default)]
     prompt_chars: Option<u64>,
     #[serde(default)]
@@ -1808,11 +1811,12 @@ impl DurableHarborTrial {
         });
         let runtime = metadata.map(retained_runtime_metrics);
         let task = AttemptTaskIdentity {
-            dataset: self
-                .result
-                .task_name
-                .split_once('/')
-                .map(|(dataset, _)| dataset.to_owned()),
+            dataset: nanocodex_lock.dataset.clone().or_else(|| {
+                self.result
+                    .task_name
+                    .split_once('/')
+                    .map(|(dataset, _)| dataset.to_owned())
+            }),
             dataset_revision: None,
             name: self.result.task_name.clone(),
             prompt_chars: nanocodex_lock.prompt_chars,

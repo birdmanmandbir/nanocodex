@@ -22,6 +22,7 @@ pub struct Task {
     root: PathBuf,
     content_digest: Box<str>,
     package: Arc<TaskPackage>,
+    dataset: Option<Box<str>>,
     name: Box<str>,
     description: Box<str>,
     prompt: Box<str>,
@@ -288,6 +289,7 @@ impl Task {
             root,
             content_digest,
             package: Arc::new(package),
+            dataset: None,
             name: name.into_boxed_str(),
             description: raw.task.description.into_boxed_str(),
             prompt_chars: u64::try_from(prompt.chars().count()).unwrap_or(u64::MAX),
@@ -465,6 +467,17 @@ impl Task {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Returns the evaluator dataset identity attached by a prepared profile.
+    #[must_use]
+    pub fn dataset(&self) -> Option<&str> {
+        self.dataset.as_deref()
+    }
+
+    pub(crate) fn attach_dataset(mut self, dataset: &str) -> Self {
+        self.dataset = Some(dataset.to_owned().into_boxed_str());
+        self
     }
 
     /// Returns the human-readable task description.
