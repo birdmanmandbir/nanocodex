@@ -101,7 +101,7 @@ use tracing::{Instrument, info, info_span};
 
 const BLOCK_SIZE: u32 = 4_096;
 const MINIMUM_DISK_BYTES: u64 = 512 * 1024 * 1024;
-const CACHE_RECORD_VERSION: u32 = 2;
+const CACHE_RECORD_VERSION: u32 = 3;
 const IMAGE_BUILD_CACHE_VERSION: u32 = 2;
 const PREPARED_DISK_RECORD_VERSION: u32 = 3;
 const CACHED_EXT4_RECORD_VERSION: u32 = 2;
@@ -140,6 +140,10 @@ const FIRMWARE_LIBRARY_PATH_ENVIRONMENT: &str = "DYLD_LIBRARY_PATH";
 const GUEST_ARCHITECTURE: &str = "arm64";
 #[cfg(target_arch = "x86_64")]
 const GUEST_ARCHITECTURE: &str = "amd64";
+#[cfg(all(test, target_arch = "aarch64"))]
+const OTHER_GUEST_ARCHITECTURE: &str = "amd64";
+#[cfg(all(test, target_arch = "x86_64"))]
+const OTHER_GUEST_ARCHITECTURE: &str = "arm64";
 const COPY_SCRIPT: &str = r#"set -eu
 dest=$1
 shift
@@ -578,6 +582,21 @@ pub enum ImageError {
     #[error("unsupported OCI layer media type: {0}")]
     UnsupportedLayer(String),
 
+    /// An OCI image targets a platform the guest VMM cannot execute.
+    #[error(
+        "OCI image {image} targets {actual_os}/{actual_architecture}, but this host runs linux/{expected_architecture} guests"
+    )]
+    UnsupportedPlatform {
+        /// The caller-provided image reference.
+        image: String,
+        /// Operating system declared by the image configuration.
+        actual_os: String,
+        /// Architecture declared by the image configuration.
+        actual_architecture: String,
+        /// Architecture supported by this build of the guest VMM.
+        expected_architecture: &'static str,
+    },
+
     /// A prepared root disk is missing a required path.
     #[error("prepared image is missing required path {0}")]
     MissingPreparedPath(&'static str),
@@ -823,16 +842,79 @@ struct LayerRecord {
 
 #[derive(Clone, Deserialize, Serialize)]
 struct ImageRuntimeConfig {
+    platform: ImagePlatform,
     environment: BTreeMap<String, String>,
     working_directory: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct ImagePlatform {
+    operating_system: String,
+    architecture: String,
 }
 
 impl Default for ImageRuntimeConfig {
     fn default() -> Self {
         Self {
+            platform: ImagePlatform::guest(),
             environment: BTreeMap::new(),
             working_directory: "/".to_owned(),
         }
+    }
+}
+
+impl ImagePlatform {
+    fn guest() -> Self {
+        Self {
+            operating_system: "linux".to_owned(),
+            architecture: GUEST_ARCHITECTURE.to_owned(),
+        }
+    }
+
+    fn validate(&self, image: &str) -> Result<(), ImageError> {
+        if self.operating_system == "linux" && self.architecture == GUEST_ARCHITECTURE {
+            return Ok(());
+        }
+        Err(ImageError::UnsupportedPlatform {
+            image: image.to_owned(),
+            actual_os: self.operating_system.clone(),
+            actual_architecture: self.architecture.clone(),
+            expected_architecture: GUEST_ARCHITECTURE,
+        })
+    }
+}
+
+impl ImageRuntimeConfig {
+    fn parse(image: &str, config: &str) -> Result<Self, ImageError> {
+        let config = serde_json::from_str::<ConfigFile>(config)?;
+        let platform = ImagePlatform {
+            operating_system: config.os.to_string(),
+            architecture: config.architecture.to_string(),
+        };
+        platform.validate(image)?;
+        let config = config.config.unwrap_or_default();
+        let mut environment = BTreeMap::new();
+        for entry in config.env.unwrap_or_default() {
+            let Some((name, value)) = entry.split_once('=') else {
+                continue;
+            };
+            if valid_environment_name(name) {
+                environment.insert(name.to_owned(), value.to_owned());
+            }
+        }
+        let working_directory = config
+            .working_dir
+            .filter(|directory| valid_guest_workdir(directory))
+            .unwrap_or_else(|| "/".to_owned());
+        Ok(Self {
+            platform,
+            environment,
+            working_directory,
+        })
+    }
+
+    fn validate_platform(&self, image: &str) -> Result<(), ImageError> {
+        self.platform.validate(image)
     }
 }
 
@@ -2248,6 +2330,7 @@ async fn local_image(
     {
         return Ok(None);
     }
+    record.config.validate_platform(image)?;
     let layers = record
         .layers
         .into_iter()
@@ -2285,7 +2368,7 @@ async fn pull_layers(image: &str, blobs: &Path) -> Result<PulledImage, ImageErro
     let (manifest, manifest_digest, config_json) = client
         .pull_manifest_and_config(&reference, &RegistryAuth::Anonymous)
         .await?;
-    let config = parse_image_config(&config_json)?;
+    let config = ImageRuntimeConfig::parse(image, &config_json)?;
     let layers = stream::iter(manifest.layers.into_iter().map(|descriptor| {
         let span = info_span!(
             target: "nanocodex_vm",
@@ -2338,29 +2421,6 @@ async fn pull_layers(image: &str, blobs: &Path) -> Result<PulledImage, ImageErro
         layers,
         source: ManifestSource::Registry,
         config,
-    })
-}
-
-fn parse_image_config(config: &str) -> Result<ImageRuntimeConfig, ImageError> {
-    let config = serde_json::from_str::<ConfigFile>(config)?
-        .config
-        .unwrap_or_default();
-    let mut environment = BTreeMap::new();
-    for entry in config.env.unwrap_or_default() {
-        let Some((name, value)) = entry.split_once('=') else {
-            continue;
-        };
-        if valid_environment_name(name) {
-            environment.insert(name.to_owned(), value.to_owned());
-        }
-    }
-    let working_directory = config
-        .working_dir
-        .filter(|directory| valid_guest_workdir(directory))
-        .unwrap_or_else(|| "/".to_owned());
-    Ok(ImageRuntimeConfig {
-        environment,
-        working_directory,
     })
 }
 
@@ -2739,13 +2799,13 @@ mod tests {
     use super::{
         BuildCacheInputs, CACHE_RECORD_VERSION, CONTEXT_DISK_BYTES, COPY_SCRIPT, CachePolicy,
         DiskStatus, DockerfileRecipe, FIRMWARE_LIBRARY_FILENAME, FIRMWARE_LIBRARY_PATH_ENVIRONMENT,
-        ImageError, ImageRuntimeConfig, LayerRecord, ManifestSource, PulledImage, PulledLayer,
-        Reader, ReferenceRecord, VmImageBuilder, append_normalized_context_entry, blob_path,
-        build_cache_key, build_guest_bootstrap_script, cached_file_digest,
-        configure_firmware_library_path, configured_root_shell, disk_cache_key,
-        docker_process_environment, output_tail, prepare_copy_source_disk, prepare_flattened_disk,
-        reference_cache_key, registry_protocol, resolver_configuration, valid_cached_blob,
-        valid_cached_ext4_disk, write_cache_record,
+        ImageError, ImagePlatform, ImageRuntimeConfig, LayerRecord, ManifestSource,
+        OTHER_GUEST_ARCHITECTURE, PulledImage, PulledLayer, Reader, ReferenceRecord,
+        VmImageBuilder, append_normalized_context_entry, blob_path, build_cache_key,
+        build_guest_bootstrap_script, cached_file_digest, configure_firmware_library_path,
+        configured_root_shell, disk_cache_key, docker_process_environment, output_tail,
+        prepare_copy_source_disk, prepare_flattened_disk, reference_cache_key, registry_protocol,
+        resolver_configuration, valid_cached_blob, valid_cached_ext4_disk, write_cache_record,
     };
     use flate2::{Compression, write::GzEncoder};
     use tracing::{
@@ -2785,6 +2845,76 @@ mod tests {
             registry_protocol(&reference),
             oci_client::client::ClientProtocol::Https
         );
+    }
+
+    #[test]
+    fn image_configuration_accepts_the_guest_platform() {
+        let config = format!(
+            r#"{{"architecture":"{}","os":"linux","config":{{"Env":["VALID=value","INVALID"],"WorkingDir":"/workspace"}},"rootfs":{{"type":"layers","diff_ids":[]}}}}"#,
+            super::GUEST_ARCHITECTURE
+        );
+
+        let config = ImageRuntimeConfig::parse(FIXTURE_IMAGE, &config).unwrap();
+
+        assert_eq!(config.platform.operating_system, "linux");
+        assert_eq!(config.platform.architecture, super::GUEST_ARCHITECTURE);
+        assert_eq!(
+            config.environment.get("VALID").map(String::as_str),
+            Some("value")
+        );
+        assert_eq!(config.environment.len(), 1);
+        assert_eq!(config.working_directory, "/workspace");
+    }
+
+    #[test]
+    fn image_configuration_rejects_an_incompatible_architecture() {
+        let config = format!(
+            r#"{{"architecture":"{OTHER_GUEST_ARCHITECTURE}","os":"linux","config":{{}},"rootfs":{{"type":"layers","diff_ids":[]}}}}"#
+        );
+
+        let Err(error) = ImageRuntimeConfig::parse(FIXTURE_IMAGE, &config) else {
+            panic!("foreign architecture unexpectedly accepted");
+        };
+
+        assert!(matches!(
+            error,
+            ImageError::UnsupportedPlatform {
+                image,
+                actual_os,
+                actual_architecture,
+                expected_architecture: super::GUEST_ARCHITECTURE,
+            } if image == FIXTURE_IMAGE
+                && actual_os == "linux"
+                && actual_architecture == OTHER_GUEST_ARCHITECTURE
+        ));
+    }
+
+    #[tokio::test]
+    async fn validated_reference_cache_rejects_a_foreign_platform() {
+        let directory = tempfile::tempdir().unwrap();
+        let record = ReferenceRecord {
+            version: CACHE_RECORD_VERSION,
+            image_reference: FIXTURE_IMAGE.to_owned(),
+            manifest_digest: FIXTURE_MANIFEST.to_owned(),
+            layers: vec![LayerRecord {
+                digest: FIXTURE_MANIFEST.to_owned(),
+                media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_owned(),
+            }],
+            config: ImageRuntimeConfig {
+                platform: ImagePlatform {
+                    operating_system: "linux".to_owned(),
+                    architecture: OTHER_GUEST_ARCHITECTURE.to_owned(),
+                },
+                environment: BTreeMap::new(),
+                working_directory: "/".to_owned(),
+            },
+        };
+
+        let Err(error) = super::local_image(FIXTURE_IMAGE, directory.path(), record).await else {
+            panic!("foreign cached architecture unexpectedly accepted");
+        };
+
+        assert!(matches!(error, ImageError::UnsupportedPlatform { .. }));
     }
 
     #[test]
