@@ -157,6 +157,19 @@ cargo run -p nanocodex-examples --bin eval-rlm -- tasks/write-greeting
 `NANOCODEX_RLM_PROMPTS` and `NANOCODEX_RLM_HARNESS` select alternate launch
 inputs; `NANOCODEX_EVAL_TRIALS` changes the default three trials.
 
+Run the same runtime through the full native CLI with bundled immutable prompts
+and a mutable harness file:
+
+```sh
+cargo run -p nanocodex-bin --bin nanocodex -- run \
+  "delegate independent investigations, then synthesize them" \
+  --rlm-harness crates/experimental/nanocodex-rlm/nanocodex.harness.toml
+```
+
+`--rlm-prompts <directory>` overrides the bundled prompt pack. The CLI keeps
+the RLM runtime alive for the root session, finalizes its evidence, and closes
+all retained children during normal shutdown.
+
 ## Deliberate first-slice limits
 
 - The runtime is process-local. It does not add a daemon or app-server protocol.

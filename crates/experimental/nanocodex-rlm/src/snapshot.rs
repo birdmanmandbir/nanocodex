@@ -13,6 +13,10 @@ const ORCHESTRATION_PROMPT: &str = "orchestration.md";
 const SUBAGENT_PROMPT: &str = "subagent.md";
 const REFINER_PROMPT: &str = "refiner.md";
 const TOOL_DESCRIPTIONS: &str = "tools.toml";
+const BUNDLED_ORCHESTRATION: &str = include_str!("../prompts/orchestration.md");
+const BUNDLED_SUBAGENT: &str = include_str!("../prompts/subagent.md");
+const BUNDLED_REFINER: &str = include_str!("../prompts/refiner.md");
+const BUNDLED_TOOL_DESCRIPTIONS: &str = include_str!("../prompts/tools.toml");
 
 /// Immutable launch-time orchestration prose loaded from ordinary text files.
 #[derive(Clone, Debug)]
@@ -159,6 +163,22 @@ pub enum SnapshotError {
 }
 
 impl PromptPack {
+    /// Loads the immutable prompt pack embedded in this crate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bundled tool-description document does not
+    /// match the supported schema.
+    pub fn bundled() -> Result<Self, SnapshotError> {
+        Self::from_sources(
+            BUNDLED_ORCHESTRATION.to_owned(),
+            BUNDLED_SUBAGENT.to_owned(),
+            BUNDLED_REFINER.to_owned(),
+            BUNDLED_TOOL_DESCRIPTIONS.to_owned(),
+            PathBuf::from("<bundled>/tools.toml"),
+        )
+    }
+
     /// Loads and validates the orchestration, subagent, and tool-description
     /// files from `directory`.
     ///
@@ -175,6 +195,16 @@ impl PromptPack {
         let subagent = read_nonempty(&subagent_path, "subagent prompt")?;
         let refiner = read_nonempty(&refiner_path, "refiner prompt")?;
         let tools_source = read_nonempty(&tools_path, "tool descriptions")?;
+        Self::from_sources(orchestration, subagent, refiner, tools_source, tools_path)
+    }
+
+    fn from_sources(
+        orchestration: String,
+        subagent: String,
+        refiner: String,
+        tools_source: String,
+        tools_path: PathBuf,
+    ) -> Result<Self, SnapshotError> {
         let tools: ToolDescriptions =
             toml::from_str(&tools_source).map_err(|source| SnapshotError::Parse {
                 path: tools_path,
@@ -687,6 +717,18 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn bundled_prompt_pack_matches_the_checked_in_sources() {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("prompts");
+        let bundled = PromptPack::bundled().unwrap();
+        let loaded = PromptPack::load(directory).unwrap();
+
+        assert_eq!(bundled.digest(), loaded.digest());
+        assert_eq!(bundled.orchestration(), loaded.orchestration());
+        assert_eq!(bundled.subagent(), loaded.subagent());
+        assert_eq!(bundled.refiner(), loaded.refiner());
+    }
 
     #[test]
     fn launch_snapshot_is_content_addressed_and_renders_enabled_state() {

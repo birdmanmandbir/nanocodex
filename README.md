@@ -276,6 +276,18 @@ agent protocol.
 [Examples](examples/README.md) · [JavaScript](js/README.md) ·
 [Python](py/README.md) · [Web](web/README.md)
 
+The native CLI can opt into the experimental continual RLM harness. It embeds
+the immutable orchestration prompts and reads the mutable subagent catalog from
+the selected TOML file:
+
+```sh
+nanocodex run "delegate independent investigations, then synthesize them" \
+  --rlm-harness crates/experimental/nanocodex-rlm/nanocodex.harness.toml
+```
+
+Pass `--rlm-prompts <directory>` with `--rlm-harness` to replace the bundled
+prompt pack. RLM mode and the older `--subagents` mode are mutually exclusive.
+
 ## VM-backed tools
 
 Normal TUI and one-shot sessions keep host workspace tools by default. They can

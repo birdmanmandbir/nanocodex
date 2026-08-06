@@ -5084,6 +5084,7 @@ dependencies = [
  "nanocodex-eval",
  "nanocodex-eval-adapters",
  "nanocodex-observability",
+ "nanocodex-rlm",
  "nanocodex-tools",
  "nanocodex-vm",
  "nanocodex-voice",
@@ -5345,6 +5346,7 @@ version = "0.3.0"
 dependencies = [
  "hex",
  "nanocodex",
+ "nanocodex-oai-api",
  "serde",
  "serde_json",
  "sha2 0.11.0",

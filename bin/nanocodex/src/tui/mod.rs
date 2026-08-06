@@ -589,6 +589,7 @@ pub(crate) async fn run(
     let mcp = configured.mcp;
     let browser = configured.browser;
     let vm = configured.vm;
+    let rlm = configured.rlm;
     let (worker_tx, worker_rx) = mpsc::unbounded_channel();
     let (update_tx, mut update_rx) = mpsc::unbounded_channel();
     let worker = spawn_agent_worker(
@@ -720,7 +721,8 @@ pub(crate) async fn run(
     // Restore the terminal before disconnecting the paid WebSocket session.
     drop((terminal, worker_tx, agent_events));
     math_renderer.shutdown();
-    let shutdown_result = shutdown_runtime(worker, child_agents, mpp_adapter, browser, vm).await;
+    let shutdown_result =
+        shutdown_runtime(worker, child_agents, mpp_adapter, browser, vm, rlm).await;
     loop_result?;
     shutdown_result
 }
@@ -738,11 +740,15 @@ async fn shutdown_runtime(
     mpp_adapter: Option<crate::mpp::MppAdapter>,
     browser: Option<crate::browser::ConfiguredBrowser>,
     vm: Option<crate::vm::ConfiguredVm>,
+    rlm: Option<nanocodex_rlm::RlmRuntime>,
 ) -> Result<()> {
     worker.abort();
     let worker_result = worker.await;
     if let Some(child_agents) = child_agents {
         child_agents.shutdown().await;
+    }
+    if let Some(rlm) = rlm {
+        rlm.shutdown().await;
     }
     let browser_shutdown_result = if let Some(browser) = browser {
         browser.shutdown().await

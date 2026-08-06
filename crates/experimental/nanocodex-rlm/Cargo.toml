@@ -23,6 +23,7 @@ toml.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+nanocodex-oai-api.workspace = true
 tempfile.workspace = true
 
 [lints]

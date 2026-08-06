@@ -9,7 +9,7 @@ use nanocodex::{
     AgentEvents, Nanocodex, NanocodexBuilder, PromptRoute, Tools, Turn, TurnControl,
     agent::AgentHandle,
 };
-use tokio::sync::{Mutex, Notify, Semaphore, broadcast};
+use tokio::sync::{Mutex, Notify, Semaphore, broadcast, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::{
@@ -134,7 +134,7 @@ struct Child {
     generation: u64,
     active_control: Option<TurnControl>,
     active_monitor: Option<JoinHandle<()>>,
-    event_forwarder: Option<JoinHandle<()>>,
+    event_forwarder: Option<EventForwarder>,
     turns: Vec<RlmTurnEvidence>,
     is_refiner: bool,
     refinement_applied: bool,
@@ -145,6 +145,20 @@ struct Reservation {
     parent: Option<RlmAgentId>,
     depth: usize,
     id: RlmAgentId,
+}
+
+struct EventForwarder {
+    stop: Option<oneshot::Sender<()>>,
+    task: JoinHandle<()>,
+}
+
+impl EventForwarder {
+    async fn stop(mut self) -> Result<(), tokio::task::JoinError> {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        self.task.await
+    }
 }
 
 impl Default for RlmPolicy {
@@ -647,18 +661,45 @@ impl RuntimeState {
         root_session_id: Box<str>,
         id: RlmAgentId,
         mut events: AgentEvents,
-    ) -> JoinHandle<()> {
+    ) -> EventForwarder {
         let state = Arc::downgrade(self);
-        tokio::spawn(async move {
-            while let Some(event) = events.recv().await {
-                let Some(state) = state.upgrade() else {
-                    return;
-                };
-                state
-                    .emit(&root_session_id, &id, RlmEventKind::Agent(event))
-                    .await;
+        let (stop, mut stop_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    event = events.recv() => {
+                        let Some(event) = event else {
+                            return;
+                        };
+                        let Some(state) = state.upgrade() else {
+                            return;
+                        };
+                        state
+                            .emit(&root_session_id, &id, RlmEventKind::Agent(event))
+                            .await;
+                    }
+                    _ = &mut stop_rx => {
+                        while let Some(event) = events.try_recv_timed() {
+                            let Some(state) = state.upgrade() else {
+                                return;
+                            };
+                            state
+                                .emit(
+                                    &root_session_id,
+                                    &id,
+                                    RlmEventKind::Agent(event.event),
+                                )
+                                .await;
+                        }
+                        return;
+                    }
+                }
             }
-        })
+        });
+        EventForwarder {
+            stop: Some(stop),
+            task,
+        }
     }
 
     async fn emit(&self, root_session_id: &str, id: &RlmAgentId, kind: RlmEventKind) {
@@ -1128,27 +1169,28 @@ impl RuntimeState {
         for agent in agents {
             drop(agent.shutdown().await);
         }
-        let tasks = {
+        let (monitors, forwarders) = {
             let mut registry = self.registry.lock().await;
             let scope = registry
                 .scopes
                 .get_mut(&root)
                 .ok_or_else(|| RlmRuntimeError::UnknownAgent(id.to_string()))?;
-            targets
-                .iter()
-                .flat_map(|target| {
-                    let Some(child) = scope.children.get_mut(target) else {
-                        return Vec::new();
-                    };
-                    [child.active_monitor.take(), child.event_forwarder.take()]
-                        .into_iter()
-                        .flatten()
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>()
+            let mut monitors = Vec::new();
+            let mut forwarders = Vec::new();
+            for target in &targets {
+                let Some(child) = scope.children.get_mut(target) else {
+                    continue;
+                };
+                monitors.extend(child.active_monitor.take());
+                forwarders.extend(child.event_forwarder.take());
+            }
+            (monitors, forwarders)
         };
-        for task in tasks {
+        for task in monitors {
             drop(task.await);
+        }
+        for forwarder in forwarders {
+            drop(forwarder.stop().await);
         }
         for target in &targets {
             self.emit(&root, target, RlmEventKind::Status(RlmStatus::Closed))
@@ -1302,25 +1344,29 @@ impl RuntimeState {
                 Err(error) => failures.push(error.to_string()),
             }
         }
-        let tasks = {
+        let (monitors, forwarders) = {
             let mut registry = self.registry.lock().await;
             let Some(scope) = registry.scopes.get_mut(root_session_id) else {
                 return Ok(());
             };
-            ids.iter()
-                .flat_map(|id| {
-                    let Some(child) = scope.children.get_mut(id) else {
-                        return Vec::new();
-                    };
-                    [child.active_monitor.take(), child.event_forwarder.take()]
-                        .into_iter()
-                        .flatten()
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>()
+            let mut monitors = Vec::new();
+            let mut forwarders = Vec::new();
+            for id in &ids {
+                let Some(child) = scope.children.get_mut(id) else {
+                    continue;
+                };
+                monitors.extend(child.active_monitor.take());
+                forwarders.extend(child.event_forwarder.take());
+            }
+            (monitors, forwarders)
         };
-        for task in tasks {
+        for task in monitors {
             if let Err(error) = task.await {
+                failures.push(error.to_string());
+            }
+        }
+        for forwarder in forwarders {
+            if let Err(error) = forwarder.stop().await {
                 failures.push(error.to_string());
             }
         }
@@ -1459,8 +1505,18 @@ fn validate_text(value: &str, label: &str, max_bytes: usize) -> Result<(), RlmRu
 mod tests {
     use std::path::Path;
 
+    use nanocodex_oai_api::__private::EventSink;
+
     use super::*;
     use crate::{HarnessSnapshot, PromptPack};
+
+    fn launch_snapshot() -> LaunchSnapshot {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        LaunchSnapshot::new(
+            PromptPack::load(root.join("prompts")).unwrap(),
+            HarnessSnapshot::load(root.join("nanocodex.harness.toml")).unwrap(),
+        )
+    }
 
     #[test]
     fn policy_rejects_zero_bounds() {
@@ -1482,11 +1538,7 @@ mod tests {
 
     #[tokio::test]
     async fn finalizing_an_empty_root_freezes_attributable_evidence() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let launch = LaunchSnapshot::new(
-            PromptPack::load(root.join("prompts")).unwrap(),
-            HarnessSnapshot::load(root.join("nanocodex.harness.toml")).unwrap(),
-        );
+        let launch = launch_snapshot();
         let expected_digest = launch.digest().to_owned();
         let runtime = RlmRuntime::new(launch);
 
@@ -1501,5 +1553,35 @@ mod tests {
             runtime.state.reserve("root-session").await,
             Err(RlmRuntimeError::Closed)
         ));
+    }
+
+    #[tokio::test]
+    async fn event_forwarder_stops_after_draining_with_a_retained_sink() {
+        let runtime = RlmRuntime::new(launch_snapshot());
+        let root = "root-session";
+        let id = RlmAgentId::new();
+        runtime
+            .state
+            .registry
+            .lock()
+            .await
+            .scopes
+            .entry(root.into())
+            .or_default();
+        let (sink, events) = EventSink::channel("child-session".to_owned());
+        let forwarder = runtime
+            .state
+            .forward_events(root.into(), id.clone(), events);
+
+        tokio::time::timeout(Duration::from_secs(1), forwarder.stop())
+            .await
+            .expect("forwarder should not wait for the retained sink to drop")
+            .unwrap();
+
+        let registry = runtime.state.registry.lock().await;
+        let events = &registry.scopes[root].events;
+        assert!(events.is_empty());
+        drop(registry);
+        drop(sink);
     }
 }

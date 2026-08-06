@@ -23,6 +23,7 @@ use nanocodex::{
     },
     tools::mcp::McpHandle,
 };
+use nanocodex_rlm::{HarnessSnapshot, LaunchSnapshot, PromptPack, RlmRuntime};
 
 use crate::browser::{BrowserArgs, ConfiguredBrowser};
 use crate::mcp::{ConfiguredMcp, EvalMcpArgs, McpArgs};
@@ -39,6 +40,7 @@ pub(crate) struct ConfiguredAgent {
     pub(crate) mcp: Option<McpHandle>,
     pub(crate) browser: Option<ConfiguredBrowser>,
     pub(crate) vm: Option<ConfiguredVm>,
+    pub(crate) rlm: Option<RlmRuntime>,
 }
 
 struct SessionBuild {
@@ -170,6 +172,24 @@ pub(crate) struct AgentArgs {
     )]
     subagents: bool,
 
+    /// Enable continual RLM orchestration using this mutable TOML harness.
+    #[arg(
+        long,
+        env = "NANOCODEX_RLM_HARNESS",
+        value_name = "FILE",
+        conflicts_with = "subagents"
+    )]
+    rlm_harness: Option<PathBuf>,
+
+    /// Override the immutable RLM prompt directory bundled into the CLI.
+    #[arg(
+        long,
+        env = "NANOCODEX_RLM_PROMPTS",
+        value_name = "DIRECTORY",
+        requires = "rlm_harness"
+    )]
+    rlm_prompts: Option<PathBuf>,
+
     /// Write Codex-compatible resumable threads beneath `CODEX_HOME`.
     #[arg(
         long,
@@ -269,6 +289,7 @@ impl AgentArgs {
         let web_search = self.web_search();
         let codex_home = default_codex_home()?;
         let responses_transport = self.responses_transport();
+        let rlm = configure_rlm(self.rlm_harness, self.rlm_prompts)?;
         let session = prepare_session_build(self.cwd, self.rollouts, &codex_home, durable)?;
         let configured_browser = self.browser.configure(&session.workspace)?;
         let mpp_enabled = self.mpp.is_enabled();
@@ -356,7 +377,14 @@ impl AgentArgs {
         if let Some(rollout) = session.rollout {
             builder = builder.rollout(rollout);
         }
-        let builder = if let Some(child_agents) = &child_agents {
+        let builder = if let Some(instructions) = self.instructions {
+            builder.instructions(instructions)
+        } else {
+            builder
+        };
+        let builder = if let Some(rlm) = &rlm {
+            rlm.agent_builder(builder, tools)
+        } else if let Some(child_agents) = &child_agents {
             let tools = tools;
             let child_agents = Arc::downgrade(child_agents);
             builder.tools_factory(move |agent| {
@@ -364,11 +392,6 @@ impl AgentArgs {
             })
         } else {
             builder.tools(tools)
-        };
-        let builder = if let Some(instructions) = self.instructions {
-            builder.instructions(instructions)
-        } else {
-            builder
         };
         let (handle, events) = builder.build()?;
         Ok(ConfiguredAgent {
@@ -380,8 +403,26 @@ impl AgentArgs {
             mcp: mcp_handle,
             browser: configured_browser,
             vm: configured_vm,
+            rlm,
         })
     }
+}
+
+fn configure_rlm(
+    harness_path: Option<PathBuf>,
+    prompts_path: Option<PathBuf>,
+) -> Result<Option<RlmRuntime>> {
+    let Some(harness_path) = harness_path else {
+        return Ok(None);
+    };
+    let prompts = match prompts_path {
+        Some(path) => PromptPack::load(&path)
+            .wrap_err_with(|| format!("failed to load RLM prompts from {}", path.display()))?,
+        None => PromptPack::bundled().wrap_err("failed to load bundled RLM prompts")?,
+    };
+    let harness = HarnessSnapshot::load(&harness_path)
+        .wrap_err_with(|| format!("failed to load RLM harness from {}", harness_path.display()))?;
+    Ok(Some(RlmRuntime::new(LaunchSnapshot::new(prompts, harness))))
 }
 
 impl AuthArgs {

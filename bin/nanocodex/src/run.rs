@@ -22,6 +22,7 @@ impl Run {
         let configured = config.build(vm).await?;
         let handle = configured.handle;
         let mut events = configured.events;
+        let root_session_id = events.request_id().to_owned();
         let mut stdout = tokio::io::stdout();
         let run_result: Result<()> = async {
             for _ in 0..self.repeat {
@@ -50,9 +51,17 @@ impl Run {
             Ok(())
         }
         .await;
+        let rlm_finalize_result = if let Some(rlm) = &configured.rlm {
+            rlm.finalize_root(&root_session_id).await
+        } else {
+            Ok(())
+        };
         let agent_shutdown = handle.shutdown().await;
         drop(handle);
         drop(events);
+        if let Some(rlm) = configured.rlm {
+            rlm.shutdown().await;
+        }
         if let Some(child_agents) = configured.child_agents {
             child_agents.shutdown().await;
         }
@@ -72,6 +81,7 @@ impl Run {
             Ok(())
         };
         run_result?;
+        rlm_finalize_result?;
         agent_shutdown?;
         browser_shutdown_result?;
         vm_shutdown_result?;

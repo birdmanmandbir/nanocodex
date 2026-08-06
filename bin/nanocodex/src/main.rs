@@ -286,6 +286,64 @@ mod tests {
     }
 
     #[test]
+    fn rlm_harness_is_available_to_tui_and_one_shot_runs() {
+        let tui =
+            Cli::try_parse_from(["nanocodex", "--rlm-harness", "/tmp/nanocodex.harness.toml"])
+                .unwrap();
+        assert!(tui.command.is_none());
+
+        let run = Cli::try_parse_from([
+            "nanocodex",
+            "run",
+            "delegate this task",
+            "--rlm-harness",
+            "/tmp/nanocodex.harness.toml",
+            "--rlm-prompts",
+            "/tmp/prompts",
+        ])
+        .unwrap();
+        let Some(Command::Run(run)) = run.command else {
+            panic!("run command was not parsed");
+        };
+        let _ = run.agent;
+    }
+
+    #[test]
+    fn rlm_prompt_override_requires_a_harness() {
+        let error = Cli::try_parse_from([
+            "nanocodex",
+            "run",
+            "delegate this task",
+            "--rlm-prompts",
+            "/tmp/prompts",
+        ])
+        .err()
+        .unwrap();
+
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn rlm_harness_conflicts_with_legacy_subagents() {
+        let error = Cli::try_parse_from([
+            "nanocodex",
+            "run",
+            "delegate this task",
+            "--rlm-harness",
+            "/tmp/nanocodex.harness.toml",
+            "--subagents",
+            "true",
+        ])
+        .err()
+        .unwrap();
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
     fn browser_cookies_require_an_opted_in_browser() {
         let error = Cli::try_parse_from(["nanocodex", "--cookies=true"])
             .err()
