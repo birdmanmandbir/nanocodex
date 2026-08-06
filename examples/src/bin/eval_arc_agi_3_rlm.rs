@@ -5,7 +5,9 @@ use std::{
     fmt::Write as _,
     fs, io,
     path::{Path, PathBuf},
+    process::Stdio,
     str::FromStr,
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -15,9 +17,10 @@ use nanocodex_rlm::{HarnessSnapshot, LaunchSnapshot, PromptPack, RlmPolicy, RlmR
 use reqwest::{Client, Method, StatusCode, header};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use tokio::time::timeout;
+use tokio::{process::Command, sync::Semaphore, task::JoinSet, time::timeout};
 
 const API_BASE_URL: &str = "https://three.arcprize.org";
+const ARC_COOKIES_ENV: &str = "NANOCODEX_ARC_COOKIES";
 const MAX_ANIMATION_FRAMES: usize = 7;
 const MODEL_RETRIES_PER_FRAME: usize = 3;
 const DEFAULT_TURN_TIMEOUT: Duration = Duration::from_secs(600);
@@ -53,7 +56,7 @@ impl FromStr for Mode {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Config {
     game: String,
     mode: Mode,
@@ -65,6 +68,9 @@ struct Config {
     turn_timeout: Duration,
     allow_refinement: bool,
     refine_every_actions: Option<u64>,
+    concurrency: usize,
+    scorecard_id: Option<String>,
+    suite_game_limit: Option<usize>,
 }
 
 impl Config {
@@ -81,6 +87,9 @@ impl Config {
             turn_timeout: DEFAULT_TURN_TIMEOUT,
             allow_refinement: false,
             refine_every_actions: None,
+            concurrency: 8,
+            scorecard_id: None,
+            suite_game_limit: None,
         };
         let mut args = env::args().skip(1);
         while let Some(argument) = args.next() {
@@ -130,13 +139,31 @@ impl Config {
                             })?,
                     );
                 }
+                "--concurrency" => {
+                    config.concurrency = required_value(&mut args, "--concurrency")?
+                        .parse()
+                        .map_err(|error| invalid(format!("invalid concurrency: {error}")))?;
+                }
+                "--scorecard-id" => {
+                    config.scorecard_id = Some(required_value(&mut args, "--scorecard-id")?);
+                }
+                "--suite-game-limit" => {
+                    config.suite_game_limit = Some(
+                        required_value(&mut args, "--suite-game-limit")?
+                            .parse()
+                            .map_err(|error| {
+                                invalid(format!("invalid suite game limit: {error}"))
+                            })?,
+                    );
+                }
                 "--help" | "-h" => {
                     println!(
                         "usage: eval-arc-agi-3-rlm [--game ls20] [--mode baseline|rlm] \
                          [--thinking low|medium|high|xhigh|max] [--harness PATH] \
                          [--output DIR] [--action-multiplier 5] [--max-actions N] \
                          [--turn-timeout-seconds 600] [--allow-refinement] \
-                         [--refine-every-actions N]"
+                         [--refine-every-actions N] [--concurrency 8] \
+                         [--suite-game-limit N]"
                     );
                     std::process::exit(0);
                 }
@@ -154,6 +181,9 @@ impl Config {
         if config.turn_timeout.is_zero() {
             return Err(invalid("turn timeout must be greater than zero"));
         }
+        if config.concurrency == 0 {
+            return Err(invalid("concurrency must be greater than zero"));
+        }
         if config.mode == Mode::Baseline && config.allow_refinement {
             return Err(invalid("baseline mode cannot refine an RLM harness"));
         }
@@ -166,6 +196,20 @@ impl Config {
             return Err(invalid(
                 "--refine-every-actions requires --allow-refinement",
             ));
+        }
+        if config.game.eq_ignore_ascii_case("all") && config.allow_refinement {
+            return Err(invalid(
+                "the complete suite requires a frozen harness; refine in a separate training run",
+            ));
+        }
+        if config.game.eq_ignore_ascii_case("all") && config.scorecard_id.is_some() {
+            return Err(invalid("the complete suite must own its scorecard"));
+        }
+        if config.suite_game_limit == Some(0) {
+            return Err(invalid("suite game limit must be greater than zero"));
+        }
+        if config.suite_game_limit.is_some() && !config.game.eq_ignore_ascii_case("all") {
+            return Err(invalid("--suite-game-limit requires --game all"));
         }
         Ok(config)
     }
@@ -265,6 +309,38 @@ struct RunEvidence {
     error: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct SuiteEvidence {
+    schema_version: u32,
+    benchmark: &'static str,
+    protocol: &'static str,
+    mode: Mode,
+    model: &'static str,
+    thinking: String,
+    action_budget_multiplier: f64,
+    development_action_cap: Option<u64>,
+    development_game_limit: Option<usize>,
+    concurrency: usize,
+    scorecard_id: String,
+    scorecard_url: String,
+    harness: Option<PathBuf>,
+    started_unix_ms: u128,
+    completed_unix_ms: Option<u128>,
+    games: Vec<SuiteGameEvidence>,
+    scorecard: Option<Value>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SuiteGameEvidence {
+    game_id: String,
+    output: PathBuf,
+    status: &'static str,
+    exit_code: Option<i32>,
+    error: Option<String>,
+}
+
+#[derive(Clone)]
 struct ArcClient {
     http: Client,
     cookies: BTreeMap<String, String>,
@@ -276,14 +352,20 @@ impl ArcClient {
     async fn connect() -> Result<Self> {
         let mut client = Self {
             http: Client::builder().timeout(Duration::from_secs(30)).build()?,
-            cookies: BTreeMap::new(),
-            api_key: String::new(),
+            cookies: env::var(ARC_COOKIES_ENV)
+                .ok()
+                .map(|cookies| serde_json::from_str(&cookies))
+                .transpose()?
+                .unwrap_or_default(),
+            api_key: env::var("ARC_API_KEY").unwrap_or_default(),
             card_id: String::new(),
         };
-        let key: AnonKey = client
-            .request(Method::GET, "/api/games/anonkey", None)
-            .await?;
-        client.api_key = key.api_key;
+        if client.api_key.is_empty() {
+            let key: AnonKey = client
+                .request(Method::GET, "/api/games/anonkey", None)
+                .await?;
+            client.api_key = key.api_key;
+        }
         Ok(client)
     }
 
@@ -297,6 +379,22 @@ impl ArcClient {
             .await?;
         self.card_id = opened.card_id;
         Ok(())
+    }
+
+    fn use_scorecard(&mut self, card_id: String) {
+        self.card_id = card_id;
+    }
+
+    fn card_id(&self) -> &str {
+        &self.card_id
+    }
+
+    fn api_key(&self) -> &str {
+        &self.api_key
+    }
+
+    fn encoded_cookies(&self) -> Result<String> {
+        Ok(serde_json::to_string(&self.cookies)?)
     }
 
     async fn games(&mut self) -> Result<Vec<GameMetadata>> {
@@ -420,6 +518,13 @@ fn http_error(path: &str, status: StatusCode, body: &[u8]) -> AnyError {
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     let config = Config::parse()?;
+    if config.game.eq_ignore_ascii_case("all") {
+        return run_suite(config).await;
+    }
+    run_game(config).await
+}
+
+async fn run_game(config: Config) -> Result<()> {
     let prompt_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../crates/experimental/nanocodex-rlm/prompts");
     let (runtime, immutable_prompt_digest, harness_revision_start, cache_key) =
@@ -498,11 +603,19 @@ async fn main() -> Result<()> {
         error: None,
     };
     write_evidence(&output, &evidence).await?;
-    arc.open_scorecard(config.mode).await?;
+    let owns_scorecard = config.scorecard_id.is_none();
+    match &config.scorecard_id {
+        Some(card_id) => arc.use_scorecard(card_id.clone()),
+        None => arc.open_scorecard(config.mode).await?,
+    }
     let frame = match arc.reset_initial(&game.game_id).await {
         Ok(frame) => frame,
         Err(error) => {
-            let cleanup = arc.close().await;
+            let cleanup = if owns_scorecard {
+                arc.close().await.map(Some)
+            } else {
+                Ok(None)
+            };
             let _ = agent.shutdown().await;
             if let Some(runtime) = &runtime {
                 runtime.shutdown().await;
@@ -536,9 +649,13 @@ async fn main() -> Result<()> {
             .get_or_insert_with(|| "AGENT_ERROR".to_owned());
     }
 
-    let close_result = arc.close().await;
+    let close_result = if owns_scorecard {
+        arc.close().await.map(Some)
+    } else {
+        Ok(None)
+    };
     match close_result {
-        Ok(scorecard) => evidence.scorecard = Some(scorecard),
+        Ok(scorecard) => evidence.scorecard = scorecard,
         Err(error) => {
             let message = format!("scorecard cleanup failed: {error}");
             evidence.error = Some(match evidence.error.take() {
@@ -632,6 +749,241 @@ async fn main() -> Result<()> {
         return Err(invalid(error));
     }
     Ok(())
+}
+
+async fn run_suite(mut config: Config) -> Result<()> {
+    let mut arc = ArcClient::connect().await?;
+    let mut games = arc.games().await?;
+    if games.len() != 25 {
+        return Err(invalid(format!(
+            "complete ARC-AGI-3 suite requires 25 games, but the API returned {}",
+            games.len()
+        )));
+    }
+    if let Some(limit) = config.suite_game_limit {
+        games.truncate(limit.min(games.len()));
+    }
+    let output = config.output.clone().unwrap_or_else(|| {
+        PathBuf::from(".nanocodex/evals/arc-agi-3-rlm").join(format!(
+            "all-{}-{}",
+            mode_name(config.mode),
+            unix_ms()
+        ))
+    });
+    prepare_output(&output).await?;
+    let output = output.canonicalize()?;
+    tokio::fs::create_dir_all(output.join("games")).await?;
+    tokio::fs::create_dir_all(output.join("logs")).await?;
+    if config.mode == Mode::Rlm {
+        let frozen = output.join("harness-frozen.toml");
+        tokio::fs::copy(&config.harness, &frozen).await?;
+        config.harness = frozen;
+    }
+    let executable = env::current_exe()?;
+
+    arc.open_scorecard(config.mode).await?;
+    let scorecard_id = arc.card_id().to_owned();
+    let scorecard_url = format!("{API_BASE_URL}/scorecards/{scorecard_id}");
+    let mut suite = SuiteEvidence {
+        schema_version: 1,
+        benchmark: "arc-agi-3",
+        protocol: if config.suite_game_limit.is_some() || config.max_actions.is_some() {
+            "official-live-one-scorecard-development-suite"
+        } else {
+            "official-live-one-scorecard-25-fresh-nanocodex-processes"
+        },
+        mode: config.mode,
+        model: Model::Sol.as_str(),
+        thinking: config.thinking.to_string(),
+        action_budget_multiplier: config.action_multiplier,
+        development_action_cap: config.max_actions,
+        development_game_limit: config.suite_game_limit,
+        concurrency: config.concurrency,
+        scorecard_id: scorecard_id.clone(),
+        scorecard_url,
+        harness: (config.mode == Mode::Rlm).then(|| config.harness.clone()),
+        started_unix_ms: unix_ms(),
+        completed_unix_ms: None,
+        games: games
+            .iter()
+            .map(|game| SuiteGameEvidence {
+                game_id: game.game_id.clone(),
+                output: output.join("games").join(&game.game_id),
+                status: "pending",
+                exit_code: None,
+                error: None,
+            })
+            .collect(),
+        scorecard: None,
+        error: None,
+    };
+    if let Err(error) = write_json_atomic(output.join("suite.json"), &suite).await {
+        let close = arc.close().await;
+        return Err(invalid(format!(
+            "failed to retain opened suite scorecard: {error}; scorecard cleanup: {close:?}"
+        )));
+    }
+    eprintln!(
+        "ARC suite started: mode={} games={} concurrency={} scorecard={}",
+        mode_name(config.mode),
+        games.len(),
+        config.concurrency,
+        suite.scorecard_url
+    );
+
+    let encoded_cookies = match arc.encoded_cookies() {
+        Ok(cookies) => cookies,
+        Err(error) => {
+            let close = arc.close().await;
+            return Err(invalid(format!(
+                "failed to retain ARC suite session: {error}; scorecard cleanup: {close:?}"
+            )));
+        }
+    };
+    let capacity = Arc::new(Semaphore::new(config.concurrency));
+    let mut tasks = JoinSet::new();
+    for (index, game) in games.into_iter().enumerate() {
+        let capacity = Arc::clone(&capacity);
+        let executable = executable.clone();
+        let config = config.clone();
+        let output = output.clone();
+        let scorecard_id = scorecard_id.clone();
+        let api_key = arc.api_key().to_owned();
+        let encoded_cookies = encoded_cookies.clone();
+        tasks.spawn(async move {
+            let result: Result<_> = async {
+                let _permit = capacity.acquire_owned().await?;
+                run_suite_game(
+                    &executable,
+                    &config,
+                    &output,
+                    &scorecard_id,
+                    &api_key,
+                    &encoded_cookies,
+                    &game.game_id,
+                )
+                .await
+            }
+            .await;
+            (index, game.game_id, result)
+        });
+    }
+
+    let mut interrupted = false;
+    while !tasks.is_empty() {
+        tokio::select! {
+            joined = tasks.join_next() => {
+                let Some(joined) = joined else { break };
+                match joined {
+                    Ok((index, game_id, Ok(status))) => {
+                        let success = status.success();
+                        suite.games[index].status = if success { "completed" } else { "failed" };
+                        suite.games[index].exit_code = status.code();
+                        if !success {
+                            suite.games[index].error = Some(format!("game process exited {status}"));
+                        }
+                        eprintln!(
+                            "ARC suite game {game_id}: {} ({}/{})",
+                            suite.games[index].status,
+                            suite.games.iter().filter(|game| game.status != "pending").count(),
+                            suite.games.len()
+                        );
+                    }
+                    Ok((index, game_id, Err(error))) => {
+                        suite.games[index].status = "failed";
+                        suite.games[index].error = Some(error.to_string());
+                        eprintln!("ARC suite game {game_id}: failed: {error}");
+                    }
+                    Err(error) => {
+                        suite.error = Some(format!("suite worker failed: {error}"));
+                        eprintln!("ARC suite worker failed: {error}");
+                    }
+                }
+                if let Err(error) = write_json_atomic(output.join("suite.json"), &suite).await {
+                    suite.error = Some(format!("incremental suite evidence failed: {error}"));
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                }
+            }
+            signal = tokio::signal::ctrl_c() => {
+                interrupted = true;
+                suite.error = Some(match signal {
+                    Ok(()) => "interrupted".to_owned(),
+                    Err(error) => format!("interrupt listener failed: {error}"),
+                });
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+            }
+        }
+    }
+
+    match arc.close().await {
+        Ok(scorecard) => {
+            write_json_atomic(output.join("scorecard.json"), &scorecard).await?;
+            suite.scorecard = Some(scorecard);
+        }
+        Err(error) => {
+            let close_error = format!("scorecard cleanup failed: {error}");
+            suite.error = Some(match suite.error.take() {
+                Some(primary) => format!("{primary}; {close_error}"),
+                None => close_error,
+            });
+        }
+    }
+    suite.completed_unix_ms = Some(unix_ms());
+    write_json_atomic(output.join("suite.json"), &suite).await?;
+    println!("scorecard: {}", suite.scorecard_url);
+    println!("artifacts: {}", output.display());
+
+    if interrupted {
+        return Err(invalid("complete ARC suite was interrupted"));
+    }
+    if suite.games.iter().any(|game| game.status != "completed") {
+        return Err(invalid("one or more complete ARC suite games failed"));
+    }
+    if let Some(error) = suite.error {
+        return Err(invalid(error));
+    }
+    Ok(())
+}
+
+async fn run_suite_game(
+    executable: &Path,
+    config: &Config,
+    suite_output: &Path,
+    scorecard_id: &str,
+    api_key: &str,
+    encoded_cookies: &str,
+    game_id: &str,
+) -> Result<std::process::ExitStatus> {
+    let output = suite_output.join("games").join(game_id);
+    let stdout = fs::File::create(suite_output.join("logs").join(format!("{game_id}.stdout")))?;
+    let stderr = fs::File::create(suite_output.join("logs").join(format!("{game_id}.stderr")))?;
+    let mut command = Command::new(executable);
+    command
+        .args(["--game", game_id, "--mode", mode_name(config.mode)])
+        .arg("--thinking")
+        .arg(config.thinking.to_string())
+        .arg("--output")
+        .arg(&output)
+        .arg("--action-multiplier")
+        .arg(config.action_multiplier.to_string())
+        .arg("--turn-timeout-seconds")
+        .arg(config.turn_timeout.as_secs().to_string())
+        .args(["--scorecard-id", scorecard_id])
+        .env("ARC_API_KEY", api_key)
+        .env(ARC_COOKIES_ENV, encoded_cookies)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .kill_on_drop(true);
+    if config.mode == Mode::Rlm {
+        command.arg("--harness").arg(&config.harness);
+    }
+    if let Some(max_actions) = config.max_actions {
+        command.arg("--max-actions").arg(max_actions.to_string());
+    }
+    Ok(command.spawn()?.wait().await?)
 }
 
 async fn play_game(

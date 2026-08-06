@@ -199,6 +199,23 @@ cargo run -p nanocodex-examples --bin eval-arc-agi-3-rlm -- \
   --harness examples/rlm/arc-agi-3.harness.toml
 ```
 
+Run one complete official 25-game scorecard with fresh per-game agents and a
+frozen harness:
+
+```sh
+cargo run -p nanocodex-examples --bin eval-arc-agi-3-rlm -- \
+  --game all --mode rlm --thinking low --concurrency 8 \
+  --harness examples/rlm/arc-agi-3.harness.toml \
+  --output /path/to/retained/full-suite
+```
+
+Suite mode opens one parent-owned scorecard, propagates its authenticated ARC
+session to isolated game processes, incrementally records `suite.json`, and
+closes the scorecard after every child finishes or is cancelled. It rejects
+harness refinement so concurrently scored games cannot tune each other.
+`--suite-game-limit N` and `--max-actions N` are development-only smoke bounds;
+omit both for the complete score.
+
 `--max-actions N` is a development cap and is recorded as such; omit it for an
 official-profile run. Each output directory retains incremental `run.json`,
 the closed scorecard, exact root `root-events.jsonl`, harness start/final
