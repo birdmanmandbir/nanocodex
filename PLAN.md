@@ -880,6 +880,11 @@ may hide missing coordinates or mix incompatible preparation identities.
     runner on `dev-georgios`, retaining all heavyweight state on its verified
     3.5 TB drive. Add cross-host sharding only after measurements show that
     machine memory, rather than model/API capacity, is the material limiter.
+    The `version-zero-four` profile is the release-intent matrix: current
+    Nanocodex against stock Codex on Terminal-Bench 2.1, DeepSWE 1.1, Agents'
+    Last Exam, and ARC-AGI-3 at high reasoning with three trials. Preparation
+    may begin while benchmark-specific headline-comparability gates are still
+    being completed, but reports must preserve those limitations explicitly.
 12. [ ] Decide whether PR #32 still solves a demonstrated problem or should be
     replaced by a smaller application-owned experiment.
 13. [ ] Cut the next release only after all selected milestones pass the full
