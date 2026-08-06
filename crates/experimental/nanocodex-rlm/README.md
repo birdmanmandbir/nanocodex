@@ -213,6 +213,8 @@ Suite mode opens one parent-owned scorecard, propagates its authenticated ARC
 session to isolated game processes, incrementally records `suite.json`, and
 closes the scorecard after every child finishes or is cancelled. It rejects
 harness refinement so concurrently scored games cannot tune each other.
+Each fresh game inherits the official benchmarking harness's 12-hour wall-clock
+limit in addition to its per-level action budget.
 `--suite-game-limit N` and `--max-actions N` are development-only smoke bounds;
 omit both for the complete score.
 

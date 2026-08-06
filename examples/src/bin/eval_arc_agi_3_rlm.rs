@@ -24,6 +24,7 @@ const ARC_COOKIES_ENV: &str = "NANOCODEX_ARC_COOKIES";
 const MAX_ANIMATION_FRAMES: usize = 7;
 const MODEL_RETRIES_PER_FRAME: usize = 3;
 const DEFAULT_TURN_TIMEOUT: Duration = Duration::from_secs(600);
+const DEFAULT_MAX_RUNTIME: Duration = Duration::from_secs(12 * 60 * 60);
 const CONTROLLER_INSTRUCTIONS: &str = r#"You are the decision-making root for an official ARC-AGI-3 game. You receive one ARC_FRAME message at a time. Learn the unknown controls, dynamics, objects, and goal from visible transitions, preserve useful knowledge across levels, and minimize environment actions.
 
 For each ARC_FRAME message, reason and use any available Code Mode orchestration internally. Your final response must contain only one JSON object in one of these exact forms:
@@ -66,6 +67,7 @@ struct Config {
     action_multiplier: f64,
     max_actions: Option<u64>,
     turn_timeout: Duration,
+    max_runtime: Duration,
     allow_refinement: bool,
     refine_every_actions: Option<u64>,
     concurrency: usize,
@@ -85,6 +87,7 @@ impl Config {
             action_multiplier: 5.0,
             max_actions: None,
             turn_timeout: DEFAULT_TURN_TIMEOUT,
+            max_runtime: DEFAULT_MAX_RUNTIME,
             allow_refinement: false,
             refine_every_actions: None,
             concurrency: 8,
@@ -129,6 +132,12 @@ impl Config {
                         .map_err(|error| invalid(format!("invalid turn timeout: {error}")))?;
                     config.turn_timeout = Duration::from_secs(seconds);
                 }
+                "--max-runtime-seconds" => {
+                    let seconds = required_value(&mut args, "--max-runtime-seconds")?
+                        .parse()
+                        .map_err(|error| invalid(format!("invalid max runtime: {error}")))?;
+                    config.max_runtime = Duration::from_secs(seconds);
+                }
                 "--allow-refinement" => config.allow_refinement = true,
                 "--refine-every-actions" => {
                     config.refine_every_actions = Some(
@@ -161,7 +170,8 @@ impl Config {
                         "usage: eval-arc-agi-3-rlm [--game ls20] [--mode baseline|rlm] \
                          [--thinking low|medium|high|xhigh|max] [--harness PATH] \
                          [--output DIR] [--action-multiplier 5] [--max-actions N] \
-                         [--turn-timeout-seconds 600] [--allow-refinement] \
+                         [--turn-timeout-seconds 600] [--max-runtime-seconds 43200] \
+                         [--allow-refinement] \
                          [--refine-every-actions N] [--concurrency 8] \
                          [--suite-game-limit N]"
                     );
@@ -180,6 +190,9 @@ impl Config {
         }
         if config.turn_timeout.is_zero() {
             return Err(invalid("turn timeout must be greater than zero"));
+        }
+        if config.max_runtime.is_zero() {
+            return Err(invalid("max runtime must be greater than zero"));
         }
         if config.concurrency == 0 {
             return Err(invalid("concurrency must be greater than zero"));
@@ -294,6 +307,7 @@ struct RunEvidence {
     game: GameMetadata,
     action_budget_multiplier: f64,
     development_action_cap: Option<u64>,
+    max_runtime_seconds: u64,
     prompt_cache_key: String,
     immutable_prompt_digest: Option<String>,
     harness_revision_start: Option<u64>,
@@ -320,6 +334,7 @@ struct SuiteEvidence {
     action_budget_multiplier: f64,
     development_action_cap: Option<u64>,
     development_game_limit: Option<usize>,
+    max_runtime_seconds: u64,
     concurrency: usize,
     scorecard_id: String,
     scorecard_url: String,
@@ -588,6 +603,7 @@ async fn run_game(config: Config) -> Result<()> {
         game: game.clone(),
         action_budget_multiplier: config.action_multiplier,
         development_action_cap: config.max_actions,
+        max_runtime_seconds: config.max_runtime.as_secs(),
         prompt_cache_key: cache_key,
         immutable_prompt_digest,
         harness_revision_start,
@@ -798,6 +814,7 @@ async fn run_suite(mut config: Config) -> Result<()> {
         action_budget_multiplier: config.action_multiplier,
         development_action_cap: config.max_actions,
         development_game_limit: config.suite_game_limit,
+        max_runtime_seconds: config.max_runtime.as_secs(),
         concurrency: config.concurrency,
         scorecard_id: scorecard_id.clone(),
         scorecard_url,
@@ -970,6 +987,8 @@ async fn run_suite_game(
         .arg(config.action_multiplier.to_string())
         .arg("--turn-timeout-seconds")
         .arg(config.turn_timeout.as_secs().to_string())
+        .arg("--max-runtime-seconds")
+        .arg(config.max_runtime.as_secs().to_string())
         .args(["--scorecard-id", scorecard_id])
         .env("ARC_API_KEY", api_key)
         .env(ARC_COOKIES_ENV, encoded_cookies)
@@ -1002,10 +1021,15 @@ async fn play_game(
         .map(|baseline| ((*baseline as f64) * config.action_multiplier).ceil() as u64)
         .sum::<u64>();
     let action_limit = config.max_actions.unwrap_or(total_official_budget);
+    let game_started = Instant::now();
     let mut level_actions = 0_u64;
     let mut previous_action = None::<String>;
 
     loop {
+        if game_started.elapsed() >= config.max_runtime {
+            evidence.exit_reason = Some("RUNTIME_LIMIT".to_owned());
+            return Ok(());
+        }
         if frame.state == "WIN" {
             evidence.exit_reason = Some("GAME_WIN".to_owned());
             return Ok(());
