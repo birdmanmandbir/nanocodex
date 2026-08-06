@@ -4,3 +4,7 @@ send = "Send a bounded message to a retained subagent or, from a child, to its p
 wait = "Wait for selected subagent lifecycle changes or messages addressed to the caller."
 interrupt = "Interrupt active work for a retained subagent and its active descendants without deleting them."
 close = "Close a retained subagent and its descendant subtree and wait for cleanup."
+harness_state = "Read the latest durable prompt notes, memories, skills, subagent specifications, and refinement history. Call this before selecting or changing reusable harness state."
+harness_apply = "Apply exactly one small, evidence-backed create, update, or delete operation to durable harness state. The immutable base prompt and stable tool contract never change."
+harness_rollback = "Restore the contents of an archived harness revision as a new monotonic revision when a refinement caused a regression."
+refine = "Start a background refiner that reviews one trajectory observation and may apply at most one small evidence-backed harness edit. Returns its retained agent identity immediately."

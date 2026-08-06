@@ -1,6 +1,8 @@
 use nanocodex::agent::events::AgentEvent;
 use serde::{Deserialize, Serialize};
 
+use crate::HarnessRefinement;
+
 /// Opaque identity of one retained recursive subagent.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
@@ -162,6 +164,12 @@ pub struct RlmEvidence {
     pub launch_digest: Box<str>,
     /// Frozen harness revision.
     pub harness_revision: u64,
+    /// Latest durable harness revision when evidence was projected.
+    pub final_harness_revision: u64,
+    /// Digest of the latest durable harness document.
+    pub final_harness_digest: Box<str>,
+    /// Ordered refinements visible at evidence projection time.
+    pub refinements: Vec<HarnessRefinement>,
     /// Recursive children in creation order.
     pub agents: Vec<RlmAgentEvidence>,
     /// All messages retained for the family.

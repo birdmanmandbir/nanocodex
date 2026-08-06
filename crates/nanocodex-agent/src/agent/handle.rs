@@ -63,6 +63,35 @@ impl AgentHandle {
         request_fork(&commands, None).await
     }
 
+    /// Appends application-owned developer context to the containing agent at
+    /// its next safe model boundary.
+    ///
+    /// Agent-relative tools use this to publish durable state changes without
+    /// replacing the immutable request prefix. If a turn is active, the
+    /// message is retained immediately and becomes visible before the next
+    /// turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for empty text or after the containing driver stops.
+    pub async fn append_developer_message(
+        &self,
+        text: impl Into<String>,
+    ) -> Result<AgentSessionContext> {
+        let text = text.into();
+        if text.trim().is_empty() {
+            return Err(NanocodexError::InvalidRequest(
+                "developer message must not be empty".to_owned(),
+            ));
+        }
+        let commands = self.commands()?;
+        request_command(&commands, |result| Command::AppendDeveloperMessage {
+            text,
+            result,
+        })
+        .await
+    }
+
     fn commands(&self) -> Result<mpsc::Sender<Command>> {
         self.commands.upgrade().ok_or(NanocodexError::AgentStopped)
     }

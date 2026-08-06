@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 const HARNESS_VERSION: u32 = 1;
 const ORCHESTRATION_PROMPT: &str = "orchestration.md";
 const SUBAGENT_PROMPT: &str = "subagent.md";
+const REFINER_PROMPT: &str = "refiner.md";
 const TOOL_DESCRIPTIONS: &str = "tools.toml";
 
 /// Immutable launch-time orchestration prose loaded from ordinary text files.
@@ -18,6 +19,7 @@ const TOOL_DESCRIPTIONS: &str = "tools.toml";
 pub struct PromptPack {
     orchestration: Arc<str>,
     subagent: Arc<str>,
+    refiner: Arc<str>,
     tools: ToolDescriptions,
     digest: Arc<str>,
 }
@@ -32,20 +34,34 @@ pub struct ToolDescriptions {
     wait: Box<str>,
     interrupt: Box<str>,
     close: Box<str>,
+    harness_state: Box<str>,
+    harness_apply: Box<str>,
+    harness_rollback: Box<str>,
+    refine: Box<str>,
 }
 
 /// One versioned, immutable projection of evolving supplemental harness state.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessSnapshot {
-    version: u32,
-    revision: u64,
+    pub(crate) version: u32,
+    pub(crate) revision: u64,
     #[serde(default)]
-    prompt_notes: Vec<PromptNote>,
+    pub(crate) prompt_notes: Vec<PromptNote>,
     #[serde(default)]
-    subagents: Vec<SubagentSpec>,
+    pub(crate) memories: Vec<HarnessMemory>,
+    #[serde(default)]
+    pub(crate) skills: Vec<HarnessSkill>,
+    #[serde(default)]
+    pub(crate) subagents: Vec<SubagentSpec>,
+    #[serde(default)]
+    pub(crate) refinements: Vec<HarnessRefinement>,
     #[serde(skip)]
-    digest: Arc<str>,
+    pub(crate) digest: Arc<str>,
+    #[serde(skip)]
+    pub(crate) source_path: Arc<PathBuf>,
+    #[serde(skip)]
+    pub(crate) source: Arc<[u8]>,
 }
 
 /// Complete frozen prompt and harness identity used by one treatment.
@@ -60,22 +76,54 @@ pub struct LaunchSnapshot {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PromptNote {
-    id: Box<str>,
-    text: Box<str>,
+    pub(crate) id: Box<str>,
+    pub(crate) text: Box<str>,
     #[serde(default = "enabled_by_default")]
-    enabled: bool,
+    pub(crate) enabled: bool,
+}
+
+/// One durable lesson recovered from prior work.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessMemory {
+    pub(crate) id: Box<str>,
+    pub(crate) name: Box<str>,
+    pub(crate) content: Box<str>,
+    #[serde(default = "enabled_by_default")]
+    pub(crate) enabled: bool,
+}
+
+/// One reusable, model-described workflow.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessSkill {
+    pub(crate) id: Box<str>,
+    pub(crate) name: Box<str>,
+    pub(crate) description: Box<str>,
+    pub(crate) instructions: Box<str>,
+    #[serde(default = "enabled_by_default")]
+    pub(crate) enabled: bool,
+}
+
+/// Audit record for one evidence-backed harness change.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessRefinement {
+    pub(crate) revision: u64,
+    pub(crate) trigger: Box<str>,
+    pub(crate) operation: Box<str>,
 }
 
 /// One reusable named clean-subagent specification.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubagentSpec {
-    id: Box<str>,
-    name: Box<str>,
-    description: Box<str>,
-    instructions: Box<str>,
+    pub(crate) id: Box<str>,
+    pub(crate) name: Box<str>,
+    pub(crate) description: Box<str>,
+    pub(crate) instructions: Box<str>,
     #[serde(default = "enabled_by_default")]
-    enabled: bool,
+    pub(crate) enabled: bool,
 }
 
 /// Failure to load or validate a launch snapshot.
@@ -121,9 +169,11 @@ impl PromptPack {
         let directory = directory.as_ref();
         let orchestration_path = directory.join(ORCHESTRATION_PROMPT);
         let subagent_path = directory.join(SUBAGENT_PROMPT);
+        let refiner_path = directory.join(REFINER_PROMPT);
         let tools_path = directory.join(TOOL_DESCRIPTIONS);
         let orchestration = read_nonempty(&orchestration_path, "orchestration prompt")?;
         let subagent = read_nonempty(&subagent_path, "subagent prompt")?;
+        let refiner = read_nonempty(&refiner_path, "refiner prompt")?;
         let tools_source = read_nonempty(&tools_path, "tool descriptions")?;
         let tools: ToolDescriptions =
             toml::from_str(&tools_source).map_err(|source| SnapshotError::Parse {
@@ -136,12 +186,15 @@ impl PromptPack {
             orchestration.as_bytes(),
             SUBAGENT_PROMPT.as_bytes(),
             subagent.as_bytes(),
+            REFINER_PROMPT.as_bytes(),
+            refiner.as_bytes(),
             TOOL_DESCRIPTIONS.as_bytes(),
             tools_source.as_bytes(),
         ]);
         Ok(Self {
             orchestration: orchestration.into(),
             subagent: subagent.into(),
+            refiner: refiner.into(),
             tools,
             digest: digest.into(),
         })
@@ -159,6 +212,12 @@ impl PromptPack {
         &self.subagent
     }
 
+    /// Immutable guidance injected into background harness refiners.
+    #[must_use]
+    pub fn refiner(&self) -> &str {
+        &self.refiner
+    }
+
     /// Model-facing operation descriptions loaded with this prompt pack.
     #[must_use]
     pub const fn tools(&self) -> &ToolDescriptions {
@@ -173,7 +232,7 @@ impl PromptPack {
 }
 
 impl ToolDescriptions {
-    fn validate(&self) -> Result<(), SnapshotError> {
+    pub(crate) fn validate(&self) -> Result<(), SnapshotError> {
         for (label, value) in [
             ("spawn tool description", self.spawn()),
             ("list tool description", self.list()),
@@ -181,6 +240,10 @@ impl ToolDescriptions {
             ("wait tool description", self.wait()),
             ("interrupt tool description", self.interrupt()),
             ("close tool description", self.close()),
+            ("harness state tool description", self.harness_state()),
+            ("harness apply tool description", self.harness_apply()),
+            ("harness rollback tool description", self.harness_rollback()),
+            ("refine tool description", self.refine()),
         ] {
             validate_nonempty(value, label)?;
         }
@@ -222,6 +285,30 @@ impl ToolDescriptions {
     pub fn close(&self) -> &str {
         &self.close
     }
+
+    /// Description of continual harness inspection.
+    #[must_use]
+    pub fn harness_state(&self) -> &str {
+        &self.harness_state
+    }
+
+    /// Description of one evidence-backed continual harness edit.
+    #[must_use]
+    pub fn harness_apply(&self) -> &str {
+        &self.harness_apply
+    }
+
+    /// Description of continual harness rollback.
+    #[must_use]
+    pub fn harness_rollback(&self) -> &str {
+        &self.harness_rollback
+    }
+
+    /// Description of asynchronous trajectory-driven refinement.
+    #[must_use]
+    pub fn refine(&self) -> &str {
+        &self.refine
+    }
 }
 
 impl HarnessSnapshot {
@@ -244,10 +331,12 @@ impl HarnessSnapshot {
             })?;
         snapshot.validate()?;
         snapshot.digest = digest_parts([source.as_bytes()]).into();
+        snapshot.source_path = Arc::new(path.to_path_buf());
+        snapshot.source = Arc::from(source.into_bytes());
         Ok(snapshot)
     }
 
-    fn validate(&self) -> Result<(), SnapshotError> {
+    pub(crate) fn validate(&self) -> Result<(), SnapshotError> {
         if self.version != HARNESS_VERSION {
             return Err(SnapshotError::UnsupportedVersion {
                 expected: HARNESS_VERSION,
@@ -259,12 +348,28 @@ impl HarnessSnapshot {
             "prompt note",
         )?;
         validate_unique(
+            self.memories.iter().map(|memory| memory.id.as_ref()),
+            "memory",
+        )?;
+        validate_unique(self.skills.iter().map(|skill| skill.id.as_ref()), "skill")?;
+        validate_unique(
             self.subagents.iter().map(|spec| spec.id.as_ref()),
             "subagent specification",
         )?;
         for note in &self.prompt_notes {
             validate_identifier(&note.id, "prompt note")?;
             validate_nonempty(&note.text, "prompt note text")?;
+        }
+        for memory in &self.memories {
+            validate_identifier(&memory.id, "memory")?;
+            validate_nonempty(&memory.name, "memory name")?;
+            validate_nonempty(&memory.content, "memory content")?;
+        }
+        for skill in &self.skills {
+            validate_identifier(&skill.id, "skill")?;
+            validate_nonempty(&skill.name, "skill name")?;
+            validate_nonempty(&skill.description, "skill description")?;
+            validate_nonempty(&skill.instructions, "skill instructions")?;
         }
         for spec in &self.subagents {
             validate_identifier(&spec.id, "subagent specification")?;
@@ -293,10 +398,28 @@ impl HarnessSnapshot {
         &self.prompt_notes
     }
 
+    /// All durable memories, including disabled entries.
+    #[must_use]
+    pub fn memories(&self) -> &[HarnessMemory] {
+        &self.memories
+    }
+
+    /// All reusable skills, including disabled entries.
+    #[must_use]
+    pub fn skills(&self) -> &[HarnessSkill] {
+        &self.skills
+    }
+
     /// All named subagent specifications, including disabled entries.
     #[must_use]
     pub fn subagents(&self) -> &[SubagentSpec] {
         &self.subagents
+    }
+
+    /// Ordered evidence-backed refinement history.
+    #[must_use]
+    pub fn refinements(&self) -> &[HarnessRefinement] {
+        &self.refinements
     }
 
     /// Finds one enabled named subagent specification.
@@ -311,6 +434,14 @@ impl HarnessSnapshot {
     #[must_use]
     pub fn digest(&self) -> &str {
         &self.digest
+    }
+
+    pub(crate) fn source_path(&self) -> &Path {
+        &self.source_path
+    }
+
+    pub(crate) fn source(&self) -> &[u8] {
+        &self.source
     }
 }
 
@@ -344,37 +475,10 @@ impl LaunchSnapshot {
         &self.digest
     }
 
-    /// Renders the root-facing supplemental developer message.
+    /// Renders the immutable root-facing orchestration guidance.
     #[must_use]
     pub fn root_instructions(&self) -> String {
-        let mut output = self.prompts.orchestration().trim().to_owned();
-        for note in self
-            .harness
-            .prompt_notes()
-            .iter()
-            .filter(|note| note.enabled())
-        {
-            output.push_str("\n\n- ");
-            output.push_str(note.text());
-        }
-        let enabled = self
-            .harness
-            .subagents()
-            .iter()
-            .filter(|spec| spec.enabled())
-            .collect::<Vec<_>>();
-        if !enabled.is_empty() {
-            output.push_str("\n\nAvailable subagent specifications:");
-            for spec in enabled {
-                output.push_str("\n\n- `");
-                output.push_str(spec.id());
-                output.push_str("` — ");
-                output.push_str(spec.name());
-                output.push_str(": ");
-                output.push_str(spec.description());
-            }
-        }
-        output
+        self.prompts.orchestration().trim().to_owned()
     }
 }
 
@@ -395,6 +499,84 @@ impl PromptNote {
     #[must_use]
     pub const fn enabled(&self) -> bool {
         self.enabled
+    }
+}
+
+impl HarnessMemory {
+    /// Stable memory identifier.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Human-readable memory name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Complete retained lesson.
+    #[must_use]
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+
+    /// Whether this memory participates in current harness context.
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
+impl HarnessSkill {
+    /// Stable skill identifier.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Human-readable skill name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Selection guidance for this skill.
+    #[must_use]
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    /// Complete reusable workflow instructions.
+    #[must_use]
+    pub fn instructions(&self) -> &str {
+        &self.instructions
+    }
+
+    /// Whether this skill participates in current harness context.
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
+impl HarnessRefinement {
+    /// Monotonic revision produced by this refinement.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Evidence or observation that triggered the refinement.
+    #[must_use]
+    pub fn trigger(&self) -> &str {
+        &self.trigger
+    }
+
+    /// Compact operation summary.
+    #[must_use]
+    pub fn operation(&self) -> &str {
+        &self.operation
     }
 }
 
@@ -479,7 +661,7 @@ fn validate_nonempty(value: &str, label: &str) -> Result<(), SnapshotError> {
     Ok(())
 }
 
-fn digest_parts<const N: usize>(parts: [&[u8]; N]) -> String {
+pub(crate) fn digest_parts<const N: usize>(parts: [&[u8]; N]) -> String {
     let mut hasher = Sha256::new();
     for part in parts {
         hasher.update(u64::try_from(part.len()).unwrap_or(u64::MAX).to_be_bytes());
@@ -503,9 +685,10 @@ mod tests {
         fs::create_dir(&prompts).unwrap();
         fs::write(prompts.join(ORCHESTRATION_PROMPT), "Coordinate with JS.").unwrap();
         fs::write(prompts.join(SUBAGENT_PROMPT), "Report evidence.").unwrap();
+        fs::write(prompts.join(REFINER_PROMPT), "Refine evidence.").unwrap();
         fs::write(
             prompts.join(TOOL_DESCRIPTIONS),
-            "spawn = 'spawn'\nlist = 'list'\nsend = 'send'\nwait = 'wait'\ninterrupt = 'interrupt'\nclose = 'close'\n",
+            "spawn = 'spawn'\nlist = 'list'\nsend = 'send'\nwait = 'wait'\ninterrupt = 'interrupt'\nclose = 'close'\nharness_state = 'state'\nharness_apply = 'apply'\nharness_rollback = 'rollback'\nrefine = 'refine'\n",
         )
         .unwrap();
         let harness = directory.path().join("harness.toml");
@@ -540,8 +723,9 @@ instructions = "Inspect the diff."
 
         assert_eq!(snapshot.harness().revision(), 4);
         assert_eq!(snapshot.digest().len(), 64);
-        assert!(snapshot.root_instructions().contains("Parallelize"));
-        assert!(snapshot.root_instructions().contains("`reviewer`"));
+        assert_eq!(snapshot.root_instructions(), "Coordinate with JS.");
+        assert!(!snapshot.root_instructions().contains("Parallelize"));
+        assert!(!snapshot.root_instructions().contains("`reviewer`"));
         assert!(!snapshot.root_instructions().contains("Do not render"));
     }
 

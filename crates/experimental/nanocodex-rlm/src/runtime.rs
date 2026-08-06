@@ -13,8 +13,9 @@ use tokio::sync::{Mutex, Notify, Semaphore, broadcast};
 use tokio::task::JoinHandle;
 
 use crate::{
-    LaunchSnapshot, RlmAgentEvidence, RlmAgentId, RlmAgentSummary, RlmEvent, RlmEventKind,
-    RlmEvidence, RlmMessage, RlmStatus, RlmTurnEvidence, RlmUsage, SubagentSpec,
+    HarnessSnapshot, LaunchSnapshot, RlmAgentEvidence, RlmAgentId, RlmAgentSummary, RlmEvent,
+    RlmEventKind, RlmEvidence, RlmMessage, RlmStatus, RlmTurnEvidence, RlmUsage, SubagentSpec,
+    harness::{AppliedHarnessRevision, HarnessEdit, HarnessStore, render_context},
 };
 
 const DEFAULT_MAX_ACTIVE_TURNS: usize = 16;
@@ -27,6 +28,7 @@ const MAX_MESSAGE_BYTES: usize = 2 * 1_024;
 pub struct RlmPolicy {
     max_active_turns: NonZeroUsize,
     max_depth: NonZeroUsize,
+    harness_refinement: bool,
 }
 
 /// Invalid recursive runtime policy.
@@ -67,9 +69,15 @@ pub enum RlmRuntimeError {
     /// A supplied task or message was invalid.
     #[error("invalid RLM input: {0}")]
     InvalidInput(String),
+    /// Harness mutation is disabled for this runtime, such as during held-out evaluation.
+    #[error("continual harness refinement is disabled")]
+    HarnessReadOnly,
     /// The underlying Nanocodex child lifecycle failed.
     #[error("subagent lifecycle failed: {0}")]
     Agent(String),
+    /// Durable continual harness state could not be read or changed.
+    #[error("continual harness failed: {0}")]
+    Harness(String),
 }
 
 /// Owning process-local recursive runtime.
@@ -86,6 +94,7 @@ pub struct RlmTools {
 
 pub(crate) struct RuntimeState {
     pub(crate) launch: LaunchSnapshot,
+    pub(crate) harness: HarnessStore,
     policy: RlmPolicy,
     active: Arc<Semaphore>,
     registry: Mutex<Registry>,
@@ -104,6 +113,7 @@ struct Registry {
 struct Scope {
     finalized: bool,
     finalization_complete: bool,
+    root_handle: Option<AgentHandle>,
     creation_order: Vec<RlmAgentId>,
     children: HashMap<RlmAgentId, Child>,
     messages: Vec<RlmMessage>,
@@ -126,6 +136,8 @@ struct Child {
     active_monitor: Option<JoinHandle<()>>,
     event_forwarder: Option<JoinHandle<()>>,
     turns: Vec<RlmTurnEvidence>,
+    is_refiner: bool,
+    refinement_applied: bool,
 }
 
 struct Reservation {
@@ -141,6 +153,7 @@ impl Default for RlmPolicy {
             max_active_turns: NonZeroUsize::new(DEFAULT_MAX_ACTIVE_TURNS)
                 .unwrap_or(NonZeroUsize::MIN),
             max_depth: NonZeroUsize::new(DEFAULT_MAX_DEPTH).unwrap_or(NonZeroUsize::MIN),
+            harness_refinement: true,
         }
     }
 }
@@ -158,6 +171,7 @@ impl RlmPolicy {
         Ok(Self {
             max_active_turns,
             max_depth,
+            harness_refinement: true,
         })
     }
 
@@ -172,6 +186,19 @@ impl RlmPolicy {
     pub const fn max_depth(self) -> usize {
         self.max_depth.get()
     }
+
+    /// Enables or disables durable harness mutation and background refinement.
+    #[must_use]
+    pub const fn with_harness_refinement(mut self, enabled: bool) -> Self {
+        self.harness_refinement = enabled;
+        self
+    }
+
+    /// Whether this runtime may mutate its durable harness document.
+    #[must_use]
+    pub const fn harness_refinement_enabled(self) -> bool {
+        self.harness_refinement
+    }
 }
 
 impl RlmRuntime {
@@ -185,9 +212,11 @@ impl RlmRuntime {
     #[must_use]
     pub fn with_policy(launch: LaunchSnapshot, policy: RlmPolicy) -> Self {
         let (updates, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let harness = HarnessStore::new(launch.harness().clone());
         Self {
             state: Arc::new(RuntimeState {
                 launch,
+                harness,
                 policy,
                 active: Arc::new(Semaphore::new(policy.max_active_turns())),
                 registry: Mutex::new(Registry::default()),
@@ -225,6 +254,11 @@ impl RlmRuntime {
     #[must_use]
     pub fn launch(&self) -> &LaunchSnapshot {
         &self.state.launch
+    }
+
+    /// Returns the latest durable continual harness snapshot.
+    pub async fn harness(&self) -> HarnessSnapshot {
+        self.state.harness.snapshot().await
     }
 
     /// Projects all evidence currently retained for `root_session_id`.
@@ -267,11 +301,53 @@ impl RuntimeState {
     ) -> Result<RlmAgentSummary, RlmRuntimeError> {
         validate_text(&task, "subagent task", 64 * 1_024)?;
         let spec = self
-            .launch
-            .harness()
+            .harness
             .enabled_subagent(specification)
-            .cloned()
+            .await
             .ok_or_else(|| RlmRuntimeError::UnknownSpecification(specification.to_owned()))?;
+        self.spawn_spec(parent_handle, caller_session_id, spec, task, false)
+            .await
+    }
+
+    pub(crate) async fn refine(
+        self: &Arc<Self>,
+        parent_handle: &AgentHandle,
+        caller_session_id: &str,
+        observation: String,
+    ) -> Result<RlmAgentSummary, RlmRuntimeError> {
+        if !self.policy.harness_refinement_enabled() {
+            return Err(RlmRuntimeError::HarnessReadOnly);
+        }
+        validate_text(&observation, "refinement observation", 64 * 1_024)?;
+        let snapshot = self.harness.snapshot().await;
+        let task = format!(
+            "Trajectory observation:\n{}\n\nCurrent durable harness:\n{}",
+            observation.trim(),
+            render_context(&snapshot)
+        );
+        let spec = SubagentSpec {
+            id: "harness-refiner".into(),
+            name: "Harness refiner".into(),
+            description: "Reviews trajectory evidence and proposes one minimal durable update."
+                .into(),
+            instructions: self.launch.prompts().refiner().to_owned().into_boxed_str(),
+            enabled: true,
+        };
+        self.spawn_spec(parent_handle, caller_session_id, spec, task, true)
+            .await
+    }
+
+    async fn spawn_spec(
+        self: &Arc<Self>,
+        parent_handle: &AgentHandle,
+        caller_session_id: &str,
+        spec: SubagentSpec,
+        task: String,
+        is_refiner: bool,
+    ) -> Result<RlmAgentSummary, RlmRuntimeError> {
+        let specification = spec.id().to_owned();
+        self.remember_root_handle(caller_session_id, parent_handle.clone())
+            .await;
         let permit = Arc::clone(&self.active)
             .try_acquire_owned()
             .map_err(|_| RlmRuntimeError::Capacity(self.policy.max_active_turns()))?;
@@ -309,7 +385,7 @@ impl RuntimeState {
                 agent: agent.clone(),
                 parent: reservation.parent.clone(),
                 depth: reservation.depth,
-                specification: specification.to_owned().into_boxed_str(),
+                specification: specification.into_boxed_str(),
                 task: task.clone().into_boxed_str(),
                 status: RlmStatus::Running,
                 last_message: None,
@@ -319,6 +395,8 @@ impl RuntimeState {
                 active_monitor: None,
                 event_forwarder: None,
                 turns: Vec::new(),
+                is_refiner,
+                refinement_applied: false,
             };
             let summary = child.summary(reservation.id.clone());
             scope.creation_order.push(reservation.id.clone());
@@ -356,6 +434,15 @@ impl RuntimeState {
         )
         .await?;
         Ok(summary)
+    }
+
+    async fn remember_root_handle(&self, caller_session_id: &str, handle: AgentHandle) {
+        let mut registry = self.registry.lock().await;
+        let root = registry.root_for(caller_session_id);
+        let scope = registry.scopes.entry(root).or_default();
+        if scope.agent_for_session(caller_session_id).is_none() {
+            scope.root_handle = Some(handle);
+        }
     }
 
     async fn reserve(&self, caller_session_id: &str) -> Result<Reservation, RlmRuntimeError> {
@@ -585,6 +672,138 @@ impl RuntimeState {
             }
         }
         drop(self.updates.send(event));
+    }
+
+    pub(crate) async fn harness_snapshot(&self) -> HarnessSnapshot {
+        self.harness.snapshot().await
+    }
+
+    pub(crate) async fn apply_harness_edit(
+        &self,
+        caller_session_id: &str,
+        caller_handle: AgentHandle,
+        edit: HarnessEdit,
+        trigger: String,
+    ) -> Result<(AppliedHarnessRevision, usize, Vec<String>), RlmRuntimeError> {
+        if !self.policy.harness_refinement_enabled() {
+            return Err(RlmRuntimeError::HarnessReadOnly);
+        }
+        let claimed_refiner = self.claim_refiner_edit(caller_session_id).await?;
+        let revision = match self.harness.apply(edit, trigger).await {
+            Ok(revision) => revision,
+            Err(error) => {
+                if claimed_refiner {
+                    self.release_refiner_edit(caller_session_id).await;
+                }
+                return Err(RlmRuntimeError::Harness(error.to_string()));
+            }
+        };
+        let (queued, failures) = self
+            .publish_harness_context(caller_session_id, caller_handle, &revision.context)
+            .await;
+        Ok((revision, queued, failures))
+    }
+
+    async fn claim_refiner_edit(&self, caller_session_id: &str) -> Result<bool, RlmRuntimeError> {
+        let mut registry = self.registry.lock().await;
+        let root = registry.root_for(caller_session_id);
+        let Some(scope) = registry.scopes.get_mut(&root) else {
+            return Ok(false);
+        };
+        let Some(id) = scope.agent_for_session(caller_session_id) else {
+            return Ok(false);
+        };
+        let child = scope
+            .children
+            .get_mut(&id)
+            .ok_or_else(|| RlmRuntimeError::UnknownAgent(id.to_string()))?;
+        if !child.is_refiner {
+            return Ok(false);
+        }
+        if child.refinement_applied {
+            return Err(RlmRuntimeError::InvalidInput(
+                "a background refiner may apply at most one harness edit".to_owned(),
+            ));
+        }
+        child.refinement_applied = true;
+        Ok(true)
+    }
+
+    async fn release_refiner_edit(&self, caller_session_id: &str) {
+        let mut registry = self.registry.lock().await;
+        let root = registry.root_for(caller_session_id);
+        let Some(scope) = registry.scopes.get_mut(&root) else {
+            return;
+        };
+        let Some(id) = scope.agent_for_session(caller_session_id) else {
+            return;
+        };
+        if let Some(child) = scope.children.get_mut(&id)
+            && child.is_refiner
+        {
+            child.refinement_applied = false;
+        }
+    }
+
+    pub(crate) async fn rollback_harness(
+        &self,
+        caller_session_id: &str,
+        caller_handle: AgentHandle,
+        revision: u64,
+        trigger: String,
+    ) -> Result<(AppliedHarnessRevision, usize, Vec<String>), RlmRuntimeError> {
+        if !self.policy.harness_refinement_enabled() {
+            return Err(RlmRuntimeError::HarnessReadOnly);
+        }
+        let revision = self
+            .harness
+            .rollback(revision, trigger)
+            .await
+            .map_err(|error| RlmRuntimeError::Harness(error.to_string()))?;
+        let (queued, failures) = self
+            .publish_harness_context(caller_session_id, caller_handle, &revision.context)
+            .await;
+        Ok((revision, queued, failures))
+    }
+
+    async fn publish_harness_context(
+        &self,
+        caller_session_id: &str,
+        caller_handle: AgentHandle,
+        context: &str,
+    ) -> (usize, Vec<String>) {
+        let (root_handle, children) = {
+            let mut registry = self.registry.lock().await;
+            let root = registry.root_for(caller_session_id);
+            let scope = registry.scopes.entry(root).or_default();
+            if scope.agent_for_session(caller_session_id).is_none() {
+                scope.root_handle = Some(caller_handle);
+            }
+            (
+                scope.root_handle.clone(),
+                scope
+                    .children
+                    .iter()
+                    .filter(|(_, child)| child.status != RlmStatus::Closed)
+                    .map(|(id, child)| (id.clone(), child.agent.clone()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let mut queued = 0;
+        let mut failures = Vec::new();
+        if let Some(root) = root_handle {
+            match root.append_developer_message(context.to_owned()).await {
+                Ok(_) => queued += 1,
+                Err(error) => failures.push(format!("root: {error}")),
+            }
+        }
+        for (id, child) in children {
+            match child.append_developer_message(context.to_owned()).await {
+                Ok(_) => queued += 1,
+                Err(error) => failures.push(format!("{id}: {error}")),
+            }
+        }
+        (queued, failures)
     }
 
     pub(crate) async fn list(
@@ -976,6 +1195,7 @@ impl RuntimeState {
     }
 
     async fn evidence(&self, root_session_id: &str) -> Option<RlmEvidence> {
+        let harness = self.harness.snapshot().await;
         let registry = self.registry.lock().await;
         let scope = registry.scopes.get(root_session_id)?;
         let mut usage = RlmUsage::default();
@@ -999,6 +1219,9 @@ impl RuntimeState {
             root_session_id: root_session_id.to_owned().into_boxed_str(),
             launch_digest: self.launch.digest().to_owned().into_boxed_str(),
             harness_revision: self.launch.harness().revision(),
+            final_harness_revision: harness.revision(),
+            final_harness_digest: harness.digest().to_owned().into_boxed_str(),
+            refinements: harness.refinements().to_vec(),
             agents,
             messages: scope.messages.clone(),
             events: scope.events.clone(),
@@ -1241,6 +1464,12 @@ mod tests {
     fn policy_rejects_zero_bounds() {
         assert_eq!(RlmPolicy::new(0, 1), Err(RlmPolicyError::ZeroActiveTurns));
         assert_eq!(RlmPolicy::new(1, 0), Err(RlmPolicyError::ZeroDepth));
+        assert!(RlmPolicy::default().harness_refinement_enabled());
+        assert!(
+            !RlmPolicy::default()
+                .with_harness_refinement(false)
+                .harness_refinement_enabled()
+        );
     }
 
     #[test]

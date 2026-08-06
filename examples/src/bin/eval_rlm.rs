@@ -24,15 +24,21 @@ async fn main() -> Result<(), support::AnyError> {
         .transpose()?
         .unwrap_or(3);
 
-    let launch = LaunchSnapshot::new(PromptPack::load(prompts)?, HarnessSnapshot::load(harness)?);
+    let prompts = PromptPack::load(prompts)?;
+    let prompt_cache_key = format!("nanocodex-rlm-prefix-{}", prompts.digest());
+    let launch = LaunchSnapshot::new(prompts, HarnessSnapshot::load(harness)?);
     let runtime = RlmRuntime::new(launch);
     let treatment = format!("rlm-{}", runtime.launch().digest());
     let agent = Nanocodex::builder(OpenAi::new(support::auth()?)?);
+    let rlm_agent = agent
+        .clone()
+        .prompt_cache_key(prompt_cache_key)
+        .shared_prompt_cache();
     let sweep = Sweep::builder()
         .task(task.clone())
         .trials(trials)
         .agent("baseline", agent.clone())?
-        .agent(&treatment, agent.clone())?
+        .agent(&treatment, rlm_agent)?
         .build()?;
     let planned = sweep.attempt_count();
 
@@ -75,7 +81,9 @@ async fn main() -> Result<(), support::AnyError> {
         .await?;
     let evaluator = Evaluator::builder(agent, backend)
         .output_directory(".nanocodex/evals/rlm")
-        .max_concurrency(4)
+        // Continual refinement is deliberately ordered: concurrent attempts
+        // must not race while evolving one durable harness document.
+        .max_concurrency(1)
         .resume_incomplete(sweep)
         .build()?;
 
