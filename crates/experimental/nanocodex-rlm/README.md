@@ -2,8 +2,9 @@
 
 `nanocodex-rlm` is an unpublished, application-owned recursive language-model
 runtime built only from Nanocodex's public agent and tool APIs. It gives Code
-Mode a stable set of subagent operations while leaving conversation,
-transport, and tool-runtime ownership in each spawned `Nanocodex` driver.
+Mode an evolving catalog of async subagent functions while leaving
+conversation, transport, and tool-runtime ownership in each spawned
+`Nanocodex` driver.
 
 Prime Agent supplies the semantic model: orchestration is programmatic,
 children start asynchronously, clean children may recurse, and supplemental
@@ -14,8 +15,13 @@ project's exact model-facing API is copied.
 
 ## Contract
 
-The Responses API still exposes Nanocodex's single `exec` Code Mode tool. The
-stable logical operations are:
+The Responses API exposes Nanocodex's stable `exec` and `wait` Code Mode
+boundary. RLM operations are provided by a dynamic runtime provider, so their
+names, descriptions, and schemas are not rendered into the model-visible
+`exec` definition. Each fresh JavaScript cell receives their current metadata
+through `ALL_TOOLS` and their callable async functions through `tools`.
+
+The stable runtime control operations are:
 
 - `spawn`: start a clean child and return its identity without awaiting its
   final answer;
@@ -31,14 +37,27 @@ stable logical operations are:
 - `refine_harness`: asynchronously ask a clean refiner to inspect one
   trajectory observation and apply at most one justified edit.
 
-The first native adapter exposes these as `tools.spawn_agent`,
+The native adapter exposes those controls as `tools.spawn_agent`,
 `tools.list_agents`, `tools.send_agent_message`, `tools.wait_agent`,
-`tools.interrupt_agent`, and `tools.close_agent` inside the existing persistent
-Code Mode cell. Continual operations are available as `tools.harness_state`,
+`tools.interrupt_agent`, `tools.close_agent`, `tools.harness_state`,
 `tools.harness_apply`, `tools.harness_rollback`, and `tools.refine_harness`.
-Operation names, schemas, ordering, bounds, authorization, and lifecycle
-behavior are code-owned and immutable. Human-facing descriptions and examples
-are loaded at launch from a prompt directory.
+Each enabled harness subagent additionally materializes as a runtime function:
+
+```js
+const available = ALL_TOOLS.filter(({ name }) =>
+  name.startsWith("subagent__")
+)
+
+const child = await tools.subagent__runtime_investigator({
+  task: "Trace cancellation ownership and report concrete evidence."
+})
+```
+
+The generated function starts a clean child and returns its identity without
+waiting for completion. Creating, updating, disabling, deleting, or rolling
+back a subagent refreshes this catalog. A new function is visible in
+`ALL_TOOLS` in the next fresh cell and is callable immediately by name through
+the `tools` proxy. None of those changes rebuild the Responses request prefix.
 
 ## Prompt and harness inputs
 
@@ -49,7 +68,7 @@ prompts/
 ├── orchestration.md   root-facing programming guidance
 ├── subagent.md        guidance injected into every clean child
 ├── refiner.md         immutable background-refinement policy
-└── tools.toml         model-facing descriptions for stable operations
+└── tools.toml         runtime descriptions for stable control operations
 ```
 
 `HarnessSnapshot::load` reads a separate evolving TOML document:
@@ -75,26 +94,32 @@ description = "Runs focused checks after a local change."
 instructions = "Format, run the focused test, then inspect the exact diff."
 
 [[subagents]]
-id = "runtime-investigator"
+id = "runtime_investigator"
 name = "Runtime investigator"
 description = "Traces ownership, cancellation, and cleanup."
 instructions = "Cite concrete files and report unresolved ownership questions."
 enabled = true
 ```
 
-All inputs are validated and content-addressed before an agent starts. The
-`LaunchSnapshot` records the immutable prompt/tool prefix and initial harness
-identity. During a run, `HarnessStore` serializes edits, increments the revision,
-atomically replaces the TOML file, and archives the previous document for
-rollback. Root and retained children share the latest revision.
+All inputs are validated and content-addressed before an agent starts. Subagent
+IDs contain only ASCII letters, digits, and underscores so each ID maps to one
+unambiguous `subagent__<id>` JavaScript function. The `LaunchSnapshot` records
+the immutable prompt identity and initial harness identity. During a run,
+`HarnessStore` serializes edits, increments the revision, atomically replaces
+the TOML file, archives the previous document for rollback, and refreshes a
+synchronous runtime projection consumed when Code Mode starts a cell. Root and
+retained children share the latest revision.
 
-An accepted revision never rewrites Nanocodex's system prompt or tool
-definitions. Instead, its complete supplemental snapshot is appended as a
-developer-context delta through `AgentHandle::append_developer_message`. When a
-turn is active, Nanocodex queues that delta and commits it after the turn, before
-the next prompt. The Responses request prefix, tool order, stable prompt-cache
-key, and all preceding conversation bytes therefore remain unchanged. New clean
-children receive the latest selected specification before their first prompt.
+The immutable orchestration prompt is appended to the selected agent
+instructions and shared by roots and clean children. An accepted revision never
+rewrites it or the Responses tool definitions. The provider changes only the
+functions materialized inside Code Mode. The complete supplemental snapshot is
+also appended as a developer-context delta through
+`AgentHandle::append_developer_message`. When a turn is active, Nanocodex queues
+that delta and commits it after the turn, before the next prompt. The Responses
+request prefix, tool order, stable prompt-cache key, and all preceding
+conversation bytes therefore remain unchanged. New clean children receive the
+latest selected specification before their first prompt.
 
 ## Evaluation
 
@@ -116,9 +141,12 @@ copy the selected TOML revision to a fresh path and set
 own treatment.
 
 The example's cache key is derived only from the immutable prompt pack, not the
-mutable harness digest. Builders cloned for RLM attempts share the immutable
-prefix warmup. Treatment and evidence identities still include the initial
-harness digest so results remain attributable.
+mutable harness digest or runtime subagent catalog. Builders cloned for RLM
+attempts share the immutable prefix warmup. A regression test mutates the
+catalog, proves that `subagent__reviewer` appears in the next Code Mode cell,
+and compares the serialized model-visible tool definitions byte-for-byte.
+Treatment and evidence identities still include the initial harness digest so
+results remain attributable.
 
 Run the matched PR #72 sweep with:
 

@@ -32,6 +32,7 @@ async fn main() -> Result<(), support::AnyError> {
     let agent = Nanocodex::builder(OpenAi::new(support::auth()?)?);
     let rlm_agent = agent
         .clone()
+        .append_instructions(runtime.launch().root_instructions())
         .prompt_cache_key(prompt_cache_key)
         .shared_prompt_cache();
     let sweep = Sweep::builder()

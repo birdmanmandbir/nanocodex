@@ -1,23 +1,28 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Weak},
+    time::Duration,
+};
 
 use nanocodex::{
     Tool, Tools,
     agent::AgentHandle,
     tools::{
         ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolResult, ToolsBuildError,
-        contract::async_trait,
+        contract::async_trait, runtime::DynamicToolProvider,
     },
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json, value::to_raw_value};
 
 use crate::{RlmAgentId, RlmRuntimeError, RlmTools, harness::HarnessEdit, runtime::RuntimeState};
 
 const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
+const SUBAGENT_TOOL_PREFIX: &str = "subagent__";
 
 impl RlmTools {
-    /// Adds the recursive operations to one fresh agent-relative tool collection.
+    /// Adds runtime-discovered recursive operations to one fresh agent-relative
+    /// tool collection.
     ///
     /// # Errors
     ///
@@ -25,46 +30,17 @@ impl RlmTools {
     pub fn install(&self, tools: Tools, agent: AgentHandle) -> Result<Tools, ToolsBuildError> {
         tools
             .into_builder()
-            .tool(SpawnAgent {
-                parent: agent.clone(),
-                state: self.state.clone(),
-            })
-            .tool(ListAgents {
-                state: self.state.clone(),
-            })
-            .tool(SendAgentMessage {
-                state: self.state.clone(),
-            })
-            .tool(WaitAgent {
-                state: self.state.clone(),
-            })
-            .tool(ChangeLifecycle {
-                state: self.state.clone(),
-                operation: LifecycleOperation::Interrupt,
-            })
-            .tool(ChangeLifecycle {
-                state: self.state.clone(),
-                operation: LifecycleOperation::Close,
-            })
-            .tool(HarnessState {
-                state: self.state.clone(),
-            })
-            .tool(HarnessMutation {
-                agent: agent.clone(),
-                state: self.state.clone(),
-                operation: HarnessMutationOperation::Apply,
-            })
-            .tool(HarnessMutation {
-                agent: agent.clone(),
-                state: self.state.clone(),
-                operation: HarnessMutationOperation::Rollback,
-            })
-            .tool(RefineHarness {
-                parent: agent,
+            .provider(RlmProvider {
+                parent: Some(agent),
                 state: self.state.clone(),
             })
             .build()
     }
+}
+
+struct RlmProvider {
+    parent: Option<AgentHandle>,
+    state: Weak<RuntimeState>,
 }
 
 #[derive(Deserialize)]
@@ -121,6 +97,12 @@ struct HarnessRollbackArgs {
 #[serde(deny_unknown_fields)]
 struct RefineArgs {
     observation: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubagentArgs {
+    task: String,
 }
 
 #[derive(Serialize)]
@@ -194,6 +176,97 @@ struct ChangeLifecycle {
 }
 
 #[async_trait]
+impl DynamicToolProvider for RlmProvider {
+    fn start(&self) {}
+
+    fn direct_tools(&self) -> Vec<Arc<dyn Tool>> {
+        Vec::new()
+    }
+
+    fn available_definitions(&self) -> Vec<ToolDefinition> {
+        let mut definitions = control_definitions(&self.state);
+        if let Some(state) = self.state.upgrade() {
+            let mut subagents = state
+                .harness
+                .enabled_subagents()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            subagents.sort_unstable_by(|left, right| left.id().cmp(right.id()));
+            definitions.extend(subagents.iter().map(subagent_definition));
+        }
+        definitions
+    }
+
+    fn supports_parallel_tool_calls(&self, name: &str) -> bool {
+        name == "spawn_agent" || name.starts_with(SUBAGENT_TOOL_PREFIX)
+    }
+
+    async fn execute(
+        &self,
+        name: &str,
+        input: Value,
+        context: ToolContext<'_>,
+    ) -> Option<ToolOutput> {
+        if let Some(specification) = name.strip_prefix(SUBAGENT_TOOL_PREFIX) {
+            return Some(
+                execute_subagent_function(
+                    &self.state,
+                    self.parent.as_ref(),
+                    specification,
+                    input,
+                    context,
+                )
+                .await,
+            );
+        }
+
+        let tool: Box<dyn Tool> = match name {
+            "spawn_agent" => Box::new(SpawnAgent {
+                parent: self.parent.clone()?,
+                state: self.state.clone(),
+            }),
+            "list_agents" => Box::new(ListAgents {
+                state: self.state.clone(),
+            }),
+            "send_agent_message" => Box::new(SendAgentMessage {
+                state: self.state.clone(),
+            }),
+            "wait_agent" => Box::new(WaitAgent {
+                state: self.state.clone(),
+            }),
+            "interrupt_agent" => Box::new(ChangeLifecycle {
+                state: self.state.clone(),
+                operation: LifecycleOperation::Interrupt,
+            }),
+            "close_agent" => Box::new(ChangeLifecycle {
+                state: self.state.clone(),
+                operation: LifecycleOperation::Close,
+            }),
+            "harness_state" => Box::new(HarnessState {
+                state: self.state.clone(),
+            }),
+            "harness_apply" => Box::new(HarnessMutation {
+                agent: self.parent.clone()?,
+                state: self.state.clone(),
+                operation: HarnessMutationOperation::Apply,
+            }),
+            "harness_rollback" => Box::new(HarnessMutation {
+                agent: self.parent.clone()?,
+                state: self.state.clone(),
+                operation: HarnessMutationOperation::Rollback,
+            }),
+            "refine_harness" => Box::new(RefineHarness {
+                parent: self.parent.clone()?,
+                state: self.state.clone(),
+            }),
+            _ => return None,
+        };
+        Some(execute_provider_tool(tool.as_ref(), input, context).await)
+    }
+}
+
+#[async_trait]
 impl Tool for SpawnAgent {
     fn definition(&self) -> ToolDefinition {
         spawn_definition(&self.state)
@@ -215,25 +288,15 @@ impl Tool for SpawnAgent {
 }
 
 fn spawn_definition(state: &std::sync::Weak<RuntimeState>) -> ToolDefinition {
-    let description = state.upgrade().map_or_else(
-        || "Start one clean recursive subagent.".to_owned(),
-        |state| {
-            format!(
-                "{}\n\n{}",
-                state.launch.root_instructions(),
-                state.launch.prompts().tools().spawn()
-            )
-        },
-    );
     ToolDefinition::function(
         "spawn_agent",
-        description,
+        description(state, |state| state.launch.prompts().tools().spawn()),
         json!({
             "type": "object",
             "properties": {
                 "specification": {
                     "type": "string",
-                    "description": "Enabled specification ID listed in this tool's launch guidance."
+                    "description": "Current enabled specification ID returned by harness_state."
                 },
                 "task": {
                     "type": "string",
@@ -250,20 +313,7 @@ fn spawn_definition(state: &std::sync::Weak<RuntimeState>) -> ToolDefinition {
 #[async_trait]
 impl Tool for ListAgents {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition::function(
-            "list_agents",
-            description(&self.state, |state| state.launch.prompts().tools().list()),
-            json!({
-                "type": "object",
-                "properties": {
-                    "include_closed": {
-                        "type": "boolean",
-                        "default": false
-                    }
-                },
-                "additionalProperties": false
-            }),
-        )
+        list_definition(&self.state)
     }
 
     async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult {
@@ -273,30 +323,27 @@ impl Tool for ListAgents {
     }
 }
 
+fn list_definition(state: &Weak<RuntimeState>) -> ToolDefinition {
+    ToolDefinition::function(
+        "list_agents",
+        description(state, |state| state.launch.prompts().tools().list()),
+        json!({
+            "type": "object",
+            "properties": {
+                "include_closed": {
+                    "type": "boolean",
+                    "default": false
+                }
+            },
+            "additionalProperties": false
+        }),
+    )
+}
+
 #[async_trait]
 impl Tool for SendAgentMessage {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition::function(
-            "send_agent_message",
-            description(&self.state, |state| state.launch.prompts().tools().send()),
-            json!({
-                "type": "object",
-                "properties": {
-                    "to": {
-                        "type": "string",
-                        "minLength": 1,
-                        "description": "A retained agent ID, or `parent` when called by a child."
-                    },
-                    "message": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 2048
-                    }
-                },
-                "required": ["to", "message"],
-                "additionalProperties": false
-            }),
-        )
+        send_definition(&self.state)
     }
 
     async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult {
@@ -309,30 +356,34 @@ impl Tool for SendAgentMessage {
     }
 }
 
+fn send_definition(state: &Weak<RuntimeState>) -> ToolDefinition {
+    ToolDefinition::function(
+        "send_agent_message",
+        description(state, |state| state.launch.prompts().tools().send()),
+        json!({
+            "type": "object",
+            "properties": {
+                "to": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "A retained agent ID, or `parent` when called by a child."
+                },
+                "message": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 2048
+                }
+            },
+            "required": ["to", "message"],
+            "additionalProperties": false
+        }),
+    )
+}
+
 #[async_trait]
 impl Tool for WaitAgent {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition::function(
-            "wait_agent",
-            description(&self.state, |state| state.launch.prompts().tools().wait()),
-            json!({
-                "type": "object",
-                "properties": {
-                    "agent_ids": {
-                        "type": "array",
-                        "items": { "type": "string", "minLength": 1 },
-                        "description": "Selected agent IDs. May be empty when waiting only for inbound messages."
-                    },
-                    "timeout_ms": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 300000,
-                        "description": "Defaults to 30000 milliseconds."
-                    }
-                },
-                "additionalProperties": false
-            }),
-        )
+        wait_definition(&self.state)
     }
 
     async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult {
@@ -354,33 +405,34 @@ impl Tool for WaitAgent {
     }
 }
 
+fn wait_definition(state: &Weak<RuntimeState>) -> ToolDefinition {
+    ToolDefinition::function(
+        "wait_agent",
+        description(state, |state| state.launch.prompts().tools().wait()),
+        json!({
+            "type": "object",
+            "properties": {
+                "agent_ids": {
+                    "type": "array",
+                    "items": { "type": "string", "minLength": 1 },
+                    "description": "Selected agent IDs. May be empty when waiting only for inbound messages."
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 300000,
+                    "description": "Defaults to 30000 milliseconds."
+                }
+            },
+            "additionalProperties": false
+        }),
+    )
+}
+
 #[async_trait]
 impl Tool for ChangeLifecycle {
     fn definition(&self) -> ToolDefinition {
-        let (name, description) = match self.operation {
-            LifecycleOperation::Interrupt => (
-                "interrupt_agent",
-                description(&self.state, |state| {
-                    state.launch.prompts().tools().interrupt()
-                }),
-            ),
-            LifecycleOperation::Close => (
-                "close_agent",
-                description(&self.state, |state| state.launch.prompts().tools().close()),
-            ),
-        };
-        ToolDefinition::function(
-            name,
-            description,
-            json!({
-                "type": "object",
-                "properties": {
-                    "agent_id": { "type": "string", "minLength": 1 }
-                },
-                "required": ["agent_id"],
-                "additionalProperties": false
-            }),
-        )
+        lifecycle_definition(&self.state, self.operation)
     }
 
     async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult {
@@ -398,20 +450,38 @@ impl Tool for ChangeLifecycle {
     }
 }
 
+fn lifecycle_definition(
+    state: &Weak<RuntimeState>,
+    operation: LifecycleOperation,
+) -> ToolDefinition {
+    let (name, description) = match operation {
+        LifecycleOperation::Interrupt => (
+            "interrupt_agent",
+            description(state, |state| state.launch.prompts().tools().interrupt()),
+        ),
+        LifecycleOperation::Close => (
+            "close_agent",
+            description(state, |state| state.launch.prompts().tools().close()),
+        ),
+    };
+    ToolDefinition::function(
+        name,
+        description,
+        json!({
+            "type": "object",
+            "properties": {
+                "agent_id": { "type": "string", "minLength": 1 }
+            },
+            "required": ["agent_id"],
+            "additionalProperties": false
+        }),
+    )
+}
+
 #[async_trait]
 impl Tool for HarnessState {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition::function(
-            "harness_state",
-            description(&self.state, |state| {
-                state.launch.prompts().tools().harness_state()
-            }),
-            json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            }),
-        )
+        harness_state_definition(&self.state)
     }
 
     async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
@@ -421,49 +491,24 @@ impl Tool for HarnessState {
     }
 }
 
+fn harness_state_definition(state: &Weak<RuntimeState>) -> ToolDefinition {
+    ToolDefinition::function(
+        "harness_state",
+        description(state, |state| {
+            state.launch.prompts().tools().harness_state()
+        }),
+        json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+    )
+}
+
 #[async_trait]
 impl Tool for HarnessMutation {
     fn definition(&self) -> ToolDefinition {
-        match self.operation {
-            HarnessMutationOperation::Apply => ToolDefinition::function(
-                "harness_apply",
-                description(&self.state, |state| {
-                    state.launch.prompts().tools().harness_apply()
-                }),
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "trigger": {
-                            "type": "string",
-                            "minLength": 1,
-                            "description": "Concrete trajectory evidence motivating this one small change."
-                        },
-                        "edit": harness_edit_schema()
-                    },
-                    "required": ["trigger", "edit"],
-                    "additionalProperties": false
-                }),
-            ),
-            HarnessMutationOperation::Rollback => ToolDefinition::function(
-                "harness_rollback",
-                description(&self.state, |state| {
-                    state.launch.prompts().tools().harness_rollback()
-                }),
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "revision": { "type": "integer", "minimum": 0 },
-                        "trigger": {
-                            "type": "string",
-                            "minLength": 1,
-                            "description": "Observed regression motivating rollback."
-                        }
-                    },
-                    "required": ["revision", "trigger"],
-                    "additionalProperties": false
-                }),
-            ),
-        }
+        harness_mutation_definition(&self.state, self.operation)
     }
 
     async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult {
@@ -502,25 +547,56 @@ impl Tool for HarnessMutation {
     }
 }
 
-#[async_trait]
-impl Tool for RefineHarness {
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition::function(
-            "refine_harness",
-            description(&self.state, |state| state.launch.prompts().tools().refine()),
+fn harness_mutation_definition(
+    state: &Weak<RuntimeState>,
+    operation: HarnessMutationOperation,
+) -> ToolDefinition {
+    match operation {
+        HarnessMutationOperation::Apply => ToolDefinition::function(
+            "harness_apply",
+            description(state, |state| {
+                state.launch.prompts().tools().harness_apply()
+            }),
             json!({
                 "type": "object",
                 "properties": {
-                    "observation": {
+                    "trigger": {
                         "type": "string",
                         "minLength": 1,
-                        "description": "Concrete success, failure, or repeated tactic from the current trajectory."
-                    }
+                        "description": "Concrete trajectory evidence motivating this one small change."
+                    },
+                    "edit": harness_edit_schema()
                 },
-                "required": ["observation"],
+                "required": ["trigger", "edit"],
                 "additionalProperties": false
             }),
-        )
+        ),
+        HarnessMutationOperation::Rollback => ToolDefinition::function(
+            "harness_rollback",
+            description(state, |state| {
+                state.launch.prompts().tools().harness_rollback()
+            }),
+            json!({
+                "type": "object",
+                "properties": {
+                    "revision": { "type": "integer", "minimum": 0 },
+                    "trigger": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Observed regression motivating rollback."
+                    }
+                },
+                "required": ["revision", "trigger"],
+                "additionalProperties": false
+            }),
+        ),
+    }
+}
+
+#[async_trait]
+impl Tool for RefineHarness {
+    fn definition(&self) -> ToolDefinition {
+        refine_definition(&self.state)
     }
 
     async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult {
@@ -530,6 +606,111 @@ impl Tool for RefineHarness {
             .refine(&self.parent, context.session_id(), args.observation)
             .await?;
         json_output(summary)
+    }
+}
+
+fn refine_definition(state: &Weak<RuntimeState>) -> ToolDefinition {
+    ToolDefinition::function(
+        "refine_harness",
+        description(state, |state| state.launch.prompts().tools().refine()),
+        json!({
+            "type": "object",
+            "properties": {
+                "observation": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Concrete success, failure, or repeated tactic from the current trajectory."
+                }
+            },
+            "required": ["observation"],
+            "additionalProperties": false
+        }),
+    )
+}
+
+fn control_definitions(state: &Weak<RuntimeState>) -> Vec<ToolDefinition> {
+    vec![
+        spawn_definition(state),
+        list_definition(state),
+        send_definition(state),
+        wait_definition(state),
+        lifecycle_definition(state, LifecycleOperation::Interrupt),
+        lifecycle_definition(state, LifecycleOperation::Close),
+        harness_state_definition(state),
+        harness_mutation_definition(state, HarnessMutationOperation::Apply),
+        harness_mutation_definition(state, HarnessMutationOperation::Rollback),
+        refine_definition(state),
+    ]
+}
+
+fn subagent_definition(spec: &crate::SubagentSpec) -> ToolDefinition {
+    ToolDefinition::function(
+        format!("{SUBAGENT_TOOL_PREFIX}{}", spec.id()),
+        format!(
+            "{} — {} Starts this clean subagent asynchronously and returns its identity immediately. Call with {{ task: string }}.",
+            spec.name(),
+            spec.description()
+        ),
+        json!({
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 65536,
+                    "description": "Complete focused task for this clean subagent."
+                }
+            },
+            "required": ["task"],
+            "additionalProperties": false
+        }),
+    )
+}
+
+async fn execute_provider_tool(
+    tool: &dyn Tool,
+    input: Value,
+    context: ToolContext<'_>,
+) -> ToolOutput {
+    let input = match to_raw_value(&input) {
+        Ok(input) => ToolInput::Function(input),
+        Err(error) => return ToolOutput::error(format!("failed to encode RLM input: {error}")),
+    };
+    match tool.execute(input, context).await {
+        Ok(output) => output,
+        Err(error) => ToolOutput::error(error.to_string()),
+    }
+}
+
+async fn execute_subagent_function(
+    state: &Weak<RuntimeState>,
+    parent: Option<&AgentHandle>,
+    specification: &str,
+    input: Value,
+    context: ToolContext<'_>,
+) -> ToolOutput {
+    let Some(parent) = parent else {
+        return ToolOutput::error("RLM agent-relative capability is unavailable");
+    };
+    let args = match serde_json::from_value::<SubagentArgs>(input) {
+        Ok(args) => args,
+        Err(error) => {
+            return ToolOutput::error(format!("failed to decode subagent arguments: {error}"));
+        }
+    };
+    let state = match upgrade(state) {
+        Ok(state) => state,
+        Err(error) => return ToolOutput::error(error.to_string()),
+    };
+    match state
+        .spawn(parent, context.session_id(), specification, args.task)
+        .await
+    {
+        Ok(summary) => match json_output(summary) {
+            Ok(output) => output,
+            Err(error) => ToolOutput::error(error.to_string()),
+        },
+        Err(error) => ToolOutput::error(error.to_string()),
     }
 }
 
@@ -598,6 +779,13 @@ fn json_output(value: impl Serialize) -> ToolResult {
 mod tests {
     use std::fs;
 
+    use nanocodex::{
+        Tools,
+        tools::{
+            contract::{DEFAULT_TOOL_OUTPUT_TOKENS, ToolContext},
+            runtime::{DynamicToolProvider, ToolRuntime},
+        },
+    };
     use tempfile::tempdir;
 
     use crate::{HarnessSnapshot, LaunchSnapshot, PromptPack, RlmRuntime, harness::HarnessEdit};
@@ -625,11 +813,15 @@ mod tests {
             PromptPack::load(prompts).unwrap(),
             HarnessSnapshot::load(harness).unwrap(),
         ));
-        let definition = super::spawn_definition(&runtime.tools().state);
-        let encoded = serde_json::to_string(&definition).unwrap();
-        assert!(encoded.contains("ROOT GUIDANCE"));
+        let provider = super::RlmProvider {
+            parent: None,
+            state: runtime.tools().state,
+        };
+        let encoded = serde_json::to_string(&provider.available_definitions()).unwrap();
         assert!(encoded.contains("CUSTOM SPAWN"));
-        assert!(!encoded.contains("General work"));
+        assert!(encoded.contains("subagent__general"));
+        assert!(encoded.contains("General work"));
+        assert!(!encoded.contains("ROOT GUIDANCE"));
     }
 
     #[tokio::test]
@@ -656,7 +848,19 @@ mod tests {
             HarnessSnapshot::load(harness).unwrap(),
         ));
         let launch_digest = runtime.launch().digest().to_owned();
-        let before = serde_json::to_vec(&super::spawn_definition(&runtime.tools().state)).unwrap();
+        let tools = Tools::builder()
+            .without_defaults()
+            .provider(super::RlmProvider {
+                parent: None,
+                state: runtime.tools().state,
+            })
+            .build()
+            .unwrap();
+        let tool_runtime = ToolRuntime::new_with_tools(directory.path(), None, None, &tools);
+        let before = serde_json::to_vec(&tool_runtime.model_specs("root")).unwrap();
+        let model_prefix = String::from_utf8_lossy(&before);
+        assert!(!model_prefix.contains("spawn_agent"));
+        assert!(!model_prefix.contains("subagent__general"));
 
         runtime
             .state
@@ -674,9 +878,26 @@ mod tests {
             .await
             .unwrap();
 
-        let after = serde_json::to_vec(&super::spawn_definition(&runtime.tools().state)).unwrap();
+        let after = serde_json::to_vec(&tool_runtime.model_specs("root")).unwrap();
         assert_eq!(before, after);
         assert_eq!(runtime.launch().digest(), launch_digest);
         assert_eq!(runtime.harness().await.revision(), 1);
+
+        let execution = tool_runtime
+            .execute_code(
+                "text(ALL_TOOLS.map(({ name }) => name).join(','));",
+                ToolContext::new(
+                    "test-model",
+                    "root",
+                    "test-call",
+                    &[],
+                    DEFAULT_TOOL_OUTPUT_TOKENS,
+                ),
+            )
+            .await;
+        assert!(execution.success);
+        let output = serde_json::to_string(&execution.output).unwrap();
+        assert!(output.contains("subagent__general"));
+        assert!(output.contains("subagent__reviewer"));
     }
 }

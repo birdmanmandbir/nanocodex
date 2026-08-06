@@ -241,7 +241,9 @@ impl RlmRuntime {
     #[must_use]
     pub fn agent_builder(&self, builder: NanocodexBuilder, tools: Tools) -> NanocodexBuilder {
         let installer = self.tools();
-        builder.tools_factory(move |agent| installer.install(tools.clone(), agent))
+        builder
+            .append_instructions(self.launch().root_instructions())
+            .tools_factory(move |agent| installer.install(tools.clone(), agent))
     }
 
     /// Subscribes to recursive child lifecycle and raw agent events.

@@ -1,4 +1,7 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{Arc, RwLock},
+};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -12,6 +15,7 @@ const MAX_HARNESS_TEXT_BYTES: usize = 64 * 1024;
 
 pub(crate) struct HarnessStore {
     current: Mutex<HarnessSnapshot>,
+    enabled_subagents: RwLock<Arc<[SubagentSpec]>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -112,8 +116,10 @@ pub(crate) enum HarnessStoreError {
 
 impl HarnessStore {
     pub(crate) fn new(initial: HarnessSnapshot) -> Self {
+        let enabled_subagents = enabled_subagents(&initial);
         Self {
             current: Mutex::new(initial),
+            enabled_subagents: RwLock::new(enabled_subagents),
         }
     }
 
@@ -123,6 +129,13 @@ impl HarnessStore {
 
     pub(crate) async fn enabled_subagent(&self, id: &str) -> Option<SubagentSpec> {
         self.current.lock().await.enabled_subagent(id).cloned()
+    }
+
+    pub(crate) fn enabled_subagents(&self) -> Arc<[SubagentSpec]> {
+        self.enabled_subagents
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub(crate) async fn apply(
@@ -149,6 +162,7 @@ impl HarnessStore {
             context: render_context(&candidate).into_boxed_str(),
         };
         *current = candidate;
+        self.refresh_enabled_subagents(&current);
         Ok(result)
     }
 
@@ -180,8 +194,26 @@ impl HarnessStore {
             context: render_context(&candidate).into_boxed_str(),
         };
         *current = candidate;
+        self.refresh_enabled_subagents(&current);
         Ok(result)
     }
+
+    fn refresh_enabled_subagents(&self, snapshot: &HarnessSnapshot) {
+        *self
+            .enabled_subagents
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = enabled_subagents(snapshot);
+    }
+}
+
+fn enabled_subagents(snapshot: &HarnessSnapshot) -> Arc<[SubagentSpec]> {
+    snapshot
+        .subagents()
+        .iter()
+        .filter(|spec| spec.enabled())
+        .cloned()
+        .collect::<Vec<_>>()
+        .into()
 }
 
 impl HarnessSnapshot {

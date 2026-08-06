@@ -24,7 +24,7 @@ pub struct PromptPack {
     digest: Arc<str>,
 }
 
-/// Launch-loaded model-facing prose for stable recursive operations.
+/// Launch-loaded runtime metadata for stable recursive control operations.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolDescriptions {
@@ -218,7 +218,7 @@ impl PromptPack {
         &self.refiner
     }
 
-    /// Model-facing operation descriptions loaded with this prompt pack.
+    /// Runtime operation descriptions loaded with this prompt pack.
     #[must_use]
     pub const fn tools(&self) -> &ToolDescriptions {
         &self.tools
@@ -373,6 +373,16 @@ impl HarnessSnapshot {
         }
         for spec in &self.subagents {
             validate_identifier(&spec.id, "subagent specification")?;
+            if spec
+                .id
+                .chars()
+                .any(|character| !character.is_ascii_alphanumeric() && character != '_')
+            {
+                return Err(SnapshotError::Invalid(format!(
+                    "subagent specification identifier `{}` must contain only ASCII letters, digits, and underscores so it has one unambiguous Code Mode function name",
+                    spec.id
+                )));
+            }
             validate_nonempty(&spec.name, "subagent name")?;
             validate_nonempty(&spec.description, "subagent description")?;
             validate_nonempty(&spec.instructions, "subagent instructions")?;
@@ -760,5 +770,18 @@ text = "two"
             HarnessSnapshot::load(&unknown),
             Err(SnapshotError::Parse { .. })
         ));
+
+        let ambiguous_function = directory.path().join("ambiguous-function.toml");
+        fs::write(
+            &ambiguous_function,
+            "version = 1\nrevision = 0\n[[subagents]]\nid = 'runtime-investigator'\nname = 'Runtime investigator'\ndescription = 'Investigates runtime behavior'\ninstructions = 'Inspect evidence'\n",
+        )
+        .unwrap();
+        assert!(
+            HarnessSnapshot::load(&ambiguous_function)
+                .unwrap_err()
+                .to_string()
+                .contains("Code Mode function name")
+        );
     }
 }

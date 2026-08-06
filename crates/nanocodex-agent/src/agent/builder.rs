@@ -46,6 +46,31 @@ impl<F> NanocodexBuilder<F> {
         self
     }
 
+    /// Appends stable system/developer instructions to the selected recipe.
+    ///
+    /// The additional text is separated from the existing instructions by two
+    /// newlines. Use this when an application layer augments, rather than
+    /// replaces, Nanocodex's model-specific base prompt.
+    #[must_use]
+    pub fn append_instructions(mut self, instructions: impl AsRef<str>) -> Self {
+        let instructions = instructions.as_ref();
+        if instructions.is_empty() {
+            return self;
+        }
+        let mut combined = String::with_capacity(
+            self.config
+                .system_prompt
+                .len()
+                .saturating_add(2)
+                .saturating_add(instructions.len()),
+        );
+        combined.push_str(&self.config.system_prompt);
+        combined.push_str("\n\n");
+        combined.push_str(instructions);
+        self.config.system_prompt = combined.into();
+        self
+    }
+
     /// Overrides the `OpenAi` recipe's model thinking level for this agent.
     ///
     /// Without this call the agent inherits the client default. A later
@@ -337,6 +362,19 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn appended_instructions_preserve_the_selected_base_prompt() {
+        let builder = Nanocodex::builder(OpenAi::builder("test").build().expect("OpenAI recipe"));
+        let base = builder.config.system_prompt.to_string();
+
+        let builder = builder.append_instructions("RLM orchestration");
+
+        assert_eq!(
+            builder.config.system_prompt.as_ref(),
+            format!("{base}\n\nRLM orchestration")
+        );
+    }
 
     #[test]
     fn execution_environment_requires_complete_model_visible_context() {
