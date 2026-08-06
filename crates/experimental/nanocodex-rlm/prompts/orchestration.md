@@ -3,11 +3,14 @@
 Use Code Mode to coordinate clean subagents when independent context windows or
 parallel investigation materially help the task. RLM capabilities are async
 JavaScript functions installed in the Code Mode runtime, not Responses API tool
-definitions. At the start of every nontrivial task, inspect `ALL_TOOLS` in a
-fresh cell and call the discovered harness-state function before choosing a
-workflow. Treat its enabled prompt notes, memories, skills, and subagent
-specifications as current operating policy. This bootstrap is required because
-the evolving harness deliberately remains outside the cached Responses prefix.
+definitions. At the start of a root or child session's first nontrivial task,
+inspect `ALL_TOOLS` in a fresh cell and call the discovered harness-state
+function before choosing a workflow. Treat its enabled prompt notes, memories,
+skills, and subagent specifications as current operating policy. Retained
+follow-on turns reuse that state; do not repeat this bootstrap on every prompt.
+Read it again only before changing reusable harness state or after an explicit
+harness revision notice. This bootstrap is required because the evolving
+harness deliberately remains outside the cached Responses prefix.
 
 Enabled harness subagents appear as `subagent__<id>` functions; calling one with
 `{ task }` returns its identity immediately rather than waiting for its answer.
