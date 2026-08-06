@@ -64,6 +64,7 @@ struct Config {
     max_actions: Option<u64>,
     turn_timeout: Duration,
     allow_refinement: bool,
+    refine_every_actions: Option<u64>,
 }
 
 impl Config {
@@ -79,6 +80,7 @@ impl Config {
             max_actions: None,
             turn_timeout: DEFAULT_TURN_TIMEOUT,
             allow_refinement: false,
+            refine_every_actions: None,
         };
         let mut args = env::args().skip(1);
         while let Some(argument) = args.next() {
@@ -119,12 +121,22 @@ impl Config {
                     config.turn_timeout = Duration::from_secs(seconds);
                 }
                 "--allow-refinement" => config.allow_refinement = true,
+                "--refine-every-actions" => {
+                    config.refine_every_actions = Some(
+                        required_value(&mut args, "--refine-every-actions")?
+                            .parse()
+                            .map_err(|error| {
+                                invalid(format!("invalid refinement action interval: {error}"))
+                            })?,
+                    );
+                }
                 "--help" | "-h" => {
                     println!(
                         "usage: eval-arc-agi-3-rlm [--game ls20] [--mode baseline|rlm] \
                          [--thinking low|medium|high|xhigh|max] [--harness PATH] \
                          [--output DIR] [--action-multiplier 5] [--max-actions N] \
-                         [--turn-timeout-seconds 600] [--allow-refinement]"
+                         [--turn-timeout-seconds 600] [--allow-refinement] \
+                         [--refine-every-actions N]"
                     );
                     std::process::exit(0);
                 }
@@ -144,6 +156,16 @@ impl Config {
         }
         if config.mode == Mode::Baseline && config.allow_refinement {
             return Err(invalid("baseline mode cannot refine an RLM harness"));
+        }
+        if config.refine_every_actions == Some(0) {
+            return Err(invalid(
+                "refinement action interval must be greater than zero",
+            ));
+        }
+        if config.refine_every_actions.is_some() && !config.allow_refinement {
+            return Err(invalid(
+                "--refine-every-actions requires --allow-refinement",
+            ));
         }
         Ok(config)
     }
@@ -659,10 +681,15 @@ async fn play_game(
         }
 
         let before = frame.clone();
+        let completed_actions = evidence.actions.len() as u64;
+        let refinement_checkpoint = config.refine_every_actions.is_some_and(|interval| {
+            completed_actions > 0 && completed_actions.is_multiple_of(interval)
+        });
         let prompt = render_frame_prompt(
             &frame,
-            evidence.actions.len() as u64 + 1,
+            completed_actions + 1,
             previous_action.as_deref(),
+            refinement_checkpoint,
         );
         let decision_started = Instant::now();
         let reset_available =
@@ -825,7 +852,12 @@ fn coordinate(value: Option<&Value>, name: &str) -> Result<u8> {
     Ok(value as u8)
 }
 
-fn render_frame_prompt(frame: &Frame, turn: u64, previous_action: Option<&str>) -> String {
+fn render_frame_prompt(
+    frame: &Frame,
+    turn: u64,
+    previous_action: Option<&str>,
+    refinement_checkpoint: bool,
+) -> String {
     let mut output = format!(
         "ARC_FRAME {turn}\nState: {}\nLevels completed: {}",
         frame.state, frame.levels_completed
@@ -852,6 +884,11 @@ fn render_frame_prompt(frame: &Frame, turn: u64, previous_action: Option<&str>) 
     }
     if turn > 1 && previous_action != Some("RESET") {
         output.push_str("\n- RESET");
+    }
+    if refinement_checkpoint {
+        output.push_str(
+            "\n\nHARNESS_REFINEMENT_CHECKPOINT: Review the retained trajectory before choosing this action. If the evidence shows a repeated failure or reusable tactic, call refine_harness with one concise observation, wait for the refiner, and verify the resulting harness revision. Make at most one minimal edit, then return the required action JSON.",
+        );
     }
     output
 }
@@ -1113,5 +1150,13 @@ mod tests {
             .map(|grid| grid[0][0])
             .collect::<Vec<_>>();
         assert_eq!(sampled, [0, 2, 4, 6, 7, 9, 11]);
+    }
+
+    #[test]
+    fn online_refinement_checkpoint_preserves_the_action_contract() {
+        let prompt = render_frame_prompt(&frame(), 6, Some("ACTION1"), true);
+        assert!(prompt.contains("HARNESS_REFINEMENT_CHECKPOINT"));
+        assert!(prompt.contains("return the required action JSON"));
+        assert!(prompt.contains("- ACTION1"));
     }
 }

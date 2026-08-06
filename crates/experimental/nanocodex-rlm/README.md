@@ -6,9 +6,11 @@ Mode an evolving catalog of async subagent functions while leaving
 conversation, transport, and tool-runtime ownership in each spawned
 `Nanocodex` driver.
 
-Prime Agent supplies the semantic model: orchestration is programmatic,
-children start asynchronously, clean children may recurse, and supplemental
-harness state describes reusable subagents. Tact supplies evidence that this
+[Prime Agent](https://www.primeintellect.ai/blog/prime-agent) and its
+[source](https://github.com/PrimeIntellect-ai/prime-agent) supply the semantic
+model: orchestration is programmatic, children start asynchronously, clean
+children may recurse, and supplemental harness state describes reusable
+subagents. [Tact](https://github.com/clabby/tact) supplies evidence that this
 belongs in a consumer using `tools_factory`, `AgentHandle::spawn`, typed events,
 and explicit cleanup rather than in the stable Nanocodex agent crates. Neither
 project's exact model-facing API is copied.
@@ -29,7 +31,7 @@ The stable runtime control operations are:
 - `send`: deliver a follow-up or steering message;
 - `wait`: wait for messages or lifecycle changes without polling;
 - `interrupt`: stop active work while retaining the child; and
-- `close`: terminally stop a retained child subtree and join cleanup.
+- `close`: terminally stop a retained child subtree and join cleanup;
 - `harness_state`: read current prompt notes, memories, skills, subagent specs,
   and refinement history;
 - `harness_apply`: persist one small evidence-backed CRUD edit;
@@ -172,6 +174,12 @@ inputs; `NANOCODEX_EVAL_TRIALS` changes the default three trials.
 
 ### Official live ARC-AGI-3 controller
 
+Prime's published target result is 95.5% RHAE Best@1 across the official
+25-game ARC-AGI-3 suite and 99.97% Best@3 across all 183 levels. Nanocodex
+development caps are intentionally labeled and are not presented as a
+reproduction of that result; an equivalent claim requires the full retained
+scorecards and trajectories.
+
 `eval-arc-agi-3-rlm` is a thin application-owned controller for the public
 ARC-AGI-3 API. It keeps one retained Nanocodex conversation across frames,
 submits exactly one executable action per model turn, samples at most seven
@@ -197,7 +205,9 @@ the closed scorecard, exact root `root-events.jsonl`, harness start/final
 copies, recursive `rlm-evidence.json`, root and child usage, cache-read tokens,
 decision latency, and locally estimated total cost. Use `--allow-refinement`
 only with a copied training harness. Held-out runs default to read-only harness
-state.
+state. During a training run, `--refine-every-actions N` inserts an online
+trajectory-review checkpoint after each N environment actions so a minimal
+harness edit can affect later decisions in the same retained game session.
 
 Run the same runtime through the full native CLI with bundled immutable prompts
 and a mutable harness file:
@@ -211,6 +221,13 @@ cargo run -p nanocodex-bin --bin nanocodex -- run \
 `--rlm-prompts <directory>` overrides the bundled prompt pack. The CLI keeps
 the RLM runtime alive for the root session, finalizes its evidence, and closes
 all retained children during normal shutdown.
+
+Add `--autonomous` and one or more `--autonomous-gate '<command>'` arguments to
+let the normal headless runner inject retained-session follow-ons until the
+commands pass or a host budget is reached. `--autonomous-refine-every N` adds a
+trajectory-review checkpoint every N completed root turns. The host token
+budget excludes cache-read input and includes newly generated root and child
+tokens.
 
 ## Deliberate first-slice limits
 

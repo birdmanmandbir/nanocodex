@@ -1,4 +1,5 @@
 mod auth;
+mod autonomous;
 mod browser;
 mod config;
 #[cfg(feature = "tempo")]
@@ -306,6 +307,29 @@ mod tests {
             panic!("run command was not parsed");
         };
         let _ = run.agent;
+    }
+
+    #[test]
+    fn autonomous_policy_is_available_to_one_shot_runs() {
+        let cli = Cli::try_parse_from([
+            "nanocodex",
+            "run",
+            "finish the task",
+            "--autonomous",
+            "--autonomous-gate",
+            "cargo test -p target",
+            "--autonomous-max-continuations",
+            "4",
+            "--autonomous-refine-every",
+            "2",
+            "--rlm-harness",
+            "/tmp/nanocodex.harness.toml",
+        ])
+        .unwrap();
+        let Some(Command::Run(run)) = cli.command else {
+            panic!("run command was not parsed");
+        };
+        let _ = run.run;
     }
 
     #[test]

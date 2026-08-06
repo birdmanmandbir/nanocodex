@@ -288,6 +288,23 @@ nanocodex run "delegate independent investigations, then synthesize them" \
 Pass `--rlm-prompts <directory>` with `--rlm-harness` to replace the bundled
 prompt pack. RLM mode and the older `--subagents` mode are mutually exclusive.
 
+The same retained session can run autonomously until host-owned quality gates
+pass. Gates execute after each completed turn and their bounded failure output
+becomes the next user delta. Cached input is excluded from the host token
+budget; root output, uncached root input, and recursive child work are counted.
+
+```sh
+nanocodex run "implement and verify the requested change" \
+  --rlm-harness ./nanocodex.harness.toml \
+  --autonomous \
+  --autonomous-gate "cargo test -p my-crate" \
+  --autonomous-refine-every 5
+```
+
+The immutable launch prompt and prompt-cache identity remain stable. Harness
+changes are appended as mutable developer context, and Code Mode resolves the
+latest `tools.subagent__<id>` functions without rewriting the cached prefix.
+
 ## VM-backed tools
 
 Normal TUI and one-shot sessions keep host workspace tools by default. They can
