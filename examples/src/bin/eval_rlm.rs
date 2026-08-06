@@ -7,11 +7,19 @@ use nanocodex_rlm::{HarnessSnapshot, LaunchSnapshot, PromptPack, RlmRuntime};
 
 #[tokio::main]
 async fn main() -> Result<(), support::AnyError> {
-    let task = Task::load(
-        env::args_os()
-            .nth(1)
-            .map_or_else(|| PathBuf::from("tasks/write-greeting"), PathBuf::from),
-    )?;
+    let task_paths = env::args_os()
+        .skip(1)
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let task_paths = if task_paths.is_empty() {
+        vec![PathBuf::from("tasks/write-greeting")]
+    } else {
+        task_paths
+    };
+    let tasks = task_paths
+        .into_iter()
+        .map(Task::load)
+        .collect::<Result<Vec<_>, _>>()?;
     let crate_root =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../crates/experimental/nanocodex-rlm");
     let prompts = env::var_os("NANOCODEX_RLM_PROMPTS")
@@ -25,9 +33,9 @@ async fn main() -> Result<(), support::AnyError> {
         .unwrap_or(3);
 
     let prompts = PromptPack::load(prompts)?;
-    let prompt_cache_key = format!("nanocodex-rlm-prefix-{}", prompts.digest());
     let launch = LaunchSnapshot::new(prompts, HarnessSnapshot::load(harness)?);
     let runtime = RlmRuntime::new(launch);
+    let prompt_cache_key = runtime.prompt_cache_key();
     let treatment = format!("rlm-{}", runtime.launch().digest());
     let agent = Nanocodex::builder(OpenAi::new(support::auth()?)?);
     let rlm_agent = agent
@@ -36,7 +44,7 @@ async fn main() -> Result<(), support::AnyError> {
         .prompt_cache_key(prompt_cache_key)
         .shared_prompt_cache();
     let sweep = Sweep::builder()
-        .task(task.clone())
+        .tasks(tasks.clone())
         .trials(trials)
         .agent("baseline", agent.clone())?
         .agent(&treatment, rlm_agent)?
@@ -47,7 +55,7 @@ async fn main() -> Result<(), support::AnyError> {
     let tools_treatment = treatment.clone();
     let finalizer_runtime = runtime.clone();
     let finalizer_treatment = treatment.clone();
-    let backend = support::vm_resources(vec![task])
+    let backend = support::vm_resources(tasks)
         .await?
         .backend_with(
             VmBackend::builder()

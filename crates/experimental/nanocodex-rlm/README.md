@@ -148,10 +148,23 @@ and compares the serialized model-visible tool definitions byte-for-byte.
 Treatment and evidence identities still include the initial harness digest so
 results remain attributable.
 
-Run the matched PR #72 sweep with:
+Run the matched PR #72 sweep with one or more task roots:
 
 ```sh
-cargo run -p nanocodex-examples --bin eval-rlm -- tasks/write-greeting
+cargo run -p nanocodex-examples --bin eval-rlm -- \
+  tasks/write-greeting tasks/another-task
+```
+
+`NANOCODEX_RLM_HARNESS` selects the mutable harness document. Copy a seed
+before a sweep so refinements remain eval artifacts rather than dirtying a
+checked-in example. The ARC-AGI-3 smoke seed records two trajectory-backed
+refinements from the public smoke tasks:
+
+```sh
+cp examples/rlm/arc-agi-3-smoke.harness.toml /tmp/nanocodex-arc.harness.toml
+NANOCODEX_RLM_HARNESS=/tmp/nanocodex-arc.harness.toml \
+  cargo run -p nanocodex-examples --bin eval-rlm -- \
+  /path/to/tn36-task /path/to/sb26-task
 ```
 
 `NANOCODEX_RLM_PROMPTS` and `NANOCODEX_RLM_HARNESS` select alternate launch

@@ -107,6 +107,7 @@ impl Nanocodex {
         let (config, factory) = into_openai_parts(openai);
         NanocodexBuilder {
             config,
+            instruction_suffix: None,
             tools: ToolsConfiguration::Shared(Tools::default()),
             workspace: None,
             session_id: None,

@@ -257,7 +257,16 @@ impl RlmRuntime {
         let installer = self.tools();
         builder
             .append_instructions(self.launch().root_instructions())
+            .prompt_cache_key_if_unset(self.prompt_cache_key())
             .tools_factory(move |agent| installer.install(tools.clone(), agent))
+    }
+
+    /// Returns the cache identity derived only from the immutable prompt pack.
+    ///
+    /// Mutable harness revisions deliberately retain this identity.
+    #[must_use]
+    pub fn prompt_cache_key(&self) -> String {
+        format!("nanocodex-rlm-prefix-{}", self.launch().prompts().digest())
     }
 
     /// Subscribes to recursive child lifecycle and raw agent events.
@@ -1534,6 +1543,19 @@ mod tests {
     fn message_validation_counts_utf8_bytes() {
         assert!(validate_text("hello", "message", 5).is_ok());
         assert!(validate_text("ééé", "message", 5).is_err());
+    }
+
+    #[test]
+    fn prompt_cache_key_depends_only_on_the_immutable_prompt_pack() {
+        let runtime = RlmRuntime::new(launch_snapshot());
+
+        assert_eq!(
+            runtime.prompt_cache_key(),
+            format!(
+                "nanocodex-rlm-prefix-{}",
+                runtime.launch().prompts().digest()
+            )
+        );
     }
 
     #[tokio::test]

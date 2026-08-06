@@ -1521,7 +1521,7 @@ impl Evaluator {
             }
             let builder = builder
                 .session_id(emitter.session_id)
-                .prompt_cache_key(format!(
+                .prompt_cache_key_if_unset(format!(
                     "nanoeval:{}:{:x}",
                     self.id().simple(),
                     emitter.prompt_cache_cohort

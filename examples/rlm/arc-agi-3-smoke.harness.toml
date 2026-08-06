@@ -1,0 +1,36 @@
+version = 1
+revision = 2
+memories = []
+skills = []
+
+[[prompt_notes]]
+id = "arc-root-is-the-only-actor"
+text = "For interactive ARC-AGI-3 tasks, the root is the only actor. Before the first action, retain one arc-game-analyst. Ask it to observe and recommend the next action, wait for its report, act once yourself, then send it a follow-up request after each resulting frame. Never let a child execute an action."
+enabled = true
+
+[[prompt_notes]]
+id = "arc-verify-click-coordinates"
+text = "For ARC coordinate actions, independently verify the recommended x/y against the zero-based frame column/row indices and the exact bounds of the intended object before acting."
+enabled = true
+
+[[prompt_notes]]
+id = "arc-bound-consultation"
+text = "For bounded interactive ARC tasks, do not spend more than two 30-second wait windows on a child before an action. If no fresh report arrives, interrupt that child and choose the action yourself from the observed frame; messages queued to a running child do not preempt its active turn."
+enabled = true
+
+[[subagents]]
+id = "arc_game_analyst"
+name = "ARC game analyst"
+description = "Analyzes the current ARC-AGI-3 frame and recommends exactly one next action without changing game state. Retain it across actions so it can compare transitions."
+instructions = "You are a read-only ARC-AGI-3 game analyst. Run `arc-agi-3 observe` to inspect the current public frame. Never run `arc-agi-3 act`, never inspect private session files, and never modify the workspace. Infer objects, controls, motion, goals, and frame-to-frame changes. Report exactly one recommended available action with concise evidence and uncertainty. On follow-up turns, observe again and compare against your prior frame before recommending the next action."
+enabled = true
+
+[[refinements]]
+revision = 1
+trigger = "In SB26, the retained ARC analyst recommended ACTION6 35 55 for a palette block actually spanning y=57-60; the wasted first action showed that coordinate recommendations should be verified against zero-based row/column indices before submission."
+operation = "create_prompt_note:arc-verify-click-coordinates"
+
+[[refinements]]
+revision = 2
+trigger = "In TN36, the first child consultation delayed the first click for several minutes, drove 38 root model calls, and still produced no score improvement under a three-action cap."
+operation = "create_prompt_note:arc-bound-consultation"

@@ -7,6 +7,7 @@ use crate::rollout::RolloutConfig;
 #[derive(Clone)]
 pub struct NanocodexBuilder<F = StandardServiceFactory> {
     pub(super) config: ModelConfig,
+    pub(super) instruction_suffix: Option<Arc<str>>,
     pub(super) tools: ToolsConfiguration,
     pub(super) workspace: Option<PathBuf>,
     pub(super) session_id: Option<SessionId>,
@@ -57,17 +58,10 @@ impl<F> NanocodexBuilder<F> {
         if instructions.is_empty() {
             return self;
         }
-        let mut combined = String::with_capacity(
-            self.config
-                .system_prompt
-                .len()
-                .saturating_add(2)
-                .saturating_add(instructions.len()),
-        );
-        combined.push_str(&self.config.system_prompt);
-        combined.push_str("\n\n");
-        combined.push_str(instructions);
-        self.config.system_prompt = combined.into();
+        self.instruction_suffix = Some(match self.instruction_suffix.take() {
+            Some(existing) => append_instruction_text(&existing, instructions),
+            None => Arc::from(instructions),
+        });
         self
     }
 
@@ -164,6 +158,18 @@ impl<F> NanocodexBuilder<F> {
     #[must_use]
     pub fn prompt_cache_key(mut self, prompt_cache_key: impl Into<String>) -> Self {
         self.prompt_cache.key = Some(prompt_cache_key.into());
+        self
+    }
+
+    /// Sets the prompt-cache identity only when the caller has not selected one.
+    ///
+    /// Adapters use this to supply an isolation key without replacing an
+    /// application-owned stable key that intentionally spans adapter runs.
+    #[must_use]
+    pub fn prompt_cache_key_if_unset(mut self, prompt_cache_key: impl Into<String>) -> Self {
+        if self.prompt_cache.key.is_none() {
+            self.prompt_cache.key = Some(prompt_cache_key.into());
+        }
         self
     }
 
@@ -269,6 +275,7 @@ where
     <F::Service as Service<ResponsesAttempt>>::Error: Into<ResponseError> + AgentSend + 'static,
     <F::Service as Service<ResponsesAttempt>>::Future: AgentSend,
 {
+    let builder = materialize_instruction_suffix(builder);
     validate(&builder.config, builder.prompt_cache.key.as_deref())?;
     validate_execution_environment(builder.codex.context.execution_environment())?;
     let config = Arc::new(builder.config);
@@ -284,6 +291,23 @@ where
         builder.resume,
         service_factory,
     )
+}
+
+fn materialize_instruction_suffix<F>(mut builder: NanocodexBuilder<F>) -> NanocodexBuilder<F> {
+    if let Some(suffix) = builder.instruction_suffix.take() {
+        builder.config.system_prompt =
+            append_instruction_text(&builder.config.system_prompt, &suffix);
+    }
+    builder
+}
+
+fn append_instruction_text(base: &str, suffix: &str) -> Arc<str> {
+    let mut combined =
+        String::with_capacity(base.len().saturating_add(2).saturating_add(suffix.len()));
+    combined.push_str(base);
+    combined.push_str("\n\n");
+    combined.push_str(suffix);
+    combined.into()
 }
 
 fn validate_execution_environment(environment: Option<&ExecutionEnvironment>) -> Result<()> {
@@ -368,12 +392,46 @@ mod tests {
         let builder = Nanocodex::builder(OpenAi::builder("test").build().expect("OpenAI recipe"));
         let base = builder.config.system_prompt.to_string();
 
-        let builder = builder.append_instructions("RLM orchestration");
+        let builder =
+            materialize_instruction_suffix(builder.append_instructions("RLM orchestration"));
 
         assert_eq!(
             builder.config.system_prompt.as_ref(),
             format!("{base}\n\nRLM orchestration")
         );
+    }
+
+    #[test]
+    fn appended_instructions_survive_a_later_base_replacement() {
+        let builder = Nanocodex::builder(OpenAi::builder("test").build().expect("OpenAI recipe"))
+            .append_instructions("RLM orchestration")
+            .instructions("benchmark instructions");
+        let builder = materialize_instruction_suffix(builder);
+
+        assert_eq!(
+            builder.config.system_prompt.as_ref(),
+            "benchmark instructions\n\nRLM orchestration"
+        );
+    }
+
+    #[test]
+    fn fallback_prompt_cache_key_preserves_an_explicit_identity() {
+        let builder = Nanocodex::builder(OpenAi::builder("test").build().expect("OpenAI recipe"))
+            .prompt_cache_key("application-stable")
+            .prompt_cache_key_if_unset("adapter-local");
+
+        assert_eq!(
+            builder.prompt_cache.key.as_deref(),
+            Some("application-stable")
+        );
+    }
+
+    #[test]
+    fn fallback_prompt_cache_key_fills_an_unconfigured_identity() {
+        let builder = Nanocodex::builder(OpenAi::builder("test").build().expect("OpenAI recipe"))
+            .prompt_cache_key_if_unset("adapter-local");
+
+        assert_eq!(builder.prompt_cache.key.as_deref(), Some("adapter-local"));
     }
 
     #[test]
@@ -462,6 +520,7 @@ mod tests {
         config.model = Model::Sol;
         let builder = NanocodexBuilder {
             config,
+            instruction_suffix: None,
             tools: ToolsConfiguration::Shared(
                 Tools::builder()
                     .without_defaults()
