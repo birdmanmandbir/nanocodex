@@ -65,7 +65,16 @@ impl Run {
                     {
                         state.record_recursive_usage(&evidence.usage);
                     }
-                    match state.decide(&workspace, configured.rlm.is_some()).await? {
+                    let decision = state.decide(&workspace, configured.rlm.is_some());
+                    tokio::pin!(decision);
+                    let decision = tokio::select! {
+                        result = &mut decision => result?,
+                        signal = tokio::signal::ctrl_c() => {
+                            signal?;
+                            return Err(eyre!("interrupted"));
+                        }
+                    };
+                    match decision {
                         AutonomousDecision::Continue(continuation) => {
                             prompt = continuation;
                             continue;
