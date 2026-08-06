@@ -170,6 +170,35 @@ NANOCODEX_RLM_HARNESS=/tmp/nanocodex-arc.harness.toml \
 `NANOCODEX_RLM_PROMPTS` and `NANOCODEX_RLM_HARNESS` select alternate launch
 inputs; `NANOCODEX_EVAL_TRIALS` changes the default three trials.
 
+### Official live ARC-AGI-3 controller
+
+`eval-arc-agi-3-rlm` is a thin application-owned controller for the public
+ARC-AGI-3 API. It keeps one retained Nanocodex conversation across frames,
+submits exactly one executable action per model turn, samples at most seven
+animation frames with the official interpolation rule, applies the official
+per-level `5 * baseline_actions` budgets, and closes the scorecard before any
+optional training refinement. The root is the only environment actor;
+recursive children receive read-only frame summaries and cannot call the game
+API.
+
+Run matched arms with the checked-in frozen harness:
+
+```sh
+cargo run -p nanocodex-examples --bin eval-arc-agi-3-rlm -- \
+  --game vc33 --mode baseline --thinking low
+cargo run -p nanocodex-examples --bin eval-arc-agi-3-rlm -- \
+  --game vc33 --mode rlm --thinking low \
+  --harness examples/rlm/arc-agi-3.harness.toml
+```
+
+`--max-actions N` is a development cap and is recorded as such; omit it for an
+official-profile run. Each output directory retains incremental `run.json`,
+the closed scorecard, exact root `root-events.jsonl`, harness start/final
+copies, recursive `rlm-evidence.json`, root and child usage, cache-read tokens,
+decision latency, and locally estimated total cost. Use `--allow-refinement`
+only with a copied training harness. Held-out runs default to read-only harness
+state.
+
 Run the same runtime through the full native CLI with bundled immutable prompts
 and a mutable harness file:
 

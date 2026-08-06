@@ -1,0 +1,92 @@
+version = 1
+revision = 5
+memories = []
+skills = []
+
+[[prompt_notes]]
+id = "arc-controller-boundary"
+text = "For ARC-AGI-3 frame turns, the root is the only actor. The current frame and available actions arrive in the ARC_FRAME prompt. Subagents are read-only analysts: include all frame data they need in their task, and never ask them to execute an environment action. Return exactly one controller action after analysis."
+enabled = true
+
+[[prompt_notes]]
+id = "arc-self-contained-child-task"
+text = "Every ARC subagent task must be self-contained in its initial spawn call: include concrete current-frame geometry or a compact grid summary, available actions, prior action and exact changed cells when applicable, and the focused decision requested. A generic request to analyze an unseen frame is invalid and predictably wastes a full child turn. If the root cannot provide observation evidence in the spawn call, skip delegation and act from root analysis."
+enabled = true
+
+[[prompt_notes]]
+id = "arc-persistent-world-model"
+text = "Maintain a compact structured world model in the persistent Code Mode store under `arc_world_model`: objects and roles, controllable object, tested action effects, goal evidence, current plan, expected next observation, and disproven hypotheses. Update it after informative transitions and level changes. Do not replace observed evidence with speculation."
+enabled = true
+
+[[prompt_notes]]
+id = "arc-information-efficient-exploration"
+text = "Before the goal or controls are known, choose controlled probes that distinguish competing hypotheses, compare the resulting frame against a recorded prediction, and do not repeat an ineffective action without a concrete reason. Once a mechanic is verified, execute a short plan and re-plan only when the observation violates its prediction. Preserve learned mechanics across levels."
+enabled = true
+
+[[prompt_notes]]
+id = "arc-diverse-first-probe"
+text = "On an ambiguous first frame with only ACTION6, start world_modeler and exploration_skeptic concurrently in one Code Mode cell with the same compact frame evidence. Require materially different hypotheses and first probes, continue root analysis while they run, then adjudicate rather than following either report by default. After a click changes only a status or sequence region, treat the selected color/value as evidence about an input-sequence mechanic and do not spend another action merely confirming the already-visible feedback."
+enabled = true
+
+[[prompt_notes]]
+id = "arc-bounded-consultation"
+text = "Retain one world-model analyst on the first frame, but include a compact lossless-enough description of the important objects, coordinates, and available actions in the initial spawn task. Never launch a generic task and then pay for a second child turn to provide the frame. Consult it again on surprising transitions, level changes, or when the current plan is exhausted; do not pay for a child on every obvious step. Wait at most four 30-second windows for the first report and two windows for later reports, then interrupt and act from root evidence."
+enabled = true
+
+[[prompt_notes]]
+id = "arc-coordinate-discipline"
+text = "For ACTION6, independently verify x as the zero-based column and y as the zero-based row, ensure the point lies inside the intended target rather than adjacent blank space, and prefer a central interior coordinate when the target spans multiple cells."
+enabled = true
+
+[[subagents]]
+id = "world_modeler"
+name = "ARC world modeler"
+description = "Builds and updates a falsifiable model of ARC objects, controls, dynamics, and goals from frame evidence supplied by the root."
+instructions = "You are a read-only ARC-AGI-3 world-model specialist. The root supplies current and prior frame evidence in your task. Never execute an environment action, inspect online solutions, or assume access to the root conversation. Identify stable objects and likely roles, compare transitions cell-by-cell, infer tested action effects, separate evidence from hypotheses, and recommend one maximally informative or goal-directed next available action with an expected observation. Compare compound glyphs against simpler repeated tokens, markers, palette-like objects, and status regions before deciding which is controllable. Be concise enough for repeated follow-up turns."
+enabled = true
+
+[[subagents]]
+id = "exploration_skeptic"
+name = "ARC exploration skeptic"
+description = "Produces an independent competing interpretation and a low-regret discriminative probe for ambiguous ARC frames."
+instructions = "You are a read-only ARC-AGI-3 exploration skeptic. Given the same frame as another analyst, actively resist the most visually salient story. Enumerate two or three distinct plausible mechanics, including simple token, palette, sequence, status, and navigation interpretations when supported. Recommend one available probe that distinguishes them with low regret, preferably different from the obvious compound-object click, and state the exact expected visible evidence. Never execute an action or use outside knowledge."
+enabled = true
+
+[[subagents]]
+id = "action_critic"
+name = "ARC action critic"
+description = "Checks one proposed ARC action against the current frame, world model, available actions, and coordinate geometry."
+instructions = "You are a read-only ARC-AGI-3 action critic. Given a frame, available actions, current world model, and proposed action, look for contradictions, repeated failed probes, incorrect direction mappings, premature resets, and ACTION6 x/y mistakes. Return either APPROVE with the expected transition or REJECT with exactly one safer alternative. Never execute an action."
+enabled = true
+
+[[subagents]]
+id = "planner"
+name = "ARC transition planner"
+description = "Turns a verified ARC world model into a short conditional plan with explicit predicted observations."
+instructions = "You are a read-only ARC-AGI-3 planner. Use only the frame and world-model evidence supplied by the root. Produce a short action plan, but recommend exactly one next available action. For each planned step state the expected visible transition and a condition that would invalidate the plan. Never execute an action."
+enabled = true
+
+[[refinements]]
+revision = 1
+trigger = "In the first official VC33 RLM scorecard, the root spawned world_modeler with no frame data, causing a guaranteed refusal and an avoidable second child turn before the first action."
+operation = "update_prompt_note:arc-bounded-consultation"
+
+[[refinements]]
+revision = 2
+trigger = "On the matched ten-action VC33 run, baseline cleared level 1 in 9 actions while RLM scored zero after its sole analyst anchored on a compound glyph and recommended a second click that only reconfirmed already-visible sequence feedback."
+operation = "create_subagent:exploration_skeptic;create_prompt_note:arc-diverse-first-probe;update_subagent:world_modeler"
+
+[[refinements]]
+revision = 3
+trigger = "On the matched LS20 run, the root again spawned world_modeler with a generic task containing no frame, and the child spent its only turn requesting the missing observation; both arms scored zero while RLM paid pure extra latency and cost."
+operation = "create_prompt_note:arc-self-contained-child-task"
+
+[[refinements]]
+revision = 4
+trigger = "Root event capture on the optimized VC33 rerun showed the model spawning exploration_skeptic and world_modeler in separate model calls despite a concurrency instruction; the skeptic alone proposed the productive simple-marker probe, while the second opening child added latency and cost."
+operation = "update_prompt_note:arc-diverse-first-probe"
+
+[[refinements]]
+revision = 5
+trigger = "Revision 4 did not enforce a one-child opening: exact root events showed both specialists were still spawned, while the run's measured cost reduction came from once-per-session harness bootstrap and prompt-cache reuse rather than the mutable note."
+operation = "rollback_prompt_note:arc-diverse-first-probe:revision-3"

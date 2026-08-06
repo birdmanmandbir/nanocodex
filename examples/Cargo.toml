@@ -113,6 +113,10 @@ name = "eval-rlm"
 path = "src/bin/eval_rlm.rs"
 
 [[bin]]
+name = "eval-arc-agi-3-rlm"
+path = "src/bin/eval_arc_agi_3_rlm.rs"
+
+[[bin]]
 name = "eval-differential"
 path = "src/bin/eval_differential.rs"
 
