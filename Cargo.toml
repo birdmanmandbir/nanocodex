@@ -52,6 +52,7 @@ chrono = { version = "0.4.43", default-features = false, features = ["clock", "s
 chromiumoxide = "0.9.1"
 landlock = "0.4.4"
 clap = { version = "4.5.54", features = ["derive", "env"] }
+constant_time_eq = "0.4.2"
 cpal = "0.16.0"
 crossterm = { version = "0.28.1", features = ["bracketed-paste", "event-stream"] }
 criterion = { version = "0.7.0", default-features = false, features = ["async_tokio", "cargo_bench_support"] }
@@ -69,6 +70,7 @@ http-body-util = "0.1.3"
 hmac = "0.13.0"
 hudsucker = { version = "0.25.0", git = "https://github.com/gakonst/hudsucker", rev = "9a13609adc4b37b3e7fba28a320546bf672f0f4d", default-features = false, features = ["rcgen-ca", "ring", "rustls-client"] }
 ignore = "0.4.31"
+iroh = { version = "=1.0.3", default-features = false, features = ["tls-ring"] }
 jiff = { version = "0.2.35", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 jsonschema = { version = "0.48.5", default-features = false }
 krun = { package = "libkrun", version = "=2.0.0-dev", git = "https://github.com/containers/libkrun", rev = "df85b8b75f55e8ef1b06b5bc18f08dc6d7b5aeb0", features = ["blk", "net"] }

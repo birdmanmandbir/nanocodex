@@ -2,7 +2,10 @@ use std::{net::Ipv4Addr, path::PathBuf};
 
 use clap::Args;
 use eyre::{Result, WrapErr as _};
-use nanocodex_eval::{Evaluation, coordinator::CoordinatorServer};
+use nanocodex_eval::{
+    Evaluation,
+    coordinator::{CoordinatorServer, IrohCoordinatorServer},
+};
 use tokio::net::TcpListener;
 
 use super::profile::default_state_dir;
@@ -23,6 +26,10 @@ pub(super) struct Coordinator {
     /// Listen port. Use zero to allocate an available port.
     #[arg(long, default_value_t = 8789)]
     port: u16,
+
+    /// Publish the loopback coordinator through an authenticated iroh endpoint.
+    #[arg(long)]
+    iroh: bool,
 }
 
 impl Coordinator {
@@ -33,10 +40,26 @@ impl Coordinator {
             .await
             .wrap_err("failed to bind the evaluation coordinator")?;
         let address = listener.local_addr()?;
-        println!("http://{address}");
-        CoordinatorServer::new(evaluation)
+        let iroh = if self.iroh {
+            let (server, ticket) = IrohCoordinatorServer::bind(address)
+                .await
+                .wrap_err("failed to publish the evaluation coordinator over iroh")?;
+            eprintln!("local coordinator: http://{address}");
+            println!("{ticket}");
+            Some(server)
+        } else {
+            println!("http://{address}");
+            None
+        };
+        let result = CoordinatorServer::new(evaluation)
             .serve(listener)
             .await
-            .wrap_err("evaluation coordinator stopped")
+            .wrap_err("evaluation coordinator stopped");
+        if let Some(iroh) = iroh {
+            iroh.shutdown()
+                .await
+                .wrap_err("failed to stop the iroh coordinator endpoint")?;
+        }
+        result
     }
 }

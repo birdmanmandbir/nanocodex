@@ -1,5 +1,11 @@
 //! Narrow pull coordinator for durable evaluation workers.
 
+mod iroh;
+
+pub use iroh::{
+    IrohCoordinatorConnector, IrohCoordinatorError, IrohCoordinatorServer, IrohCoordinatorTicket,
+};
+
 use std::{
     collections::HashMap,
     io::Write,

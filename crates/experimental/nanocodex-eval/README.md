@@ -164,9 +164,17 @@ nanocodex eval run local-smoke
 nanocodex eval run compare --task tasks/write-greeting --harness codex \
   --model luna --thinking high
 
-# Coordinate workers through one SQLite owner. Remote benchmark hosts reach
-# this loopback listener through an SSH reverse tunnel.
+# Coordinate workers through one SQLite owner. Remote benchmark hosts can reach
+# this loopback listener through an SSH tunnel or an ephemeral iroh capability.
 nanocodex eval coordinator compare --port 8789
+nanocodex eval benchmark compare --coordinator http://127.0.0.1:8789
+
+# On the coordinator, print an ephemeral `iroh-eval:...` capability.
+nanocodex eval coordinator compare --iroh
+
+# On each remote worker host, bridge that capability back to loopback. Existing
+# run and benchmark commands continue to use the ordinary local HTTP URL.
+nanocodex eval connect 'iroh-eval:...' --port 8789
 nanocodex eval benchmark compare --coordinator http://127.0.0.1:8789
 
 # Let an agent inspect the ledger and choose process fan-out.
@@ -194,6 +202,17 @@ exit observation, which is a no-op if the row is already terminal and otherwise
 changes its running row permanently to failed. A small locked local marker
 survives benchmarker termination so a systemd restart can reconcile children
 that died with the previous benchmark process.
+
+The iroh ticket is a bearer capability and must be handled as a secret. It
+contains the coordinator endpoint's authenticated public identity, current
+relay/direct addressing, and a random access token. The iroh endpoint forwards
+only to the coordinator's fixed loopback address; it is not a general proxy.
+Both the endpoint and ticket are ephemeral in this prototype. This authenticates
+the transport but does not attest worker hardware or execution; TEE admission
+can replace the bearer capability without changing the coordinator HTTP API.
+The prototype uses iroh's N0 preset, preferring a direct path and falling back
+to its default relay infrastructure. Persistent endpoint identity and
+operator-selected or community relay policy remain future work.
 
 VM-backed evals consume a prepared host installation. The matching static
 `nanocodex-vm-guest` must be installed beside the `nanocodex` executable; VM

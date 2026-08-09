@@ -1,5 +1,6 @@
 mod attach;
 mod benchmark;
+mod connect;
 mod coordinator;
 mod profile;
 mod systemd;
@@ -27,6 +28,9 @@ enum EvalCommand {
     /// Own one SQLite ledger for pull workers on this machine.
     Coordinator(coordinator::Coordinator),
 
+    /// Expose an iroh coordinator through a worker-local loopback URL.
+    Connect(connect::Connect),
+
     /// Inspect one immutable profile revision and its durable progress.
     Status(profile::Status),
 
@@ -51,6 +55,7 @@ async fn run(eval: Eval) -> Result<()> {
         EvalCommand::Add(command) => command.run().await?,
         EvalCommand::Attach(command) => command.run().await?,
         EvalCommand::Benchmark(command) => command.run().await?,
+        EvalCommand::Connect(command) => command.run().await?,
         EvalCommand::Coordinator(command) => command.run().await?,
         EvalCommand::Status(command) => command.run().await?,
         EvalCommand::Run(command) => command.run().await?,
@@ -89,6 +94,7 @@ mod tests {
             vec!["nanocodex", "eval", "attach", "local-smoke"],
             vec!["nanocodex", "eval", "benchmark", "local-smoke"],
             vec!["nanocodex", "eval", "coordinator", "local-smoke"],
+            vec!["nanocodex", "eval", "connect", "iroh-eval:ticket"],
         ] {
             Cli::try_parse_from(arguments).expect("supported eval command must parse");
         }
