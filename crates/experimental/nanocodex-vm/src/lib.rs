@@ -9,6 +9,14 @@
         all(target_os = "macos", target_arch = "aarch64")
     )
 ))]
+mod attestation;
+#[cfg(all(
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 mod capabilities;
 #[cfg(all(
     feature = "host",
@@ -34,6 +42,14 @@ pub use child_lifetime::terminate_child_with_parent;
     )
 ))]
 mod command;
+#[cfg(all(
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
+mod confidential;
 #[cfg(all(
     feature = "host",
     any(
@@ -127,8 +143,16 @@ mod workspace;
 ))]
 pub mod host {
     pub use crate::{
+        attestation::{
+            AttestationBinding, AttestationChallenge, AttestationInputError, AttestedComponent,
+            EvidenceProfile, MAX_RAW_EVIDENCE_BYTES, RawEvidence,
+        },
         capabilities::{Capabilities, KrunFeature},
         command::GuestCommand,
+        confidential::{
+            ConfidentialCapability, ConfidentialCapabilityCheck, ConfidentialHostReport,
+            ConfidentialVmError, ConfidentialVmProfile, CpuTee,
+        },
         config::{BlockDevice, Network, RootFilesystem, SharedDirectory, VmConfig},
         egress::{
             EgressError, EgressFile, EgressLease, EgressMount, GUEST_EGRESS_ROOT,

@@ -21,6 +21,42 @@ The normal API is:
 The crate root intentionally re-exports only [`VmWorkspace`],
 [`VmWorkspaceBuilder`], and [`VmWorkspaceError`].
 
+## Confidential-VM boundary
+
+[`host::ConfidentialVmProfile`] selects one exact local CPU TEE and optional
+confidential NVIDIA device counts. [`host::Capabilities::confidential_report`]
+reports every required host, active-libkrun-artifact, measured-guest, and
+confidential-device capability without selecting a weaker profile.
+
+The current implementation deliberately reports the measured guest attester
+as unavailable. A [`host::VmConfig`] carrying a confidential profile therefore
+fails before libkrun creates a context on every host. This gate remains closed
+until the guest can generate a fresh key, bind the canonical
+[`host::AttestationBinding`] transcript into native evidence, and the caller
+can appraise that evidence. Having `/dev/sev`, `/dev/kvm`, or a TEE-enabled
+libkrun build is not sufficient by itself.
+
+```no_run
+use nanocodex_vm::host::{Capabilities, ConfidentialVmProfile};
+
+# fn detect() -> Result<(), Box<dyn std::error::Error>> {
+let profile = ConfidentialVmProfile::amd_sev_snp();
+let capabilities = Capabilities::detect()?;
+let report = capabilities.confidential_report(&profile);
+for missing in report.missing() {
+    eprintln!("missing confidential-VM capability: {missing}");
+}
+report.ensure_supported()?;
+# Ok(())
+# }
+```
+
+Ordinary libkrun VMs are unchanged. In particular, macOS ARM64/HVF remains an
+ordinary isolation backend and cannot satisfy a confidential profile. The
+host report is discovery rather than attestation: only evidence from the
+particular launched guest can eventually authorize an `AttestedVm` or secret
+release. Command receipts and agent execution remain separate consumers.
+
 ## Use VM-backed workspace tools
 
 Build the static Linux companion with `just build-vm-guest`, prepare one

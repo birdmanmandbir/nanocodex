@@ -14,7 +14,9 @@ use std::{
 use thiserror::Error;
 
 use crate::{
+    capabilities::Capabilities,
     command::GuestCommand,
+    confidential::ConfidentialVmError,
     config::{BlockDevice, Network, RootFilesystem, SharedDirectory, VmConfig},
 };
 
@@ -38,6 +40,10 @@ const NET_FEATURE_HOST_UFO: u32 = 1 << 14;
 /// Failure to validate, configure, control, or enter a libkrun VM.
 #[derive(Debug, Error)]
 pub enum VmError {
+    /// An exact confidential-VM profile could not be satisfied.
+    #[error(transparent)]
+    Confidential(#[from] ConfidentialVmError),
+
     /// A typed VM policy value violates a libkrun precondition.
     #[error("invalid VM configuration: {0}")]
     InvalidConfig(&'static str),
@@ -164,6 +170,12 @@ impl KrunVm {
         }
         if config.memory_mib_value() == 0 {
             return Err(VmError::InvalidConfig("memory must be nonzero"));
+        }
+        if let Some(profile) = config.confidential_profile() {
+            validate_confidential_config(config)?;
+            Capabilities::detect()?
+                .confidential_report(profile)
+                .ensure_supported()?;
         }
 
         let root = resolve_root(config.root_filesystem())?;
@@ -605,6 +617,20 @@ fn validate_guest_command(command: &GuestCommand) -> Result<(), VmError> {
     Ok(())
 }
 
+fn validate_confidential_config(config: &VmConfig) -> Result<(), ConfidentialVmError> {
+    if !matches!(config.root_filesystem(), RootFilesystem::Ext4(_)) {
+        return Err(ConfidentialVmError::InvalidConfig(
+            "confidential VMs require one raw ext4 root disk",
+        ));
+    }
+    if !config.shared_directories().is_empty() {
+        return Err(ConfidentialVmError::InvalidConfig(
+            "confidential VMs cannot expose host directories through virtiofs",
+        ));
+    }
+    Ok(())
+}
+
 fn positive_context(status: i32, operation: &'static str) -> Result<u32, VmError> {
     u32::try_from(status).map_err(|_| VmError::Libkrun {
         operation,
@@ -627,7 +653,13 @@ const fn check(status: i32, operation: &'static str) -> Result<(), VmError> {
 mod tests {
     use std::{ffi::OsStr, path::Path};
 
-    use super::{GuestCommand, VmError, array_string, validate_guest_command};
+    use super::{
+        GuestCommand, VmError, array_string, validate_confidential_config, validate_guest_command,
+    };
+    use crate::{
+        confidential::{ConfidentialVmError, ConfidentialVmProfile},
+        config::{SharedDirectory, VmConfig},
+    };
 
     #[test]
     fn libkrun_array_values_reject_unrepresentable_quotes() {
@@ -651,5 +683,27 @@ mod tests {
                 if path == Path::new("workspace")
         ));
         validate_guest_command(&GuestCommand::new("/bin/true").current_dir("/workspace")).unwrap();
+    }
+
+    #[test]
+    fn confidential_vm_rejects_host_directory_roots_and_shares() {
+        let directory_root =
+            VmConfig::new("root").confidential(ConfidentialVmProfile::amd_sev_snp());
+        assert!(matches!(
+            validate_confidential_config(&directory_root),
+            Err(ConfidentialVmError::InvalidConfig(
+                "confidential VMs require one raw ext4 root disk"
+            ))
+        ));
+
+        let shared = VmConfig::ext4("root.ext4")
+            .shared_directory(SharedDirectory::read_only("host", "/host"))
+            .confidential(ConfidentialVmProfile::amd_sev_snp());
+        assert!(matches!(
+            validate_confidential_config(&shared),
+            Err(ConfidentialVmError::InvalidConfig(
+                "confidential VMs cannot expose host directories through virtiofs"
+            ))
+        ));
     }
 }

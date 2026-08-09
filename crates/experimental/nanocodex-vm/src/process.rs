@@ -14,7 +14,7 @@ use crate::{
     krun::{KrunVm, VmError},
 };
 
-const PROCESS_CONFIG_VERSION: u32 = 2;
+const PROCESS_CONFIG_VERSION: u32 = 3;
 
 /// Complete owned input for one dedicated VMM process.
 ///
@@ -110,7 +110,7 @@ mod tests {
     use std::{ffi::OsString, os::unix::fs::PermissionsExt};
 
     use super::*;
-    use crate::config::Network;
+    use crate::{confidential::ConfidentialVmProfile, config::Network};
 
     #[test]
     fn private_config_round_trips_without_argv_delivery() {
@@ -133,6 +133,25 @@ mod tests {
                 .get(&OsString::from("HTTPS_PROXY"))
                 .unwrap(),
             &OsString::from("http://lease:credential@host.internal:8080")
+        );
+    }
+
+    #[test]
+    fn private_config_preserves_a_fail_closed_confidential_profile() {
+        let private = VmProcessConfig::new(
+            VmConfig::ext4("/tmp/rootfs.ext4")
+                .network(Network::Disabled)
+                .confidential(ConfidentialVmProfile::amd_sev_snp()),
+            GuestCommand::new("/bin/true"),
+        )
+        .write_private()
+        .unwrap();
+
+        let decoded = VmProcessConfig::read(private.path()).unwrap();
+
+        assert_eq!(
+            decoded.vm.confidential_profile(),
+            Some(&ConfidentialVmProfile::amd_sev_snp())
         );
     }
 }

@@ -5,7 +5,10 @@
 
 use std::collections::BTreeSet;
 
-use crate::krun::VmError;
+use crate::{
+    confidential::{ConfidentialHostReport, ConfidentialVmProfile},
+    krun::VmError,
+};
 
 /// Optional functionality compiled into the pinned libkrun build.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -114,6 +117,16 @@ impl Capabilities {
     /// Iterates over optional features included in the pinned libkrun build.
     pub fn features(&self) -> impl Iterator<Item = KrunFeature> + '_ {
         self.features.iter().copied()
+    }
+
+    /// Evaluates one exact confidential-VM profile against this libkrun build
+    /// and the local host.
+    ///
+    /// Capability discovery is diagnostic only. A launch must still obtain
+    /// and appraise fresh evidence from the particular guest it creates.
+    #[must_use]
+    pub fn confidential_report(&self, profile: &ConfidentialVmProfile) -> ConfidentialHostReport {
+        ConfidentialHostReport::detect(profile, self)
     }
 }
 

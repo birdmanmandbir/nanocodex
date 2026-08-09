@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::confidential::ConfidentialVmProfile;
+
 /// Root filesystem exposed to one guest.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum RootFilesystem {
@@ -144,6 +146,7 @@ impl SharedDirectory {
 
 /// Immutable configuration for one libkrun VM.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct VmConfig {
     root: RootFilesystem,
     cpus: u8,
@@ -151,6 +154,8 @@ pub struct VmConfig {
     network: Network,
     block_devices: Vec<BlockDevice>,
     shared_directories: Vec<SharedDirectory>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    confidential_profile: Option<ConfidentialVmProfile>,
 }
 
 impl VmConfig {
@@ -164,6 +169,7 @@ impl VmConfig {
             network: Network::Internet,
             block_devices: Vec::new(),
             shared_directories: Vec::new(),
+            confidential_profile: None,
         }
     }
 
@@ -176,6 +182,7 @@ impl VmConfig {
             network: Network::Internet,
             block_devices: Vec::new(),
             shared_directories: Vec::new(),
+            confidential_profile: None,
         }
     }
 
@@ -200,6 +207,7 @@ impl VmConfig {
             network: Network::Internet,
             block_devices: Vec::new(),
             shared_directories: Vec::new(),
+            confidential_profile: None,
         }
     }
 
@@ -235,6 +243,17 @@ impl VmConfig {
     #[must_use]
     pub fn block_device(mut self, device: BlockDevice) -> Self {
         self.block_devices.push(device);
+        self
+    }
+
+    /// Requires this exact confidential-VM profile.
+    ///
+    /// The VMM validates the active libkrun artifact and local host before it
+    /// creates a context. Unsupported profiles fail without falling back to an
+    /// ordinary VM.
+    #[must_use]
+    pub const fn confidential(mut self, profile: ConfidentialVmProfile) -> Self {
+        self.confidential_profile = Some(profile);
         self
     }
 
@@ -285,6 +304,12 @@ impl VmConfig {
     pub fn block_devices(&self) -> &[BlockDevice] {
         &self.block_devices
     }
+
+    /// Returns the exact required confidential profile, when configured.
+    #[must_use]
+    pub const fn confidential_profile(&self) -> Option<&ConfidentialVmProfile> {
+        self.confidential_profile.as_ref()
+    }
 }
 
 #[cfg(test)]
@@ -315,6 +340,20 @@ mod tests {
         assert_eq!(config.cpus_value(), 8);
         assert_eq!(config.memory_mib_value(), 4_096);
         assert_eq!(config.network_value(), &Network::Disabled);
+    }
+
+    #[test]
+    fn confidential_policy_is_explicit_and_has_no_default() {
+        let ordinary = VmConfig::ext4("rootfs.ext4");
+        let confidential = ordinary
+            .clone()
+            .confidential(ConfidentialVmProfile::amd_sev_snp());
+
+        assert_eq!(ordinary.confidential_profile(), None);
+        assert_eq!(
+            confidential.confidential_profile(),
+            Some(&ConfidentialVmProfile::amd_sev_snp())
+        );
     }
 
     #[test]
