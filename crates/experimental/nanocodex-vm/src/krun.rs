@@ -657,7 +657,7 @@ mod tests {
         GuestCommand, VmError, array_string, validate_confidential_config, validate_guest_command,
     };
     use crate::{
-        confidential::{ConfidentialVmError, ConfidentialVmProfile},
+        confidential::{ConfidentialCapability, ConfidentialVmError, ConfidentialVmProfile},
         config::{SharedDirectory, VmConfig},
     };
 
@@ -704,6 +704,23 @@ mod tests {
             Err(ConfidentialVmError::InvalidConfig(
                 "confidential VMs cannot expose host directories through virtiofs"
             ))
+        ));
+    }
+
+    #[test]
+    fn unsupported_confidential_profile_fails_before_root_or_context_creation() {
+        let config = VmConfig::ext4("/path/which/must/not/be-resolved.ext4")
+            .confidential(ConfidentialVmProfile::amd_sev_snp());
+
+        let error = match super::KrunVm::new(&config) {
+            Ok(_) => panic!("confidential VM unexpectedly created a libkrun context"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            VmError::Confidential(ConfidentialVmError::UnsupportedProfile { missing, .. })
+                if missing.contains(&ConfidentialCapability::MeasuredGuestAttester)
         ));
     }
 }
