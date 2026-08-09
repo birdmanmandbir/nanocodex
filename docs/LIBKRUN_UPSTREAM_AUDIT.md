@@ -2,9 +2,10 @@
 
 ## Checkpoint and decision
 
-Nanocodex currently pins `containers/libkrun` `2.0.0-dev` revision
-`df85b8b75f55e8ef1b06b5bc18f08dc6d7b5aeb0`. This audit compares every
-subsequent commit through upstream `main` revision
+Nanocodex `master` pins `containers/libkrun` `2.0.0-dev` revision
+`df85b8b75f55e8ef1b06b5bc18f08dc6d7b5aeb0`; this implementation branch pins
+the reviewed `b71a880` backport described below. This audit compares every
+upstream commit after the base through `main` revision
 `07fd40dcf6da8e14dd47e16a535531f0383fe52c`, inspected on 2026-08-09.
 
 Do not advance the Nanocodex pin wholesale yet. The range contains useful
@@ -26,6 +27,12 @@ it adds typed `krun_set_tee_type` selection for SNP and TDX while preserving
 the legacy JSON API. Both variants pass warnings-denied Clippy and focused C
 API tests on `dev-georgios`. It intentionally does not claim or implement
 guest attestation.
+
+Nanocodex uses the equivalent reviewed backport
+[`gakonst/libkrun@b71a880`](https://github.com/gakonst/libkrun/commit/b71a880a44d66c55c4e1fb1b37aece4affa313b9)
+on top of the existing `df85b8b` checkpoint. This keeps the current ordinary
+VM/init contract byte-compatible while the upstream init migration is
+evaluated separately.
 
 ## Commit classification
 

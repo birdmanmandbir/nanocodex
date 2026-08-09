@@ -274,8 +274,10 @@ satisfy those constraints.
 
 ## libkrun upstream workstream
 
-Implementation uses a dedicated worktree of `containers/libkrun` at the pinned
-`2.0.0-dev` revision `df85b8b75f55e8ef1b06b5bc18f08dc6d7b5aeb0`.
+Implementation uses a dedicated worktree based on the reviewed `2.0.0-dev`
+revision `df85b8b75f55e8ef1b06b5bc18f08dc6d7b5aeb0`. The implementation branch
+pins reviewed backport `b71a880a44d66c55c4e1fb1b37aece4affa313b9` on that
+base for typed TEE selection.
 Before patching it, classify relevant upstream changes since that revision so
 already-landed fixes are not reimplemented. Every upstream change is isolated,
 tested in libkrun's supported feature matrix, and submitted as a focused
