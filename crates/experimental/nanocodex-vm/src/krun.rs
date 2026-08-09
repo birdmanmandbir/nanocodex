@@ -20,6 +20,7 @@ use crate::{
     config::{BlockDevice, Network, RootFilesystem, SharedDirectory, VmConfig},
 };
 
+#[cfg(not(any(feature = "libkrun-amd-sev", feature = "libkrun-intel-tdx")))]
 const ROOT_TAG: &std::ffi::CStr = c"/dev/root";
 const ROOT_BLOCK_ID: &std::ffi::CStr = c"vda";
 #[cfg(not(any(feature = "libkrun-amd-sev", feature = "libkrun-intel-tdx")))]
@@ -199,21 +200,7 @@ impl KrunVm {
 
         match root {
             ResolvedRoot::Directory(root) => {
-                let root = c_string(root.as_os_str(), "root filesystem path")?;
-                // SAFETY: both C strings live through the call and libkrun copies their
-                // contents into the context before returning.
-                check(
-                    unsafe {
-                        krun::krun_add_virtiofs3(
-                            context,
-                            ROOT_TAG.as_ptr(),
-                            root.as_ptr(),
-                            0,
-                            false,
-                        )
-                    },
-                    "attach root filesystem",
-                )?;
+                attach_directory_root(context, &root)?;
             }
             ResolvedRoot::Ext4(root) => {
                 attach_root_disk(context, &root, false)?;
@@ -439,6 +426,25 @@ fn attach_root_disk(context: u32, path: &std::path::Path, read_only: bool) -> Re
     }
 }
 
+#[cfg(not(any(feature = "libkrun-amd-sev", feature = "libkrun-intel-tdx")))]
+fn attach_directory_root(context: u32, root: &std::path::Path) -> Result<(), VmError> {
+    let root = c_string(root.as_os_str(), "root filesystem path")?;
+    // SAFETY: both C strings live through the call and libkrun copies their
+    // contents into the context before returning.
+    check(
+        unsafe { krun::krun_add_virtiofs3(context, ROOT_TAG.as_ptr(), root.as_ptr(), 0, false) },
+        "attach root filesystem",
+    )
+}
+
+#[cfg(any(feature = "libkrun-amd-sev", feature = "libkrun-intel-tdx"))]
+fn attach_directory_root(_context: u32, _root: &std::path::Path) -> Result<(), VmError> {
+    Err(ConfidentialVmError::InvalidConfig(
+        "TEE VMM artifacts cannot expose a directory root through virtiofs",
+    )
+    .into())
+}
+
 fn attach_resolved_disk(
     context: u32,
     id: &std::ffi::CStr,
@@ -529,6 +535,7 @@ fn attach_block_devices(context: u32, devices: &[BlockDevice]) -> Result<(), VmE
     Ok(())
 }
 
+#[cfg(not(any(feature = "libkrun-amd-sev", feature = "libkrun-intel-tdx")))]
 fn attach_shared_directories(context: u32, directories: &[SharedDirectory]) -> Result<(), VmError> {
     for directory in directories {
         let path =
@@ -560,6 +567,21 @@ fn attach_shared_directories(context: u32, directories: &[SharedDirectory]) -> R
         )?;
     }
     Ok(())
+}
+
+#[cfg(any(feature = "libkrun-amd-sev", feature = "libkrun-intel-tdx"))]
+fn attach_shared_directories(
+    _context: u32,
+    directories: &[SharedDirectory],
+) -> Result<(), VmError> {
+    if directories.is_empty() {
+        Ok(())
+    } else {
+        Err(ConfidentialVmError::InvalidConfig(
+            "TEE VMM artifacts cannot expose host directories through virtiofs",
+        )
+        .into())
+    }
 }
 
 /// Out-of-band control for a VM running in libkrun's event loop.
