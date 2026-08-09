@@ -283,6 +283,11 @@ libkrun commit before Nanocodex pins it. A temporary Nanocodex fork is
 acceptable while upstream review is pending; long-lived behavior forks are
 not.
 
+The initial classification through upstream `07fd40d` is retained in
+[`LIBKRUN_UPSTREAM_AUDIT.md`](LIBKRUN_UPSTREAM_AUDIT.md). It records the Nitro
+fixes already upstream, the incompatible init/API migration, dead
+attestation-shaped JSON fields, and the first typed TEE API patch.
+
 Initial libkrun issues to resolve:
 
 1. Restore or replace the remote-attestation functionality lost when the old C
