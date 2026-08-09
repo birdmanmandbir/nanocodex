@@ -165,7 +165,21 @@ unrelated workspace changes.
 
 ## Active milestones
 
-### 1. Runtime and Code Mode parity
+### 1. Attestable confidential VMs on libkrun
+
+- Execute the ordered plan in
+  [`docs/LIBKRUN_CONFIDENTIAL_VMS.md`](docs/LIBKRUN_CONFIDENTIAL_VMS.md) after
+  the immediate durable-evaluation-throughput exit gate.
+- Keep the work centered on caller-selected local libkrun confidential-VM
+  profiles, fresh native evidence, appraisal, measured guests, and confidential
+  devices. Host capability discovery may select or reject a requested local
+  artifact; it must not grow into scheduling or placement.
+- Implement and upstream missing libkrun launch, attestation, rootfs, TDX,
+  Nitro, confidential-device, and GPU support as focused changes.
+- Keep agent execution and attestable command receipts as separate consumers
+  after the confidential-VM contract is proven.
+
+### 2. Runtime and Code Mode parity
 
 - Land the focused Code Mode contract alignment from
   [PR #95](https://github.com/gakonst/nanocodex/pull/95) independently of the
@@ -178,7 +192,7 @@ unrelated workspace changes.
   keep app-server, approval, provider-portability, and unrelated TUI behavior
   classified out of scope.
 
-### 2. Browser identity, placement, and visibility
+### 3. Browser identity, placement, and visibility
 
 - Finish the private-browser desktop profile import in
   [PR #93](https://github.com/gakonst/nanocodex/pull/93). Cookie extraction must
@@ -217,7 +231,7 @@ unrelated workspace changes.
   capability-specific contract; unsupported actions must not be discovered as
   usable.
 
-### 3. Application-owned terminals and managed sessions
+### 4. Application-owned terminals and managed sessions
 
 - Rebase and finish the narrow application-owned terminal contract in
   [PR #79](https://github.com/gakonst/nanocodex/pull/79). Retained process state,
@@ -232,7 +246,7 @@ unrelated workspace changes.
   in the consuming application. Lower `nanocodex-*` libraries own typed seams,
   not one hosted product's policy.
 
-### 4. Evaluation as product evidence
+### 5. Evaluation as product evidence
 
 - Finish the immediate durable-evaluation-throughput slice above before adding
   another evaluation abstraction or benchmark family.
@@ -254,7 +268,7 @@ unrelated workspace changes.
   Nanocodex pass. Inspect exact JSONL, trajectories, retained files, verifier
   logs, and cold-versus-warm timing before making an evaluation claim.
 
-### 5. Next release gate
+### 6. Next release gate
 
 - Select the next version only after the included milestones and migrations are
   known; do not infer a version number from unreleased workspace metadata.
@@ -274,22 +288,25 @@ unrelated workspace changes.
    hosted transports, composable egress, Cloudflare, and Rivet consumers.
 3. [ ] Finish the immediate durable-evaluation-throughput slice and satisfy its
    live rolling-pool exit gate. Keep work in progress limited to this item.
-4. [ ] Finish and merge the focused Code Mode parity slice in PR #95.
-5. [ ] Reconcile and advance the Codex parity checkpoint with a complete commit
+4. [ ] Execute the attestable confidential-VM plan through live SEV-SNP before
+   starting another broad experimental VM consumer; continue through TDX,
+   Nitro, and confidential GPUs as independently mergeable vertical slices.
+5. [ ] Finish and merge the focused Code Mode parity slice in PR #95.
+6. [ ] Reconcile and advance the Codex parity checkpoint with a complete commit
    classification and direct evidence for every adopted behavior.
-6. [ ] Fix, validate, and merge desktop profile import in PR #93.
-7. [ ] Build browser placement and presentation policy for private host and
+7. [ ] Fix, validate, and merge desktop profile import in PR #93.
+8. [ ] Build browser placement and presentation policy for private host and
    private VM sessions, then prove both through the CLI consumer.
-8. [ ] Prototype the user-Chrome extension/native-host path; prove exact tab
+9. [ ] Prototype the user-Chrome extension/native-host path; prove exact tab
    claiming, grouping, visible cursor feedback, interruption, leasing, and
    cleanup before exposing it as normal CLI policy.
-9. [ ] Rebase and decide PR #79, then review PR #89 against the stable-core and
-   application-policy boundaries above.
-10. [ ] Rebase and merge PR #61, then complete the stacked StableBench work in
-   PR #72 and record retained differential evidence.
-11. [ ] Decide whether PR #32 still solves a demonstrated problem or should be
+10. [ ] Rebase and decide PR #79, then review PR #89 against the stable-core and
+    application-policy boundaries above.
+11. [ ] Rebase and merge PR #61, then complete the stacked StableBench work in
+    PR #72 and record retained differential evidence.
+12. [ ] Decide whether PR #32 still solves a demonstrated problem or should be
     replaced by a smaller application-owned experiment.
-12. [ ] Cut the next release only after all selected milestones pass the full
+13. [ ] Cut the next release only after all selected milestones pass the full
     release gate.
 
 ## Current non-goals
