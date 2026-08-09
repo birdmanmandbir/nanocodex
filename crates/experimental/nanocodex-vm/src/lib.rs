@@ -2,6 +2,9 @@
 #![cfg_attr(not(feature = "host"), doc = include_str!("../GUEST_RUNTIME.md"))]
 #![deny(unsafe_code, missing_docs, rustdoc::broken_intra_doc_links)]
 
+#[cfg(all(feature = "libkrun-amd-sev", feature = "libkrun-intel-tdx"))]
+compile_error!("one VMM artifact cannot contain both AMD SEV-SNP and Intel TDX libkrun variants");
+
 #[cfg(all(
     feature = "host",
     any(

@@ -36,6 +36,14 @@ until the guest can generate a fresh key, bind the canonical
 can appraise that evidence. Having `/dev/sev`, `/dev/kvm`, or a TEE-enabled
 libkrun build is not sufficient by itself.
 
+Linux VMM artifacts opt into exactly one compile-time libkrun variant with
+`just build-vm-host-amd-sev` or `just build-vm-host-intel-tdx`. The builds use
+separate target directories, and selecting both crate features is a compile
+error. The requested profile is then selected through libkrun's typed TEE API
+before CPU and memory configuration; TEE roots use libkrun's fixed `/dev/vda`
+guest-init path and split IRQ-chip mode. These launch mechanics do not open the
+attestation gate described above.
+
 ```no_run
 use nanocodex_vm::host::{Capabilities, ConfidentialVmProfile};
 

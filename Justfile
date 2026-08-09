@@ -141,6 +141,20 @@ build-eval-host: build-vm-guest
         target/debug/nanocodex
     fi
 
+# Build one Linux VMM entry point against the dedicated SEV-SNP libkrun
+# variant. Keeping a separate target directory prevents artifact confusion.
+build-vm-host-amd-sev:
+    @test "$(uname -s)" = Linux || { echo "SEV-SNP VMM builds require Linux" >&2; exit 2; }
+    cargo build --locked -p nanocodex-bin --bin nanocodex \
+      --features libkrun-amd-sev --target-dir target/libkrun-amd-sev
+
+# Build one Linux VMM entry point against the dedicated Intel TDX libkrun
+# variant. SNP and TDX are deliberately never feature-unified.
+build-vm-host-intel-tdx:
+    @test "$(uname -s)" = Linux || { echo "Intel TDX VMM builds require Linux" >&2; exit 2; }
+    cargo build --locked -p nanocodex-bin --bin nanocodex \
+      --features libkrun-intel-tdx --target-dir target/libkrun-intel-tdx
+
 build-vm-example:
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="{{justfile_directory()}}/scripts/aarch64-unknown-linux-musl-linker" \
     CC_aarch64_unknown_linux_musl="{{justfile_directory()}}/scripts/aarch64-unknown-linux-musl-linker" \

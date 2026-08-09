@@ -26,6 +26,10 @@ tempo = [
     "dep:rand",
     "dep:tempo-alloy",
 ]
+# Build the private VM entry point against one dedicated libkrun TEE variant.
+# The nanocodex-vm crate rejects selecting both variants in one artifact.
+libkrun-amd-sev = ["nanocodex-vm/libkrun-amd-sev"]
+libkrun-intel-tdx = ["nanocodex-vm/libkrun-intel-tdx"]
 
 [dependencies]
 arboard.workspace = true

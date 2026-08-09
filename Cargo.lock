@@ -1555,6 +1555,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitfield"
+version = "0.19.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b45721c9db4c7a20899d05efb7ad9235f50b256e980db30ffb229abf732934c3"
+dependencies = [
+ "bitfield-macros",
+]
+
+[[package]]
+name = "bitfield-macros"
+version = "0.19.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0cb6f3d4773a2107b94cbeccaa5b5f0b35a88389b5d522d13d659f64317b22d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
+]
+
+[[package]]
 name = "bitflags"
 version = "1.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4238,6 +4258,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "iocuddle"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8972d5be69940353d5347a1344cb375d9b457d6809b428b05bb1ca2fb9ce007"
+
+[[package]]
 name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4492,6 +4518,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbs-types"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2119e8aaa1382675e879f0cbc95fc948d28284d134896f57676b8ef2c90212e"
+dependencies = [
+ "base64",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sm3",
+ "strum 0.27.2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "keccak"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4539,6 +4580,7 @@ dependencies = [
  "kvm-ioctls",
  "libc",
  "linux-loader",
+ "tdx",
  "vm-memory",
  "vmm-sys-util 0.15.0",
  "windows-sys 0.61.2",
@@ -4649,9 +4691,13 @@ name = "krun-vmm"
 version = "0.1.0-2.0.0-dev"
 source = "git+https://github.com/gakonst/libkrun?rev=b71a880a44d66c55c4e1fb1b37aece4affa313b9#b71a880a44d66c55c4e1fb1b37aece4affa313b9"
 dependencies = [
+ "bitfield",
+ "bitflags 2.13.1",
  "bzip2",
  "crossbeam-channel",
  "flate2",
+ "iocuddle",
+ "kbs-types",
  "krun-arch",
  "krun-arch-gen",
  "krun-cpuid",
@@ -4666,6 +4712,9 @@ dependencies = [
  "linux-loader",
  "log",
  "nix 0.30.1",
+ "serde",
+ "serde_json",
+ "tdx",
  "vm-memory",
  "vmm-sys-util 0.14.0",
  "windows-sys 0.61.2",
@@ -8624,6 +8673,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sm3"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ebb9a3b702d0a7e33bc4d85a14456633d2b165c2ad839c5fd9a8417c1ab15860"
+dependencies = [
+ "digest 0.10.7",
+]
+
+[[package]]
 name = "smallvec"
 version = "1.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8791,6 +8849,9 @@ name = "strum"
 version = "0.27.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af23d6f6c1a224baef9d3f61e287d2761385a5b88fdab4eb4c6f11aeb54c4bcf"
+dependencies = [
+ "strum_macros 0.27.2",
+]
 
 [[package]]
 name = "strum"
@@ -8900,6 +8961,17 @@ name = "syn"
 version = "2.0.119"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "872831b642d1a07999a962a351ed35b955ea2cfc8f3862091e2a240a84f17297"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
+name = "syn"
+version = "3.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53e9bae58849f64dfa4f5d5ae372c8341f7305f82a3868709269343628b659a3"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -9018,6 +9090,21 @@ name = "target-lexicon"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
+
+[[package]]
+name = "tdx"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83943e37cf46979f711ad11489c641fa058fd0fae92c122d1fc26a664e82acab"
+dependencies = [
+ "bitflags 2.13.1",
+ "iocuddle",
+ "kvm-bindings",
+ "kvm-ioctls",
+ "libc",
+ "uuid",
+ "vmm-sys-util 0.15.0",
+]
 
 [[package]]
 name = "tempfile"

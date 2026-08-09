@@ -264,13 +264,13 @@ firmware. They will not be merged into one Cargo feature-unified binary.
 - Firmware filenames and identities are profile-owned rather than hidden behind
   the current generic `libkrunfw.so.5` default.
 
-The first implementation slice decides whether variant builds remain feature-
-selected builds of the existing hidden `nanocodex vm-run-config` entry point or
-become smaller unpublished VMM packages. The decision gate is concrete: normal
-workspace `--all-targets` validation must not unify incompatible libkrun
-features, and each artifact must retain the existing dedicated-process cleanup
-contract. Dynamic loading is not introduced unless separate artifacts cannot
-satisfy those constraints.
+SNP and TDX now remain feature-selected builds of the existing hidden
+`nanocodex vm-run-config` entry point. Mutually exclusive `libkrun-amd-sev` and
+`libkrun-intel-tdx` features build into separate target directories, preserving
+the existing dedicated-process cleanup contract without dynamic loading. The
+ordinary workspace build selects neither feature. Nitro remains a separate
+launch-boundary decision because its root and process model is structurally
+different.
 
 ## libkrun upstream workstream
 
@@ -321,7 +321,7 @@ pinned libkrun revision requires them.
   `nanocodex-vm` README.
 - [ ] Audit every libkrun TEE, Nitro, firmware, rootfs, memory, network, and
   device API at the pinned revision.
-- [ ] Choose the separate-artifact layout and prove generic workspace builds do
+- [x] Choose the separate-artifact layout and prove generic workspace builds do
   not feature-unify confidential variants.
 - [ ] Define the profile, capability report, challenge, raw evidence,
   component graph, binding, reference, endorsement, and result types.

@@ -16,16 +16,19 @@ use thiserror::Error;
 use crate::{
     capabilities::Capabilities,
     command::GuestCommand,
-    confidential::ConfidentialVmError,
+    confidential::{ConfidentialVmError, ConfidentialVmProfile, CpuTee},
     config::{BlockDevice, Network, RootFilesystem, SharedDirectory, VmConfig},
 };
 
 const ROOT_TAG: &std::ffi::CStr = c"/dev/root";
 const ROOT_BLOCK_ID: &std::ffi::CStr = c"vda";
+#[cfg(not(any(feature = "libkrun-amd-sev", feature = "libkrun-intel-tdx")))]
 const ROOT_BLOCK_DEVICE: &std::ffi::CStr = c"/dev/vda";
 const OVERLAY_LOWER_BLOCK_ID: &std::ffi::CStr = c"nanocodex-overlay-lower";
 const OVERLAY_UPPER_BLOCK_ID: &std::ffi::CStr = c"nanocodex-overlay-upper";
+#[cfg(not(any(feature = "libkrun-amd-sev", feature = "libkrun-intel-tdx")))]
 const EXT4_FILESYSTEM: &std::ffi::CStr = c"ext4";
+#[cfg(not(any(feature = "libkrun-amd-sev", feature = "libkrun-intel-tdx")))]
 const READ_ONLY_MOUNT_OPTIONS: &std::ffi::CStr = c"ro";
 const TSI_HIJACK_INET: u32 = 1;
 const NET_FLAG_VFKIT: u32 = 1 << 0;
@@ -185,6 +188,10 @@ impl KrunVm {
             context: Some(context),
         };
 
+        if let Some(profile) = config.confidential_profile() {
+            configure_confidential_context(context, profile)?;
+        }
+
         check(
             krun::krun_set_vm_config(context, config.cpus_value(), config.memory_mib_value()),
             "configure VM",
@@ -256,7 +263,7 @@ impl KrunVm {
 
         attach_network(context, config.network_value())?;
         check(
-            krun::krun_split_irqchip(context, false),
+            krun::krun_split_irqchip(context, config.confidential_profile().is_some()),
             "configure interrupt controller",
         )?;
 
@@ -407,23 +414,29 @@ fn resolve_block_path(path: &std::path::Path) -> Result<PathBuf, VmError> {
 
 fn attach_root_disk(context: u32, path: &std::path::Path, read_only: bool) -> Result<(), VmError> {
     attach_resolved_disk(context, ROOT_BLOCK_ID, path, read_only, "attach root disk")?;
-    let options = if read_only {
-        READ_ONLY_MOUNT_OPTIONS.as_ptr()
-    } else {
-        ptr::null()
-    };
-    // SAFETY: all strings are static and NUL terminated.
-    check(
-        unsafe {
-            krun::krun_set_root_disk_remount(
-                context,
-                ROOT_BLOCK_DEVICE.as_ptr(),
-                EXT4_FILESYSTEM.as_ptr(),
-                options,
-            )
-        },
-        "select root disk",
-    )
+    #[cfg(any(feature = "libkrun-amd-sev", feature = "libkrun-intel-tdx"))]
+    return Ok(());
+
+    #[cfg(not(any(feature = "libkrun-amd-sev", feature = "libkrun-intel-tdx")))]
+    {
+        let options = if read_only {
+            READ_ONLY_MOUNT_OPTIONS.as_ptr()
+        } else {
+            ptr::null()
+        };
+        // SAFETY: all strings are static and NUL terminated.
+        check(
+            unsafe {
+                krun::krun_set_root_disk_remount(
+                    context,
+                    ROOT_BLOCK_DEVICE.as_ptr(),
+                    EXT4_FILESYSTEM.as_ptr(),
+                    options,
+                )
+            },
+            "select root disk",
+        )
+    }
 }
 
 fn attach_resolved_disk(
@@ -629,6 +642,46 @@ fn validate_confidential_config(config: &VmConfig) -> Result<(), ConfidentialVmE
         ));
     }
     Ok(())
+}
+
+fn configure_confidential_context(
+    context: u32,
+    profile: &ConfidentialVmProfile,
+) -> Result<(), VmError> {
+    match profile.cpu_tee() {
+        CpuTee::AmdSevSnp => configure_amd_sev_context(context),
+        CpuTee::IntelTdx => configure_intel_tdx_context(context),
+        CpuTee::AwsNitro => Err(ConfidentialVmError::InvalidConfig(
+            "AWS Nitro requires its dedicated libkrun launch boundary",
+        )
+        .into()),
+    }
+}
+
+#[cfg(feature = "libkrun-amd-sev")]
+fn configure_amd_sev_context(context: u32) -> Result<(), VmError> {
+    check(krun::krun_set_tee_type(context, 0), "select AMD SEV-SNP")
+}
+
+#[cfg(not(feature = "libkrun-amd-sev"))]
+fn configure_amd_sev_context(_context: u32) -> Result<(), VmError> {
+    Err(ConfidentialVmError::InvalidConfig(
+        "the active VMM artifact is not the AMD SEV-SNP variant",
+    )
+    .into())
+}
+
+#[cfg(feature = "libkrun-intel-tdx")]
+fn configure_intel_tdx_context(context: u32) -> Result<(), VmError> {
+    check(krun::krun_set_tee_type(context, 1), "select Intel TDX")
+}
+
+#[cfg(not(feature = "libkrun-intel-tdx"))]
+fn configure_intel_tdx_context(_context: u32) -> Result<(), VmError> {
+    Err(
+        ConfidentialVmError::InvalidConfig("the active VMM artifact is not the Intel TDX variant")
+            .into(),
+    )
 }
 
 fn positive_context(status: i32, operation: &'static str) -> Result<u32, VmError> {

@@ -36,6 +36,10 @@ host = [
     "nanocodex-tools/native",
 ]
 guest-runtime = ["dep:nix", "nanocodex-tools/workspace-runtime"]
+# Dedicated host artifacts select exactly one libkrun TEE implementation. These
+# features are intentionally not part of `host` or the ordinary workspace build.
+libkrun-amd-sev = ["host", "krun/amd-sev"]
+libkrun-intel-tdx = ["host", "krun/tdx"]
 
 [dependencies]
 base64.workspace = true
