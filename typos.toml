@@ -15,6 +15,8 @@ wasm = "wasm"
 ba = "ba"
 # `CMO` abbreviates the differential evaluator's code-mode-only profile.
 CMO = "CMO"
+# CBOR Object Signing and Encryption, used by Nitro attestation documents.
+COSE = "COSE"
 # `caf` is the hexadecimal middle of the reviewed Codex commit
 # `312caf176a8f`, not prose.
 caf = "caf"
