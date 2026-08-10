@@ -94,7 +94,7 @@ mod tests {
             vec!["nanocodex", "eval", "attach", "local-smoke"],
             vec!["nanocodex", "eval", "benchmark", "local-smoke"],
             vec!["nanocodex", "eval", "coordinator", "local-smoke"],
-            vec!["nanocodex", "eval", "connect", "iroh-eval:ticket"],
+            vec!["nanocodex", "eval", "connect", "nanocodex-net:ticket"],
         ] {
             Cli::try_parse_from(arguments).expect("supported eval command must parse");
         }

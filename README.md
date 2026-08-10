@@ -294,6 +294,7 @@ Components whose public contracts are still maturing live under
 | [`nanocodex-voice`](crates/experimental/nanocodex-voice/README.md) | Desktop GPT Realtime audio and reusable voice-to-agent lifecycle |
 | [`nanocodex-vm`](crates/experimental/nanocodex-vm/README.md) | VM lifecycle and images plus retained guest-backed workspace tools |
 | [`nanocodex-eval`](crates/experimental/nanocodex-eval/README.md) | VM-backed evaluation, canonical verification, durable evidence, and live stock-Codex differential analysis |
+| [`nanocodex-network`](crates/experimental/nanocodex-network/README.md) | Durable Iroh identities, bootstrap admission, local service bridges, and identity-bound direct sessions |
 
 The CLI is a consumer of these crates. Voice and VM-backed tools remain thin,
 opt-in adapters over the stable library contracts for normal agent sessions;

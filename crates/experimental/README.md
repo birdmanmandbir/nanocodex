@@ -14,6 +14,9 @@ being exercised and revised:
 - [`nanocodex-eval`](nanocodex-eval/README.md): VM-backed benchmark
   scheduling, verification, durable evidence, and live stock-Codex
   differential analysis.
+- [`nanocodex-network`](nanocodex-network/README.md): durable Iroh identities,
+  bootstrap admission, bounded local bridges, and identity-bound direct
+  sessions.
 
 Experimental means API stability, not reduced engineering standards. These
 packages remain workspace members and must pass the normal formatting, Clippy,

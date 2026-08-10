@@ -1,12 +1,5 @@
 //! Narrow pull coordinator for durable evaluation workers.
 
-mod iroh;
-
-pub use iroh::{
-    IrohCoordinatorConnector, IrohCoordinatorError, IrohCoordinatorIdentity, IrohCoordinatorServer,
-    IrohCoordinatorTicket,
-};
-
 use std::{
     collections::HashMap,
     io::Write,
@@ -1430,8 +1423,9 @@ impl TryFrom<WireTreatment> for EvaluationTreatment {
 mod tests {
     use std::{fs, path::Path};
 
+    use nanocodex_network::{Hub, NodeConnector};
     use rusqlite::Connection;
-    use tokio::task::JoinHandle;
+    use tokio::{sync::Semaphore, task::JoinHandle};
 
     use super::*;
     use crate::{
@@ -1439,6 +1433,8 @@ mod tests {
         coordinator::RemoteClaim,
         workset::{BeginTask, Workset},
     };
+
+    static IROH_TEST_PERMIT: Semaphore = Semaphore::const_new(1);
 
     fn write_task(root: &Path) {
         let task = root.join("one");
@@ -1540,7 +1536,7 @@ thinking = ["high"]
             .await
             .unwrap();
         let (iroh_server, ticket) =
-            IrohCoordinatorServer::spawn(coordinator_address, server_endpoint, false)
+            Hub::bind_with_endpoint(coordinator_address, server_endpoint, false)
                 .await
                 .unwrap();
         let bridge_listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -1557,7 +1553,7 @@ thinking = ["high"]
                 result = CoordinatorServer::new(evaluation).serve(coordinator_listener) => {
                     result.unwrap();
                 }
-                result = IrohCoordinatorConnector::serve_with_endpoint(
+                result = NodeConnector::serve_with_endpoint(
                     ticket,
                     bridge_listener,
                     client_endpoint,
@@ -1573,7 +1569,7 @@ thinking = ["high"]
 
     #[tokio::test]
     async fn coordinator_http_and_artifact_upload_cross_iroh() {
-        let _test_permit = super::iroh::TEST_ENDPOINT_PERMIT.acquire().await.unwrap();
+        let _test_permit = IROH_TEST_PERMIT.acquire().await.unwrap();
         let (directory, client, selection, server) = iroh_fixture().await;
         let worker = client.clone().worker("iroh-worker");
         let RemoteClaim::Run { claim, .. } = worker.claim(&selection).await.unwrap() else {

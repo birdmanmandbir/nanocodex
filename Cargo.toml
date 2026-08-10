@@ -10,6 +10,7 @@ members = [
     "crates/experimental/nanocodex-voice",
     "crates/experimental/nanocodex-eval",
     "crates/experimental/nanocodex-eval-adapters",
+    "crates/experimental/nanocodex-network",
     "crates/experimental/nanocodex-vm",
     "crates/nanocodex-oai-api",
     "crates/nanocodex-observability",
@@ -82,6 +83,7 @@ nanocodex-egress = { version = "0.5.0", path = "crates/experimental/nanocodex-eg
 nanocodex-voice = { version = "0.5.0", path = "crates/experimental/nanocodex-voice" }
 nanocodex-eval = { version = "0.5.0", path = "crates/experimental/nanocodex-eval" }
 nanocodex-eval-adapters = { version = "0.5.0", path = "crates/experimental/nanocodex-eval-adapters" }
+nanocodex-network = { version = "0.5.0", path = "crates/experimental/nanocodex-network" }
 nanocodex-vm = { version = "0.5.0", path = "crates/experimental/nanocodex-vm" }
 nanocodex-oai-api = { version = "0.5.0", path = "crates/nanocodex-oai-api" }
 nanocodex-observability = { version = "0.5.0", path = "crates/nanocodex-observability" }

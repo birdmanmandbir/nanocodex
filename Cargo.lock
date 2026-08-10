@@ -5880,6 +5880,7 @@ dependencies = [
  "nanocodex-egress",
  "nanocodex-eval",
  "nanocodex-eval-adapters",
+ "nanocodex-network",
  "nanocodex-observability",
  "nanocodex-subagents",
  "nanocodex-vm",
@@ -5977,17 +5978,16 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "chrono",
- "constant_time_eq",
  "filetime",
  "flate2",
  "fs2",
  "futures-util",
- "getrandom 0.4.3",
  "hex",
  "ignore",
  "iroh",
  "jiff",
  "nanocodex-agent",
+ "nanocodex-network",
  "nanocodex-oai-api",
  "nanocodex-tools",
  "nanocodex-vm",
@@ -6073,6 +6073,24 @@ dependencies = [
  "tokio",
  "tower",
  "uuid",
+]
+
+[[package]]
+name = "nanocodex-network"
+version = "0.5.0"
+dependencies = [
+ "base64 0.22.1",
+ "constant_time_eq",
+ "getrandom 0.4.3",
+ "hex",
+ "iroh",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

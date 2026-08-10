@@ -2,10 +2,8 @@ use std::{net::Ipv4Addr, path::PathBuf};
 
 use clap::Args;
 use eyre::{Result, WrapErr as _};
-use nanocodex_eval::{
-    Evaluation,
-    coordinator::{CoordinatorServer, IrohCoordinatorIdentity, IrohCoordinatorServer},
-};
+use nanocodex_eval::{Evaluation, coordinator::CoordinatorServer};
+use nanocodex_network::{Hub, JoinAuthority};
 use tokio::net::TcpListener;
 
 use super::profile::default_state_dir;
@@ -38,7 +36,7 @@ impl Coordinator {
         let evaluation = Evaluation::open(&self.config, Some(&self.profile), state.clone())?;
         let identity = self
             .iroh
-            .then(|| IrohCoordinatorIdentity::load_or_create(&state))
+            .then(|| JoinAuthority::load_or_create(state.join("iroh/authority.json")))
             .transpose()
             .wrap_err("failed to load the durable iroh coordinator identity")?;
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, self.port))
@@ -46,7 +44,7 @@ impl Coordinator {
             .wrap_err("failed to bind the evaluation coordinator")?;
         let address = listener.local_addr()?;
         let iroh = if let Some(identity) = identity.as_ref() {
-            let (server, ticket) = IrohCoordinatorServer::bind(address, identity)
+            let (server, ticket) = Hub::bind(address, identity)
                 .await
                 .wrap_err("failed to publish the evaluation coordinator over iroh")?;
             eprintln!("local coordinator: http://{address}");
