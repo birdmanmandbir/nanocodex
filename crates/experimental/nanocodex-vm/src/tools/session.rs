@@ -13,6 +13,7 @@ use std::{
 use crate::{
     attestation::{GuestAttestation, GuestAttestationParameters},
     command::GuestCommand,
+    command_proof::{AttestedCommandProof, AttestedCommandRequest},
     config::VmConfig,
     egress::EgressLease,
     process::{PrivateVmProcessConfig, VmProcessConfig, VmProcessError},
@@ -30,10 +31,10 @@ use super::{
     VmToolClient,
     protocol::{
         AttestRequest, AttestResponse, CancelRequest, ControlResponse, CreateDirectoryRequest,
-        ExecuteRequest, ExecuteResponse, MemoryRequest, MemoryResponse, ReadFileRequest,
-        ReadFileResponse, ReadyRequest, SessionRequest, SessionResponse, ShutdownRequest,
-        TerminateToolProcessesRequest, ToolRequest, WireToolContext, WireToolInput,
-        WriteFileRequest,
+        ExecuteRequest, ExecuteResponse, MemoryRequest, MemoryResponse, ProveCommandRequest,
+        ProveCommandResponse, ReadFileRequest, ReadFileResponse, ReadyRequest, SessionRequest,
+        SessionResponse, ShutdownRequest, TerminateToolProcessesRequest, ToolRequest,
+        WireToolContext, WireToolInput, WriteFileRequest,
     },
 };
 
@@ -739,6 +740,20 @@ impl VmToolSession {
         self.handle.attest(parameters).await
     }
 
+    /// Executes exact sealed bytes and returns fresh native evidence plus a
+    /// receipt signed by the evidence-bound guest key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when sealed execution or evidence collection fails,
+    /// the session closes, or the typed response is invalid.
+    pub async fn prove_command(
+        &self,
+        request: AttestedCommandRequest,
+    ) -> Result<AttestedCommandProof, VmToolSessionError> {
+        self.handle.prove_command(request).await
+    }
+
     /// Returns the best-effort peak memory observed for this VM session.
     ///
     /// Host RSS remains available when the guest protocol has already failed.
@@ -993,6 +1008,33 @@ impl VmToolSessionHandle {
             (None, Some(error)) => Err(VmToolSessionError::Guest(error)),
             _ => Err(VmToolSessionError::Protocol(
                 "expected exactly one of attestation or error",
+            )),
+        }
+    }
+
+    /// Executes an exact command and requests fresh evidence for its receipt key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when execution, collection, or the session protocol fails.
+    pub async fn prove_command(
+        &self,
+        request: AttestedCommandRequest,
+    ) -> Result<AttestedCommandProof, VmToolSessionError> {
+        let response = self
+            .control_request(|id| SessionRequest::ProveCommand(ProveCommandRequest { id, request }))
+            .await?;
+        let SessionResponse::ProveCommand(ProveCommandResponse { proof, error, .. }) = response
+        else {
+            return Err(VmToolSessionError::Protocol(
+                "expected a prove-command response",
+            ));
+        };
+        match (proof, error) {
+            (Some(proof), None) => Ok(proof),
+            (None, Some(error)) => Err(VmToolSessionError::Guest(error)),
+            _ => Err(VmToolSessionError::Protocol(
+                "expected exactly one of proof or error",
             )),
         }
     }
@@ -1840,6 +1882,7 @@ const fn set_request_id(request: &mut SessionRequest, id: u64) {
         SessionRequest::ReadFile(request) => request.id = id,
         SessionRequest::Memory(request) => request.id = id,
         SessionRequest::Attest(request) => request.id = id,
+        SessionRequest::ProveCommand(request) => request.id = id,
         SessionRequest::Execute(request) => request.id = id,
         SessionRequest::Cancel(request) => request.id = id,
         SessionRequest::TerminateToolProcesses(request) => request.id = id,

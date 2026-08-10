@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
 use crate::attestation::{GuestAttestation, GuestAttestationParameters};
+use crate::command_proof::{AttestedCommandProof, AttestedCommandRequest};
 
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
@@ -14,6 +15,7 @@ pub(crate) enum SessionRequest {
     ReadFile(ReadFileRequest),
     Memory(MemoryRequest),
     Attest(AttestRequest),
+    ProveCommand(ProveCommandRequest),
     Execute(ExecuteRequest),
     Cancel(CancelRequest),
     TerminateToolProcesses(TerminateToolProcessesRequest),
@@ -31,6 +33,7 @@ impl SessionRequest {
             Self::ReadFile(request) => request.id,
             Self::Memory(request) => request.id,
             Self::Attest(request) => request.id,
+            Self::ProveCommand(request) => request.id,
             Self::Execute(request) => request.id,
             Self::Cancel(request) => request.id,
             Self::TerminateToolProcesses(request) => request.id,
@@ -49,6 +52,7 @@ pub(crate) enum SessionResponse {
     ReadFile(ReadFileResponse),
     Memory(MemoryResponse),
     Attest(AttestResponse),
+    ProveCommand(ProveCommandResponse),
     Execute(ExecuteResponse),
     Cancel(ControlResponse),
     TerminateToolProcesses(ControlResponse),
@@ -68,6 +72,7 @@ impl SessionResponse {
             Self::ReadFile(response) => response.id,
             Self::Memory(response) => response.id,
             Self::Attest(response) => response.id,
+            Self::ProveCommand(response) => response.id,
             Self::Execute(response) => response.id,
         }
     }
@@ -192,6 +197,21 @@ pub(crate) struct AttestResponse {
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct ProveCommandRequest {
+    pub id: u64,
+    pub request: AttestedCommandRequest,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProveCommandResponse {
+    pub id: u64,
+    pub proof: Option<AttestedCommandProof>,
+    pub error: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ExecuteResponse {
     pub id: u64,
     pub exit_code: Option<i32>,
@@ -273,13 +293,14 @@ mod tests {
     use crate::attestation::{
         AttestationChallenge, CpuAttestationProfile, GuestAttestationParameters,
     };
+    use crate::command_proof::{AttestedCommand, AttestedCommandRequest};
     use nanocodex_tools::{ToolInput, ToolOutput, standard::StandardTool};
     use serde_json::{json, value::to_raw_value};
 
     use super::{
         AttestRequest, CancelRequest, ControlResponse, CreateDirectoryRequest, ExecuteRequest,
-        ExecuteResponse, MemoryRequest, MemoryResponse, ReadFileRequest, ReadFileResponse,
-        ReadyRequest, SessionRequest, SessionResponse, ShutdownRequest,
+        ExecuteResponse, MemoryRequest, MemoryResponse, ProveCommandRequest, ReadFileRequest,
+        ReadFileResponse, ReadyRequest, SessionRequest, SessionResponse, ShutdownRequest,
         TerminateToolProcessesRequest, ToolRequest, ToolResponse, WireToolContext, WireToolInput,
         WriteFileRequest,
     };
@@ -312,6 +333,39 @@ mod tests {
         assert_eq!(
             decoded.parameters.cpu_profile(),
             CpuAttestationProfile::AmdSevSnp
+        );
+    }
+
+    #[test]
+    fn command_proof_request_round_trips_as_a_typed_control_message() {
+        let parameters = GuestAttestationParameters::new(
+            AttestationChallenge::new([0x43; 32], "command-proof", 2_000_000_000).unwrap(),
+            [0x18; 32],
+            CpuAttestationProfile::IntelTdx,
+            None,
+        );
+        let command = AttestedCommand::new("/nanocodex-vm-guest")
+            .unwrap()
+            .arg("--proof-message")
+            .unwrap()
+            .arg("hello")
+            .unwrap();
+        let request = SessionRequest::ProveCommand(ProveCommandRequest {
+            id: 12,
+            request: AttestedCommandRequest::new(parameters, command),
+        });
+        let encoded = serde_json::to_string(&request).unwrap();
+
+        assert!(encoded.starts_with(r#"{"kind":"prove_command","payload":{"id":12,"request":"#));
+        let decoded = serde_json::from_str::<SessionRequest>(&encoded).unwrap();
+        let SessionRequest::ProveCommand(decoded) = decoded else {
+            panic!("command-proof request changed variants");
+        };
+        assert_eq!(decoded.id, 12);
+        assert_eq!(decoded.request.command().program(), "/nanocodex-vm-guest");
+        assert_eq!(
+            decoded.request.attestation().cpu_profile(),
+            CpuAttestationProfile::IntelTdx
         );
     }
 

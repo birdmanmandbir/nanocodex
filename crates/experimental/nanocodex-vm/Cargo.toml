@@ -112,6 +112,10 @@ name = "confidential_attestation"
 required-features = ["host"]
 
 [[example]]
+name = "confidential_command"
+required-features = ["host"]
+
+[[example]]
 name = "verify_snp_attestation"
 required-features = ["host"]
 

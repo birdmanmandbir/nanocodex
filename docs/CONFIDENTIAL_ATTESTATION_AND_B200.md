@@ -266,7 +266,9 @@ bytes, provenance, validity intervals, and appraisal time enter the result.
 1. Retain positive and negative real-hardware fixtures for the implemented
    SNP, TDX/DCAP, Nitro, and NVIDIA verifier backends.
 2. Extend the implemented typed session attestation and guest-key proof into
-   key-release gating, with malicious-relay protocol tests.
+   key-release gating, with malicious-relay protocol tests. The separate
+   sealed-ELF command receipt already exercises this binding, but does not
+   release secrets or replace vendor-native appraisal.
 3. Add SNP verification fixtures, measurement tooling, then a live
    SNP record.
 4. Add the missing libkrun TDX QGS relay, DCAP fixtures, then a live TDX record.

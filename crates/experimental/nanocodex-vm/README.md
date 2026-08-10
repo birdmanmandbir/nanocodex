@@ -76,7 +76,8 @@ Ordinary libkrun VMs are unchanged. In particular, macOS ARM64/HVF remains an
 ordinary isolation backend and cannot satisfy a confidential profile. The
 host report is discovery rather than attestation: only evidence from the
 particular launched guest can eventually authorize an `AttestedVm` or secret
-release. Command receipts and agent execution remain separate consumers.
+release. Command receipts are implemented as a separate consumer below;
+ordinary agent execution is not treated as an attestation claim.
 
 Run `just confidential-capabilities` on any host to print each profile's
 launch blockers separately from claims which can only be checked after launch.
@@ -166,6 +167,56 @@ identity. Use the expanded Cargo example to repeat `--pcr`, require
 TDX, and Nitro backends without allowing one evidence format to fall through to
 another verifier.
 
+### Prove one exact command execution
+
+[`tools::VmToolSession::prove_command`] is a separate consumer of the native
+attestation boundary. It does not claim that CPU hardware directly observes a
+process. Instead, the relying party appraises a measured guest supervisor; the
+supervisor executes a command and signs a receipt with the guest key bound into
+fresh native evidence.
+
+For the first narrow boundary the supervisor:
+
+- accepts only a static 64-bit little-endian Linux ELF without `PT_INTERP`;
+- reads at most 64 MiB, copies those exact bytes to a Linux `memfd`, applies
+  write/grow/shrink/further-seal seals, and executes `/proc/self/fd/<fd>`;
+- preserves the caller-visible program as `argv[0]`, fixes cwd to `/`, clears
+  the environment except for `LANG=C`, and supplies empty stdin;
+- retains at most 1 MiB combined stdout and stderr; and
+- signs a domain-separated record containing the challenge, executable
+  SHA-256, complete argv, stdin/stdout/stderr SHA-256 values, and exit code or
+  terminating signal.
+
+Timeout and output overflow kill and reap the process group without issuing a
+success receipt. Cancellation drops the request task and the same process-group
+guard performs cleanup.
+
+On matching SNP or TDX hardware, run the complete native collection example:
+
+```console
+just prove-command-libkrun-snp
+just prove-command-libkrun-tdx /run/tdx-qgs/qgs.socket
+```
+
+The example executes the static measured `nanocodex-vm-guest` bytes themselves
+from a sealed `memfd`, checks the challenge, supervisor manifest, exact binary
+digest and argv, verifies the two guest-key signatures and output digest, and
+prints the receipt with fresh native evidence. That collection check is
+deliberately labelled unappraised. A relying party first passes the embedded
+bundle through [`host::verify_attestation`] with vendor collateral and exact
+launch measurements, then calls [`host::verify_command_proof`] with a
+[`host::CommandProofExpectation`] to obtain [`host::VerifiedCommandProof`].
+
+This proves only that the accepted supervisor reports execution and observed
+the returned process result. It does not prove semantic correctness, external
+side effects, network responses, or GPU workload execution. Dynamic ELF files,
+scripts, and dependency closures are rejected rather than implying that one
+top-level executable hash covers their interpreter or libraries. The current
+example uses the static guest-binary digest as its workload-manifest identity;
+production acceptance remains gated on the reproducible firmware, kernel,
+initrd, command-line, supervisor, and authenticated-root manifest described in
+the confidential-VM plan.
+
 ### B200 assignment
 
 The 1x and 8x B200 host assignment descriptors are fail-closed. Linux
@@ -205,7 +256,7 @@ just attest-libkrun-tdx-b200 b200-single b200-single.json /run/tdx-qgs/qgs.socke
 just attest-libkrun-tdx-b200 b200-hgx8 b200-hgx8.json /run/tdx-qgs/qgs.socket
 ```
 
-The JSON file is a serialized [`host::ConfidentialDeviceBundle`]. A single-GPU
+The JSON file is a serialized `host::ConfidentialDeviceBundle`. A single-GPU
 manifest contains exactly one `nvidia_b200_gpu` (`10de:2901`). An HGX manifest
 contains exactly eight such GPUs plus functions `.0` through `.3` of one
 `nvidia_cx7_fabric_bridge` slot; each bridge entry includes its platform device
@@ -232,7 +283,7 @@ A minimal single-B200 manifest is:
 
 PCI IDs in the JSON encoding are decimal (`4318 == 0x10de`,
 `10497 == 0x2901`). Prefer constructing HGX manifests through
-[`host::ConfidentialDeviceBundle::b200_hgx_8`] so duplicate addresses, exact
+`host::ConfidentialDeviceBundle::b200_hgx_8` so duplicate addresses, exact
 counts, bridge function placement, and VPD digest lengths are checked before
 the manifest is written.
 

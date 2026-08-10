@@ -50,6 +50,17 @@ pub use child_lifetime::terminate_child_with_parent;
     )
 ))]
 mod command;
+#[cfg(any(
+    feature = "guest-runtime",
+    all(
+        feature = "host",
+        any(
+            all(target_os = "linux", not(target_env = "musl")),
+            all(target_os = "macos", target_arch = "aarch64")
+        )
+    )
+))]
+mod command_proof;
 #[cfg(all(
     feature = "host",
     any(
@@ -208,6 +219,13 @@ pub mod host {
         },
         capabilities::{Capabilities, KrunFeature},
         command::GuestCommand,
+        command_proof::{
+            AttestedCommand, AttestedCommandProof, AttestedCommandReceipt, AttestedCommandRequest,
+            CollectedCommandProof, CommandProofExpectation, CommandProofInputError,
+            CommandProofVerificationError, CommandTermination, ExecutionRecord,
+            MAX_ATTESTED_COMMAND_OUTPUT_BYTES, MAX_ATTESTED_EXECUTABLE_BYTES, VerifiedCommandProof,
+            verify_collected_command_proof, verify_command_proof,
+        },
         confidential::{
             ConfidentialCapability, ConfidentialCapabilityCheck, ConfidentialHostReport,
             ConfidentialNvidiaProfile, ConfidentialVmError, ConfidentialVmProfile, CpuTee,
@@ -239,6 +257,11 @@ pub mod guest {
             AttestedGuestKeyProofError, CpuAttestationProfile, GuestAttestation,
             GuestAttestationBundle, GuestAttestationParameters, GuestAttestationRequest,
             NvidiaAttestationProfile,
+        },
+        command_proof::{
+            AttestedCommand, AttestedCommandProof, AttestedCommandReceipt, AttestedCommandRequest,
+            CommandProofInputError, CommandTermination, ExecutionRecord,
+            MAX_ATTESTED_COMMAND_OUTPUT_BYTES, MAX_ATTESTED_EXECUTABLE_BYTES,
         },
         guest_attestation::{
             GuestAttestationError, GuestAttestationIdentity, collect_attestation,

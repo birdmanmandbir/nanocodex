@@ -202,6 +202,24 @@ attest-libkrun-tdx qgs="/run/tdx-qgs/qgs.socket": build-vm-guest build-vm-host-i
       --guest target/x86_64-unknown-linux-musl/debug/nanocodex-vm-guest \
       --qgs "{{qgs}}"
 
+# Execute the measured guest binary from a sealed memfd and return its signed
+# receipt with fresh SNP evidence.
+prove-command-libkrun-snp message="confidential-vm-command-proof": build-vm-guest build-vm-host-amd-sev
+    @test "$(uname -m)" = x86_64 || { echo "SEV-SNP requires x86_64" >&2; exit 2; }
+    cargo run --locked --quiet -p nanocodex-vm --example confidential_command -- \
+      --profile snp --message "{{message}}" \
+      --vmm target/libkrun-amd-sev/debug/nanocodex \
+      --guest target/x86_64-unknown-linux-musl/debug/nanocodex-vm-guest
+
+# Execute the same protocol with fresh TDX evidence and the configured QGS.
+prove-command-libkrun-tdx message="confidential-vm-command-proof" qgs="/run/tdx-qgs/qgs.socket": build-vm-guest build-vm-host-intel-tdx
+    @test "$(uname -m)" = x86_64 || { echo "Intel TDX requires x86_64" >&2; exit 2; }
+    cargo run --locked --quiet -p nanocodex-vm --example confidential_command -- \
+      --profile tdx --message "{{message}}" \
+      --vmm target/libkrun-intel-tdx/debug/nanocodex \
+      --guest target/x86_64-unknown-linux-musl/debug/nanocodex-vm-guest \
+      --qgs "{{qgs}}"
+
 # Launch either reviewed B200 topology in an SNP VM. `topology` is
 # b200-single or b200-hgx8; `bundle` is the exact JSON PCI identity manifest.
 attest-libkrun-snp-b200 topology bundle: build-vm-guest build-vm-host-amd-sev

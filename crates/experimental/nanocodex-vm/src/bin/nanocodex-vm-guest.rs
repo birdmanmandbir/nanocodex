@@ -21,6 +21,28 @@ const MAX_ATTESTATION_REQUEST_BYTES: usize = 64 * 1024;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args_os().skip(1);
     let first = arguments.next();
+    if first.as_deref() == Some(OsStr::new("--proof-message")) {
+        let message = arguments.next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--proof-message requires one UTF-8 message",
+            )
+        })?;
+        if arguments.next().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--proof-message accepts exactly one message",
+            )
+            .into());
+        }
+        println!(
+            "{}",
+            message.to_str().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "proof message must be UTF-8")
+            })?
+        );
+        return Ok(());
+    }
     if first.as_deref() == Some(OsStr::new("--attest-example")) {
         let options = ExampleOptions::parse(arguments)?;
         let output = collect_example(options).await?;

@@ -10,12 +10,25 @@ use std::{
     },
     time::Duration,
 };
+#[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+use std::{
+    io::Write as _,
+    os::{fd::AsRawFd as _, unix::process::CommandExt as _},
+};
 
 use nanocodex_tools::{ToolContext, workspace_runtime::WorkspaceToolRuntime};
 use nix::{
     errno::Errno,
     sys::signal::{Signal, killpg},
     unistd::Pid,
+};
+#[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+use nix::{
+    fcntl::{FcntlArg, SealFlag, fcntl},
+    sys::{
+        memfd::{MFdFlags, memfd_create},
+        stat::{Mode, fchmod},
+    },
 };
 use thiserror::Error;
 #[cfg(all(feature = "guest-runtime", target_os = "linux"))]
@@ -33,13 +46,21 @@ use tokio::{
 
 use super::protocol::{
     AttestResponse, CancelRequest, ControlResponse, CreateDirectoryRequest, ExecuteRequest,
-    ExecuteResponse, MemoryResponse, ReadFileRequest, ReadFileResponse, SessionRequest,
-    SessionResponse, ShutdownRequest, ToolResponse, WriteFileRequest,
+    ExecuteResponse, MemoryResponse, ProveCommandResponse, ReadFileRequest, ReadFileResponse,
+    SessionRequest, SessionResponse, ShutdownRequest, ToolResponse, WriteFileRequest,
 };
 #[cfg(all(feature = "guest-runtime", target_os = "linux"))]
 use crate::guest_attestation::GuestAttestationIdentity;
 #[cfg(all(feature = "guest-runtime", target_os = "linux"))]
 use crate::overlay::{GuestOverlayError, enter_guest_overlay_root};
+#[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+use crate::{
+    command_proof::{
+        AttestedCommandProof, AttestedCommandReceipt, AttestedCommandRequest, CommandTermination,
+        ExecutionRecord, MAX_ATTESTED_EXECUTABLE_BYTES,
+    },
+    guest_attestation::GuestAttestationError,
+};
 
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CONTROL_FILE_BYTES: usize = 32 * 1024 * 1024;
@@ -432,6 +453,38 @@ async fn execute_request(
                 })
             }
         }
+        SessionRequest::ProveCommand(request) => {
+            #[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+            {
+                let result = async {
+                    let identity = attestation_identity
+                        .get_or_try_init(|| async { GuestAttestationIdentity::generate() })
+                        .await?;
+                    prove_command(identity, request.request).await
+                }
+                .await;
+                SessionResponse::ProveCommand(match result {
+                    Ok(proof) => ProveCommandResponse {
+                        id: request.id,
+                        proof: Some(proof),
+                        error: None,
+                    },
+                    Err(error) => ProveCommandResponse {
+                        id: request.id,
+                        proof: None,
+                        error: Some(error.to_string()),
+                    },
+                })
+            }
+            #[cfg(not(all(feature = "guest-runtime", target_os = "linux")))]
+            {
+                SessionResponse::ProveCommand(ProveCommandResponse {
+                    id: request.id,
+                    proof: None,
+                    error: Some("attested command execution requires a Linux guest runtime".into()),
+                })
+            }
+        }
         SessionRequest::Execute(request) => {
             SessionResponse::Execute(execute_command(request).await)
         }
@@ -798,6 +851,188 @@ async fn execute_command(request: ExecuteRequest) -> ExecuteResponse {
     }
 }
 
+#[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+#[derive(Debug, Error)]
+enum GuestCommandProofError {
+    #[error("failed to read or execute the attestable command: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("attestable executable exceeds 64 MiB")]
+    ExecutableTooLarge,
+    #[error("attestable command requires a directly executable ELF binary")]
+    NotElf,
+    #[error("attestable command requires a static 64-bit little-endian ELF without PT_INTERP")]
+    DynamicOrUnsupportedElf,
+    #[error("attestable command exceeded its deadline")]
+    TimedOut,
+    #[error("attestable command exceeded its retained-output limit")]
+    OutputLimitExceeded,
+    #[error("attestable command did not expose an exit code or terminating signal")]
+    MissingTermination,
+    #[error(transparent)]
+    Attestation(#[from] GuestAttestationError),
+}
+
+#[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+async fn prove_command(
+    identity: &GuestAttestationIdentity,
+    request: AttestedCommandRequest,
+) -> Result<AttestedCommandProof, GuestCommandProofError> {
+    use sha2::Digest as _;
+
+    let (parameters, command) = request.into_parts();
+    let executable = read_attested_executable(command.program()).await?;
+    let executable_sha256 = sha2::Sha256::digest(&executable).into();
+    let executable = sealed_executable(&executable)?;
+    let argv = command.argv();
+    let path = format!("/proc/self/fd/{}", executable.as_raw_fd());
+    let mut process = Command::new(path);
+    process
+        .as_std_mut()
+        .arg0(&argv[0])
+        .args(&argv[1..])
+        .current_dir("/")
+        .env_clear()
+        .env("LANG", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    process.process_group(0);
+    let outcome = command_output(
+        &mut process,
+        Duration::from_millis(command.timeout_millis_value()),
+        command.max_output_bytes_value(),
+        None,
+        None,
+    )
+    .await?;
+    let output = match outcome {
+        CommandOutcome::Completed(output) => output,
+        CommandOutcome::TimedOut { .. } => return Err(GuestCommandProofError::TimedOut),
+        CommandOutcome::OutputLimitExceeded => {
+            return Err(GuestCommandProofError::OutputLimitExceeded);
+        }
+    };
+    use std::os::unix::process::ExitStatusExt as _;
+    let termination = if let Some(code) = output.status.code() {
+        CommandTermination::ExitCode(code)
+    } else if let Some(signal) = output.status.signal() {
+        CommandTermination::Signal(signal)
+    } else {
+        return Err(GuestCommandProofError::MissingTermination);
+    };
+    let record = ExecutionRecord::new(
+        parameters.challenge().clone(),
+        executable_sha256,
+        argv,
+        &output.stdout,
+        &output.stderr,
+        termination,
+    );
+    let signature = identity.sign_execution_record(&record);
+    let receipt = AttestedCommandReceipt::new(record, output.stdout, output.stderr, signature);
+    let attestation = identity.collect(parameters).await?;
+    Ok(AttestedCommandProof::new(attestation, receipt))
+}
+
+#[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+async fn read_attested_executable(path: &str) -> Result<Vec<u8>, GuestCommandProofError> {
+    let file = File::open(path).await?;
+    let mut bytes = Vec::new();
+    file.take((MAX_ATTESTED_EXECUTABLE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() > MAX_ATTESTED_EXECUTABLE_BYTES {
+        return Err(GuestCommandProofError::ExecutableTooLarge);
+    }
+    validate_attested_elf(&bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+fn validate_attested_elf(bytes: &[u8]) -> Result<(), GuestCommandProofError> {
+    if !bytes.starts_with(b"\x7fELF") {
+        return Err(GuestCommandProofError::NotElf);
+    }
+    if bytes.get(4) != Some(&2) || bytes.get(5) != Some(&1) || bytes.len() < 64 {
+        return Err(GuestCommandProofError::DynamicOrUnsupportedElf);
+    }
+    let program_header_offset = read_elf_u64(bytes, 32)?;
+    let program_header_size = usize::from(read_elf_u16(bytes, 54)?);
+    let program_header_count = usize::from(read_elf_u16(bytes, 56)?);
+    if program_header_size < 56 {
+        return Err(GuestCommandProofError::DynamicOrUnsupportedElf);
+    }
+    let program_header_offset = usize::try_from(program_header_offset)
+        .map_err(|_| GuestCommandProofError::DynamicOrUnsupportedElf)?;
+    for index in 0..program_header_count {
+        let offset = index
+            .checked_mul(program_header_size)
+            .and_then(|offset| program_header_offset.checked_add(offset))
+            .ok_or(GuestCommandProofError::DynamicOrUnsupportedElf)?;
+        let program_type = read_elf_u32(bytes, offset)?;
+        if program_type == 3 {
+            return Err(GuestCommandProofError::DynamicOrUnsupportedElf);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+fn read_elf_u16(bytes: &[u8], offset: usize) -> Result<u16, GuestCommandProofError> {
+    let end = offset
+        .checked_add(2)
+        .ok_or(GuestCommandProofError::DynamicOrUnsupportedElf)?;
+    bytes
+        .get(offset..end)
+        .and_then(|bytes| <[u8; 2]>::try_from(bytes).ok())
+        .map(u16::from_le_bytes)
+        .ok_or(GuestCommandProofError::DynamicOrUnsupportedElf)
+}
+
+#[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+fn read_elf_u32(bytes: &[u8], offset: usize) -> Result<u32, GuestCommandProofError> {
+    let end = offset
+        .checked_add(4)
+        .ok_or(GuestCommandProofError::DynamicOrUnsupportedElf)?;
+    bytes
+        .get(offset..end)
+        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+        .map(u32::from_le_bytes)
+        .ok_or(GuestCommandProofError::DynamicOrUnsupportedElf)
+}
+
+#[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+fn read_elf_u64(bytes: &[u8], offset: usize) -> Result<u64, GuestCommandProofError> {
+    let end = offset
+        .checked_add(8)
+        .ok_or(GuestCommandProofError::DynamicOrUnsupportedElf)?;
+    bytes
+        .get(offset..end)
+        .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+        .map(u64::from_le_bytes)
+        .ok_or(GuestCommandProofError::DynamicOrUnsupportedElf)
+}
+
+#[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+fn sealed_executable(bytes: &[u8]) -> Result<std::fs::File, std::io::Error> {
+    let descriptor = memfd_create("nanocodex-attested-command", MFdFlags::MFD_ALLOW_SEALING)
+        .map_err(std::io::Error::from)?;
+    let mut file = std::fs::File::from(descriptor);
+    file.write_all(bytes)?;
+    fchmod(&file, Mode::S_IRUSR | Mode::S_IXUSR).map_err(std::io::Error::from)?;
+    fcntl(
+        &file,
+        FcntlArg::F_ADD_SEALS(
+            SealFlag::F_SEAL_SEAL
+                | SealFlag::F_SEAL_SHRINK
+                | SealFlag::F_SEAL_GROW
+                | SealFlag::F_SEAL_WRITE,
+        ),
+    )
+    .map_err(std::io::Error::from)?;
+    Ok(file)
+}
+
 async fn open_output_mirror(path: Option<&str>) -> std::io::Result<Option<File>> {
     match path {
         Some(path) => OpenOptions::new()
@@ -1011,6 +1246,8 @@ mod tests {
         SessionResponse, ShutdownRequest, TerminateToolProcessesRequest, ToolRequest,
         WireToolContext, WireToolInput,
     };
+    #[cfg(target_os = "linux")]
+    use super::{CommandOutcome, command_output, sealed_executable, validate_attested_elf};
     use super::{
         atomic_write_file, command_environment, create_directory_path, execute_command,
         parse_meminfo, parse_vmstat_oom_kills, read_file, serve_test_io,
@@ -1020,6 +1257,58 @@ mod tests {
     const DEFAULT_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
     const DETACHED_PROCESS_PID_FILE_ENV: &str = "NANOCODEX_VM_TEST_DETACHED_PID_FILE";
     const PATH_TRACING_IMAGE_BYTES: u64 = 48_262_737;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn sealed_executable_runs_the_copied_elf_bytes() {
+        use std::{os::fd::AsRawFd as _, os::unix::process::CommandExt as _, process::Stdio};
+
+        let bytes = fs::read("/bin/echo").unwrap();
+        let executable = sealed_executable(&bytes).unwrap();
+        let path = format!("/proc/self/fd/{}", executable.as_raw_fd());
+        let mut command = tokio::process::Command::new(path);
+        command
+            .as_std_mut()
+            .arg0("/bin/echo")
+            .arg("sealed-execution")
+            .env_clear()
+            .env("LANG", "C")
+            .current_dir("/")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command.process_group(0);
+
+        let outcome = command_output(
+            &mut command,
+            Duration::from_secs(5),
+            DEFAULT_OUTPUT_BYTES,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let CommandOutcome::Completed(output) = outcome else {
+            panic!("sealed command did not complete");
+        };
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"sealed-execution\n");
+        assert!(output.stderr.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn attestable_elf_rejects_a_dynamic_interpreter() {
+        let mut elf = vec![0_u8; 120];
+        elf[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        elf[32..40].copy_from_slice(&64_u64.to_le_bytes());
+        elf[54..56].copy_from_slice(&56_u16.to_le_bytes());
+        elf[56..58].copy_from_slice(&1_u16.to_le_bytes());
+        validate_attested_elf(&elf).unwrap();
+
+        elf[64..68].copy_from_slice(&3_u32.to_le_bytes());
+        assert!(validate_attested_elf(&elf).is_err());
+    }
 
     #[test]
     fn parses_guest_peak_memory_inputs() {

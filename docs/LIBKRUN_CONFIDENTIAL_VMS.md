@@ -158,6 +158,23 @@ The protocol uses canonical encodings and fixed domain separators. Raw reports,
 certificates, collateral, reference values, and appraisal output are retained
 for reproducibility. Private session keys never cross the guest boundary.
 
+## Separate command-receipt consumer
+
+The initial command-receipt consumer is implemented without changing the
+native-attestation claim. `VmToolSession::prove_command` uses the key bound into
+fresh SNP, TDX, or Nitro evidence to sign a deterministic execution record. The
+guest copies a bounded static ELF into a sealed `memfd`; fixes cwd, environment,
+and stdin; captures bounded output; and binds the caller challenge, exact
+executable digest, argv, streams, and termination status.
+
+This is an execute-and-report protocol implemented by the measured supervisor,
+not an assertion that TEE hardware traces instructions or proves output
+correctness. Full acceptance requires both `verify_attestation` under an exact
+measured-supervisor policy and `verify_command_proof` under an exact command
+expectation. A collection-only check remains explicitly unappraised. Dynamic
+ELFs and scripts are rejected until a later protocol can identify and enforce
+their complete loader, library, interpreter, and input closure.
+
 ## Backend matrix
 
 ### AMD SEV-SNP
@@ -371,6 +388,11 @@ construct `AttestedVm` without a successful result.
   mounting writable state.
 - [x] Add a single-request challenge/evidence protocol with bounded input,
   output, subprocess streams, component counts, and native evidence.
+- [x] Add the separate single-request command consumer with sealed exact-byte
+  execution, deterministic receipt hashing, evidence-bound Ed25519 signatures,
+  replay/output/argv/termination tamper tests, and SNP/TDX launch examples.
+- [x] Reject dynamic ELF and script execution rather than treating a top-level
+  executable hash as the complete dependency closure.
 - [ ] Prove guest private keys never enter launch records, host tracing, console
   diagnostics, or retained host files.
 
@@ -519,8 +541,10 @@ weaker hosts fail closed; tampering and replay are rejected; cleanup remains
 exact; and the libkrun changes required for those claims are either upstream or
 carried as a small, reviewed, explicitly pinned delta.
 
-Only after this gate should a separate plan define attestable command receipts
-or place Nanocodex agents inside the resulting confidential VMs.
+The command-receipt protocol has been implemented early as a separate consumer
+to exercise the attested-key contract. It does not weaken this completion gate:
+no command receipt is trusted until the embedded VM evidence and complete
+measured-supervisor manifest pass it. Agent execution remains a later consumer.
 
 The retained record layout and mandatory positive and tamper gates for each
 hardware runner are defined in

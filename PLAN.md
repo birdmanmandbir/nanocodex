@@ -176,8 +176,10 @@ unrelated workspace changes.
   artifact; it must not grow into scheduling or placement.
 - Implement and upstream missing libkrun launch, attestation, rootfs, TDX,
   Nitro, confidential-device, and GPU support as focused changes.
-- Keep agent execution and attestable command receipts as separate consumers
-  after the confidential-VM contract is proven.
+- Keep agent execution and attestable command receipts as separate consumers.
+  The sealed-ELF receipt now exercises the attested guest-key contract, but it
+  becomes trusted only after the confidential-VM evidence and complete
+  measured-supervisor manifest pass appraisal.
 
 ### 2. Runtime and Code Mode parity
 

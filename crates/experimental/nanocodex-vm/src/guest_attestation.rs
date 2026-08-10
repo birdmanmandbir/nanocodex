@@ -24,6 +24,7 @@ use crate::attestation::{
     GuestAttestationRequest, MAX_RAW_EVIDENCE_BYTES, NvidiaAttestationProfile, RawEvidence,
     key_proof_message,
 };
+use crate::command_proof::{ExecutionRecord, receipt_signature_message};
 
 const TSM_REPORT_ROOT: &str = "/sys/kernel/config/tsm/report";
 const NVATTEST: &str = "nvattest";
@@ -221,6 +222,12 @@ impl GuestAttestationIdentity {
             bundle,
             AttestedGuestKeyProof::new(signature),
         ))
+    }
+
+    pub(crate) fn sign_execution_record(&self, record: &ExecutionRecord) -> [u8; 64] {
+        self.signing_key
+            .sign(&receipt_signature_message(record))
+            .to_bytes()
     }
 }
 
