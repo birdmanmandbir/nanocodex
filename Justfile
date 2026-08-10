@@ -155,6 +155,32 @@ build-vm-host-intel-tdx:
     cargo build --locked -p nanocodex-bin --bin nanocodex \
       --features libkrun-intel-tdx --target-dir target/libkrun-intel-tdx
 
+# Collect real native evidence when run inside an SNP VM, TDX TD, or Nitro
+# Enclave. A relying party should pass its own nonce with the expanded Cargo
+# command documented in the VM crate README.
+attest-example:
+    @test "$(uname -s)" = Linux || { echo "native TEE attestation requires Linux" >&2; exit 2; }
+    cargo run --locked --quiet -p nanocodex-vm --bin nanocodex-vm-guest \
+      --no-default-features --features guest-runtime -- --attest-example
+
+# Build, launch, and collect one fresh SNP attestation through libkrun.
+attest-libkrun-snp: build-vm-guest build-vm-host-amd-sev
+    @test "$(uname -m)" = x86_64 || { echo "SEV-SNP requires x86_64" >&2; exit 2; }
+    cargo run --locked --quiet -p nanocodex-vm --example confidential_attestation -- \
+      --profile snp \
+      --vmm target/libkrun-amd-sev/debug/nanocodex \
+      --guest target/x86_64-unknown-linux-musl/debug/nanocodex-vm-guest
+
+# Build, launch, and collect one fresh TDX attestation through libkrun. The
+# QGS socket is relayed to guest vsock port 4050.
+attest-libkrun-tdx qgs="/run/tdx-qgs/qgs.socket": build-vm-guest build-vm-host-intel-tdx
+    @test "$(uname -m)" = x86_64 || { echo "Intel TDX requires x86_64" >&2; exit 2; }
+    cargo run --locked --quiet -p nanocodex-vm --example confidential_attestation -- \
+      --profile tdx \
+      --vmm target/libkrun-intel-tdx/debug/nanocodex \
+      --guest target/x86_64-unknown-linux-musl/debug/nanocodex-vm-guest \
+      --qgs "{{qgs}}"
+
 build-vm-example:
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="{{justfile_directory()}}/scripts/aarch64-unknown-linux-musl-linker" \
     CC_aarch64_unknown_linux_musl="{{justfile_directory()}}/scripts/aarch64-unknown-linux-musl-linker" \

@@ -49,23 +49,27 @@ Primary NVIDIA references:
 
 The attester is a mode of the small static `nanocodex-vm-guest` program built
 separately from the agent. `nanocodex-vm-guest --attest` accepts one bounded
-JSON request on stdin and emits one bounded evidence bundle. The existing VM
-transport can relay those bytes, but the host is never trusted to construct
-evidence or an appraisal result.
+JSON request on stdin and emits one bounded evidence bundle.
+`nanocodex-vm-guest --attest-example` additionally auto-detects Nitro NSM or
+the Linux TSM provider and an exact supported B200 topology. The typed VM
+transport exposes the same operation as `VmToolSession::attest`; the host is
+never trusted to construct evidence or an appraisal result.
 
 For every launch it:
 
 1. receives a versioned challenge containing a 256-bit nonce, policy identity,
    expiry, and expected workload-manifest digest;
-2. receives a fresh signing/key-agreement public key from the caller's measured
-   in-guest supervisor (private-key generation and lifecycle remain owned by
-   that supervisor);
+2. lazily generates and retains an Ed25519 identity in the measured guest
+   supervisor, unless the low-level `--attest` API is being used with a
+   caller-owned in-guest key;
 3. enumerates required child devices and collects their nonce-bound evidence;
 4. hashes the ordered child evidence and topology into the canonical
    `AttestationBinding` transcript;
 5. places that digest in the CPU TEE's native report-data field;
-6. returns the public key and exact native evidence, never the private key; and
-7. remains blocked from workspace startup and secret access until the relying
+6. returns the public key, exact native evidence, and an Ed25519 signature over
+   the domain-separated transcript to prove live key possession, never the
+   private key; and
+7. remains blocked from secret access until the relying
    party returns an accepted result bound to that challenge.
 
 Requests, responses, individual evidence objects, and the complete bundle have
@@ -73,9 +77,12 @@ independent byte/count/depth limits. Cancellation closes the channel and kills
 the VMM through the existing process-group lifecycle.
 
 The native bundle types, base64 encoding, exact component ordering, transcript
-digest, and verifier boundary are shared by host and guest builds. The Linux
-collector is tested on x86-64 Ubuntu with warnings denied; live hardware tests
-remain mandatory.
+digest, key-possession proof, and verifier boundary are shared by host and
+guest builds. `just attest-example` is the direct in-guest smoke;
+`just attest-libkrun-snp` and `just attest-libkrun-tdx` are complete
+launch-and-collect entry points. The Linux collector and static musl artifact
+are tested on x86-64 Ubuntu with warnings denied; live hardware tests remain
+mandatory.
 
 ### AMD SEV-SNP
 
@@ -254,8 +261,8 @@ bytes, provenance, validity intervals, and appraisal time enter the result.
 
 1. Add concrete SNP, TDX/DCAP, Nitro, and NVIDIA implementations of the now
    typed `NativeEvidenceVerifier` boundary with retained collateral.
-2. Integrate `--attest` into VM startup and key-release gating, with
-   malicious-relay protocol tests.
+2. Extend the implemented typed session attestation and guest-key proof into
+   key-release gating, with malicious-relay protocol tests.
 3. Add SNP verification fixtures, measurement tooling, then a live
    SNP record.
 4. Add the missing libkrun TDX QGS relay, DCAP fixtures, then a live TDX record.

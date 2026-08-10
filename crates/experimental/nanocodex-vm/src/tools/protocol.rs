@@ -2,6 +2,8 @@ use nanocodex_tools::{ToolInput, contract::ToolOutputWire, standard::StandardToo
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
+use crate::attestation::{GuestAttestation, GuestAttestationParameters};
+
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
 pub(crate) enum SessionRequest {
@@ -11,6 +13,7 @@ pub(crate) enum SessionRequest {
     CreateDirectory(CreateDirectoryRequest),
     ReadFile(ReadFileRequest),
     Memory(MemoryRequest),
+    Attest(AttestRequest),
     Execute(ExecuteRequest),
     Cancel(CancelRequest),
     TerminateToolProcesses(TerminateToolProcessesRequest),
@@ -27,6 +30,7 @@ impl SessionRequest {
             Self::CreateDirectory(request) => request.id,
             Self::ReadFile(request) => request.id,
             Self::Memory(request) => request.id,
+            Self::Attest(request) => request.id,
             Self::Execute(request) => request.id,
             Self::Cancel(request) => request.id,
             Self::TerminateToolProcesses(request) => request.id,
@@ -44,6 +48,7 @@ pub(crate) enum SessionResponse {
     CreateDirectory(ControlResponse),
     ReadFile(ReadFileResponse),
     Memory(MemoryResponse),
+    Attest(AttestResponse),
     Execute(ExecuteResponse),
     Cancel(ControlResponse),
     TerminateToolProcesses(ControlResponse),
@@ -62,6 +67,7 @@ impl SessionResponse {
             | Self::Shutdown(response) => response.id,
             Self::ReadFile(response) => response.id,
             Self::Memory(response) => response.id,
+            Self::Attest(response) => response.id,
             Self::Execute(response) => response.id,
         }
     }
@@ -171,6 +177,21 @@ pub(crate) struct MemoryResponse {
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct AttestRequest {
+    pub id: u64,
+    pub parameters: GuestAttestationParameters,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AttestResponse {
+    pub id: u64,
+    pub attestation: Option<GuestAttestation>,
+    pub error: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ExecuteResponse {
     pub id: u64,
     pub exit_code: Option<i32>,
@@ -249,14 +270,18 @@ pub(crate) enum WireToolInput {
 
 #[cfg(test)]
 mod tests {
+    use crate::attestation::{
+        AttestationChallenge, CpuAttestationProfile, GuestAttestationParameters,
+    };
     use nanocodex_tools::{ToolInput, ToolOutput, standard::StandardTool};
     use serde_json::{json, value::to_raw_value};
 
     use super::{
-        CancelRequest, ControlResponse, CreateDirectoryRequest, ExecuteRequest, ExecuteResponse,
-        MemoryRequest, MemoryResponse, ReadFileRequest, ReadFileResponse, ReadyRequest,
-        SessionRequest, SessionResponse, ShutdownRequest, TerminateToolProcessesRequest,
-        ToolRequest, ToolResponse, WireToolContext, WireToolInput, WriteFileRequest,
+        AttestRequest, CancelRequest, ControlResponse, CreateDirectoryRequest, ExecuteRequest,
+        ExecuteResponse, MemoryRequest, MemoryResponse, ReadFileRequest, ReadFileResponse,
+        ReadyRequest, SessionRequest, SessionResponse, ShutdownRequest,
+        TerminateToolProcessesRequest, ToolRequest, ToolResponse, WireToolContext, WireToolInput,
+        WriteFileRequest,
     };
 
     #[test]
@@ -265,6 +290,29 @@ mod tests {
         let encoded = serde_json::to_string(&request).unwrap();
 
         assert_eq!(encoded, r#"{"kind":"ready","payload":{"id":4}}"#);
+    }
+
+    #[test]
+    fn attestation_request_round_trips_as_a_typed_control_message() {
+        let parameters = GuestAttestationParameters::new(
+            AttestationChallenge::new([0x42; 32], "example", 2_000_000_000).unwrap(),
+            [0x17; 32],
+            CpuAttestationProfile::AmdSevSnp,
+            None,
+        );
+        let request = SessionRequest::Attest(AttestRequest { id: 11, parameters });
+        let encoded = serde_json::to_string(&request).unwrap();
+
+        assert!(encoded.starts_with(r#"{"kind":"attest","payload":{"id":11,"parameters":"#));
+        let decoded = serde_json::from_str::<SessionRequest>(&encoded).unwrap();
+        let SessionRequest::Attest(decoded) = decoded else {
+            panic!("attestation request changed variants");
+        };
+        assert_eq!(decoded.id, 11);
+        assert_eq!(
+            decoded.parameters.cpu_profile(),
+            CpuAttestationProfile::AmdSevSnp
+        );
     }
 
     #[test]

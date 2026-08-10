@@ -30,13 +30,14 @@ public profile. [`host::Capabilities::confidential_report`] reports every
 required host, active-libkrun-artifact, measured-guest, device-assignment,
 attestation, and topology capability without selecting a weaker profile.
 
-The current implementation deliberately reports the measured guest attester
-as unavailable. A [`host::VmConfig`] carrying a confidential profile therefore
-fails before libkrun creates a context on every host. This gate remains closed
-until the guest can generate a fresh key, bind the canonical
-[`host::AttestationBinding`] transcript into native evidence, and the caller
-can appraise that evidence. Having `/dev/sev`, `/dev/kvm`, or a TEE-enabled
-libkrun build is not sufficient by itself.
+The measured guest attester is implemented. It lazily generates a retained
+Ed25519 identity, binds its public key and the canonical
+[`host::AttestationBinding`] transcript into native evidence, and signs the
+transcript to prove possession of the guest key. [`tools::VmToolSession::attest`]
+returns this typed response over the existing bounded host/guest channel.
+Issuing [`host::VerifiedAttestation`] remains a separate relying-party action:
+having evidence, `/dev/sev`, `/dev/kvm`, or a TEE-enabled libkrun build is not
+equivalent to verifying vendor signatures and an expected measurement policy.
 
 Linux VMM artifacts opt into exactly one compile-time libkrun variant with
 `just build-vm-host-amd-sev` or `just build-vm-host-intel-tdx`. The builds use
@@ -76,6 +77,50 @@ ordinary isolation backend and cannot satisfy a confidential profile. The
 host report is discovery rather than attestation: only evidence from the
 particular launched guest can eventually authorize an `AttestedVm` or secret
 release. Command receipts and agent execution remain separate consumers.
+
+### Collect an attestation
+
+On any Linux guest already running as AMD SEV-SNP, Intel TDX, or an AWS Nitro
+Enclave, the smallest demonstration command is:
+
+```console
+just attest-example
+```
+
+The command detects Nitro NSM or the Linux configfs TSM provider, detects an
+exact one- or eight-B200 topology when present, generates a guest Ed25519 key,
+binds the SHA-256 digest of the running attester, and prints the complete JSON
+evidence bundle. Without a TEE it exits nonzero with the missing native
+interface instead of fabricating evidence.
+
+For remote freshness, generate the 32-byte nonce at the relying party and pass
+it into the guest:
+
+```console
+cargo run --locked --quiet -p nanocodex-vm --bin nanocodex-vm-guest \
+  --no-default-features --features guest-runtime -- \
+  --attest-example --nonce-hex "$RELYING_PARTY_NONCE_HEX"
+```
+
+The guest-generated challenge used by bare `just attest-example` demonstrates
+native collection only. The JSON labels its nonce origin and warns that vendor
+appraisal is still required.
+
+On an x86-64 host which supports the selected architecture, the complete
+libkrun launch-and-collect examples are:
+
+```console
+just attest-libkrun-snp
+just attest-libkrun-tdx /run/tdx-qgs/qgs.socket
+```
+
+These build the static guest and matching dedicated libkrun VMM, create the
+minimal measured ext4 runtime, launch the confidential VM, send a fresh host
+challenge through [`tools::VmToolSession::attest`], verify the guest's Ed25519
+possession proof, print the bundle, and shut down. The TDX form additionally
+maps QGS to guest vsock port 4050. The guest kernel and libkrun must still
+provide the quote-generation ABI; a raw TDREPORT is not presented as a
+remotely verifiable quote.
 
 ## Use VM-backed workspace tools
 

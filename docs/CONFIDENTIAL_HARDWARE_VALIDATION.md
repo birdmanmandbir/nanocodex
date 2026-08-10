@@ -18,6 +18,7 @@ operator has approved it. One run directory contains:
 - `request.json`: the relying-party challenge, policy ID, expiry, expected
   workload-manifest digest, CPU profile, and optional NVIDIA profile;
 - `bundle.json`: the byte-exact `GuestAttestationBundle` returned by the guest;
+- `key-proof.json`: the detached Ed25519 proof over the attestation transcript;
 - `collateral/`: the exact endorsements, CRLs, reference values, RIMs, and
   policy files used by native verification, with provenance and validity;
 - `appraisal.json`: native verifier identity/status and the accepted composite
@@ -46,6 +47,12 @@ Before a profile-specific run:
 8. Prove possession of the attested guest key before releasing a test secret.
 9. Release only a synthetic test secret, confirm it is usable by the intended
    measured guest process, and destroy it after the run.
+
+The initial collection smoke is one command on the appropriate machine:
+`just attest-libkrun-snp`, `just attest-libkrun-tdx QGS_SOCKET`, or, from
+inside a pre-launched Nitro Enclave, `just attest-example`. Supply a
+relying-party `--nonce-hex` for records; the guest-generated demonstration
+nonce is not an acceptable freshness record.
 
 No production key release is enabled by a hardware bring-up run.
 

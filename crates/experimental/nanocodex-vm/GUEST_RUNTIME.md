@@ -15,3 +15,16 @@ second public execution model or a versioned remote service.
 The complete lockstep host/guest wire contract is documented in the package
 README. Applications should use the default `host` feature and its typed
 workspace API rather than calling [`tools::serve_guest`] directly.
+
+The same static artifact can collect native evidence directly when executed
+inside an SNP VM, TDX TD, or Nitro Enclave:
+
+```text
+nanocodex-vm-guest --attest-example
+```
+
+This auto-detects the CPU TEE and exact supported B200 topology, generates an
+Ed25519 guest identity, and emits a JSON evidence bundle with a signed
+key-possession proof. Supply `--nonce-hex` with a relying-party nonce for
+remote freshness. Collection is not vendor signature or measurement-policy
+appraisal.

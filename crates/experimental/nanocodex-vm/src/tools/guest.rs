@@ -18,6 +18,8 @@ use nix::{
     unistd::Pid,
 };
 use thiserror::Error;
+#[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+use tokio::sync::OnceCell;
 use tokio::{
     fs::{File, OpenOptions},
     io::{
@@ -30,10 +32,12 @@ use tokio::{
 };
 
 use super::protocol::{
-    CancelRequest, ControlResponse, CreateDirectoryRequest, ExecuteRequest, ExecuteResponse,
-    MemoryResponse, ReadFileRequest, ReadFileResponse, SessionRequest, SessionResponse,
-    ShutdownRequest, ToolResponse, WriteFileRequest,
+    AttestResponse, CancelRequest, ControlResponse, CreateDirectoryRequest, ExecuteRequest,
+    ExecuteResponse, MemoryResponse, ReadFileRequest, ReadFileResponse, SessionRequest,
+    SessionResponse, ShutdownRequest, ToolResponse, WriteFileRequest,
 };
+#[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+use crate::guest_attestation::GuestAttestationIdentity;
 #[cfg(all(feature = "guest-runtime", target_os = "linux"))]
 use crate::overlay::{GuestOverlayError, enter_guest_overlay_root};
 
@@ -231,6 +235,8 @@ where
         minimum_available_kib: AtomicU64::new(u64::MAX),
         ..GuestMemoryMonitor::default()
     });
+    #[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+    let attestation_identity = Arc::new(OnceCell::<GuestAttestationIdentity>::new());
     memory.sample().await;
     let memory_task = tokio::spawn(Arc::clone(&memory).run());
     let mut input = BufReader::new(input);
@@ -294,9 +300,18 @@ where
                             }
                             let runtime = Arc::clone(&runtime);
                             let memory = Arc::clone(&memory);
+                            #[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+                            let attestation_identity = Arc::clone(&attestation_identity);
                             let task =
                                 requests.spawn(async move {
-                                    execute_request(runtime, memory, request).await
+                                    execute_request(
+                                        runtime,
+                                        memory,
+                                        #[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+                                        attestation_identity,
+                                        request,
+                                    )
+                                    .await
                                 });
                             active.insert(id, task);
                         }
@@ -351,6 +366,9 @@ async fn serve_test_io_with_frame_limit(
 async fn execute_request(
     runtime: Arc<WorkspaceToolRuntime>,
     memory: Arc<GuestMemoryMonitor>,
+    #[cfg(all(feature = "guest-runtime", target_os = "linux"))] attestation_identity: Arc<
+        OnceCell<GuestAttestationIdentity>,
+    >,
     request: SessionRequest,
 ) -> SessionResponse {
     match request {
@@ -380,6 +398,40 @@ async fn execute_request(
         }
         SessionRequest::ReadFile(request) => SessionResponse::ReadFile(read_file(request).await),
         SessionRequest::Memory(request) => SessionResponse::Memory(memory.response(request.id)),
+        SessionRequest::Attest(request) => {
+            #[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+            {
+                let result = match attestation_identity
+                    .get_or_try_init(|| async { GuestAttestationIdentity::generate() })
+                    .await
+                {
+                    Ok(identity) => identity.collect(request.parameters).await,
+                    Err(error) => Err(error),
+                };
+                SessionResponse::Attest(match result {
+                    Ok(attestation) => AttestResponse {
+                        id: request.id,
+                        attestation: Some(attestation),
+                        error: None,
+                    },
+                    Err(error) => AttestResponse {
+                        id: request.id,
+                        attestation: None,
+                        error: Some(error.to_string()),
+                    },
+                })
+            }
+            #[cfg(not(all(feature = "guest-runtime", target_os = "linux")))]
+            {
+                SessionResponse::Attest(AttestResponse {
+                    id: request.id,
+                    attestation: None,
+                    error: Some(
+                        "native guest attestation requires a Linux guest runtime".to_owned(),
+                    ),
+                })
+            }
+        }
         SessionRequest::Execute(request) => {
             SessionResponse::Execute(execute_command(request).await)
         }
@@ -413,15 +465,22 @@ async fn write_response(
     let mut encoded = match encode_frame(response, max_frame_bytes)? {
         EncodedFrame::Complete(encoded) => encoded,
         EncodedFrame::TooLarge => {
-            let SessionResponse::Tool(response) = response else {
-                return Err(VmGuestError::FrameTooLarge);
+            let fallback = match response {
+                SessionResponse::Tool(response) => SessionResponse::Tool(ToolResponse::failed(
+                    response.id,
+                    format!(
+                        "VM tool response exceeded the {max_frame_bytes}-byte protocol frame limit"
+                    ),
+                )),
+                SessionResponse::Attest(response) => SessionResponse::Attest(AttestResponse {
+                    id: response.id,
+                    attestation: None,
+                    error: Some(format!(
+                        "VM attestation response exceeded the {max_frame_bytes}-byte protocol frame limit"
+                    )),
+                }),
+                _ => return Err(VmGuestError::FrameTooLarge),
             };
-            let fallback = SessionResponse::Tool(ToolResponse::failed(
-                response.id,
-                format!(
-                    "VM tool response exceeded the {max_frame_bytes}-byte protocol frame limit"
-                ),
-            ));
             match encode_frame(&fallback, max_frame_bytes)? {
                 EncodedFrame::Complete(encoded) => encoded,
                 EncodedFrame::TooLarge => return Err(VmGuestError::FrameTooLarge),

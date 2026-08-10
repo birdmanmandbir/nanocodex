@@ -53,6 +53,7 @@ cpal = "0.16.0"
 crossterm = { version = "0.28.1", features = ["bracketed-paste", "event-stream"] }
 criterion = { version = "0.7.0", default-features = false, features = ["async_tokio", "cargo_bench_support"] }
 dotenvy = "0.15.7"
+ed25519-dalek = "2.2.0"
 eyre = "0.6.12"
 filetime = "0.2.26"
 flate2 = "1.1"

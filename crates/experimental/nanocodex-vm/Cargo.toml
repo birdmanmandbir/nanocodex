@@ -45,7 +45,9 @@ libkrun-intel-tdx = ["host", "krun/tdx"]
 
 [dependencies]
 base64.workspace = true
+ed25519-dalek.workspace = true
 filetime.workspace = true
+getrandom.workspace = true
 hex.workspace = true
 nanocodex-tools = { path = "../../nanocodex-tools", version = "0.3.0", default-features = false }
 nix = { workspace = true, optional = true, features = ["fs", "mount"] }
@@ -90,6 +92,10 @@ required-features = ["guest-runtime"]
 
 [[example]]
 name = "confidential_host"
+required-features = ["host"]
+
+[[example]]
+name = "confidential_attestation"
 required-features = ["host"]
 
 [[bench]]

@@ -6,7 +6,7 @@
 compile_error!("one VMM artifact cannot contain both AMD SEV-SNP and Intel TDX libkrun variants");
 
 #[cfg(any(
-    all(feature = "guest-runtime", target_os = "linux"),
+    feature = "guest-runtime",
     all(
         feature = "host",
         any(
@@ -173,7 +173,8 @@ pub mod host {
     pub use crate::{
         attestation::{
             AttestationBinding, AttestationChallenge, AttestationInputError, AttestedComponent,
-            CpuAttestationProfile, EvidenceProfile, GuestAttestationBundle,
+            AttestedGuestKeyProof, AttestedGuestKeyProofError, CpuAttestationProfile,
+            EvidenceProfile, GuestAttestation, GuestAttestationBundle, GuestAttestationParameters,
             GuestAttestationRequest, MAX_RAW_EVIDENCE_BYTES, NvidiaAttestationProfile, RawEvidence,
         },
         capabilities::{Capabilities, KrunFeature},
@@ -204,10 +205,15 @@ pub mod host {
 pub mod guest {
     pub use crate::{
         attestation::{
-            AttestationChallenge, AttestationInputError, CpuAttestationProfile,
-            GuestAttestationBundle, GuestAttestationRequest, NvidiaAttestationProfile,
+            AttestationChallenge, AttestationInputError, AttestedGuestKeyProof,
+            AttestedGuestKeyProofError, CpuAttestationProfile, GuestAttestation,
+            GuestAttestationBundle, GuestAttestationParameters, GuestAttestationRequest,
+            NvidiaAttestationProfile,
         },
-        guest_attestation::{GuestAttestationError, collect_attestation},
+        guest_attestation::{
+            GuestAttestationError, GuestAttestationIdentity, collect_attestation,
+            detect_cpu_attestation_profile, detect_nvidia_attestation_profile,
+        },
     };
 }
 

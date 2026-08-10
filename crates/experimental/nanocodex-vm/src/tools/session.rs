@@ -11,6 +11,7 @@ use std::{
 };
 
 use crate::{
+    attestation::{GuestAttestation, GuestAttestationParameters},
     command::GuestCommand,
     config::VmConfig,
     egress::EgressLease,
@@ -28,10 +29,11 @@ use tracing::{Instrument, Span, info, info_span};
 use super::{
     VmToolClient,
     protocol::{
-        CancelRequest, ControlResponse, CreateDirectoryRequest, ExecuteRequest, ExecuteResponse,
-        MemoryRequest, MemoryResponse, ReadFileRequest, ReadFileResponse, ReadyRequest,
-        SessionRequest, SessionResponse, ShutdownRequest, TerminateToolProcessesRequest,
-        ToolRequest, WireToolContext, WireToolInput, WriteFileRequest,
+        AttestRequest, AttestResponse, CancelRequest, ControlResponse, CreateDirectoryRequest,
+        ExecuteRequest, ExecuteResponse, MemoryRequest, MemoryResponse, ReadFileRequest,
+        ReadFileResponse, ReadyRequest, SessionRequest, SessionResponse, ShutdownRequest,
+        TerminateToolProcessesRequest, ToolRequest, WireToolContext, WireToolInput,
+        WriteFileRequest,
     },
 };
 
@@ -721,6 +723,22 @@ impl VmToolSession {
         self.handle.command(command).await
     }
 
+    /// Requests fresh native evidence from the running confidential guest.
+    ///
+    /// The guest lazily creates and retains an Ed25519 identity, binds its
+    /// public key into the native report, and signs the resulting transcript.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when evidence collection fails, the session closes, or
+    /// the typed response is invalid.
+    pub async fn attest(
+        &self,
+        parameters: GuestAttestationParameters,
+    ) -> Result<GuestAttestation, VmToolSessionError> {
+        self.handle.attest(parameters).await
+    }
+
     /// Returns the best-effort peak memory observed for this VM session.
     ///
     /// Host RSS remains available when the guest protocol has already failed.
@@ -948,6 +966,35 @@ impl VmToolSessionHandle {
         span.record("vm.session.age_ns", elapsed_ns(self.inner.spawned_at));
         record_vm_result(&span, started_at, &result);
         result
+    }
+
+    /// Requests fresh native evidence from the running confidential guest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when collection fails or the session protocol closes.
+    pub async fn attest(
+        &self,
+        parameters: GuestAttestationParameters,
+    ) -> Result<GuestAttestation, VmToolSessionError> {
+        let response = self
+            .control_request(|id| SessionRequest::Attest(AttestRequest { id, parameters }))
+            .await?;
+        let SessionResponse::Attest(AttestResponse {
+            attestation, error, ..
+        }) = response
+        else {
+            return Err(VmToolSessionError::Protocol(
+                "expected an attestation response",
+            ));
+        };
+        match (attestation, error) {
+            (Some(attestation), None) => Ok(attestation),
+            (None, Some(error)) => Err(VmToolSessionError::Guest(error)),
+            _ => Err(VmToolSessionError::Protocol(
+                "expected exactly one of attestation or error",
+            )),
+        }
     }
 
     /// Returns the best-effort peak memory observed for this VM session.
@@ -1792,6 +1839,7 @@ const fn set_request_id(request: &mut SessionRequest, id: u64) {
         SessionRequest::CreateDirectory(request) => request.id = id,
         SessionRequest::ReadFile(request) => request.id = id,
         SessionRequest::Memory(request) => request.id = id,
+        SessionRequest::Attest(request) => request.id = id,
         SessionRequest::Execute(request) => request.id = id,
         SessionRequest::Cancel(request) => request.id = id,
         SessionRequest::TerminateToolProcesses(request) => request.id = id,
