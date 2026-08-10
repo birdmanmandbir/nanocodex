@@ -12,6 +12,7 @@ use iroh::{
 use serde::{Deserialize, Serialize};
 use tokio::{
     net::{TcpListener, TcpStream},
+    sync::{Mutex, Semaphore},
     task::JoinSet,
 };
 
@@ -20,9 +21,12 @@ const TICKET_PREFIX: &str = "iroh-eval:";
 const TICKET_VERSION: u8 = 1;
 const MAX_TICKET_BYTES: usize = 16 * 1024;
 const TOKEN_BYTES: usize = 32;
-const ONLINE_TIMEOUT: Duration = Duration::from_secs(30);
+const ONLINE_TIMEOUT: Duration = Duration::from_secs(60);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_CONCURRENT_STREAMS: usize = 256;
+const MAX_CONCURRENT_STREAMS: usize = 32;
+
+#[cfg(test)]
+pub(super) static TEST_ENDPOINT_PERMIT: Semaphore = Semaphore::const_new(1);
 
 /// One ephemeral capability for reaching a coordinator over iroh.
 ///
@@ -42,6 +46,13 @@ pub struct IrohCoordinatorServer {
 
 /// Worker-side bridge from a loopback TCP listener to an iroh coordinator.
 pub struct IrohCoordinatorConnector;
+
+#[derive(Clone)]
+struct CoordinatorDialer {
+    endpoint: Endpoint,
+    ticket: Arc<IrohCoordinatorTicket>,
+    connection: Arc<Mutex<Option<iroh::endpoint::Connection>>>,
+}
 
 /// Iroh coordinator ticket, endpoint, or forwarding failure.
 #[derive(Debug, thiserror::Error)]
@@ -74,6 +85,7 @@ struct WireTicket {
 struct CoordinatorProtocol {
     origin: SocketAddr,
     token: [u8; TOKEN_BYTES],
+    streams: Arc<Semaphore>,
 }
 
 impl IrohCoordinatorTicket {
@@ -159,7 +171,7 @@ impl IrohCoordinatorServer {
         Self::spawn(origin, endpoint, true).await
     }
 
-    async fn spawn(
+    pub(super) async fn spawn(
         origin: SocketAddr,
         endpoint: Endpoint,
         wait_until_online: bool,
@@ -167,6 +179,7 @@ impl IrohCoordinatorServer {
         require_loopback(origin)?;
         let protocol = CoordinatorProtocol {
             origin,
+            streams: Arc::new(Semaphore::new(MAX_CONCURRENT_STREAMS)),
             token: {
                 let mut token = [0; TOKEN_BYTES];
                 getrandom::fill(&mut token)
@@ -211,22 +224,25 @@ impl IrohCoordinatorConnector {
         Self::serve_with_endpoint(ticket, listener, endpoint).await
     }
 
-    async fn serve_with_endpoint(
+    pub(super) async fn serve_with_endpoint(
         ticket: IrohCoordinatorTicket,
         listener: TcpListener,
         endpoint: Endpoint,
     ) -> Result<(), IrohCoordinatorError> {
         require_loopback(listener.local_addr()?)?;
-        let ticket = Arc::new(ticket);
+        let dialer = CoordinatorDialer {
+            endpoint,
+            ticket: Arc::new(ticket),
+            connection: Arc::new(Mutex::new(None)),
+        };
         let mut connections = JoinSet::new();
         loop {
             tokio::select! {
                 accepted = listener.accept(), if connections.len() < MAX_CONCURRENT_STREAMS => {
                     let (stream, peer) = accepted?;
-                    let endpoint = endpoint.clone();
-                    let ticket = ticket.clone();
+                    let dialer = dialer.clone();
                     connections.spawn(async move {
-                        if let Err(error) = forward_downstream(endpoint, ticket, stream).await {
+                        if let Err(error) = forward_downstream(dialer, stream).await {
                             tracing::warn!(%peer, %error, "iroh coordinator downstream closed");
                         }
                     });
@@ -241,18 +257,51 @@ impl IrohCoordinatorConnector {
     }
 }
 
+impl CoordinatorDialer {
+    async fn open_bi(
+        &self,
+    ) -> Result<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream), IrohCoordinatorError>
+    {
+        let mut connection = self.connection.lock().await;
+        if let Some(active) = connection.as_ref() {
+            match active.open_bi().await {
+                Ok(streams) => return Ok(streams),
+                Err(error) => {
+                    tracing::debug!(%error, "reconnecting closed iroh coordinator connection");
+                    *connection = None;
+                }
+            }
+        }
+        let active = self
+            .endpoint
+            .connect(self.ticket.address.clone(), ALPN)
+            .await
+            .map_err(|error| IrohCoordinatorError::Endpoint(error.to_string()))?;
+        let streams = active
+            .open_bi()
+            .await
+            .map_err(|error| IrohCoordinatorError::Endpoint(error.to_string()))?;
+        *connection = Some(active);
+        Ok(streams)
+    }
+}
+
 impl ProtocolHandler for CoordinatorProtocol {
     async fn accept(&self, connection: iroh::endpoint::Connection) -> Result<(), AcceptError> {
         let remote = connection.remote_id();
         let mut streams = JoinSet::new();
         loop {
             tokio::select! {
-                accepted = connection.accept_bi(), if streams.len() < MAX_CONCURRENT_STREAMS => {
+                accepted = connection.accept_bi() => {
                     let Ok((send, recv)) = accepted else {
+                        break;
+                    };
+                    let Ok(permit) = self.streams.clone().acquire_owned().await else {
                         break;
                     };
                     let protocol = self.clone();
                     streams.spawn(async move {
+                        let _permit = permit;
                         if let Err(error) = protocol.forward_upstream(send, recv).await {
                             tracing::warn!(%remote, %error, "iroh coordinator upstream closed");
                         }
@@ -300,19 +349,11 @@ impl CoordinatorProtocol {
 }
 
 async fn forward_downstream(
-    endpoint: Endpoint,
-    ticket: Arc<IrohCoordinatorTicket>,
+    dialer: CoordinatorDialer,
     mut stream: TcpStream,
 ) -> Result<(), IrohCoordinatorError> {
-    let connection = endpoint
-        .connect(ticket.address.clone(), ALPN)
-        .await
-        .map_err(|error| IrohCoordinatorError::Endpoint(error.to_string()))?;
-    let (mut send, recv) = connection
-        .open_bi()
-        .await
-        .map_err(|error| IrohCoordinatorError::Endpoint(error.to_string()))?;
-    send.write_all(&ticket.token)
+    let (mut send, recv) = dialer.open_bi().await?;
+    send.write_all(&dialer.ticket.token)
         .await
         .map_err(|error| IrohCoordinatorError::Protocol(error.to_string()))?;
     let mut iroh = tokio::io::join(recv, send);
@@ -345,7 +386,20 @@ mod tests {
         assert_eq!(decoded.address, ticket.address);
         assert_eq!(decoded.token, ticket.token);
         assert!(!format!("{ticket:?}").contains(&encoded));
-        assert!(IrohCoordinatorTicket::from_str("https://example.com").is_err());
+        for malformed in [
+            "",
+            "https://example.com",
+            TICKET_PREFIX,
+            "iroh-eval:not-base64!",
+            "iroh-eval:e30",
+        ] {
+            assert!(
+                IrohCoordinatorTicket::from_str(malformed).is_err(),
+                "malformed ticket unexpectedly parsed: {malformed}"
+            );
+        }
+        let oversized = format!("{TICKET_PREFIX}{}", "a".repeat(MAX_TICKET_BYTES + 1));
+        assert!(IrohCoordinatorTicket::from_str(&oversized).is_err());
 
         let unsupported = URL_SAFE_NO_PAD.encode(
             serde_json::to_vec(&WireTicket {
@@ -358,10 +412,73 @@ mod tests {
         assert!(IrohCoordinatorTicket::from_str(&format!("{TICKET_PREFIX}{unsupported}")).is_err());
     }
 
+    #[test]
+    fn forwarding_accepts_only_loopback_tcp_addresses() {
+        assert!(require_loopback("127.0.0.1:8789".parse().unwrap()).is_ok());
+        assert!(require_loopback("[::1]:8789".parse().unwrap()).is_ok());
+        for address in ["0.0.0.0:8789", "10.0.0.1:8789", "[::]:8789"] {
+            assert!(require_loopback(address.parse().unwrap()).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn dialer_multiplexes_streams_on_one_quic_connection() {
+        let _test_permit = TEST_ENDPOINT_PERMIT.acquire().await.unwrap();
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_address = origin.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = origin.accept().await.unwrap();
+                let mut request = [0; 4];
+                stream.read_exact(&mut request).await.unwrap();
+                assert_eq!(&request, b"ping");
+                stream.write_all(b"pong").await.unwrap();
+            }
+        });
+        let server_endpoint = Endpoint::builder(presets::Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let (server, ticket) = IrohCoordinatorServer::spawn(origin_address, server_endpoint, false)
+            .await
+            .unwrap();
+        let client_endpoint = Endpoint::builder(presets::Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let dialer = CoordinatorDialer {
+            endpoint: client_endpoint,
+            ticket: Arc::new(ticket),
+            connection: Arc::new(Mutex::new(None)),
+        };
+
+        let mut connection_ids = Vec::new();
+        for _ in 0..2 {
+            let (mut send, mut recv) = dialer.open_bi().await.unwrap();
+            connection_ids.push(dialer.connection.lock().await.as_ref().unwrap().stable_id());
+            send.write_all(&dialer.ticket.token).await.unwrap();
+            send.write_all(b"ping").await.unwrap();
+            send.finish().unwrap();
+            assert_eq!(recv.read_to_end(4).await.unwrap(), b"pong");
+        }
+
+        assert_eq!(connection_ids[0], connection_ids[1]);
+        origin_task.await.unwrap();
+        drop(dialer);
+        server.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn loopback_tcp_crosses_an_authenticated_iroh_stream() {
         const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+        const VALID_CONNECTIONS: usize = 8;
 
+        let _test_permit = TEST_ENDPOINT_PERMIT.acquire().await.unwrap();
         let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin_address = origin.local_addr().unwrap();
         let server_endpoint = Endpoint::builder(presets::Minimal)
@@ -402,11 +519,13 @@ mod tests {
         invalid_client.close().await;
 
         let origin_task = tokio::spawn(async move {
-            let (mut stream, _) = origin.accept().await.unwrap();
-            let mut request = [0; 4];
-            stream.read_exact(&mut request).await.unwrap();
-            assert_eq!(&request, b"ping");
-            stream.write_all(b"pong").await.unwrap();
+            for _ in 0..VALID_CONNECTIONS {
+                let (mut stream, _) = origin.accept().await.unwrap();
+                let mut request = [0; 4];
+                stream.read_exact(&mut request).await.unwrap();
+                assert_eq!(&request, b"ping");
+                stream.write_all(b"pong").await.unwrap();
+            }
         });
         let downstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let downstream_address = downstream.local_addr().unwrap();
@@ -422,12 +541,20 @@ mod tests {
         ));
 
         tokio::time::timeout(TEST_TIMEOUT, async {
-            let mut stream = TcpStream::connect(downstream_address).await.unwrap();
-            stream.write_all(b"ping").await.unwrap();
-            let mut response = [0; 4];
-            stream.read_exact(&mut response).await.unwrap();
-            assert_eq!(&response, b"pong");
-            stream.shutdown().await.unwrap();
+            let mut clients = JoinSet::new();
+            for _ in 0..VALID_CONNECTIONS {
+                clients.spawn(async move {
+                    let mut stream = TcpStream::connect(downstream_address).await.unwrap();
+                    stream.write_all(b"ping").await.unwrap();
+                    let mut response = [0; 4];
+                    stream.read_exact(&mut response).await.unwrap();
+                    assert_eq!(&response, b"pong");
+                    stream.shutdown().await.unwrap();
+                });
+            }
+            while let Some(result) = clients.join_next().await {
+                result.unwrap();
+            }
         })
         .await
         .expect("iroh loopback forwarding timed out");

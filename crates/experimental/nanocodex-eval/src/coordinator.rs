@@ -1468,12 +1468,7 @@ allow_internet = false
         fs::write(task.join("tests/test.sh"), "#!/bin/sh\n").unwrap();
     }
 
-    async fn fixture() -> (
-        tempfile::TempDir,
-        CoordinatorClient,
-        EvaluationSelector,
-        JoinHandle<()>,
-    ) {
+    fn prepared_fixture() -> (tempfile::TempDir, Evaluation, EvaluationSelector) {
         let directory = tempfile::tempdir().unwrap();
         write_task(directory.path());
         let config = directory.path().join("nanocodex.toml");
@@ -1498,6 +1493,16 @@ thinking = ["high"]
         let evaluation =
             Evaluation::open(&config, Some("release"), directory.path().join("state")).unwrap();
         let selection = EvaluationSelector::new("one");
+        (directory, evaluation, selection)
+    }
+
+    async fn fixture() -> (
+        tempfile::TempDir,
+        CoordinatorClient,
+        EvaluationSelector,
+        JoinHandle<()>,
+    ) {
+        let (directory, evaluation, selection) = prepared_fixture();
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
@@ -1512,6 +1517,95 @@ thinking = ["high"]
             .unwrap()
             .profile("release");
         (directory, client, selection, server)
+    }
+
+    async fn iroh_fixture() -> (
+        tempfile::TempDir,
+        CoordinatorClient,
+        EvaluationSelector,
+        JoinHandle<()>,
+    ) {
+        let (directory, evaluation, selection) = prepared_fixture();
+        let coordinator_listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let coordinator_address = coordinator_listener.local_addr().unwrap();
+        let server_endpoint = ::iroh::Endpoint::builder(::iroh::endpoint::presets::Minimal)
+            .relay_mode(::iroh::RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let (iroh_server, ticket) =
+            IrohCoordinatorServer::spawn(coordinator_address, server_endpoint, false)
+                .await
+                .unwrap();
+        let bridge_listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let bridge_address = bridge_listener.local_addr().unwrap();
+        let client_endpoint = ::iroh::Endpoint::builder(::iroh::endpoint::presets::Minimal)
+            .relay_mode(::iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let server = tokio::spawn(async move {
+            tokio::select! {
+                result = CoordinatorServer::new(evaluation).serve(coordinator_listener) => {
+                    result.unwrap();
+                }
+                result = IrohCoordinatorConnector::serve_with_endpoint(
+                    ticket,
+                    bridge_listener,
+                    client_endpoint,
+                ) => {
+                    result.unwrap();
+                }
+            }
+            iroh_server.shutdown().await.unwrap();
+        });
+        let client = CoordinatorClient::new(&format!("http://{bridge_address}")).unwrap();
+        (directory, client, selection, server)
+    }
+
+    #[tokio::test]
+    async fn coordinator_http_and_artifact_upload_cross_iroh() {
+        let _test_permit = super::iroh::TEST_ENDPOINT_PERMIT.acquire().await.unwrap();
+        let (directory, client, selection, server) = iroh_fixture().await;
+        let worker = client.clone().worker("iroh-worker");
+        let RemoteClaim::Run { claim, .. } = worker.claim(&selection).await.unwrap() else {
+            panic!("iroh worker should claim one row");
+        };
+        let output = directory.path().join("iroh-worker");
+        fs::create_dir_all(output.join("agent")).unwrap();
+        fs::create_dir_all(output.join("verifier")).unwrap();
+        let evidence = output.join("comparison.json");
+        fs::write(&evidence, "{\"transport\":\"iroh\"}\n").unwrap();
+        fs::write(
+            output.join("events.jsonl"),
+            "{\"type\":\"attempt_started\",\"payload\":{\"prompt\":\"do it\"},\"attempt\":{\"task_name\":\"one\"}}\n\
+             {\"type\":\"completed\",\"payload\":{\"task_name\":\"one\",\"status\":\"passed\",\"outcome\":\"passed\",\"environment\":\"micro_vm\",\"agent\":{\"model\":\"sol\",\"effort\":\"high\",\"tool_calls\":1,\"usage\":{\"total_tokens\":10}},\"verifier\":{\"exit_code\":0,\"rewards\":{\"reward\":1}}}}\n",
+        )
+        .unwrap();
+        fs::write(
+            output.join("agent/trajectory.json"),
+            "{\"transport\":\"iroh\"}\n",
+        )
+        .unwrap();
+        fs::write(output.join("verifier/reward.txt"), "1\n").unwrap();
+
+        worker.succeed(&claim, &output, &evidence).await.unwrap();
+
+        let status = client.status().await.unwrap();
+        assert_eq!(status["tasks"]["success"], 1);
+        assert_eq!(
+            count_named_files(&directory.path().join("state/artifacts"), "trajectory.json"),
+            1
+        );
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
