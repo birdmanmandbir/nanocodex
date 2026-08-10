@@ -64,7 +64,25 @@ jobs:
       - run: cargo fmt --all -- --check
       - name: Clippy workspace and mutually exclusive libkrun TEE artifacts
         run: |
-          cargo clippy --workspace --exclude nanocodex-vm --all-targets --all-features -- -D warnings
+          cargo clippy \
+            --package nanocodex-bin \
+            --package nanocodex \
+            --package nanocodex-agent \
+            --package nanocodex-oai-api \
+            --package nanocodex-tools \
+            --package nanocodex-tools-macros \
+            --package nanocodex-observability \
+            --package nanocodex-browser \
+            --package nanocodex-egress \
+            --package nanocodex-voice \
+            --package nanousd \
+            --package nanocodex-eval \
+            --package nanousd-api \
+            --package nanocodex-examples \
+            --package nanocodex-exe-dev \
+            --package nanocodex-wasm \
+            --package nanocodex-python \
+            --all-targets --all-features -- -D warnings
           cargo clippy --package nanocodex-vm --all-targets --features host -- -D warnings
           cargo clippy --package nanocodex-vm --all-targets --features libkrun-amd-sev -- -D warnings
           cargo clippy --package nanocodex-vm --all-targets --features libkrun-intel-tdx -- -D warnings
@@ -77,7 +95,25 @@ jobs:
           cargo check --locked --package nanocodex-examples --bins
       - name: Document workspace without unifying libkrun TEE artifacts
         run: |
-          cargo doc --workspace --exclude nanocodex-vm --all-features --no-deps --locked
+          cargo doc \
+            --package nanocodex-bin \
+            --package nanocodex \
+            --package nanocodex-agent \
+            --package nanocodex-oai-api \
+            --package nanocodex-tools \
+            --package nanocodex-tools-macros \
+            --package nanocodex-observability \
+            --package nanocodex-browser \
+            --package nanocodex-egress \
+            --package nanocodex-voice \
+            --package nanousd \
+            --package nanocodex-eval \
+            --package nanousd-api \
+            --package nanocodex-examples \
+            --package nanocodex-exe-dev \
+            --package nanocodex-wasm \
+            --package nanocodex-python \
+            --all-features --no-deps --locked
           cargo doc --package nanocodex-vm --features host --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
