@@ -353,7 +353,7 @@ check:
     ./scripts/check-rustls-provider.sh
     cargo fmt --all -- --check
     cargo clippy \
-      --package nanocodex-bin --package nanocodex --package nanocodex-agent \
+      --package nanocodex --package nanocodex-agent \
       --package nanocodex-oai-api --package nanocodex-tools \
       --package nanocodex-tools-macros --package nanocodex-observability \
       --package nanocodex-browser --package nanocodex-egress \
@@ -361,6 +361,9 @@ check:
       --package nanousd-api --package nanocodex-examples \
       --package nanocodex-exe-dev --package nanocodex-wasm \
       --package nanocodex-python --all-targets --all-features -- -D warnings
+    cargo clippy --package nanocodex-bin --all-targets --features tempo -- -D warnings
+    cargo clippy --package nanocodex-bin --all-targets --features tempo,libkrun-amd-sev -- -D warnings
+    cargo clippy --package nanocodex-bin --all-targets --features tempo,libkrun-intel-tdx -- -D warnings
     cargo clippy --package nanocodex-vm --all-targets --features host -- -D warnings
     cargo clippy --package nanocodex-vm --all-targets --features libkrun-amd-sev -- -D warnings
     cargo clippy --package nanocodex-vm --all-targets --features libkrun-intel-tdx -- -D warnings
