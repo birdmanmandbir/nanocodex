@@ -635,12 +635,10 @@ async fn read_frame(
 
 #[cfg(feature = "guest-runtime")]
 async fn sync_filesystems(request: ShutdownRequest) -> ControlResponse {
-    let mut command = Command::new("/bin/sync");
-    command.kill_on_drop(true);
-    let error = match tokio::time::timeout(FILESYSTEM_SYNC_TIMEOUT, command.status()).await {
-        Ok(Ok(status)) if status.success() => None,
-        Ok(Ok(status)) => Some(format!("sync exited with {status}")),
-        Ok(Err(error)) => Some(error.to_string()),
+    let sync = tokio::task::spawn_blocking(nix::unistd::sync);
+    let error = match tokio::time::timeout(FILESYSTEM_SYNC_TIMEOUT, sync).await {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(format!("sync task failed: {error}")),
         Err(_) => Some(format!(
             "sync exceeded the {FILESYSTEM_SYNC_TIMEOUT:?} shutdown deadline"
         )),
