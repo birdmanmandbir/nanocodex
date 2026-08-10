@@ -158,6 +158,9 @@ build-vm-host-intel-tdx:
 # Collect real native evidence when run inside an SNP VM, TDX TD, or Nitro
 # Enclave. A relying party should pass its own nonce with the expanded Cargo
 # command documented in the VM crate README.
+confidential-capabilities:
+    cargo run --locked --quiet -p nanocodex-vm --example confidential_host
+
 attest-example:
     @test "$(uname -s)" = Linux || { echo "native TEE attestation requires Linux" >&2; exit 2; }
     cargo run --locked --quiet -p nanocodex-vm --bin nanocodex-vm-guest \
@@ -190,11 +193,29 @@ attest-libkrun-snp: build-vm-guest build-vm-host-amd-sev
       --guest target/x86_64-unknown-linux-musl/debug/nanocodex-vm-guest
 
 # Build, launch, and collect one fresh TDX attestation through libkrun. The
-# QGS socket is relayed to guest vsock port 4050.
+# QGS socket serves the guest's TDX GetQuote configfs requests directly.
 attest-libkrun-tdx qgs="/run/tdx-qgs/qgs.socket": build-vm-guest build-vm-host-intel-tdx
     @test "$(uname -m)" = x86_64 || { echo "Intel TDX requires x86_64" >&2; exit 2; }
     cargo run --locked --quiet -p nanocodex-vm --example confidential_attestation -- \
       --profile tdx \
+      --vmm target/libkrun-intel-tdx/debug/nanocodex \
+      --guest target/x86_64-unknown-linux-musl/debug/nanocodex-vm-guest \
+      --qgs "{{qgs}}"
+
+# Launch either reviewed B200 topology in an SNP VM. `topology` is
+# b200-single or b200-hgx8; `bundle` is the exact JSON PCI identity manifest.
+attest-libkrun-snp-b200 topology bundle: build-vm-guest build-vm-host-amd-sev
+    @test "$(uname -m)" = x86_64 || { echo "SEV-SNP requires x86_64" >&2; exit 2; }
+    cargo run --locked --quiet -p nanocodex-vm --example confidential_attestation -- \
+      --profile snp --nvidia "{{topology}}" --device-bundle "{{bundle}}" \
+      --vmm target/libkrun-amd-sev/debug/nanocodex \
+      --guest target/x86_64-unknown-linux-musl/debug/nanocodex-vm-guest
+
+# Launch either reviewed B200 topology in a TDX VM and relay configfs GetQuote.
+attest-libkrun-tdx-b200 topology bundle qgs="/run/tdx-qgs/qgs.socket": build-vm-guest build-vm-host-intel-tdx
+    @test "$(uname -m)" = x86_64 || { echo "Intel TDX requires x86_64" >&2; exit 2; }
+    cargo run --locked --quiet -p nanocodex-vm --example confidential_attestation -- \
+      --profile tdx --nvidia "{{topology}}" --device-bundle "{{bundle}}" \
       --vmm target/libkrun-intel-tdx/debug/nanocodex \
       --guest target/x86_64-unknown-linux-musl/debug/nanocodex-vm-guest \
       --qgs "{{qgs}}"

@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use nanocodex_vm::host::{Capabilities, ConfidentialVmProfile};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -10,14 +12,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ConfidentialVmProfile::intel_tdx().nvidia_b200_hgx_8_encrypted_nvlink(),
     ] {
         let report = capabilities.confidential_report(&profile);
-        let status = if report.is_supported() {
-            "supported"
+        let launch_missing = report.launch_missing().collect::<BTreeSet<_>>();
+        let status = if report.is_launch_supported() {
+            "launch-ready"
         } else {
-            "unsupported"
+            "launch-blocked"
         };
-        println!("{}: {status}", profile.cpu_tee());
+        println!("{profile:?}: {status}");
         for missing in report.missing() {
-            println!("  missing: {missing}");
+            let phase = if launch_missing.contains(&missing) {
+                "launch"
+            } else {
+                "post-launch evidence"
+            };
+            println!("  missing ({phase}): {missing}");
         }
     }
     Ok(())

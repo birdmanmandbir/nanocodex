@@ -78,6 +78,9 @@ host report is discovery rather than attestation: only evidence from the
 particular launched guest can eventually authorize an `AttestedVm` or secret
 release. Command receipts and agent execution remain separate consumers.
 
+Run `just confidential-capabilities` on any host to print each profile's
+launch blockers separately from claims which can only be checked after launch.
+
 ### Collect an attestation
 
 On any Linux guest already running as AMD SEV-SNP, Intel TDX, or an AWS Nitro
@@ -118,9 +121,8 @@ These build the static guest and matching dedicated libkrun VMM, create the
 minimal measured ext4 runtime, launch the confidential VM, send a fresh host
 challenge through [`tools::VmToolSession::attest`], verify the guest's Ed25519
 possession proof, print the bundle, and shut down. The TDX form additionally
-maps QGS to guest vsock port 4050. The guest kernel and libkrun must still
-provide the quote-generation ABI; a raw TDREPORT is not presented as a
-remotely verifiable quote.
+relays guest configfs GetQuote exits to the selected QGS Unix socket with QGS
+1.1 framing. A raw TDREPORT is never presented as a remotely verifiable quote.
 
 An SNP relying party can now appraise a retained response entirely offline:
 
@@ -164,7 +166,7 @@ identity. Use the expanded Cargo example to repeat `--pcr`, require
 TDX, and Nitro backends without allowing one evidence format to fall through to
 another verifier.
 
-### B200 assignment status
+### B200 assignment
 
 The 1x and 8x B200 host assignment descriptors are fail-closed. Linux
 resolution requires the exact `10de:2901` GPU identities, `vfio-pci` ownership,
@@ -174,21 +176,65 @@ caller-pinned SHA-256 digest of each function's production VPD. This prevents a
 same-device-ID ConnectX NIC from being mistaken for the NVLink management
 bridge.
 
-Two gates remain intentionally unavailable in the current libkrun artifact:
+The pinned libkrun artifact exposes a Linux x86-64 VFIO cdev/IOMMUFD boundary.
+Nanocodex resolves each selected function's exact `vfio-dev` cdev, pins its
+major/minor identity, assigns deterministic guest BDFs, and hands the complete
+bundle to libkrun. Ordinary guests receive identity DMA mappings for RAM;
+confidential guests receive mappings only for pages explicitly converted to
+shared state. PCI assignment alone is not treated as TDISP, IDE, or device
+attestation.
 
-- pinned and current upstream libkrun expose no VFIO/IOMMUFD PCI assignment API,
-  so `host::ResolvedConfidentialDeviceBundle` cannot yet be handed to the VMM;
-- NVIDIA's signed GPU/NVSwitch claims establish device identity, firmware
-  measurements, secure boot, debug policy, and nonce freshness, but do not sign
-  the complete administrative NVLink state. Host `nvidia-smi`/Fabric Manager
-  output is useful launch diagnostics, not remote proof of disabled 1x links or
-  encrypted 8x MPT links.
+The remaining remote-proof gate is intentionally fail-closed: NVIDIA's signed
+GPU/NVSwitch claims establish device identity, firmware measurements, secure
+boot, debug policy, and nonce freshness, but do not sign the complete
+administrative NVLink state. Host `nvidia-smi`/Fabric Manager output is useful
+launch diagnostics, not remote proof of disabled 1x links or encrypted 8x MPT
+links.
 
 Consequently, `host::NvidiaNvattestVerifier` verifies real retained native
 device evidence but returns no fabric claim, and composite verification refuses
 to issue a B200 [`host::VerifiedAttestation`]. This is the safe handoff point for
-libkrun VFIO work and a future NVIDIA-signed fabric-state claim; neither state is
-inferred from device counts or unsigned host output.
+hardware validation and a future NVIDIA-signed fabric-state claim; neither state
+is inferred from device counts or unsigned host output. The launch and native
+evidence-collection path is runnable on supporting hardware:
+
+```console
+just attest-libkrun-snp-b200 b200-single b200-single.json
+just attest-libkrun-snp-b200 b200-hgx8 b200-hgx8.json
+just attest-libkrun-tdx-b200 b200-single b200-single.json /run/tdx-qgs/qgs.socket
+just attest-libkrun-tdx-b200 b200-hgx8 b200-hgx8.json /run/tdx-qgs/qgs.socket
+```
+
+The JSON file is a serialized [`host::ConfidentialDeviceBundle`]. A single-GPU
+manifest contains exactly one `nvidia_b200_gpu` (`10de:2901`). An HGX manifest
+contains exactly eight such GPUs plus functions `.0` through `.3` of one
+`nvidia_cx7_fabric_bridge` slot; each bridge entry includes its platform device
+ID and a 32-byte operator-pinned VPD SHA-256 array. Bind every listed function
+to `vfio-pci` before launch and ensure `/dev/iommu` plus each function's
+`/dev/vfio/devices/vfioN` cdev are accessible to the VMM process.
+
+A minimal single-B200 manifest is:
+
+```json
+{
+  "profile": "b200_single",
+  "devices": [
+    {
+      "address": "0000:1b:00.0",
+      "role": "nvidia_b200_gpu",
+      "vendor_id": 4318,
+      "device_id": 10497,
+      "expected_vpd_sha256": null
+    }
+  ]
+}
+```
+
+PCI IDs in the JSON encoding are decimal (`4318 == 0x10de`,
+`10497 == 0x2901`). Prefer constructing HGX manifests through
+[`host::ConfidentialDeviceBundle::b200_hgx_8`] so duplicate addresses, exact
+counts, bridge function placement, and VPD digest lengths are checked before
+the manifest is written.
 
 ## Use VM-backed workspace tools
 

@@ -34,6 +34,7 @@ struct Options {
     guest: PathBuf,
     cache: PathBuf,
     qgs: Option<PathBuf>,
+    device_bundle: Option<PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -77,6 +78,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .confidential(vm_profile);
     if let Some(qgs) = options.qgs {
         vm = vm.tdx_quote_generation_socket(qgs);
+    }
+    if let Some(bundle) = options.device_bundle {
+        vm = attach_device_bundle(vm, &bundle)?;
     }
     let mut vmm = Command::new(options.vmm);
     vmm.arg("vm-run-config");
@@ -138,6 +142,7 @@ impl Options {
         let mut guest = None;
         let mut cache = PathBuf::from(".cache/nanocodex/attestation-example");
         let mut qgs = None;
+        let mut device_bundle = None;
         let mut arguments = std::env::args().skip(1);
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
@@ -166,9 +171,12 @@ impl Options {
                 "--guest" => guest = Some(value(&mut arguments, "--guest")?.into()),
                 "--cache" => cache = value(&mut arguments, "--cache")?.into(),
                 "--qgs" => qgs = Some(value(&mut arguments, "--qgs")?.into()),
+                "--device-bundle" => {
+                    device_bundle = Some(value(&mut arguments, "--device-bundle")?.into());
+                }
                 "--help" | "-h" => {
                     println!(
-                        "usage: confidential_attestation --profile snp|tdx --vmm PATH --guest PATH [--cache PATH] [--qgs PATH] [--nvidia off|b200-single|b200-hgx8]"
+                        "usage: confidential_attestation --profile snp|tdx --vmm PATH --guest PATH [--cache PATH] [--qgs PATH] [--nvidia off|b200-single|b200-hgx8] [--device-bundle PATH]"
                     );
                     std::process::exit(0);
                 }
@@ -187,6 +195,12 @@ impl Options {
                 "--qgs is valid only with --profile tdx",
             ));
         }
+        if matches!(nvidia, NvidiaProfile::Off) != device_bundle.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--nvidia and --device-bundle must be supplied together",
+            ));
+        }
         Ok(Self {
             cpu,
             nvidia,
@@ -194,8 +208,31 @@ impl Options {
             guest: guest.ok_or_else(|| missing("--guest"))?,
             cache,
             qgs,
+            device_bundle,
         })
     }
+}
+
+#[cfg(target_os = "linux")]
+fn attach_device_bundle(
+    vm: nanocodex_vm::host::VmConfig,
+    path: &std::path::Path,
+) -> Result<nanocodex_vm::host::VmConfig, Box<dyn std::error::Error>> {
+    let file = std::fs::File::open(path)?;
+    let bundle = serde_json::from_reader(file)?;
+    Ok(vm.confidential_devices(bundle))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn attach_device_bundle(
+    _vm: nanocodex_vm::host::VmConfig,
+    _path: &std::path::Path,
+) -> Result<nanocodex_vm::host::VmConfig, Box<dyn std::error::Error>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "confidential PCI assignment requires Linux",
+    )
+    .into())
 }
 
 fn value(arguments: &mut impl Iterator<Item = String>, option: &str) -> Result<String, io::Error> {
