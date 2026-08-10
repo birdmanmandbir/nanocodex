@@ -165,11 +165,12 @@ nanocodex eval run compare --task tasks/write-greeting --harness codex \
   --model luna --thinking high
 
 # Coordinate workers through one SQLite owner. Remote benchmark hosts can reach
-# this loopback listener through an SSH tunnel or an ephemeral iroh capability.
+# this loopback listener through an SSH tunnel or an authenticated iroh capability.
 nanocodex eval coordinator compare --port 8789
 nanocodex eval benchmark compare --coordinator http://127.0.0.1:8789
 
-# On the coordinator, print an ephemeral `iroh-eval:...` capability.
+# On the coordinator, print an `iroh-eval:...` capability using the durable
+# identity and shared join authority stored under its eval state directory.
 nanocodex eval coordinator compare --iroh
 
 # On each remote worker host, bridge that capability back to loopback. Existing
@@ -203,16 +204,22 @@ changes its running row permanently to failed. A small locked local marker
 survives benchmarker termination so a systemd restart can reconcile children
 that died with the previous benchmark process.
 
-The iroh ticket is a bearer capability and must be handled as a secret. It
-contains the coordinator endpoint's authenticated public identity, current
-relay/direct addressing, and a random access token. The iroh endpoint forwards
-only to the coordinator's fixed loopback address; it is not a general proxy.
-Both the endpoint and ticket are ephemeral in this prototype. This authenticates
-the transport but does not attest worker hardware or execution; TEE admission
-can replace the bearer capability without changing the coordinator HTTP API.
-The prototype uses iroh's N0 preset, preferring a direct path and falling back
-to its default relay infrastructure. Persistent endpoint identity and
-operator-selected or community relay policy remain future work.
+The iroh ticket is a shared bearer capability and must be handled as a secret.
+It contains the coordinator endpoint's authenticated public identity, current
+relay/direct addressing, and a shared access token. The private endpoint key
+and access token are atomically created at
+`<state-dir>/iroh/coordinator.json`, restricted to the coordinator user on Unix,
+and reused across restarts. Each start prints a fresh ticket with current
+routing hints while preserving the endpoint identity and join authority.
+Deleting that identity file intentionally creates a new cluster authority.
+
+The iroh endpoint forwards only to the coordinator's fixed loopback address; it
+is not a general proxy. This authenticates the transport but does not attest
+worker hardware or execution; TEE admission can replace the shared bearer
+capability without changing the coordinator HTTP API. The prototype uses
+iroh's N0 preset, preferring a direct path and falling back to its default relay
+infrastructure. Operator-selected or community relay policy remains future
+work.
 
 VM-backed evals consume a prepared host installation. The matching static
 `nanocodex-vm-guest` must be installed beside the `nanocodex` executable; VM

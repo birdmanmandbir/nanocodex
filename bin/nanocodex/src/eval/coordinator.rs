@@ -4,7 +4,7 @@ use clap::Args;
 use eyre::{Result, WrapErr as _};
 use nanocodex_eval::{
     Evaluation,
-    coordinator::{CoordinatorServer, IrohCoordinatorServer},
+    coordinator::{CoordinatorServer, IrohCoordinatorIdentity, IrohCoordinatorServer},
 };
 use tokio::net::TcpListener;
 
@@ -35,13 +35,18 @@ pub(super) struct Coordinator {
 impl Coordinator {
     pub(super) async fn run(self) -> Result<()> {
         let state = self.state_dir.map_or_else(default_state_dir, Ok)?;
-        let evaluation = Evaluation::open(&self.config, Some(&self.profile), state)?;
+        let evaluation = Evaluation::open(&self.config, Some(&self.profile), state.clone())?;
+        let identity = self
+            .iroh
+            .then(|| IrohCoordinatorIdentity::load_or_create(&state))
+            .transpose()
+            .wrap_err("failed to load the durable iroh coordinator identity")?;
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, self.port))
             .await
             .wrap_err("failed to bind the evaluation coordinator")?;
         let address = listener.local_addr()?;
-        let iroh = if self.iroh {
-            let (server, ticket) = IrohCoordinatorServer::bind(address)
+        let iroh = if let Some(identity) = identity.as_ref() {
+            let (server, ticket) = IrohCoordinatorServer::bind(address, identity)
                 .await
                 .wrap_err("failed to publish the evaluation coordinator over iroh")?;
             eprintln!("local coordinator: http://{address}");

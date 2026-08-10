@@ -1,6 +1,14 @@
 //! Authenticated loopback forwarding for coordinators over iroh.
 
-use std::{fmt, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    fmt, fs,
+    io::Write as _,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
+};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use constant_time_eq::constant_time_eq_32;
@@ -19,6 +27,10 @@ use tokio::{
 const ALPN: &[u8] = b"nanocodex-eval-coordinator/1";
 const TICKET_PREFIX: &str = "iroh-eval:";
 const TICKET_VERSION: u8 = 1;
+const IDENTITY_VERSION: u8 = 1;
+const IDENTITY_DIRECTORY: &str = "iroh";
+const IDENTITY_FILENAME: &str = "coordinator.json";
+const MAX_IDENTITY_BYTES: u64 = 4 * 1024;
 const MAX_TICKET_BYTES: usize = 16 * 1024;
 const TOKEN_BYTES: usize = 32;
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -28,10 +40,20 @@ const MAX_CONCURRENT_STREAMS: usize = 32;
 #[cfg(test)]
 pub(super) static TEST_ENDPOINT_PERMIT: Semaphore = Semaphore::const_new(1);
 
-/// One ephemeral capability for reaching a coordinator over iroh.
+/// Durable coordinator identity and shared join capability.
+///
+/// The private key and bearer token are persisted under the evaluation state
+/// directory. Treat that directory as coordinator authority.
+#[derive(Clone)]
+pub struct IrohCoordinatorIdentity {
+    secret_key: iroh::SecretKey,
+    token: [u8; TOKEN_BYTES],
+}
+
+/// One shared capability for reaching a coordinator over iroh.
 ///
 /// The ticket contains the coordinator's authenticated iroh address and a
-/// random bearer capability. Treat its string representation as a secret.
+/// shared bearer capability. Treat its string representation as a secret.
 #[derive(Clone)]
 pub struct IrohCoordinatorTicket {
     address: EndpointAddr,
@@ -66,6 +88,25 @@ pub enum IrohCoordinatorError {
     /// Creating or shutting down an iroh endpoint failed.
     #[error("iroh evaluation coordinator endpoint failed: {0}")]
     Endpoint(String),
+    /// Durable coordinator identity I/O failed.
+    #[error("failed to {operation} iroh coordinator identity at {}: {source}", path.display())]
+    IdentityIo {
+        /// Identity operation that failed.
+        operation: &'static str,
+        /// Durable identity path.
+        path: PathBuf,
+        /// Underlying filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The durable coordinator identity is malformed or unsupported.
+    #[error("invalid iroh coordinator identity at {}: {message}", path.display())]
+    InvalidIdentity {
+        /// Durable identity path.
+        path: PathBuf,
+        /// Bounded validation diagnostic.
+        message: String,
+    },
     /// An authenticated iroh stream could not be established or forwarded.
     #[error("iroh evaluation coordinator protocol failed: {0}")]
     Protocol(String),
@@ -81,11 +122,164 @@ struct WireTicket {
     token: [u8; TOKEN_BYTES],
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireIdentity {
+    version: u8,
+    secret_key: [u8; 32],
+    token: [u8; TOKEN_BYTES],
+}
+
 #[derive(Clone, Debug)]
 struct CoordinatorProtocol {
     origin: SocketAddr,
     token: [u8; TOKEN_BYTES],
     streams: Arc<Semaphore>,
+}
+
+impl IrohCoordinatorIdentity {
+    /// Loads or atomically creates the identity owned by one evaluation state directory.
+    pub fn load_or_create(state_directory: impl AsRef<Path>) -> Result<Self, IrohCoordinatorError> {
+        let directory = state_directory.as_ref().join(IDENTITY_DIRECTORY);
+        let path = directory.join(IDENTITY_FILENAME);
+        if let Some(identity) = Self::load(&path)? {
+            secure_identity_directory(&directory)?;
+            secure_identity_file(&path)?;
+            return Ok(identity);
+        }
+
+        fs::create_dir_all(&directory).map_err(|source| IrohCoordinatorError::IdentityIo {
+            operation: "create the identity directory",
+            path: directory.clone(),
+            source,
+        })?;
+        secure_identity_directory(&directory)?;
+
+        let identity = Self::generate()?;
+        let encoded = serde_json::to_vec(&WireIdentity {
+            version: IDENTITY_VERSION,
+            secret_key: identity.secret_key.to_bytes(),
+            token: identity.token,
+        })
+        .map_err(|error| IrohCoordinatorError::InvalidIdentity {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+        let mut staged = tempfile::NamedTempFile::new_in(&directory).map_err(|source| {
+            IrohCoordinatorError::IdentityIo {
+                operation: "stage the identity",
+                path: path.clone(),
+                source,
+            }
+        })?;
+        staged
+            .write_all(&encoded)
+            .and_then(|()| staged.as_file().sync_all())
+            .map_err(|source| IrohCoordinatorError::IdentityIo {
+                operation: "write the identity",
+                path: path.clone(),
+                source,
+            })?;
+        match staged.persist_noclobber(&path) {
+            Ok(file) => {
+                file.sync_all()
+                    .map_err(|source| IrohCoordinatorError::IdentityIo {
+                        operation: "persist the identity",
+                        path: path.clone(),
+                        source,
+                    })?;
+                secure_identity_file(&path)?;
+                sync_identity_directory(&directory)?;
+                Ok(identity)
+            }
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                drop(error.file);
+                Self::load(&path)?.ok_or_else(|| IrohCoordinatorError::InvalidIdentity {
+                    path,
+                    message: "identity disappeared during concurrent creation".to_owned(),
+                })
+            }
+            Err(error) => Err(IrohCoordinatorError::IdentityIo {
+                operation: "persist the identity",
+                path,
+                source: error.error,
+            }),
+        }
+    }
+
+    fn generate() -> Result<Self, IrohCoordinatorError> {
+        let mut secret_key = [0; 32];
+        let mut token = [0; TOKEN_BYTES];
+        getrandom::fill(&mut secret_key)
+            .and_then(|()| getrandom::fill(&mut token))
+            .map_err(|error| IrohCoordinatorError::Endpoint(error.to_string()))?;
+        Ok(Self {
+            secret_key: iroh::SecretKey::from_bytes(&secret_key),
+            token,
+        })
+    }
+
+    fn load(path: &Path) -> Result<Option<Self>, IrohCoordinatorError> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(IrohCoordinatorError::IdentityIo {
+                    operation: "inspect the identity",
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        };
+        if !metadata.file_type().is_file() {
+            return Err(IrohCoordinatorError::InvalidIdentity {
+                path: path.to_path_buf(),
+                message: "identity is not a regular file".to_owned(),
+            });
+        }
+        if metadata.len() > MAX_IDENTITY_BYTES {
+            return Err(IrohCoordinatorError::InvalidIdentity {
+                path: path.to_path_buf(),
+                message: "identity exceeds the maximum encoded size".to_owned(),
+            });
+        }
+        let encoded = fs::read(path).map_err(|source| IrohCoordinatorError::IdentityIo {
+            operation: "read the identity",
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let WireIdentity {
+            version,
+            secret_key,
+            token,
+        } = serde_json::from_slice(&encoded).map_err(|error| {
+            IrohCoordinatorError::InvalidIdentity {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            }
+        })?;
+        if version != IDENTITY_VERSION {
+            return Err(IrohCoordinatorError::InvalidIdentity {
+                path: path.to_path_buf(),
+                message: format!("unsupported identity version {version}"),
+            });
+        }
+        Ok(Some(Self {
+            secret_key: iroh::SecretKey::from_bytes(&secret_key),
+            token,
+        }))
+    }
+}
+
+impl fmt::Debug for IrohCoordinatorIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IrohCoordinatorIdentity")
+            .field("endpoint_id", &self.secret_key.public())
+            .field("secret_key", &"<redacted>")
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 impl IrohCoordinatorTicket {
@@ -157,35 +351,45 @@ impl FromStr for IrohCoordinatorTicket {
 }
 
 impl IrohCoordinatorServer {
-    /// Starts a public-relay-capable iroh endpoint for one loopback coordinator.
+    /// Starts a public-relay-capable iroh endpoint with a durable identity.
     ///
-    /// The returned ticket is ephemeral and becomes invalid when this server is
-    /// replaced. The origin is fixed for the server lifetime, so an authorized
-    /// peer cannot use the endpoint as a general-purpose proxy.
+    /// The returned ticket contains current routing hints for the persistent
+    /// endpoint identity and shared join capability. The origin is fixed for
+    /// the server lifetime, so an authorized peer cannot use the endpoint as a
+    /// general-purpose proxy.
     pub async fn bind(
         origin: SocketAddr,
+        identity: &IrohCoordinatorIdentity,
     ) -> Result<(Self, IrohCoordinatorTicket), IrohCoordinatorError> {
-        let endpoint = Endpoint::bind(presets::N0)
+        let endpoint = Endpoint::builder(presets::N0)
+            .secret_key(identity.secret_key.clone())
+            .bind()
             .await
             .map_err(|error| IrohCoordinatorError::Endpoint(error.to_string()))?;
-        Self::spawn(origin, endpoint, true).await
+        Self::spawn_with_token(origin, endpoint, true, identity.token).await
     }
 
+    #[cfg(test)]
     pub(super) async fn spawn(
         origin: SocketAddr,
         endpoint: Endpoint,
         wait_until_online: bool,
     ) -> Result<(Self, IrohCoordinatorTicket), IrohCoordinatorError> {
+        let identity = IrohCoordinatorIdentity::generate()?;
+        Self::spawn_with_token(origin, endpoint, wait_until_online, identity.token).await
+    }
+
+    async fn spawn_with_token(
+        origin: SocketAddr,
+        endpoint: Endpoint,
+        wait_until_online: bool,
+        token: [u8; TOKEN_BYTES],
+    ) -> Result<(Self, IrohCoordinatorTicket), IrohCoordinatorError> {
         require_loopback(origin)?;
         let protocol = CoordinatorProtocol {
             origin,
             streams: Arc::new(Semaphore::new(MAX_CONCURRENT_STREAMS)),
-            token: {
-                let mut token = [0; TOKEN_BYTES];
-                getrandom::fill(&mut token)
-                    .map_err(|error| IrohCoordinatorError::Endpoint(error.to_string()))?;
-                token
-            },
+            token,
         };
         let token = protocol.token;
         let router = Router::builder(endpoint).accept(ALPN, protocol).spawn();
@@ -369,10 +573,256 @@ const fn require_loopback(address: SocketAddr) -> Result<(), IrohCoordinatorErro
     }
 }
 
+fn secure_identity_directory(path: &Path) -> Result<(), IrohCoordinatorError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|source| {
+            IrohCoordinatorError::IdentityIo {
+                operation: "secure the identity directory",
+                path: path.to_path_buf(),
+                source,
+            }
+        })?;
+    }
+    Ok(())
+}
+
+fn secure_identity_file(path: &Path) -> Result<(), IrohCoordinatorError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|source| {
+            IrohCoordinatorError::IdentityIo {
+                operation: "secure the identity",
+                path: path.to_path_buf(),
+                source,
+            }
+        })?;
+    }
+    Ok(())
+}
+
+fn sync_identity_directory(path: &Path) -> Result<(), IrohCoordinatorError> {
+    #[cfg(unix)]
+    {
+        fs::File::open(path)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| IrohCoordinatorError::IdentityIo {
+                operation: "sync the identity directory",
+                path: path.to_path_buf(),
+                source,
+            })?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Barrier;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    #[test]
+    fn durable_identity_is_restart_stable_and_redacted() {
+        let state = tempfile::tempdir().unwrap();
+        let first = IrohCoordinatorIdentity::load_or_create(state.path()).unwrap();
+        let second = IrohCoordinatorIdentity::load_or_create(state.path()).unwrap();
+
+        assert_eq!(first.secret_key.to_bytes(), second.secret_key.to_bytes());
+        assert_eq!(first.secret_key.public(), second.secret_key.public());
+        assert_eq!(first.token, second.token);
+        let debug = format!("{first:?}");
+        assert!(debug.contains(&first.secret_key.public().to_string()));
+        assert!(!debug.contains(&hex::encode(first.secret_key.to_bytes())));
+        assert!(!debug.contains(&hex::encode(first.token)));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let directory = state.path().join(IDENTITY_DIRECTORY);
+            let path = directory.join(IDENTITY_FILENAME);
+            assert_eq!(
+                fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            IrohCoordinatorIdentity::load_or_create(state.path()).unwrap();
+            assert_eq!(
+                fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_identity_creation_converges_on_one_authority() {
+        const CREATORS: usize = 8;
+
+        let state = tempfile::tempdir().unwrap();
+        let state_path = Arc::new(state.path().to_path_buf());
+        let barrier = Arc::new(Barrier::new(CREATORS));
+        let creators = (0..CREATORS)
+            .map(|_| {
+                let state_path = state_path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    IrohCoordinatorIdentity::load_or_create(state_path.as_path()).unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let identities = creators
+            .into_iter()
+            .map(|creator| creator.join().unwrap())
+            .collect::<Vec<_>>();
+
+        for identity in &identities[1..] {
+            assert_eq!(
+                identity.secret_key.to_bytes(),
+                identities[0].secret_key.to_bytes()
+            );
+            assert_eq!(identity.token, identities[0].token);
+        }
+    }
+
+    #[test]
+    fn malformed_or_unsupported_identity_is_never_replaced() {
+        let state = tempfile::tempdir().unwrap();
+        let directory = state.path().join(IDENTITY_DIRECTORY);
+        let path = directory.join(IDENTITY_FILENAME);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(&path, b"not-json").unwrap();
+        assert!(matches!(
+            IrohCoordinatorIdentity::load_or_create(state.path()),
+            Err(IrohCoordinatorError::InvalidIdentity { .. })
+        ));
+        assert_eq!(fs::read(&path).unwrap(), b"not-json");
+
+        fs::write(
+            &path,
+            serde_json::to_vec(&WireIdentity {
+                version: IDENTITY_VERSION + 1,
+                secret_key: [7; 32],
+                token: [9; TOKEN_BYTES],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            IrohCoordinatorIdentity::load_or_create(state.path()),
+            Err(IrohCoordinatorError::InvalidIdentity { message, .. })
+                if message == format!("unsupported identity version {}", IDENTITY_VERSION + 1)
+        ));
+    }
+
+    #[test]
+    fn unsafe_identity_paths_are_rejected() {
+        let state = tempfile::tempdir().unwrap();
+        let directory = state.path().join(IDENTITY_DIRECTORY);
+        let path = directory.join(IDENTITY_FILENAME);
+        fs::create_dir_all(&path).unwrap();
+
+        assert!(matches!(
+            IrohCoordinatorIdentity::load_or_create(state.path()),
+            Err(IrohCoordinatorError::InvalidIdentity { message, .. })
+                if message == "identity is not a regular file"
+        ));
+
+        fs::remove_dir(&path).unwrap();
+        fs::write(&path, vec![0; MAX_IDENTITY_BYTES as usize + 1]).unwrap();
+        assert!(matches!(
+            IrohCoordinatorIdentity::load_or_create(state.path()),
+            Err(IrohCoordinatorError::InvalidIdentity { message, .. })
+                if message == "identity exceeds the maximum encoded size"
+        ));
+    }
+
+    #[tokio::test]
+    async fn restarted_endpoint_keeps_identity_token_and_connectivity() {
+        let _test_permit = TEST_ENDPOINT_PERMIT.acquire().await.unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let identity = IrohCoordinatorIdentity::load_or_create(state.path()).unwrap();
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_address = origin.local_addr().unwrap();
+
+        let first_endpoint = Endpoint::builder(presets::Minimal)
+            .secret_key(identity.secret_key.clone())
+            .relay_mode(iroh::RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let (first_server, first_ticket) = IrohCoordinatorServer::spawn_with_token(
+            origin_address,
+            first_endpoint,
+            false,
+            identity.token,
+        )
+        .await
+        .unwrap();
+        first_server.shutdown().await.unwrap();
+
+        let reloaded = IrohCoordinatorIdentity::load_or_create(state.path()).unwrap();
+        let second_endpoint = Endpoint::builder(presets::Minimal)
+            .secret_key(reloaded.secret_key.clone())
+            .relay_mode(iroh::RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let (second_server, second_ticket) = IrohCoordinatorServer::spawn_with_token(
+            origin_address,
+            second_endpoint,
+            false,
+            reloaded.token,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first_ticket.address.id, second_ticket.address.id);
+        assert_eq!(first_ticket.token, second_ticket.token);
+
+        let origin_task = tokio::spawn(async move {
+            let (mut stream, _) = origin.accept().await.unwrap();
+            let mut request = [0; 4];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"ping");
+            stream.write_all(b"pong").await.unwrap();
+        });
+        let client = Endpoint::builder(presets::Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let connection = client
+            .connect(second_ticket.address.clone(), ALPN)
+            .await
+            .unwrap();
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        send.write_all(&second_ticket.token).await.unwrap();
+        send.write_all(b"ping").await.unwrap();
+        send.finish().unwrap();
+        assert_eq!(recv.read_to_end(4).await.unwrap(), b"pong");
+        origin_task.await.unwrap();
+        client.close().await;
+        second_server.shutdown().await.unwrap();
+    }
 
     #[test]
     fn tickets_round_trip_without_exposing_the_capability_in_debug() {

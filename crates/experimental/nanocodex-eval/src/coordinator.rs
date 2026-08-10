@@ -3,7 +3,8 @@
 mod iroh;
 
 pub use iroh::{
-    IrohCoordinatorConnector, IrohCoordinatorError, IrohCoordinatorServer, IrohCoordinatorTicket,
+    IrohCoordinatorConnector, IrohCoordinatorError, IrohCoordinatorIdentity, IrohCoordinatorServer,
+    IrohCoordinatorTicket,
 };
 
 use std::{
