@@ -122,6 +122,74 @@ maps QGS to guest vsock port 4050. The guest kernel and libkrun must still
 provide the quote-generation ABI; a raw TDREPORT is not presented as a
 remotely verifiable quote.
 
+An SNP relying party can now appraise a retained response entirely offline:
+
+```console
+just verify-snp-attestation attestation.json "$EXPECTED_SNP_MEASUREMENT_HEX"
+```
+
+[`host::SnpVerifier`] uses pure Rust cryptography and pinned AMD Milan, Genoa,
+and Turin roots. It validates the certificate/report signature path, VCEK
+hardware identity and TCB extensions, certificate validity at caller-supplied
+trusted time, transcript binding, VMPL, debug/migration/SMT policy, exact
+launch measurement, and component-wise minimum TCB. The command requires a
+fresh signed CRL by default. `--allow-missing-crl` exists only as an explicit
+offline availability policy; any CRL which is present is still verified.
+
+TDX and Nitro responses have equivalent offline appraisal entry points:
+
+```console
+just verify-tdx-attestation attestation.json collateral.json \
+  "$MRTD_HEX" "$RTMR0_HEX" "$RTMR1_HEX" "$RTMR2_HEX" "$RTMR3_HEX"
+just verify-nitro-attestation attestation.json aws-root.der \
+  "0=$EXPECTED_PCR0_SHA384_HEX"
+```
+
+[`host::TdxVerifier`] validates the TDX quote with a pure-Rust DCAP QVL,
+caller-retained PCS collateral, strict current-status policy, Intel's production
+root (or a caller-pinned replacement), exact MRTD and all four RTMR values, and
+the transcript-bound REPORTDATA. Optional policy pins cover MRCONFIGID,
+MROWNER, MROWNERCONFIG, and XFAM. The collateral is an appraisal input and must
+be obtained and retained by the relying party; quote collection never silently
+fetches trust material.
+
+[`host::NitroVerifier`] requires a caller-pinned AWS root in DER form and at
+least one exact SHA-384 PCR. It validates the unique X.509 path and path-length
+constraints, certificate validity, COSE Sign1 ES384 signature, freshness,
+nonce, guest public key, transcript user data, PCR policy, and optional module
+identity. Use the expanded Cargo example to repeat `--pcr`, require
+`--exact-pcr-set`, or adjust the default five-minute freshness window.
+
+[`host::CpuVerifierSet`] dispatches a heterogeneous fleet to these exact SNP,
+TDX, and Nitro backends without allowing one evidence format to fall through to
+another verifier.
+
+### B200 assignment status
+
+The 1x and 8x B200 host assignment descriptors are fail-closed. Linux
+resolution requires the exact `10de:2901` GPU identities, `vfio-pci` ownership,
+complete IOMMU groups, and no ambient group siblings. The 8x descriptor also
+requires four functions `.0` through `.3` of one CX-7 bridge slot and a
+caller-pinned SHA-256 digest of each function's production VPD. This prevents a
+same-device-ID ConnectX NIC from being mistaken for the NVLink management
+bridge.
+
+Two gates remain intentionally unavailable in the current libkrun artifact:
+
+- pinned and current upstream libkrun expose no VFIO/IOMMUFD PCI assignment API,
+  so `host::ResolvedConfidentialDeviceBundle` cannot yet be handed to the VMM;
+- NVIDIA's signed GPU/NVSwitch claims establish device identity, firmware
+  measurements, secure boot, debug policy, and nonce freshness, but do not sign
+  the complete administrative NVLink state. Host `nvidia-smi`/Fabric Manager
+  output is useful launch diagnostics, not remote proof of disabled 1x links or
+  encrypted 8x MPT links.
+
+Consequently, `host::NvidiaNvattestVerifier` verifies real retained native
+device evidence but returns no fabric claim, and composite verification refuses
+to issue a B200 [`host::VerifiedAttestation`]. This is the safe handoff point for
+libkrun VFIO work and a future NVIDIA-signed fabric-state claim; neither state is
+inferred from device counts or unsigned host output.
+
 ## Use VM-backed workspace tools
 
 Build the static Linux companion with `just build-vm-guest`, prepare one

@@ -18,6 +18,8 @@ default = ["host"]
 host = [
     "dep:arcbox-ext4",
     "dep:async-trait",
+    "dep:aws-nitro-enclaves-nsm-api",
+    "dep:dcap-qvl",
     "dep:flate2",
     "dep:fs2",
     "dep:futures-util",
@@ -25,16 +27,22 @@ host = [
     "dep:krun",
     "dep:nix",
     "dep:oci-client",
+    "dep:p384",
     "dep:reflink-copy",
+    "dep:sev",
+    "dep:serde_cbor",
     "dep:shlex",
     "dep:tar",
     "dep:tempfile",
     "dep:tracing",
+    "dep:uuid",
+    "dep:x509-parser",
     "dep:zstd",
     "nanocodex-tools/native",
 ]
 guest-runtime = [
     "dep:aws-nitro-enclaves-nsm-api",
+    "aws-nitro-enclaves-nsm-api/nix",
     "dep:nix",
     "nanocodex-tools/workspace-runtime",
 ]
@@ -52,13 +60,13 @@ hex.workspace = true
 nanocodex-tools = { path = "../../nanocodex-tools", version = "0.3.0", default-features = false }
 nix = { workspace = true, optional = true, features = ["fs", "mount"] }
 serde.workspace = true
+serde_cbor = { workspace = true, optional = true }
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "process", "rt", "rt-multi-thread", "sync", "time"] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-aws-nitro-enclaves-nsm-api = { version = "0.5.2", optional = true }
+aws-nitro-enclaves-nsm-api = { version = "0.5.2", optional = true, default-features = false }
 
 [target.'cfg(any(all(target_os = "linux", not(target_env = "musl")), all(target_os = "macos", target_arch = "aarch64")))'.dependencies]
 arcbox-ext4 = { workspace = true, optional = true }
@@ -69,11 +77,16 @@ futures-util = { workspace = true, optional = true }
 ignore = { workspace = true, optional = true }
 krun = { workspace = true, optional = true }
 oci-client = { workspace = true, optional = true }
+p384 = { workspace = true, optional = true }
+dcap-qvl = { workspace = true, optional = true }
 reflink-copy = { workspace = true, optional = true }
+sev = { workspace = true, optional = true }
 shlex = { workspace = true, optional = true }
 tar = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+x509-parser = { workspace = true, optional = true }
 zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
@@ -96,6 +109,18 @@ required-features = ["host"]
 
 [[example]]
 name = "confidential_attestation"
+required-features = ["host"]
+
+[[example]]
+name = "verify_snp_attestation"
+required-features = ["host"]
+
+[[example]]
+name = "verify_tdx_attestation"
+required-features = ["host"]
+
+[[example]]
+name = "verify_nitro_attestation"
 required-features = ["host"]
 
 [[bench]]

@@ -238,11 +238,12 @@ specified in
 The eight-GPU target is Blackwell MPT CC; Hopper PPCIe does not satisfy its
 encrypted-NVLink requirement.
 
-As of August 2026, NVIDIA's own Blackwell multi-GPU attestation documentation
-says MPT support is waiting for driver support and does not yet attest topology
-or switches. The 8-GPU code path therefore remains deliberately impossible to
-approve until NVIDIA supplies those claims; counts or a successful NCCL run do
-not weaken that gate.
+As of August 2026, NVIDIA R595 supports Blackwell MPT CC on HGX B200 and
+documents encrypted peer-to-peer NVLink inside one CVM. Current signed GPU and
+NVSwitch claim schemas still do not attest the complete encrypted fabric
+state. The 8-GPU code path therefore remains deliberately impossible to
+approve until NVIDIA supplies that claim; counts, host diagnostics, or a
+successful NCCL run do not weaken that gate.
 
 ### AMD trusted I/O and other confidential devices
 
@@ -382,7 +383,7 @@ VMM exactly once.
 - [ ] Complete the SNP libkrun upstream fixes and dedicated artifact.
 - [x] Implement strict SNP host detection and configuration validation.
 - [ ] Launch the measured guest on real SNP hardware and collect fresh reports.
-- [ ] Verify the complete AMD chain and policy locally from retained inputs.
+- [x] Verify the complete AMD chain and policy locally from retained inputs.
 - [ ] Bind an ephemeral guest key and dm-verity root to `REPORT_DATA` and the
   accepted launch measurement.
 - [ ] Add live tamper tests for nonce replay, debug/migration policy, firmware,
@@ -398,7 +399,7 @@ to demonstrate the contract.
 ### Slice 3: live TDX vertical
 
 - [ ] Complete the TDX libkrun, firmware, and quote-generation path.
-- [ ] Implement DCAP collateral resolution with explicit offline/online policy.
+- [x] Implement offline DCAP appraisal with caller-retained collateral.
 - [x] Bind the same protocol transcript into TDX report data.
 - [ ] Define and test MRTD/RTMR ownership and authenticated-root measurement.
 - [ ] Port the SNP lifecycle and tamper suite without erasing TDX-specific
@@ -412,7 +413,7 @@ evidence, appraisal, policy, and limitations remain backend-specific.
 
 - [ ] Complete the libkrun Nitro upstream repairs and artifact build.
 - [ ] Build a reproducible EIF containing the measured attester.
-- [ ] Verify fresh Nitro documents and exact PCR policy through a concrete
+- [x] Verify fresh Nitro documents and exact PCR policy through a concrete
   native verifier (collection through NSM is implemented).
 - [x] Bind the session key using Nitro's native public-key and user-data fields.
 - [ ] Port cancellation, failure, evidence retention, and tamper tests.
@@ -427,7 +428,8 @@ without adding a generic-cloud or scheduler abstraction.
 - [ ] Land the minimum audited libkrun device-assignment and protected-memory
   changes.
 - [x] Add exact one-B200 and eight-B200/four-CX-7 host bundles with canonical
-  PCI identity, `vfio-pci`, IOMMU-group, and complete-sibling validation.
+  PCI identity, pinned CX-7 VPD, `vfio-pci`, IOMMU-group, and complete-sibling
+  validation.
 - [ ] Prove the protected CVM-to-GPU channel (exact-count native GPU evidence
   collection is implemented).
 - [ ] Verify device certificates, RIMs, revocation, nonce, debug state, CC mode,

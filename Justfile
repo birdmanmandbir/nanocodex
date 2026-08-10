@@ -163,6 +163,24 @@ attest-example:
     cargo run --locked --quiet -p nanocodex-vm --bin nanocodex-vm-guest \
       --no-default-features --features guest-runtime -- --attest-example
 
+# Verify a collected SNP JSON response offline. Fresh CRL evidence is required
+# unless the caller explicitly adds --allow-missing-crl to the Cargo example.
+verify-snp-attestation input measurement:
+    cargo run --locked --quiet -p nanocodex-vm --example verify_snp_attestation -- \
+      --input "{{input}}" --measurement "{{measurement}}"
+
+# Verify a collected TDX JSON response with retained Intel DCAP collateral.
+verify-tdx-attestation input collateral mrtd rtmr0 rtmr1 rtmr2 rtmr3:
+    cargo run --locked --quiet -p nanocodex-vm --example verify_tdx_attestation -- \
+      --input "{{input}}" --collateral "{{collateral}}" --mrtd "{{mrtd}}" \
+      --rtmr0 "{{rtmr0}}" --rtmr1 "{{rtmr1}}" --rtmr2 "{{rtmr2}}" --rtmr3 "{{rtmr3}}"
+
+# Verify a collected Nitro JSON response against one pinned AWS root and PCR.
+# Repeat --pcr through the expanded Cargo command when policy pins more PCRs.
+verify-nitro-attestation input aws_root pcr:
+    cargo run --locked --quiet -p nanocodex-vm --example verify_nitro_attestation -- \
+      --input "{{input}}" --aws-root "{{aws_root}}" --pcr "{{pcr}}"
+
 # Build, launch, and collect one fresh SNP attestation through libkrun.
 attest-libkrun-snp: build-vm-guest build-vm-host-amd-sev
     @test "$(uname -m)" = x86_64 || { echo "SEV-SNP requires x86_64" >&2; exit 2; }

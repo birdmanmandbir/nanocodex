@@ -100,6 +100,14 @@ pub mod image;
     )
 ))]
 mod krun;
+#[cfg(all(
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
+mod nitro_verification;
 #[cfg(all(feature = "host", target_os = "linux", not(target_env = "musl")))]
 mod nvidia_verification;
 #[cfg(any(
@@ -121,6 +129,22 @@ mod overlay;
     )
 ))]
 mod process;
+#[cfg(all(
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
+mod snp_verification;
+#[cfg(all(
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
+mod tdx_verification;
 #[cfg(any(
     feature = "guest-runtime",
     all(
@@ -167,8 +191,13 @@ pub mod host {
         ConfidentialDeviceBundle, ConfidentialPciDevice, ConfidentialPciRole, DeviceBundleError,
         PciAddress, ResolvedConfidentialDeviceBundle,
     };
+    pub use crate::nitro_verification::{NitroVerificationPolicy, NitroVerifier};
     #[cfg(all(target_os = "linux", not(target_env = "musl")))]
     pub use crate::nvidia_verification::NvidiaNvattestVerifier;
+    pub use crate::snp_verification::{
+        SnpRevocationPolicy, SnpTcbVersion, SnpVerificationPolicy, SnpVerifier,
+    };
+    pub use crate::tdx_verification::{TdxVerificationPolicy, TdxVerifier};
 
     pub use crate::{
         attestation::{
@@ -193,9 +222,10 @@ pub mod host {
         overlay::{OverlayDiskError, create_sparse_overlay_disk, overlay_guest_command},
         process::{PrivateVmProcessConfig, VmProcessConfig, VmProcessError},
         verification::{
-            AttestationVerificationError, NativeEvidenceVerifier, NativeVerificationContext,
-            NativeVerificationError, NativeVerifierSet, VerifiedAttestation, VerifiedNativeBinding,
-            VerifiedNativeEvidence, VerifiedNvidiaFabric, verify_attestation,
+            AttestationVerificationError, CpuVerifierSet, NativeEvidenceVerifier,
+            NativeVerificationContext, NativeVerificationError, NativeVerifierSet,
+            VerifiedAttestation, VerifiedNativeBinding, VerifiedNativeEvidence,
+            VerifiedNvidiaFabric, verify_attestation,
         },
     };
 }

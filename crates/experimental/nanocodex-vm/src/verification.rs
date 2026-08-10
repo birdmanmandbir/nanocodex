@@ -140,6 +140,7 @@ impl VerifiedNativeEvidence {
 pub struct NativeVerificationContext<'a> {
     binding: &'a AttestationBinding,
     transcript_digest: [u8; 32],
+    now_unix_seconds: u64,
 }
 
 impl<'a> NativeVerificationContext<'a> {
@@ -159,6 +160,12 @@ impl<'a> NativeVerificationContext<'a> {
     #[must_use]
     pub const fn transcript_digest(&self) -> &[u8; 32] {
         &self.transcript_digest
+    }
+
+    /// Returns the relying party's trusted appraisal time as Unix seconds.
+    #[must_use]
+    pub const fn now_unix_seconds(&self) -> u64 {
+        self.now_unix_seconds
     }
 }
 
@@ -193,6 +200,44 @@ pub trait NativeEvidenceVerifier: Send + Sync {
         evidence: &RawEvidence,
         context: NativeVerificationContext<'_>,
     ) -> Result<VerifiedNativeEvidence, NativeVerificationError>;
+}
+
+/// Dispatches heterogeneous CPU evidence to exact architecture backends.
+pub struct CpuVerifierSet<S, T, A> {
+    snp: S,
+    tdx: T,
+    nitro: A,
+}
+
+impl<S, T, A> CpuVerifierSet<S, T, A> {
+    /// Creates the complete CPU verifier dispatch table.
+    #[must_use]
+    pub const fn new(snp: S, tdx: T, nitro: A) -> Self {
+        Self { snp, tdx, nitro }
+    }
+}
+
+#[async_trait]
+impl<S, T, A> NativeEvidenceVerifier for CpuVerifierSet<S, T, A>
+where
+    S: NativeEvidenceVerifier,
+    T: NativeEvidenceVerifier,
+    A: NativeEvidenceVerifier,
+{
+    async fn verify(
+        &self,
+        evidence: &RawEvidence,
+        context: NativeVerificationContext<'_>,
+    ) -> Result<VerifiedNativeEvidence, NativeVerificationError> {
+        match evidence.profile() {
+            EvidenceProfile::AmdSevSnp => self.snp.verify(evidence, context).await,
+            EvidenceProfile::IntelTdx => self.tdx.verify(evidence, context).await,
+            EvidenceProfile::AwsNitro => self.nitro.verify(evidence, context).await,
+            EvidenceProfile::NvidiaGpu | EvidenceProfile::NvidiaNvSwitch => Err(
+                NativeVerificationError::new("CPU verifier received NVIDIA evidence"),
+            ),
+        }
+    }
 }
 
 /// Dispatches CPU and NVIDIA evidence to independently reviewed backends.
@@ -374,6 +419,7 @@ where
     let context = NativeVerificationContext {
         binding: &binding,
         transcript_digest,
+        now_unix_seconds,
     };
     let mut claims = Vec::with_capacity(evidence.len());
     let mut device_identities = BTreeSet::new();

@@ -1,11 +1,13 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, fs,
+    io::Read as _,
     path::{Path, PathBuf},
     str::FromStr,
 };
 
 use serde::{Deserialize, Deserializer, Serialize};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::confidential::ConfidentialNvidiaProfile;
@@ -14,6 +16,7 @@ const PCI_SYSFS_ROOT: &str = "/sys/bus/pci/devices";
 const NVIDIA_VENDOR_ID: u16 = 0x10de;
 const NVIDIA_B200_DEVICE_ID: u16 = 0x2901;
 const MELLANOX_VENDOR_ID: u16 = 0x15b3;
+const MAX_PCI_VPD_BYTES: usize = 64 * 1024;
 
 /// Canonical PCI domain, bus, slot, and function address.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -80,6 +83,7 @@ pub struct ConfidentialPciDevice {
     role: ConfidentialPciRole,
     vendor_id: u16,
     device_id: u16,
+    expected_vpd_sha256: Option<[u8; 32]>,
 }
 
 impl ConfidentialPciDevice {
@@ -91,6 +95,7 @@ impl ConfidentialPciDevice {
             role: ConfidentialPciRole::NvidiaB200Gpu,
             vendor_id: NVIDIA_VENDOR_ID,
             device_id: NVIDIA_B200_DEVICE_ID,
+            expected_vpd_sha256: None,
         }
     }
 
@@ -100,12 +105,17 @@ impl ConfidentialPciDevice {
     /// different CX-7 functions. Live admission must additionally validate
     /// the platform VPD against an operator-owned reference value.
     #[must_use]
-    pub const fn cx7_fabric_bridge(address: PciAddress, device_id: u16) -> Self {
+    pub const fn cx7_fabric_bridge(
+        address: PciAddress,
+        device_id: u16,
+        expected_vpd_sha256: [u8; 32],
+    ) -> Self {
         Self {
             address,
             role: ConfidentialPciRole::NvidiaCx7FabricBridge,
             vendor_id: MELLANOX_VENDOR_ID,
             device_id,
+            expected_vpd_sha256: Some(expected_vpd_sha256),
         }
     }
 
@@ -131,6 +141,12 @@ impl ConfidentialPciDevice {
     #[must_use]
     pub const fn device_id(&self) -> u16 {
         self.device_id
+    }
+
+    /// Returns the operator-pinned VPD digest required for a CX-7 bridge PF.
+    #[must_use]
+    pub const fn expected_vpd_sha256(&self) -> Option<&[u8; 32]> {
+        self.expected_vpd_sha256.as_ref()
     }
 }
 
@@ -159,13 +175,13 @@ impl ConfidentialDeviceBundle {
     /// Returns an error when any PCI address is repeated.
     pub fn b200_hgx_8(
         gpus: [PciAddress; 8],
-        cx7_bridges: [(PciAddress, u16); 4],
+        cx7_bridges: [(PciAddress, u16, [u8; 32]); 4],
     ) -> Result<Self, DeviceBundleError> {
         let devices = gpus
             .into_iter()
             .map(ConfidentialPciDevice::b200)
-            .chain(cx7_bridges.into_iter().map(|(address, device_id)| {
-                ConfidentialPciDevice::cx7_fabric_bridge(address, device_id)
+            .chain(cx7_bridges.into_iter().map(|(address, device_id, vpd)| {
+                ConfidentialPciDevice::cx7_fabric_bridge(address, device_id, vpd)
             }))
             .collect::<Vec<_>>();
         reject_duplicate_addresses(&devices)?;
@@ -190,9 +206,10 @@ impl ConfidentialDeviceBundle {
     /// Resolves and validates this bundle against Linux PCI sysfs.
     ///
     /// Validation requires exact vendor/device identities, `vfio-pci`
-    /// ownership, an IOMMU group for every function, and no unlisted sibling
-    /// in any selected group. It does not validate CX-7 VPD, GPU CC mode,
-    /// reset ownership, or NVLink state; those remain separate launch gates.
+    /// ownership, an exact operator-pinned CX-7 VPD digest, an IOMMU group for
+    /// every function, and no unlisted sibling in any selected group. It does
+    /// not validate GPU CC mode, reset ownership, or NVLink state; those remain
+    /// separate launch gates.
     ///
     /// # Errors
     ///
@@ -226,6 +243,16 @@ impl ConfidentialDeviceBundle {
                     actual_vendor,
                     actual_device,
                 });
+            }
+            if let Some(expected) = device.expected_vpd_sha256 {
+                let actual = read_vpd_digest(&root.join("vpd"))?;
+                if actual != expected {
+                    return Err(DeviceBundleError::VpdMismatch {
+                        address: device.address.clone(),
+                        expected,
+                        actual,
+                    });
+                }
             }
             let driver =
                 fs::read_link(root.join("driver")).map_err(|source| DeviceBundleError::Sysfs {
@@ -334,6 +361,20 @@ pub enum DeviceBundleError {
         /// Observed device ID.
         actual_device: u16,
     },
+    /// A CX-7 PF did not match its operator-reviewed production VPD.
+    #[error(
+        "PCI function {address} VPD SHA-256 was {actual}; expected {expected}",
+        actual = hex::encode(.actual),
+        expected = hex::encode(.expected)
+    )]
+    VpdMismatch {
+        /// Selected bridge PF.
+        address: PciAddress,
+        /// Pinned VPD digest.
+        expected: [u8; 32],
+        /// Observed VPD digest.
+        actual: [u8; 32],
+    },
     /// A selected function was not owned by `vfio-pci`.
     #[error("PCI function {address} is bound to {driver:?}, not vfio-pci")]
     NotBoundToVfio {
@@ -398,6 +439,26 @@ fn validate_shape(
     if (gpu_count, bridge_count) != expected || devices.len() != gpu_count + bridge_count {
         return Err(DeviceBundleError::TopologyMismatch);
     }
+    if profile == ConfidentialNvidiaProfile::B200Hgx8EncryptedNvlink {
+        let bridges = devices
+            .iter()
+            .filter(|device| device.role == ConfidentialPciRole::NvidiaCx7FabricBridge)
+            .collect::<Vec<_>>();
+        let Some(slot) = bridges.first().map(|device| &device.address.as_str()[..11]) else {
+            return Err(DeviceBundleError::TopologyMismatch);
+        };
+        let functions = bridges
+            .iter()
+            .map(|device| device.address.as_str().as_bytes()[11])
+            .collect::<BTreeSet<_>>();
+        if bridges
+            .iter()
+            .any(|device| &device.address.as_str()[..11] != slot)
+            || functions != BTreeSet::from(*b"0123")
+        {
+            return Err(DeviceBundleError::TopologyMismatch);
+        }
+    }
     Ok(())
 }
 
@@ -424,6 +485,31 @@ fn read_hex_u16(path: &Path) -> Result<u16, DeviceBundleError> {
             source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
         }
     })
+}
+
+fn read_vpd_digest(path: &Path) -> Result<[u8; 32], DeviceBundleError> {
+    let mut value = Vec::new();
+    fs::File::open(path)
+        .map_err(|source| DeviceBundleError::Sysfs {
+            path: path.to_owned(),
+            source,
+        })?
+        .take((MAX_PCI_VPD_BYTES + 1) as u64)
+        .read_to_end(&mut value)
+        .map_err(|source| DeviceBundleError::Sysfs {
+            path: path.to_owned(),
+            source,
+        })?;
+    if value.is_empty() || value.len() > MAX_PCI_VPD_BYTES {
+        return Err(DeviceBundleError::Sysfs {
+            path: path.to_owned(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "PCI VPD is empty or exceeds 64 KiB",
+            ),
+        });
+    }
+    Ok(Sha256::digest(value).into())
 }
 
 fn read_group_devices(group_path: &Path) -> Result<Vec<PciAddress>, DeviceBundleError> {
@@ -483,8 +569,13 @@ mod tests {
                 address(&format!("0000:{:02x}:00.0", 0x1b + index))
             }
         });
-        let bridges =
-            std::array::from_fn(|index| (address(&format!("0000:05:00.{index}")), 0x1021));
+        let bridges = std::array::from_fn(|index| {
+            (
+                address(&format!("0000:05:00.{index}")),
+                0x1021,
+                [u8::try_from(index).unwrap(); 32],
+            )
+        });
 
         assert!(matches!(
             ConfidentialDeviceBundle::b200_hgx_8(gpus, bridges),
@@ -532,6 +623,21 @@ mod tests {
                 sibling: actual,
                 ..
             }) if actual == sibling
+        ));
+    }
+
+    #[test]
+    fn vpd_digest_is_exact_and_nonempty() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("vpd");
+        fs::write(&path, b"reviewed production VPD").unwrap();
+        let expected: [u8; 32] = Sha256::digest(b"reviewed production VPD").into();
+
+        assert_eq!(read_vpd_digest(&path).unwrap(), expected);
+        fs::write(&path, b"").unwrap();
+        assert!(matches!(
+            read_vpd_digest(&path),
+            Err(DeviceBundleError::Sysfs { .. })
         ));
     }
 }

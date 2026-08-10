@@ -10,6 +10,12 @@ ignore = [
     "RUSTSEC-2025-0141",
     # Transitive through Ratatex's font stack; this is an unmaintained warning with no safe upgrade.
     "RUSTSEC-2026-0192",
+    # Transitive through sev and dcap-qvl. The advisory affects RSA private-key
+    # operations; nanocodex-vm only performs public signature verification.
+    "RUSTSEC-2023-0071",
+    # Required transitively by AWS's official NSM API and directly for its
+    # COSE document format; this is an unmaintained warning with no safe upgrade.
+    "RUSTSEC-2021-0127",
 ]
 
 [bans]
