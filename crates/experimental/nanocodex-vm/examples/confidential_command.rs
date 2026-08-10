@@ -14,6 +14,7 @@ use nanocodex_vm::{
     tools::{GuestRuntimeDisk, VmToolSession},
 };
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 use tokio::process::Command;
 
 #[derive(Clone, Copy)]
@@ -45,6 +46,7 @@ struct Output {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = Options::parse()?;
+    let executable_digest: [u8; 32] = Sha256::digest(std::fs::read(&options.guest)?).into();
     let runtime = GuestRuntimeDisk::prepare(&options.guest, &options.cache)?;
     let runtime_digest = decode_digest(runtime.digest())?;
     let (vm_profile, cpu_profile) = match options.cpu {
@@ -100,7 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proof = tokio::time::timeout(Duration::from_secs(180), session.prove_command(request))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "command proof exceeded 180s"))??;
-    let expected = CommandProofExpectation::new(challenge, runtime_digest, runtime_digest, argv);
+    let expected = CommandProofExpectation::new(challenge, runtime_digest, executable_digest, argv);
     let collected = verify_collected_command_proof(&proof, &expected)?;
     if collected.stdout() != format!("{}\n", options.message).as_bytes() {
         return Err(io::Error::other("authenticated command output was unexpected").into());
@@ -112,7 +114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             schema_version: 1,
             status: "command_proof_collected",
             warning: "the receipt is internally consistent but is trusted only after vendor-native evidence and measurement policy verification",
-            expected_executable_sha256: hex::encode(runtime_digest),
+            expected_executable_sha256: hex::encode(executable_digest),
             proof,
         })?
     );
