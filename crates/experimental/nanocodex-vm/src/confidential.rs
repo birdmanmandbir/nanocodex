@@ -1,7 +1,6 @@
 use std::{
     fmt,
     fs::{self, OpenOptions},
-    num::NonZeroU16,
     path::Path,
 };
 
@@ -32,13 +31,51 @@ impl fmt::Display for CpuTee {
     }
 }
 
+/// Exact NVIDIA confidential-computing topology assigned to one VM.
+///
+/// Named profiles prevent an arbitrary device count from being mistaken for a
+/// reviewed and attested topology.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfidentialNvidiaProfile {
+    /// One B200 with every NVLink disabled and no NVSwitch components.
+    B200Single,
+    /// One complete eight-B200 HGX fabric using encrypted Blackwell MPT NVLink.
+    B200Hgx8EncryptedNvlink,
+}
+
+impl ConfidentialNvidiaProfile {
+    /// Returns the exact number of required B200 GPU functions.
+    #[must_use]
+    pub const fn gpu_count(self) -> u16 {
+        match self {
+            Self::B200Single => 1,
+            Self::B200Hgx8EncryptedNvlink => 8,
+        }
+    }
+
+    /// Returns the exact number of required NVSwitch components.
+    #[must_use]
+    pub const fn nv_switch_count(self) -> u16 {
+        match self {
+            Self::B200Single => 0,
+            Self::B200Hgx8EncryptedNvlink => 2,
+        }
+    }
+
+    /// Returns whether the profile requires encrypted peer-to-peer NVLink.
+    #[must_use]
+    pub const fn requires_encrypted_nvlink(self) -> bool {
+        matches!(self, Self::B200Hgx8EncryptedNvlink)
+    }
+}
+
 /// Exact confidential-computing requirements selected by the caller.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfidentialVmProfile {
     cpu_tee: CpuTee,
-    nvidia_gpus: u16,
-    nvidia_nv_switches: u16,
+    nvidia: Option<ConfidentialNvidiaProfile>,
 }
 
 impl ConfidentialVmProfile {
@@ -63,22 +100,21 @@ impl ConfidentialVmProfile {
     const fn new(cpu_tee: CpuTee) -> Self {
         Self {
             cpu_tee,
-            nvidia_gpus: 0,
-            nvidia_nv_switches: 0,
+            nvidia: None,
         }
     }
 
-    /// Requires exactly `count` confidential NVIDIA GPUs.
+    /// Requires exactly one B200 with every NVLink disabled.
     #[must_use]
-    pub const fn nvidia_gpus(mut self, count: NonZeroU16) -> Self {
-        self.nvidia_gpus = count.get();
+    pub const fn nvidia_b200_single(mut self) -> Self {
+        self.nvidia = Some(ConfidentialNvidiaProfile::B200Single);
         self
     }
 
-    /// Requires exactly `count` confidential NVIDIA NVSwitch components.
+    /// Requires one complete eight-B200 HGX fabric with encrypted MPT NVLink.
     #[must_use]
-    pub const fn nvidia_nv_switches(mut self, count: NonZeroU16) -> Self {
-        self.nvidia_nv_switches = count.get();
+    pub const fn nvidia_b200_hgx_8_encrypted_nvlink(mut self) -> Self {
+        self.nvidia = Some(ConfidentialNvidiaProfile::B200Hgx8EncryptedNvlink);
         self
     }
 
@@ -88,16 +124,28 @@ impl ConfidentialVmProfile {
         self.cpu_tee
     }
 
+    /// Returns the exact NVIDIA topology, when one is required.
+    #[must_use]
+    pub const fn nvidia_profile(&self) -> Option<ConfidentialNvidiaProfile> {
+        self.nvidia
+    }
+
     /// Returns the exact number of required confidential NVIDIA GPUs.
     #[must_use]
     pub const fn nvidia_gpu_count(&self) -> u16 {
-        self.nvidia_gpus
+        match self.nvidia {
+            Some(profile) => profile.gpu_count(),
+            None => 0,
+        }
     }
 
     /// Returns the exact number of required confidential NVIDIA switches.
     #[must_use]
     pub const fn nvidia_nv_switch_count(&self) -> u16 {
-        self.nvidia_nv_switches
+        match self.nvidia {
+            Some(profile) => profile.nv_switch_count(),
+            None => 0,
+        }
     }
 }
 
@@ -131,10 +179,20 @@ pub enum ConfidentialCapability {
     AwsNitroDevice,
     /// Nanocodex has a measured guest attester for the selected backend.
     MeasuredGuestAttester,
-    /// libkrun can assign and attest confidential NVIDIA GPUs.
-    ConfidentialNvidiaGpuAssignment,
-    /// libkrun can assign and attest confidential NVIDIA NVSwitch topology.
-    ConfidentialNvidiaNvSwitchAssignment,
+    /// libkrun can assign the reviewed device bundle through VFIO/IOMMUFD.
+    LibkrunConfidentialVfioAssignment,
+    /// Every selected B200 is configured in confidential-computing mode.
+    NvidiaB200CcMode,
+    /// The guest attester and verifier support native NVIDIA GPU evidence.
+    NvidiaGpuAttestation,
+    /// The single-GPU profile has every NVLink disabled.
+    NvidiaNvlinkDisabled,
+    /// The guest attester and verifier support native NVSwitch evidence.
+    NvidiaNvSwitchAttestation,
+    /// The assigned devices match the reviewed complete HGX B200 topology.
+    NvidiaB200Hgx8Topology,
+    /// The complete HGX B200 fabric is using encrypted Blackwell MPT NVLink.
+    NvidiaEncryptedNvlink,
 }
 
 impl fmt::Display for ConfidentialCapability {
@@ -153,12 +211,15 @@ impl fmt::Display for ConfidentialCapability {
             Self::IntelTdxKvm => "TDX-enabled KVM Intel module",
             Self::AwsNitroDevice => "read-write /dev/nitro_enclaves",
             Self::MeasuredGuestAttester => "measured guest attester",
-            Self::ConfidentialNvidiaGpuAssignment => {
-                "confidential NVIDIA GPU assignment and attestation"
+            Self::LibkrunConfidentialVfioAssignment => {
+                "libkrun confidential VFIO/IOMMUFD device assignment"
             }
-            Self::ConfidentialNvidiaNvSwitchAssignment => {
-                "confidential NVIDIA NVSwitch assignment and attestation"
-            }
+            Self::NvidiaB200CcMode => "NVIDIA B200 confidential-computing mode",
+            Self::NvidiaGpuAttestation => "native NVIDIA GPU attestation",
+            Self::NvidiaNvlinkDisabled => "disabled NVIDIA NVLink topology",
+            Self::NvidiaNvSwitchAttestation => "native NVIDIA NVSwitch attestation",
+            Self::NvidiaB200Hgx8Topology => "complete eight-GPU HGX B200 topology",
+            Self::NvidiaEncryptedNvlink => "encrypted Blackwell MPT NVLink",
         })
     }
 }
@@ -207,8 +268,7 @@ impl ConfidentialHostReport {
             HostFacts::detect(),
             LibkrunFacts::from(capabilities),
             false,
-            false,
-            false,
+            NvidiaFacts::unavailable(),
         )
     }
 
@@ -217,8 +277,7 @@ impl ConfidentialHostReport {
         host: HostFacts,
         libkrun: LibkrunFacts,
         measured_guest_attester: bool,
-        confidential_nvidia_gpu_assignment: bool,
-        confidential_nvidia_nv_switch_assignment: bool,
+        nvidia: NvidiaFacts,
     ) -> Self {
         let mut checks = Vec::with_capacity(12);
         checks.push(ConfidentialCapabilityCheck::new(
@@ -291,17 +350,45 @@ impl ConfidentialHostReport {
             ConfidentialCapability::MeasuredGuestAttester,
             measured_guest_attester,
         ));
-        if profile.nvidia_gpus > 0 {
-            checks.push(ConfidentialCapabilityCheck::new(
-                ConfidentialCapability::ConfidentialNvidiaGpuAssignment,
-                confidential_nvidia_gpu_assignment,
-            ));
-        }
-        if profile.nvidia_nv_switches > 0 {
-            checks.push(ConfidentialCapabilityCheck::new(
-                ConfidentialCapability::ConfidentialNvidiaNvSwitchAssignment,
-                confidential_nvidia_nv_switch_assignment,
-            ));
+        if let Some(nvidia_profile) = profile.nvidia {
+            checks.extend([
+                ConfidentialCapabilityCheck::new(
+                    ConfidentialCapability::LibkrunConfidentialVfioAssignment,
+                    nvidia.libkrun_vfio_assignment,
+                ),
+                ConfidentialCapabilityCheck::new(
+                    ConfidentialCapability::NvidiaB200CcMode,
+                    nvidia.b200_cc_mode,
+                ),
+                ConfidentialCapabilityCheck::new(
+                    ConfidentialCapability::NvidiaGpuAttestation,
+                    nvidia.gpu_attestation,
+                ),
+            ]);
+            match nvidia_profile {
+                ConfidentialNvidiaProfile::B200Single => {
+                    checks.push(ConfidentialCapabilityCheck::new(
+                        ConfidentialCapability::NvidiaNvlinkDisabled,
+                        nvidia.nvlink_disabled,
+                    ));
+                }
+                ConfidentialNvidiaProfile::B200Hgx8EncryptedNvlink => {
+                    checks.extend([
+                        ConfidentialCapabilityCheck::new(
+                            ConfidentialCapability::NvidiaNvSwitchAttestation,
+                            nvidia.nv_switch_attestation,
+                        ),
+                        ConfidentialCapabilityCheck::new(
+                            ConfidentialCapability::NvidiaB200Hgx8Topology,
+                            nvidia.b200_hgx_8_topology,
+                        ),
+                        ConfidentialCapabilityCheck::new(
+                            ConfidentialCapability::NvidiaEncryptedNvlink,
+                            nvidia.encrypted_nvlink,
+                        ),
+                    ]);
+                }
+            }
         }
 
         Self {
@@ -408,6 +495,44 @@ struct LibkrunFacts {
     aws_nitro: bool,
 }
 
+#[derive(Clone, Copy)]
+struct NvidiaFacts {
+    libkrun_vfio_assignment: bool,
+    b200_cc_mode: bool,
+    gpu_attestation: bool,
+    nvlink_disabled: bool,
+    nv_switch_attestation: bool,
+    b200_hgx_8_topology: bool,
+    encrypted_nvlink: bool,
+}
+
+impl NvidiaFacts {
+    const fn unavailable() -> Self {
+        Self {
+            libkrun_vfio_assignment: false,
+            b200_cc_mode: false,
+            gpu_attestation: false,
+            nvlink_disabled: false,
+            nv_switch_attestation: false,
+            b200_hgx_8_topology: false,
+            encrypted_nvlink: false,
+        }
+    }
+
+    #[cfg(test)]
+    const fn available() -> Self {
+        Self {
+            libkrun_vfio_assignment: true,
+            b200_cc_mode: true,
+            gpu_attestation: true,
+            nvlink_disabled: true,
+            nv_switch_attestation: true,
+            b200_hgx_8_topology: true,
+            encrypted_nvlink: true,
+        }
+    }
+}
+
 impl From<&Capabilities> for LibkrunFacts {
     fn from(capabilities: &Capabilities) -> Self {
         Self {
@@ -479,8 +604,7 @@ mod tests {
             complete_snp_host(),
             snp_libkrun(),
             true,
-            false,
-            false,
+            NvidiaFacts::unavailable(),
         );
 
         assert!(report.is_supported());
@@ -496,7 +620,13 @@ mod tests {
         host.amd_sev_snp_kvm = false;
         let mut libkrun = snp_libkrun();
         libkrun.amd_sev = false;
-        let report = ConfidentialHostReport::evaluate(&profile, host, libkrun, false, false, false);
+        let report = ConfidentialHostReport::evaluate(
+            &profile,
+            host,
+            libkrun,
+            false,
+            NvidiaFacts::unavailable(),
+        );
 
         assert_eq!(
             report.missing().collect::<Vec<_>>(),
@@ -517,37 +647,84 @@ mod tests {
     }
 
     #[test]
-    fn confidential_gpu_and_switch_require_independent_support() {
-        let profile = ConfidentialVmProfile::amd_sev_snp()
-            .nvidia_gpus(NonZeroU16::new(2).unwrap())
-            .nvidia_nv_switches(NonZeroU16::new(1).unwrap());
+    fn single_b200_requires_disabled_nvlink_and_no_switch_capabilities() {
+        let profile = ConfidentialVmProfile::amd_sev_snp().nvidia_b200_single();
         let report = ConfidentialHostReport::evaluate(
             &profile,
             complete_snp_host(),
             snp_libkrun(),
             true,
-            false,
-            false,
+            NvidiaFacts::unavailable(),
         );
 
         assert_eq!(
             report.missing().collect::<Vec<_>>(),
             [
-                ConfidentialCapability::ConfidentialNvidiaGpuAssignment,
-                ConfidentialCapability::ConfidentialNvidiaNvSwitchAssignment,
+                ConfidentialCapability::LibkrunConfidentialVfioAssignment,
+                ConfidentialCapability::NvidiaB200CcMode,
+                ConfidentialCapability::NvidiaGpuAttestation,
+                ConfidentialCapability::NvidiaNvlinkDisabled,
             ]
+        );
+        assert_eq!(profile.nvidia_gpu_count(), 1);
+        assert_eq!(profile.nvidia_nv_switch_count(), 0);
+    }
+
+    #[test]
+    fn hgx_b200_requires_complete_attested_encrypted_fabric() {
+        let profile = ConfidentialVmProfile::intel_tdx().nvidia_b200_hgx_8_encrypted_nvlink();
+        let mut nvidia = NvidiaFacts::available();
+        nvidia.nv_switch_attestation = false;
+        nvidia.encrypted_nvlink = false;
+        let report = ConfidentialHostReport::evaluate(
+            &profile,
+            HostFacts {
+                linux: true,
+                x86_64: true,
+                kvm: true,
+                amd_sev: false,
+                amd_sev_snp_cpu: false,
+                amd_sev_snp_kvm: false,
+                intel_tdx_kvm: true,
+                aws_nitro: false,
+            },
+            LibkrunFacts {
+                tee: true,
+                amd_sev: false,
+                intel_tdx: true,
+                aws_nitro: false,
+            },
+            true,
+            nvidia,
+        );
+
+        assert_eq!(
+            report.missing().collect::<Vec<_>>(),
+            [
+                ConfidentialCapability::NvidiaNvSwitchAttestation,
+                ConfidentialCapability::NvidiaEncryptedNvlink,
+            ]
+        );
+        assert_eq!(profile.nvidia_gpu_count(), 8);
+        assert_eq!(profile.nvidia_nv_switch_count(), 2);
+        assert!(
+            profile
+                .nvidia_profile()
+                .is_some_and(ConfidentialNvidiaProfile::requires_encrypted_nvlink)
         );
     }
 
     #[test]
-    fn profile_round_trip_preserves_exact_device_counts() {
-        let profile = ConfidentialVmProfile::intel_tdx()
-            .nvidia_gpus(NonZeroU16::new(8).unwrap())
-            .nvidia_nv_switches(NonZeroU16::new(2).unwrap());
+    fn profile_round_trip_preserves_exact_b200_topology() {
+        let profile = ConfidentialVmProfile::intel_tdx().nvidia_b200_hgx_8_encrypted_nvlink();
 
         let encoded = serde_json::to_vec(&profile).unwrap();
         let decoded = serde_json::from_slice(&encoded).unwrap();
 
         assert_eq!(profile, decoded);
+        assert_eq!(
+            decoded.nvidia_profile(),
+            Some(ConfidentialNvidiaProfile::B200Hgx8EncryptedNvlink)
+        );
     }
 }

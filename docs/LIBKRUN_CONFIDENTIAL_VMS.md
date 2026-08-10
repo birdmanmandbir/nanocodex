@@ -200,9 +200,11 @@ This is the first libkrun CVM backend.
 ### NVIDIA confidential GPUs and NVSwitch
 
 This is a libkrun extension program, not use of the existing virtio-gpu path.
-The first target is one Hopper or later confidential GPU assigned to an SNP or
-TDX guest; multi-GPU and NVSwitch follow only after single-device binding is
-proven.
+The first target is exactly one B200 assigned to an SNP or TDX guest with every
+NVLink disabled. The second target is the complete eight-B200 HGX fabric in
+Blackwell MPT CC with encrypted NVLink; it follows only after single-device
+binding is proven. Hopper PPCIe is not an acceptable substitute for the second
+profile because its NVLink/NVSwitch path is not encrypted.
 
 - Add the required VFIO/device-assignment boundary to libkrun without exposing
   a broad unsafe host-device API from `nanocodex-vm`.
@@ -219,6 +221,13 @@ proven.
   requires all mandatory component appraisals and topology bindings.
 - Never claim that GPU attestation proves a CUDA kernel or model executed; it
   proves the accepted GPU/device stack and its binding to the CVM.
+
+The concrete Blackwell decision, native CPU-attestation protocol, libkrun VFIO
+boundary, and distinct one-B200 versus eight-B200 encrypted-NVLink profiles are
+specified in
+[`CONFIDENTIAL_ATTESTATION_AND_B200.md`](CONFIDENTIAL_ATTESTATION_AND_B200.md).
+The eight-GPU target is Blackwell MPT CC; Hopper PPCIe does not satisfy its
+encrypted-NVLink requirement.
 
 ### AMD trusted I/O and other confidential devices
 

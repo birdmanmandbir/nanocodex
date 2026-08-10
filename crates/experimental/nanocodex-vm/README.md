@@ -23,10 +23,12 @@ The crate root intentionally re-exports only [`VmWorkspace`],
 
 ## Confidential-VM boundary
 
-[`host::ConfidentialVmProfile`] selects one exact local CPU TEE and optional
-confidential NVIDIA device counts. [`host::Capabilities::confidential_report`]
-reports every required host, active-libkrun-artifact, measured-guest, and
-confidential-device capability without selecting a weaker profile.
+[`host::ConfidentialVmProfile`] selects one exact local CPU TEE and, optionally,
+either one B200 with every NVLink disabled or one complete eight-B200 HGX fabric
+with encrypted Blackwell MPT NVLink. Arbitrary GPU and switch counts are not a
+public profile. [`host::Capabilities::confidential_report`] reports every
+required host, active-libkrun-artifact, measured-guest, device-assignment,
+attestation, and topology capability without selecting a weaker profile.
 
 The current implementation deliberately reports the measured guest attester
 as unavailable. A [`host::VmConfig`] carrying a confidential profile therefore
@@ -57,6 +59,16 @@ for missing in report.missing() {
 report.ensure_supported()?;
 # Ok(())
 # }
+```
+
+The GPU variants are selected without count-based escape hatches:
+
+```no_run
+use nanocodex_vm::host::ConfidentialVmProfile;
+
+let one_b200 = ConfidentialVmProfile::amd_sev_snp().nvidia_b200_single();
+let full_hgx = ConfidentialVmProfile::intel_tdx()
+    .nvidia_b200_hgx_8_encrypted_nvlink();
 ```
 
 Ordinary libkrun VMs are unchanged. In particular, macOS ARM64/HVF remains an

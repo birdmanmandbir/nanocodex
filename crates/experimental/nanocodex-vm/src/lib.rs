@@ -154,7 +154,7 @@ pub mod host {
         command::GuestCommand,
         confidential::{
             ConfidentialCapability, ConfidentialCapabilityCheck, ConfidentialHostReport,
-            ConfidentialVmError, ConfidentialVmProfile, CpuTee,
+            ConfidentialNvidiaProfile, ConfidentialVmError, ConfidentialVmProfile, CpuTee,
         },
         config::{BlockDevice, Network, RootFilesystem, SharedDirectory, VmConfig},
         egress::{
