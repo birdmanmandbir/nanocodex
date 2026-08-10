@@ -352,7 +352,10 @@ check:
     ./scripts/check-experimental-boundary.sh
     ./scripts/check-rustls-provider.sh
     cargo fmt --all -- --check
-    cargo clippy --workspace --all-targets --all-features -- -D warnings
+    cargo clippy --workspace --exclude nanocodex-vm --all-targets --all-features -- -D warnings
+    cargo clippy --package nanocodex-vm --all-targets --features host -- -D warnings
+    cargo clippy --package nanocodex-vm --all-targets --features libkrun-amd-sev -- -D warnings
+    cargo clippy --package nanocodex-vm --all-targets --features libkrun-intel-tdx -- -D warnings
     cargo test --workspace
     .venv/bin/python -m unittest discover -s harbor_adapter -p 'test_*.py'
     .venv/bin/python -m compileall -q harbor_adapter

@@ -83,6 +83,10 @@ path = "src/bin/nanocodex-vm-guest.rs"
 doc = false
 required-features = ["guest-runtime"]
 
+[[example]]
+name = "confidential_host"
+required-features = ["host"]
+
 [[bench]]
 name = "image_cache"
 harness = false

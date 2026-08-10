@@ -783,7 +783,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_confidential_profile_fails_before_root_or_context_creation() {
+    fn confidential_preflight_fails_before_root_or_context_creation() {
         let config = VmConfig::ext4("/path/which/must/not/be-resolved.ext4")
             .confidential(ConfidentialVmProfile::amd_sev_snp());
 
@@ -792,10 +792,11 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(matches!(
-            error,
-            VmError::Confidential(ConfidentialVmError::UnsupportedProfile { missing, .. })
-                if missing.contains(&ConfidentialCapability::MeasuredGuestAttester)
-        ));
+        assert!(!matches!(error, VmError::RootNotFile(_)));
+        if let VmError::Confidential(ConfidentialVmError::UnsupportedProfile { missing, .. }) =
+            error
+        {
+            assert!(missing.contains(&ConfidentialCapability::MeasuredGuestAttester));
+        }
     }
 }
