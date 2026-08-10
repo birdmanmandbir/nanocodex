@@ -189,7 +189,7 @@ pub mod host {
     #[cfg(all(target_os = "linux", not(target_env = "musl")))]
     pub use crate::devices::{
         ConfidentialDeviceBundle, ConfidentialPciDevice, ConfidentialPciRole, DeviceBundleError,
-        PciAddress, ResolvedConfidentialDeviceBundle,
+        PciAddress, ResolvedConfidentialDeviceBundle, VfioAssignment,
     };
     pub use crate::nitro_verification::{NitroVerificationPolicy, NitroVerifier};
     #[cfg(all(target_os = "linux", not(target_env = "musl")))]

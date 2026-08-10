@@ -69,7 +69,7 @@ hudsucker = { version = "0.25.0", git = "https://github.com/gakonst/hudsucker", 
 ignore = "0.4.31"
 jiff = { version = "0.2.35", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 jsonschema = { version = "0.48.5", default-features = false }
-krun = { package = "libkrun", version = "=2.0.0-dev", git = "https://github.com/gakonst/libkrun", rev = "b71a880a44d66c55c4e1fb1b37aece4affa313b9", features = ["blk", "net"] }
+krun = { package = "libkrun", version = "=2.0.0-dev", git = "https://github.com/gakonst/libkrun", rev = "742f08c0083a0646ef074c67d4176d9f375f9cbe", features = ["blk", "net"] }
 mpp = { version = "=0.11.0", git = "https://github.com/tempoxyz/mpp-rs", rev = "3e37469bb19434982b433ae44ea8c713f7ea923a", default-features = false }
 nanocodex = { version = "0.3.0", path = "crates/nanocodex" }
 nanocodex-agent = { version = "0.3.0", path = "crates/nanocodex-agent" }

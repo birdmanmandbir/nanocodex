@@ -34,9 +34,11 @@ pub enum KrunFeature {
     VirglResourceMap2 = 10,
     /// Embedded guest init-blob support.
     InitBlob = 11,
+    /// Linux VFIO cdev and IOMMUFD PCI assignment support.
+    Vfio = 12,
 }
 
-const FEATURES: [KrunFeature; 10] = [
+const FEATURES: [KrunFeature; 11] = [
     KrunFeature::Network,
     KrunFeature::Block,
     KrunFeature::Gpu,
@@ -47,6 +49,7 @@ const FEATURES: [KrunFeature; 10] = [
     KrunFeature::AwsNitro,
     KrunFeature::VirglResourceMap2,
     KrunFeature::InitBlob,
+    KrunFeature::Vfio,
 ];
 
 /// Host and build capabilities relevant when configuring a VM.

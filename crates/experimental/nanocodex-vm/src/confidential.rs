@@ -179,6 +179,8 @@ pub enum ConfidentialCapability {
     AwsNitroDevice,
     /// Nanocodex has a measured guest attester for the selected backend.
     MeasuredGuestAttester,
+    /// The process can open `/dev/iommu` for reading and writing.
+    IommufdDevice,
     /// libkrun can assign the reviewed device bundle through VFIO/IOMMUFD.
     LibkrunConfidentialVfioAssignment,
     /// Every selected B200 is configured in confidential-computing mode.
@@ -211,6 +213,7 @@ impl fmt::Display for ConfidentialCapability {
             Self::IntelTdxKvm => "TDX-enabled KVM Intel module",
             Self::AwsNitroDevice => "read-write /dev/nitro_enclaves",
             Self::MeasuredGuestAttester => "measured guest attester",
+            Self::IommufdDevice => "read-write /dev/iommu",
             Self::LibkrunConfidentialVfioAssignment => {
                 "libkrun confidential VFIO/IOMMUFD device assignment"
             }
@@ -268,7 +271,7 @@ impl ConfidentialHostReport {
             HostFacts::detect(),
             LibkrunFacts::from(capabilities),
             true,
-            NvidiaFacts::unavailable(),
+            NvidiaFacts::detect(capabilities),
         )
     }
 
@@ -352,6 +355,10 @@ impl ConfidentialHostReport {
         ));
         if let Some(nvidia_profile) = profile.nvidia {
             checks.extend([
+                ConfidentialCapabilityCheck::new(
+                    ConfidentialCapability::IommufdDevice,
+                    host.iommufd,
+                ),
                 ConfidentialCapabilityCheck::new(
                     ConfidentialCapability::LibkrunConfidentialVfioAssignment,
                     nvidia.libkrun_vfio_assignment,
@@ -439,6 +446,56 @@ impl ConfidentialHostReport {
             })
         }
     }
+
+    /// Returns whether every prerequisite needed to start collecting evidence
+    /// is available.
+    ///
+    /// Runtime NVIDIA CC, device-attestation, and fabric-state claims are not
+    /// launch prerequisites: they can only be established from the particular
+    /// assigned devices after the guest starts. [`Self::ensure_supported`]
+    /// remains the full post-collection gate.
+    #[must_use]
+    pub fn is_launch_supported(&self) -> bool {
+        self.launch_missing().next().is_none()
+    }
+
+    /// Iterates over unavailable prerequisites which must exist before launch.
+    pub fn launch_missing(&self) -> impl Iterator<Item = ConfidentialCapability> + '_ {
+        self.missing()
+            .filter(|capability| capability.is_launch_prerequisite())
+    }
+
+    /// Rejects launch unless every static host and VMM prerequisite exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns all unavailable launch prerequisites without accepting a weaker
+    /// profile.
+    pub fn ensure_launch_supported(&self) -> Result<(), ConfidentialVmError> {
+        let missing = self.launch_missing().collect::<Vec<_>>();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(ConfidentialVmError::UnsupportedProfile {
+                tee: self.profile.cpu_tee,
+                missing,
+            })
+        }
+    }
+}
+
+impl ConfidentialCapability {
+    const fn is_launch_prerequisite(self) -> bool {
+        !matches!(
+            self,
+            Self::NvidiaB200CcMode
+                | Self::NvidiaGpuAttestation
+                | Self::NvidiaNvlinkDisabled
+                | Self::NvidiaNvSwitchAttestation
+                | Self::NvidiaB200Hgx8Topology
+                | Self::NvidiaEncryptedNvlink
+        )
+    }
 }
 
 /// Failure to satisfy an exact confidential-VM request.
@@ -467,6 +524,7 @@ struct HostFacts {
     amd_sev_snp_kvm: bool,
     intel_tdx_kvm: bool,
     aws_nitro: bool,
+    iommufd: bool,
 }
 
 impl HostFacts {
@@ -483,6 +541,7 @@ impl HostFacts {
                 "/sys/module/kvm_intel/parameters/enable_tdx",
             ]),
             aws_nitro: device_is_read_write(Path::new("/dev/nitro_enclaves")),
+            iommufd: device_is_read_write(Path::new("/dev/iommu")),
         }
     }
 }
@@ -516,6 +575,13 @@ impl NvidiaFacts {
             nv_switch_attestation: false,
             b200_hgx_8_topology: false,
             encrypted_nvlink: false,
+        }
+    }
+
+    fn detect(capabilities: &Capabilities) -> Self {
+        Self {
+            libkrun_vfio_assignment: capabilities.has(KrunFeature::Vfio),
+            ..Self::unavailable()
         }
     }
 
@@ -584,6 +650,7 @@ mod tests {
             amd_sev_snp_kvm: true,
             intel_tdx_kvm: false,
             aws_nitro: false,
+            iommufd: true,
         }
     }
 
@@ -687,6 +754,7 @@ mod tests {
                 amd_sev_snp_kvm: false,
                 intel_tdx_kvm: true,
                 aws_nitro: false,
+                iommufd: true,
             },
             LibkrunFacts {
                 tee: true,
@@ -711,6 +779,32 @@ mod tests {
             profile
                 .nvidia_profile()
                 .is_some_and(ConfidentialNvidiaProfile::requires_encrypted_nvlink)
+        );
+    }
+
+    #[test]
+    fn launch_requires_vfio_but_defers_runtime_nvidia_claims() {
+        let profile = ConfidentialVmProfile::amd_sev_snp().nvidia_b200_single();
+        let mut nvidia = NvidiaFacts::unavailable();
+        nvidia.libkrun_vfio_assignment = true;
+        let report = ConfidentialHostReport::evaluate(
+            &profile,
+            complete_snp_host(),
+            snp_libkrun(),
+            true,
+            nvidia,
+        );
+
+        assert!(report.is_launch_supported());
+        assert!(report.ensure_launch_supported().is_ok());
+        assert!(!report.is_supported());
+        assert_eq!(
+            report.missing().collect::<Vec<_>>(),
+            [
+                ConfidentialCapability::NvidiaB200CcMode,
+                ConfidentialCapability::NvidiaGpuAttestation,
+                ConfidentialCapability::NvidiaNvlinkDisabled,
+            ]
         );
     }
 

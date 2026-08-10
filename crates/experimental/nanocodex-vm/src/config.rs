@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::confidential::ConfidentialVmProfile;
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+use crate::devices::ConfidentialDeviceBundle;
 
 /// Root filesystem exposed to one guest.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -158,6 +160,9 @@ pub struct VmConfig {
     confidential_profile: Option<ConfidentialVmProfile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tdx_qgs_socket: Option<PathBuf>,
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    confidential_devices: Option<ConfidentialDeviceBundle>,
 }
 
 impl VmConfig {
@@ -173,6 +178,8 @@ impl VmConfig {
             shared_directories: Vec::new(),
             confidential_profile: None,
             tdx_qgs_socket: None,
+            #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+            confidential_devices: None,
         }
     }
 
@@ -187,6 +194,8 @@ impl VmConfig {
             shared_directories: Vec::new(),
             confidential_profile: None,
             tdx_qgs_socket: None,
+            #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+            confidential_devices: None,
         }
     }
 
@@ -213,6 +222,8 @@ impl VmConfig {
             shared_directories: Vec::new(),
             confidential_profile: None,
             tdx_qgs_socket: None,
+            #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+            confidential_devices: None,
         }
     }
 
@@ -270,6 +281,18 @@ impl VmConfig {
     #[must_use]
     pub fn tdx_quote_generation_socket(mut self, socket: impl Into<PathBuf>) -> Self {
         self.tdx_qgs_socket = Some(socket.into());
+        self
+    }
+
+    /// Assigns one exact host-validated B200 device topology.
+    ///
+    /// Linux sysfs identity, VFIO ownership, cdev presence, IOMMU isolation,
+    /// and complete-group membership are revalidated before libkrun creates
+    /// the VM. Runtime CC/NVLink claims remain subject to guest attestation.
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    #[must_use]
+    pub fn confidential_devices(mut self, bundle: ConfidentialDeviceBundle) -> Self {
+        self.confidential_devices = Some(bundle);
         self
     }
 
@@ -331,6 +354,13 @@ impl VmConfig {
     #[must_use]
     pub fn tdx_qgs_socket(&self) -> Option<&Path> {
         self.tdx_qgs_socket.as_deref()
+    }
+
+    /// Returns the exact host PCI bundle requested for confidential assignment.
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    #[must_use]
+    pub const fn confidential_device_bundle(&self) -> Option<&ConfidentialDeviceBundle> {
+        self.confidential_devices.as_ref()
     }
 }
 

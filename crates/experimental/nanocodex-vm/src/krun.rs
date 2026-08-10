@@ -6,16 +6,27 @@
 use std::{
     ffi::{CString, NulError, OsStr, c_char},
     io,
-    os::{
-        fd::AsRawFd,
-        unix::{ffi::OsStrExt, fs::FileTypeExt as _},
-    },
+    os::{fd::AsRawFd, unix::ffi::OsStrExt},
     path::PathBuf,
     ptr,
 };
 
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+use std::fs::OpenOptions;
+#[cfg(any(
+    feature = "libkrun-intel-tdx",
+    all(target_os = "linux", not(target_env = "musl"))
+))]
+use std::os::unix::fs::FileTypeExt as _;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt as _;
+
 use thiserror::Error;
 
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+use crate::devices::{
+    DeviceBundleError, PciAddress, ResolvedConfidentialDeviceBundle, VfioAssignment,
+};
 use crate::{
     capabilities::Capabilities,
     command::GuestCommand,
@@ -152,6 +163,49 @@ pub enum VmError {
         /// Underlying filesystem failure.
         source: io::Error,
     },
+
+    /// A confidential PCI bundle failed host identity or isolation checks.
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    #[error(transparent)]
+    DeviceBundle(#[from] DeviceBundleError),
+
+    /// A validated VFIO cdev could not be opened.
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    #[error("failed to open VFIO cdev {path} for PCI function {address}: {source}")]
+    OpenVfioCdev {
+        /// Selected host PCI function.
+        address: PciAddress,
+        /// Resolved VFIO cdev path.
+        path: PathBuf,
+        /// Underlying open or metadata error.
+        source: io::Error,
+    },
+
+    /// A resolved VFIO path was replaced with a non-character device.
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    #[error("VFIO cdev {path} for PCI function {address} is not a character device")]
+    VfioCdevNotCharacter {
+        /// Selected host PCI function.
+        address: PciAddress,
+        /// Resolved VFIO cdev path.
+        path: PathBuf,
+    },
+
+    /// A VFIO cdev no longer has the major/minor identity pinned in sysfs.
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    #[error(
+        "VFIO cdev {path} for PCI function {address} changed device number from {expected:?} to {actual:?}"
+    )]
+    VfioCdevIdentityChanged {
+        /// Selected host PCI function.
+        address: PciAddress,
+        /// Resolved VFIO cdev path.
+        path: PathBuf,
+        /// Device number read from PCI sysfs.
+        expected: (u32, u32),
+        /// Device number observed on the opened descriptor.
+        actual: (u64, u64),
+    },
 }
 
 /// A configured libkrun VM which has not entered its blocking event loop yet.
@@ -187,13 +241,15 @@ impl KrunVm {
         if config.memory_mib_value() == 0 {
             return Err(VmError::InvalidConfig("memory must be nonzero"));
         }
+        validate_confidential_config(config)?;
         if let Some(profile) = config.confidential_profile() {
-            validate_confidential_config(config)?;
             Capabilities::detect()?
                 .confidential_report(profile)
-                .ensure_supported()?;
+                .ensure_launch_supported()?;
         }
 
+        #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+        let confidential_devices = resolve_confidential_devices(config)?;
         let root = resolve_root(config.root_filesystem())?;
 
         let context = positive_context(krun::krun_create_ctx(), "create context")?;
@@ -242,6 +298,8 @@ impl KrunVm {
 
         attach_block_devices(context, config.block_devices())?;
         attach_shared_directories(context, config.shared_directories())?;
+        #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+        attach_confidential_devices(context, confidential_devices.as_ref())?;
 
         let stdin = io::stdin();
         let stdout = io::stdout();
@@ -515,8 +573,78 @@ fn attach_network(context: u32, network: &Network) -> Result<(), VmError> {
     Ok(())
 }
 
-const TDX_QGS_VSOCK_PORT: u32 = 4050;
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+fn resolve_confidential_devices(
+    config: &VmConfig,
+) -> Result<Option<ResolvedConfidentialDeviceBundle>, VmError> {
+    config
+        .confidential_device_bundle()
+        .map(crate::devices::ConfidentialDeviceBundle::resolve_linux)
+        .transpose()
+        .map_err(Into::into)
+}
 
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+fn attach_confidential_devices(
+    context: u32,
+    devices: Option<&ResolvedConfidentialDeviceBundle>,
+) -> Result<(), VmError> {
+    let Some(devices) = devices else {
+        return Ok(());
+    };
+    for assignment in devices.vfio_assignments() {
+        attach_vfio_assignment(context, &assignment)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+fn attach_vfio_assignment(context: u32, assignment: &VfioAssignment) -> Result<(), VmError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(assignment.cdev())
+        .map_err(|source| VmError::OpenVfioCdev {
+            address: assignment.host_address().clone(),
+            path: assignment.cdev().to_owned(),
+            source,
+        })?;
+    let metadata = file.metadata().map_err(|source| VmError::OpenVfioCdev {
+        address: assignment.host_address().clone(),
+        path: assignment.cdev().to_owned(),
+        source,
+    })?;
+    if !metadata.file_type().is_char_device() {
+        return Err(VmError::VfioCdevNotCharacter {
+            address: assignment.host_address().clone(),
+            path: assignment.cdev().to_owned(),
+        });
+    }
+    let actual = (
+        nix::sys::stat::major(metadata.rdev()),
+        nix::sys::stat::minor(metadata.rdev()),
+    );
+    let expected = assignment.expected_device_number();
+    if actual != (u64::from(expected.0), u64::from(expected.1)) {
+        return Err(VmError::VfioCdevIdentityChanged {
+            address: assignment.host_address().clone(),
+            path: assignment.cdev().to_owned(),
+            expected,
+            actual,
+        });
+    }
+    check(
+        krun::krun_add_vfio_device(
+            context,
+            file.as_raw_fd(),
+            assignment.guest_device(),
+            assignment.guest_function(),
+        ),
+        "attach confidential VFIO PCI function",
+    )
+}
+
+#[cfg(feature = "libkrun-intel-tdx")]
 fn attach_tdx_qgs(context: u32, config: &VmConfig) -> Result<(), VmError> {
     let Some(socket) = config.tdx_qgs_socket() else {
         return Ok(());
@@ -538,19 +666,25 @@ fn attach_tdx_qgs(context: u32, config: &VmConfig) -> Result<(), VmError> {
             path: socket.to_owned(),
             source,
         })?;
-    if !matches!(config.network_value(), Network::Internet) {
-        check(
-            krun::krun_add_vsock(context, 0),
-            "attach Intel QGS vsock transport",
-        )?;
-    }
     let socket = c_string(socket.as_os_str(), "Intel QGS socket path")?;
     // SAFETY: the C string remains valid through the call and libkrun copies
     // its contents into the configuration context.
     check(
-        unsafe { krun::krun_add_vsock_port(context, TDX_QGS_VSOCK_PORT, socket.as_ptr()) },
-        "attach Intel QGS socket relay",
+        unsafe { krun::krun_set_tdx_quote_generation_socket(context, socket.as_ptr()) },
+        "configure Intel TDX GetQuote relay",
     )
+}
+
+#[cfg(not(feature = "libkrun-intel-tdx"))]
+fn attach_tdx_qgs(_context: u32, config: &VmConfig) -> Result<(), VmError> {
+    if config.tdx_qgs_socket().is_none() {
+        Ok(())
+    } else {
+        Err(ConfidentialVmError::InvalidConfig(
+            "Intel QGS transport requires the Intel TDX libkrun artifact",
+        )
+        .into())
+    }
 }
 
 const COMPATIBLE_NETWORK_FEATURES: u32 = NET_FEATURE_CSUM
@@ -704,6 +838,20 @@ fn validate_guest_command(command: &GuestCommand) -> Result<(), VmError> {
 }
 
 fn validate_confidential_config(config: &VmConfig) -> Result<(), ConfidentialVmError> {
+    let Some(profile) = config.confidential_profile() else {
+        if config.tdx_qgs_socket().is_some() {
+            return Err(ConfidentialVmError::InvalidConfig(
+                "Intel QGS transport requires an Intel TDX profile",
+            ));
+        }
+        #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+        if config.confidential_device_bundle().is_some() {
+            return Err(ConfidentialVmError::InvalidConfig(
+                "a confidential PCI device bundle requires an NVIDIA profile",
+            ));
+        }
+        return Ok(());
+    };
     if !matches!(config.root_filesystem(), RootFilesystem::Ext4(_)) {
         return Err(ConfidentialVmError::InvalidConfig(
             "confidential VMs require one raw ext4 root disk",
@@ -714,14 +862,33 @@ fn validate_confidential_config(config: &VmConfig) -> Result<(), ConfidentialVmE
             "confidential VMs cannot expose host directories through virtiofs",
         ));
     }
-    if config.tdx_qgs_socket().is_some()
-        && config
-            .confidential_profile()
-            .is_none_or(|profile| profile.cpu_tee() != CpuTee::IntelTdx)
-    {
+    if config.tdx_qgs_socket().is_some() && profile.cpu_tee() != CpuTee::IntelTdx {
         return Err(ConfidentialVmError::InvalidConfig(
             "Intel QGS transport requires an Intel TDX profile",
         ));
+    }
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    match (
+        profile.nvidia_profile(),
+        config.confidential_device_bundle(),
+    ) {
+        (None, None) => {}
+        (Some(_), None) => {
+            return Err(ConfidentialVmError::InvalidConfig(
+                "a confidential NVIDIA profile requires an exact PCI device bundle",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(ConfidentialVmError::InvalidConfig(
+                "a confidential PCI device bundle requires an NVIDIA profile",
+            ));
+        }
+        (Some(profile), Some(bundle)) if profile != bundle.profile() => {
+            return Err(ConfidentialVmError::InvalidConfig(
+                "the confidential PCI bundle does not match the NVIDIA profile",
+            ));
+        }
+        (Some(_), Some(_)) => {}
     }
     Ok(())
 }
@@ -844,6 +1011,13 @@ mod tests {
 
     #[test]
     fn qgs_transport_rejects_non_tdx_profiles() {
+        let no_profile =
+            VmConfig::ext4("root.ext4").tdx_quote_generation_socket("/run/tdx-qgs/qgs.socket");
+        assert_eq!(
+            validate_confidential_config(&no_profile).unwrap_err(),
+            ConfidentialVmError::InvalidConfig("Intel QGS transport requires an Intel TDX profile")
+        );
+
         let config = VmConfig::ext4("root.ext4")
             .confidential(ConfidentialVmProfile::amd_sev_snp())
             .tdx_quote_generation_socket("/run/tdx-qgs/qgs.socket");
@@ -852,6 +1026,36 @@ mod tests {
             validate_confidential_config(&config).unwrap_err(),
             ConfidentialVmError::InvalidConfig("Intel QGS transport requires an Intel TDX profile")
         );
+    }
+
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    #[test]
+    fn confidential_nvidia_profile_requires_a_matching_device_bundle() {
+        use crate::devices::{ConfidentialDeviceBundle, PciAddress};
+
+        let bundle =
+            ConfidentialDeviceBundle::b200_single(PciAddress::new("0000:1b:00.0").unwrap());
+        let no_profile = VmConfig::ext4("root.ext4").confidential_devices(bundle.clone());
+        assert_eq!(
+            validate_confidential_config(&no_profile).unwrap_err(),
+            ConfidentialVmError::InvalidConfig(
+                "a confidential PCI device bundle requires an NVIDIA profile"
+            )
+        );
+
+        let missing = VmConfig::ext4("root.ext4")
+            .confidential(ConfidentialVmProfile::amd_sev_snp().nvidia_b200_single());
+        assert_eq!(
+            validate_confidential_config(&missing).unwrap_err(),
+            ConfidentialVmError::InvalidConfig(
+                "a confidential NVIDIA profile requires an exact PCI device bundle"
+            )
+        );
+
+        let matching = VmConfig::ext4("root.ext4")
+            .confidential(ConfidentialVmProfile::amd_sev_snp().nvidia_b200_single())
+            .confidential_devices(bundle);
+        validate_confidential_config(&matching).unwrap();
     }
 
     #[test]

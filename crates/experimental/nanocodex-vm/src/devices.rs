@@ -13,6 +13,7 @@ use thiserror::Error;
 use crate::confidential::ConfidentialNvidiaProfile;
 
 const PCI_SYSFS_ROOT: &str = "/sys/bus/pci/devices";
+const VFIO_CDEV_ROOT: &str = "/dev/vfio/devices";
 const NVIDIA_VENDOR_ID: u16 = 0x10de;
 const NVIDIA_B200_DEVICE_ID: u16 = 0x2901;
 const MELLANOX_VENDOR_ID: u16 = 0x15b3;
@@ -231,6 +232,7 @@ impl ConfidentialDeviceBundle {
             .map(|device| device.address.as_str())
             .collect::<BTreeSet<_>>();
         let mut iommu_groups = BTreeMap::new();
+        let mut vfio_cdevs = BTreeMap::new();
         for device in &self.devices {
             let root = pci_root.join(device.address.as_str());
             let actual_vendor = read_hex_u16(&root.join("vendor"))?;
@@ -290,10 +292,12 @@ impl ConfidentialDeviceBundle {
                 }
             }
             iommu_groups.insert(device.address.clone(), group);
+            vfio_cdevs.insert(device.address.clone(), resolve_vfio_cdev(&root)?);
         }
         Ok(ResolvedConfidentialDeviceBundle {
             bundle: self.clone(),
             iommu_groups,
+            vfio_cdevs,
         })
     }
 }
@@ -303,6 +307,7 @@ impl ConfidentialDeviceBundle {
 pub struct ResolvedConfidentialDeviceBundle {
     bundle: ConfidentialDeviceBundle,
     iommu_groups: BTreeMap<PciAddress, u32>,
+    vfio_cdevs: BTreeMap<PciAddress, ResolvedVfioCdev>,
 }
 
 impl ResolvedConfidentialDeviceBundle {
@@ -316,6 +321,85 @@ impl ResolvedConfidentialDeviceBundle {
     #[must_use]
     pub const fn iommu_groups(&self) -> &BTreeMap<PciAddress, u32> {
         &self.iommu_groups
+    }
+
+    /// Returns deterministic guest BDF and pinned VFIO cdev assignments.
+    #[must_use]
+    pub fn vfio_assignments(&self) -> Vec<VfioAssignment> {
+        let mut gpus = self
+            .bundle
+            .devices
+            .iter()
+            .filter(|device| device.role == ConfidentialPciRole::NvidiaB200Gpu)
+            .collect::<Vec<_>>();
+        gpus.sort_by_key(|device| &device.address);
+        let mut bridges = self
+            .bundle
+            .devices
+            .iter()
+            .filter(|device| device.role == ConfidentialPciRole::NvidiaCx7FabricBridge)
+            .collect::<Vec<_>>();
+        bridges.sort_by_key(|device| &device.address);
+
+        gpus.into_iter()
+            .enumerate()
+            .map(|(index, device)| VfioAssignment {
+                host_address: device.address.clone(),
+                cdev: self.vfio_cdevs[&device.address].path.clone(),
+                expected_device_number: self.vfio_cdevs[&device.address].device_number,
+                guest_device: u8::try_from(index + 1).expect("B200 profile has at most 8 GPUs"),
+                guest_function: 0,
+            })
+            .chain(bridges.into_iter().map(|device| VfioAssignment {
+                host_address: device.address.clone(),
+                cdev: self.vfio_cdevs[&device.address].path.clone(),
+                expected_device_number: self.vfio_cdevs[&device.address].device_number,
+                guest_device: 9,
+                guest_function: device.address.as_str().as_bytes()[11] - b'0',
+            }))
+            .collect()
+    }
+}
+
+/// One validated host cdev mapped to a deterministic guest PCI function.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VfioAssignment {
+    host_address: PciAddress,
+    cdev: PathBuf,
+    expected_device_number: (u32, u32),
+    guest_device: u8,
+    guest_function: u8,
+}
+
+impl VfioAssignment {
+    /// Returns the host PCI identity whose cdev was resolved.
+    #[must_use]
+    pub const fn host_address(&self) -> &PciAddress {
+        &self.host_address
+    }
+
+    /// Returns the per-device VFIO cdev path.
+    #[must_use]
+    pub fn cdev(&self) -> &Path {
+        &self.cdev
+    }
+
+    /// Returns the sysfs-pinned character-device major and minor numbers.
+    #[must_use]
+    pub const fn expected_device_number(&self) -> (u32, u32) {
+        self.expected_device_number
+    }
+
+    /// Returns the device number on guest PCI bus 0.
+    #[must_use]
+    pub const fn guest_device(&self) -> u8 {
+        self.guest_device
+    }
+
+    /// Returns the guest PCI function number.
+    #[must_use]
+    pub const fn guest_function(&self) -> u8 {
+        self.guest_function
     }
 }
 
@@ -399,6 +483,77 @@ pub enum DeviceBundleError {
         /// Unlisted sibling.
         sibling: PciAddress,
     },
+    /// The selected function did not expose exactly one VFIO cdev.
+    #[error("PCI function {address} has invalid VFIO cdev directory {path}")]
+    InvalidVfioCdev {
+        /// Selected PCI function.
+        address: PciAddress,
+        /// Inspected sysfs directory.
+        path: PathBuf,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResolvedVfioCdev {
+    path: PathBuf,
+    device_number: (u32, u32),
+}
+
+fn resolve_vfio_cdev(root: &Path) -> Result<ResolvedVfioCdev, DeviceBundleError> {
+    let directory = root.join("vfio-dev");
+    let entries = fs::read_dir(&directory).map_err(|source| DeviceBundleError::Sysfs {
+        path: directory.clone(),
+        source,
+    })?;
+    let names = entries
+        .map(|entry| {
+            entry
+                .map(|entry| entry.file_name())
+                .map_err(|source| DeviceBundleError::Sysfs {
+                    path: directory.clone(),
+                    source,
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let address = PciAddress::new(
+        root.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+    )?;
+    let [name] = names.as_slice() else {
+        return Err(DeviceBundleError::InvalidVfioCdev {
+            address,
+            path: directory,
+        });
+    };
+    let Some(name) = name.to_str().filter(|name| {
+        name.strip_prefix("vfio").is_some_and(|suffix| {
+            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    }) else {
+        return Err(DeviceBundleError::InvalidVfioCdev {
+            address,
+            path: directory,
+        });
+    };
+    let device_number_path = directory.join(name).join("dev");
+    let device_number = fs::read_to_string(&device_number_path)
+        .map_err(|source| DeviceBundleError::Sysfs {
+            path: device_number_path.clone(),
+            source,
+        })?
+        .trim()
+        .split_once(':')
+        .and_then(|(major, minor)| Some((major.parse().ok()?, minor.parse().ok()?)))
+        .ok_or_else(|| DeviceBundleError::InvalidVfioCdev {
+            address: address.clone(),
+            path: device_number_path,
+        })?;
+    Ok(ResolvedVfioCdev {
+        path: Path::new(VFIO_CDEV_ROOT).join(name),
+        device_number,
+    })
 }
 
 fn validate_pci_address(address: &str) -> Result<(), DeviceBundleError> {
@@ -589,10 +744,12 @@ mod tests {
         let group_root = temporary.path().join("groups").join(group.to_string());
         let driver_root = temporary.path().join("drivers/vfio-pci");
         fs::create_dir_all(&device_root).unwrap();
+        fs::create_dir_all(device_root.join("vfio-dev/vfio42")).unwrap();
         fs::create_dir_all(group_root.join("devices")).unwrap();
         fs::create_dir_all(&driver_root).unwrap();
         fs::write(device_root.join("vendor"), "0x10de\n").unwrap();
         fs::write(device_root.join("device"), "0x2901\n").unwrap();
+        fs::write(device_root.join("vfio-dev/vfio42/dev"), "241:42\n").unwrap();
         symlink(&driver_root, device_root.join("driver")).unwrap();
         symlink(&group_root, device_root.join("iommu_group")).unwrap();
         symlink(&device_root, group_root.join("devices").join(address)).unwrap();
@@ -607,6 +764,16 @@ mod tests {
 
         let resolved = bundle.resolve_at(&pci_root).unwrap();
         assert_eq!(resolved.iommu_groups()[&address("0000:1b:00.0")], 7);
+        assert_eq!(
+            resolved.vfio_assignments(),
+            vec![VfioAssignment {
+                host_address: address("0000:1b:00.0"),
+                cdev: PathBuf::from("/dev/vfio/devices/vfio42"),
+                expected_device_number: (241, 42),
+                guest_device: 1,
+                guest_function: 0,
+            }]
+        );
 
         let sibling = address("0000:1b:00.1");
         symlink(
