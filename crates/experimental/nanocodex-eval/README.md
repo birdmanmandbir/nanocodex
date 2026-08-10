@@ -169,13 +169,13 @@ nanocodex eval run compare --task tasks/write-greeting --harness codex \
 nanocodex eval coordinator compare --port 8789
 nanocodex eval benchmark compare --coordinator http://127.0.0.1:8789
 
-# On the coordinator, print a `nanocodex-net:...` capability using the durable
-# identity and shared join authority stored under its eval state directory.
-nanocodex eval coordinator compare --iroh
+# In another process on the coordinator host, publish that fixed loopback port.
+# This generic network command prints a `nanocodex-net:...` join capability.
+nanocodex network publish --target 127.0.0.1:8789
 
 # On each remote worker host, bridge that capability back to loopback. Existing
 # run and benchmark commands continue to use the ordinary local HTTP URL.
-nanocodex eval connect 'nanocodex-net:...' --port 8789
+nanocodex network connect 'nanocodex-net:...' --port 8789
 nanocodex eval benchmark compare --coordinator http://127.0.0.1:8789
 
 # Let an agent inspect the ledger and choose process fan-out.
@@ -207,14 +207,15 @@ that died with the previous benchmark process.
 The iroh ticket is a shared bearer capability and must be handled as a secret.
 It contains the coordinator endpoint's authenticated public identity, current
 relay/direct addressing, and a shared access token. The private endpoint key
-and access token are atomically created at
-`<state-dir>/iroh/authority.json`, restricted to the coordinator user on Unix,
+and access token are atomically created under the network command's state
+directory (by default `~/.nanocodex/network/authority.json`), restricted to the
+network user on Unix,
 and reused across restarts. Each start prints a fresh ticket with current
 routing hints while preserving the endpoint identity and join authority.
 Deleting that identity file intentionally creates a new cluster authority.
-Each connector likewise retains its own cryptographic Iroh identity at
-`<state-dir>/iroh/node.json`; this identity is distinct from the shared ticket
-used for initial admission.
+Each joined node likewise retains its own cryptographic Iroh identity at
+`~/.nanocodex/network/node.json` by default; this identity is distinct from the
+shared ticket used for initial admission.
 
 The iroh endpoint forwards only to the coordinator's fixed loopback address; it
 is not a general proxy. This authenticates the transport but does not attest

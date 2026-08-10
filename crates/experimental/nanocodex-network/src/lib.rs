@@ -78,14 +78,21 @@ pub struct JoinTicket {
     encoded: String,
 }
 
-/// Running Iroh rendezvous endpoint and bounded loopback service bridge.
+/// Running Iroh rendezvous and admission endpoint.
 pub struct Hub {
     router: Router,
     nodes: Arc<NodeRegistry>,
+    tcp_target: Arc<Mutex<Option<SocketAddr>>>,
 }
 
-/// Node-side bridge from a loopback TCP listener to a hub-owned service.
-pub struct NodeConnector;
+/// One durable node joined to a network.
+pub struct Node {
+    router: Router,
+    dialer: HubDialer,
+}
+
+/// Optional bounded adapter between loopback TCP and network streams.
+pub struct TcpBridge;
 
 #[derive(Clone)]
 struct HubDialer {
@@ -239,10 +246,10 @@ struct DirectResponse {
 
 #[derive(Clone)]
 struct HubProtocol {
-    origin: SocketAddr,
     token: [u8; TOKEN_BYTES],
     streams: Arc<Semaphore>,
     nodes: Arc<NodeRegistry>,
+    tcp_target: Arc<Mutex<Option<SocketAddr>>>,
 }
 
 #[derive(Clone)]
@@ -254,7 +261,6 @@ impl fmt::Debug for HubProtocol {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("HubProtocol")
-            .field("origin", &self.origin)
             .field("token", &"<redacted>")
             .finish_non_exhaustive()
     }
@@ -502,45 +508,38 @@ impl Hub {
     /// Starts a public-relay-capable Iroh endpoint with a durable identity.
     ///
     /// The returned ticket contains current routing hints for the persistent
-    /// endpoint identity and shared join capability. The origin is fixed for
-    /// the server lifetime, so an authorized peer cannot use the endpoint as a
-    /// general-purpose proxy.
-    pub async fn bind(
-        origin: SocketAddr,
-        identity: &JoinAuthority,
-    ) -> Result<(Self, JoinTicket), NetworkError> {
+    /// endpoint identity and shared join capability.
+    pub async fn bind(identity: &JoinAuthority) -> Result<(Self, JoinTicket), NetworkError> {
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(identity.secret_key.clone())
             .bind()
             .await
             .map_err(|error| NetworkError::Endpoint(error.to_string()))?;
-        Self::spawn_with_token(origin, endpoint, true, identity.token).await
+        Self::spawn_with_token(endpoint, true, identity.token).await
     }
 
     /// Starts a hub from an application-configured endpoint.
     #[doc(hidden)]
     pub async fn bind_with_endpoint(
-        origin: SocketAddr,
         endpoint: Endpoint,
         wait_until_online: bool,
     ) -> Result<(Self, JoinTicket), NetworkError> {
         let identity = JoinAuthority::generate()?;
-        Self::spawn_with_token(origin, endpoint, wait_until_online, identity.token).await
+        Self::spawn_with_token(endpoint, wait_until_online, identity.token).await
     }
 
     async fn spawn_with_token(
-        origin: SocketAddr,
         endpoint: Endpoint,
         wait_until_online: bool,
         token: [u8; TOKEN_BYTES],
     ) -> Result<(Self, JoinTicket), NetworkError> {
-        require_loopback(origin)?;
         let nodes = Arc::new(NodeRegistry::default());
+        let tcp_target = Arc::new(Mutex::new(None));
         let protocol = HubProtocol {
-            origin,
             streams: Arc::new(Semaphore::new(MAX_CONCURRENT_STREAMS)),
             token,
             nodes: nodes.clone(),
+            tcp_target: tcp_target.clone(),
         };
         let token = protocol.token;
         let router = Router::builder(endpoint).accept(HUB_ALPN, protocol).spawn();
@@ -555,7 +554,14 @@ impl Hub {
                 })?;
         }
         let ticket = JoinTicket::from_parts(router.endpoint().addr(), token)?;
-        Ok((Self { router, nodes }, ticket))
+        Ok((
+            Self {
+                router,
+                nodes,
+                tcp_target,
+            },
+            ticket,
+        ))
     }
 
     /// Returns the durable endpoint identities currently registered over live connections.
@@ -578,7 +584,7 @@ impl Hub {
     /// to `requester`'s Iroh identity. It then asks `requester` to dial the
     /// provider directly and echo a fresh nonce. Session traffic does not pass
     /// through the hub.
-    pub async fn bilateral_ping(
+    pub async fn prove_direct_path(
         &self,
         requester: iroh::EndpointId,
         provider: iroh::EndpointId,
@@ -630,7 +636,7 @@ impl Hub {
         dial
     }
 
-    /// Gracefully closes the Iroh endpoint and its active forwarded streams.
+    /// Gracefully closes the Iroh endpoint and its active sessions.
     pub async fn shutdown(self) -> Result<(), NetworkError> {
         self.router
             .shutdown()
@@ -639,31 +645,25 @@ impl Hub {
     }
 }
 
-impl NodeConnector {
-    /// Forwards one node-local loopback listener to the supplied hub.
-    pub async fn serve(
-        ticket: JoinTicket,
-        identity: &NodeIdentity,
-        listener: TcpListener,
-    ) -> Result<(), NetworkError> {
+impl Node {
+    /// Joins a network with a public-relay-capable durable Iroh endpoint.
+    pub async fn join(ticket: JoinTicket, identity: &NodeIdentity) -> Result<Self, NetworkError> {
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(identity.secret_key.clone())
             .bind()
             .await
             .map_err(|error| NetworkError::Endpoint(error.to_string()))?;
-        Self::serve_with_endpoint(ticket, listener, endpoint).await
+        Self::join_with_endpoint(ticket, endpoint).await
     }
 
-    /// Runs a connector from an application-configured endpoint.
+    /// Joins from an application-configured endpoint.
     #[doc(hidden)]
-    pub async fn serve_with_endpoint(
+    pub async fn join_with_endpoint(
         ticket: JoinTicket,
-        listener: TcpListener,
         endpoint: Endpoint,
-    ) -> Result<(), NetworkError> {
-        require_loopback(listener.local_addr()?)?;
+    ) -> Result<Self, NetworkError> {
         let grants = Arc::new(Mutex::new(Vec::new()));
-        let _node_router = Router::builder(endpoint.clone())
+        let router = Router::builder(endpoint.clone())
             .accept(
                 NODE_ALPN,
                 NodeProtocol {
@@ -678,12 +678,47 @@ impl NodeConnector {
             connection: Arc::new(Mutex::new(None)),
         };
         dialer.ensure_connected().await?;
+        Ok(Self { router, dialer })
+    }
+
+    /// Returns the node's durable authenticated endpoint identity.
+    #[must_use]
+    pub fn endpoint_id(&self) -> iroh::EndpointId {
+        self.router.endpoint().id()
+    }
+
+    /// Gracefully leaves the network and closes direct sessions.
+    pub async fn shutdown(self) -> Result<(), NetworkError> {
+        self.router
+            .shutdown()
+            .await
+            .map_err(|error| NetworkError::Endpoint(error.to_string()))
+    }
+}
+
+impl TcpBridge {
+    /// Publishes one fixed loopback TCP service through a hub.
+    pub async fn publish(hub: &Hub, target: SocketAddr) -> Result<(), NetworkError> {
+        require_loopback(target)?;
+        let mut configured = hub.tcp_target.lock().await;
+        if configured.is_some() {
+            return Err(NetworkError::Protocol(
+                "the hub already publishes a TCP target".to_owned(),
+            ));
+        }
+        *configured = Some(target);
+        Ok(())
+    }
+
+    /// Forwards a node-local loopback listener to the hub's published service.
+    pub async fn connect(node: &Node, listener: TcpListener) -> Result<(), NetworkError> {
+        require_loopback(listener.local_addr()?)?;
         let mut connections = JoinSet::new();
         loop {
             tokio::select! {
                 accepted = listener.accept(), if connections.len() < MAX_CONCURRENT_STREAMS => {
                     let (stream, peer) = accepted?;
-                    let dialer = dialer.clone();
+                    let dialer = node.dialer.clone();
                     connections.spawn(async move {
                         if let Err(error) = forward_downstream(dialer, stream).await {
                             tracing::warn!(%peer, %error, "Iroh hub downstream closed");
@@ -893,7 +928,16 @@ impl HubProtocol {
         mut recv: iroh::endpoint::RecvStream,
     ) -> Result<(), NetworkError> {
         read_stream_prefix(&mut recv, &self.token, STREAM_FORWARD).await?;
-        let mut origin = TcpStream::connect(self.origin).await?;
+        let target = self
+            .tcp_target
+            .lock()
+            .await
+            .as_ref()
+            .copied()
+            .ok_or_else(|| {
+                NetworkError::Protocol("the hub has no published TCP target".to_owned())
+            })?;
+        let mut origin = TcpStream::connect(target).await?;
         let mut transport = tokio::io::join(recv, send);
         tokio::io::copy_bidirectional(&mut origin, &mut transport).await?;
         Ok(())
@@ -1539,9 +1583,12 @@ mod tests {
             .await
             .unwrap();
         let (first_server, first_ticket) =
-            Hub::spawn_with_token(origin_address, first_endpoint, false, identity.token)
+            Hub::spawn_with_token(first_endpoint, false, identity.token)
                 .await
                 .unwrap();
+        TcpBridge::publish(&first_server, origin_address)
+            .await
+            .unwrap();
         first_server.shutdown().await.unwrap();
 
         let reloaded = JoinAuthority::load_or_create(&path).unwrap();
@@ -1555,9 +1602,12 @@ mod tests {
             .await
             .unwrap();
         let (second_server, second_ticket) =
-            Hub::spawn_with_token(origin_address, second_endpoint, false, reloaded.token)
+            Hub::spawn_with_token(second_endpoint, false, reloaded.token)
                 .await
                 .unwrap();
+        TcpBridge::publish(&second_server, origin_address)
+            .await
+            .unwrap();
         assert_eq!(first_ticket.address.id, second_ticket.address.id);
         assert_eq!(first_ticket.token, second_ticket.token);
 
@@ -1659,9 +1709,10 @@ mod tests {
             .bind()
             .await
             .unwrap();
-        let (server, ticket) = Hub::bind_with_endpoint(origin_address, server_endpoint, false)
+        let (server, ticket) = Hub::bind_with_endpoint(server_endpoint, false)
             .await
             .unwrap();
+        TcpBridge::publish(&server, origin_address).await.unwrap();
         let client_endpoint = Endpoint::builder(presets::Minimal)
             .relay_mode(iroh::RelayMode::Disabled)
             .bind()
@@ -1706,7 +1757,6 @@ mod tests {
         const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
         let _test_permit = TEST_ENDPOINT_PERMIT.acquire().await.unwrap();
-        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_endpoint = Endpoint::builder(presets::Minimal)
             .relay_mode(iroh::RelayMode::Disabled)
             .clear_ip_transports()
@@ -1715,10 +1765,9 @@ mod tests {
             .bind()
             .await
             .unwrap();
-        let (hub, ticket) =
-            Hub::bind_with_endpoint(origin.local_addr().unwrap(), server_endpoint, false)
-                .await
-                .unwrap();
+        let (hub, ticket) = Hub::bind_with_endpoint(server_endpoint, false)
+            .await
+            .unwrap();
 
         let first_identity = NodeIdentity::generate().unwrap();
         let first_id = first_identity.endpoint_id();
@@ -1731,12 +1780,9 @@ mod tests {
             .bind()
             .await
             .unwrap();
-        let first_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let first = tokio::spawn(NodeConnector::serve_with_endpoint(
-            ticket.clone(),
-            first_listener,
-            first_endpoint,
-        ));
+        let first = Node::join_with_endpoint(ticket.clone(), first_endpoint)
+            .await
+            .unwrap();
 
         let second_identity = NodeIdentity::generate().unwrap();
         let second_id = second_identity.endpoint_id();
@@ -1749,12 +1795,9 @@ mod tests {
             .bind()
             .await
             .unwrap();
-        let second_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let second = tokio::spawn(NodeConnector::serve_with_endpoint(
-            ticket,
-            second_listener,
-            second_endpoint,
-        ));
+        let second = Node::join_with_endpoint(ticket, second_endpoint)
+            .await
+            .unwrap();
 
         tokio::time::timeout(TEST_TIMEOUT, async {
             while hub.connected_nodes().await.len() != 2 {
@@ -1767,28 +1810,25 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(hub.connected_nodes().await, expected);
 
-        tokio::time::timeout(TEST_TIMEOUT, hub.bilateral_ping(first_id, second_id))
+        tokio::time::timeout(TEST_TIMEOUT, hub.prove_direct_path(first_id, second_id))
             .await
             .expect("first bilateral session timed out")
             .unwrap();
-        tokio::time::timeout(TEST_TIMEOUT, hub.bilateral_ping(second_id, first_id))
+        tokio::time::timeout(TEST_TIMEOUT, hub.prove_direct_path(second_id, first_id))
             .await
             .expect("reverse bilateral session timed out")
             .unwrap();
         assert!(matches!(
-            hub.bilateral_ping(first_id, first_id).await,
+            hub.prove_direct_path(first_id, first_id).await,
             Err(NetworkError::SameNode)
         ));
 
-        first.abort();
-        second.abort();
-        let _ = first.await;
-        let _ = second.await;
+        first.shutdown().await.unwrap();
+        second.shutdown().await.unwrap();
         tokio::time::timeout(TEST_TIMEOUT, hub.shutdown())
             .await
             .expect("Iroh hub shutdown timed out")
             .unwrap();
-        drop(origin);
     }
 
     #[tokio::test]
@@ -1807,9 +1847,10 @@ mod tests {
             .bind()
             .await
             .unwrap();
-        let (server, ticket) = Hub::bind_with_endpoint(origin_address, server_endpoint, false)
+        let (server, ticket) = Hub::bind_with_endpoint(server_endpoint, false)
             .await
             .unwrap();
+        TcpBridge::publish(&server, origin_address).await.unwrap();
 
         let invalid_client = Endpoint::builder(presets::Minimal)
             .relay_mode(iroh::RelayMode::Disabled)
@@ -1854,11 +1895,10 @@ mod tests {
             .bind()
             .await
             .unwrap();
-        let connector = tokio::spawn(NodeConnector::serve_with_endpoint(
-            ticket,
-            downstream,
-            client_endpoint,
-        ));
+        let node = Node::join_with_endpoint(ticket, client_endpoint)
+            .await
+            .unwrap();
+        let connector = tokio::spawn(async move { TcpBridge::connect(&node, downstream).await });
 
         tokio::time::timeout(TEST_TIMEOUT, async {
             let mut clients = JoinSet::new();

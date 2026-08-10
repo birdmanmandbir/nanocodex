@@ -1423,7 +1423,7 @@ impl TryFrom<WireTreatment> for EvaluationTreatment {
 mod tests {
     use std::{fs, path::Path};
 
-    use nanocodex_network::{Hub, NodeConnector};
+    use nanocodex_network::{Hub, Node, TcpBridge};
     use rusqlite::Connection;
     use tokio::{sync::Semaphore, task::JoinHandle};
 
@@ -1535,10 +1535,12 @@ thinking = ["high"]
             .bind()
             .await
             .unwrap();
-        let (iroh_server, ticket) =
-            Hub::bind_with_endpoint(coordinator_address, server_endpoint, false)
-                .await
-                .unwrap();
+        let (iroh_server, ticket) = Hub::bind_with_endpoint(server_endpoint, false)
+            .await
+            .unwrap();
+        TcpBridge::publish(&iroh_server, coordinator_address)
+            .await
+            .unwrap();
         let bridge_listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
@@ -1548,16 +1550,15 @@ thinking = ["high"]
             .bind()
             .await
             .unwrap();
+        let node = Node::join_with_endpoint(ticket, client_endpoint)
+            .await
+            .unwrap();
         let server = tokio::spawn(async move {
             tokio::select! {
                 result = CoordinatorServer::new(evaluation).serve(coordinator_listener) => {
                     result.unwrap();
                 }
-                result = NodeConnector::serve_with_endpoint(
-                    ticket,
-                    bridge_listener,
-                    client_endpoint,
-                ) => {
+                result = TcpBridge::connect(&node, bridge_listener) => {
                     result.unwrap();
                 }
             }

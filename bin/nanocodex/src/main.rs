@@ -18,6 +18,7 @@ mod eval;
 mod mcp;
 #[cfg_attr(not(feature = "tempo"), path = "mpp_disabled.rs")]
 mod mpp;
+mod network;
 mod observability;
 mod run;
 mod subagents;
@@ -96,6 +97,8 @@ enum Command {
     Credits(credits::Credits),
     /// Run and inspect durable VM-backed agent evaluations.
     Eval(eval::Eval),
+    /// Join and publish services over the Nanocodex network topology.
+    Network(network::Network),
     /// Internal entrypoint for one dedicated libkrun VMM process.
     #[command(hide = true)]
     VmRunConfig(vm::VmRunConfig),
@@ -182,6 +185,7 @@ async fn run(cli: Cli) -> Result<()> {
         #[cfg(feature = "tempo")]
         Some(Command::Credits(command)) => command.run().await,
         Some(Command::Eval(command)) => command.run().await,
+        Some(Command::Network(command)) => command.run().await,
         Some(Command::VmRunConfig(_)) => unreachable!("VMM commands run before Tokio starts"),
         Some(Command::Run(command)) => {
             let _observability = command.observability.install(false, command.agent.cwd())?;
