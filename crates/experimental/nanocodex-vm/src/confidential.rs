@@ -267,7 +267,7 @@ impl ConfidentialHostReport {
             profile,
             HostFacts::detect(),
             LibkrunFacts::from(capabilities),
-            false,
+            true,
             NvidiaFacts::unavailable(),
         )
     }

@@ -156,6 +156,8 @@ pub struct VmConfig {
     shared_directories: Vec<SharedDirectory>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     confidential_profile: Option<ConfidentialVmProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tdx_qgs_socket: Option<PathBuf>,
 }
 
 impl VmConfig {
@@ -170,6 +172,7 @@ impl VmConfig {
             block_devices: Vec::new(),
             shared_directories: Vec::new(),
             confidential_profile: None,
+            tdx_qgs_socket: None,
         }
     }
 
@@ -183,6 +186,7 @@ impl VmConfig {
             block_devices: Vec::new(),
             shared_directories: Vec::new(),
             confidential_profile: None,
+            tdx_qgs_socket: None,
         }
     }
 
@@ -208,6 +212,7 @@ impl VmConfig {
             block_devices: Vec::new(),
             shared_directories: Vec::new(),
             confidential_profile: None,
+            tdx_qgs_socket: None,
         }
     }
 
@@ -254,6 +259,17 @@ impl VmConfig {
     #[must_use]
     pub const fn confidential(mut self, profile: ConfidentialVmProfile) -> Self {
         self.confidential_profile = Some(profile);
+        self
+    }
+
+    /// Relays guest vsock port 4050 to this host Intel QGS Unix socket.
+    ///
+    /// This is accepted only with an Intel TDX confidential profile. It
+    /// supports guest user-space quote libraries which connect directly to
+    /// QGS; Linux TSM `GetQuote` hypercall handling still requires VMM support.
+    #[must_use]
+    pub fn tdx_quote_generation_socket(mut self, socket: impl Into<PathBuf>) -> Self {
+        self.tdx_qgs_socket = Some(socket.into());
         self
     }
 
@@ -310,6 +326,12 @@ impl VmConfig {
     pub const fn confidential_profile(&self) -> Option<&ConfidentialVmProfile> {
         self.confidential_profile.as_ref()
     }
+
+    /// Returns the host Intel QGS Unix socket relayed to guest port 4050.
+    #[must_use]
+    pub fn tdx_qgs_socket(&self) -> Option<&Path> {
+        self.tdx_qgs_socket.as_deref()
+    }
 }
 
 #[cfg(test)]
@@ -353,6 +375,18 @@ mod tests {
         assert_eq!(
             confidential.confidential_profile(),
             Some(&ConfidentialVmProfile::amd_sev_snp())
+        );
+    }
+
+    #[test]
+    fn tdx_quote_generation_transport_is_explicit() {
+        let config = VmConfig::ext4("rootfs.ext4")
+            .confidential(ConfidentialVmProfile::intel_tdx())
+            .tdx_quote_generation_socket("/run/tdx-qgs/qgs.socket");
+
+        assert_eq!(
+            config.tdx_qgs_socket(),
+            Some(Path::new("/run/tdx-qgs/qgs.socket"))
         );
     }
 

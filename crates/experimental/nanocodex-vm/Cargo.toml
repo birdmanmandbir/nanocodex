@@ -21,13 +21,11 @@ host = [
     "dep:flate2",
     "dep:fs2",
     "dep:futures-util",
-    "dep:hex",
     "dep:ignore",
     "dep:krun",
     "dep:nix",
     "dep:oci-client",
     "dep:reflink-copy",
-    "dep:sha2",
     "dep:shlex",
     "dep:tar",
     "dep:tempfile",
@@ -35,7 +33,11 @@ host = [
     "dep:zstd",
     "nanocodex-tools/native",
 ]
-guest-runtime = ["dep:nix", "nanocodex-tools/workspace-runtime"]
+guest-runtime = [
+    "dep:aws-nitro-enclaves-nsm-api",
+    "dep:nix",
+    "nanocodex-tools/workspace-runtime",
+]
 # Dedicated host artifacts select exactly one libkrun TEE implementation. These
 # features are intentionally not part of `host` or the ordinary workspace build.
 libkrun-amd-sev = ["host", "krun/amd-sev"]
@@ -44,12 +46,17 @@ libkrun-intel-tdx = ["host", "krun/tdx"]
 [dependencies]
 base64.workspace = true
 filetime.workspace = true
+hex.workspace = true
 nanocodex-tools = { path = "../../nanocodex-tools", version = "0.3.0", default-features = false }
 nix = { workspace = true, optional = true, features = ["fs", "mount"] }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "process", "rt", "rt-multi-thread", "sync", "time"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aws-nitro-enclaves-nsm-api = { version = "0.5.2", optional = true }
 
 [target.'cfg(any(all(target_os = "linux", not(target_env = "musl")), all(target_os = "macos", target_arch = "aarch64")))'.dependencies]
 arcbox-ext4 = { workspace = true, optional = true }
@@ -57,12 +64,10 @@ async-trait = { workspace = true, optional = true }
 flate2 = { workspace = true, optional = true }
 fs2 = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
-hex = { workspace = true, optional = true }
 ignore = { workspace = true, optional = true }
 krun = { workspace = true, optional = true }
 oci-client = { workspace = true, optional = true }
 reflink-copy = { workspace = true, optional = true }
-sha2 = { workspace = true, optional = true }
 shlex = { workspace = true, optional = true }
 tar = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }

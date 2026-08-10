@@ -5,11 +5,14 @@
 #[cfg(all(feature = "libkrun-amd-sev", feature = "libkrun-intel-tdx"))]
 compile_error!("one VMM artifact cannot contain both AMD SEV-SNP and Intel TDX libkrun variants");
 
-#[cfg(all(
-    feature = "host",
-    any(
-        all(target_os = "linux", not(target_env = "musl")),
-        all(target_os = "macos", target_arch = "aarch64")
+#[cfg(any(
+    all(feature = "guest-runtime", target_os = "linux"),
+    all(
+        feature = "host",
+        any(
+            all(target_os = "linux", not(target_env = "musl")),
+            all(target_os = "macos", target_arch = "aarch64")
+        )
     )
 ))]
 mod attestation;
@@ -29,6 +32,8 @@ mod capabilities;
     )
 ))]
 mod child_lifetime;
+#[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+mod guest_attestation;
 #[cfg(all(
     feature = "host",
     any(
@@ -61,6 +66,8 @@ mod confidential;
     )
 ))]
 mod config;
+#[cfg(all(feature = "host", target_os = "linux", not(target_env = "musl")))]
+mod devices;
 #[cfg(all(
     feature = "host",
     any(
@@ -93,6 +100,8 @@ pub mod image;
     )
 ))]
 mod krun;
+#[cfg(all(feature = "host", target_os = "linux", not(target_env = "musl")))]
+mod nvidia_verification;
 #[cfg(any(
     all(feature = "guest-runtime", target_os = "linux"),
     all(
@@ -130,6 +139,14 @@ pub mod tools;
         all(target_os = "macos", target_arch = "aarch64")
     )
 ))]
+mod verification;
+#[cfg(all(
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 mod workspace;
 
 /// Low-level host-side VM configuration and lifecycle components.
@@ -145,10 +162,19 @@ mod workspace;
     )
 ))]
 pub mod host {
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    pub use crate::devices::{
+        ConfidentialDeviceBundle, ConfidentialPciDevice, ConfidentialPciRole, DeviceBundleError,
+        PciAddress, ResolvedConfidentialDeviceBundle,
+    };
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    pub use crate::nvidia_verification::NvidiaNvattestVerifier;
+
     pub use crate::{
         attestation::{
             AttestationBinding, AttestationChallenge, AttestationInputError, AttestedComponent,
-            EvidenceProfile, MAX_RAW_EVIDENCE_BYTES, RawEvidence,
+            CpuAttestationProfile, EvidenceProfile, GuestAttestationBundle,
+            GuestAttestationRequest, MAX_RAW_EVIDENCE_BYTES, NvidiaAttestationProfile, RawEvidence,
         },
         capabilities::{Capabilities, KrunFeature},
         command::GuestCommand,
@@ -165,6 +191,23 @@ pub mod host {
         krun::{KrunVm, KrunVmControl, VmError},
         overlay::{OverlayDiskError, create_sparse_overlay_disk, overlay_guest_command},
         process::{PrivateVmProcessConfig, VmProcessConfig, VmProcessError},
+        verification::{
+            AttestationVerificationError, NativeEvidenceVerifier, NativeVerificationContext,
+            NativeVerificationError, NativeVerifierSet, VerifiedAttestation, VerifiedNativeBinding,
+            VerifiedNativeEvidence, VerifiedNvidiaFabric, verify_attestation,
+        },
+    };
+}
+
+/// Guest-side collection of native confidential-computing evidence.
+#[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+pub mod guest {
+    pub use crate::{
+        attestation::{
+            AttestationChallenge, AttestationInputError, CpuAttestationProfile,
+            GuestAttestationBundle, GuestAttestationRequest, NvidiaAttestationProfile,
+        },
+        guest_attestation::{GuestAttestationError, collect_attestation},
     };
 }
 

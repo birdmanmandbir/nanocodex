@@ -77,8 +77,9 @@ evaluated separately.
    upstream patch after typed TEE selection lands.
 4. Add explicit SNP launch policy and host-data/measurement inputs; typed TEE
    selection alone is not an attestation interface.
-5. Implement the measured guest attester and native report channel before
-   Nanocodex can mark `MeasuredGuestAttester` available.
+5. Integrate the implemented measured guest attester and native report channel
+   into the long-lived startup/key-release protocol before issuing an attested
+   VM capability.
 6. Build the exact SEV and TDX libkrun/libkrunfw pairs and retain their revision
    and firmware identities in the measured-workload manifest.
 

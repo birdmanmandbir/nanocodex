@@ -6,6 +6,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ConfidentialVmProfile::amd_sev_snp(),
         ConfidentialVmProfile::intel_tdx(),
         ConfidentialVmProfile::aws_nitro(),
+        ConfidentialVmProfile::amd_sev_snp().nvidia_b200_single(),
+        ConfidentialVmProfile::intel_tdx().nvidia_b200_hgx_8_encrypted_nvlink(),
     ] {
         let report = capabilities.confidential_report(&profile);
         let status = if report.is_supported() {

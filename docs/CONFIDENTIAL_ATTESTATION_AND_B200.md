@@ -3,12 +3,15 @@
 ## Decision
 
 PR #141 remains draft until it has live evidence from the hardware it claims to
-support. Development proceeds in three independently testable layers:
+support. The software boundary now implements substantial parts of three
+independently testable layers:
 
-1. a measured guest attester and native CPU-TEE verification;
-2. audited libkrun VFIO/IOMMUFD assignment for one exact device bundle; and
-3. composite CPU, GPU, switch, and topology appraisal before a GPU becomes
-   ready or any secret is released.
+1. a measured guest evidence collector, verifier interface, local NVIDIA
+   verifier, and fail-closed composite verification;
+2. exact Linux PCI/IOMMU bundle resolution before the still-missing audited
+   libkrun VFIO/IOMMUFD assignment boundary; and
+3. typed CPU, GPU, switch, and topology appraisal policy, not yet integrated
+   into guest startup, GPU ReadyState, or secret release.
 
 The first NVIDIA targets are deliberately exact:
 
@@ -24,6 +27,13 @@ profile because NVIDIA documents its GPU-to-GPU NVLink/NVSwitch traffic as
 unencrypted. Blackwell MPT CC explicitly provides encrypted peer-to-peer
 NVLink for up to eight GPUs.
 
+NVIDIA's current Blackwell multi-GPU attestation guide says MPT support is
+still waiting for driver support and that the SDK currently appraises GPUs
+independently rather than the topology or switches. The 8-GPU implementation
+is therefore intentionally fail-closed: its typed path and exact evidence
+counts exist, but the profile cannot pass live appraisal until NVIDIA ships
+and documents those signed topology/switch claims.
+
 Primary NVIDIA references:
 
 - [R595 trusted-computing release notes](https://docs.nvidia.com/595trd1-trusted-computing-solutions-release-notes.pdf)
@@ -32,19 +42,24 @@ Primary NVIDIA references:
 - [Fabric Manager topology and assignment guide](https://docs.nvidia.com/hgx-platforms/fabric-manager-user-guide/index.html)
 - [GPU and switch attestation](https://docs.nvidia.com/attestation/attestation-client-tools-sdk/latest/gpu_and_switch_attestation.html)
 - [NVIDIA attestation claims](https://docs.nvidia.com/attestation/advanced-documentation/latest/claims-guide/introduction.html)
+- [Blackwell multi-GPU attestation](https://docs.nvidia.com/attestation/quick-start-guide/latest/attestation-examples/blackwell_multi_gpu.html)
+- [NVIDIA System Management Interface](https://docs.nvidia.com/deploy/nvidia-smi/index.html)
 
 ## Measured guest attester
 
-The attester is a small static guest program built separately from the agent and
-workspace-tool runtime. It owns a bounded request/response protocol over a
-dedicated vsock port. The host is only a byte relay and is never trusted to
-construct evidence or an appraisal result.
+The attester is a mode of the small static `nanocodex-vm-guest` program built
+separately from the agent. `nanocodex-vm-guest --attest` accepts one bounded
+JSON request on stdin and emits one bounded evidence bundle. The existing VM
+transport can relay those bytes, but the host is never trusted to construct
+evidence or an appraisal result.
 
 For every launch it:
 
 1. receives a versioned challenge containing a 256-bit nonce, policy identity,
    expiry, and expected workload-manifest digest;
-2. generates a fresh signing/key-agreement key inside the confidential guest;
+2. receives a fresh signing/key-agreement public key from the caller's measured
+   in-guest supervisor (private-key generation and lifecycle remain owned by
+   that supervisor);
 3. enumerates required child devices and collects their nonce-bound evidence;
 4. hashes the ordered child evidence and topology into the canonical
    `AttestationBinding` transcript;
@@ -57,15 +72,22 @@ Requests, responses, individual evidence objects, and the complete bundle have
 independent byte/count/depth limits. Cancellation closes the channel and kills
 the VMM through the existing process-group lifecycle.
 
+The native bundle types, base64 encoding, exact component ordering, transcript
+digest, and verifier boundary are shared by host and guest builds. The Linux
+collector is tested on x86-64 Ubuntu with warnings denied; live hardware tests
+remain mandatory.
+
 ### AMD SEV-SNP
 
-The guest opens `/dev/sev-guest` and uses `SNP_GET_EXT_REPORT`, falling back to
-`SNP_GET_REPORT` only when certificate collateral is supplied independently.
+The guest uses Linux's configfs TSM report ABI. The `sev_guest` provider emits
+the native SNP report in `outblob` and the GHCB certificate table in `auxblob`.
 The 32-byte transcript digest is copied into the first half of the 64-byte
-`REPORT_DATA`; the remaining half is zero and verified as zero. The verifier
-checks the VCEK/VLEK chain, report signature, chip/TCB identity, VMPL, policy,
-debug/migration/SMT requirements, launch measurement, freshness, and exact
-report-data binding. The Linux ABI is specified by the
+`REPORT_DATA`; the remaining half is zero and verified as zero. The native
+verifier must check the VCEK/VLEK chain, report signature, chip/TCB identity,
+VMPL, policy, debug/migration/SMT requirements, launch measurement, freshness,
+and exact report-data binding. That concrete backend remains to be implemented
+with memory-safe report/certificate parsing and explicit caller roots. The
+Linux ABI is specified by the
 [SEV guest API](https://docs.kernel.org/virt/coco/sev-guest.html).
 
 The measured manifest must reproduce libkrun's injected firmware, kernel,
@@ -75,14 +97,22 @@ dm-verity and its root hash is included in measured boot state.
 
 ### Intel TDX
 
-The guest generates a TDREPORT with the same 64-byte report-data convention.
-A host Quoting Generation Service converts it to a remotely verifiable DCAP
-quote over a dedicated vsock relay. The QGS and relay are untrusted for
+The guest uses the `tdx_guest` TSM provider to generate a TDREPORT with the
+same 64-byte report-data convention and return a DCAP quote. A host Quote
+Generation Service must service the guest's `GetQuote` hypercall. The QGS and relay are untrusted for
 correctness; signature and collateral verification are authoritative. The
-verifier checks quote signatures, PCK chain and CRLs, QE identity, TDX module
-identity, TCB status, attributes, XFAM, MRTD, all owned RTMRs, freshness, and
-report-data binding. Intel's two-stage TDREPORT/quote model is described in the
+native verifier must check quote signatures, PCK chain and CRLs, QE identity,
+TDX module identity, TCB status, attributes, XFAM, MRTD, all owned RTMRs,
+freshness, and report-data binding. The audited DCAP QVL boundary remains to be
+implemented. Intel's two-stage TDREPORT/quote model is described in the
 [Linux TDX documentation](https://docs.kernel.org/arch/x86/tdx.html).
+
+`VmConfig::tdx_quote_generation_socket` now maps an explicitly selected host
+QGS Unix socket to guest vsock port 4050 using libkrun's existing bounded IPC
+mapping. That makes direct guest user-space DCAP libraries possible and is
+rejected for non-TDX profiles. It does not satisfy configfs TSM by itself:
+libkrun still needs to handle the TDX `GetQuote` hypercall and relay its shared
+128-KiB request buffer to QGS.
 
 RTMR ownership is fixed before implementation: firmware/boot owns one register,
 the authenticated root and attester manifest own one, and later runtime
@@ -92,12 +122,14 @@ baseline.
 
 ### AWS Nitro Enclaves
 
-The guest requests a COSE-signed attestation document from the Nitro Secure
-Module. The challenge nonce uses the native `nonce` field, the guest public key
-uses `public_key`, and the workload transcript uses `user_data`, each within
-Nitro's 1024-byte bounds. Verification covers the AWS root and CA bundle,
-certificate validity, COSE signature, timestamp, module identity, expected
-PCRs, and all three bindings. AWS documents the exact CBOR structure and
+The guest requests a COSE-signed attestation document directly through AWS's
+Rust NSM API. The challenge nonce uses the native `nonce` field, the guest
+public key uses `public_key`, and the 32-byte workload transcript uses
+`user_data`. Verification must cover the AWS root and CA bundle, certificate
+validity, COSE signature, timestamp, module identity, expected PCRs, and all
+three bindings. The composite verifier now requires exact native nonce,
+public-key, and user-data claims; the concrete bounded COSE/X.509 backend
+remains to be implemented. AWS documents the exact CBOR structure and
 validation flow in [Verifying the root of trust](https://docs.aws.amazon.com/enclaves/latest/user/verify-root.html).
 
 Nitro keeps a dedicated launch/image path; it is not represented as a KVM VM
@@ -129,6 +161,16 @@ reset ownership, and exact topology. libkrun then owns:
 
 The initial API accepts only NVIDIA vendor `10de` and the reviewed B200 device
 IDs/topologies. General VFIO assignment is out of scope.
+
+`ConfidentialDeviceBundle` now implements the pre-libkrun half of this
+boundary. It accepts only canonical full PCI BDFs, pins B200 to `10de:2901`,
+requires one GPU for the single profile or eight GPUs plus four explicit CX-7
+bridge functions for HGX, rejects duplicates, checks every vendor/device ID,
+requires `vfio-pci`, resolves every IOMMU group, and rejects any unassigned
+group sibling. CX-7 VPD, reset ownership, CC mode, and link state deliberately
+remain additional live admission gates rather than being inferred from PCI
+IDs. The pinned libkrun still lacks PCI/VFIO/IOMMUFD, so this resolved bundle
+cannot yet be attached.
 
 ### One B200
 
@@ -176,9 +218,12 @@ but it is not treated as proof that an arbitrary workload executed.
 
 ## Verification boundary
 
-Native evidence is always retained. A backend adapter can use a reviewed vendor
-library, but the public API receives typed policy and returns typed component
-claims; it does not accept a vendor `success: true` boolean as sufficient.
+Native evidence is always retained. `NativeEvidenceVerifier` is the explicit
+vendor cryptographic boundary and `verify_attestation` independently enforces
+challenge freshness, exact requested topology, exact evidence digests,
+CPU-to-child transcript binding, nonce binding, secure boot, disabled debug,
+measurement policy, and NVIDIA fabric mode. Only that function can produce a
+`VerifiedAttestation`; a vendor `success: true` boolean is insufficient.
 
 - SNP verification starts with a memory-safe native report parser and explicit
   AMD roots/collateral.
@@ -190,19 +235,31 @@ claims; it does not accept a vendor `success: true` boolean as sufficient.
   explicit trust/availability choice. Detached EAT/JWT results and the raw SPDM
   evidence they appraise are both retained.
 
+`NvidiaNvattestVerifier` now implements the local NVIDIA side. It reconstructs
+one bounded evidence file per component, invokes NVAT with the exact challenge
+nonce and a mandatory operator Rego policy, requires one claim and a detached EAT,
+and checks device type, nonce, secure boot, debug state, measurement result,
+architecture, parse status, and report signature. A single GPU is classified
+as having no signed switch relationship when its claim has no switch PDI, but
+that does not prove every NVLink is disabled because the current claim schema
+has no link-state field. Neither disabled NVLink nor encrypted MPT is inferred,
+which keeps both exact GPU profiles closed until the additional measured guest
+observation or signed vendor claim is present.
+
 No verifier performs ambient network access. Collateral resolution happens
 before appraisal through a caller-selected offline or online resolver and all
 bytes, provenance, validity intervals, and appraisal time enter the result.
 
 ## Ordered implementation and live gates
 
-1. Finish `EvidenceBundle`, endorsements/reference values, component graph,
-   appraisal result, and unforgeable `AttestedVm` types.
-2. Build the static attester plus malicious-relay protocol tests.
-3. Add SNP collection, verification fixtures, measurement tooling, then a live
+1. Add concrete SNP, TDX/DCAP, Nitro, and NVIDIA implementations of the now
+   typed `NativeEvidenceVerifier` boundary with retained collateral.
+2. Integrate `--attest` into VM startup and key-release gating, with
+   malicious-relay protocol tests.
+3. Add SNP verification fixtures, measurement tooling, then a live
    SNP record.
-4. Add TDX QGS relay, DCAP verification, fixtures, then a live TDX record.
-5. Repair Nitro's dedicated libkrun path and produce a live Nitro record.
+4. Add the missing libkrun TDX QGS relay, DCAP fixtures, then a live TDX record.
+5. Finish Nitro's dedicated libkrun launch path and produce a live Nitro record.
 6. Land libkrun IOMMUFD/VFIO support and validate one B200 with CPU-plus-GPU
    appraisal before enabling ReadyState.
 7. Extend the device bundle to the exact eight-GPU/two-switch/CX-7 topology,
@@ -213,3 +270,7 @@ bytes, provenance, validity intervals, and appraisal time enter the result.
 or GPU devices required by gates 3 through 7. Hardware claims therefore need
 separate labelled SNP, TDX, Nitro, and HGX/DGX B200 runners. PR #141 stays
 draft, and the runtime gate remains closed, until those records exist.
+
+The retained artifact layout, positive gates, and mandatory tamper matrix are
+defined in
+[`CONFIDENTIAL_HARDWARE_VALIDATION.md`](CONFIDENTIAL_HARDWARE_VALIDATION.md).

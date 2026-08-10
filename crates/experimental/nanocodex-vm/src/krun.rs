@@ -6,7 +6,10 @@
 use std::{
     ffi::{CString, NulError, OsStr, c_char},
     io,
-    os::{fd::AsRawFd, unix::ffi::OsStrExt},
+    os::{
+        fd::AsRawFd,
+        unix::{ffi::OsStrExt, fs::FileTypeExt as _},
+    },
     path::PathBuf,
     ptr,
 };
@@ -140,6 +143,15 @@ pub enum VmError {
     /// A caller reused a context already handed to the VMM loop.
     #[error("the libkrun context has already entered the VM")]
     ContextConsumed,
+
+    /// The configured Intel QGS Unix socket could not be resolved.
+    #[error("failed to resolve Intel QGS socket {path}: {source}")]
+    ResolveTdxQgsSocket {
+        /// Configured socket path.
+        path: PathBuf,
+        /// Underlying filesystem failure.
+        source: io::Error,
+    },
 }
 
 /// A configured libkrun VM which has not entered its blocking event loop yet.
@@ -249,6 +261,7 @@ impl KrunVm {
         )?;
 
         attach_network(context, config.network_value())?;
+        attach_tdx_qgs(context, config)?;
         check(
             krun::krun_split_irqchip(context, config.confidential_profile().is_some()),
             "configure interrupt controller",
@@ -502,6 +515,44 @@ fn attach_network(context: u32, network: &Network) -> Result<(), VmError> {
     Ok(())
 }
 
+const TDX_QGS_VSOCK_PORT: u32 = 4050;
+
+fn attach_tdx_qgs(context: u32, config: &VmConfig) -> Result<(), VmError> {
+    let Some(socket) = config.tdx_qgs_socket() else {
+        return Ok(());
+    };
+    let metadata = socket
+        .metadata()
+        .map_err(|source| VmError::ResolveTdxQgsSocket {
+            path: socket.to_owned(),
+            source,
+        })?;
+    if !metadata.file_type().is_socket() {
+        return Err(VmError::InvalidConfig(
+            "Intel QGS path must identify a Unix socket",
+        ));
+    }
+    let socket = socket
+        .canonicalize()
+        .map_err(|source| VmError::ResolveTdxQgsSocket {
+            path: socket.to_owned(),
+            source,
+        })?;
+    if !matches!(config.network_value(), Network::Internet) {
+        check(
+            krun::krun_add_vsock(context, 0),
+            "attach Intel QGS vsock transport",
+        )?;
+    }
+    let socket = c_string(socket.as_os_str(), "Intel QGS socket path")?;
+    // SAFETY: the C string remains valid through the call and libkrun copies
+    // its contents into the configuration context.
+    check(
+        unsafe { krun::krun_add_vsock_port(context, TDX_QGS_VSOCK_PORT, socket.as_ptr()) },
+        "attach Intel QGS socket relay",
+    )
+}
+
 const COMPATIBLE_NETWORK_FEATURES: u32 = NET_FEATURE_CSUM
     | NET_FEATURE_GUEST_CSUM
     | NET_FEATURE_GUEST_TSO4
@@ -663,6 +714,15 @@ fn validate_confidential_config(config: &VmConfig) -> Result<(), ConfidentialVmE
             "confidential VMs cannot expose host directories through virtiofs",
         ));
     }
+    if config.tdx_qgs_socket().is_some()
+        && config
+            .confidential_profile()
+            .is_none_or(|profile| profile.cpu_tee() != CpuTee::IntelTdx)
+    {
+        return Err(ConfidentialVmError::InvalidConfig(
+            "Intel QGS transport requires an Intel TDX profile",
+        ));
+    }
     Ok(())
 }
 
@@ -732,7 +792,7 @@ mod tests {
         GuestCommand, VmError, array_string, validate_confidential_config, validate_guest_command,
     };
     use crate::{
-        confidential::{ConfidentialCapability, ConfidentialVmError, ConfidentialVmProfile},
+        confidential::{ConfidentialVmError, ConfidentialVmProfile},
         config::{SharedDirectory, VmConfig},
     };
 
@@ -783,6 +843,18 @@ mod tests {
     }
 
     #[test]
+    fn qgs_transport_rejects_non_tdx_profiles() {
+        let config = VmConfig::ext4("root.ext4")
+            .confidential(ConfidentialVmProfile::amd_sev_snp())
+            .tdx_quote_generation_socket("/run/tdx-qgs/qgs.socket");
+
+        assert_eq!(
+            validate_confidential_config(&config).unwrap_err(),
+            ConfidentialVmError::InvalidConfig("Intel QGS transport requires an Intel TDX profile")
+        );
+    }
+
+    #[test]
     fn confidential_preflight_fails_before_root_or_context_creation() {
         let config = VmConfig::ext4("/path/which/must/not/be-resolved.ext4")
             .confidential(ConfidentialVmProfile::amd_sev_snp());
@@ -796,7 +868,7 @@ mod tests {
         if let VmError::Confidential(ConfidentialVmError::UnsupportedProfile { missing, .. }) =
             error
         {
-            assert!(missing.contains(&ConfidentialCapability::MeasuredGuestAttester));
+            assert!(!missing.is_empty());
         }
     }
 }

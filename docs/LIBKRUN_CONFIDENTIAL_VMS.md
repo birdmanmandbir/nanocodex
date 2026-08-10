@@ -2,8 +2,9 @@
 
 ## Status and objective
 
-This document is the implementation plan for making `nanocodex-vm` an owned
-library boundary for launching and attesting confidential VMs through libkrun.
+This document records the implementation and remaining hardware gates for
+making `nanocodex-vm` an owned library boundary for launching and attesting
+confidential VMs through libkrun.
 It is intentionally about the VM and its attached confidential devices. Agent
 scheduling, fleet placement, model behavior, and proof that an arbitrary
 command executed are separate consumers and are not part of this program.
@@ -97,7 +98,8 @@ Endorsements, Reference Values, Appraisal Policy, Attestation Results, and the
 Relying Party. EAT and RATS conceptual-message wrappers are preferred for
 interchange, but native evidence is always retained byte-for-byte.
 
-The core types belong in the experimental `nanocodex-vm` crate initially:
+The first set of core types now belongs in the experimental `nanocodex-vm`
+crate:
 
 - `ConfidentialVmProfile`: exact requested TEE, resource, policy, device, and
   evidence requirements;
@@ -111,18 +113,25 @@ The core types belong in the experimental `nanocodex-vm` crate initially:
   measured guest component;
 - `EvidenceBinding`: the mechanism binding parent, child, challenge, key, and
   topology rather than merely asserting that they belong together;
-- `EvidenceBundle`: ordered native evidence and a component/binding graph;
+- `GuestAttestationBundle`: ordered native evidence and its parent transcript;
 - `ReferenceValues` and `Endorsements`: caller-provided or explicitly resolved
   verification inputs with provenance and validity;
 - `ComponentAppraisal`: native verified claims without lossy normalization;
-- `AttestationResult`: the complete component graph, appraisals, warnings,
-  policy identity, and terminal decision; and
-- `AttestedVm`: the live VM capability paired with the accepted result and
-  attested session public key.
+- `VerifiedNativeEvidence`: claims returned by a trusted vendor verifier; and
+- `VerifiedAttestation`: the only composite success type, carrying accepted
+  claims, exact evidence, workload digest, and attested session public key.
 
 Known evidence profiles receive typed adapters. Unknown evidence is never
 accepted by generic parsing. Callers may supply a verifier implementation for
 a known profile, but there is no dynamically loaded plugin framework.
+
+`nanocodex-vm-guest --attest` now collects SNP and TDX evidence through Linux
+TSM configfs, Nitro evidence directly through AWS's NSM API, and exact-count
+NVIDIA GPU/NVSwitch evidence through `nvattest`. Accelerator evidence is
+collected first and its ordered digests are included in the CPU report-data
+transcript. `verify_attestation` recomputes that transcript and refuses to
+issue `VerifiedAttestation` until every vendor-native verifier and composite
+policy check succeeds.
 
 ## Key and evidence binding protocol
 
@@ -229,6 +238,12 @@ specified in
 The eight-GPU target is Blackwell MPT CC; Hopper PPCIe does not satisfy its
 encrypted-NVLink requirement.
 
+As of August 2026, NVIDIA's own Blackwell multi-GPU attestation documentation
+says MPT support is waiting for driver support and does not yet attest topology
+or switches. The 8-GPU code path therefore remains deliberately impossible to
+approve until NVIDIA supplies those claims; counts or a successful NCCL run do
+not weaken that gate.
+
 ### AMD trusted I/O and other confidential devices
 
 - Track SEV-TIO/TDISP support in host KVM, firmware, libkrun, and concrete
@@ -332,9 +347,10 @@ pinned libkrun revision requires them.
   device API at the pinned revision.
 - [x] Choose the separate-artifact layout and prove generic workspace builds do
   not feature-unify confidential variants.
-- [ ] Define the profile, capability report, challenge, raw evidence,
-  component graph, binding, reference, endorsement, and result types.
-- [ ] Define canonical transcript hashing and key binding with test vectors.
+- [x] Define the initial profile, capability report, challenge, raw evidence,
+  component, binding, verifier-claims, and composite-result types. Reference
+  values and endorsements remain native-verifier inputs.
+- [x] Define canonical transcript hashing and key binding with test vectors.
 - [ ] Establish a retained, redistributable fixture corpus of valid and invalid
   native evidence, collateral, reference values, and expected appraisals.
 - [ ] Add parsers with strict size/depth bounds and fuzz targets before
@@ -346,14 +362,14 @@ construct `AttestedVm` without a successful result.
 
 ### Slice 1: reproducible measured guest
 
-- [ ] Build a minimal static in-guest attester separately from the workspace
-  tool runtime.
+- [x] Add a bounded evidence-collection mode to the minimal static guest
+  executable, separate from agent orchestration.
 - [ ] Produce a manifest covering VMM, libkrun, firmware, kernel, initrd,
   command line, attester, root image, and dm-verity root.
 - [ ] Make immutable confidential roots reproducible and verifiable before
   mounting writable state.
-- [ ] Add the challenge/evidence handshake over a bounded transport while
-  treating the host relay as malicious.
+- [x] Add a single-request challenge/evidence protocol with bounded input,
+  output, subprocess streams, component counts, and native evidence.
 - [ ] Prove guest private keys never enter launch records, host tracing, console
   diagnostics, or retained host files.
 
@@ -364,7 +380,7 @@ VMM exactly once.
 ### Slice 2: live SEV-SNP vertical
 
 - [ ] Complete the SNP libkrun upstream fixes and dedicated artifact.
-- [ ] Implement strict SNP host detection and configuration validation.
+- [x] Implement strict SNP host detection and configuration validation.
 - [ ] Launch the measured guest on real SNP hardware and collect fresh reports.
 - [ ] Verify the complete AMD chain and policy locally from retained inputs.
 - [ ] Bind an ephemeral guest key and dm-verity root to `REPORT_DATA` and the
@@ -383,7 +399,7 @@ to demonstrate the contract.
 
 - [ ] Complete the TDX libkrun, firmware, and quote-generation path.
 - [ ] Implement DCAP collateral resolution with explicit offline/online policy.
-- [ ] Bind the same protocol transcript into TDX report data.
+- [x] Bind the same protocol transcript into TDX report data.
 - [ ] Define and test MRTD/RTMR ownership and authenticated-root measurement.
 - [ ] Port the SNP lifecycle and tamper suite without erasing TDX-specific
   claims.
@@ -396,8 +412,9 @@ evidence, appraisal, policy, and limitations remain backend-specific.
 
 - [ ] Complete the libkrun Nitro upstream repairs and artifact build.
 - [ ] Build a reproducible EIF containing the measured attester.
-- [ ] Collect and verify fresh Nitro documents and exact PCR policy.
-- [ ] Bind the session key using Nitro's native public-key and user-data fields.
+- [ ] Verify fresh Nitro documents and exact PCR policy through a concrete
+  native verifier (collection through NSM is implemented).
+- [x] Bind the session key using Nitro's native public-key and user-data fields.
 - [ ] Port cancellation, failure, evidence retention, and tamper tests.
 
 Exit gate: a third, structurally different TEE passes the same lifecycle
@@ -409,11 +426,16 @@ without adding a generic-cloud or scheduler abstraction.
   confidential GPU.
 - [ ] Land the minimum audited libkrun device-assignment and protected-memory
   changes.
-- [ ] Prove the protected CVM-to-GPU channel and collect native GPU evidence.
+- [x] Add exact one-B200 and eight-B200/four-CX-7 host bundles with canonical
+  PCI identity, `vfio-pci`, IOMMU-group, and complete-sibling validation.
+- [ ] Prove the protected CVM-to-GPU channel (exact-count native GPU evidence
+  collection is implemented).
 - [ ] Verify device certificates, RIMs, revocation, nonce, debug state, CC mode,
-  firmware, VBIOS, driver, UUID, and VM binding.
-- [ ] Return a composite component graph and reject CPU-only or GPU-only partial
-  success when the profile requires both.
+  firmware, VBIOS, driver, UUID, and VM binding. The local NVAT adapter now
+  verifies and parses the native report/nonce/security claims; live policy and
+  VM-channel fixtures remain.
+- [x] Return a composite result and reject CPU-only or GPU-only partial success
+  when the profile requires both.
 - [ ] Run a deterministic GPU memory/compute workload only as a device-path
   smoke; do not label it proof of workload execution.
 
@@ -422,9 +444,10 @@ mix evidence from another VM without appraisal failure.
 
 ### Slice 6: multi-GPU, NVSwitch, and additional devices
 
-- [ ] Add multiple independently identified GPU components.
+- [x] Add multiple independently ordered GPU components.
 - [ ] Add NVSwitch/fabric evidence and protected topology edges.
-- [ ] Reject missing, duplicated, reordered, or cross-host component evidence.
+- [x] Reject missing, duplicated, reordered, or transcript-spliced component
+  evidence. Cross-host rejection still needs retained live fixtures.
 - [ ] Add AMD TIO/TDISP or another device backend only with a complete live
   evidence and verification story.
 
@@ -496,6 +519,10 @@ carried as a small, reviewed, explicitly pinned delta.
 
 Only after this gate should a separate plan define attestable command receipts
 or place Nanocodex agents inside the resulting confidential VMs.
+
+The retained record layout and mandatory positive and tamper gates for each
+hardware runner are defined in
+[`CONFIDENTIAL_HARDWARE_VALIDATION.md`](CONFIDENTIAL_HARDWARE_VALIDATION.md).
 
 ## Primary references
 

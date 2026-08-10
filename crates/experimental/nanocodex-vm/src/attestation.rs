@@ -1,6 +1,10 @@
 use std::collections::BTreeSet;
 
-use serde::{Deserialize, Serialize};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::{SeqAccess, Visitor},
+};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -10,18 +14,37 @@ const MAX_POLICY_ID_BYTES: usize = 256;
 const MAX_GUEST_PUBLIC_KEY_BYTES: usize = 4 * 1024;
 const MAX_CHILD_EVIDENCE: usize = 256;
 const MAX_MEDIA_TYPE_BYTES: usize = 128;
-const MAX_COMPONENT_ID_BYTES: usize = 256;
+const MAX_BUNDLE_EVIDENCE: usize = 11;
 
 /// Maximum native evidence size accepted for one attested component.
 pub const MAX_RAW_EVIDENCE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Fresh relying-party input which native hardware evidence must bind.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AttestationChallenge {
     nonce: [u8; 32],
     policy_id: String,
     expires_at_unix_seconds: u64,
+}
+
+impl<'de> Deserialize<'de> for AttestationChallenge {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireChallenge {
+            nonce: [u8; 32],
+            policy_id: String,
+            expires_at_unix_seconds: u64,
+        }
+
+        let wire = WireChallenge::deserialize(deserializer)?;
+        Self::new(wire.nonce, wire.policy_id, wire.expires_at_unix_seconds)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 impl AttestationChallenge {
@@ -137,24 +160,28 @@ impl AttestationBinding {
 
     /// Returns the relying-party challenge.
     #[must_use]
+    #[cfg(feature = "host")]
     pub const fn challenge(&self) -> &AttestationChallenge {
         &self.challenge
     }
 
     /// Returns the guest-generated public key.
     #[must_use]
+    #[cfg(feature = "host")]
     pub fn guest_public_key(&self) -> &[u8] {
         &self.guest_public_key
     }
 
     /// Returns the expected measured-workload manifest digest.
     #[must_use]
+    #[cfg(feature = "host")]
     pub const fn workload_manifest_digest(&self) -> &[u8; 32] {
         &self.workload_manifest_digest
     }
 
     /// Returns child evidence digests in canonical component order.
     #[must_use]
+    #[cfg(feature = "host")]
     pub fn child_evidence_digests(&self) -> &[[u8; 32]] {
         &self.child_evidence_digests
     }
@@ -197,6 +224,60 @@ pub enum EvidenceProfile {
     NvidiaNvSwitch,
 }
 
+/// Native CPU attestation mechanism requested from the guest.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CpuAttestationProfile {
+    /// AMD SEV-SNP through Linux's `sev_guest` TSM provider.
+    AmdSevSnp,
+    /// Intel TDX through Linux's `tdx_guest` TSM provider.
+    IntelTdx,
+    /// AWS Nitro Enclaves through the Nitro Secure Module.
+    AwsNitro,
+}
+
+impl CpuAttestationProfile {
+    /// Returns the native evidence profile emitted by this mechanism.
+    #[must_use]
+    pub const fn evidence_profile(self) -> EvidenceProfile {
+        match self {
+            Self::AmdSevSnp => EvidenceProfile::AmdSevSnp,
+            Self::IntelTdx => EvidenceProfile::IntelTdx,
+            Self::AwsNitro => EvidenceProfile::AwsNitro,
+        }
+    }
+}
+
+/// NVIDIA device topology whose evidence must be included in the CPU report.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NvidiaAttestationProfile {
+    /// Exactly one B200 GPU, with NVLink disabled.
+    B200Single,
+    /// Exactly eight B200 GPUs and two NVSwitches in encrypted MPT mode.
+    B200Hgx8EncryptedNvlink,
+}
+
+impl NvidiaAttestationProfile {
+    /// Returns the exact number of GPU evidence objects required.
+    #[must_use]
+    pub const fn gpu_count(self) -> usize {
+        match self {
+            Self::B200Single => 1,
+            Self::B200Hgx8EncryptedNvlink => 8,
+        }
+    }
+
+    /// Returns the exact number of NVSwitch evidence objects required.
+    #[must_use]
+    pub const fn switch_count(self) -> usize {
+        match self {
+            Self::B200Single => 0,
+            Self::B200Hgx8EncryptedNvlink => 2,
+        }
+    }
+}
+
 /// Stable identity of one independently appraised component.
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
@@ -205,23 +286,204 @@ pub enum AttestedComponent {
     CpuVm,
     /// One GPU identified by its canonical device UUID.
     NvidiaGpu {
-        /// Vendor device UUID retained without normalization.
-        uuid: String,
+        /// Stable collector ordinal; verification resolves the signed UEID.
+        index: u16,
     },
     /// One NVSwitch identified by its canonical device UUID.
     NvidiaNvSwitch {
-        /// Vendor device UUID retained without normalization.
-        uuid: String,
+        /// Stable collector ordinal; verification resolves the signed UEID.
+        index: u16,
     },
 }
 
 /// Bounded native hardware evidence retained byte-for-byte.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RawEvidence {
     component: AttestedComponent,
     profile: EvidenceProfile,
     media_type: String,
+    #[serde(serialize_with = "serialize_base64")]
     bytes: Vec<u8>,
+}
+
+impl<'de> Deserialize<'de> for RawEvidence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireEvidence {
+            component: AttestedComponent,
+            profile: EvidenceProfile,
+            media_type: String,
+            #[serde(deserialize_with = "deserialize_evidence_base64")]
+            bytes: Vec<u8>,
+        }
+
+        let wire = WireEvidence::deserialize(deserializer)?;
+        Self::new(wire.component, wire.profile, wire.media_type, wire.bytes)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Bounded request accepted by the guest attestation collector.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuestAttestationRequest {
+    challenge: AttestationChallenge,
+    #[serde(
+        serialize_with = "serialize_base64",
+        deserialize_with = "deserialize_guest_key_base64"
+    )]
+    guest_public_key: Vec<u8>,
+    workload_manifest_digest: [u8; 32],
+    cpu_profile: CpuAttestationProfile,
+    nvidia_profile: Option<NvidiaAttestationProfile>,
+}
+
+impl<'de> Deserialize<'de> for GuestAttestationRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireRequest {
+            challenge: AttestationChallenge,
+            #[serde(deserialize_with = "deserialize_guest_key_base64")]
+            guest_public_key: Vec<u8>,
+            workload_manifest_digest: [u8; 32],
+            cpu_profile: CpuAttestationProfile,
+            nvidia_profile: Option<NvidiaAttestationProfile>,
+        }
+
+        let wire = WireRequest::deserialize(deserializer)?;
+        Self::new(
+            wire.challenge,
+            wire.guest_public_key,
+            wire.workload_manifest_digest,
+            wire.cpu_profile,
+            wire.nvidia_profile,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+impl GuestAttestationRequest {
+    /// Creates and validates a guest evidence request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the binding inputs violate protocol bounds.
+    pub fn new(
+        challenge: AttestationChallenge,
+        guest_public_key: impl Into<Vec<u8>>,
+        workload_manifest_digest: [u8; 32],
+        cpu_profile: CpuAttestationProfile,
+        nvidia_profile: Option<NvidiaAttestationProfile>,
+    ) -> Result<Self, AttestationInputError> {
+        let guest_public_key = guest_public_key.into();
+        AttestationBinding::new(
+            challenge.clone(),
+            guest_public_key.clone(),
+            workload_manifest_digest,
+            Vec::new(),
+        )?;
+        Ok(Self {
+            challenge,
+            guest_public_key,
+            workload_manifest_digest,
+            cpu_profile,
+            nvidia_profile,
+        })
+    }
+
+    /// Returns the relying-party challenge.
+    #[must_use]
+    pub const fn challenge(&self) -> &AttestationChallenge {
+        &self.challenge
+    }
+
+    /// Returns the guest-generated public key.
+    #[must_use]
+    pub fn guest_public_key(&self) -> &[u8] {
+        &self.guest_public_key
+    }
+
+    /// Returns the measured workload manifest digest.
+    #[must_use]
+    pub const fn workload_manifest_digest(&self) -> &[u8; 32] {
+        &self.workload_manifest_digest
+    }
+
+    /// Returns the requested CPU attestation mechanism.
+    #[must_use]
+    pub const fn cpu_profile(&self) -> CpuAttestationProfile {
+        self.cpu_profile
+    }
+
+    /// Returns the requested accelerator topology, if any.
+    #[must_use]
+    pub const fn nvidia_profile(&self) -> Option<NvidiaAttestationProfile> {
+        self.nvidia_profile
+    }
+
+    #[cfg(any(test, all(feature = "guest-runtime", target_os = "linux")))]
+    pub(crate) fn binding(
+        &self,
+        child_evidence_digests: Vec<[u8; 32]>,
+    ) -> Result<AttestationBinding, AttestationInputError> {
+        AttestationBinding::new(
+            self.challenge.clone(),
+            self.guest_public_key.clone(),
+            self.workload_manifest_digest,
+            child_evidence_digests,
+        )
+    }
+}
+
+/// Complete native evidence response emitted by the guest.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuestAttestationBundle {
+    request: GuestAttestationRequest,
+    transcript_digest: [u8; 32],
+    #[serde(deserialize_with = "deserialize_bounded_evidence")]
+    evidence: Vec<RawEvidence>,
+}
+
+impl GuestAttestationBundle {
+    #[cfg(any(test, all(feature = "guest-runtime", target_os = "linux")))]
+    pub(crate) const fn new(
+        request: GuestAttestationRequest,
+        transcript_digest: [u8; 32],
+        evidence: Vec<RawEvidence>,
+    ) -> Self {
+        Self {
+            request,
+            transcript_digest,
+            evidence,
+        }
+    }
+
+    /// Returns the request bound into the response.
+    #[must_use]
+    pub const fn request(&self) -> &GuestAttestationRequest {
+        &self.request
+    }
+
+    /// Returns the digest placed in the native CPU report-data field.
+    #[must_use]
+    pub const fn transcript_digest(&self) -> &[u8; 32] {
+        &self.transcript_digest
+    }
+
+    /// Returns child evidence first and CPU evidence last.
+    #[must_use]
+    pub fn evidence(&self) -> &[RawEvidence] {
+        &self.evidence
+    }
 }
 
 impl RawEvidence {
@@ -367,20 +629,6 @@ pub enum AttestationInputError {
         /// Protocol maximum.
         maximum: usize,
     },
-    /// A device component identifier was empty.
-    #[error("attested device component identifier must not be empty")]
-    EmptyComponentId,
-    /// A device component identifier was not ASCII.
-    #[error("attested device component identifier must be ASCII")]
-    NonAsciiComponentId,
-    /// A device component identifier exceeded its protocol bound.
-    #[error("attested device component identifier is {actual} bytes; maximum is {maximum}")]
-    ComponentIdTooLarge {
-        /// Supplied size.
-        actual: usize,
-        /// Protocol maximum.
-        maximum: usize,
-    },
     /// The native evidence profile does not match its component kind.
     #[error("native evidence profile does not match the attested component kind")]
     ComponentProfileMismatch,
@@ -391,25 +639,97 @@ fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
-fn validate_component(component: &AttestedComponent) -> Result<(), AttestationInputError> {
-    let (AttestedComponent::NvidiaGpu { uuid } | AttestedComponent::NvidiaNvSwitch { uuid }) =
-        component
-    else {
-        return Ok(());
-    };
-    if uuid.is_empty() {
-        return Err(AttestationInputError::EmptyComponentId);
-    }
-    if uuid.len() > MAX_COMPONENT_ID_BYTES {
-        return Err(AttestationInputError::ComponentIdTooLarge {
-            actual: uuid.len(),
-            maximum: MAX_COMPONENT_ID_BYTES,
-        });
-    }
-    if !uuid.is_ascii() {
-        return Err(AttestationInputError::NonAsciiComponentId);
-    }
+const fn validate_component(_component: &AttestedComponent) -> Result<(), AttestationInputError> {
     Ok(())
+}
+
+fn serialize_base64<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(&BASE64_STANDARD.encode(bytes))
+}
+
+const fn maximum_base64_len(maximum_decoded_len: usize) -> usize {
+    maximum_decoded_len.div_ceil(3) * 4
+}
+
+fn deserialize_bounded_base64<'de, D>(
+    deserializer: D,
+    maximum_decoded_len: usize,
+) -> Result<Vec<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let encoded = String::deserialize(deserializer)?;
+    let maximum_encoded_len = maximum_base64_len(maximum_decoded_len);
+    if encoded.len() > maximum_encoded_len {
+        return Err(serde::de::Error::custom(format_args!(
+            "base64 field is {} bytes; maximum encoded length is {maximum_encoded_len}",
+            encoded.len()
+        )));
+    }
+    let decoded = BASE64_STANDARD
+        .decode(encoded)
+        .map_err(serde::de::Error::custom)?;
+    if decoded.len() > maximum_decoded_len {
+        return Err(serde::de::Error::custom(format_args!(
+            "decoded base64 field is {} bytes; maximum is {maximum_decoded_len}",
+            decoded.len()
+        )));
+    }
+    Ok(decoded)
+}
+
+fn deserialize_evidence_base64<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_base64(deserializer, MAX_RAW_EVIDENCE_BYTES)
+}
+
+fn deserialize_guest_key_base64<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_base64(deserializer, MAX_GUEST_PUBLIC_KEY_BYTES)
+}
+
+fn deserialize_bounded_evidence<'de, D>(deserializer: D) -> Result<Vec<RawEvidence>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct EvidenceVisitor;
+
+    impl<'de> Visitor<'de> for EvidenceVisitor {
+        type Value = Vec<RawEvidence>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "at most {MAX_BUNDLE_EVIDENCE} native evidence objects"
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut evidence =
+                Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(MAX_BUNDLE_EVIDENCE));
+            while let Some(item) = sequence.next_element()? {
+                if evidence.len() == MAX_BUNDLE_EVIDENCE {
+                    return Err(serde::de::Error::custom(format_args!(
+                        "attestation bundle has more than {MAX_BUNDLE_EVIDENCE} evidence objects"
+                    )));
+                }
+                evidence.push(item);
+            }
+            Ok(evidence)
+        }
+    }
+
+    deserializer.deserialize_seq(EvidenceVisitor)
 }
 
 const fn validate_component_profile(
@@ -490,22 +810,37 @@ mod tests {
     }
 
     #[test]
-    fn challenge_and_component_id_reject_ambient_identifiers() {
+    fn raw_evidence_json_is_bounded_base64_and_revalidated() {
+        let evidence = RawEvidence::new(
+            AttestedComponent::CpuVm,
+            EvidenceProfile::IntelTdx,
+            "application/octet-stream",
+            [1, 2, 3, 4],
+        )
+        .unwrap();
+        let encoded = serde_json::to_value(&evidence).unwrap();
+
+        assert_eq!(encoded["bytes"], "AQIDBA==");
+        assert_eq!(
+            serde_json::from_value::<RawEvidence>(encoded).unwrap(),
+            evidence
+        );
+        assert!(
+            serde_json::from_value::<RawEvidence>(serde_json::json!({
+                "component": { "kind": "cpu_vm" },
+                "profile": "intel_tdx",
+                "media_type": "application/octet-stream",
+                "bytes": ""
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn challenge_and_profile_reject_invalid_inputs() {
         assert_eq!(
             AttestationChallenge::new([0; 32], "policy", 1).unwrap_err(),
             AttestationInputError::ZeroNonce
-        );
-        assert_eq!(
-            RawEvidence::new(
-                AttestedComponent::NvidiaGpu {
-                    uuid: String::new(),
-                },
-                EvidenceProfile::NvidiaGpu,
-                "application/octet-stream",
-                [1],
-            )
-            .unwrap_err(),
-            AttestationInputError::EmptyComponentId
         );
         assert_eq!(
             RawEvidence::new(
@@ -517,5 +852,66 @@ mod tests {
             .unwrap_err(),
             AttestationInputError::ComponentProfileMismatch
         );
+    }
+
+    #[test]
+    fn serde_revalidates_challenges_requests_and_encoded_bounds() {
+        assert!(
+            serde_json::from_value::<AttestationChallenge>(serde_json::json!({
+                "nonce": vec![0; 32],
+                "policy_id": "policy",
+                "expires_at_unix_seconds": 1
+            }))
+            .is_err()
+        );
+
+        let oversized_key = BASE64_STANDARD.encode(vec![1; MAX_GUEST_PUBLIC_KEY_BYTES + 1]);
+        assert!(
+            serde_json::from_value::<GuestAttestationRequest>(serde_json::json!({
+                "challenge": challenge(),
+                "guest_public_key": oversized_key,
+                "workload_manifest_digest": vec![1; 32],
+                "cpu_profile": "amd_sev_snp",
+                "nvidia_profile": null
+            }))
+            .is_err()
+        );
+
+        let oversized_evidence = "A".repeat(maximum_base64_len(MAX_RAW_EVIDENCE_BYTES) + 1);
+        assert!(
+            serde_json::from_value::<RawEvidence>(serde_json::json!({
+                "component": { "kind": "cpu_vm" },
+                "profile": "amd_sev_snp",
+                "media_type": "application/octet-stream",
+                "bytes": oversized_evidence
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn bundle_deserialization_bounds_component_count() {
+        let request = GuestAttestationRequest::new(
+            challenge(),
+            vec![1, 2, 3],
+            [4; 32],
+            CpuAttestationProfile::AmdSevSnp,
+            None,
+        )
+        .unwrap();
+        let item = RawEvidence::new(
+            AttestedComponent::CpuVm,
+            EvidenceProfile::AmdSevSnp,
+            "application/octet-stream",
+            [1],
+        )
+        .unwrap();
+        let encoded = serde_json::json!({
+            "request": request,
+            "transcript_digest": vec![0; 32],
+            "evidence": vec![item; MAX_BUNDLE_EVIDENCE + 1],
+        });
+
+        assert!(serde_json::from_value::<GuestAttestationBundle>(encoded).is_err());
     }
 }
