@@ -230,6 +230,10 @@ where
         context: NativeVerificationContext<'_>,
     ) -> Result<VerifiedNativeEvidence, NativeVerificationError> {
         match evidence.profile() {
+            #[cfg(feature = "development-attestation")]
+            EvidenceProfile::Development => Err(NativeVerificationError::new(
+                "development evidence has no trusted native verifier",
+            )),
             EvidenceProfile::AmdSevSnp => self.snp.verify(evidence, context).await,
             EvidenceProfile::IntelTdx => self.tdx.verify(evidence, context).await,
             EvidenceProfile::AwsNitro => self.nitro.verify(evidence, context).await,
@@ -266,6 +270,10 @@ where
         context: NativeVerificationContext<'_>,
     ) -> Result<VerifiedNativeEvidence, NativeVerificationError> {
         match evidence.profile() {
+            #[cfg(feature = "development-attestation")]
+            EvidenceProfile::Development => Err(NativeVerificationError::new(
+                "development evidence cannot be appraised as native hardware evidence",
+            )),
             EvidenceProfile::AmdSevSnp | EvidenceProfile::IntelTdx | EvidenceProfile::AwsNitro => {
                 self.cpu.verify(evidence, context).await
             }
@@ -468,6 +476,8 @@ fn expected_cpu_binding(
     transcript_digest: [u8; 32],
 ) -> Option<VerifiedNativeBinding> {
     match profile {
+        #[cfg(feature = "development-attestation")]
+        EvidenceProfile::Development => None,
         EvidenceProfile::AwsNitro => Some(VerifiedNativeBinding::AwsNitro {
             nonce: *binding.challenge().nonce(),
             guest_public_key: binding.guest_public_key().to_vec(),

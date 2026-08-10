@@ -213,6 +213,9 @@ impl AttestationBinding {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceProfile {
+    /// Untrusted software evidence for end-to-end development smoke tests.
+    #[cfg(feature = "development-attestation")]
+    Development,
     /// AMD SEV-SNP attestation report.
     AmdSevSnp,
     /// Intel TDX quote.
@@ -229,6 +232,9 @@ pub enum EvidenceProfile {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CpuAttestationProfile {
+    /// Untrusted software collector for end-to-end development smoke tests.
+    #[cfg(feature = "development-attestation")]
+    Development,
     /// AMD SEV-SNP through Linux's `sev_guest` TSM provider.
     AmdSevSnp,
     /// Intel TDX through Linux's `tdx_guest` TSM provider.
@@ -242,6 +248,8 @@ impl CpuAttestationProfile {
     #[must_use]
     pub const fn evidence_profile(self) -> EvidenceProfile {
         match self {
+            #[cfg(feature = "development-attestation")]
+            Self::Development => EvidenceProfile::Development,
             Self::AmdSevSnp => EvidenceProfile::AmdSevSnp,
             Self::IntelTdx => EvidenceProfile::IntelTdx,
             Self::AwsNitro => EvidenceProfile::AwsNitro,
@@ -1012,10 +1020,22 @@ const fn validate_component_profile(
     profile: EvidenceProfile,
 ) -> Result<(), AttestationInputError> {
     let matches = match component {
-        AttestedComponent::CpuVm => matches!(
-            profile,
-            EvidenceProfile::AmdSevSnp | EvidenceProfile::IntelTdx | EvidenceProfile::AwsNitro
-        ),
+        AttestedComponent::CpuVm => {
+            #[cfg(feature = "development-attestation")]
+            let matches = matches!(
+                profile,
+                EvidenceProfile::Development
+                    | EvidenceProfile::AmdSevSnp
+                    | EvidenceProfile::IntelTdx
+                    | EvidenceProfile::AwsNitro
+            );
+            #[cfg(not(feature = "development-attestation"))]
+            let matches = matches!(
+                profile,
+                EvidenceProfile::AmdSevSnp | EvidenceProfile::IntelTdx | EvidenceProfile::AwsNitro
+            );
+            matches
+        }
         AttestedComponent::NvidiaGpu { .. } => matches!(profile, EvidenceProfile::NvidiaGpu),
         AttestedComponent::NvidiaNvSwitch { .. } => {
             matches!(profile, EvidenceProfile::NvidiaNvSwitch)

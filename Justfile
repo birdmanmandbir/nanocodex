@@ -119,6 +119,24 @@ build-vm-guest:
     cargo build -p nanocodex-vm --bin nanocodex-vm-guest \
       --no-default-features --features guest-runtime --target "$target"
 
+# Build the same guest with an explicitly untrusted software evidence source.
+# This exists only to exercise the complete proof protocol on ordinary KVM.
+build-vm-guest-development:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "$(uname -m)" in
+      arm64|aarch64)
+        target=aarch64-unknown-linux-musl
+        export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="{{justfile_directory()}}/scripts/aarch64-unknown-linux-musl-linker"
+        export CC_aarch64_unknown_linux_musl="{{justfile_directory()}}/scripts/aarch64-unknown-linux-musl-linker"
+        export AR_aarch64_unknown_linux_musl="{{justfile_directory()}}/scripts/aarch64-unknown-linux-musl-ar"
+        ;;
+      x86_64|amd64) target=x86_64-unknown-linux-musl ;;
+      *) echo "unsupported VM guest architecture: $(uname -m)" >&2; exit 2 ;;
+    esac
+    cargo build -p nanocodex-vm --bin nanocodex-vm-guest \
+      --no-default-features --features guest-runtime,development-attestation --target "$target"
+
 # Produce the complete prepared-host installation used by VM-backed evals.
 # Runtime execution validates this installation but never builds or signs it.
 build-eval-host: build-vm-guest
@@ -219,6 +237,18 @@ prove-command-libkrun-tdx qgs="/run/tdx-qgs/qgs.socket" message="confidential-vm
       --vmm target/libkrun-intel-tdx/debug/nanocodex \
       --guest target/x86_64-unknown-linux-musl/debug/nanocodex-vm-guest \
       --qgs "{{qgs}}"
+
+# Exercise the real KVM VM, sealed execution, retained key, signatures, and
+# verifier without claiming hardware trust. The native verifier deliberately
+# rejects the development evidence profile.
+prove-command-libkrun-development message="kvm-command-proof-smoke": build-vm-guest-development
+    @test "$(uname -s)" = Linux || { echo "the development KVM smoke requires Linux" >&2; exit 2; }
+    cargo build --locked -p nanocodex-bin --bin nanocodex
+    cargo run --locked --quiet -p nanocodex-vm --example confidential_command \
+      --features development-attestation -- \
+      --profile development --message "{{message}}" \
+      --vmm target/debug/nanocodex \
+      --guest target/x86_64-unknown-linux-musl/debug/nanocodex-vm-guest
 
 # Launch either reviewed B200 topology in an SNP VM. `runtime` is a measured
 # ext4 image whose /nanocodex-vm-guest entrypoint initializes the matching

@@ -18,6 +18,8 @@ use tokio::process::Command;
 
 #[derive(Clone, Copy)]
 enum CpuProfile {
+    #[cfg(feature = "development-attestation")]
+    Development,
     Snp,
     Tdx,
 }
@@ -46,19 +48,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = GuestRuntimeDisk::prepare(&options.guest, &options.cache)?;
     let runtime_digest = decode_digest(runtime.digest())?;
     let (vm_profile, cpu_profile) = match options.cpu {
+        #[cfg(feature = "development-attestation")]
+        CpuProfile::Development => (None, CpuAttestationProfile::Development),
         CpuProfile::Snp => (
-            ConfidentialVmProfile::amd_sev_snp(),
+            Some(ConfidentialVmProfile::amd_sev_snp()),
             CpuAttestationProfile::AmdSevSnp,
         ),
         CpuProfile::Tdx => (
-            ConfidentialVmProfile::intel_tdx(),
+            Some(ConfidentialVmProfile::intel_tdx()),
             CpuAttestationProfile::IntelTdx,
         ),
     };
 
-    let mut vm = VmConfig::ext4(runtime.path())
-        .network(Network::Disabled)
-        .confidential(vm_profile);
+    let mut vm = VmConfig::ext4(runtime.path()).network(Network::Disabled);
+    if let Some(vm_profile) = vm_profile {
+        vm = vm.confidential(vm_profile);
+    }
     if let Some(qgs) = options.qgs {
         vm = vm.tdx_quote_generation_socket(qgs);
     }
@@ -128,9 +133,21 @@ impl Options {
             match argument.as_str() {
                 "--profile" => {
                     cpu = Some(match value(&mut arguments, "--profile")?.as_str() {
+                        #[cfg(feature = "development-attestation")]
+                        "development" => CpuProfile::Development,
                         "snp" => CpuProfile::Snp,
                         "tdx" => CpuProfile::Tdx,
-                        other => return Err(invalid("--profile", other, "snp or tdx")),
+                        other => {
+                            return Err(invalid(
+                                "--profile",
+                                other,
+                                if cfg!(feature = "development-attestation") {
+                                    "development, snp, or tdx"
+                                } else {
+                                    "snp or tdx"
+                                },
+                            ));
+                        }
                     });
                 }
                 "--vmm" => vmm = Some(value(&mut arguments, "--vmm")?.into()),
@@ -140,7 +157,12 @@ impl Options {
                 "--message" => message = value(&mut arguments, "--message")?,
                 "--help" | "-h" => {
                     println!(
-                        "usage: confidential_command --profile snp|tdx --vmm PATH --guest PATH [--cache PATH] [--qgs PATH] [--message TEXT]"
+                        "usage: confidential_command --profile snp|tdx{} --vmm PATH --guest PATH [--cache PATH] [--qgs PATH] [--message TEXT]",
+                        if cfg!(feature = "development-attestation") {
+                            "|development"
+                        } else {
+                            ""
+                        }
                     );
                     std::process::exit(0);
                 }

@@ -444,6 +444,14 @@ async fn collect_cpu_evidence(
     transcript_digest: [u8; 32],
 ) -> Result<RawEvidence, GuestAttestationError> {
     match request.cpu_profile() {
+        #[cfg(feature = "development-attestation")]
+        CpuAttestationProfile::Development => RawEvidence::new(
+            AttestedComponent::CpuVm,
+            EvidenceProfile::Development,
+            "application/vnd.nanocodex.untrusted-development-attestation",
+            transcript_digest,
+        )
+        .map_err(Into::into),
         CpuAttestationProfile::AmdSevSnp => {
             collect_tsm_evidence(request.cpu_profile(), "sev_guest", transcript_digest).await
         }

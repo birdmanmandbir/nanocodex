@@ -46,6 +46,10 @@ guest-runtime = [
     "dep:nix",
     "nanocodex-tools/workspace-runtime",
 ]
+# Explicitly untrusted evidence used only to exercise the complete command-proof
+# transport and receipt path on an ordinary KVM host. Native verification always
+# rejects this profile.
+development-attestation = []
 # Dedicated host artifacts select exactly one libkrun TEE implementation. These
 # features are intentionally not part of `host` or the ordinary workspace build.
 libkrun-amd-sev = ["host", "krun/amd-sev", "krun/vfio"]
