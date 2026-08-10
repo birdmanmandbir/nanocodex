@@ -102,7 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         vm = attach_device_bundle(vm, &bundle)?;
     }
     let mut vmm = Command::new(options.vmm);
-    vmm.arg("vm-run-config");
+    vmm.args(["vm-run-config", "--config"]);
     let session = VmToolSession::spawn_configured(
         vmm,
         vm,
