@@ -220,22 +220,23 @@ prove-command-libkrun-tdx message="confidential-vm-command-proof" qgs="/run/tdx-
       --guest target/x86_64-unknown-linux-musl/debug/nanocodex-vm-guest \
       --qgs "{{qgs}}"
 
-# Launch either reviewed B200 topology in an SNP VM. `topology` is
-# b200-single or b200-hgx8; `bundle` is the exact JSON PCI identity manifest.
-attest-libkrun-snp-b200 topology bundle: build-vm-guest build-vm-host-amd-sev
+# Launch either reviewed B200 topology in an SNP VM. `runtime` is a measured
+# ext4 image whose /nanocodex-vm-guest entrypoint initializes the matching
+# NVIDIA driver and then execs the protocol guest; nvattest must be on PATH.
+attest-libkrun-snp-b200 topology bundle runtime: build-vm-host-amd-sev
     @test "$(uname -m)" = x86_64 || { echo "SEV-SNP requires x86_64" >&2; exit 2; }
     cargo run --locked --quiet -p nanocodex-vm --example confidential_attestation -- \
       --profile snp --nvidia "{{topology}}" --device-bundle "{{bundle}}" \
       --vmm target/libkrun-amd-sev/debug/nanocodex \
-      --guest target/x86_64-unknown-linux-musl/debug/nanocodex-vm-guest
+      --runtime-disk "{{runtime}}"
 
 # Launch either reviewed B200 topology in a TDX VM and relay configfs GetQuote.
-attest-libkrun-tdx-b200 topology bundle qgs="/run/tdx-qgs/qgs.socket": build-vm-guest build-vm-host-intel-tdx
+attest-libkrun-tdx-b200 topology bundle runtime qgs="/run/tdx-qgs/qgs.socket": build-vm-host-intel-tdx
     @test "$(uname -m)" = x86_64 || { echo "Intel TDX requires x86_64" >&2; exit 2; }
     cargo run --locked --quiet -p nanocodex-vm --example confidential_attestation -- \
       --profile tdx --nvidia "{{topology}}" --device-bundle "{{bundle}}" \
       --vmm target/libkrun-intel-tdx/debug/nanocodex \
-      --guest target/x86_64-unknown-linux-musl/debug/nanocodex-vm-guest \
+      --runtime-disk "{{runtime}}" \
       --qgs "{{qgs}}"
 
 build-vm-example:

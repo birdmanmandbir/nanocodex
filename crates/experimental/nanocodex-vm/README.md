@@ -250,11 +250,22 @@ is inferred from device counts or unsigned host output. The launch and native
 evidence-collection path is runnable on supporting hardware:
 
 ```console
-just attest-libkrun-snp-b200 b200-single b200-single.json
-just attest-libkrun-snp-b200 b200-hgx8 b200-hgx8.json
-just attest-libkrun-tdx-b200 b200-single b200-single.json /run/tdx-qgs/qgs.socket
-just attest-libkrun-tdx-b200 b200-hgx8 b200-hgx8.json /run/tdx-qgs/qgs.socket
+just attest-libkrun-snp-b200 b200-single b200-single.json nvidia-runtime.ext4
+just attest-libkrun-snp-b200 b200-hgx8 b200-hgx8.json nvidia-runtime.ext4
+just attest-libkrun-tdx-b200 b200-single b200-single.json nvidia-runtime.ext4 /run/tdx-qgs/qgs.socket
+just attest-libkrun-tdx-b200 b200-hgx8 b200-hgx8.json nvidia-runtime.ext4 /run/tdx-qgs/qgs.socket
 ```
+
+Unlike the CPU-only recipe, a B200 launch cannot use the generated 128 MiB
+single-binary runtime: native GPU evidence requires NVIDIA's guest kernel
+driver and `nvattest`. The required `runtime` argument is a caller-built,
+reviewed ext4 image containing `/nanocodex-vm-guest`, the NVIDIA guest stack
+matching libkrun's guest kernel, and `nvattest` on `PATH`. Its
+`/nanocodex-vm-guest` entrypoint must initialize the driver and then exec the
+Nanocodex protocol guest on the same standard input and output. The launcher
+hashes the complete runtime image and binds that digest into the attestation
+transcript. It does not download a mutable driver or attestation tool after
+measurement.
 
 The JSON file is a serialized `host::ConfidentialDeviceBundle`. A single-GPU
 manifest contains exactly one `nvidia_b200_gpu` (`10de:2901`). An HGX manifest

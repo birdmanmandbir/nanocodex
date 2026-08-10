@@ -1,5 +1,6 @@
 use std::{
-    io,
+    fs::File,
+    io::{self, Read as _},
     path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -12,6 +13,7 @@ use nanocodex_vm::{
     tools::{GuestRuntimeDisk, VmToolSession},
 };
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 use tokio::process::Command;
 
 #[derive(Clone, Copy)]
@@ -31,7 +33,8 @@ struct Options {
     cpu: CpuProfile,
     nvidia: NvidiaProfile,
     vmm: PathBuf,
-    guest: PathBuf,
+    guest: Option<PathBuf>,
+    runtime_disk: Option<PathBuf>,
     cache: PathBuf,
     qgs: Option<PathBuf>,
     device_bundle: Option<PathBuf>,
@@ -49,8 +52,24 @@ struct Output {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = Options::parse()?;
-    let runtime = GuestRuntimeDisk::prepare(&options.guest, &options.cache)?;
-    let manifest_digest = decode_digest(runtime.digest())?;
+    let (runtime_path, manifest_digest) = match (&options.guest, &options.runtime_disk) {
+        (Some(guest), None) => {
+            let runtime = GuestRuntimeDisk::prepare(guest, &options.cache)?;
+            let digest = decode_digest(runtime.digest())?;
+            (runtime.path().to_path_buf(), digest)
+        }
+        (None, Some(runtime_disk)) => {
+            let digest = sha256_file(runtime_disk)?;
+            (runtime_disk.clone(), digest)
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "exactly one guest runtime source is required",
+            )
+            .into());
+        }
+    };
     let (vm_profile, cpu_profile) = match options.cpu {
         CpuProfile::Snp => (
             ConfidentialVmProfile::amd_sev_snp(),
@@ -73,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     };
 
-    let mut vm = VmConfig::ext4(runtime.path())
+    let mut vm = VmConfig::ext4(runtime_path)
         .network(nanocodex_vm::host::Network::Disabled)
         .confidential(vm_profile);
     if let Some(qgs) = options.qgs {
@@ -143,6 +162,7 @@ impl Options {
         let mut cache = PathBuf::from(".cache/nanocodex/attestation-example");
         let mut qgs = None;
         let mut device_bundle = None;
+        let mut runtime_disk = None;
         let mut arguments = std::env::args().skip(1);
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
@@ -169,6 +189,9 @@ impl Options {
                 }
                 "--vmm" => vmm = Some(value(&mut arguments, "--vmm")?.into()),
                 "--guest" => guest = Some(value(&mut arguments, "--guest")?.into()),
+                "--runtime-disk" => {
+                    runtime_disk = Some(value(&mut arguments, "--runtime-disk")?.into());
+                }
                 "--cache" => cache = value(&mut arguments, "--cache")?.into(),
                 "--qgs" => qgs = Some(value(&mut arguments, "--qgs")?.into()),
                 "--device-bundle" => {
@@ -176,7 +199,7 @@ impl Options {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "usage: confidential_attestation --profile snp|tdx --vmm PATH --guest PATH [--cache PATH] [--qgs PATH] [--nvidia off|b200-single|b200-hgx8] [--device-bundle PATH]"
+                        "usage: confidential_attestation --profile snp|tdx --vmm PATH (--guest PATH | --runtime-disk PATH) [--cache PATH] [--qgs PATH] [--nvidia off|b200-single|b200-hgx8] [--device-bundle PATH]"
                     );
                     std::process::exit(0);
                 }
@@ -201,16 +224,54 @@ impl Options {
                 "--nvidia and --device-bundle must be supplied together",
             ));
         }
+        match (&guest, &runtime_disk) {
+            (Some(_), None) | (None, Some(_)) => {}
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "exactly one of --guest and --runtime-disk is required",
+                ));
+            }
+        }
+        if !matches!(nvidia, NvidiaProfile::Off) && runtime_disk.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "B200 attestation requires --runtime-disk with /nanocodex-vm-guest, the matching NVIDIA guest driver, and nvattest",
+            ));
+        }
         Ok(Self {
             cpu,
             nvidia,
             vmm: vmm.ok_or_else(|| missing("--vmm"))?,
-            guest: guest.ok_or_else(|| missing("--guest"))?,
+            guest,
+            runtime_disk,
             cache,
             qgs,
             device_bundle,
         })
     }
+}
+
+fn sha256_file(path: &std::path::Path) -> Result<[u8; 32], io::Error> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("runtime disk {} is not a regular file", path.display()),
+        ));
+    }
+
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().into())
 }
 
 #[cfg(target_os = "linux")]
