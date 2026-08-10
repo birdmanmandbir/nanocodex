@@ -1246,7 +1246,7 @@ mod tests {
         SessionResponse, ShutdownRequest, TerminateToolProcessesRequest, ToolRequest,
         WireToolContext, WireToolInput,
     };
-    #[cfg(target_os = "linux")]
+    #[cfg(all(feature = "guest-runtime", target_os = "linux"))]
     use super::{CommandOutcome, command_output, sealed_executable, validate_attested_elf};
     use super::{
         atomic_write_file, command_environment, create_directory_path, execute_command,
@@ -1258,7 +1258,7 @@ mod tests {
     const DETACHED_PROCESS_PID_FILE_ENV: &str = "NANOCODEX_VM_TEST_DETACHED_PID_FILE";
     const PATH_TRACING_IMAGE_BYTES: u64 = 48_262_737;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(feature = "guest-runtime", target_os = "linux"))]
     #[tokio::test]
     async fn sealed_executable_runs_the_copied_elf_bytes() {
         use std::{os::fd::AsRawFd as _, os::unix::process::CommandExt as _, process::Stdio};
@@ -1296,7 +1296,7 @@ mod tests {
         assert!(output.stderr.is_empty());
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(feature = "guest-runtime", target_os = "linux"))]
     #[test]
     fn attestable_elf_rejects_a_dynamic_interpreter() {
         let mut elf = vec![0_u8; 120];
