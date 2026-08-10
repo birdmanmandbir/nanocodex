@@ -212,7 +212,7 @@ prove-command-libkrun-snp message="confidential-vm-command-proof": build-vm-gues
       --guest target/x86_64-unknown-linux-musl/debug/nanocodex-vm-guest
 
 # Execute the same protocol with fresh TDX evidence and the configured QGS.
-prove-command-libkrun-tdx message="confidential-vm-command-proof" qgs="/run/tdx-qgs/qgs.socket": build-vm-guest build-vm-host-intel-tdx
+prove-command-libkrun-tdx qgs="/run/tdx-qgs/qgs.socket" message="confidential-vm-command-proof": build-vm-guest build-vm-host-intel-tdx
     @test "$(uname -m)" = x86_64 || { echo "Intel TDX requires x86_64" >&2; exit 2; }
     cargo run --locked --quiet -p nanocodex-vm --example confidential_command -- \
       --profile tdx --message "{{message}}" \
