@@ -185,7 +185,10 @@ async fn run(cli: Cli) -> Result<()> {
         #[cfg(feature = "tempo")]
         Some(Command::Credits(command)) => command.run().await,
         Some(Command::Eval(command)) => command.run().await,
-        Some(Command::Network(command)) => command.run().await,
+        Some(Command::Network(command)) => {
+            let _observability = cli.observability.install(false, cli.agent.cwd())?;
+            command.run().await
+        }
         Some(Command::VmRunConfig(_)) => unreachable!("VMM commands run before Tokio starts"),
         Some(Command::Run(command)) => {
             let _observability = command.observability.install(false, command.agent.cwd())?;
