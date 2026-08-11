@@ -8,7 +8,7 @@ use nanocodex_vm::{
     host::{
         AttestationChallenge, AttestedCommand, AttestedCommandProof, AttestedCommandRequest,
         CommandProofExpectation, CpuAttestationProfile, GuestAttestationParameters,
-        verify_collected_command_proof,
+        NvidiaAttestationProfile, verify_collected_command_proof,
     },
     tools::VmToolSession,
 };
@@ -24,6 +24,7 @@ enum CpuProfile {
 
 struct Options {
     cpu: CpuProfile,
+    nvidia: Option<NvidiaAttestationProfile>,
     transport: String,
     transport_arguments: Vec<String>,
     local_guest: PathBuf,
@@ -75,8 +76,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let command = AttestedCommand::new(&argv[0])?
         .arg(&argv[1])?
         .arg(&argv[2])?;
-    let parameters =
-        GuestAttestationParameters::new(challenge.clone(), workload_digest, cpu_profile, None);
+    let parameters = GuestAttestationParameters::new(
+        challenge.clone(),
+        workload_digest,
+        cpu_profile,
+        options.nvidia,
+    );
     let request = AttestedCommandRequest::new(parameters, command);
     let proof = tokio::time::timeout(Duration::from_secs(180), session.prove_command(request))
         .await
@@ -105,6 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 impl Options {
     fn parse() -> Result<Self, io::Error> {
         let mut cpu = None;
+        let mut nvidia = None;
         let mut transport = None;
         let mut transport_arguments = Vec::new();
         let mut local_guest = None;
@@ -120,6 +126,21 @@ impl Options {
                         other => return Err(invalid("--profile", other, "snp or tdx")),
                     });
                 }
+                "--nvidia" => {
+                    nvidia = match value(&mut arguments, "--nvidia")?.as_str() {
+                        "off" => None,
+                        "h100-single" => Some(NvidiaAttestationProfile::H100Single),
+                        "b200-single" => Some(NvidiaAttestationProfile::B200Single),
+                        "b200-hgx8" => Some(NvidiaAttestationProfile::B200Hgx8EncryptedNvlink),
+                        other => {
+                            return Err(invalid(
+                                "--nvidia",
+                                other,
+                                "off, h100-single, b200-single, or b200-hgx8",
+                            ));
+                        }
+                    };
+                }
                 "--transport" => transport = Some(value(&mut arguments, "--transport")?),
                 "--transport-arg" => {
                     transport_arguments.push(value(&mut arguments, "--transport-arg")?)
@@ -133,7 +154,7 @@ impl Options {
                 "--message" => message = value(&mut arguments, "--message")?,
                 "--help" | "-h" => {
                     println!(
-                        "usage: confidential_transport_command --profile snp|tdx --transport PROGRAM [--transport-arg ARG]... --local-guest PATH --guest-program PATH [--message TEXT]"
+                        "usage: confidential_transport_command --profile snp|tdx [--nvidia off|h100-single|b200-single|b200-hgx8] --transport PROGRAM [--transport-arg ARG]... --local-guest PATH --guest-program PATH [--message TEXT]"
                     );
                     std::process::exit(0);
                 }
@@ -147,6 +168,7 @@ impl Options {
         }
         Ok(Self {
             cpu: cpu.ok_or_else(|| missing("--profile"))?,
+            nvidia,
             transport: transport.ok_or_else(|| missing("--transport"))?,
             transport_arguments,
             local_guest: local_guest.ok_or_else(|| missing("--local-guest"))?,

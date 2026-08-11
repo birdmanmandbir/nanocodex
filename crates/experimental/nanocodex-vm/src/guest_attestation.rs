@@ -31,6 +31,7 @@ const NVATTEST: &str = "nvattest";
 const NVATTEST_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_COMMAND_OUTPUT_BYTES: usize = MAX_RAW_EVIDENCE_BYTES;
 const NVIDIA_VENDOR_ID: &str = "0x10de";
+const NVIDIA_H100_DEVICE_ID: &str = "0x2330";
 const NVIDIA_B200_DEVICE_ID: &str = "0x2901";
 static REPORT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -61,6 +62,15 @@ pub enum GuestAttestationError {
         /// Visible B200 PCI function count.
         count: usize,
     },
+    /// The visible H100 count is not the reviewed single-GPU topology.
+    #[error("detected {count} NVIDIA H100 GPUs; the supported automatic topology is exactly 1")]
+    UnsupportedH100Topology {
+        /// Visible H100 PCI function count.
+        count: usize,
+    },
+    /// Hopper and Blackwell accelerators cannot share one automatic profile.
+    #[error("detected both NVIDIA H100 and B200 GPUs; select an explicit attestation profile")]
+    MixedNvidiaArchitectures,
     /// PCI topology inspection failed.
     #[error("failed to inspect PCI topology at {path}: {source}")]
     PciIo {
@@ -269,12 +279,12 @@ pub async fn detect_cpu_attestation_profile() -> Result<CpuAttestationProfile, G
     }
 }
 
-/// Detects one of the exact reviewed NVIDIA B200 topologies visible to the guest.
+/// Detects one of the exact reviewed NVIDIA H100 or B200 topologies visible to the guest.
 ///
 /// # Errors
 ///
-/// Returns an error when B200 devices are visible but their count is neither
-/// the single-GPU nor complete eight-GPU topology.
+/// Returns an error when H100 and B200 devices are mixed or a visible device
+/// count is not one of the reviewed topologies.
 pub async fn detect_nvidia_attestation_profile()
 -> Result<Option<NvidiaAttestationProfile>, GuestAttestationError> {
     let mut devices = match fs::read_dir("/sys/bus/pci/devices").await {
@@ -282,7 +292,8 @@ pub async fn detect_nvidia_attestation_profile()
         Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(source) => return Err(pci_io("/sys/bus/pci/devices", source)),
     };
-    let mut count = 0_usize;
+    let mut h100_count = 0_usize;
+    let mut b200_count = 0_usize;
     while let Some(device) = devices
         .next_entry()
         .await
@@ -296,13 +307,31 @@ pub async fn detect_nvidia_attestation_profile()
         let device_id = fs::read_to_string(&device_path)
             .await
             .map_err(|source| pci_io(device_path, source))?;
-        if vendor.trim().eq_ignore_ascii_case(NVIDIA_VENDOR_ID)
-            && device_id.trim().eq_ignore_ascii_case(NVIDIA_B200_DEVICE_ID)
-        {
-            count += 1;
+        if vendor.trim().eq_ignore_ascii_case(NVIDIA_VENDOR_ID) {
+            if device_id.trim().eq_ignore_ascii_case(NVIDIA_H100_DEVICE_ID) {
+                h100_count += 1;
+            } else if device_id.trim().eq_ignore_ascii_case(NVIDIA_B200_DEVICE_ID) {
+                b200_count += 1;
+            }
         }
     }
-    nvidia_profile_for_b200_count(count)
+    nvidia_profile_for_counts(h100_count, b200_count)
+}
+
+const fn nvidia_profile_for_counts(
+    h100_count: usize,
+    b200_count: usize,
+) -> Result<Option<NvidiaAttestationProfile>, GuestAttestationError> {
+    if h100_count != 0 && b200_count != 0 {
+        return Err(GuestAttestationError::MixedNvidiaArchitectures);
+    }
+    if h100_count != 0 {
+        return match h100_count {
+            1 => Ok(Some(NvidiaAttestationProfile::H100Single)),
+            count => Err(GuestAttestationError::UnsupportedH100Topology { count }),
+        };
+    }
+    nvidia_profile_for_b200_count(b200_count)
 }
 
 const fn nvidia_profile_for_b200_count(
@@ -798,6 +827,8 @@ mod tests {
 
     #[test]
     fn nvidia_profiles_require_exact_topologies() {
+        assert_eq!(NvidiaAttestationProfile::H100Single.gpu_count(), 1);
+        assert_eq!(NvidiaAttestationProfile::H100Single.switch_count(), 0);
         assert_eq!(NvidiaAttestationProfile::B200Single.gpu_count(), 1);
         assert_eq!(NvidiaAttestationProfile::B200Single.switch_count(), 0);
         assert_eq!(
@@ -808,6 +839,22 @@ mod tests {
             NvidiaAttestationProfile::B200Hgx8EncryptedNvlink.switch_count(),
             2
         );
+    }
+
+    #[test]
+    fn h100_auto_detection_is_exact_and_fail_closed() {
+        assert_eq!(
+            nvidia_profile_for_counts(1, 0).unwrap(),
+            Some(NvidiaAttestationProfile::H100Single)
+        );
+        assert!(matches!(
+            nvidia_profile_for_counts(2, 0),
+            Err(GuestAttestationError::UnsupportedH100Topology { count: 2 })
+        ));
+        assert!(matches!(
+            nvidia_profile_for_counts(1, 1),
+            Err(GuestAttestationError::MixedNvidiaArchitectures)
+        ));
     }
 
     #[test]

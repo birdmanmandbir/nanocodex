@@ -543,13 +543,14 @@ fn validate_fabric(
     let required = match evidence.component() {
         AttestedComponent::CpuVm => None,
         AttestedComponent::NvidiaGpu { .. } | AttestedComponent::NvidiaNvSwitch { .. } => {
-            Some(match requested {
-                Some(NvidiaAttestationProfile::B200Single) => VerifiedNvidiaFabric::Disabled,
+            match requested {
+                Some(NvidiaAttestationProfile::H100Single) => None,
+                Some(NvidiaAttestationProfile::B200Single) => Some(VerifiedNvidiaFabric::Disabled),
                 Some(NvidiaAttestationProfile::B200Hgx8EncryptedNvlink) => {
-                    VerifiedNvidiaFabric::EncryptedHgxB200Mpt
+                    Some(VerifiedNvidiaFabric::EncryptedHgxB200Mpt)
                 }
                 None => return Err(AttestationVerificationError::NvidiaFabricMismatch { index }),
-            })
+            }
         }
     };
     if verified.nvidia_fabric != required {

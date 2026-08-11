@@ -122,6 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 enum ExampleNvidia {
     Auto,
     Off,
+    H100,
     Single,
     Hgx8,
 }
@@ -163,13 +164,14 @@ impl ExampleOptions {
                     options.nvidia = match next_value(&mut arguments, argument)?.as_str() {
                         "auto" => ExampleNvidia::Auto,
                         "off" => ExampleNvidia::Off,
+                        "h100-single" => ExampleNvidia::H100,
                         "b200-single" => ExampleNvidia::Single,
                         "b200-hgx8" => ExampleNvidia::Hgx8,
                         value => {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidInput,
                                 format!(
-                                    "invalid --nvidia value {value:?}; expected auto, off, b200-single, or b200-hgx8"
+                                    "invalid --nvidia value {value:?}; expected auto, off, h100-single, b200-single, or b200-hgx8"
                                 ),
                             ));
                         }
@@ -177,7 +179,7 @@ impl ExampleOptions {
                 }
                 "--help" | "-h" => {
                     eprintln!(
-                        "usage: nanocodex-vm-guest --attest-example [--nonce-hex 64_HEX] [--policy-id ID] [--manifest-sha256 64_HEX] [--nvidia auto|off|b200-single|b200-hgx8]"
+                        "usage: nanocodex-vm-guest --attest-example [--nonce-hex 64_HEX] [--policy-id ID] [--manifest-sha256 64_HEX] [--nvidia auto|off|h100-single|b200-single|b200-hgx8]"
                     );
                     std::process::exit(0);
                 }
@@ -245,6 +247,7 @@ async fn collect_example(
     let nvidia_profile = match options.nvidia {
         ExampleNvidia::Auto => detect_nvidia_attestation_profile().await?,
         ExampleNvidia::Off => None,
+        ExampleNvidia::H100 => Some(NvidiaAttestationProfile::H100Single),
         ExampleNvidia::Single => Some(NvidiaAttestationProfile::B200Single),
         ExampleNvidia::Hgx8 => Some(NvidiaAttestationProfile::B200Hgx8EncryptedNvlink),
     };

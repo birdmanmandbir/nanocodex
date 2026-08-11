@@ -1,6 +1,9 @@
 use std::{io, path::PathBuf};
 
-use nanocodex_vm::host::{TdxVerificationPolicy, TdxVerifier, verify_attestation};
+use nanocodex_vm::host::{
+    NativeVerifierSet, NvidiaNvattestVerifier, TdxVerificationPolicy, TdxVerifier,
+    verify_attestation,
+};
 
 mod attestation_support;
 
@@ -16,6 +19,8 @@ struct Options {
     input: PathBuf,
     collateral: PathBuf,
     intel_root: Option<PathBuf>,
+    nvidia_policy: Option<PathBuf>,
+    nvattest: PathBuf,
     mr_td: [u8; 48],
     rt_mrs: [[u8; 48]; 4],
     mr_config_id: Option<[u8; 48]>,
@@ -60,13 +65,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .allow_cached_keys(options.allow_cached_keys)
         .allow_smt(options.allow_smt);
     let verifier = TdxVerifier::new(policy);
-    let verified = verify_attestation(
-        attestation.into_bundle(),
-        &challenge,
-        now_unix_seconds()?,
-        &verifier,
-    )
-    .await?;
+    let has_nvidia = attestation.bundle().request().nvidia_profile().is_some();
+    if has_nvidia != options.nvidia_policy.is_some() {
+        return Err(invalid_argument(
+            "--nvidia-policy is required exactly when the attestation contains NVIDIA evidence",
+        )
+        .into());
+    }
+    let bundle = attestation.into_bundle();
+    let now = now_unix_seconds()?;
+    let verified = if let Some(nvidia_policy) = options.nvidia_policy {
+        let nvidia = NvidiaNvattestVerifier::program(options.nvattest, nvidia_policy);
+        let verifiers = NativeVerifierSet::new(verifier, nvidia);
+        verify_attestation(bundle, &challenge, now, &verifiers).await?
+    } else {
+        verify_attestation(bundle, &challenge, now, &verifier).await?
+    };
     print_verified(&verified, challenge.policy_id())
 }
 
@@ -75,6 +89,8 @@ impl Options {
         let mut input = None;
         let mut collateral = None;
         let mut intel_root = None;
+        let mut nvidia_policy = None;
+        let mut nvattest = PathBuf::from("nvattest");
         let mut mr_td = None;
         let mut rt_mrs = [None; 4];
         let mut mr_config_id = None;
@@ -90,6 +106,10 @@ impl Options {
                 "--input" => input = Some(value(&mut arguments, "--input")?.into()),
                 "--collateral" => collateral = Some(value(&mut arguments, "--collateral")?.into()),
                 "--intel-root" => intel_root = Some(value(&mut arguments, "--intel-root")?.into()),
+                "--nvidia-policy" => {
+                    nvidia_policy = Some(value(&mut arguments, "--nvidia-policy")?.into())
+                }
+                "--nvattest" => nvattest = value(&mut arguments, "--nvattest")?.into(),
                 "--mrtd" => mr_td = Some(parse_hex(&value(&mut arguments, "--mrtd")?, "MRTD")?),
                 "--rtmr0" | "--rtmr1" | "--rtmr2" | "--rtmr3" => {
                     let index = usize::from(argument.as_bytes()[6] - b'0');
@@ -119,7 +139,7 @@ impl Options {
                 "--allow-smt" => allow_smt = true,
                 "--help" | "-h" => {
                     println!(
-                        "usage: verify_tdx_attestation --input PATH|- --collateral PATH --mrtd 96_HEX --rtmr0 96_HEX --rtmr1 96_HEX --rtmr2 96_HEX --rtmr3 96_HEX [--intel-root DER_PATH] [--mr-config-id 96_HEX] [--mr-owner 96_HEX] [--mr-owner-config 96_HEX] [--xfam 16_HEX] [--allow-dynamic-platform] [--allow-cached-keys] [--allow-smt]"
+                        "usage: verify_tdx_attestation --input PATH|- --collateral PATH --mrtd 96_HEX --rtmr0 96_HEX --rtmr1 96_HEX --rtmr2 96_HEX --rtmr3 96_HEX [--intel-root DER_PATH] [--nvidia-policy REGO_PATH] [--nvattest PATH] [--mr-config-id 96_HEX] [--mr-owner 96_HEX] [--mr-owner-config 96_HEX] [--xfam 16_HEX] [--allow-dynamic-platform] [--allow-cached-keys] [--allow-smt]"
                     );
                     std::process::exit(0);
                 }
@@ -130,6 +150,8 @@ impl Options {
             input: input.ok_or_else(|| invalid_argument("missing --input"))?,
             collateral: collateral.ok_or_else(|| invalid_argument("missing --collateral"))?,
             intel_root,
+            nvidia_policy,
+            nvattest,
             mr_td: mr_td.ok_or_else(|| invalid_argument("missing --mrtd"))?,
             rt_mrs: [0, 1, 2, 3].map(|index| {
                 rt_mrs[index].unwrap_or_else(|| {

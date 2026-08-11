@@ -119,7 +119,13 @@ mod krun;
     )
 ))]
 mod nitro_verification;
-#[cfg(all(feature = "host", target_os = "linux", not(target_env = "musl")))]
+#[cfg(all(
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 mod nvidia_verification;
 #[cfg(any(
     all(feature = "guest-runtime", target_os = "linux"),
@@ -203,7 +209,6 @@ pub mod host {
         PciAddress, ResolvedConfidentialDeviceBundle, VfioAssignment,
     };
     pub use crate::nitro_verification::{NitroVerificationPolicy, NitroVerifier};
-    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
     pub use crate::nvidia_verification::NvidiaNvattestVerifier;
     pub use crate::snp_verification::{
         SnpRevocationPolicy, SnpTcbVersion, SnpVerificationPolicy, SnpVerifier,

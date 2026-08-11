@@ -197,7 +197,7 @@ verify-snp-attestation input measurement crl="":
       --example verify_snp_attestation -- "${args[@]}"
 
 # Verify a collected TDX JSON response with retained Intel DCAP collateral.
-verify-tdx-attestation input collateral mrtd rtmr0 rtmr1 rtmr2 rtmr3 allow_dynamic_platform="false" allow_cached_keys="false" allow_smt="false":
+verify-tdx-attestation input collateral mrtd rtmr0 rtmr1 rtmr2 rtmr3 allow_dynamic_platform="false" allow_cached_keys="false" allow_smt="false" nvidia_policy="" nvattest="nvattest":
     #!/usr/bin/env bash
     set -euo pipefail
     args=(
@@ -207,6 +207,9 @@ verify-tdx-attestation input collateral mrtd rtmr0 rtmr1 rtmr2 rtmr3 allow_dynam
     if [ "{{allow_dynamic_platform}}" = true ]; then args+=(--allow-dynamic-platform); fi
     if [ "{{allow_cached_keys}}" = true ]; then args+=(--allow-cached-keys); fi
     if [ "{{allow_smt}}" = true ]; then args+=(--allow-smt); fi
+    if [ -n "{{nvidia_policy}}" ]; then
+      args+=(--nvidia-policy "{{nvidia_policy}}" --nvattest "{{nvattest}}")
+    fi
     cargo run --locked --quiet -p nanocodex-vm \
       --example verify_tdx_attestation -- "${args[@]}"
 
@@ -254,10 +257,10 @@ prove-command-libkrun-tdx qgs="/run/tdx-qgs/qgs.socket" message="confidential-vm
 
 # Drive an already-running managed Confidential VM through an untrusted gcloud
 # SSH stdio transport. `local_guest` must be byte-identical to `guest_program`.
-prove-command-gcp-managed profile instance zone local_guest project="nanocodex-tee-lab" guest_program="/home/georgios/nanocodex-vm-guest" message="attested-managed-tool-call":
+prove-command-gcp-managed profile instance zone local_guest project="nanocodex-tee-lab" guest_program="/home/georgios/nanocodex-vm-guest" message="attested-managed-tool-call" nvidia="off":
     cargo run --locked --quiet -p nanocodex-vm \
       --example confidential_transport_command -- \
-      --profile "{{profile}}" --local-guest "{{local_guest}}" \
+      --profile "{{profile}}" --nvidia "{{nvidia}}" --local-guest "{{local_guest}}" \
       --guest-program "{{guest_program}}" --message "{{message}}" \
       --transport gcloud \
       --transport-arg compute --transport-arg ssh \
@@ -267,6 +270,11 @@ prove-command-gcp-managed profile instance zone local_guest project="nanocodex-t
       --transport-arg --command \
       --transport-arg "sudo {{guest_program}} /" \
       --transport-arg --quiet
+
+# Collect one H100 report under the same challenge as the TDX command receipt.
+prove-command-gcp-managed-h100-tdx instance zone local_guest project="nanocodex-tee-lab" guest_program="/home/georgios/nanocodex-vm-guest" message="attested-managed-h100-tool-call":
+    just prove-command-gcp-managed tdx "{{instance}}" "{{zone}}" "{{local_guest}}" \
+      "{{project}}" "{{guest_program}}" "{{message}}" h100-single
 
 # Exercise the real KVM VM, sealed execution, retained key, signatures, and
 # verifier without claiming hardware trust. The native verifier deliberately

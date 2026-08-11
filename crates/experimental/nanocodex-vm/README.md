@@ -135,6 +135,7 @@ guest to a GCP SNP or TDX VM:
 ```console
 just prove-command-gcp-managed snp INSTANCE us-central1-a ./nanocodex-vm-guest
 just prove-command-gcp-managed tdx INSTANCE us-central1-a ./nanocodex-vm-guest
+just prove-command-gcp-managed-h100-tdx INSTANCE us-central1-a ./nanocodex-vm-guest
 ```
 
 The outside process treats `gcloud ssh` as an untrusted transport. The returned
@@ -146,6 +147,14 @@ trust. On a managed VM, a caller-supplied workload digest is report-bound but
 is not automatically part of the launch measurement. Exact workload identity
 therefore additionally requires a measured/verity image, an owned RTMR
 extension, or a cloud image-digest attestation policy.
+
+The H100 recipe requests exactly one Hopper GPU evidence object from NVIDIA's
+`nvattest` C++ CLI using the same 32-byte challenge as the command receipt. The
+guest includes the raw GPU evidence digest in the CPU transcript before asking
+TDX for its quote, so removing or replacing GPU evidence invalidates the CPU
+report binding. `detect_nvidia_attestation_profile` recognizes the reviewed
+`10de:2330` H100 PCI identity and fails closed on mixed H100/B200 systems or a
+non-single H100 topology.
 
 An SNP relying party can now appraise a retained response entirely offline:
 
@@ -190,6 +199,20 @@ inferred from the cloud provider or quote topology. The final three optional
 arguments to `just verify-tdx-attestation` expose these choices in the order
 `allow_dynamic_platform`, `allow_cached_keys`, and `allow_smt`, so the GCP
 combination ends in `true false true`.
+
+For a bundle containing H100 evidence, append the checked-in H100 Rego policy
+and the independently installed `nvattest` path to that recipe after the three
+boolean flags. `NativeVerifierSet` dispatches TDX and NVIDIA evidence to their
+independent verifiers and accepts the composite only when both bind the same
+challenge and the CPU quote binds the exact GPU evidence digest:
+
+```console
+just verify-tdx-attestation attestation.json collateral.json \
+  "$MRTD_HEX" "$RTMR0_HEX" "$RTMR1_HEX" "$RTMR2_HEX" "$RTMR3_HEX" \
+  true false true \
+  crates/experimental/nanocodex-vm/examples/nvidia-h100-single.rego \
+  /usr/local/bin/nvattest
+```
 
 [`host::NitroVerifier`] requires a caller-pinned AWS root in DER form and at
 least one exact SHA-384 PCR. It validates the unique X.509 path and path-length

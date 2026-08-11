@@ -261,6 +261,8 @@ impl CpuAttestationProfile {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NvidiaAttestationProfile {
+    /// Exactly one Hopper H100 GPU, with no NVSwitch evidence required.
+    H100Single,
     /// Exactly one B200 GPU, with NVLink disabled.
     B200Single,
     /// Exactly eight B200 GPUs and two NVSwitches in encrypted MPT mode.
@@ -272,7 +274,7 @@ impl NvidiaAttestationProfile {
     #[must_use]
     pub const fn gpu_count(self) -> usize {
         match self {
-            Self::B200Single => 1,
+            Self::H100Single | Self::B200Single => 1,
             Self::B200Hgx8EncryptedNvlink => 8,
         }
     }
@@ -281,7 +283,7 @@ impl NvidiaAttestationProfile {
     #[must_use]
     pub const fn switch_count(self) -> usize {
         match self {
-            Self::B200Single => 0,
+            Self::H100Single | Self::B200Single => 0,
             Self::B200Hgx8EncryptedNvlink => 2,
         }
     }
