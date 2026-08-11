@@ -1,5 +1,6 @@
 use std::{collections::HashSet, future, path::Path, time::Duration};
 
+use futures_util::{StreamExt as _, TryStreamExt as _, stream};
 use nanocodex_network::{
     Hub, JoinAuthority, JoinTicket, Node, NodeAdvertisement, NodeIdentity, PeerChange, ProtocolId,
     Query,
@@ -8,6 +9,7 @@ use serde::Serialize;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 const WORKER_PROTOCOL: &str = "nanocodex.worker/1";
+const PROBE_DIAL_CONCURRENCY: usize = 32;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -157,22 +159,11 @@ async fn probe(
     let discovery_millis = discovery_started.elapsed().as_millis();
 
     let dial_started = std::time::Instant::now();
-    for provider in &providers {
-        tokio::time::timeout(Duration::from_secs(30), async {
-            let mut stream = node.connect(*provider, &protocol).await?;
-            stream.write_all(b"ping").await?;
-            let mut response = [0; 4];
-            stream.read_exact(&mut response).await?;
-            if &response != b"pong" {
-                return Err::<(), Box<dyn std::error::Error>>(
-                    "received an unexpected direct-stream response".into(),
-                );
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|_| format!("timed out dialing provider {provider}"))??;
-    }
+    stream::iter(providers.iter().copied())
+        .map(|provider| ping(&node, provider, &protocol))
+        .buffer_unordered(PROBE_DIAL_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
     let result = ProbeResult {
         workers: providers.len(),
         discovery_millis,
@@ -181,6 +172,27 @@ async fn probe(
     println!("{}", serde_json::to_string(&result)?);
     node.shutdown().await?;
     Ok(())
+}
+
+async fn ping(
+    node: &Node,
+    provider: iroh::EndpointId,
+    protocol: &ProtocolId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let mut stream = node.connect(provider, protocol).await?;
+        stream.write_all(b"ping").await?;
+        let mut response = [0; 4];
+        stream.read_exact(&mut response).await?;
+        if &response != b"pong" {
+            return Err::<(), Box<dyn std::error::Error>>(
+                "received an unexpected direct-stream response".into(),
+            );
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| format!("timed out dialing provider {provider}"))?
 }
 
 fn required(
