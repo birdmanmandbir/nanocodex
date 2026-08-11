@@ -2,7 +2,7 @@ use std::{io::Write as _, net::SocketAddr, path::PathBuf, str::FromStr as _};
 
 use clap::{Args, Subcommand};
 use eyre::{Result, WrapErr as _, eyre};
-use nanocodex_network::{Hub, JoinAuthority, JoinTicket, Node, NodeIdentity, TcpBridge};
+use nanocodex_network::{Hub, JoinAuthority, Node, NodeIdentity, TcpBridge, TcpBridgeTicket};
 use tokio::net::TcpListener;
 
 #[derive(Args)]
@@ -32,7 +32,7 @@ struct Publish {
 
 #[derive(Args)]
 struct Connect {
-    /// Opaque capability printed by `nanocodex network publish`.
+    /// Opaque TCP bridge capability printed by `nanocodex network publish`.
     ticket: String,
 
     /// Node-local listen port. Use zero to allocate an available port.
@@ -61,31 +61,50 @@ impl Publish {
         let (hub, ticket) = Hub::bind(&authority)
             .await
             .wrap_err("failed to start the Iroh network hub")?;
-        TcpBridge::publish(&hub, self.target)
+        let provider_identity = NodeIdentity::load_or_create(state.join("provider.json"))
+            .wrap_err("failed to load the durable network provider identity")?;
+        let provider = Node::join(ticket.clone(), &provider_identity)
             .await
-            .wrap_err("failed to publish the loopback TCP service")?;
+            .wrap_err("failed to join the TCP provider to its Iroh network")?;
+        let listener = TcpBridge::listen(&provider)
+            .await
+            .wrap_err("failed to register the TCP bridge protocol")?;
+        let bridge_ticket = TcpBridgeTicket::new(ticket, provider.endpoint_id())?;
         eprintln!("network hub identity: {}", authority.endpoint_id());
+        eprintln!("network provider identity: {}", provider.endpoint_id());
         eprintln!("published TCP target: {}", self.target);
-        println!("{ticket}");
+        println!("{bridge_ticket}");
         std::io::stdout()
             .flush()
-            .wrap_err("failed to flush the network join ticket")?;
-        tokio::signal::ctrl_c()
+            .wrap_err("failed to flush the network TCP bridge ticket")?;
+        let bridge = tokio::select! {
+            result = TcpBridge::serve(listener, self.target) => result,
+            signal = tokio::signal::ctrl_c() => {
+                signal.wrap_err("failed to listen for network publisher shutdown")?;
+                Ok(())
+            }
+        };
+        let provider_shutdown = provider
+            .shutdown()
             .await
-            .wrap_err("failed to listen for network hub shutdown")?;
-        hub.shutdown()
+            .wrap_err("failed to stop the Iroh network provider");
+        let hub_shutdown = hub
+            .shutdown()
             .await
-            .wrap_err("failed to stop the Iroh network hub")
+            .wrap_err("failed to stop the Iroh network hub");
+        bridge.wrap_err("network TCP bridge stopped")?;
+        provider_shutdown?;
+        hub_shutdown
     }
 }
 
 impl Connect {
     async fn run(self) -> Result<()> {
-        let ticket = JoinTicket::from_str(&self.ticket)?;
+        let ticket = TcpBridgeTicket::from_str(&self.ticket)?;
         let state = self.state_dir.map_or_else(default_state_dir, Ok)?;
         let identity = NodeIdentity::load_or_create(state.join("node.json"))
             .wrap_err("failed to load the durable network node identity")?;
-        let node = Node::join(ticket, &identity)
+        let node = Node::join(ticket.join_ticket(), &identity)
             .await
             .wrap_err("failed to join the Iroh network")?;
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, self.port))
@@ -98,7 +117,7 @@ impl Connect {
             .flush()
             .wrap_err("failed to flush the node-local TCP address")?;
         let bridge = tokio::select! {
-            result = TcpBridge::connect(&node, listener) => result,
+            result = TcpBridge::connect(&node, ticket.provider_id(), listener) => result,
             signal = tokio::signal::ctrl_c() => {
                 signal.wrap_err("failed to listen for network node shutdown")?;
                 Ok(())
@@ -142,7 +161,7 @@ mod tests {
                 "nanocodex",
                 "network",
                 "connect",
-                "nanocodex-net:ticket",
+                "nanocodex-tcp:ticket",
                 "--port",
                 "0",
             ],

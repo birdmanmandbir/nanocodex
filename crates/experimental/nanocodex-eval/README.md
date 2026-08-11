@@ -170,12 +170,12 @@ nanocodex eval coordinator compare --port 8789
 nanocodex eval benchmark compare --coordinator http://127.0.0.1:8789
 
 # In another process on the coordinator host, publish that fixed loopback port.
-# This generic network command prints a `nanocodex-net:...` join capability.
+# This generic network command prints a `nanocodex-tcp:...` bridge capability.
 nanocodex network publish --target 127.0.0.1:8789
 
 # On each remote worker host, bridge that capability back to loopback. Existing
 # run and benchmark commands continue to use the ordinary local HTTP URL.
-nanocodex network connect 'nanocodex-net:...' --port 8789
+nanocodex network connect 'nanocodex-tcp:...' --port 8789
 nanocodex eval benchmark compare --coordinator http://127.0.0.1:8789
 
 # Let an agent inspect the ledger and choose process fan-out.
@@ -204,26 +204,23 @@ changes its running row permanently to failed. A small locked local marker
 survives benchmarker termination so a systemd restart can reconcile children
 that died with the previous benchmark process.
 
-The iroh ticket is a shared bearer capability and must be handled as a secret.
-It contains the coordinator endpoint's authenticated public identity, current
-relay/direct addressing, and a shared access token. The private endpoint key
-and access token are atomically created under the network command's state
-directory (by default `~/.nanocodex/network/authority.json`), restricted to the
-network user on Unix,
-and reused across restarts. Each start prints a fresh ticket with current
-routing hints while preserving the endpoint identity and join authority.
-Deleting that identity file intentionally creates a new cluster authority.
-Each joined node likewise retains its own cryptographic Iroh identity at
-`~/.nanocodex/network/node.json` by default; this identity is distinct from the
-shared ticket used for initial admission.
+The printed TCP bridge ticket wraps a shared network bearer capability and must
+be handled as a secret. It contains the hub's authenticated public identity,
+current relay/direct addressing, shared admission token, and the public
+identity of the node providing the service. The private hub key and admission
+token are atomically created at `~/.nanocodex/network/authority.json` by
+default. The publisher's separate node identity is retained at
+`provider.json`, and each connector retains its identity at `node.json`.
+Identity files are restricted to the network user on Unix and reused across
+restarts. Each start prints fresh routing hints while preserving those durable
+identities.
 
-The iroh endpoint forwards only to the coordinator's fixed loopback address; it
-is not a general proxy. This authenticates the transport but does not attest
-worker hardware or execution; TEE admission can replace the shared bearer
-capability without changing the coordinator HTTP API. The prototype uses
-iroh's N0 preset, preferring a direct path and falling back to its default relay
-infrastructure. Operator-selected or community relay policy remains future
-work.
+The provider node accepts only the fixed TCP bridge protocol and opens only the
+configured coordinator loopback address; it is not a general proxy. Each
+connection uses a short-lived, single-use grant bound to requester identity,
+provider identity, and protocol. This authenticates the transport but does not
+attest worker hardware or execution. The prototype uses iroh's N0 preset,
+preferring a direct path and falling back to its default relay infrastructure.
 
 VM-backed evals consume a prepared host installation. The matching static
 `nanocodex-vm-guest` must be installed beside the `nanocodex` executable; VM

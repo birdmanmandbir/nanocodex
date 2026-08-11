@@ -146,9 +146,10 @@
   loopback HTTP(S) proxy, ephemeral CA, bounded forwarding, and ordered outbound
   layer seam. Provider and payment behavior stays in the consuming application.
 - The unpublished experimental `nanocodex-network` crate owns durable Iroh node
-  identities, bootstrap admission, endpoint lifecycle, bounded local bridges,
-  and identity-bound direct sessions. Evaluation, scheduling, payment, and TEE
-  policy stay in consuming applications.
+  identities, bootstrap admission, endpoint lifecycle, named application
+  protocols, authenticated peer streams, and bounded local bridges.
+  Evaluation, scheduling, payment, and TEE policy stay in consuming
+  applications.
 - Tempo payment policy and `NanoUSD` support stay under `bin/`; public
   `nanocodex-*` library crates must not depend on them.
 - The unpublished experimental `nanocodex-vm` crate owns the complete VM

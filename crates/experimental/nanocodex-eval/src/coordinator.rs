@@ -1538,15 +1538,28 @@ thinking = ["high"]
         let (iroh_server, ticket) = Hub::bind_with_endpoint(server_endpoint, false)
             .await
             .unwrap();
-        TcpBridge::publish(&iroh_server, coordinator_address)
+        let provider_endpoint = ::iroh::Endpoint::builder(::iroh::endpoint::presets::Minimal)
+            .relay_mode(::iroh::RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .bind()
             .await
             .unwrap();
+        let provider = Node::join_with_endpoint(ticket.clone(), provider_endpoint)
+            .await
+            .unwrap();
+        let provider_id = provider.endpoint_id();
+        let provider_listener = TcpBridge::listen(&provider).await.unwrap();
         let bridge_listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
         let bridge_address = bridge_listener.local_addr().unwrap();
         let client_endpoint = ::iroh::Endpoint::builder(::iroh::endpoint::presets::Minimal)
             .relay_mode(::iroh::RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
             .bind()
             .await
             .unwrap();
@@ -1558,10 +1571,14 @@ thinking = ["high"]
                 result = CoordinatorServer::new(evaluation).serve(coordinator_listener) => {
                     result.unwrap();
                 }
-                result = TcpBridge::connect(&node, bridge_listener) => {
+                result = TcpBridge::serve(provider_listener, coordinator_address) => {
+                    result.unwrap();
+                }
+                result = TcpBridge::connect(&node, provider_id, bridge_listener) => {
                     result.unwrap();
                 }
             }
+            provider.shutdown().await.unwrap();
             iroh_server.shutdown().await.unwrap();
         });
         let client = CoordinatorClient::new(&format!("http://{bridge_address}")).unwrap();

@@ -6,12 +6,14 @@ use std::{
     io::Write as _,
     net::SocketAddr,
     path::{Path, PathBuf},
+    pin::Pin,
     str::FromStr,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    task::{Context, Poll},
+    time::{Duration, Instant},
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -23,9 +25,9 @@ use iroh::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _},
+    io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf},
     net::{TcpListener, TcpStream},
-    sync::{Mutex, Semaphore},
+    sync::{Mutex, Semaphore, mpsc},
     task::JoinSet,
 };
 use tokio_util::task::AbortOnDropHandle;
@@ -40,13 +42,19 @@ const MAX_IDENTITY_BYTES: u64 = 4 * 1024;
 const MAX_TICKET_BYTES: usize = 16 * 1024;
 const MAX_CONTROL_BYTES: usize = 16 * 1024;
 const MAX_PENDING_GRANTS: usize = 128;
+const MAX_PENDING_SESSIONS: usize = 32;
+const MAX_PROTOCOL_BYTES: usize = 128;
 const TOKEN_BYTES: usize = 32;
 const NONCE_BYTES: usize = 32;
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(60);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+const GRANT_LIFETIME: Duration = Duration::from_secs(30);
 const MAX_CONCURRENT_STREAMS: usize = 32;
 const STREAM_CONTROL: u8 = 1;
-const STREAM_FORWARD: u8 = 2;
+const STREAM_SESSION_REQUEST: u8 = 2;
+const TCP_BRIDGE_PROTOCOL: &str = "nanocodex/tcp-bridge/1";
+const TCP_TICKET_PREFIX: &str = "nanocodex-tcp:";
+const TCP_TICKET_VERSION: u8 = 1;
 
 #[cfg(test)]
 static TEST_ENDPOINT_PERMIT: Semaphore = Semaphore::const_new(1);
@@ -78,17 +86,44 @@ pub struct JoinTicket {
     encoded: String,
 }
 
+/// Stable application protocol name routed between authenticated peers.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ProtocolId(String);
+
+/// Opaque capability for joining a network and reaching one published TCP bridge.
+#[derive(Clone)]
+pub struct TcpBridgeTicket {
+    network: JoinTicket,
+    provider: iroh::EndpointId,
+    encoded: String,
+}
+
 /// Running Iroh rendezvous and admission endpoint.
 pub struct Hub {
     router: Router,
     nodes: Arc<NodeRegistry>,
-    tcp_target: Arc<Mutex<Option<SocketAddr>>>,
 }
 
 /// One durable node joined to a network.
 pub struct Node {
     router: Router,
     dialer: HubDialer,
+    listeners: Arc<Mutex<HashMap<ProtocolId, mpsc::Sender<PeerStream>>>>,
+}
+
+/// Receiver for authenticated streams addressed to one application protocol.
+pub struct ProtocolListener {
+    protocol: ProtocolId,
+    incoming: mpsc::Receiver<PeerStream>,
+}
+
+/// One mutually authenticated, protocol-bound peer stream.
+pub struct PeerStream {
+    peer: iroh::EndpointId,
+    protocol: ProtocolId,
+    _connection: iroh::endpoint::Connection,
+    send: iroh::endpoint::SendStream,
+    recv: iroh::endpoint::RecvStream,
 }
 
 /// Optional bounded adapter between loopback TCP and network streams.
@@ -98,7 +133,8 @@ pub struct TcpBridge;
 struct HubDialer {
     endpoint: Endpoint,
     ticket: Arc<JoinTicket>,
-    grants: Arc<Mutex<Vec<DirectGrant>>>,
+    grants: Arc<Mutex<Vec<PendingSessionGrant>>>,
+    listeners: Arc<Mutex<HashMap<ProtocolId, mpsc::Sender<PeerStream>>>>,
     connection: Arc<Mutex<Option<ActiveHubConnection>>>,
 }
 
@@ -124,10 +160,12 @@ struct ControlStreams {
     recv: iroh::endpoint::RecvStream,
 }
 
-#[derive(Clone, Copy)]
-struct DirectGrant {
+#[derive(Clone)]
+struct PendingSessionGrant {
     token: [u8; TOKEN_BYTES],
     requester: iroh::EndpointId,
+    protocol: ProtocolId,
+    expires_at: Instant,
 }
 
 /// Identity, admission, Iroh endpoint, or forwarding failure.
@@ -136,6 +174,9 @@ pub enum NetworkError {
     /// The supplied ticket is malformed or uses an unsupported version.
     #[error("invalid network join ticket: {0}")]
     InvalidTicket(String),
+    /// An application protocol name is empty, too long, or contains unsupported bytes.
+    #[error("invalid network protocol: {0}")]
+    InvalidProtocol(String),
     /// A bridge was asked to expose or target a non-loopback TCP address.
     #[error("invalid network loopback bridge address: {0}")]
     InvalidLoopback(SocketAddr),
@@ -161,11 +202,8 @@ pub enum NetworkError {
         /// Bounded validation diagnostic.
         message: String,
     },
-    /// A bilateral operation targeted a node that is not currently registered.
-    #[error("Iroh node {0} is not connected to the hub")]
-    NodeNotConnected(iroh::EndpointId),
-    /// A direct bilateral session requires two distinct node identities.
-    #[error("a bilateral Iroh session requires two distinct nodes")]
+    /// A peer session requires two distinct node identities.
+    #[error("an Iroh peer session requires two distinct nodes")]
     SameNode,
     /// An authenticated Iroh stream could not be established or forwarded.
     #[error("network protocol failed: {0}")]
@@ -180,6 +218,13 @@ struct WireTicket {
     version: u8,
     address: EndpointAddr,
     token: [u8; TOKEN_BYTES],
+}
+
+#[derive(Serialize, Deserialize)]
+struct WireTcpBridgeTicket {
+    version: u8,
+    network: String,
+    provider: iroh::EndpointId,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -214,19 +259,26 @@ enum ControlMessage {
     Grant {
         token: [u8; TOKEN_BYTES],
         requester: iroh::EndpointId,
+        protocol: String,
     },
     Granted,
-    Revoke {
-        token: [u8; TOKEN_BYTES],
+    Rejected {
+        message: String,
     },
-    Revoked,
-    Dial {
+}
+
+#[derive(Serialize, Deserialize)]
+struct SessionRequest {
+    provider: iroh::EndpointId,
+    protocol: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum SessionGrant {
+    Granted {
         address: EndpointAddr,
         token: [u8; TOKEN_BYTES],
-        nonce: [u8; NONCE_BYTES],
-    },
-    Dialed {
-        nonce: [u8; NONCE_BYTES],
     },
     Rejected {
         message: String,
@@ -234,14 +286,16 @@ enum ControlMessage {
 }
 
 #[derive(Serialize, Deserialize)]
-struct DirectRequest {
+struct SessionOpen {
     token: [u8; TOKEN_BYTES],
-    nonce: [u8; NONCE_BYTES],
+    protocol: String,
 }
 
 #[derive(Serialize, Deserialize)]
-struct DirectResponse {
-    nonce: [u8; NONCE_BYTES],
+#[serde(tag = "status", rename_all = "snake_case")]
+enum SessionOpenResponse {
+    Accepted,
+    Rejected { message: String },
 }
 
 #[derive(Clone)]
@@ -249,12 +303,13 @@ struct HubProtocol {
     token: [u8; TOKEN_BYTES],
     streams: Arc<Semaphore>,
     nodes: Arc<NodeRegistry>,
-    tcp_target: Arc<Mutex<Option<SocketAddr>>>,
 }
 
 #[derive(Clone)]
 struct NodeProtocol {
-    grants: Arc<Mutex<Vec<DirectGrant>>>,
+    grants: Arc<Mutex<Vec<PendingSessionGrant>>>,
+    listeners: Arc<Mutex<HashMap<ProtocolId, mpsc::Sender<PeerStream>>>>,
+    streams: Arc<Semaphore>,
 }
 
 impl fmt::Debug for HubProtocol {
@@ -441,6 +496,53 @@ impl fmt::Debug for NodeIdentity {
     }
 }
 
+impl ProtocolId {
+    /// Creates a bounded protocol identifier suitable for stable wire routing.
+    pub fn new(protocol: impl Into<String>) -> Result<Self, NetworkError> {
+        let protocol = protocol.into();
+        if protocol.is_empty() {
+            return Err(NetworkError::InvalidProtocol(
+                "protocol name must not be empty".to_owned(),
+            ));
+        }
+        if protocol.len() > MAX_PROTOCOL_BYTES {
+            return Err(NetworkError::InvalidProtocol(format!(
+                "protocol name exceeds {MAX_PROTOCOL_BYTES} bytes"
+            )));
+        }
+        if !protocol
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+        {
+            return Err(NetworkError::InvalidProtocol(
+                "protocol name must use only ASCII letters, digits, '/', '.', '_', or '-'"
+                    .to_owned(),
+            ));
+        }
+        Ok(Self(protocol))
+    }
+
+    /// Returns the wire-stable protocol name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ProtocolId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl FromStr for ProtocolId {
+    type Err = NetworkError;
+
+    fn from_str(protocol: &str) -> Result<Self, Self::Err> {
+        Self::new(protocol)
+    }
+}
+
 impl JoinTicket {
     fn from_parts(address: EndpointAddr, token: [u8; TOKEN_BYTES]) -> Result<Self, NetworkError> {
         let payload = serde_json::to_vec(&WireTicket {
@@ -504,6 +606,83 @@ impl FromStr for JoinTicket {
     }
 }
 
+impl TcpBridgeTicket {
+    /// Binds one TCP bridge provider identity to a network admission ticket.
+    pub fn new(network: JoinTicket, provider: iroh::EndpointId) -> Result<Self, NetworkError> {
+        let payload = serde_json::to_vec(&WireTcpBridgeTicket {
+            version: TCP_TICKET_VERSION,
+            network: network.to_string(),
+            provider,
+        })
+        .map_err(|error| NetworkError::InvalidTicket(error.to_string()))?;
+        Ok(Self {
+            network,
+            provider,
+            encoded: URL_SAFE_NO_PAD.encode(payload),
+        })
+    }
+
+    /// Returns the topology admission capability carried by this bridge ticket.
+    #[must_use]
+    pub fn join_ticket(&self) -> JoinTicket {
+        self.network.clone()
+    }
+
+    /// Returns the durable identity providing the TCP service.
+    #[must_use]
+    pub const fn provider_id(&self) -> iroh::EndpointId {
+        self.provider
+    }
+}
+
+impl fmt::Debug for TcpBridgeTicket {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TcpBridgeTicket")
+            .field("provider_id", &self.provider)
+            .field("network", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for TcpBridgeTicket {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{TCP_TICKET_PREFIX}{}", self.encoded)
+    }
+}
+
+impl FromStr for TcpBridgeTicket {
+    type Err = NetworkError;
+
+    fn from_str(ticket: &str) -> Result<Self, Self::Err> {
+        let encoded = ticket.strip_prefix(TCP_TICKET_PREFIX).ok_or_else(|| {
+            NetworkError::InvalidTicket(format!(
+                "expected a TCP bridge ticket beginning with {TCP_TICKET_PREFIX}"
+            ))
+        })?;
+        if encoded.is_empty() || encoded.len() > MAX_TICKET_BYTES * 2 {
+            return Err(NetworkError::InvalidTicket(
+                "TCP bridge ticket payload has an invalid length".to_owned(),
+            ));
+        }
+        let payload = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|error| NetworkError::InvalidTicket(error.to_string()))?;
+        let WireTcpBridgeTicket {
+            version,
+            network,
+            provider,
+        } = serde_json::from_slice(&payload)
+            .map_err(|error| NetworkError::InvalidTicket(error.to_string()))?;
+        if version != TCP_TICKET_VERSION {
+            return Err(NetworkError::InvalidTicket(format!(
+                "unsupported TCP bridge ticket version {version}"
+            )));
+        }
+        Self::new(JoinTicket::from_str(&network)?, provider)
+    }
+}
+
 impl Hub {
     /// Starts a public-relay-capable Iroh endpoint with a durable identity.
     ///
@@ -534,12 +713,10 @@ impl Hub {
         token: [u8; TOKEN_BYTES],
     ) -> Result<(Self, JoinTicket), NetworkError> {
         let nodes = Arc::new(NodeRegistry::default());
-        let tcp_target = Arc::new(Mutex::new(None));
         let protocol = HubProtocol {
             streams: Arc::new(Semaphore::new(MAX_CONCURRENT_STREAMS)),
             token,
             nodes: nodes.clone(),
-            tcp_target: tcp_target.clone(),
         };
         let token = protocol.token;
         let router = Router::builder(endpoint).accept(HUB_ALPN, protocol).spawn();
@@ -554,14 +731,7 @@ impl Hub {
                 })?;
         }
         let ticket = JoinTicket::from_parts(router.endpoint().addr(), token)?;
-        Ok((
-            Self {
-                router,
-                nodes,
-                tcp_target,
-            },
-            ticket,
-        ))
+        Ok((Self { router, nodes }, ticket))
     }
 
     /// Returns the durable endpoint identities currently registered over live connections.
@@ -576,64 +746,6 @@ impl Hub {
             .collect::<Vec<_>>();
         nodes.sort_unstable();
         nodes
-    }
-
-    /// Proves a direct, mutually authenticated node-to-node path.
-    ///
-    /// The hub grants one single-use capability to `provider`, pinned
-    /// to `requester`'s Iroh identity. It then asks `requester` to dial the
-    /// provider directly and echo a fresh nonce. Session traffic does not pass
-    /// through the hub.
-    pub async fn prove_direct_path(
-        &self,
-        requester: iroh::EndpointId,
-        provider: iroh::EndpointId,
-    ) -> Result<(), NetworkError> {
-        if requester == provider {
-            return Err(NetworkError::SameNode);
-        }
-        let (requester_peer, provider_peer) = {
-            let nodes = self.nodes.peers.lock().await;
-            let requester_peer = nodes
-                .get(&requester)
-                .cloned()
-                .ok_or(NetworkError::NodeNotConnected(requester))?;
-            let provider_peer = nodes
-                .get(&provider)
-                .cloned()
-                .ok_or(NetworkError::NodeNotConnected(provider))?;
-            (requester_peer, provider_peer)
-        };
-        let token = random_bytes::<TOKEN_BYTES>()?;
-        let nonce = random_bytes::<NONCE_BYTES>()?;
-        expect_control(
-            &provider_peer,
-            &ControlMessage::Grant { token, requester },
-            |message| matches!(message, ControlMessage::Granted),
-            "node rejected a bilateral session grant",
-        )
-        .await?;
-        let dial = expect_control(
-            &requester_peer,
-            &ControlMessage::Dial {
-                address: provider_peer.address.clone(),
-                token,
-                nonce,
-            },
-            |message| matches!(message, ControlMessage::Dialed { nonce: echoed } if *echoed == nonce),
-            "node failed a bilateral direct-path challenge",
-        )
-        .await;
-        if dial.is_err() {
-            let _ = expect_control(
-                &provider_peer,
-                &ControlMessage::Revoke { token },
-                |message| matches!(message, ControlMessage::Revoked),
-                "node failed to revoke an unused bilateral grant",
-            )
-            .await;
-        }
-        dial
     }
 
     /// Gracefully closes the Iroh endpoint and its active sessions.
@@ -663,11 +775,14 @@ impl Node {
         endpoint: Endpoint,
     ) -> Result<Self, NetworkError> {
         let grants = Arc::new(Mutex::new(Vec::new()));
+        let listeners = Arc::new(Mutex::new(HashMap::new()));
         let router = Router::builder(endpoint.clone())
             .accept(
                 NODE_ALPN,
                 NodeProtocol {
                     grants: grants.clone(),
+                    listeners: listeners.clone(),
+                    streams: Arc::new(Semaphore::new(MAX_CONCURRENT_STREAMS)),
                 },
             )
             .spawn();
@@ -675,16 +790,58 @@ impl Node {
             endpoint,
             ticket: Arc::new(ticket),
             grants,
+            listeners: listeners.clone(),
             connection: Arc::new(Mutex::new(None)),
         };
         dialer.ensure_connected().await?;
-        Ok(Self { router, dialer })
+        Ok(Self {
+            router,
+            dialer,
+            listeners,
+        })
     }
 
     /// Returns the node's durable authenticated endpoint identity.
     #[must_use]
     pub fn endpoint_id(&self) -> iroh::EndpointId {
         self.router.endpoint().id()
+    }
+
+    /// Registers one application protocol on this node.
+    ///
+    /// At most one live listener may own a protocol name at a time. Dropping
+    /// the listener closes its queue and permits a replacement listener.
+    pub async fn listen(&self, protocol: ProtocolId) -> Result<ProtocolListener, NetworkError> {
+        let mut listeners = self.listeners.lock().await;
+        if listeners
+            .get(&protocol)
+            .is_some_and(|listener| !listener.is_closed())
+        {
+            return Err(NetworkError::Protocol(format!(
+                "protocol {protocol} already has a listener"
+            )));
+        }
+        let (incoming, receiver) = mpsc::channel(MAX_PENDING_SESSIONS);
+        listeners.insert(protocol.clone(), incoming);
+        Ok(ProtocolListener {
+            protocol,
+            incoming: receiver,
+        })
+    }
+
+    /// Opens a direct authenticated stream to `peer` for `protocol`.
+    ///
+    /// The hub authorizes one short-lived, identity- and protocol-bound grant.
+    /// Application bytes then flow directly between the two nodes.
+    pub async fn connect(
+        &self,
+        peer: iroh::EndpointId,
+        protocol: &ProtocolId,
+    ) -> Result<PeerStream, NetworkError> {
+        if peer == self.endpoint_id() {
+            return Err(NetworkError::SameNode);
+        }
+        self.dialer.connect_peer(peer, protocol).await
     }
 
     /// Gracefully leaves the network and closes direct sessions.
@@ -696,43 +853,168 @@ impl Node {
     }
 }
 
-impl TcpBridge {
-    /// Publishes one fixed loopback TCP service through a hub.
-    pub async fn publish(hub: &Hub, target: SocketAddr) -> Result<(), NetworkError> {
-        require_loopback(target)?;
-        let mut configured = hub.tcp_target.lock().await;
-        if configured.is_some() {
-            return Err(NetworkError::Protocol(
-                "the hub already publishes a TCP target".to_owned(),
-            ));
-        }
-        *configured = Some(target);
-        Ok(())
+impl ProtocolListener {
+    /// Returns the protocol routed to this listener.
+    #[must_use]
+    pub const fn protocol(&self) -> &ProtocolId {
+        &self.protocol
     }
 
-    /// Forwards a node-local loopback listener to the hub's published service.
-    pub async fn connect(node: &Node, listener: TcpListener) -> Result<(), NetworkError> {
-        require_loopback(listener.local_addr()?)?;
+    /// Waits for the next authenticated peer stream.
+    pub async fn accept(&mut self) -> Option<PeerStream> {
+        self.incoming.recv().await
+    }
+}
+
+impl fmt::Debug for ProtocolListener {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProtocolListener")
+            .field("protocol", &self.protocol)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PeerStream {
+    /// Returns the durable identity authenticated by the peer's Iroh endpoint.
+    #[must_use]
+    pub const fn peer_id(&self) -> iroh::EndpointId {
+        self.peer
+    }
+
+    /// Returns the application protocol bound into this session's grant.
+    #[must_use]
+    pub const fn protocol(&self) -> &ProtocolId {
+        &self.protocol
+    }
+}
+
+impl fmt::Debug for PeerStream {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PeerStream")
+            .field("peer_id", &self.peer)
+            .field("protocol", &self.protocol)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AsyncRead for PeerStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        AsyncRead::poll_read(Pin::new(&mut self.recv), context, buffer)
+    }
+}
+
+impl AsyncWrite for PeerStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        AsyncWrite::poll_write(Pin::new(&mut self.send), context, buffer)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        AsyncWrite::poll_flush(Pin::new(&mut self.send), context)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        AsyncWrite::poll_shutdown(Pin::new(&mut self.send), context)
+    }
+}
+
+impl TcpBridge {
+    /// Registers the fixed TCP bridge protocol before advertising a provider.
+    pub async fn listen(node: &Node) -> Result<ProtocolListener, NetworkError> {
+        let protocol = ProtocolId::new(TCP_BRIDGE_PROTOCOL)?;
+        node.listen(protocol).await
+    }
+
+    /// Serves one fixed loopback TCP target over authenticated peer sessions.
+    pub async fn serve(
+        mut listener: ProtocolListener,
+        target: SocketAddr,
+    ) -> Result<(), NetworkError> {
+        require_loopback(target)?;
+        if listener.protocol().as_str() != TCP_BRIDGE_PROTOCOL {
+            return Err(NetworkError::Protocol(
+                "TCP bridge received a listener for the wrong protocol".to_owned(),
+            ));
+        }
         let mut connections = JoinSet::new();
         loop {
             tokio::select! {
-                accepted = listener.accept(), if connections.len() < MAX_CONCURRENT_STREAMS => {
-                    let (stream, peer) = accepted?;
-                    let dialer = node.dialer.clone();
+                incoming = listener.accept(), if connections.len() < MAX_CONCURRENT_STREAMS => {
+                    let Some(mut session) = incoming else {
+                        return Ok(());
+                    };
                     connections.spawn(async move {
-                        if let Err(error) = forward_downstream(dialer, stream).await {
-                            tracing::warn!(%peer, %error, "Iroh hub downstream closed");
-                        }
+                        let mut origin = TcpStream::connect(target).await?;
+                        tokio::io::copy_bidirectional(&mut origin, &mut session).await?;
+                        Ok::<(), NetworkError>(())
                     });
                 }
                 completed = connections.join_next(), if !connections.is_empty() => {
-                    if let Some(Err(error)) = completed {
-                        tracing::warn!(%error, "Iroh hub downstream task failed");
+                    if let Some(Ok(Err(error))) = completed {
+                        tracing::warn!(%error, "network TCP bridge upstream closed");
+                    } else if let Some(Err(error)) = completed {
+                        tracing::warn!(%error, "network TCP bridge upstream task failed");
                     }
                 }
             }
         }
     }
+
+    /// Forwards a node-local loopback listener to one peer's published service.
+    pub async fn connect(
+        node: &Node,
+        provider: iroh::EndpointId,
+        listener: TcpListener,
+    ) -> Result<(), NetworkError> {
+        require_loopback(listener.local_addr()?)?;
+        let protocol = ProtocolId::new(TCP_BRIDGE_PROTOCOL)?;
+        let mut connections = JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept(), if connections.len() < MAX_CONCURRENT_STREAMS => {
+                    let (stream, peer) = accepted?;
+                    let node = node.dialer.clone();
+                    let protocol = protocol.clone();
+                    connections.spawn(async move {
+                        if let Err(error) = forward_downstream(node, provider, protocol, stream).await {
+                            tracing::warn!(%peer, %error, "network TCP bridge downstream closed");
+                        }
+                    });
+                }
+                completed = connections.join_next(), if !connections.is_empty() => {
+                    if let Some(Err(error)) = completed {
+                        tracing::warn!(%error, "network TCP bridge downstream task failed");
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn forward_downstream(
+    node: HubDialer,
+    provider: iroh::EndpointId,
+    protocol: ProtocolId,
+    mut stream: TcpStream,
+) -> Result<(), NetworkError> {
+    let mut session = node.connect_peer(provider, &protocol).await?;
+    tokio::io::copy_bidirectional(&mut stream, &mut session).await?;
+    Ok(())
 }
 
 impl HubDialer {
@@ -779,10 +1061,10 @@ impl HubDialer {
         if !matches!(ready, ControlMessage::Ready) {
             return Err(unexpected_control("hub rejected node registration", ready));
         }
-        let endpoint = self.endpoint.clone();
         let grants = self.grants.clone();
+        let listeners = self.listeners.clone();
         let control_task = AbortOnDropHandle::new(tokio::spawn(async move {
-            if let Err(error) = node_control_loop(endpoint, grants, send, recv).await {
+            if let Err(error) = node_control_loop(grants, listeners, send, recv).await {
                 tracing::debug!(%error, "Iroh node control channel closed");
             }
         }));
@@ -814,6 +1096,74 @@ impl HubDialer {
         *connection = Some(active);
         Ok(streams)
     }
+
+    async fn request_session(
+        &self,
+        provider: iroh::EndpointId,
+        protocol: &ProtocolId,
+    ) -> Result<(EndpointAddr, [u8; TOKEN_BYTES]), NetworkError> {
+        let (mut send, mut recv) = self.open_bi().await?;
+        write_stream_prefix(&mut send, &self.ticket.token, STREAM_SESSION_REQUEST).await?;
+        write_frame(
+            &mut send,
+            &SessionRequest {
+                provider,
+                protocol: protocol.to_string(),
+            },
+        )
+        .await?;
+        send.finish()
+            .map_err(|error| NetworkError::Protocol(error.to_string()))?;
+        match tokio::time::timeout(AUTH_TIMEOUT, read_frame(&mut recv))
+            .await
+            .map_err(|_| NetworkError::Protocol("hub session grant timed out".to_owned()))??
+        {
+            SessionGrant::Granted { address, token } => Ok((address, token)),
+            SessionGrant::Rejected { message } => Err(NetworkError::Protocol(format!(
+                "hub rejected protocol {protocol} to {provider}: {message}"
+            ))),
+        }
+    }
+
+    async fn connect_peer(
+        &self,
+        peer: iroh::EndpointId,
+        protocol: &ProtocolId,
+    ) -> Result<PeerStream, NetworkError> {
+        let (address, token) = self.request_session(peer, protocol).await?;
+        let connection = self
+            .endpoint
+            .connect(address, NODE_ALPN)
+            .await
+            .map_err(|error| NetworkError::Endpoint(error.to_string()))?;
+        let (mut send, mut recv) = connection
+            .open_bi()
+            .await
+            .map_err(|error| NetworkError::Endpoint(error.to_string()))?;
+        write_frame(
+            &mut send,
+            &SessionOpen {
+                token,
+                protocol: protocol.to_string(),
+            },
+        )
+        .await?;
+        match tokio::time::timeout(AUTH_TIMEOUT, read_frame(&mut recv))
+            .await
+            .map_err(|_| NetworkError::Protocol("peer session acceptance timed out".to_owned()))??
+        {
+            SessionOpenResponse::Accepted => Ok(PeerStream {
+                peer,
+                protocol: protocol.clone(),
+                _connection: connection,
+                send,
+                recv,
+            }),
+            SessionOpenResponse::Rejected { message } => Err(NetworkError::Protocol(format!(
+                "peer rejected protocol {protocol}: {message}"
+            ))),
+        }
+    }
 }
 
 impl ProtocolHandler for HubProtocol {
@@ -839,8 +1189,8 @@ impl ProtocolHandler for HubProtocol {
                     let protocol = self.clone();
                     streams.spawn(async move {
                         let _permit = permit;
-                        if let Err(error) = protocol.forward_upstream(send, recv).await {
-                            tracing::warn!(%remote, %error, "Iroh hub upstream closed");
+                        if let Err(error) = protocol.request_session(remote, send, recv).await {
+                            tracing::warn!(%remote, %error, "Iroh hub session request failed");
                         }
                     });
                 }
@@ -922,152 +1272,257 @@ impl HubProtocol {
         Ok(registered)
     }
 
-    async fn forward_upstream(
+    async fn request_session(
         &self,
-        send: iroh::endpoint::SendStream,
+        requester: iroh::EndpointId,
+        mut send: iroh::endpoint::SendStream,
         mut recv: iroh::endpoint::RecvStream,
     ) -> Result<(), NetworkError> {
-        read_stream_prefix(&mut recv, &self.token, STREAM_FORWARD).await?;
-        let target = self
-            .tcp_target
-            .lock()
-            .await
-            .as_ref()
-            .copied()
-            .ok_or_else(|| {
-                NetworkError::Protocol("the hub has no published TCP target".to_owned())
-            })?;
-        let mut origin = TcpStream::connect(target).await?;
-        let mut transport = tokio::io::join(recv, send);
-        tokio::io::copy_bidirectional(&mut origin, &mut transport).await?;
+        read_stream_prefix(&mut recv, &self.token, STREAM_SESSION_REQUEST).await?;
+        let SessionRequest { provider, protocol } = read_frame(&mut recv).await?;
+        let response = self
+            .grant_session(requester, provider, ProtocolId::new(protocol)?)
+            .await;
+        write_frame(&mut send, &response).await?;
+        send.finish()
+            .map_err(|error| NetworkError::Protocol(error.to_string()))?;
         Ok(())
     }
-}
 
-async fn forward_downstream(dialer: HubDialer, mut stream: TcpStream) -> Result<(), NetworkError> {
-    let (mut send, recv) = dialer.open_bi().await?;
-    write_stream_prefix(&mut send, &dialer.ticket.token, STREAM_FORWARD).await?;
-    let mut transport = tokio::io::join(recv, send);
-    tokio::io::copy_bidirectional(&mut stream, &mut transport).await?;
-    Ok(())
+    async fn grant_session(
+        &self,
+        requester: iroh::EndpointId,
+        provider: iroh::EndpointId,
+        protocol: ProtocolId,
+    ) -> SessionGrant {
+        if requester == provider {
+            return SessionGrant::Rejected {
+                message: "a peer session requires two distinct nodes".to_owned(),
+            };
+        }
+        let provider_peer = {
+            let nodes = self.nodes.peers.lock().await;
+            if !nodes.contains_key(&requester) {
+                return SessionGrant::Rejected {
+                    message: "requesting node is no longer registered".to_owned(),
+                };
+            }
+            let Some(provider_peer) = nodes.get(&provider).cloned() else {
+                return SessionGrant::Rejected {
+                    message: format!("provider {provider} is not connected"),
+                };
+            };
+            provider_peer
+        };
+        let token = match random_bytes::<TOKEN_BYTES>() {
+            Ok(token) => token,
+            Err(error) => {
+                return SessionGrant::Rejected {
+                    message: error.to_string(),
+                };
+            }
+        };
+        let request = ControlMessage::Grant {
+            token,
+            requester,
+            protocol: protocol.to_string(),
+        };
+        if let Err(error) = expect_control(
+            &provider_peer,
+            &request,
+            |message| matches!(message, ControlMessage::Granted),
+            "provider rejected the peer session grant",
+        )
+        .await
+        {
+            return SessionGrant::Rejected {
+                message: error.to_string(),
+            };
+        }
+        SessionGrant::Granted {
+            address: provider_peer.address.clone(),
+            token,
+        }
+    }
 }
 
 impl ProtocolHandler for NodeProtocol {
     async fn accept(&self, connection: iroh::endpoint::Connection) -> Result<(), AcceptError> {
         let remote = connection.remote_id();
-        if let Err(error) = self.accept_direct(remote, connection).await {
-            tracing::warn!(%remote, %error, "Iroh bilateral node session failed");
+        let mut streams = JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = connection.accept_bi() => {
+                    let Ok((send, recv)) = accepted else {
+                        break;
+                    };
+                    let Ok(permit) = self.streams.clone().acquire_owned().await else {
+                        break;
+                    };
+                    let protocol = self.clone();
+                    let connection = connection.clone();
+                    streams.spawn(async move {
+                        let _permit = permit;
+                        if let Err(error) = protocol
+                            .accept_session(remote, connection, send, recv)
+                            .await
+                        {
+                            tracing::warn!(%remote, %error, "Iroh bilateral peer session failed");
+                        }
+                    });
+                }
+                completed = streams.join_next(), if !streams.is_empty() => {
+                    if let Some(Err(error)) = completed {
+                        tracing::warn!(%remote, %error, "Iroh bilateral peer task failed");
+                    }
+                }
+            }
         }
+        while streams.join_next().await.is_some() {}
         Ok(())
     }
 }
 
 impl NodeProtocol {
-    async fn accept_direct(
+    async fn accept_session(
         &self,
         remote: iroh::EndpointId,
         connection: iroh::endpoint::Connection,
+        mut send: iroh::endpoint::SendStream,
+        mut recv: iroh::endpoint::RecvStream,
     ) -> Result<(), NetworkError> {
-        let (mut send, mut recv) = tokio::time::timeout(AUTH_TIMEOUT, connection.accept_bi())
-            .await
-            .map_err(|_| {
-                NetworkError::Protocol(
-                    "bilateral peer did not open a stream before the authentication timeout"
-                        .to_owned(),
-                )
-            })?
-            .map_err(|error| NetworkError::Protocol(error.to_string()))?;
-        let DirectRequest { token, nonce } = read_frame(&mut recv).await?;
+        let SessionOpen { token, protocol } =
+            tokio::time::timeout(AUTH_TIMEOUT, read_frame(&mut recv))
+                .await
+                .map_err(|_| NetworkError::Protocol("peer session hello timed out".to_owned()))??;
+        let protocol = ProtocolId::new(protocol)?;
         let mut grants = self.grants.lock().await;
+        let now = Instant::now();
+        grants.retain(|grant| grant.expires_at > now);
         let Some(index) = grants.iter().position(|grant| {
-            grant.requester == remote && constant_time_eq_32(&grant.token, &token)
+            grant.requester == remote
+                && grant.protocol == protocol
+                && constant_time_eq_32(&grant.token, &token)
         }) else {
-            return Err(NetworkError::Protocol(
-                "bilateral peer presented no matching identity-bound grant".to_owned(),
-            ));
+            write_frame(
+                &mut send,
+                &SessionOpenResponse::Rejected {
+                    message: "no matching identity- and protocol-bound grant".to_owned(),
+                },
+            )
+            .await?;
+            send.finish()
+                .map_err(|error| NetworkError::Protocol(error.to_string()))?;
+            return Ok(());
         };
         grants.swap_remove(index);
         drop(grants);
-        write_frame(&mut send, &DirectResponse { nonce }).await?;
-        send.finish()
-            .map_err(|error| NetworkError::Protocol(error.to_string()))?;
-        send.stopped()
-            .await
-            .map_err(|error| NetworkError::Protocol(error.to_string()))?;
+
+        let listener = self.listeners.lock().await.get(&protocol).cloned();
+        let Some(listener) = listener else {
+            write_frame(
+                &mut send,
+                &SessionOpenResponse::Rejected {
+                    message: "protocol listener is no longer available".to_owned(),
+                },
+            )
+            .await?;
+            send.finish()
+                .map_err(|error| NetworkError::Protocol(error.to_string()))?;
+            return Ok(());
+        };
+        let permit = match listener.try_reserve_owned() {
+            Ok(permit) => permit,
+            Err(error) => {
+                let message = match error {
+                    mpsc::error::TrySendError::Closed(_) => "protocol listener is closed",
+                    mpsc::error::TrySendError::Full(_) => "protocol listener queue is full",
+                };
+                write_frame(
+                    &mut send,
+                    &SessionOpenResponse::Rejected {
+                        message: message.to_owned(),
+                    },
+                )
+                .await?;
+                send.finish()
+                    .map_err(|error| NetworkError::Protocol(error.to_string()))?;
+                return Ok(());
+            }
+        };
+        write_frame(&mut send, &SessionOpenResponse::Accepted).await?;
+        permit.send(PeerStream {
+            peer: remote,
+            protocol,
+            _connection: connection,
+            send,
+            recv,
+        });
         Ok(())
     }
 }
 
 async fn node_control_loop(
-    endpoint: Endpoint,
-    grants: Arc<Mutex<Vec<DirectGrant>>>,
+    grants: Arc<Mutex<Vec<PendingSessionGrant>>>,
+    listeners: Arc<Mutex<HashMap<ProtocolId, mpsc::Sender<PeerStream>>>>,
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
 ) -> Result<(), NetworkError> {
     loop {
         let message = read_control(&mut recv).await?;
         let response = match message {
-            ControlMessage::Grant { token, requester } => {
-                let mut grants = grants.lock().await;
-                if grants.len() >= MAX_PENDING_GRANTS {
+            ControlMessage::Grant {
+                token,
+                requester,
+                protocol,
+            } => {
+                let protocol = match ProtocolId::new(protocol) {
+                    Ok(protocol) => protocol,
+                    Err(error) => {
+                        write_frame(
+                            &mut send,
+                            &ControlMessage::Rejected {
+                                message: error.to_string(),
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
+                let listener_available = listeners
+                    .lock()
+                    .await
+                    .get(&protocol)
+                    .is_some_and(|listener| !listener.is_closed());
+                if !listener_available {
                     ControlMessage::Rejected {
-                        message: "node has too many pending bilateral grants".to_owned(),
+                        message: format!("protocol {protocol} has no live listener"),
                     }
                 } else {
-                    grants.push(DirectGrant { token, requester });
-                    ControlMessage::Granted
+                    let mut grants = grants.lock().await;
+                    let now = Instant::now();
+                    grants.retain(|grant| grant.expires_at > now);
+                    if grants.len() >= MAX_PENDING_GRANTS {
+                        ControlMessage::Rejected {
+                            message: "node has too many pending bilateral grants".to_owned(),
+                        }
+                    } else {
+                        grants.push(PendingSessionGrant {
+                            token,
+                            requester,
+                            protocol,
+                            expires_at: now + GRANT_LIFETIME,
+                        });
+                        ControlMessage::Granted
+                    }
                 }
             }
-            ControlMessage::Revoke { token } => {
-                let mut grants = grants.lock().await;
-                grants.retain(|grant| !constant_time_eq_32(&grant.token, &token));
-                ControlMessage::Revoked
-            }
-            ControlMessage::Dial {
-                address,
-                token,
-                nonce,
-            } => match direct_ping(&endpoint, address, token, nonce).await {
-                Ok(()) => ControlMessage::Dialed { nonce },
-                Err(error) => ControlMessage::Rejected {
-                    message: error.to_string(),
-                },
-            },
             other => ControlMessage::Rejected {
                 message: format!("unexpected hub control message {}", control_name(&other)),
             },
         };
         write_frame(&mut send, &response).await?;
     }
-}
-
-async fn direct_ping(
-    endpoint: &Endpoint,
-    address: EndpointAddr,
-    token: [u8; TOKEN_BYTES],
-    nonce: [u8; NONCE_BYTES],
-) -> Result<(), NetworkError> {
-    let connection = endpoint
-        .connect(address, NODE_ALPN)
-        .await
-        .map_err(|error| NetworkError::Endpoint(error.to_string()))?;
-    let (mut send, mut recv) = connection
-        .open_bi()
-        .await
-        .map_err(|error| NetworkError::Endpoint(error.to_string()))?;
-    write_frame(&mut send, &DirectRequest { token, nonce }).await?;
-    send.finish()
-        .map_err(|error| NetworkError::Protocol(error.to_string()))?;
-    let response: DirectResponse = read_frame(&mut recv).await?;
-    recv.read_to_end(0)
-        .await
-        .map_err(|error| NetworkError::Protocol(error.to_string()))?;
-    if response.nonce != nonce {
-        return Err(NetworkError::Protocol(
-            "bilateral peer returned the wrong challenge nonce".to_owned(),
-        ));
-    }
-    Ok(())
 }
 
 async fn expect_control(
@@ -1202,10 +1657,6 @@ const fn control_name(message: &ControlMessage) -> &'static str {
         ControlMessage::Ready => "ready",
         ControlMessage::Grant { .. } => "grant",
         ControlMessage::Granted => "granted",
-        ControlMessage::Revoke { .. } => "revoke",
-        ControlMessage::Revoked => "revoked",
-        ControlMessage::Dial { .. } => "dial",
-        ControlMessage::Dialed { .. } => "dialed",
         ControlMessage::Rejected { .. } => "rejected",
     }
 }
@@ -1408,6 +1859,26 @@ mod tests {
         directory.join("node.json")
     }
 
+    async fn present_session_grant(
+        endpoint: &Endpoint,
+        address: EndpointAddr,
+        token: [u8; TOKEN_BYTES],
+        protocol: &ProtocolId,
+    ) -> SessionOpenResponse {
+        let connection = endpoint.connect(address, NODE_ALPN).await.unwrap();
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        write_frame(
+            &mut send,
+            &SessionOpen {
+                token,
+                protocol: protocol.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        read_frame(&mut recv).await.unwrap()
+    }
+
     #[test]
     fn durable_identity_is_restart_stable_and_redacted() {
         let state = tempfile::tempdir().unwrap();
@@ -1570,8 +2041,6 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let path = authority_path(state.path());
         let identity = JoinAuthority::load_or_create(&path).unwrap();
-        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin_address = origin.local_addr().unwrap();
 
         let first_endpoint = Endpoint::builder(presets::Minimal)
             .secret_key(identity.secret_key.clone())
@@ -1586,9 +2055,6 @@ mod tests {
             Hub::spawn_with_token(first_endpoint, false, identity.token)
                 .await
                 .unwrap();
-        TcpBridge::publish(&first_server, origin_address)
-            .await
-            .unwrap();
         first_server.shutdown().await.unwrap();
 
         let reloaded = JoinAuthority::load_or_create(&path).unwrap();
@@ -1605,39 +2071,50 @@ mod tests {
             Hub::spawn_with_token(second_endpoint, false, reloaded.token)
                 .await
                 .unwrap();
-        TcpBridge::publish(&second_server, origin_address)
-            .await
-            .unwrap();
         assert_eq!(first_ticket.address.id, second_ticket.address.id);
         assert_eq!(first_ticket.token, second_ticket.token);
 
-        let origin_task = tokio::spawn(async move {
-            let (mut stream, _) = origin.accept().await.unwrap();
-            let mut request = [0; 4];
-            stream.read_exact(&mut request).await.unwrap();
-            assert_eq!(&request, b"ping");
-            stream.write_all(b"pong").await.unwrap();
-        });
-        let client = Endpoint::builder(presets::Minimal)
+        let provider_identity = NodeIdentity::generate().unwrap();
+        let provider_endpoint = Endpoint::builder(presets::Minimal)
+            .secret_key(provider_identity.secret_key.clone())
             .relay_mode(iroh::RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
             .bind()
             .await
             .unwrap();
-        let dialer = HubDialer {
-            endpoint: client.clone(),
-            ticket: Arc::new(second_ticket),
-            grants: Arc::new(Mutex::new(Vec::new())),
-            connection: Arc::new(Mutex::new(None)),
-        };
-        let (mut send, mut recv) = dialer.open_bi().await.unwrap();
-        write_stream_prefix(&mut send, &dialer.ticket.token, STREAM_FORWARD)
+        let provider = Node::join_with_endpoint(second_ticket.clone(), provider_endpoint)
             .await
             .unwrap();
-        send.write_all(b"ping").await.unwrap();
-        send.finish().unwrap();
-        assert_eq!(recv.read_to_end(4).await.unwrap(), b"pong");
-        origin_task.await.unwrap();
-        client.close().await;
+        let protocol = ProtocolId::new("nanocodex/restart-test/1").unwrap();
+        let mut listener = provider.listen(protocol.clone()).await.unwrap();
+
+        let requester_identity = NodeIdentity::generate().unwrap();
+        let requester_endpoint = Endpoint::builder(presets::Minimal)
+            .secret_key(requester_identity.secret_key.clone())
+            .relay_mode(iroh::RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let requester = Node::join_with_endpoint(second_ticket, requester_endpoint)
+            .await
+            .unwrap();
+        let mut outgoing = requester
+            .connect(provider.endpoint_id(), &protocol)
+            .await
+            .unwrap();
+        let mut incoming = listener.accept().await.unwrap();
+        outgoing.write_all(b"ping").await.unwrap();
+        let mut request = [0; 4];
+        incoming.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"ping");
+
+        requester.shutdown().await.unwrap();
+        provider.shutdown().await.unwrap();
         second_server.shutdown().await.unwrap();
     }
 
@@ -1676,6 +2153,25 @@ mod tests {
             .unwrap(),
         );
         assert!(JoinTicket::from_str(&format!("{TICKET_PREFIX}{unsupported}")).is_err());
+
+        let bridge = TcpBridgeTicket::new(ticket.clone(), secret.public()).unwrap();
+        let bridge_encoded = bridge.to_string();
+        let decoded_bridge = TcpBridgeTicket::from_str(&bridge_encoded).unwrap();
+        assert_eq!(decoded_bridge.provider_id(), secret.public());
+        assert_eq!(decoded_bridge.join_ticket().token, ticket.token);
+        assert!(!format!("{bridge:?}").contains(&ticket.to_string()));
+        assert!(TcpBridgeTicket::from_str(&ticket.to_string()).is_err());
+    }
+
+    #[test]
+    fn protocol_names_are_bounded_and_wire_stable() {
+        let protocol = ProtocolId::new("nanocodex/tasks.claim_v1").unwrap();
+        assert_eq!(protocol.as_str(), "nanocodex/tasks.claim_v1");
+        assert_eq!(ProtocolId::from_str(protocol.as_str()).unwrap(), protocol);
+        for invalid in ["", "spaces are not stable", "emoji/🦀"] {
+            assert!(ProtocolId::new(invalid).is_err());
+        }
+        assert!(ProtocolId::new("a".repeat(MAX_PROTOCOL_BYTES + 1)).is_err());
     }
 
     #[test]
@@ -1690,17 +2186,6 @@ mod tests {
     #[tokio::test]
     async fn dialer_multiplexes_streams_on_one_quic_connection() {
         let _test_permit = TEST_ENDPOINT_PERMIT.acquire().await.unwrap();
-        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin_address = origin.local_addr().unwrap();
-        let origin_task = tokio::spawn(async move {
-            for _ in 0..2 {
-                let (mut stream, _) = origin.accept().await.unwrap();
-                let mut request = [0; 4];
-                stream.read_exact(&mut request).await.unwrap();
-                assert_eq!(&request, b"ping");
-                stream.write_all(b"pong").await.unwrap();
-            }
-        });
         let server_endpoint = Endpoint::builder(presets::Minimal)
             .relay_mode(iroh::RelayMode::Disabled)
             .clear_ip_transports()
@@ -1712,24 +2197,47 @@ mod tests {
         let (server, ticket) = Hub::bind_with_endpoint(server_endpoint, false)
             .await
             .unwrap();
-        TcpBridge::publish(&server, origin_address).await.unwrap();
-        let client_endpoint = Endpoint::builder(presets::Minimal)
+
+        let provider_identity = NodeIdentity::generate().unwrap();
+        let provider_endpoint = Endpoint::builder(presets::Minimal)
+            .secret_key(provider_identity.secret_key.clone())
             .relay_mode(iroh::RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
             .bind()
             .await
             .unwrap();
-        let dialer = HubDialer {
-            endpoint: client_endpoint,
-            ticket: Arc::new(ticket),
-            grants: Arc::new(Mutex::new(Vec::new())),
-            connection: Arc::new(Mutex::new(None)),
-        };
+        let provider = Node::join_with_endpoint(ticket.clone(), provider_endpoint)
+            .await
+            .unwrap();
+        let protocol = ProtocolId::new("nanocodex/multiplex-test/1").unwrap();
+        let mut listener = provider.listen(protocol.clone()).await.unwrap();
+
+        let requester_identity = NodeIdentity::generate().unwrap();
+        let requester_endpoint = Endpoint::builder(presets::Minimal)
+            .secret_key(requester_identity.secret_key.clone())
+            .relay_mode(iroh::RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let requester = Node::join_with_endpoint(ticket, requester_endpoint)
+            .await
+            .unwrap();
 
         let mut connection_ids = Vec::new();
         for _ in 0..2 {
-            let (mut send, mut recv) = dialer.open_bi().await.unwrap();
+            let mut outgoing = requester
+                .connect(provider.endpoint_id(), &protocol)
+                .await
+                .unwrap();
+            let mut incoming = listener.accept().await.unwrap();
             connection_ids.push(
-                dialer
+                requester
+                    .dialer
                     .connection
                     .lock()
                     .await
@@ -1738,22 +2246,20 @@ mod tests {
                     .connection
                     .stable_id(),
             );
-            write_stream_prefix(&mut send, &dialer.ticket.token, STREAM_FORWARD)
-                .await
-                .unwrap();
-            send.write_all(b"ping").await.unwrap();
-            send.finish().unwrap();
-            assert_eq!(recv.read_to_end(4).await.unwrap(), b"pong");
+            outgoing.write_all(b"ping").await.unwrap();
+            let mut request = [0; 4];
+            incoming.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"ping");
         }
 
         assert_eq!(connection_ids[0], connection_ids[1]);
-        origin_task.await.unwrap();
-        drop(dialer);
+        requester.shutdown().await.unwrap();
+        provider.shutdown().await.unwrap();
         server.shutdown().await.unwrap();
     }
 
     #[tokio::test]
-    async fn hub_arranges_direct_identity_bound_sessions_between_registered_nodes() {
+    async fn nodes_exchange_application_bytes_over_protocol_bound_sessions() {
         const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
         let _test_permit = TEST_ENDPOINT_PERMIT.acquire().await.unwrap();
@@ -1799,6 +2305,10 @@ mod tests {
             .await
             .unwrap();
 
+        let protocol = ProtocolId::new("nanocodex/example/1").unwrap();
+        let mut second_listener = second.listen(protocol.clone()).await.unwrap();
+        assert!(second.listen(protocol.clone()).await.is_err());
+
         tokio::time::timeout(TEST_TIMEOUT, async {
             while hub.connected_nodes().await.len() != 2 {
                 tokio::task::yield_now().await;
@@ -1810,19 +2320,83 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(hub.connected_nodes().await, expected);
 
-        tokio::time::timeout(TEST_TIMEOUT, hub.prove_direct_path(first_id, second_id))
+        let (address, token) = first
+            .dialer
+            .request_session(second_id, &protocol)
             .await
-            .expect("first bilateral session timed out")
             .unwrap();
-        tokio::time::timeout(TEST_TIMEOUT, hub.prove_direct_path(second_id, first_id))
+        let wrong_protocol = ProtocolId::new("nanocodex/wrong-protocol/1").unwrap();
+        assert!(matches!(
+            present_session_grant(
+                &first.dialer.endpoint,
+                address.clone(),
+                token,
+                &wrong_protocol,
+            )
+            .await,
+            SessionOpenResponse::Rejected { message }
+                if message.contains("identity- and protocol-bound")
+        ));
+        let attacker = Endpoint::builder(presets::Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .bind()
             .await
-            .expect("reverse bilateral session timed out")
             .unwrap();
         assert!(matches!(
-            hub.prove_direct_path(first_id, first_id).await,
+            present_session_grant(&attacker, address, token, &protocol).await,
+            SessionOpenResponse::Rejected { message }
+                if message.contains("identity- and protocol-bound")
+        ));
+        attacker.close().await;
+
+        let mut outgoing = tokio::time::timeout(TEST_TIMEOUT, first.connect(second_id, &protocol))
+            .await
+            .expect("outgoing peer session timed out")
+            .unwrap();
+        let mut incoming = tokio::time::timeout(TEST_TIMEOUT, second_listener.accept())
+            .await
+            .expect("incoming peer session timed out")
+            .unwrap();
+        assert_eq!(outgoing.peer_id(), second_id);
+        assert_eq!(incoming.peer_id(), first_id);
+        assert_eq!(outgoing.protocol(), &protocol);
+        assert_eq!(incoming.protocol(), &protocol);
+        outgoing.write_all(b"ping").await.unwrap();
+        let mut request = [0; 4];
+        incoming.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"ping");
+        incoming.write_all(b"pong").await.unwrap();
+        let mut response = [0; 4];
+        outgoing.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"pong");
+
+        let reverse_protocol = ProtocolId::new("nanocodex/example-reverse/1").unwrap();
+        let mut first_listener = first.listen(reverse_protocol.clone()).await.unwrap();
+        let reverse_outgoing = second.connect(first_id, &reverse_protocol).await.unwrap();
+        let reverse_incoming = first_listener.accept().await.unwrap();
+        assert_eq!(reverse_outgoing.peer_id(), first_id);
+        assert_eq!(reverse_incoming.peer_id(), second_id);
+
+        assert!(matches!(
+            first.connect(first_id, &protocol).await,
             Err(NetworkError::SameNode)
         ));
+        let unavailable = ProtocolId::new("nanocodex/unavailable/1").unwrap();
+        assert!(matches!(
+            first.connect(second_id, &unavailable).await,
+            Err(NetworkError::Protocol(message))
+                if message.contains("has no live listener")
+        ));
 
+        drop(outgoing);
+        drop(incoming);
+        drop(reverse_outgoing);
+        drop(reverse_incoming);
+        drop(first_listener);
+        drop(second_listener);
         first.shutdown().await.unwrap();
         second.shutdown().await.unwrap();
         tokio::time::timeout(TEST_TIMEOUT, hub.shutdown())
@@ -1850,7 +2424,6 @@ mod tests {
         let (server, ticket) = Hub::bind_with_endpoint(server_endpoint, false)
             .await
             .unwrap();
-        TcpBridge::publish(&server, origin_address).await.unwrap();
 
         let invalid_client = Endpoint::builder(presets::Minimal)
             .relay_mode(iroh::RelayMode::Disabled)
@@ -1879,6 +2452,24 @@ mod tests {
         );
         invalid_client.close().await;
 
+        let provider_identity = NodeIdentity::generate().unwrap();
+        let provider_id = provider_identity.endpoint_id();
+        let provider_endpoint = Endpoint::builder(presets::Minimal)
+            .secret_key(provider_identity.secret_key.clone())
+            .relay_mode(iroh::RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let provider = Node::join_with_endpoint(ticket.clone(), provider_endpoint)
+            .await
+            .unwrap();
+        let bridge_listener = TcpBridge::listen(&provider).await.unwrap();
+        let bridge_server =
+            tokio::spawn(async move { TcpBridge::serve(bridge_listener, origin_address).await });
+
         let origin_task = tokio::spawn(async move {
             for _ in 0..VALID_CONNECTIONS {
                 let (mut stream, _) = origin.accept().await.unwrap();
@@ -1892,13 +2483,17 @@ mod tests {
         let downstream_address = downstream.local_addr().unwrap();
         let client_endpoint = Endpoint::builder(presets::Minimal)
             .relay_mode(iroh::RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
             .bind()
             .await
             .unwrap();
         let node = Node::join_with_endpoint(ticket, client_endpoint)
             .await
             .unwrap();
-        let connector = tokio::spawn(async move { TcpBridge::connect(&node, downstream).await });
+        let connector =
+            tokio::spawn(async move { TcpBridge::connect(&node, provider_id, downstream).await });
 
         tokio::time::timeout(TEST_TIMEOUT, async {
             let mut clients = JoinSet::new();
@@ -1925,6 +2520,9 @@ mod tests {
             .unwrap();
         connector.abort();
         let _ = connector.await;
+        bridge_server.abort();
+        let _ = bridge_server.await;
+        provider.shutdown().await.unwrap();
         tokio::time::timeout(TEST_TIMEOUT, server.shutdown())
             .await
             .expect("Iroh server shutdown timed out")
