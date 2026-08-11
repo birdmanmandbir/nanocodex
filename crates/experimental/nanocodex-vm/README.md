@@ -198,6 +198,13 @@ just prove-inference-gcp-managed-h100-tdx \
   > attested-inference.json
 ```
 
+H100 CUDA initialization remains closed while the GPU ready state is
+`not-ready`. Appraise a bootstrap GPU attestation under the deployment policy
+first, then explicitly authorize compute with
+`sudo nvidia-smi conf-compute -srs 1`; never set ready merely because a device
+is present. The fresh evidence embedded in the inference receipt is still
+independently appraised by the relying party.
+
 The verifier accepts the receipt only when the independently retained
 manifest and local guest bytes match, Intel DCAP appraisal passes, NVIDIA NVAT
 appraisal passes under the checked-in Rego policy, and the exact command exits
