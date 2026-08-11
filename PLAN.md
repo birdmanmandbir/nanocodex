@@ -58,105 +58,222 @@ instructions with the classifications already recorded in
 and classify every intervening commit as port/evaluate/defer/out-of-scope. Do
 not let an unreviewed upstream change silently redefine Nanocodex behavior.
 
-## Immediate working slice: durable evaluation throughput
+## Immediate working slice: durable neural evaluation throughput
 
-This is the only active execution track until it reaches its exit gate. Do not
-split implementation time across the later browser, managed-session, parity,
-or release milestones while safe work remains here. Those milestones are the
-ordered backlog, not concurrent work in progress.
+This is the only active execution track until it reaches its exit gate. The
+design has three actors:
 
-Outcome: drive a closed, pre-materialized benchmark continuously at the
-highest safe host occupancy while preserving a four-state SQLite ledger and
-exact process ownership. The neural benchmark controller is disposable; each
-eval worker is an independent background process recovered from a durable PID
-marker. There is no queue, lease, heartbeat, or stale-task reclamation.
+```text
+controller --launches--> durable one-shot workers --claim/finish--> coordinator
+```
 
-The neural orchestrator continuously discovers live worker PIDs, samples the
-host, and launches independent workers while capacity remains. Controller
-death must not terminate, release, or duplicate a live worker. A restarted
-controller adopts the surviving markers before making another admission.
+SQLite is the task ledger. A worker owns exactly one task. The controller owns
+only observation and admission; after launch, the OS owns each worker's
+lifetime. There is no worker pool, second scheduler, wave, fixed topology, or
+configured worker-count cap.
 
-- [x] Store every task/treatment/repetition as one immutable SQLite row with
-  exactly `unclaimed`, `running`, `success`, or `failed` state.
-- [x] Claim one row with an atomic SQLite transition and use its durable claim
-  ID to reject only stale terminal writes.
-- [x] Let successful and failed workers report their own terminal result; let
-  the benchmark report only an otherwise-unrecorded child exit, which releases
-  the row to `unclaimed` instead of manufacturing a terminal failure.
-- [x] Recover retained running claims from SQLite after coordinator process
-  death.
-- [x] Remove the model-facing `run_eval` tool and promise/batch orchestration.
-- [ ] Launch each `eval run` as an independent background worker, write its PID
-  marker before returning to the refill loop, and never wait on it through a
-  child agent or Code Mode exec session.
-- [ ] Rebuild live occupancy from markers and the operating system before every
-  admission. An inactive marker reports one idempotent worker exit, releases
-  only that unfinished claim, and is removed before replacement.
-- [ ] Keep the neural refill policy in one long-lived Code Mode cell without
-  making that cell the worker lifetime owner. A yielded, failed, or restarted
-  controller adopts surviving workers and continues from their actual count.
-- [ ] Remove the global benchmark-restart interruption edge. Controller restart
-  is not evidence that any worker exited.
-- [x] Hold a measured steady worker capacity that maximizes successful
-  completions without OOM. Compare occupancy, task throughput, available
-  memory, pressure, swap, load, and worker/VMM/proxy correspondence.
-- [x] Keep the benchmark prompt direct and test its ownership and admission
-  invariants rather than snapshotting its prose.
-- [x] Measure before/after utilization on the retained live workload: active
-  workers over time, idle-slot seconds, tasks/hour, peak and available memory,
-  swap-in/out, load, and row/worker/VM/proxy correspondence.
-  The rejected 75-worker burst yielded 3 successes and 72 processless claims;
-  the rolling 16-worker sample yielded 17 successes in 4.5 minutes (~227/hour),
-  no failures, 48--50 GiB available, zero memory pressure, no swap-out, and
-  exact row/worker/marker/VMM/proxy correspondence after startup transitions.
-  Native capacity 48 produced 33 successes in about six minutes (~330/hour),
-  but its fully resident set fell to 4.1 GiB available. Capacity 40 reached 1.6
-  GiB with memory-pressure `avg10=35.48`; capacity 32 later reached 0.1 GiB and
-  all workers collapsed. Those settings are rejected despite fast admission.
-  Capacity 24 held 23--24 running rows/eval processes/proxies for five minutes,
-  retained 36.9--43.4 GiB available with zero pressure, produced 10 successes,
-  and had no new failures. Capacity 28 then held its full resident set through
-  churn with 41--43 GiB available and 13 successes. Capacity 30 passed two hot
-  churn samples, including a heavier set with a 17.3 GiB memory floor. Its
-  first sample exposed one premature child completion, which close/report
-  contained without a leak; after tightening the child wait contract, nine
-  fresh successes had no failure or premature completion. Capacity 30 is the
-  highest measured safe setting, and the installed service drop-in preserves
-  it across restarts.
-- [ ] Re-run worker death, benchmark death, and coordinator death tests against
-  independent workers. No test may leave a running row, eval worker, VMM, or
-  proxy without its corresponding live owner.
-  Killing one eval process releases its row once, removes its gvproxy/libkrun
-  descendants, and refills the slot. Benchmark controller death leaves every
-  worker running; its replacement adopts those PIDs without releasing their
-  rows. Coordinator restart retains every running row and kills no worker.
-- [x] Let the configured benchmark continue under systemd, inspect exact
-  successful and failed evidence, and record the terminal board without
-  modifying tasks, verifiers, images, or expected outputs.
-  Before repairing historical orchestration artifacts, the service exited
-  normally at a terminal board of 5,034 success, 2,087 failed, zero running,
-  and zero unclaimed rows. Of the failed rows, 1,364
-  record deliberate restart/migration torture, 506 record earlier
-  launcher/process failures exposed while replacing the old designs, and 217
-  have retained evaluator results. The final service start first drained 30
-  claims owned by its killed predecessor, then completed 151 fresh rows as 142
-  successes and nine retained evaluator failures with no fresh
-  launcher/process failure. SQLite integrity is `ok`; after completion there
-  are zero eval workers, VMMs, or proxies and 53 GiB available memory.
-- [x] Return the no-evidence orchestration failures to `unclaimed`, deploy the
-  release semantics, and let replacement workers finish those rows without
-  reintroducing crash-shaped terminal failures.
-- [ ] Carry PR #135's unified routed eval UI, progress surfaces, score
-  frontiers, and task run charts onto the final four-state coordinator API;
-  validate the complete Terminal Bench workset locally against `dev-georgios`.
+### Hard requirement: saturate the machine
 
-Exit gate: focused Linux and macOS tests pass; rustfmt and warnings-denied
-Clippy are clean for the changed surface; SQLite integrity is clean; the live
-neural refill loop maintains host occupancy without a wave tail; killing and
-restarting only the controller leaves worker PIDs and running rows unchanged;
-dead workers become claimable and replacement attempts converge to terminal
-outcomes; and the implementation is reduced to a reviewable, mergeable diff
-with no unrelated workspace changes.
+While claimable work exists, the controller must drive the host to its highest
+productive occupancy and keep it there. The bias is deliberately asymmetric:
+unused healthy capacity is a controller bug, while a short overload is an
+expected, recoverable probe. When the evidence supports multiple reasonable
+targets, choose the higher one.
+
+Infrastructure retries and OOM-killed workers are acceptable calibration
+signals. They return their tasks to `unclaimed`, remain visible as attempt and
+OTEL evidence, and inform the next occupancy decision. They are not benchmark
+failures and the controller is not required to avoid them. Repeated OOMs that
+produce no useful throughput or adaptation are a controller failure.
+
+Growth is batched and may make large jumps. One-at-a-time admission is not the
+default, and the controller never waits for a task batch or wave to finish
+before reconsidering capacity. Workers whose launch has not yet settled count
+as occupied, so repeated control ticks do not blindly compound the same launch.
+As soon as those workers start, claim, exit, or change host pressure, the
+controller can make another decision.
+
+Saturation means the highest occupancy that produces useful terminal
+throughput. The controller keeps probing upward until added occupancy produces
+adverse pressure or stops improving completion rate. High CPU, load, resident
+memory, or worker count alone is not a stop signal; using the machine is the
+goal. It may stop launching when the host is stalling, swapping, OOM-killing,
+slowing task progress, or producing more infrastructure failures. It then lets
+existing workers drain naturally and never proactively kills them to move
+downward. The conclusion is local to the recent task mix and telemetry, not a
+remembered lower/upper worker bound. As soon as the adverse evidence clears or
+the task mix changes, the controller probes upward again.
+
+A no-launch cycle is valid only when at least one of these is true:
+
+- the requested occupancy is already represented by live and starting workers;
+- a settled upward probe produced kernel pressure, swap activity, OOM/process
+  loss, degraded throughput, rising latency, or infrastructure failures; or
+- no unreserved `unclaimed` row remains.
+
+The controller computes whether a hold is admissible from those observations;
+the model does not get to declare the host unhealthy through prose. A busy but
+productive host remains eligible for another upward probe. A throughput hold
+requires comparison with a higher, settled occupancy rather than an arbitrary
+utilization or free-memory threshold.
+
+"The model chose to hold" is not sufficient. This is a deterministic controller
+guard, not prompt advice. If the model call fails, emits an invalid target, or
+requests no growth on a healthy host with backlog, the controller retries
+promptly and uses a geometric upward fallback: from zero, seed from detected
+host parallelism; otherwise, target at least twice the current occupied count.
+This is a growth floor, not a worker cap, and the model may request more.
+Unsettled launches count as occupied and prevent the fallback from compounding
+before the previous probe has materialized.
+
+A saturation run is not proven merely because a worker count stayed constant.
+It must show either a real resource bottleneck or no throughput gain from an
+upward probe. Every cycle records enough evidence to explain why it launched,
+held, or recovered.
+
+### Coordinator: idempotent task truth
+
+A task is `unclaimed`, `running`, `success`, or `failed`. `Failed` means the
+task ran to completion and the verifier rejected it. Infrastructure failure and
+process interruption are attempt outcomes; both return the task to
+`unclaimed`.
+
+- `claim(worker_id)` returns that worker's existing claim or atomically assigns
+  one row. One worker can never own two active claims.
+- `finish(claim_id, result)` accepts repeated identical publication and rejects
+  a conflicting result.
+- `worker_exited(worker_id)` idempotently releases zero or one unfinished claim
+  and records one interrupted attempt.
+
+### Worker: one durable task
+
+Each worker runs from an immutable `releases/<revision>/nanocodex`, claims one
+task, executes it once, durably saves the outcome, publishes it, and exits:
+
+```text
+workers/<worker-id>/process.json
+workers/<worker-id>/claim.json
+workers/<worker-id>/result.json
+workers/<worker-id>/artifacts/
+```
+
+The launcher creates the worker ID and directory before spawn and uses that ID
+in an independent OS/systemd unit. The worker unit is not in the controller's
+process group or service cgroup: stopping, restarting, or OOM-killing the
+controller cannot signal the worker. The worker unit does own that worker's VM,
+proxy, and other descendants so the OS removes the complete task process tree
+when the worker exits or is killed.
+
+The worker finalizes artifacts before atomically writing `result.json`. It
+retries coordinator requests without changing their identities. If it dies
+before `result.json`, reconciliation returns its task to `unclaimed`. If it
+dies after `result.json`, reconciliation publishes that saved result. Cleanup
+happens only after either path is acknowledged.
+
+Controller death does not affect workers. Coordinator death does not release
+claims. A restarted controller first reconciles worker directories and OS
+process identity, then makes another admission decision. A per-node lock allows
+only one controller to reconcile and launch, but never owns worker lifetimes.
+
+### Controller cycle
+
+The controller reevaluates on worker lifecycle changes and on a short telemetry
+timer. It does not wait for task completion. Every cycle:
+
+1. Reconcile saved results and confirmed worker exits.
+2. Observe live and starting workers, backlog, terminal throughput, claim/start
+   latency, infrastructure/interrupted attempts, memory, swap, load,
+   CPU/memory pressure, and current/remaining task resource declarations.
+3. Ask the model, under a bounded decision deadline, only for an absolute
+   `desired_workers` count and a reason.
+4. Validate the decision against the saturation invariant.
+5. Let `occupied` be live plus unsettled workers. Reserve one currently
+   unclaimed row for each occupied worker that has not claimed yet. Launch
+   `min(desired_workers - occupied, unclaimed - reservations)`, with both
+   differences floored at zero, then continue observing.
+
+The model has no shell, PID, HTTP, or process-killing tools. Its objective is
+terminal completions per unit time, not worker count. Verifier pass and verifier
+failure both count as useful completions; infrastructure and interrupted
+attempts count against the controller.
+
+### Observability
+
+SQLite stores only task, claim, attempt, and result truth. OTEL records active
+and starting workers, backlog, completions, throughput, launches, exits,
+infrastructure failures, memory, swap, load, and pressure by `node.id`. Each
+decision records its observations, desired occupancy, actual launches, and
+reason. OTEL failure never blocks evaluation.
+
+### Build order
+
+1. [ ] Make coordinator claim, finish, and worker-exit operations idempotent.
+2. [ ] Make one worker durable across lost responses, coordinator restart, and
+   death before or after `result.json`.
+3. [ ] Add controller reconciliation and independent OS-unit multi-worker
+   launch.
+4. [ ] Add the neural desired-occupancy decision, saturation guard, and OTEL.
+5. [ ] Install immutable releases and prove the complete system on the real
+   benchmark host.
+
+Do not begin saturation tuning until one worker's durability cases pass.
+Thereafter, every orchestration change must be run on the real host; do not wait
+for a wave or rely on prompt-prose tests.
+
+### Acceptance cases
+
+- [ ] Repeated claim, finish, and worker-exit requests change SQLite exactly
+  once; one worker never owns two claims.
+- [ ] Pass and verifier failure are terminal. Infrastructure failure and
+  interruption retain attempt evidence and return the task to `unclaimed`.
+- [ ] Killing a worker before `result.json` requeues once; killing it after
+  `result.json` publishes the saved result instead of rerunning the task.
+- [ ] Killing only the controller leaves every worker and claim running. Its
+  replacement adopts them before launching more; killing one worker removes
+  that worker's VM/proxy tree without affecting its siblings.
+- [ ] Killing the controller before, during, and after a multi-worker launch
+  produces neither an untracked process nor a duplicate launch after restart.
+- [ ] Starting two controllers for one node leaves exactly one lock holder able
+  to reconcile or launch; losing that controller does not affect workers.
+- [ ] Restarting the coordinator while a worker finishes loses no claim or
+  result; the worker retries the same publication.
+- [ ] Installing a new revision does not change a live worker's executable.
+- [ ] Starting from zero with a large backlog launches multiple workers and
+  repeatedly raises the target until an upward probe demonstrates a real
+  bottleneck or throughput plateau. No static cap, one-at-a-time ramp, or wave
+  tail is accepted.
+- [ ] Repeated ticks while a launch is still settling do not launch duplicates;
+  starting workers count as occupied and reserve rows they are about to claim.
+- [ ] With backlog and healthy headroom, a failed, invalid, or conservative
+  model response triggers prompt retry and geometric upward growth instead of
+  an idle cycle.
+- [ ] Under pressure, the controller stops admission without killing workers;
+  after recovery it resumes growth on the next healthy cycle.
+- [ ] An aggressive probe that causes worker OOMs preserves every task, records
+  interrupted/infrastructure attempts, reclaims the rows, and adapts subsequent
+  admission without manufacturing terminal benchmark failures.
+- [ ] High utilization without stalls, regressions, or control failures does
+  not by itself stop admission while backlog remains.
+- [ ] A changing task mix cannot leave contradictory capacity bounds or strand
+  claimable rows.
+- [ ] The completed run has zero `unclaimed` and `running` rows, SQLite
+  integrity is `ok`, every terminal task has evidence, and no worker, VM,
+  proxy, marker, or temporary directory remains.
+- [ ] OTEL can plot occupancy, utilization, throughput, overload, exits, and
+  recovery per node for the complete run.
+
+Judge the loop by terminal completions per hour, time to reach best observed
+throughput, idle host time while backlog exists, infrastructure/interrupted
+attempts per completion, and overload recovery time. The target is productive
+adaptation, not zero retries or zero OOMs. A run fails the exit gate if healthy
+capacity remains unused or the controller repeatedly thrashes without learning,
+even when correctness tests pass.
+
+Exit gate: focused deterministic and Linux process tests, rustfmt, and
+warnings-denied Clippy pass; real-host evidence demonstrates autonomous,
+aggressive saturation and recovery; controller and coordinator restarts lose no
+work; OTEL explains the run; and the PR contains only this evaluation-runtime
+slice against current `master`.
 
 ## Active milestones
 
@@ -267,8 +384,8 @@ with no unrelated workspace changes.
 1. [x] Merge PR #50, ship `0.3.0`, and establish the layered stable SDK.
 2. [x] Land retained VM tools, browser/VM automation, Realtime voice, reusable
    hosted transports, composable egress, Cloudflare, and Rivet consumers.
-3. [ ] Finish the immediate durable-evaluation-throughput slice and satisfy its
-   live rolling-pool exit gate. Keep work in progress limited to this item.
+3. [ ] Finish the immediate durable-neural-evaluation slice and satisfy its
+   real-host saturation exit gate. Keep work in progress limited to this item.
 4. [ ] Finish and merge the focused Code Mode parity slice in PR #95.
 5. [ ] Reconcile and advance the Codex parity checkpoint with a complete commit
    classification and direct evidence for every adopted behavior.
