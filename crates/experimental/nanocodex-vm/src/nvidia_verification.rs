@@ -79,15 +79,9 @@ impl NativeEvidenceVerifier for NvidiaNvattestVerifier {
             NativeVerificationError::new(format!("invalid collected NVAT evidence JSON: {error}"))
         })?;
         let mut evidence_file = NamedTempFile::new().map_err(native_io("create NVAT evidence"))?;
-        serde_json::to_writer(
-            &mut evidence_file,
-            &json!({
-                "evidences": [entry],
-                "result_code": 0,
-                "result_message": "Ok"
-            }),
-        )
-        .map_err(|error| {
+        // NVAT's collection command emits a result envelope, while its file
+        // evidence source accepts the envelope's bare `evidences` array.
+        serde_json::to_writer(&mut evidence_file, &json!([entry])).map_err(|error| {
             NativeVerificationError::new(format!("encode NVAT evidence file: {error}"))
         })?;
         evidence_file
