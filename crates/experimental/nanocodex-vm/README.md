@@ -124,11 +124,14 @@ challenge through [`tools::VmToolSession::attest`], verify the guest's Ed25519
 possession proof, print the bundle, and shut down. The TDX form additionally
 relays guest configfs GetQuote exits to the selected QGS Unix socket with QGS
 1.1 framing. A raw TDREPORT is never presented as a remotely verifiable quote.
+The guest collector also rejects a successful configfs read with an empty
+`outblob`; QGS or provisioning failure cannot become a zero-byte attestation.
 
 An SNP relying party can now appraise a retained response entirely offline:
 
 ```console
-just verify-snp-attestation attestation.json "$EXPECTED_SNP_MEASUREMENT_HEX"
+just verify-snp-attestation attestation.json \
+  "$EXPECTED_SNP_MEASUREMENT_HEX" amd-generation.crl
 ```
 
 [`host::SnpVerifier`] uses pure Rust cryptography and pinned AMD Milan, Genoa,
@@ -136,8 +139,10 @@ and Turin roots. It validates the certificate/report signature path, VCEK
 hardware identity and TCB extensions, certificate validity at caller-supplied
 trusted time, transcript binding, VMPL, debug/migration/SMT policy, exact
 launch measurement, and component-wise minimum TCB. The command requires a
-fresh signed CRL by default. `--allow-missing-crl` exists only as an explicit
-offline availability policy; any CRL which is present is still verified.
+fresh signed CRL by default and accepts it as separately retained relying-party
+collateral. An identical CRL embedded in the guest certificate table remains
+compatible. `--allow-missing-crl` exists only as an explicit offline
+availability policy; any CRL which is present is still verified.
 
 TDX and Nitro responses have equivalent offline appraisal entry points:
 
@@ -155,6 +160,16 @@ the transcript-bound REPORTDATA. Optional policy pins cover MRCONFIGID,
 MROWNER, MROWNERCONFIG, and XFAM. The collateral is an appraisal input and must
 be obtained and retained by the relying party; quote collection never silently
 fetches trust material.
+
+DCAP's dynamic-platform, cached-key, and SMT PCK flags are denied by default.
+Cloud platforms which intentionally use one of those modes must opt into each
+flag separately through `TdxVerificationPolicy` (or the matching
+`verify_tdx_attestation` command-line switch). For example, current GCP TDX
+instances require `--allow-dynamic-platform --allow-smt`; neither condition is
+inferred from the cloud provider or quote topology. The final three optional
+arguments to `just verify-tdx-attestation` expose these choices in the order
+`allow_dynamic_platform`, `allow_cached_keys`, and `allow_smt`, so the GCP
+combination ends in `true false true`.
 
 [`host::NitroVerifier`] requires a caller-pinned AWS root in DER form and at
 least one exact SHA-384 PCR. It validates the unique X.509 path and path-length

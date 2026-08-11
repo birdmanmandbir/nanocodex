@@ -10,6 +10,7 @@ use attestation_support::{load_attestation, now_unix_seconds, parse_hex, print_v
 
 struct Options {
     input: PathBuf,
+    crl: Option<PathBuf>,
     measurement: [u8; 48],
     minimum_tcb: SnpTcbVersion,
     minimum_guest_svn: u32,
@@ -24,7 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let attestation = load_attestation(&options.input)?;
     attestation.verify_key_proof()?;
     let challenge = attestation.bundle().request().challenge().clone();
-    let policy = SnpVerificationPolicy::new(
+    let mut policy = SnpVerificationPolicy::new(
         challenge.policy_id(),
         options.measurement,
         options.minimum_tcb,
@@ -33,6 +34,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .with_minimum_guest_svn(options.minimum_guest_svn)
     .with_smt_allowed(options.allow_smt)
     .with_single_socket_required(options.require_single_socket);
+    if let Some(crl) = options.crl {
+        policy = policy.with_crl_der(attestation_support::read_bounded(&crl, 4 * 1024 * 1024)?)?;
+    }
     let verifier = SnpVerifier::new(policy);
     let now = now_unix_seconds()?;
     let verified =
@@ -43,6 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 impl Options {
     fn parse() -> Result<Self, io::Error> {
         let mut input = None;
+        let mut crl = None;
         let mut measurement = None;
         let mut minimum_tcb = SnpTcbVersion::default();
         let mut minimum_guest_svn = 0;
@@ -53,6 +58,7 @@ impl Options {
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
                 "--input" => input = Some(value(&mut arguments, "--input")?.into()),
+                "--crl" => crl = Some(value(&mut arguments, "--crl")?.into()),
                 "--measurement" => {
                     measurement = Some(parse_hex(
                         &value(&mut arguments, "--measurement")?,
@@ -80,7 +86,7 @@ impl Options {
                 "--allow-missing-crl" => revocation = SnpRevocationPolicy::AllowUnavailable,
                 "--help" | "-h" => {
                     println!(
-                        "usage: verify_snp_attestation --input PATH|- --measurement 96_HEX [--minimum-fmc N] [--minimum-bootloader N] [--minimum-tee N] [--minimum-snp N] [--minimum-microcode N] [--minimum-guest-svn N] [--allow-smt] [--require-single-socket] [--allow-missing-crl]"
+                        "usage: verify_snp_attestation --input PATH|- --measurement 96_HEX [--crl AMD_CRL.der] [--minimum-fmc N] [--minimum-bootloader N] [--minimum-tee N] [--minimum-snp N] [--minimum-microcode N] [--minimum-guest-svn N] [--allow-smt] [--require-single-socket] [--allow-missing-crl]"
                     );
                     std::process::exit(0);
                 }
@@ -89,6 +95,7 @@ impl Options {
         }
         Ok(Self {
             input: input.ok_or_else(|| invalid_argument("missing --input"))?,
+            crl,
             measurement: measurement.ok_or_else(|| invalid_argument("missing --measurement"))?,
             minimum_tcb,
             minimum_guest_svn,

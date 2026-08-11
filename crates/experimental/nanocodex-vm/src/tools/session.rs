@@ -1778,7 +1778,19 @@ async fn route_responses(output: ChildStdout, inner: Weak<VmToolSessionInner>) {
             Ok(response) => response,
             Err(error) => {
                 if let Some(inner) = inner.upgrade() {
-                    close_pending(&inner, &format!("invalid VM tool response: {error}"));
+                    let preview_length = line.len().min(512);
+                    let preview = String::from_utf8_lossy(&line[..preview_length]);
+                    let truncated = if preview_length == line.len() {
+                        ""
+                    } else {
+                        "…"
+                    };
+                    close_pending(
+                        &inner,
+                        &format!(
+                            "invalid VM tool response: {error}; frame preview: {preview:?}{truncated}"
+                        ),
+                    );
                 }
                 return;
             }

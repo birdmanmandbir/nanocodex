@@ -2,16 +2,17 @@
 
 ## Decision
 
-PR #141 remains draft until it has live evidence from the hardware it claims to
-support. The software boundary now implements substantial parts of three
+PR #141 remains draft until each libkrun launch path has live evidence from the
+hardware it claims to support. The software boundary implements three
 independently testable layers:
 
 1. a measured guest evidence collector, verifier interface, local NVIDIA
    verifier, and fail-closed composite verification;
-2. exact Linux PCI/IOMMU bundle resolution before the still-missing audited
-   libkrun VFIO/IOMMUFD assignment boundary; and
-3. typed CPU, GPU, switch, and topology appraisal policy, not yet integrated
-   into guest startup, GPU ReadyState, or secret release.
+2. exact Linux PCI/IOMMU bundle resolution and an audited pinned libkrun
+   VFIO-cdev/IOMMUFD assignment boundary; and
+3. typed CPU, GPU, switch, and topology appraisal policy integrated into the
+   launch-and-collect examples. GPU ReadyState and secret release remain closed
+   until the complete composite appraisal succeeds.
 
 The first NVIDIA targets are deliberately exact:
 
@@ -118,12 +119,11 @@ owner/configuration fields, freshness, and report-data binding. Intel's
 two-stage TDREPORT/quote model is described in the
 [Linux TDX documentation](https://docs.kernel.org/arch/x86/tdx.html).
 
-`VmConfig::tdx_quote_generation_socket` now maps an explicitly selected host
-QGS Unix socket to guest vsock port 4050 using libkrun's existing bounded IPC
-mapping. That makes direct guest user-space DCAP libraries possible and is
-rejected for non-TDX profiles. It does not satisfy configfs TSM by itself:
-libkrun still needs to handle the TDX `GetQuote` hypercall and relay its shared
-128-KiB request buffer to QGS.
+`VmConfig::tdx_quote_generation_socket` selects an explicit host QGS Unix
+socket and is rejected for non-TDX profiles. The pinned libkrun handles the
+TDX `GetQuote` exit, bounds and validates the shared request buffer, relays it
+with QGS 1.1 framing, and returns the quote to the guest's configfs TSM
+request. A raw TDREPORT is never substituted for a remotely verifiable quote.
 
 RTMR ownership is fixed before implementation: firmware/boot owns one register,
 the authenticated root and attester manifest own one, and later runtime
@@ -172,16 +172,19 @@ reset ownership, and exact topology. libkrun then owns:
 The initial API accepts only NVIDIA vendor `10de` and the reviewed B200 device
 IDs/topologies. General VFIO assignment is out of scope.
 
-`ConfidentialDeviceBundle` now implements the pre-libkrun half of this
-boundary. It accepts only canonical full PCI BDFs, pins B200 to `10de:2901`,
+`ConfidentialDeviceBundle` implements the admission half of this boundary. It
+accepts only canonical full PCI BDFs, pins B200 to `10de:2901`,
 requires one GPU for the single profile or eight GPUs plus exactly functions
 `.0` through `.3` of one CX-7 bridge slot for HGX, rejects duplicates, checks
 every vendor/device ID, requires a caller-pinned SHA-256 production VPD for
 each CX-7 function, requires `vfio-pci`, resolves every IOMMU group, and
 rejects any unassigned group sibling. Reset ownership, CC mode, and link state
 deliberately remain additional live admission gates rather than being inferred
-from PCI IDs. The pinned libkrun still lacks PCI/VFIO/IOMMUFD, so this resolved
-bundle cannot yet be attached.
+from PCI IDs. The pinned libkrun accepts the resolved VFIO cdevs, creates one
+IOMMUFD IOAS for the VM, cold-plugs functions at deterministic guest BDFs,
+configures BARs and MSI-X, and maps only DMA-eligible guest pages.
+Confidential private-page conversion unmaps DMA before the page returns to
+private state.
 
 ### One B200
 
@@ -271,18 +274,33 @@ bytes, provenance, validity intervals, and appraisal time enter the result.
    release secrets or replace vendor-native appraisal.
 3. Add SNP verification fixtures, measurement tooling, then a live
    SNP record.
-4. Add the missing libkrun TDX QGS relay, DCAP fixtures, then a live TDX record.
+4. Retain the implemented libkrun TDX QGS relay and DCAP appraisal record, then
+   complete a production-quote libkrun TDX record on a KVM TDX host enrolled
+   with Intel PCS.
 5. Finish Nitro's dedicated libkrun launch path and produce a live Nitro record.
-6. Land libkrun IOMMUFD/VFIO support and validate one B200 with CPU-plus-GPU
-   appraisal before enabling ReadyState.
+6. Validate the pinned libkrun IOMMUFD/VFIO support with one B200 and
+   CPU-plus-GPU appraisal before enabling ReadyState.
 7. Use the implemented exact eight-GPU/two-switch/four-CX-7 bundle to validate
    encrypted NVLink once a signed vendor fabric claim exists, then retain a
    live tamper matrix.
 
-`dev-georgios` can compile and run deterministic tests but has none of the TEE
-or GPU devices required by gates 3 through 7. Hardware claims therefore need
-separate labelled SNP, TDX, Nitro, and HGX/DGX B200 runners. PR #141 stays
-draft, and the runtime gate remains closed, until those records exist.
+Managed GCP SNP and TDX guests have produced fresh native evidence which passed
+the strict offline AMD and Intel appraisers. A GCP C4 bare-metal host also
+validated the nested libkrun TDX launch, configured measured-memory layout,
+guest configfs GetQuote exit, and 1,052-byte QGS relay. That host was not
+enrolled in Intel PCS: PCCS received HTTP 404 instead of PCK certificate data,
+so no production quote existed and Nanocodex correctly rejected the empty TSM
+report. A GCP C4D bare-metal SNP probe was blocked earlier because BIOS had not
+reserved the RMP table. These are operator provisioning blockers, not passing
+attestation records.
+
+GCP A4 exposes eight B200s only inside a VM, while its B200 bare-metal-adjacent
+offerings have different four-GPU GB200/GB300 topologies. GCP also does not list
+B200 among its Confidential VM GPU combinations. It therefore cannot validate
+libkrun's host VFIO/IOMMUFD boundary or either exact B200 profile. Hardware
+claims still need an enrolled bare-metal SNP/TDX runner, Nitro, PCIe one-B200,
+and HGX/DGX eight-B200 runners. PR #141 stays draft, and the GPU runtime gate
+remains closed, until those records exist.
 
 The retained artifact layout, positive gates, and mandatory tamper matrix are
 defined in

@@ -34,6 +34,7 @@ const TSM_MEDIA_TYPE: &str = "application/vnd.nanocodex.linux-tsm-report+json";
 const SNP_PROVIDER: &str = "sev_guest";
 const MAX_CERT_TABLE_ENTRIES: usize = 32;
 const CERT_TABLE_HEADER_BYTES: usize = 24;
+const MAX_CRL_BYTES: usize = 4 * 1024 * 1024;
 
 /// Component-wise SEV-SNP firmware security version.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -64,7 +65,7 @@ impl SnpTcbVersion {
 /// Revocation behavior selected explicitly by an SNP relying party.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SnpRevocationPolicy {
-    /// Reject evidence unless it carries a current, AMD-signed CRL.
+    /// Reject evidence unless appraisal has a current, AMD-signed CRL.
     RequireFreshCrl,
     /// Verify a CRL when present but permit offline evidence without one.
     AllowUnavailable,
@@ -83,6 +84,7 @@ pub struct SnpVerificationPolicy {
     expected_host_data: Option<[u8; 32]>,
     expected_id_key_digest: Option<[u8; 48]>,
     expected_author_key_digest: Option<[u8; 48]>,
+    crl_der: Option<Vec<u8>>,
 }
 
 impl SnpVerificationPolicy {
@@ -114,6 +116,7 @@ impl SnpVerificationPolicy {
             expected_host_data: None,
             expected_id_key_digest: None,
             expected_author_key_digest: None,
+            crl_der: None,
         })
     }
 
@@ -157,6 +160,25 @@ impl SnpVerificationPolicy {
     pub const fn with_author_key_digest(mut self, digest: [u8; 48]) -> Self {
         self.expected_author_key_digest = Some(digest);
         self
+    }
+
+    /// Supplies an AMD CRL resolved and retained by the relying party.
+    ///
+    /// A CRL carried in the guest's auxiliary certificate table remains
+    /// supported for compatibility, but when both sources are present their
+    /// bytes must agree exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the CRL is empty or exceeds the appraisal bound.
+    pub fn with_crl_der(mut self, crl_der: Vec<u8>) -> Result<Self, NativeVerificationError> {
+        if crl_der.is_empty() || crl_der.len() > MAX_CRL_BYTES {
+            return Err(error(format!(
+                "SNP endorsement CRL must contain between 1 and {MAX_CRL_BYTES} bytes"
+            )));
+        }
+        self.crl_der = Some(crl_der);
+        Ok(self)
     }
 }
 
@@ -260,6 +282,7 @@ impl NativeEvidenceVerifier for SnpVerifier {
             &chain,
             &vek_x509,
             appraisal_time,
+            policy.crl_der.as_deref(),
             policy.revocation,
         )?;
         validate_report_policy(&report, context.transcript_digest(), policy)?;
@@ -559,24 +582,34 @@ fn validate_revocation(
     chain: &Chain,
     vek: &X509Certificate<'_>,
     now: ASN1Time,
+    relying_party_crl: Option<&[u8]>,
     policy: SnpRevocationPolicy,
 ) -> Result<(), NativeVerificationError> {
     let crl_entries: Vec<_> = entries
         .iter()
         .filter(|entry| entry.cert_type == CertType::CRL)
         .collect();
-    if crl_entries.is_empty() {
+    if crl_entries.len() > 1 {
+        return Err(error("SNP evidence contains multiple CRL entries"));
+    }
+    let evidence_crl = crl_entries.first().map(|entry| entry.data());
+    let crl_der = match (relying_party_crl, evidence_crl) {
+        (Some(external), Some(embedded)) if external != embedded => {
+            return Err(error("SNP relying-party and evidence CRLs do not match"));
+        }
+        (Some(external), _) => Some(external),
+        (None, Some(embedded)) => Some(embedded),
+        (None, None) => None,
+    };
+    let Some(crl_der) = crl_der else {
         return match policy {
             SnpRevocationPolicy::RequireFreshCrl => {
                 Err(error("SNP policy requires a fresh endorsement CRL"))
             }
             SnpRevocationPolicy::AllowUnavailable => Ok(()),
         };
-    }
-    if crl_entries.len() != 1 {
-        return Err(error("SNP evidence contains multiple CRL entries"));
-    }
-    let (remaining, crl) = CertificateRevocationList::from_der(crl_entries[0].data())
+    };
+    let (remaining, crl) = CertificateRevocationList::from_der(crl_der)
         .map_err(|source| error(format!("invalid SNP endorsement CRL: {source}")))?;
     if !remaining.is_empty() {
         return Err(error("SNP endorsement CRL contains trailing bytes"));
@@ -741,5 +774,25 @@ mod tests {
         let mut changed = report;
         changed.measurement[0] ^= 0x80;
         assert!(trusted_chain(&vek, &changed).is_err());
+    }
+
+    #[test]
+    fn relying_party_crl_is_bounded() {
+        let policy = || {
+            SnpVerificationPolicy::new(
+                "test",
+                [0; 48],
+                SnpTcbVersion::default(),
+                SnpRevocationPolicy::RequireFreshCrl,
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            policy().with_crl_der(Vec::new()).unwrap_err().to_string(),
+            format!("SNP endorsement CRL must contain between 1 and {MAX_CRL_BYTES} bytes")
+        );
+        assert!(policy().with_crl_der(vec![0; MAX_CRL_BYTES + 1]).is_err());
+        assert!(policy().with_crl_der(vec![1]).is_ok());
     }
 }

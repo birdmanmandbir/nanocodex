@@ -30,6 +30,9 @@ pub struct TdxVerificationPolicy {
     mr_owner: Option<[u8; 48]>,
     mr_owner_config: Option<[u8; 48]>,
     xfam: Option<[u8; 8]>,
+    allow_dynamic_platform: bool,
+    allow_cached_keys: bool,
+    allow_smt: bool,
 }
 
 impl TdxVerificationPolicy {
@@ -60,6 +63,9 @@ impl TdxVerificationPolicy {
             mr_owner: None,
             mr_owner_config: None,
             xfam: None,
+            allow_dynamic_platform: false,
+            allow_cached_keys: false,
+            allow_smt: false,
         })
     }
 
@@ -95,6 +101,27 @@ impl TdxVerificationPolicy {
     #[must_use]
     pub const fn with_xfam(mut self, value: [u8; 8]) -> Self {
         self.xfam = Some(value);
+        self
+    }
+
+    /// Allows a PCK certificate marked as a dynamic platform.
+    #[must_use]
+    pub const fn allow_dynamic_platform(mut self, allow: bool) -> Self {
+        self.allow_dynamic_platform = allow;
+        self
+    }
+
+    /// Allows a PCK certificate marked as using cached attestation keys.
+    #[must_use]
+    pub const fn allow_cached_keys(mut self, allow: bool) -> Self {
+        self.allow_cached_keys = allow;
+        self
+    }
+
+    /// Allows a PCK certificate marked as having simultaneous multithreading enabled.
+    #[must_use]
+    pub const fn allow_smt(mut self, allow: bool) -> Self {
+        self.allow_smt = allow;
         self
     }
 }
@@ -174,13 +201,13 @@ impl NativeEvidenceVerifier for TdxVerifier {
             None => QuoteVerifier::new_prod(),
         }
         .with_config::<RustCryptoConfig>();
+        let now = context.now_unix_seconds();
+        let quote_policy = QuotePolicy::strict(now)
+            .allow_dynamic_platform(policy.allow_dynamic_platform)
+            .allow_cached_keys(policy.allow_cached_keys)
+            .allow_smt(policy.allow_smt);
         let claims = verifier
-            .verify_with_policy(
-                &quote,
-                policy.collateral.clone(),
-                context.now_unix_seconds(),
-                &QuotePolicy::strict(context.now_unix_seconds()),
-            )
+            .verify_with_policy(&quote, policy.collateral.clone(), now, &quote_policy)
             .map_err(|source| error(format!("Intel DCAP quote verification failed: {source:#}")))?;
         if claims.tee_type != 0x81 {
             return Err(error("DCAP evidence is not a TDX quote"));

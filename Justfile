@@ -186,15 +186,29 @@ attest-example:
 
 # Verify a collected SNP JSON response offline. Fresh CRL evidence is required
 # unless the caller explicitly adds --allow-missing-crl to the Cargo example.
-verify-snp-attestation input measurement:
-    cargo run --locked --quiet -p nanocodex-vm --example verify_snp_attestation -- \
-      --input "{{input}}" --measurement "{{measurement}}"
+verify-snp-attestation input measurement crl="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    args=(--input "{{input}}" --measurement "{{measurement}}")
+    if [ -n "{{crl}}" ]; then
+      args+=(--crl "{{crl}}")
+    fi
+    cargo run --locked --quiet -p nanocodex-vm \
+      --example verify_snp_attestation -- "${args[@]}"
 
 # Verify a collected TDX JSON response with retained Intel DCAP collateral.
-verify-tdx-attestation input collateral mrtd rtmr0 rtmr1 rtmr2 rtmr3:
-    cargo run --locked --quiet -p nanocodex-vm --example verify_tdx_attestation -- \
-      --input "{{input}}" --collateral "{{collateral}}" --mrtd "{{mrtd}}" \
+verify-tdx-attestation input collateral mrtd rtmr0 rtmr1 rtmr2 rtmr3 allow_dynamic_platform="false" allow_cached_keys="false" allow_smt="false":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    args=(
+      --input "{{input}}" --collateral "{{collateral}}" --mrtd "{{mrtd}}"
       --rtmr0 "{{rtmr0}}" --rtmr1 "{{rtmr1}}" --rtmr2 "{{rtmr2}}" --rtmr3 "{{rtmr3}}"
+    )
+    if [ "{{allow_dynamic_platform}}" = true ]; then args+=(--allow-dynamic-platform); fi
+    if [ "{{allow_cached_keys}}" = true ]; then args+=(--allow-cached-keys); fi
+    if [ "{{allow_smt}}" = true ]; then args+=(--allow-smt); fi
+    cargo run --locked --quiet -p nanocodex-vm \
+      --example verify_tdx_attestation -- "${args[@]}"
 
 # Verify a collected Nitro JSON response against one pinned AWS root and PCR.
 # Repeat --pcr through the expanded Cargo command when policy pins more PCRs.

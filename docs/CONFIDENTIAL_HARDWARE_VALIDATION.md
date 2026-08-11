@@ -74,9 +74,10 @@ measurement, policy, TCB collateral, expiry, and child-evidence ordering.
 ## Intel TDX runner
 
 The runner must expose TDX KVM support, guest private memory, the exact TDX
-libkrun/libkrunfw pair, and a pinned QGS socket. The direct vsock mapping on
-guest port 4050 can validate a user-space DCAP quote path. Linux configfs TSM
-validation additionally requires the missing libkrun GetQuote hypercall relay.
+libkrun/libkrunfw pair, and a pinned QGS socket. The pinned libkrun relays the
+guest's bounded configfs TSM `GetQuote` request to QGS with QGS 1.1 framing;
+the retained evidence must therefore contain a complete DCAP quote, never only
+a TDREPORT.
 
 Acceptance requires offline DCAP QVL verification with retained PCK chain,
 CRLs, TCB info, QE identity, TDX module identity, supplemental data, and
@@ -85,6 +86,15 @@ and the complete 64-byte `REPORTDATA` must match policy.
 
 Required failures: stopped QGS, malformed relay length, stale collateral,
 changed MRTD or RTMR, debug enabled, changed transcript, and expired challenge.
+
+The August 2026 GCP `c4-standard-288-metal` probe validated KVM TDX launch with
+the configured 1 GiB measured layout and delivered the guest's 1,052-byte
+configfs GetQuote request to QGS. Quote production then stopped outside the VMM:
+Intel PCS returned HTTP 404 for the physical platform and PCCS reported no PCK
+certificate data. The guest kernel consequently exposed an empty `outblob`.
+Nanocodex rejects that result as `EmptyTsmReport`; it is not retained as
+evidence. A passing bare-metal record therefore requires cloud/operator PCK
+enrollment or an already provisioned PCCS cache, not another relay fallback.
 
 ## AWS Nitro runner
 
@@ -134,6 +144,16 @@ fabric state. NCCL peer-to-peer validation runs only after that appraisal.
 Current NVIDIA tooling does not expose the signed switch/topology/MPT claims
 needed for this decision. Until it does, `NvidiaNvattestVerifier` deliberately
 returns no encrypted-MPT fabric claim and this profile must fail.
+
+GCP cannot currently serve as this libkrun PCI-passthrough runner. Its A4 B200
+offering is only `a4-highgpu-8g`, and A4 is a VM rather than bare metal. A4X is
+also a VM with four GB200/B200 GPUs; A4X Max is bare metal but contains four
+GB300/B300 GPUs. In addition, GCP's documented Confidential VM GPU combinations
+are A3 High H100 with TDX and G4 RTX PRO 6000 with SEV, not B200. See the
+[accelerator machine table](https://docs.cloud.google.com/compute/docs/accelerator-optimized-machines)
+and [Confidential VM supported configurations](https://docs.cloud.google.com/confidential-computing/confidential-vm/docs/supported-configurations).
+The required runners remain a PCIe B200 bare-metal host for the one-GPU profile
+and an HGX/DGX B200 bare-metal host for the eight-GPU encrypted-fabric profile.
 
 Required failures, once the vendor claims exist: each omitted GPU, switch, or
 bridge; every single changed evidence object; duplicate/reordered evidence;

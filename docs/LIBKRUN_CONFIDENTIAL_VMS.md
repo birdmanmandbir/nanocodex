@@ -316,23 +316,21 @@ different.
 
 ## libkrun upstream workstream
 
-Implementation uses a dedicated worktree based on the reviewed `2.0.0-dev`
-revision `df85b8b75f55e8ef1b06b5bc18f08dc6d7b5aeb0`. The implementation branch
-pins reviewed backport `b71a880a44d66c55c4e1fb1b37aece4affa313b9` on that
-base for typed TEE selection.
-Before patching it, classify relevant upstream changes since that revision so
-already-landed fixes are not reimplemented. Every upstream change is isolated,
-tested in libkrun's supported feature matrix, and submitted as a focused
-libkrun commit before Nanocodex pins it. A temporary Nanocodex fork is
-acceptable while upstream review is pending; long-lived behavior forks are
-not.
+Implementation uses a dedicated worktree and pins the reviewed `2.0.0-dev`
+fork revision `a638d2eef67ee3c602d80eb0d337befcf6eb351b`. It consists of the
+typed TEE base, TDX configfs GetQuote-to-QGS relay (`589ee44a`), Linux
+VFIO-cdev/IOMMUFD PCI assignment (`742f08c0`), configured TDX memory layout
+fix (`afb7a27`), and GetQuote KVM-exit dispatch fix (`a638d2e`). Nanocodex
+consumes the exact SHA so the active VMM boundary is reproducible. The changes
+are also maintained as upstream libkrun draft PR #812; its rebased head can
+move independently and is not an implicit dependency.
 
 The initial classification through upstream `07fd40d` is retained in
 [`LIBKRUN_UPSTREAM_AUDIT.md`](LIBKRUN_UPSTREAM_AUDIT.md). It records the Nitro
 fixes already upstream, the incompatible init/API migration, dead
 attestation-shaped JSON fields, and the first typed TEE API patch.
 
-Initial libkrun issues to resolve:
+Remaining libkrun work after the implemented quote and PCI boundaries:
 
 1. Restore or replace the remote-attestation functionality lost when the old C
    init was removed. The current Rust init parses TEE configuration but does
@@ -341,14 +339,15 @@ Initial libkrun issues to resolve:
    typed C/Rust APIs where the VMM needs policy or measurement inputs.
 3. Make TEE block-root and init behavior explicit so callers do not reference
    APIs compiled out under `feature = "tee"`.
-4. Complete TDX quote/report support and document its exact measured regions,
-   resource limits, and guest requirements.
+4. Complete production-quote validation on a KVM TDX host whose platform is
+   enrolled with Intel PCS; launch, measured memory, GetQuote exit dispatch,
+   QGS framing, and the guest configfs path are hardware-validated.
 5. Repair and test the Nitro 2.0 rootfs/API path.
 6. Expose deterministic launch-measurement inputs or calculation tooling without
    making the untrusted host the attestation authority.
-7. Add confidential device assignment, protected DMA, and evidence plumbing
-   for NVIDIA confidential GPUs, then remove the current architectural
-   incompatibility between TEE and the relevant device path.
+7. Validate confidential device assignment and protected shared-page DMA on
+   one- and eight-B200 hardware, then complete the signed protected-path and
+   fabric-state evidence gates.
 8. Evaluate an Arm CCA flavor after the x86 and Nitro paths are complete.
 
 Upstream tests must cover negative configurations and feature combinations, not
@@ -420,7 +419,8 @@ to demonstrate the contract.
 
 ### Slice 3: live TDX vertical
 
-- [ ] Complete the TDX libkrun, firmware, and quote-generation path.
+- [x] Implement the TDX libkrun launch configuration and bounded GetQuote/QGS
+  relay; live KVM TDX validation remains below.
 - [x] Implement offline DCAP appraisal with caller-retained collateral.
 - [x] Bind the same protocol transcript into TDX report data.
 - [ ] Define and test MRTD/RTMR ownership and authenticated-root measurement.
@@ -447,8 +447,8 @@ without adding a generic-cloud or scheduler abstraction.
 
 - [ ] Select one supported live combination: SNP or TDX plus one Hopper-or-later
   confidential GPU.
-- [ ] Land the minimum audited libkrun device-assignment and protected-memory
-  changes.
+- [x] Land the minimum pinned libkrun VFIO-cdev/IOMMUFD device-assignment and
+  confidential shared-page DMA changes; live B200 validation remains below.
 - [x] Add exact one-B200 and eight-B200/four-CX-7 host bundles with canonical
   PCI identity, pinned CX-7 VPD, `vfio-pci`, IOMMU-group, and complete-sibling
   validation.

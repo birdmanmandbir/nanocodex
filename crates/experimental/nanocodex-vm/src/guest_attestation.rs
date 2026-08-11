@@ -97,6 +97,12 @@ pub enum GuestAttestationError {
         /// Provider reported by configfs.
         actual: String,
     },
+    /// Linux completed the report operation without returning native evidence.
+    #[error("Linux TSM provider {provider:?} returned an empty native report")]
+    EmptyTsmReport {
+        /// Provider reported by configfs.
+        provider: String,
+    },
     /// Another writer changed the otherwise private report instance.
     #[error("Linux TSM report generation is {actual}; expected exactly one input write")]
     TsmGenerationMismatch {
@@ -547,6 +553,7 @@ async fn collect_tsm_evidence(
         });
     }
     let report = read_file(&instance.join("outblob")).await?;
+    validate_tsm_report(&provider, &report)?;
     let auxiliary = read_optional_file(&instance.join("auxblob")).await?;
     let manifest = read_optional_file(&instance.join("manifestblob")).await?;
     let generation_path = instance.join("generation");
@@ -585,6 +592,15 @@ async fn collect_tsm_evidence(
         bytes,
     )
     .map_err(Into::into)
+}
+
+fn validate_tsm_report(provider: &str, report: &[u8]) -> Result<(), GuestAttestationError> {
+    if report.is_empty() {
+        return Err(GuestAttestationError::EmptyTsmReport {
+            provider: provider.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 async fn ensure_tsm_report_root() -> Result<(), GuestAttestationError> {
@@ -809,5 +825,15 @@ mod tests {
             nvidia_profile_for_b200_count(2),
             Err(GuestAttestationError::UnsupportedB200Topology { count: 2 })
         ));
+    }
+
+    #[test]
+    fn empty_tsm_report_is_rejected() {
+        assert!(matches!(
+            validate_tsm_report("tdx_guest", &[]),
+            Err(GuestAttestationError::EmptyTsmReport { provider })
+                if provider == "tdx_guest"
+        ));
+        validate_tsm_report("tdx_guest", &[1]).unwrap();
     }
 }

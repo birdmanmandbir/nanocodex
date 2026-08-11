@@ -17,7 +17,9 @@ use tracing::{info, info_span};
 const BLOCK_SIZE: u32 = 4_096;
 const DISK_BYTES: u64 = 128 * 1024 * 1024;
 const GUEST_PATH: &str = "/nanocodex-vm-guest";
-const RUNTIME_ROOT_DIRECTORIES: [&str; 10] = [
+const GUEST_FIRMWARE_FALLBACK_PATH: &str = "/bin/sh";
+const RUNTIME_ROOT_DIRECTORIES: [&str; 11] = [
+    "/bin",
     "/dev",
     "/dev/pts",
     "/dev/shm",
@@ -29,7 +31,7 @@ const RUNTIME_ROOT_DIRECTORIES: [&str; 10] = [
     "/run",
     "/tmp",
 ];
-const IDENTITY_VERSION: &[u8] = b"nanocodex-vm-guest-runtime-v2-overlay-root\0";
+const IDENTITY_VERSION: &[u8] = b"nanocodex-vm-guest-runtime-v3-tee-fallback\0";
 const RECORD_VERSION: u32 = 1;
 
 /// Whether preparing a guest runtime disk reused or created its cache entry.
@@ -235,6 +237,17 @@ impl GuestRuntimeDisk {
             None,
             None,
             Some(&mut contents),
+            Some(0),
+            Some(0),
+            None,
+        )?;
+        let mut fallback_contents = bytes.as_slice();
+        formatter.create(
+            GUEST_FIRMWARE_FALLBACK_PATH,
+            make_mode(file_mode::S_IFREG, 0o755),
+            None,
+            None,
+            Some(&mut fallback_contents),
             Some(0),
             Some(0),
             None,
@@ -594,15 +607,21 @@ fn valid_cached_disk(path: &Path, binary: &[u8]) -> Result<bool, GuestRuntimeDis
     }) {
         return Ok(false);
     }
-    let Ok((_, inode)) = reader.stat(GUEST_PATH) else {
-        return Ok(false);
-    };
-    if !inode.is_reg() || inode.file_size() != binary.len() as u64 || inode.mode & 0o777 != 0o755 {
-        return Ok(false);
+    for path in [GUEST_PATH, GUEST_FIRMWARE_FALLBACK_PATH] {
+        let Ok((_, inode)) = reader.stat(path) else {
+            return Ok(false);
+        };
+        if !inode.is_reg()
+            || inode.file_size() != binary.len() as u64
+            || inode.mode & 0o777 != 0o755
+            || !reader
+                .read_file(path, 0, None)
+                .is_ok_and(|cached| cached == binary)
+        {
+            return Ok(false);
+        }
     }
-    Ok(reader
-        .read_file(GUEST_PATH, 0, None)
-        .is_ok_and(|cached| cached == binary))
+    Ok(true)
 }
 
 fn validate_prepared_disk(path: &Path, binary: &[u8]) -> Result<(), GuestRuntimeDiskError> {
@@ -628,30 +647,34 @@ fn validate_prepared_disk(path: &Path, binary: &[u8]) -> Result<(), GuestRuntime
             source: None,
         });
     }
-    let (_, inode) =
-        reader
-            .stat(GUEST_PATH)
-            .map_err(|source| GuestRuntimeDiskError::InvalidPreparedDisk {
+    for guest_path in [GUEST_PATH, GUEST_FIRMWARE_FALLBACK_PATH] {
+        let (_, inode) = reader.stat(guest_path).map_err(|source| {
+            GuestRuntimeDiskError::InvalidPreparedDisk {
                 path: path.to_path_buf(),
                 source: Some(source),
-            })?;
-    if !inode.is_reg() || inode.file_size() != binary.len() as u64 || inode.mode & 0o777 != 0o755 {
-        return Err(GuestRuntimeDiskError::InvalidPreparedDisk {
-            path: path.to_path_buf(),
-            source: None,
-        });
-    }
-    let contents = reader.read_file(GUEST_PATH, 0, None).map_err(|source| {
-        GuestRuntimeDiskError::InvalidPreparedDisk {
-            path: path.to_path_buf(),
-            source: Some(source),
+            }
+        })?;
+        if !inode.is_reg()
+            || inode.file_size() != binary.len() as u64
+            || inode.mode & 0o777 != 0o755
+        {
+            return Err(GuestRuntimeDiskError::InvalidPreparedDisk {
+                path: path.to_path_buf(),
+                source: None,
+            });
         }
-    })?;
-    if contents != binary {
-        return Err(GuestRuntimeDiskError::InvalidPreparedDisk {
-            path: path.to_path_buf(),
-            source: None,
-        });
+        let contents = reader.read_file(guest_path, 0, None).map_err(|source| {
+            GuestRuntimeDiskError::InvalidPreparedDisk {
+                path: path.to_path_buf(),
+                source: Some(source),
+            }
+        })?;
+        if contents != binary {
+            return Err(GuestRuntimeDiskError::InvalidPreparedDisk {
+                path: path.to_path_buf(),
+                source: None,
+            });
+        }
     }
     Ok(())
 }
@@ -667,8 +690,8 @@ mod tests {
     use arcbox_ext4::Reader;
 
     use super::{
-        GUEST_PATH, GuestRuntimeDisk, GuestRuntimeDiskStatus, RUNTIME_ROOT_DIRECTORIES,
-        runtime_digest,
+        GUEST_FIRMWARE_FALLBACK_PATH, GUEST_PATH, GuestRuntimeDisk, GuestRuntimeDiskStatus,
+        RUNTIME_ROOT_DIRECTORIES, runtime_digest,
     };
 
     #[test]
@@ -699,6 +722,16 @@ mod tests {
         assert_eq!(inode.file_size(), bytes.len() as u64);
         assert_eq!(inode.mode & 0o777, 0o755);
         assert_eq!(reader.read_file(GUEST_PATH, 0, None).unwrap(), bytes);
+        let (_, inode) = reader.stat(GUEST_FIRMWARE_FALLBACK_PATH).unwrap();
+        assert!(inode.is_reg());
+        assert_eq!(inode.file_size(), bytes.len() as u64);
+        assert_eq!(inode.mode & 0o777, 0o755);
+        assert_eq!(
+            reader
+                .read_file(GUEST_FIRMWARE_FALLBACK_PATH, 0, None)
+                .unwrap(),
+            bytes
+        );
 
         let reused = GuestRuntimeDisk::prepare(&binary, &cache).unwrap();
         assert_eq!(reused.status(), GuestRuntimeDiskStatus::Hit);

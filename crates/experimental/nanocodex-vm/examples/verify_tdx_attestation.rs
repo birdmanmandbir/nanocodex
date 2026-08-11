@@ -22,6 +22,9 @@ struct Options {
     mr_owner: Option<[u8; 48]>,
     mr_owner_config: Option<[u8; 48]>,
     xfam: Option<[u8; 8]>,
+    allow_dynamic_platform: bool,
+    allow_cached_keys: bool,
+    allow_smt: bool,
 }
 
 #[tokio::main]
@@ -52,6 +55,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(value) = options.xfam {
         policy = policy.with_xfam(value);
     }
+    policy = policy
+        .allow_dynamic_platform(options.allow_dynamic_platform)
+        .allow_cached_keys(options.allow_cached_keys)
+        .allow_smt(options.allow_smt);
     let verifier = TdxVerifier::new(policy);
     let verified = verify_attestation(
         attestation.into_bundle(),
@@ -74,6 +81,9 @@ impl Options {
         let mut mr_owner = None;
         let mut mr_owner_config = None;
         let mut xfam = None;
+        let mut allow_dynamic_platform = false;
+        let mut allow_cached_keys = false;
+        let mut allow_smt = false;
         let mut arguments = std::env::args().skip(1);
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
@@ -104,9 +114,12 @@ impl Options {
                     )?)
                 }
                 "--xfam" => xfam = Some(parse_hex(&value(&mut arguments, "--xfam")?, "XFAM")?),
+                "--allow-dynamic-platform" => allow_dynamic_platform = true,
+                "--allow-cached-keys" => allow_cached_keys = true,
+                "--allow-smt" => allow_smt = true,
                 "--help" | "-h" => {
                     println!(
-                        "usage: verify_tdx_attestation --input PATH|- --collateral PATH --mrtd 96_HEX --rtmr0 96_HEX --rtmr1 96_HEX --rtmr2 96_HEX --rtmr3 96_HEX [--intel-root DER_PATH] [--mr-config-id 96_HEX] [--mr-owner 96_HEX] [--mr-owner-config 96_HEX] [--xfam 16_HEX]"
+                        "usage: verify_tdx_attestation --input PATH|- --collateral PATH --mrtd 96_HEX --rtmr0 96_HEX --rtmr1 96_HEX --rtmr2 96_HEX --rtmr3 96_HEX [--intel-root DER_PATH] [--mr-config-id 96_HEX] [--mr-owner 96_HEX] [--mr-owner-config 96_HEX] [--xfam 16_HEX] [--allow-dynamic-platform] [--allow-cached-keys] [--allow-smt]"
                     );
                     std::process::exit(0);
                 }
@@ -128,6 +141,9 @@ impl Options {
             mr_owner,
             mr_owner_config,
             xfam,
+            allow_dynamic_platform,
+            allow_cached_keys,
+            allow_smt,
         })
     }
 }
