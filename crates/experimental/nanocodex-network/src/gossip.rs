@@ -252,7 +252,7 @@ async fn broadcast_snapshot(
             continue;
         }
         sender
-            .broadcast(encode(&record)?.into())
+            .broadcast_neighbors(encode(&record)?.into())
             .await
             .map_err(gossip_error)?;
     }
