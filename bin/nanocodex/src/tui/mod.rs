@@ -1,7 +1,6 @@
 mod app;
 mod clipboard;
 mod composer;
-mod computer_pane;
 mod diff;
 mod eval_attach;
 mod external_editor;
@@ -36,7 +35,7 @@ use nanocodex::{
     },
     tools::mcp::McpHandle,
 };
-use nanocodex_computer::{ComputerControl, ComputerFrames, InterventionReason};
+use nanocodex_computer::{ComputerControl, InterventionReason};
 use nanocodex_voice::{
     CHATGPT_REALTIME_VOICES, PLATFORM_REALTIME_VOICES, RealtimeVoice, VoiceAgentControl,
     VoiceEvent, VoiceEvents, VoiceSession, VoiceSessionBuilder, VoiceSpeaker,
@@ -51,7 +50,6 @@ use tracing::{Instrument, info_span};
 
 use self::{
     app::{App, EscapeAction, PaneId, ReasoningPickerAction, SubmittedPrompt},
-    computer_pane::ComputerPane,
     notification::Notifier,
     scheduler::{ANIMATION_TICK_INTERVAL, RenderScheduler, RenderScope, STREAM_FRAME_INTERVAL},
     telemetry::{StreamTelemetry, ViewTelemetry},
@@ -277,10 +275,6 @@ enum WorkerEvent {
         error: String,
     },
     VoiceStopped,
-    ComputerFrame(ComputerPane),
-    ComputerFrameFailed {
-        error: String,
-    },
     ComputerStatus {
         message: String,
         error: bool,
@@ -595,8 +589,6 @@ enum VoiceControl {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ComputerCommand {
-    Show,
-    Hide,
     Pause,
     Resume,
     Takeover,
@@ -640,9 +632,6 @@ pub(crate) async fn run(
     let mcp = configured.mcp;
     let browser = configured.browser;
     let computer = configured.computer;
-    let computer_frames = computer
-        .as_ref()
-        .map(crate::computer::ConfiguredComputer::frames);
     let computer_control = computer.as_ref().map(|configured| ComputerWorker {
         control: configured.control(),
         preview_url: configured.preview_url().map(ToOwned::to_owned),
@@ -661,7 +650,7 @@ pub(crate) async fn run(
     );
 
     let mut terminal = TerminalSession::enter().wrap_err("failed to initialize the terminal")?;
-    let (terminal_profile, computer_picker) = query_terminal_profile(Duration::from_millis(750));
+    let terminal_profile = query_terminal_profile(Duration::from_millis(750));
     let (math_update_tx, mut math_update_rx) = mpsc::channel(1);
     let math_renderer = Ratatex::builder(terminal_profile)
         .on_update(move || {
@@ -676,9 +665,6 @@ pub(crate) async fn run(
         cell_height = terminal_profile.cell.height,
         "initialized Ratatex"
     );
-    if let Some(frames) = computer_frames {
-        forward_computer_frames(frames, computer_picker, update_tx.clone());
-    }
     let mut input_events = EventStream::new();
     let mut ticker = ui_ticker();
     let mut app = App::new(cwd)
@@ -1151,10 +1137,6 @@ fn handle_worker_update(
             app.main
                 .push_output(TranscriptItem::Assistant(format!("**Voice:** {message}")));
         }
-        WorkerEvent::ComputerFrame(pane) => app.set_computer_pane(pane),
-        WorkerEvent::ComputerFrameFailed { error } => {
-            app.push_active_error(format!("Computer preview: {error}"));
-        }
         WorkerEvent::ComputerStatus { message, error } => {
             if error {
                 app.push_active_error(message);
@@ -1219,41 +1201,7 @@ fn spawn_agent_worker(
     })
 }
 
-fn forward_computer_frames(
-    mut frames: ComputerFrames,
-    picker: Option<Picker>,
-    updates: mpsc::UnboundedSender<WorkerEvent>,
-) {
-    drop(tokio::spawn(async move {
-        loop {
-            let frame = match frames.changed().await {
-                Ok(frame) => frame,
-                Err(error) => {
-                    drop(updates.send(WorkerEvent::ComputerFrameFailed {
-                        error: error.to_string(),
-                    }));
-                    return;
-                }
-            };
-            let picker = picker.clone();
-            let prepared =
-                tokio::task::spawn_blocking(move || ComputerPane::prepare(&frame, picker.as_ref()))
-                    .await;
-            let event = match prepared {
-                Ok(Ok(pane)) => WorkerEvent::ComputerFrame(pane),
-                Ok(Err(error)) => WorkerEvent::ComputerFrameFailed { error },
-                Err(error) => WorkerEvent::ComputerFrameFailed {
-                    error: format!("computer frame worker failed: {error}"),
-                },
-            };
-            if updates.send(event).is_err() {
-                return;
-            }
-        }
-    }));
-}
-
-fn query_terminal_profile(timeout: Duration) -> (TerminalProfile, Option<Picker>) {
+fn query_terminal_profile(timeout: Duration) -> TerminalProfile {
     let options = QueryStdioOptions {
         timeout,
         ..QueryStdioOptions::default()
@@ -1263,14 +1211,13 @@ fn query_terminal_profile(timeout: Duration) -> (TerminalProfile, Option<Picker>
         Ok(picker) => {
             let (width, height) = picker.font_size();
             let cell = PixelSize::new(width, height);
-            let terminal_profile = if picker.protocol_type() == ProtocolType::Kitty {
+            if picker.protocol_type() == ProtocolType::Kitty {
                 TerminalProfile::kitty(cell, tmux)
             } else {
                 TerminalProfile::unsupported(cell)
-            };
-            (terminal_profile, Some(picker))
+            }
         }
-        Err(_) => (TerminalProfile::unsupported(PixelSize::default()), None),
+        Err(_) => TerminalProfile::unsupported(PixelSize::default()),
     }
 }
 
@@ -1406,7 +1353,6 @@ impl AgentWorker {
                         .map_err(|error| format!("failed to open computer preview: {error}"))
                 },
             ),
-            ComputerCommand::Show | ComputerCommand::Hide => return,
         };
         let (message, error) = match result {
             Ok(message) => (message, false),
@@ -2900,15 +2846,9 @@ fn submit(
         Submission::Voice(control) => {
             send_command(commands, WorkerCommand::Voice(control))?;
         }
-        Submission::Computer(command) => match command {
-            ComputerCommand::Show => {
-                if !app.show_computer() {
-                    app.set_active_status("Waiting for the first computer frame");
-                }
-            }
-            ComputerCommand::Hide => app.hide_computer(),
-            command => send_command(commands, WorkerCommand::Computer(command))?,
-        },
+        Submission::Computer(command) => {
+            send_command(commands, WorkerCommand::Computer(command))?;
+        }
         Submission::McpLogin(name) => {
             send_command(commands, WorkerCommand::McpLogin { name })?;
         }
@@ -2986,18 +2926,16 @@ fn classify_submission(input: impl Into<SubmittedPrompt>) -> Submission {
         };
     }
     if trimmed == "/computer" {
-        return Submission::Computer(ComputerCommand::Show);
+        return Submission::Computer(ComputerCommand::OpenPreview);
     }
     if let Some(argument) = trimmed.strip_prefix("/computer ") {
         return match argument.trim() {
-            "show" => Submission::Computer(ComputerCommand::Show),
-            "hide" => Submission::Computer(ComputerCommand::Hide),
+            "show" | "open" => Submission::Computer(ComputerCommand::OpenPreview),
             "pause" => Submission::Computer(ComputerCommand::Pause),
             "resume" => Submission::Computer(ComputerCommand::Resume),
             "takeover" => Submission::Computer(ComputerCommand::Takeover),
-            "open" => Submission::Computer(ComputerCommand::OpenPreview),
             _ => Submission::InvalidCommand(
-                "Usage: /computer [show|hide|pause|resume|takeover|open]".to_owned(),
+                "Usage: /computer [open|pause|resume|takeover]".to_owned(),
             ),
         };
     }
@@ -3211,9 +3149,7 @@ mod tests {
         );
         assert_eq!(
             classify_submission("/computer wat"),
-            Submission::InvalidCommand(
-                "Usage: /computer [show|hide|pause|resume|takeover|open]".to_owned()
-            )
+            Submission::InvalidCommand("Usage: /computer [open|pause|resume|takeover]".to_owned())
         );
         assert_eq!(classify_submission("/fast"), Submission::Fast(None));
         assert_eq!(

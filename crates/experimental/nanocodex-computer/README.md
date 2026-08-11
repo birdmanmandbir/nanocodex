@@ -132,17 +132,14 @@ With preview enabled, the CLI opens a non-activating native floating PIP and
 keeps the loopback controls available without foregrounding a browser. The PIP
 shows both the live physical cursor and an independent agent cursor driven by
 the exact background pointer events, remains draggable and edge-resizable, and
-preserves the user's placement and scale when the source window changes shape. Its
-in-process capture stream stays live between agent observations, including while
-the agent is waiting or paused. In the
-Ratatui consumer, the first frame also opens an adaptive live computer pane.
-Kitty-capable terminals render the captured pixels; other terminals retain a
-compact target/status fallback and can use the loopback preview. Human control
-never passes through the model:
+preserves the user's placement and scale when the source window changes shape.
+Its in-process capture stream stays live between agent observations, including
+while the agent is waiting or paused. The native PIP is the sole in-terminal
+computer visual surface; the Ratatui transcript remains full-width and does not
+downsample native frames into terminal cells. Human control never passes through
+the model:
 
 ```text
-/computer show
-/computer hide
 /computer pause
 /computer resume
 /computer takeover

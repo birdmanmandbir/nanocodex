@@ -25,7 +25,6 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::composer::ComposerLayout;
-use super::computer_pane::ComputerPane;
 use super::selection::{
     ScreenSelection, SelectionClick, SelectionScrollDirection, SelectionScrollRequest,
 };
@@ -1194,8 +1193,6 @@ pub(super) struct App {
     model: Model,
     thinking: Thinking,
     reasoning_picker: Option<ReasoningPicker>,
-    computer_pane: Option<ComputerPane>,
-    computer_visible: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1248,36 +1245,7 @@ impl App {
             model: Model::default(),
             thinking: Thinking::default(),
             reasoning_picker: None,
-            computer_pane: None,
-            computer_visible: false,
         }
-    }
-
-    pub(super) fn set_computer_pane(&mut self, pane: ComputerPane) {
-        if self.computer_pane.is_none() {
-            self.computer_visible = true;
-        }
-        self.computer_pane = Some(pane);
-    }
-
-    pub(super) const fn computer_pane_mut(&mut self) -> Option<&mut ComputerPane> {
-        if !self.computer_visible {
-            return None;
-        }
-        self.computer_pane.as_mut()
-    }
-
-    pub(super) const fn computer_visible(&self) -> bool {
-        self.computer_visible && self.computer_pane.is_some()
-    }
-
-    pub(super) const fn show_computer(&mut self) -> bool {
-        self.computer_visible = self.computer_pane.is_some();
-        self.computer_visible
-    }
-
-    pub(super) const fn hide_computer(&mut self) {
-        self.computer_visible = false;
     }
 
     pub(super) fn restore_transcript(

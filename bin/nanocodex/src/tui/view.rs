@@ -19,11 +19,6 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
     render_header(frame, app, layout.header);
     let mut selectable_areas = SelectableAreas::default();
     render_transcripts(frame, app, layout.transcript, &mut selectable_areas);
-    if let Some(area) = layout.computer
-        && let Some(computer) = app.computer_pane_mut()
-    {
-        computer.render(frame, area);
-    }
     render_pending(frame, app, layout.pending);
     selectable_areas.push(render_composer(
         frame,
@@ -46,7 +41,6 @@ pub(super) fn render_animation(frame: &mut Frame<'_>, app: &mut App) {
 struct ViewLayout {
     header: Rect,
     transcript: Rect,
-    computer: Option<Rect>,
     pending: Rect,
     composer: Rect,
     footer: Rect,
@@ -88,33 +82,13 @@ fn view_layout(area: Rect, app: &mut App) -> ViewLayout {
     ])
     .areas(area);
 
-    let (transcript_area, computer) = computer_layout(transcript_area, app.computer_visible());
-
     ViewLayout {
         header: header_area,
         transcript: transcript_area,
-        computer,
         pending: pending_area,
         composer: composer_area,
         footer: footer_area,
         composer_layout,
-    }
-}
-
-fn computer_layout(area: Rect, visible: bool) -> (Rect, Option<Rect>) {
-    if !visible || area.height < 8 || area.width < 40 {
-        return (area, None);
-    }
-    if area.width >= 100 {
-        let [transcript, computer] =
-            Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
-                .areas(area);
-        (transcript, Some(computer))
-    } else {
-        let computer_height = area.height.saturating_div(2).clamp(6, 12);
-        let [transcript, computer] =
-            Layout::vertical([Constraint::Min(4), Constraint::Length(computer_height)]).areas(area);
-        (transcript, Some(computer))
     }
 }
 
@@ -581,18 +555,13 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         "Ctrl+O expand tools"
     };
-    let computer_help = if app.computer_visible() {
-        " · /computer hide|pause|takeover"
-    } else {
-        ""
-    };
     let help = if app.btw.is_some() {
         format!(
             "  BackTab switch · {tool_help} · Ctrl+V image · /close dismiss · Enter send/steer · Tab queue · {escape_help} · Ctrl+C quit"
         )
     } else {
         format!(
-            "  /btw <question> side fork · /voice [voice]{computer_help} · {tool_help} · Ctrl+V image · Enter send/steer · Tab queue · {escape_help} · Ctrl+C quit"
+            "  /btw <question> side fork · /voice [voice] · {tool_help} · Ctrl+V image · Enter send/steer · Tab queue · {escape_help} · Ctrl+C quit"
         )
     };
     let model_width = app.model().as_str().len() + 3 + "default".len() + 7 + 1;
@@ -772,7 +741,6 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use nanocodex_computer::ComputerFramePhase;
     use ratatex::{PixelSize, Ratatex, TerminalProfile};
     use ratatui::{
         Terminal,
@@ -782,43 +750,8 @@ mod tests {
         style::{Color, Modifier},
     };
 
-    use super::{computer_layout, render, render_animation};
-    use crate::tui::{app::App, computer_pane::ComputerPane, transcript::TranscriptItem};
-
-    #[test]
-    fn computer_layout_preserves_baseline_and_adapts_to_terminal_width() {
-        let area = Rect::new(0, 0, 120, 30);
-        assert_eq!(computer_layout(area, false), (area, None));
-
-        let (transcript, computer) = computer_layout(area, true);
-        let computer = computer.unwrap();
-        assert_eq!(transcript.width + computer.width, area.width);
-        assert_eq!(computer.height, area.height);
-
-        let narrow = Rect::new(0, 0, 80, 20);
-        let (transcript, computer) = computer_layout(narrow, true);
-        let computer = computer.unwrap();
-        assert_eq!(transcript.height + computer.height, narrow.height);
-        assert_eq!(computer.width, narrow.width);
-    }
-
-    #[test]
-    fn computer_status_fallback_is_visible_without_terminal_graphics() {
-        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
-        let mut app = App::new("/workspace".into());
-        app.set_computer_pane(ComputerPane::status_only(
-            12,
-            4,
-            "TextEdit",
-            "Agent draft",
-            ComputerFramePhase::Settling,
-            (1_440, 900),
-        ));
-        terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let rendered = terminal.backend().to_string();
-        assert!(rendered.contains("TextEdit — Agent draft"));
-        assert!(rendered.contains("Terminal graphics unavailable"));
-    }
+    use super::{render, render_animation};
+    use crate::tui::{app::App, transcript::TranscriptItem};
 
     #[test]
     fn btw_renders_as_a_side_by_side_focused_pane() {

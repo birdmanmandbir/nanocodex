@@ -1,8 +1,7 @@
 use clap::{ArgAction, Args};
 use eyre::{Result, WrapErr};
 use nanocodex_computer::{
-    Computer, ComputerControl, ComputerEvent, ComputerFrames, ComputerPip, ComputerPreview,
-    ComputerTool,
+    Computer, ComputerControl, ComputerEvent, ComputerPip, ComputerPreview, ComputerTool,
 };
 
 /// Native computer-use configuration for normal agent sessions.
@@ -119,10 +118,6 @@ pub(crate) struct ConfiguredComputer {
 impl ConfiguredComputer {
     pub(crate) fn tool(&self) -> ComputerTool {
         ComputerTool::from_computer(self.computer.clone())
-    }
-
-    pub(crate) fn frames(&self) -> ComputerFrames {
-        self.computer.frames()
     }
 
     pub(crate) fn control(&self) -> ComputerControl {

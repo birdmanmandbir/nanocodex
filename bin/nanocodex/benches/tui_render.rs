@@ -12,7 +12,6 @@ mod tui {
 
     use criterion::{BatchSize, BenchmarkId, Criterion, Throughput};
     use nanocodex::agent::events::{AgentEvent, AgentEventKind, AgentEventTiming, TimedAgentEvent};
-    use nanocodex_computer::ComputerFramePhase;
     use ratatex::{PixelSize, Ratatex, TerminalProfile};
     use ratatui::{
         Terminal, TerminalOptions, Viewport,
@@ -50,14 +49,6 @@ mod tui {
     }
 
     #[allow(dead_code, unused_imports)]
-    mod computer_pane {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/tui/computer_pane.rs"
-        ));
-    }
-
-    #[allow(dead_code, unused_imports)]
     mod app {
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/tui/app.rs"));
     }
@@ -83,7 +74,6 @@ mod tui {
     }
 
     use app::App;
-    use computer_pane::ComputerPane;
     use scheduler::{ANIMATION_TICK_INTERVAL, STREAM_FRAME_INTERVAL};
     use telemetry::StreamTelemetry;
     use terminal::{ByteCountingWriter, DrawMetrics, MeasuredBackend, seed_from_cached_frame};
@@ -316,45 +306,6 @@ mod tui {
         terminal
             .draw(|frame| view::render(frame, app))
             .expect("fast-mode footer frame should render");
-        DrawMetrics {
-            changed_cells: terminal.backend().changed_cells,
-            output_bytes: output_bytes.get().saturating_sub(bytes_before),
-        }
-    }
-
-    fn computer_first_frame_setup() -> (App, OutputTerminal, Rc<Cell<u64>>) {
-        let mut app = App::new("/workspace/nanocodex".into());
-        app.main
-            .transcript
-            .push(TranscriptItem::User(sized_text(320, 0)));
-        app.main
-            .transcript
-            .push(TranscriptItem::Assistant(sized_text(1_024, 1)));
-        let (mut terminal, output_bytes) = output_terminal();
-        terminal
-            .draw(|frame| view::render(frame, &mut app))
-            .expect("baseline computer-pane frame should render");
-        app.set_computer_pane(ComputerPane::status_only(
-            42,
-            17,
-            "TextEdit",
-            "Agent draft",
-            ComputerFramePhase::Settling,
-            (1_440, 900),
-        ));
-        (app, terminal, output_bytes)
-    }
-
-    fn draw_computer_first_frame(
-        app: &mut App,
-        terminal: &mut OutputTerminal,
-        output_bytes: &Cell<u64>,
-    ) -> DrawMetrics {
-        let bytes_before = output_bytes.get();
-        terminal.backend_mut().changed_cells = 0;
-        terminal
-            .draw(|frame| view::render(frame, app))
-            .expect("computer-pane first frame should render");
         DrawMetrics {
             changed_cells: terminal.backend().changed_cells,
             output_bytes: output_bytes.get().saturating_sub(bytes_before),
@@ -1920,64 +1871,6 @@ mod tui {
             });
         });
     }
-
-    pub(super) fn computer_pane_benchmark(criterion: &mut Criterion) {
-        let (mut sample_app, mut sample_terminal, sample_bytes) = computer_first_frame_setup();
-        let sample =
-            draw_computer_first_frame(&mut sample_app, &mut sample_terminal, sample_bytes.as_ref());
-        assert!(
-            sample.changed_cells <= 2_500,
-            "computer pane first frame changed {} cells",
-            sample.changed_cells
-        );
-        assert!(
-            sample.output_bytes <= 16_000,
-            "computer pane first frame emitted {} bytes",
-            sample.output_bytes
-        );
-
-        criterion.bench_function(
-            "tui_computer/status_fallback_first_frame/120x40",
-            |bencher| {
-                bencher.iter_batched(
-                    computer_first_frame_setup,
-                    |(mut app, mut terminal, output_bytes)| {
-                        black_box(draw_computer_first_frame(
-                            &mut app,
-                            &mut terminal,
-                            output_bytes.as_ref(),
-                        ));
-                    },
-                    BatchSize::LargeInput,
-                );
-            },
-        );
-
-        criterion.bench_function(
-            "tui_computer/status_fallback_cached_frame/120x40",
-            |bencher| {
-                let mut app = App::new("/workspace/nanocodex".into());
-                app.set_computer_pane(ComputerPane::status_only(
-                    42,
-                    17,
-                    "TextEdit",
-                    "Agent draft",
-                    ComputerFramePhase::Settling,
-                    (1_440, 900),
-                ));
-                let mut terminal = Terminal::new(TestBackend::new(120, 40))
-                    .expect("computer-pane benchmark terminal should initialize");
-                terminal
-                    .draw(|frame| view::render(frame, &mut app))
-                    .expect("initial computer-pane frame should render");
-                bencher.iter(|| {
-                    terminal
-                        .draw(|frame| view::render(frame, &mut app))
-                        .expect("cached computer-pane frame should render");
-                });
-            },
-        );
-    }
 }
 
 criterion_group!(
@@ -2003,7 +1896,6 @@ criterion_group!(
     tui::markdown_benchmarks,
     tui::tool_tree_benchmark,
     tui::code_mode_streaming_benchmark,
-    tui::folded_tool_benchmarks,
-    tui::computer_pane_benchmark
+    tui::folded_tool_benchmarks
 );
 criterion_main!(benches);

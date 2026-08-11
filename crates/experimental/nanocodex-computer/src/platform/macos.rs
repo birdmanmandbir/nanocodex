@@ -99,6 +99,7 @@ pub(super) struct MacosBackend {
     generation: u64,
     accessibility_revision: Option<AccessibilityRevision>,
     screenshots: VecDeque<PathBuf>,
+    last_screenshot_digest: Option<String>,
     intervention_target: Arc<super::InterventionTarget>,
     allowed_bundle_ids: Option<HashSet<String>>,
     accessibility_monitor: Option<AccessibilityNotificationMonitor>,
@@ -123,6 +124,7 @@ impl MacosBackend {
             generation: 0,
             accessibility_revision: None,
             screenshots: VecDeque::new(),
+            last_screenshot_digest: None,
             intervention_target,
             allowed_bundle_ids,
             accessibility_monitor: None,
@@ -536,6 +538,7 @@ impl MacosBackend {
 
     async fn retain_screenshot(&mut self, observed: &ComputerObservation) {
         if let Some(screenshot) = &observed.screenshot {
+            self.last_screenshot_digest = Some(screenshot.digest.clone());
             self.screenshots.push_back(screenshot.path.clone());
         }
         while self.screenshots.len() > MAX_RETAINED_SCREENSHOTS {
@@ -567,24 +570,18 @@ impl MacosBackend {
         });
     }
 
-    async fn mutate(
+    async fn dispatch_native_action(
         &mut self,
         action: NativeAction,
         sequence: u64,
         state: Arc<RunState>,
-        frames: &mut FrameSink,
         pointers: &PointerSink,
-    ) -> Result<ComputerOutput, ComputerError> {
+    ) -> Result<(), ComputerError> {
         state.ensure_action_current()?;
         let target = self.target.clone().ok_or(ComputerError::NoTarget)?;
         let generation = self.generation;
         let maximum = self.maximum_elements;
         let allowed_url_origins = self.allowed_url_origins.clone();
-        let protected_frontmost = tokio::task::spawn_blocking(frontmost_application_pid)
-            .await
-            .map_err(|error| ComputerError::Native {
-                message: format!("frontmost application observer panicked: {error}"),
-            })?;
         let action_kind = action.kind();
         let dispatch = action.dispatch();
         let initial_pointer_fallbacks = self.intervention_target.synthetic_pointer_fallback_count();
@@ -641,11 +638,67 @@ impl MacosBackend {
         }
         outcome?;
         drop(span);
-        Ok(ComputerOutput::State {
-            state: self
+        Ok(())
+    }
+
+    async fn mutate(
+        &mut self,
+        action: NativeAction,
+        sequence: u64,
+        state: Arc<RunState>,
+        frames: &mut FrameSink,
+        pointers: &PointerSink,
+    ) -> Result<ComputerOutput, ComputerError> {
+        let fallback_key = action.scroll_fallback_key();
+        let before_digest = self.last_screenshot_digest.clone();
+        let protected_frontmost = tokio::task::spawn_blocking(frontmost_application_pid)
+            .await
+            .map_err(|error| ComputerError::Native {
+                message: format!("frontmost application observer panicked: {error}"),
+            })?;
+        self.dispatch_native_action(action, sequence, Arc::clone(&state), pointers)
+            .await?;
+        let mut observed = self
+            .settled_observation(sequence, Arc::clone(&state), frames, protected_frontmost)
+            .await?;
+        let wheel_had_no_effect = fallback_key.is_some()
+            && before_digest.as_deref()
+                == observed
+                    .screenshot
+                    .as_ref()
+                    .map(|screenshot| screenshot.digest.as_str());
+        if let Some(key) = fallback_key.filter(|_| wheel_had_no_effect) {
+            tracing::info!(
+                target: "nanocodex_computer",
+                sequence,
+                fallback_key = key,
+                "background wheel input made no visual change; retrying with keyboard paging"
+            );
+            self.dispatch_native_action(
+                NativeAction::PressKey {
+                    key: key.to_owned(),
+                    modifiers: Vec::new(),
+                },
+                sequence,
+                Arc::clone(&state),
+                pointers,
+            )
+            .await?;
+            observed = self
                 .settled_observation(sequence, state, frames, protected_frontmost)
-                .await?,
-        })
+                .await?;
+            if before_digest.as_deref()
+                == observed
+                    .screenshot
+                    .as_ref()
+                    .map(|screenshot| screenshot.digest.as_str())
+            {
+                return Err(ComputerError::Native {
+                    message: "wheel and keyboard paging produced no visible movement; the target may already be at its scroll boundary".to_owned(),
+                });
+            }
+        }
+        Ok(ComputerOutput::State { state: observed })
     }
 }
 
@@ -1137,6 +1190,22 @@ impl NativeAction {
             | Self::Scroll { .. }
             | Self::PressKey { .. }
             | Self::TypeText { .. } => "cg_event",
+        }
+    }
+
+    const fn scroll_fallback_key(&self) -> Option<&'static str> {
+        match self {
+            Self::Scroll {
+                delta_x: 0,
+                delta_y,
+                ..
+            } if *delta_y < 0 => Some("page_down"),
+            Self::Scroll {
+                delta_x: 0,
+                delta_y,
+                ..
+            } if *delta_y > 0 => Some("page_up"),
+            _ => None,
         }
     }
 }
@@ -1979,6 +2048,8 @@ fn native_action(
             if public.actions.iter().any(|action| action == "AXPress") {
                 let point = public.frame.map(Rect::center);
                 if let Some(point) = point {
+                    std::thread::sleep(input.pointers.prepare(point));
+                    input.ensure_current()?;
                     input.pointers.publish(point, true);
                 }
                 let result = element
@@ -2071,6 +2142,8 @@ fn native_action(
                 .then(|| public.frame.map(Rect::center))
                 .flatten();
             if let Some(point) = point {
+                std::thread::sleep(input.pointers.prepare(point));
+                input.ensure_current()?;
                 input.pointers.publish(point, true);
             }
             let result = element
@@ -2169,6 +2242,8 @@ fn post_click(
     point: Point,
     button: MouseButton,
 ) -> Result<(), ComputerError> {
+    std::thread::sleep(input.pointers.prepare(point));
+    input.ensure_current()?;
     let source = event_source()?;
     let (button, down, up) = match button {
         MouseButton::Left => (
@@ -2199,6 +2274,8 @@ fn post_click(
 }
 
 fn post_move(input: &NativeInput<'_>, point: Point) -> Result<(), ComputerError> {
+    std::thread::sleep(input.pointers.prepare(point));
+    input.ensure_current()?;
     let event = CGEvent::new_mouse_event(
         event_source()?,
         CGEventType::MouseMoved,
@@ -2216,6 +2293,8 @@ fn post_drag(
     to: Point,
     duration_ms: u64,
 ) -> Result<(), ComputerError> {
+    std::thread::sleep(input.pointers.prepare(from));
+    input.ensure_current()?;
     let source = event_source()?;
     let down = CGEvent::new_mouse_event(
         source.clone(),

@@ -69,8 +69,9 @@ use objc2_app_kit::{
     NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy,
     NSAutoresizingMaskOptions, NSBackingStoreType, NSBitmapImageRep, NSColor, NSCursor,
     NSDeviceRGBColorSpace, NSEventMask, NSFloatingWindowLevel, NSImage, NSImageScaling,
-    NSImageView, NSPanel, NSRunningApplication, NSScreen, NSView, NSWindowCollectionBehavior,
-    NSWindowStyleMask, NSWorkspace,
+    NSImageView, NSNormalWindowLevel, NSPanel, NSRunningApplication, NSScreen, NSView,
+    NSWindowCollectionBehavior, NSWindowOrderingMode, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSWorkspace,
 };
 use objc2_foundation::{NSData, NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize, NSString};
 
@@ -538,7 +539,12 @@ pub struct NativePipWindow {
     cursor_view: Retained<NSImageView>,
     agent_cursor_halo: Retained<NSView>,
     agent_cursor_view: Retained<NSImageView>,
+    agent_overlay_panel: Retained<NSPanel>,
+    agent_overlay_halo: Retained<NSView>,
+    agent_overlay_cursor: Retained<NSImageView>,
     cursor_source: CGEventSource,
+    source_window_id: Cell<Option<u32>>,
+    source_on_screen: Cell<bool>,
     source_frame: Cell<Option<CGRect>>,
     agent_cursor: Cell<Option<AgentCursor>>,
     presentation_aspect: Cell<Option<f64>>,
@@ -548,6 +554,11 @@ pub struct NativePipWindow {
 struct AgentCursor {
     x: f64,
     y: f64,
+    from_x: f64,
+    from_y: f64,
+    motion_started: Instant,
+    motion_duration: Duration,
+    pressed_from: Option<Instant>,
     pressed_until: Option<Instant>,
 }
 
@@ -570,7 +581,10 @@ impl NativePipWindow {
             visible.origin.y + visible.size.height - size.height - 24.0,
         );
         let frame = NSRect::new(origin, size);
-        let style = NSWindowStyleMask::Resizable | NSWindowStyleMask::NonactivatingPanel;
+        let style = NSWindowStyleMask::Titled
+            | NSWindowStyleMask::Resizable
+            | NSWindowStyleMask::FullSizeContentView
+            | NSWindowStyleMask::NonactivatingPanel;
         let panel = NSPanel::initWithContentRect_styleMask_backing_defer(
             NSPanel::alloc(mtm),
             frame,
@@ -579,6 +593,8 @@ impl NativePipWindow {
             false,
         );
         panel.setTitle(&NSString::from_str("Nanocodex Computer"));
+        panel.setTitleVisibility(NSWindowTitleVisibility::Hidden);
+        panel.setTitlebarAppearsTransparent(true);
         panel.setOpaque(false);
         panel.setBackgroundColor(Some(&NSColor::clearColor()));
         panel.setHasShadow(true);
@@ -643,6 +659,58 @@ impl NativePipWindow {
         agent_cursor_view.setHidden(true);
         image_view.addSubview(&agent_cursor_view);
         panel.setContentView(Some(&image_view));
+
+        let overlay_size = NSSize::new(72.0, 72.0);
+        let agent_overlay_panel = NSPanel::initWithContentRect_styleMask_backing_defer(
+            NSPanel::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), overlay_size),
+            NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel,
+            NSBackingStoreType::Buffered,
+            false,
+        );
+        agent_overlay_panel.setOpaque(false);
+        agent_overlay_panel.setBackgroundColor(Some(&NSColor::clearColor()));
+        agent_overlay_panel.setHasShadow(false);
+        agent_overlay_panel.setIgnoresMouseEvents(true);
+        agent_overlay_panel.setHidesOnDeactivate(false);
+        agent_overlay_panel.setCanHide(false);
+        agent_overlay_panel.setLevel(NSNormalWindowLevel);
+        agent_overlay_panel.setCollectionBehavior(
+            NSWindowCollectionBehavior::CanJoinAllSpaces
+                | NSWindowCollectionBehavior::FullScreenAuxiliary,
+        );
+        // SAFETY: The overlay remains strongly retained by this wrapper.
+        unsafe { agent_overlay_panel.setReleasedWhenClosed(false) };
+        let overlay_root = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), overlay_size),
+        );
+        overlay_root.setWantsLayer(true);
+        let agent_overlay_halo = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            NSRect::new(NSPoint::new(15.0, 31.0), NSSize::new(26.0, 26.0)),
+        );
+        agent_overlay_halo.setWantsLayer(true);
+        if let Some(layer) = agent_overlay_halo.layer() {
+            let cyan = NSColor::systemCyanColor().CGColor();
+            layer.setBackgroundColor(Some(&cyan));
+            layer.setCornerRadius(13.0);
+            layer.setShadowColor(Some(&cyan));
+            layer.setShadowOpacity(0.9);
+            layer.setShadowRadius(8.0);
+        }
+        agent_overlay_halo.setAlphaValue(0.72);
+        overlay_root.addSubview(&agent_overlay_halo);
+        let agent_overlay_cursor = NSImageView::initWithFrame(
+            NSImageView::alloc(mtm),
+            NSRect::new(NSPoint::new(28.0, 15.0), NSSize::new(24.0, 32.0)),
+        );
+        agent_overlay_cursor.setImage(Some(&NSCursor::arrowCursor().image()));
+        agent_overlay_cursor.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
+        agent_overlay_cursor.setAlphaValue(0.96);
+        overlay_root.addSubview(&agent_overlay_cursor);
+        agent_overlay_panel.setContentView(Some(&overlay_root));
+        agent_overlay_panel.orderOut(None);
         let cursor_source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .map_err(|()| NativePipWindowError)?;
         application.updateWindows();
@@ -653,7 +721,12 @@ impl NativePipWindow {
             cursor_view,
             agent_cursor_halo,
             agent_cursor_view,
+            agent_overlay_panel,
+            agent_overlay_halo,
+            agent_overlay_cursor,
             cursor_source,
+            source_window_id: Cell::new(None),
+            source_on_screen: Cell::new(false),
             source_frame: Cell::new(None),
             agent_cursor: Cell::new(None),
             presentation_aspect: Cell::new(None),
@@ -661,34 +734,85 @@ impl NativePipWindow {
     }
 
     /// Updates the global source-window geometry used to place the cursor overlay.
-    pub fn set_source_frame(&self, x: f64, y: f64, width: f64, height: f64) {
+    pub fn set_source_frame(
+        &self,
+        window_id: u32,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        on_screen: bool,
+    ) {
         let source = CGRect::new(&CGPoint::new(x, y), &CGSize::new(width, height));
+        self.source_window_id.set(Some(window_id));
+        self.source_on_screen.set(on_screen);
         self.source_frame.set(Some(source));
         if self.agent_cursor.get().is_none_or(|cursor| {
             cursor.x < x || cursor.x > x + width || cursor.y < y || cursor.y > y + height
         }) {
+            let now = Instant::now();
             self.agent_cursor.set(Some(AgentCursor {
                 x: x + width / 2.0,
                 y: y + height / 2.0,
+                from_x: x + width / 2.0,
+                from_y: y + height / 2.0,
+                motion_started: now,
+                motion_duration: Duration::ZERO,
+                pressed_from: None,
                 pressed_until: None,
             }));
         }
     }
 
     /// Updates the independent logical cursor used by background agent input.
-    pub fn set_agent_cursor(&self, x: f64, y: f64, pressed: bool) {
+    pub fn set_agent_cursor(&self, x: f64, y: f64, pressed: bool, travel_duration: Duration) {
         let now = Instant::now();
-        let pressed_until = if pressed {
-            Some(now + Duration::from_millis(180))
+        let previous = self.agent_cursor.get().unwrap_or(AgentCursor {
+            x,
+            y,
+            from_x: x,
+            from_y: y,
+            motion_started: now,
+            motion_duration: Duration::ZERO,
+            pressed_from: None,
+            pressed_until: None,
+        });
+        let unchanged_target = (previous.x - x).abs() < 0.5 && (previous.y - y).abs() < 0.5;
+        let (from_x, from_y, motion_started, motion_duration) = if unchanged_target {
+            (
+                previous.from_x,
+                previous.from_y,
+                previous.motion_started,
+                previous.motion_duration,
+            )
         } else {
-            self.agent_cursor
-                .get()
-                .and_then(|cursor| cursor.pressed_until)
-                .filter(|deadline| *deadline > now)
+            let (from_x, from_y) = rendered_cursor_position(previous, now);
+            (from_x, from_y, now, travel_duration)
+        };
+        let (pressed_from, pressed_until) = if pressed {
+            let pressed_from = motion_started + motion_duration;
+            (
+                Some(pressed_from),
+                Some(pressed_from + Duration::from_millis(180)),
+            )
+        } else {
+            (
+                previous.pressed_from.filter(|_| {
+                    previous
+                        .pressed_until
+                        .is_some_and(|deadline| deadline > now)
+                }),
+                previous.pressed_until.filter(|deadline| *deadline > now),
+            )
         };
         self.agent_cursor.set(Some(AgentCursor {
             x,
             y,
+            from_x,
+            from_y,
+            motion_started,
+            motion_duration,
+            pressed_from,
             pressed_until,
         }));
     }
@@ -862,30 +986,35 @@ impl NativePipWindow {
 
     fn update_agent_cursor(&self) {
         let Some(cursor) = self.agent_cursor.get() else {
-            self.agent_cursor_halo.setHidden(true);
-            self.agent_cursor_view.setHidden(true);
+            self.hide_agent_cursor();
             return;
         };
+        if !self.source_on_screen.get() {
+            self.hide_agent_cursor();
+            return;
+        }
         let Some(source) = self.source_frame.get() else {
-            self.agent_cursor_halo.setHidden(true);
-            self.agent_cursor_view.setHidden(true);
+            self.hide_agent_cursor();
+            return;
+        };
+        let Some(source_window_id) = self.source_window_id.get() else {
+            self.hide_agent_cursor();
             return;
         };
         if source.size.width <= 0.0 || source.size.height <= 0.0 {
-            self.agent_cursor_halo.setHidden(true);
-            self.agent_cursor_view.setHidden(true);
+            self.hide_agent_cursor();
             return;
         }
-        let relative_x = (cursor.x - source.origin.x) / source.size.width;
-        let relative_y = (cursor.y - source.origin.y) / source.size.height;
+        let now = Instant::now();
+        let (cursor_x, cursor_y) = rendered_cursor_position(cursor, now);
+        let relative_x = (cursor_x - source.origin.x) / source.size.width;
+        let relative_y = (cursor_y - source.origin.y) / source.size.height;
         if !(0.0..=1.0).contains(&relative_x) || !(0.0..=1.0).contains(&relative_y) {
-            self.agent_cursor_halo.setHidden(true);
-            self.agent_cursor_view.setHidden(true);
+            self.hide_agent_cursor();
             return;
         }
-        let pressed = cursor
-            .pressed_until
-            .is_some_and(|deadline| deadline > Instant::now());
+        let pressed = cursor.pressed_from.is_some_and(|started| started <= now)
+            && cursor.pressed_until.is_some_and(|deadline| deadline > now);
         let cursor_size = if pressed {
             NSSize::new(26.0, 34.0)
         } else {
@@ -909,6 +1038,38 @@ impl NativePipWindow {
             .setFrameOrigin(NSPoint::new(x, y - cursor_size.height));
         self.agent_cursor_halo.setHidden(false);
         self.agent_cursor_view.setHidden(false);
+
+        let overlay_cursor_size = if pressed {
+            NSSize::new(27.0, 36.0)
+        } else {
+            NSSize::new(24.0, 32.0)
+        };
+        let overlay_halo_size = if pressed {
+            NSSize::new(30.0, 30.0)
+        } else {
+            NSSize::new(20.0, 20.0)
+        };
+        self.agent_overlay_cursor.setFrameSize(overlay_cursor_size);
+        self.agent_overlay_cursor
+            .setFrameOrigin(NSPoint::new(28.0, 47.0 - overlay_cursor_size.height));
+        self.agent_overlay_halo.setFrameSize(overlay_halo_size);
+        self.agent_overlay_halo.setFrameOrigin(NSPoint::new(
+            28.0 - overlay_halo_size.width / 2.0,
+            47.0 - overlay_halo_size.height / 2.0,
+        ));
+        self.agent_overlay_halo
+            .setAlphaValue(if pressed { 0.9 } else { 0.58 });
+        let screen_point = appkit_screen_point(cursor_x, cursor_y);
+        self.agent_overlay_panel
+            .setFrameOrigin(NSPoint::new(screen_point.x - 28.0, screen_point.y - 47.0));
+        self.agent_overlay_panel
+            .orderWindow_relativeTo(NSWindowOrderingMode::Above, source_window_id as isize);
+    }
+
+    fn hide_agent_cursor(&self) {
+        self.agent_cursor_halo.setHidden(true);
+        self.agent_cursor_view.setHidden(true);
+        self.agent_overlay_panel.orderOut(None);
     }
 
     /// Removes the panel from screen without activating another application.
@@ -916,9 +1077,44 @@ impl NativePipWindow {
         autoreleasepool(|_| {
             MainThreadMarker::new().ok_or(NativePipWindowError)?;
             self.panel.orderOut(None);
+            self.agent_overlay_panel.orderOut(None);
             Ok(())
         })
     }
+}
+
+fn rendered_cursor_position(cursor: AgentCursor, now: Instant) -> (f64, f64) {
+    if cursor.motion_duration.is_zero() {
+        return (cursor.x, cursor.y);
+    }
+    let progress = (now
+        .saturating_duration_since(cursor.motion_started)
+        .as_secs_f64()
+        / cursor.motion_duration.as_secs_f64())
+    .clamp(0.0, 1.0);
+    let eased = 1.0 - (1.0 - progress).powi(3);
+    let distance = ((cursor.x - cursor.from_x).powi(2) + (cursor.y - cursor.from_y).powi(2)).sqrt();
+    let arc = (std::f64::consts::PI * progress).sin() * (distance * 0.06).min(24.0);
+    (
+        cursor.from_x + (cursor.x - cursor.from_x) * eased,
+        cursor.from_y + (cursor.y - cursor.from_y) * eased - arc,
+    )
+}
+
+fn appkit_screen_point(x: f64, quartz_y: f64) -> NSPoint {
+    let primary_height = MainThreadMarker::new()
+        .and_then(|mtm| {
+            NSScreen::screens(mtm)
+                .to_vec()
+                .into_iter()
+                .find(|screen| {
+                    let frame = screen.frame();
+                    frame.origin.x == 0.0 && frame.origin.y == 0.0
+                })
+                .map(|screen| screen.frame().size.height)
+        })
+        .unwrap_or(0.0);
+    NSPoint::new(x, primary_height - quartz_y)
 }
 
 /// Requests activation of one running graphical application.

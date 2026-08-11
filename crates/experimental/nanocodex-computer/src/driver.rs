@@ -242,6 +242,7 @@ struct Inner {
 pub(crate) struct AgentPointer {
     pub(crate) point: Point,
     pub(crate) pressed: bool,
+    pub(crate) travel_duration: Duration,
 }
 
 #[derive(Clone)]
@@ -251,7 +252,34 @@ pub(crate) struct PointerSink {
 
 impl PointerSink {
     pub(crate) fn publish(&self, point: Point, pressed: bool) {
-        let _ = self.pointers.send(Some(AgentPointer { point, pressed }));
+        let _ = self.pointers.send(Some(AgentPointer {
+            point,
+            pressed,
+            travel_duration: Duration::ZERO,
+        }));
+    }
+
+    pub(crate) fn prepare(&self, point: Point) -> Duration {
+        let duration =
+            self.pointers
+                .borrow()
+                .as_ref()
+                .map_or(Duration::from_millis(180), |previous| {
+                    let distance = ((point.x - previous.point.x).powi(2)
+                        + (point.y - previous.point.y).powi(2))
+                    .sqrt();
+                    if distance < 2.0 {
+                        Duration::ZERO
+                    } else {
+                        Duration::from_secs_f64((0.08 + distance / 2_400.0).clamp(0.08, 0.32))
+                    }
+                });
+        let _ = self.pointers.send(Some(AgentPointer {
+            point,
+            pressed: false,
+            travel_duration: duration,
+        }));
+        duration
     }
 }
 

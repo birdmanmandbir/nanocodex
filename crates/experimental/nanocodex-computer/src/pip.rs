@@ -21,6 +21,7 @@ struct PipSource {
     y: f64,
     width: f64,
     height: f64,
+    on_screen: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -60,7 +61,14 @@ impl ComputerPip {
                 if let Some(frame) = frames.latest() {
                     let source = pip_source(&frame);
                     let _ = source_tx.send(Some(source));
-                    window.set_source_frame(source.x, source.y, source.width, source.height);
+                    window.set_source_frame(
+                        source.window_id,
+                        source.x,
+                        source.y,
+                        source.width,
+                        source.height,
+                        source.on_screen,
+                    );
                     if window.update_png(frame.image.png()).is_err() {
                         let _ = ready_tx.send(false);
                         return;
@@ -81,7 +89,14 @@ impl ComputerPip {
                             let Ok(frame) = frame else { break };
                             let source = pip_source(&frame);
                             let _ = source_tx.send(Some(source));
-                            window.set_source_frame(source.x, source.y, source.width, source.height);
+                            window.set_source_frame(
+                                source.window_id,
+                                source.x,
+                                source.y,
+                                source.width,
+                                source.height,
+                                source.on_screen,
+                            );
                             if window.update_png(frame.image.png()).is_err() {
                                 tracing::warn!(target: "nanocodex_computer", generation = frame.generation, "native computer PIP frame rendering failed");
                                 break;
@@ -95,7 +110,14 @@ impl ComputerPip {
                                 continue;
                             };
                             let source = frame.source;
-                            window.set_source_frame(source.x, source.y, source.width, source.height);
+                            window.set_source_frame(
+                                source.window_id,
+                                source.x,
+                                source.y,
+                                source.width,
+                                source.height,
+                                source.on_screen,
+                            );
                             if window.update_rgba(&frame.rgba, frame.width, frame.height).is_err() {
                                 tracing::warn!(target: "nanocodex_computer", window_id = source.window_id, "native computer PIP live frame rendering failed");
                                 break;
@@ -112,6 +134,7 @@ impl ComputerPip {
                                 pointer.point.x,
                                 pointer.point.y,
                                 pointer.pressed,
+                                pointer.travel_duration,
                             );
                         }
                         _ = &mut stop_rx => break,
@@ -159,6 +182,7 @@ const fn pip_source(frame: &crate::ComputerFrame) -> PipSource {
         y: bounds.y,
         width: bounds.width,
         height: bounds.height,
+        on_screen: frame.window.on_screen,
     }
 }
 
@@ -237,6 +261,7 @@ fn capture_live_frame(window_id: u32) -> Result<LivePipFrame, String> {
             y: window.y,
             width: window.width,
             height: window.height,
+            on_screen: window.on_screen,
         },
         rgba,
         width: image.width,
