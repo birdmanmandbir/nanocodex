@@ -1,7 +1,7 @@
 #[cfg(target_os = "linux")]
 use std::{
     ffi::{OsStr, OsString},
-    io::{self, Read as _, Write as _},
+    io::{self, Read, Write},
     net::{TcpStream, ToSocketAddrs as _},
     os::unix::net::UnixStream,
     path::PathBuf,
