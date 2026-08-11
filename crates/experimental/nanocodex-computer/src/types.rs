@@ -185,6 +185,7 @@ pub struct CapturedImage {
 }
 
 impl CapturedImage {
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) const fn new(width: u32, height: u32, digest: String, png: Arc<[u8]>) -> Self {
         Self {
             width,

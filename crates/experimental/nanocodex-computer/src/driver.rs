@@ -13,10 +13,15 @@ use tracing::{Instrument as _, Span, field::Empty, info_span};
 use uuid::Uuid;
 
 use crate::{
-    Application, ComputerAction, ComputerActionResult, ComputerBuildError, ComputerError,
-    ComputerEvent, ComputerFrame, ComputerOutput, InterventionReason, Point, SettlePolicy, Window,
+    ComputerAction, ComputerActionResult, ComputerBuildError, ComputerError, ComputerEvent,
+    ComputerFrame, ComputerOutput, InterventionReason, SettlePolicy,
     platform::{self, Backend},
 };
+
+#[cfg(target_os = "macos")]
+use crate::Point;
+#[cfg(any(target_os = "macos", test))]
+use crate::{Application, Window};
 
 const RUNNING: u8 = 0;
 const PAUSED: u8 = 1;
@@ -91,6 +96,7 @@ impl RunState {
         }
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn ensure_action_current(&self) -> Result<(), ComputerError> {
         self.ensure_running()?;
         let human = self.human();
@@ -232,6 +238,7 @@ struct Inner {
     control: ComputerControl,
     events: broadcast::Sender<ComputerEvent>,
     frames: watch::Receiver<Option<Arc<ComputerFrame>>>,
+    #[cfg(target_os = "macos")]
     pointers: watch::Receiver<Option<AgentPointer>>,
     artifact_root: PathBuf,
     owned_artifacts: bool,
@@ -239,6 +246,7 @@ struct Inner {
 }
 
 #[derive(Clone, Copy)]
+#[cfg(target_os = "macos")]
 pub(crate) struct AgentPointer {
     pub(crate) point: Point,
     pub(crate) pressed: bool,
@@ -247,9 +255,11 @@ pub(crate) struct AgentPointer {
 
 #[derive(Clone)]
 pub(crate) struct PointerSink {
+    #[cfg(target_os = "macos")]
     pointers: watch::Sender<Option<AgentPointer>>,
 }
 
+#[cfg(target_os = "macos")]
 impl PointerSink {
     pub(crate) fn publish(&self, point: Point, pressed: bool) {
         let _ = self.pointers.send(Some(AgentPointer {
@@ -343,12 +353,35 @@ impl ComputerFrames {
 
 #[derive(Clone)]
 pub(crate) struct FrameSink {
+    #[cfg(any(target_os = "macos", test))]
     frames: watch::Sender<Option<Arc<ComputerFrame>>>,
+    #[cfg(any(target_os = "macos", test))]
     events: broadcast::Sender<ComputerEvent>,
+    #[cfg(any(target_os = "macos", test))]
     last_target: Option<(Application, Window)>,
 }
 
 impl FrameSink {
+    const fn new(
+        frames: watch::Sender<Option<Arc<ComputerFrame>>>,
+        events: broadcast::Sender<ComputerEvent>,
+    ) -> Self {
+        #[cfg(any(target_os = "macos", test))]
+        {
+            Self {
+                frames,
+                events,
+                last_target: None,
+            }
+        }
+        #[cfg(not(any(target_os = "macos", test)))]
+        {
+            let _ = (frames, events);
+            Self {}
+        }
+    }
+
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn publish(&mut self, frame: ComputerFrame) {
         let target = (frame.application.clone(), frame.window.clone());
         if self.last_target.as_ref() != Some(&target) {
@@ -625,7 +658,18 @@ impl ComputerBuilder {
         let (commands_tx, commands_rx) = mpsc::channel(COMMAND_CAPACITY);
         let (events_tx, events_rx) = broadcast::channel(EVENT_CAPACITY);
         let (frames_tx, frames_rx) = watch::channel(None);
-        let (pointers_tx, pointers_rx) = watch::channel(None);
+        #[cfg(target_os = "macos")]
+        let (pointer_sink, pointers_rx) = {
+            let (pointers_tx, pointers_rx) = watch::channel(None);
+            (
+                PointerSink {
+                    pointers: pointers_tx,
+                },
+                pointers_rx,
+            )
+        };
+        #[cfg(not(target_os = "macos"))]
+        let pointer_sink = PointerSink {};
         let (notices_tx, notices_rx) = mpsc::unbounded_channel();
         let state = Arc::new(RunState::new());
         let control = ComputerControl {
@@ -669,9 +713,7 @@ impl ComputerBuilder {
             notices_rx,
             events_tx.clone(),
             frames_tx,
-            PointerSink {
-                pointers: pointers_tx,
-            },
+            pointer_sink,
             state,
             startup_permission,
         ));
@@ -682,6 +724,7 @@ impl ComputerBuilder {
                     control,
                     events: events_tx,
                     frames: frames_rx,
+                    #[cfg(target_os = "macos")]
                     pointers: pointers_rx,
                     artifact_root,
                     owned_artifacts,
@@ -721,6 +764,7 @@ impl Computer {
         }
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn pointers(&self) -> watch::Receiver<Option<AgentPointer>> {
         self.inner.pointers.clone()
     }
@@ -795,11 +839,7 @@ async fn run_driver(
     state: Arc<RunState>,
     startup_permission: Option<ComputerEvent>,
 ) {
-    let mut frame_sink = FrameSink {
-        frames,
-        events: events.clone(),
-        last_target: None,
-    };
+    let mut frame_sink = FrameSink::new(frames, events.clone());
     send(
         &events,
         ComputerEvent::SessionStarted {
