@@ -362,23 +362,26 @@ pub(crate) struct FrameSink {
 }
 
 impl FrameSink {
+    #[cfg(any(target_os = "macos", test))]
     const fn new(
         frames: watch::Sender<Option<Arc<ComputerFrame>>>,
         events: broadcast::Sender<ComputerEvent>,
     ) -> Self {
-        #[cfg(any(target_os = "macos", test))]
-        {
-            Self {
-                frames,
-                events,
-                last_target: None,
-            }
+        Self {
+            frames,
+            events,
+            last_target: None,
         }
-        #[cfg(not(any(target_os = "macos", test)))]
-        {
-            let _ = (frames, events);
-            Self {}
-        }
+    }
+
+    #[cfg(not(any(target_os = "macos", test)))]
+    fn new(
+        frames: watch::Sender<Option<Arc<ComputerFrame>>>,
+        events: broadcast::Sender<ComputerEvent>,
+    ) -> Self {
+        drop(frames);
+        drop(events);
+        Self {}
     }
 
     #[cfg(any(target_os = "macos", test))]
