@@ -1,11 +1,12 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use iroh::{EndpointId, SecretKey, Signature};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, watch};
 
 use crate::{NetworkError, ProtocolId};
 
@@ -19,7 +20,6 @@ const MAX_ATTRIBUTES: usize = 64;
 const MAX_ATTRIBUTE_KEY_BYTES: usize = 128;
 const MAX_ATTRIBUTE_STRING_BYTES: usize = 1024;
 const MAX_ATTRIBUTE_SET_ITEMS: usize = 128;
-const WATCH_QUEUE_CAPACITY: usize = 256;
 
 /// One typed fact advertised by a node.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -405,14 +405,26 @@ impl PeerChange {
 }
 
 /// Receiver for a filtered, live local cluster view.
+///
+/// Pending changes are coalesced by durable peer identity. A slow consumer
+/// therefore observes each peer's latest query-relative state without an
+/// update-frequency-dependent queue or a fixed fleet-size ceiling.
 pub struct PeerWatcher {
-    incoming: mpsc::Receiver<PeerChange>,
+    queue: std::sync::Arc<WatcherQueue>,
+    changed: watch::Receiver<u64>,
 }
 
 impl PeerWatcher {
     /// Waits for the next matching cluster-view change.
     pub async fn next(&mut self) -> Option<PeerChange> {
-        self.incoming.recv().await
+        loop {
+            if let Some(change) = self.queue.pop() {
+                return Some(change);
+            }
+            if self.changed.changed().await.is_err() {
+                return self.queue.pop();
+            }
+        }
     }
 }
 
@@ -462,119 +474,173 @@ struct PeerPresence {
 struct WatcherState {
     query: Query,
     own_id: EndpointId,
-    matched: HashSet<EndpointId>,
-    sender: mpsc::Sender<PeerChange>,
+    queue: std::sync::Arc<WatcherQueue>,
+    changed: watch::Sender<u64>,
+}
+
+#[derive(Default)]
+struct WatcherQueue {
+    state: StdMutex<WatcherQueueState>,
+}
+
+#[derive(Default)]
+struct WatcherQueueState {
+    delivered: HashMap<EndpointId, SignedAdvertisement>,
+    pending: HashMap<EndpointId, PeerChange>,
+    order: VecDeque<EndpointId>,
+    queued: HashSet<EndpointId>,
+    stale_order_entries: usize,
+}
+
+enum WatcherTarget<'a> {
+    Matching(&'a SignedAdvertisement),
+    Unmatched(&'a SignedAdvertisement),
+    Expired(&'a SignedAdvertisement),
+}
+
+impl WatcherQueue {
+    fn update(&self, target: WatcherTarget<'_>) -> bool {
+        let peer = match target {
+            WatcherTarget::Matching(record)
+            | WatcherTarget::Unmatched(record)
+            | WatcherTarget::Expired(record) => record.node_id(),
+        };
+        let mut state = self.lock();
+        let change = match (state.delivered.get(&peer), target) {
+            (None, WatcherTarget::Matching(record)) => Some(PeerChange::Joined(record.clone())),
+            (Some(previous), WatcherTarget::Matching(record))
+                if !record.same_revision_content(previous) =>
+            {
+                Some(PeerChange::Updated(record.clone()))
+            }
+            (Some(_), WatcherTarget::Unmatched(record)) => {
+                Some(PeerChange::Unmatched(record.clone()))
+            }
+            (Some(_), WatcherTarget::Expired(record)) => Some(PeerChange::Expired(record.clone())),
+            _ => None,
+        };
+
+        match change {
+            Some(change) => {
+                let replaced = state.pending.insert(peer, change).is_some();
+                if state.queued.insert(peer) {
+                    state.order.push_back(peer);
+                } else if !replaced {
+                    state.stale_order_entries = state.stale_order_entries.saturating_sub(1);
+                }
+            }
+            None => {
+                if state.pending.remove(&peer).is_some() {
+                    state.stale_order_entries += 1;
+                }
+            }
+        }
+        state.compact_order_if_needed();
+        true
+    }
+
+    fn pop(&self) -> Option<PeerChange> {
+        let mut state = self.lock();
+        while let Some(peer) = state.order.pop_front() {
+            state.queued.remove(&peer);
+            let Some(change) = state.pending.remove(&peer) else {
+                state.stale_order_entries = state.stale_order_entries.saturating_sub(1);
+                continue;
+            };
+            match &change {
+                PeerChange::Joined(record) | PeerChange::Updated(record) => {
+                    state.delivered.insert(peer, record.clone());
+                }
+                PeerChange::Expired(_) | PeerChange::Unmatched(_) => {
+                    state.delivered.remove(&peer);
+                }
+            }
+            return Some(change);
+        }
+        None
+    }
+
+    fn lock(&self) -> StdMutexGuard<'_, WatcherQueueState> {
+        match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
+impl WatcherQueueState {
+    fn compact_order_if_needed(&mut self) {
+        if self.stale_order_entries < 64
+            || self.stale_order_entries.saturating_mul(2) < self.order.len()
+        {
+            return;
+        }
+        let pending = self.pending.keys().copied().collect::<HashSet<_>>();
+        self.order.retain(|peer| pending.contains(peer));
+        self.queued = pending;
+        self.stale_order_entries = 0;
+    }
 }
 
 impl ClusterView {
     pub(crate) async fn watch(&self, own_id: EndpointId, query: Query) -> PeerWatcher {
-        let (sender, incoming) = mpsc::channel(WATCH_QUEUE_CAPACITY);
+        let queue = std::sync::Arc::new(WatcherQueue::default());
+        let (changed, receiver) = watch::channel(0_u64);
         let mut state = self.state.lock().await;
-        let mut matched = HashSet::new();
         for (peer, presence) in &state.peers {
             if *peer != own_id && query.matches(&presence.record) {
-                matched.insert(*peer);
-                let _ = sender.try_send(PeerChange::Joined(presence.record.clone()));
+                queue.update(WatcherTarget::Matching(&presence.record));
             }
         }
         state.watchers.push(WatcherState {
             query,
             own_id,
-            matched,
-            sender,
+            queue: queue.clone(),
+            changed,
         });
-        PeerWatcher { incoming }
-    }
-
-    async fn apply(&self, change: PresenceChange) {
-        let peer = change.record.node_id();
-        let mut state = self.state.lock().await;
-        match change.kind {
-            PresenceKind::Joined | PresenceKind::Updated => {
-                state.peers.insert(
-                    peer,
-                    PeerPresence {
-                        record: change.record.clone(),
-                    },
-                );
-            }
-            PresenceKind::Expired => {
-                state.peers.remove(&peer);
-            }
+        PeerWatcher {
+            queue,
+            changed: receiver,
         }
-
-        state.watchers.retain_mut(|watcher| {
-            if watcher.sender.is_closed() {
-                return false;
-            }
-            if peer == watcher.own_id {
-                return true;
-            }
-            let was_matching = watcher.matched.contains(&peer);
-            let now_matching = matches!(change.kind, PresenceKind::Joined | PresenceKind::Updated)
-                && watcher.query.matches(&change.record);
-            let event = match (change.kind, was_matching, now_matching) {
-                (PresenceKind::Joined, false, true) => {
-                    Some(PeerChange::Joined(change.record.clone()))
-                }
-                (PresenceKind::Joined, true, true) | (PresenceKind::Updated, true, true) => {
-                    Some(PeerChange::Updated(change.record.clone()))
-                }
-                (PresenceKind::Updated, false, true) => {
-                    Some(PeerChange::Joined(change.record.clone()))
-                }
-                (PresenceKind::Updated, true, false) => {
-                    Some(PeerChange::Unmatched(change.record.clone()))
-                }
-                (PresenceKind::Expired, true, _) => {
-                    Some(PeerChange::Expired(change.record.clone()))
-                }
-                _ => None,
-            };
-            if now_matching {
-                watcher.matched.insert(peer);
-            } else {
-                watcher.matched.remove(&peer);
-            }
-            event.is_none_or(|event| watcher.sender.try_send(event).is_ok())
-        });
     }
 
     pub(crate) async fn ingest(
         &self,
         record: SignedAdvertisement,
     ) -> Result<IngestOutcome, NetworkError> {
-        let kind = {
-            let mut state = self.state.lock().await;
-            match state.peers.get_mut(&record.node_id()) {
-                None => Some(PresenceKind::Joined),
-                Some(previous)
-                    if record.advertisement().revision()
-                        < previous.record.advertisement().revision() =>
-                {
-                    return Ok(IngestOutcome::Stale);
-                }
-                Some(previous)
-                    if record.advertisement().revision()
-                        == previous.record.advertisement().revision() =>
-                {
-                    if !record.same_revision_content(&previous.record) {
-                        return Err(NetworkError::InvalidAdvertisement(
-                            "one revision cannot describe different capability content".to_owned(),
-                        ));
-                    }
-                    if record.expires_at_unix_millis() > previous.record.expires_at_unix_millis() {
-                        previous.record = record;
-                        return Ok(IngestOutcome::Broadcast);
-                    }
-                    return Ok(IngestOutcome::Replay);
-                }
-                Some(_) => Some(PresenceKind::Updated),
+        let mut state = self.state.lock().await;
+        let kind = match state.peers.get_mut(&record.node_id()) {
+            None => PresenceKind::Joined,
+            Some(previous)
+                if record.advertisement().revision()
+                    < previous.record.advertisement().revision() =>
+            {
+                return Ok(IngestOutcome::Stale);
             }
+            Some(previous)
+                if record.advertisement().revision()
+                    == previous.record.advertisement().revision() =>
+            {
+                if !record.same_revision_content(&previous.record) {
+                    return Err(NetworkError::InvalidAdvertisement(
+                        "one revision cannot describe different capability content".to_owned(),
+                    ));
+                }
+                if record.expires_at_unix_millis() > previous.record.expires_at_unix_millis() {
+                    previous.record = record;
+                    return Ok(IngestOutcome::Broadcast);
+                }
+                return Ok(IngestOutcome::Replay);
+            }
+            Some(_) => PresenceKind::Updated,
         };
-        if let Some(kind) = kind {
-            self.apply(PresenceChange { kind, record }).await;
-        }
+        state.peers.insert(
+            record.node_id(),
+            PeerPresence {
+                record: record.clone(),
+            },
+        );
+        state.notify_watchers(PresenceChange { kind, record });
         Ok(IngestOutcome::Broadcast)
     }
 
@@ -586,21 +652,19 @@ impl ClusterView {
                 return;
             }
         };
-        let expired = self
-            .state
-            .lock()
-            .await
+        let mut state = self.state.lock().await;
+        let expired = state
             .peers
             .values()
             .filter(|presence| presence.record.is_expired_at(now))
             .map(|presence| presence.record.clone())
             .collect::<Vec<_>>();
         for record in expired {
-            self.apply(PresenceChange {
+            state.peers.remove(&record.node_id());
+            state.notify_watchers(PresenceChange {
                 kind: PresenceKind::Expired,
                 record,
-            })
-            .await;
+            });
         }
     }
 
@@ -612,6 +676,36 @@ impl ClusterView {
             .values()
             .map(|presence| presence.record.clone())
             .collect()
+    }
+}
+
+impl ViewState {
+    fn notify_watchers(&mut self, change: PresenceChange) {
+        let peer = change.record.node_id();
+        self.watchers.retain_mut(|watcher| {
+            if watcher.changed.receiver_count() == 0 {
+                return false;
+            }
+            if peer == watcher.own_id {
+                return true;
+            }
+            let target = match change.kind {
+                PresenceKind::Joined | PresenceKind::Updated
+                    if watcher.query.matches(&change.record) =>
+                {
+                    WatcherTarget::Matching(&change.record)
+                }
+                PresenceKind::Joined | PresenceKind::Updated => {
+                    WatcherTarget::Unmatched(&change.record)
+                }
+                PresenceKind::Expired => WatcherTarget::Expired(&change.record),
+            };
+            watcher.queue.update(target);
+            watcher
+                .changed
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+            true
+        });
     }
 }
 
@@ -694,4 +788,105 @@ fn invalid_advertisement(message: impl Into<String>) -> NetworkError {
 
 const fn default_lease() -> Duration {
     DEFAULT_LEASE
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn initial_watch_snapshot_does_not_drop_large_fleets() {
+        const PEERS: usize = 320;
+
+        let view = ClusterView::default();
+        let protocol = ProtocolId::new("nanocodex.worker/1").unwrap();
+        for index in 0..PEERS {
+            let mut key = [0_u8; 32];
+            key[..8].copy_from_slice(&(index as u64 + 1).to_le_bytes());
+            let identity = SecretKey::from_bytes(&key);
+            let record = SignedAdvertisement::sign(
+                NodeAdvertisement::new(1).with_service(protocol.clone()),
+                &identity,
+            )
+            .unwrap();
+            assert_eq!(view.ingest(record).await.unwrap(), IngestOutcome::Broadcast);
+        }
+
+        let observer = SecretKey::from_bytes(&[0xff; 32]).public();
+        let mut watcher = view.watch(observer, Query::service(protocol)).await;
+        let mut joined = HashSet::with_capacity(PEERS);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while joined.len() < PEERS {
+                let PeerChange::Joined(record) = watcher.next().await.unwrap() else {
+                    panic!("initial snapshot must contain only joins");
+                };
+                joined.insert(record.node_id());
+            }
+        })
+        .await
+        .expect("initial snapshot silently dropped peers");
+    }
+
+    #[tokio::test]
+    async fn slow_watchers_coalesce_each_identity_to_its_latest_state() {
+        const LAST_REVISION: u64 = 1_024;
+
+        let view = ClusterView::default();
+        let protocol = ProtocolId::new("nanocodex.worker/1").unwrap();
+        let identity = SecretKey::from_bytes(&[0x41; 32]);
+        let observer = SecretKey::from_bytes(&[0x42; 32]).public();
+        let first = SignedAdvertisement::sign(
+            NodeAdvertisement::new(1).with_service(protocol.clone()),
+            &identity,
+        )
+        .unwrap();
+        view.ingest(first).await.unwrap();
+        let mut watcher = view.watch(observer, Query::service(protocol.clone())).await;
+
+        for revision in 2..=LAST_REVISION {
+            let record = SignedAdvertisement::sign(
+                NodeAdvertisement::new(revision)
+                    .with_service(protocol.clone())
+                    .with_attribute("worker.free_slots", revision),
+                &identity,
+            )
+            .unwrap();
+            view.ingest(record).await.unwrap();
+        }
+        assert!(matches!(
+            watcher.next().await,
+            Some(PeerChange::Joined(record))
+                if record.advertisement().revision() == LAST_REVISION
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), watcher.next())
+                .await
+                .is_err(),
+            "coalesced revisions must not leave stale events"
+        );
+
+        let unmatched =
+            SignedAdvertisement::sign(NodeAdvertisement::new(LAST_REVISION + 1), &identity)
+                .unwrap();
+        view.ingest(unmatched).await.unwrap();
+        let matching_again = SignedAdvertisement::sign(
+            NodeAdvertisement::new(LAST_REVISION + 2).with_service(protocol),
+            &identity,
+        )
+        .unwrap();
+        view.ingest(matching_again).await.unwrap();
+        assert!(matches!(
+            watcher.next().await,
+            Some(PeerChange::Updated(record))
+                if record.advertisement().revision() == LAST_REVISION + 2
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), watcher.next())
+                .await
+                .is_err(),
+            "a transient unmatch must collapse into the latest matching state"
+        );
+    }
 }

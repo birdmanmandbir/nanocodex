@@ -47,12 +47,21 @@ enum Command {
     },
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum DiscoveryMessage {
     Advertisement {
         version: u8,
         record: SignedAdvertisement,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum DiscoveryMessageRef<'a> {
+    Advertisement {
+        version: u8,
+        record: &'a SignedAdvertisement,
     },
 }
 
@@ -260,9 +269,9 @@ async fn broadcast_snapshot(
 }
 
 fn encode(record: &SignedAdvertisement) -> Result<Vec<u8>, NetworkError> {
-    let encoded = serde_json::to_vec(&DiscoveryMessage::Advertisement {
+    let encoded = serde_json::to_vec(&DiscoveryMessageRef::Advertisement {
         version: MESSAGE_VERSION,
-        record: record.clone(),
+        record,
     })
     .map_err(|error| NetworkError::InvalidAdvertisement(error.to_string()))?;
     if encoded.len() > MAX_GOSSIP_MESSAGE_BYTES {
@@ -322,5 +331,40 @@ mod tests {
             Err(NetworkError::InvalidAdvertisement(message))
                 if message.contains("exceeds")
         ));
+    }
+
+    #[tokio::test]
+    async fn gossip_boundary_rejects_malformed_and_unsupported_messages() {
+        let view = ClusterView::default();
+        for malformed in [b"".as_slice(), b"not-json", b"{}"] {
+            assert!(receive(malformed, &view).await.is_err());
+        }
+
+        let identity = iroh::SecretKey::from_bytes(&[6; 32]);
+        let record = SignedAdvertisement::sign(
+            NodeAdvertisement::new(1).with_service(ProtocolId::new("nanocodex.worker/1").unwrap()),
+            &identity,
+        )
+        .unwrap();
+        let mut unsupported = serde_json::to_value(DiscoveryMessageRef::Advertisement {
+            version: MESSAGE_VERSION,
+            record: &record,
+        })
+        .unwrap();
+        unsupported["version"] = serde_json::json!(MESSAGE_VERSION + 1);
+        assert!(
+            receive(&serde_json::to_vec(&unsupported).unwrap(), &view)
+                .await
+                .is_err()
+        );
+
+        let mut unknown_field = unsupported;
+        unknown_field["version"] = serde_json::json!(MESSAGE_VERSION);
+        unknown_field["unexpected"] = serde_json::json!(true);
+        assert!(
+            receive(&serde_json::to_vec(&unknown_field).unwrap(), &view)
+                .await
+                .is_err()
+        );
     }
 }
