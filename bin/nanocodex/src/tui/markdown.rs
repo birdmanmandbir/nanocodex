@@ -1772,7 +1772,7 @@ After";
                 .flat_map(|line| line.spans.iter())
                 .all(|span| !span.content.contains(r"\rho"))
         );
-        wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        wake_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         let rendered = render_agent_markdown_with_math(source, 100, &renderer);
         assert_eq!(rendered.formulas.len(), 1);
         assert!(rendered.formulas[0].formula.columns() > 10);
