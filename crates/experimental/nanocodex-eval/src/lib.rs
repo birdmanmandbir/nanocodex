@@ -46,6 +46,12 @@
     allow(dead_code, unused_imports)
 )]
 
+#[cfg(test)]
+// Keep Iroh socket setup from perturbing the 64-writer SQLite stress test on
+// small CI runners. The tests still run concurrently with the rest of the suite.
+pub(crate) static NETWORK_AND_SQLITE_STRESS_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
 mod api;
 /// Agent Trajectory Interchange Format projection and wire types.
 pub mod atif;

@@ -1425,7 +1425,7 @@ mod tests {
 
     use nanocodex_network::{Hub, Node, TcpBridge};
     use rusqlite::Connection;
-    use tokio::{sync::Semaphore, task::JoinHandle};
+    use tokio::task::JoinHandle;
 
     use super::*;
     use crate::{
@@ -1433,8 +1433,6 @@ mod tests {
         coordinator::RemoteClaim,
         workset::{BeginTask, Workset},
     };
-
-    static IROH_TEST_PERMIT: Semaphore = Semaphore::const_new(1);
 
     fn write_task(root: &Path) {
         let task = root.join("one");
@@ -1587,7 +1585,7 @@ thinking = ["high"]
 
     #[tokio::test]
     async fn coordinator_http_and_artifact_upload_cross_iroh() {
-        let _test_permit = IROH_TEST_PERMIT.acquire().await.unwrap();
+        let _resource_permit = crate::NETWORK_AND_SQLITE_STRESS_TEST_LOCK.lock().await;
         let (directory, client, selection, server) = iroh_fixture().await;
         let worker = client.clone().worker("iroh-worker");
         let RemoteClaim::Run { claim, .. } = worker.claim(&selection).await.unwrap() else {

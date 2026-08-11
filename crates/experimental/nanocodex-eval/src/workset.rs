@@ -1359,6 +1359,7 @@ mod tests {
 
     #[test]
     fn concurrent_claimers_never_receive_the_same_row() {
+        let _resource_permit = crate::NETWORK_AND_SQLITE_STRESS_TEST_LOCK.blocking_lock();
         let directory = tempfile::tempdir().unwrap();
         const WORKERS: usize = 64;
         const TASKS: usize = 1_024;
