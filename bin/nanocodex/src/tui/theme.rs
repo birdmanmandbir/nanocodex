@@ -288,10 +288,80 @@ impl Theme {
 }
 
 fn detect_system_mode() -> Option<ThemeMode> {
-    match dark_light::detect().ok()? {
-        dark_light::Mode::Light => Some(ThemeMode::Light),
-        dark_light::Mode::Dark => Some(ThemeMode::Dark),
-        dark_light::Mode::Unspecified => None,
+    detect_native_system_mode()
+}
+
+#[cfg(target_os = "macos")]
+fn detect_native_system_mode() -> Option<ThemeMode> {
+    let output = std::process::Command::new("defaults")
+        .args(["read", "-g", "AppleInterfaceStyle"])
+        .output()
+        .ok()?;
+    Some(if output.status.success() {
+        parse_theme_hint(&output.stdout).unwrap_or(ThemeMode::Dark)
+    } else {
+        // macOS omits AppleInterfaceStyle when the appearance is light.
+        ThemeMode::Light
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn detect_native_system_mode() -> Option<ThemeMode> {
+    let color_scheme = std::process::Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.interface", "color-scheme"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| parse_theme_hint(&output.stdout));
+    if color_scheme.is_some() {
+        return color_scheme;
+    }
+
+    std::process::Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.interface", "gtk-theme"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| parse_theme_hint(&output.stdout))
+}
+
+#[cfg(windows)]
+fn detect_native_system_mode() -> Option<ThemeMode> {
+    let output = std::process::Command::new("reg")
+        .args([
+            "query",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+            "/v",
+            "AppsUseLightTheme",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+    if value.contains("0x0") {
+        Some(ThemeMode::Dark)
+    } else if value.contains("0x1") {
+        Some(ThemeMode::Light)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn detect_native_system_mode() -> Option<ThemeMode> {
+    None
+}
+
+fn parse_theme_hint(value: &[u8]) -> Option<ThemeMode> {
+    let value = String::from_utf8_lossy(value).to_ascii_lowercase();
+    if value.contains("dark") {
+        Some(ThemeMode::Dark)
+    } else if value.contains("light") {
+        Some(ThemeMode::Light)
+    } else {
+        None
     }
 }
 
@@ -354,7 +424,7 @@ mod tests {
 
     use ratatui::style::Color;
 
-    use super::{Theme, ThemeMode, detect_colorfgbg_mode};
+    use super::{Theme, ThemeMode, detect_colorfgbg_mode, parse_theme_hint};
 
     #[test]
     fn theme_mode_is_clap_compatible_and_cycles() {
@@ -401,6 +471,17 @@ mod tests {
         assert_eq!(theme.mode(), ThemeMode::Auto);
         assert_eq!(theme.resolved_mode(), ThemeMode::Dark);
         assert_eq!(theme.code_background(), Color::Rgb(0x26, 0x26, 0x26));
+    }
+
+    #[test]
+    fn system_theme_hints_are_parsed_case_insensitively() {
+        assert_eq!(parse_theme_hint(b"Dark\n"), Some(ThemeMode::Dark));
+        assert_eq!(
+            parse_theme_hint(b"'prefer-light'\n"),
+            Some(ThemeMode::Light)
+        );
+        assert_eq!(parse_theme_hint(b"'Adwaita-dark'\n"), Some(ThemeMode::Dark));
+        assert_eq!(parse_theme_hint(b"'default'\n"), None);
     }
 
     #[test]
