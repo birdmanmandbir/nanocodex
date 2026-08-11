@@ -1,15 +1,16 @@
 use std::{io, path::PathBuf};
 
 use nanocodex_vm::host::{
-    NativeVerifierSet, NvidiaNvattestVerifier, TdxVerificationPolicy, TdxVerifier,
-    verify_attestation,
+    CommandProofExpectation, NativeVerifierSet, NvidiaNvattestVerifier, TdxVerificationPolicy,
+    TdxVerifier, verify_attestation, verify_command_proof,
 };
+use sha2::{Digest as _, Sha256};
 
 mod attestation_support;
 
 use attestation_support::{
-    invalid_argument, load_attestation, now_unix_seconds, parse_hex, print_verified, read_bounded,
-    value,
+    invalid_argument, load_attestation, load_command_proof, load_inference_manifest,
+    now_unix_seconds, parse_hex, print_verified, print_verified_command, read_bounded, value,
 };
 
 const MAX_COLLATERAL_BYTES: usize = 16 * 1024 * 1024;
@@ -30,14 +31,50 @@ struct Options {
     allow_dynamic_platform: bool,
     allow_cached_keys: bool,
     allow_smt: bool,
+    command_manifest: Option<PathBuf>,
+    local_guest: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = Options::parse()?;
-    let attestation = load_attestation(&options.input)?;
+    let command_inputs = match (&options.command_manifest, &options.local_guest) {
+        (Some(manifest_path), Some(local_guest)) => {
+            let proof = load_command_proof(&options.input)?;
+            let (manifest, manifest_digest) = load_inference_manifest(manifest_path)?;
+            let executable_digest: [u8; 32] = Sha256::digest(std::fs::read(local_guest)?).into();
+            if hex::encode(executable_digest) != manifest.guest_executable_sha256 {
+                return Err(invalid_argument(
+                    "--local-guest does not match guest_executable_sha256 in the manifest",
+                )
+                .into());
+            }
+            Some((proof, manifest, manifest_digest, executable_digest))
+        }
+        (None, None) => None,
+        _ => {
+            return Err(invalid_argument(
+                "--command-manifest and --local-guest must be supplied together",
+            )
+            .into());
+        }
+    };
+    let attestation = if let Some((proof, _, _, _)) = &command_inputs {
+        proof.attestation().clone()
+    } else {
+        load_attestation(&options.input)?
+    };
     attestation.verify_key_proof()?;
     let challenge = attestation.bundle().request().challenge().clone();
+    if let Some((_, manifest, manifest_digest, _)) = &command_inputs
+        && (manifest.policy_id != challenge.policy_id()
+            || manifest_digest != attestation.bundle().request().workload_manifest_digest())
+    {
+        return Err(invalid_argument(
+            "command manifest does not match the attested policy or workload digest",
+        )
+        .into());
+    }
     let collateral = read_bounded(&options.collateral, MAX_COLLATERAL_BYTES)?;
     let mut policy = TdxVerificationPolicy::new(
         challenge.policy_id(),
@@ -81,7 +118,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         verify_attestation(bundle, &challenge, now, &verifier).await?
     };
-    print_verified(&verified, challenge.policy_id())
+    if let Some((proof, manifest, manifest_digest, executable_digest)) = command_inputs {
+        let expected = CommandProofExpectation::new(
+            challenge.clone(),
+            manifest_digest,
+            executable_digest,
+            manifest.argv(),
+        );
+        let command = verify_command_proof(&proof, &verified, &expected)?;
+        print_verified_command(&verified, &command, challenge.policy_id())
+    } else {
+        print_verified(&verified, challenge.policy_id())
+    }
 }
 
 impl Options {
@@ -100,6 +148,8 @@ impl Options {
         let mut allow_dynamic_platform = false;
         let mut allow_cached_keys = false;
         let mut allow_smt = false;
+        let mut command_manifest = None;
+        let mut local_guest = None;
         let mut arguments = std::env::args().skip(1);
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
@@ -137,9 +187,15 @@ impl Options {
                 "--allow-dynamic-platform" => allow_dynamic_platform = true,
                 "--allow-cached-keys" => allow_cached_keys = true,
                 "--allow-smt" => allow_smt = true,
+                "--command-manifest" => {
+                    command_manifest = Some(value(&mut arguments, "--command-manifest")?.into())
+                }
+                "--local-guest" => {
+                    local_guest = Some(value(&mut arguments, "--local-guest")?.into())
+                }
                 "--help" | "-h" => {
                     println!(
-                        "usage: verify_tdx_attestation --input PATH|- --collateral PATH --mrtd 96_HEX --rtmr0 96_HEX --rtmr1 96_HEX --rtmr2 96_HEX --rtmr3 96_HEX [--intel-root DER_PATH] [--nvidia-policy REGO_PATH] [--nvattest PATH] [--mr-config-id 96_HEX] [--mr-owner 96_HEX] [--mr-owner-config 96_HEX] [--xfam 16_HEX] [--allow-dynamic-platform] [--allow-cached-keys] [--allow-smt]"
+                        "usage: verify_tdx_attestation --input PATH|- --collateral PATH --mrtd 96_HEX --rtmr0 96_HEX --rtmr1 96_HEX --rtmr2 96_HEX --rtmr3 96_HEX [--intel-root DER_PATH] [--nvidia-policy REGO_PATH] [--nvattest PATH] [--mr-config-id 96_HEX] [--mr-owner 96_HEX] [--mr-owner-config 96_HEX] [--xfam 16_HEX] [--allow-dynamic-platform] [--allow-cached-keys] [--allow-smt] [--command-manifest PATH --local-guest PATH]"
                     );
                     std::process::exit(0);
                 }
@@ -166,6 +222,8 @@ impl Options {
             allow_dynamic_platform,
             allow_cached_keys,
             allow_smt,
+            command_manifest,
+            local_guest,
         })
     }
 }

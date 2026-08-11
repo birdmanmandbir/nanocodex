@@ -197,7 +197,7 @@ verify-snp-attestation input measurement crl="":
       --example verify_snp_attestation -- "${args[@]}"
 
 # Verify a collected TDX JSON response with retained Intel DCAP collateral.
-verify-tdx-attestation input collateral mrtd rtmr0 rtmr1 rtmr2 rtmr3 allow_dynamic_platform="false" allow_cached_keys="false" allow_smt="false" nvidia_policy="" nvattest="nvattest":
+verify-tdx-attestation input collateral mrtd rtmr0 rtmr1 rtmr2 rtmr3 allow_dynamic_platform="false" allow_cached_keys="false" allow_smt="false" nvidia_policy="" nvattest="nvattest" command_manifest="" local_guest="":
     #!/usr/bin/env bash
     set -euo pipefail
     args=(
@@ -209,6 +209,9 @@ verify-tdx-attestation input collateral mrtd rtmr0 rtmr1 rtmr2 rtmr3 allow_dynam
     if [ "{{allow_smt}}" = true ]; then args+=(--allow-smt); fi
     if [ -n "{{nvidia_policy}}" ]; then
       args+=(--nvidia-policy "{{nvidia_policy}}" --nvattest "{{nvattest}}")
+    fi
+    if [ -n "{{command_manifest}}" ] || [ -n "{{local_guest}}" ]; then
+      args+=(--command-manifest "{{command_manifest}}" --local-guest "{{local_guest}}")
     fi
     cargo run --locked --quiet -p nanocodex-vm \
       --example verify_tdx_attestation -- "${args[@]}"
@@ -275,6 +278,21 @@ prove-command-gcp-managed profile instance zone local_guest project="nanocodex-t
 prove-command-gcp-managed-h100-tdx instance zone local_guest project="nanocodex-tee-lab" guest_program="/home/georgios/nanocodex-vm-guest" message="attested-managed-h100-tool-call":
     just prove-command-gcp-managed tdx "{{instance}}" "{{zone}}" "{{local_guest}}" \
       "{{project}}" "{{guest_program}}" "{{message}}" h100-single
+
+# Bind one request and response from an exact vLLM OCI image/model revision to
+# fresh TDX and H100 evidence. The manifest is the relying party's policy input.
+prove-inference-gcp-managed-h100-tdx instance zone local_guest manifest project="nanocodex-tee-lab" guest_program="/home/georgios/nanocodex-vm-guest":
+    cargo run --locked --quiet -p nanocodex-vm \
+      --example confidential_transport_vllm -- \
+      --local-guest "{{local_guest}}" --manifest "{{manifest}}" \
+      --transport gcloud \
+      --transport-arg compute --transport-arg ssh \
+      --transport-arg "{{instance}}" \
+      --transport-arg --project --transport-arg "{{project}}" \
+      --transport-arg --zone --transport-arg "{{zone}}" \
+      --transport-arg --command \
+      --transport-arg "sudo {{guest_program}} /" \
+      --transport-arg --quiet
 
 # Exercise the real KVM VM, sealed execution, retained key, signatures, and
 # verifier without claiming hardware trust. The native verifier deliberately

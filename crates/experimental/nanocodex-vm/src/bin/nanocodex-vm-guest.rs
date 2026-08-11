@@ -1,13 +1,17 @@
 #[cfg(target_os = "linux")]
 use std::{
     ffi::{OsStr, OsString},
-    io::{self, Read as _},
+    io::{self, Read as _, Write as _},
+    net::{TcpStream, ToSocketAddrs as _},
+    os::unix::net::UnixStream,
     path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(target_os = "linux")]
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+#[cfg(target_os = "linux")]
+use serde_json::{Value, json};
 #[cfg(target_os = "linux")]
 use sha2::{Digest as _, Sha256};
 #[cfg(target_os = "linux")]
@@ -15,6 +19,8 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 #[cfg(target_os = "linux")]
 const MAX_ATTESTATION_REQUEST_BYTES: usize = 64 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_INFERENCE_HTTP_BYTES: usize = 1024 * 1024;
 
 #[cfg(target_os = "linux")]
 #[tokio::main(flavor = "current_thread")]
@@ -41,6 +47,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 io::Error::new(io::ErrorKind::InvalidInput, "proof message must be UTF-8")
             })?
         );
+        return Ok(());
+    }
+    if first.as_deref() == Some(OsStr::new("--proof-vllm-inference")) {
+        let options = VllmProofOptions::parse(arguments)?;
+        let output = prove_vllm_inference(&options)?;
+        serde_json::to_writer(io::stdout().lock(), &output)?;
+        println!();
         return Ok(());
     }
     if first.as_deref() == Some(OsStr::new("--attest-example")) {
@@ -115,6 +128,285 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     nanocodex_vm::tools::serve_guest(workspace)
         .await
         .map_err(Into::into)
+}
+
+#[cfg(target_os = "linux")]
+struct VllmProofOptions {
+    container: String,
+    image_id: String,
+    image_reference: String,
+    model: String,
+    model_revision: String,
+    prompt: String,
+}
+
+#[cfg(target_os = "linux")]
+impl VllmProofOptions {
+    fn parse(mut arguments: impl Iterator<Item = OsString>) -> Result<Self, io::Error> {
+        let container = proof_argument(&mut arguments, "CONTAINER")?;
+        let image_id = proof_argument(&mut arguments, "IMAGE_ID")?;
+        let image_reference = proof_argument(&mut arguments, "IMAGE_REFERENCE")?;
+        let model = proof_argument(&mut arguments, "MODEL")?;
+        let model_revision = proof_argument(&mut arguments, "MODEL_REVISION")?;
+        let prompt = proof_argument(&mut arguments, "PROMPT")?;
+        if arguments.next().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--proof-vllm-inference accepts exactly six arguments",
+            ));
+        }
+        if container.is_empty()
+            || !container
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            || !image_id.starts_with("sha256:")
+            || !image_reference.contains("@sha256:")
+            || model.is_empty()
+            || model_revision.is_empty()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid container, image, model, or revision identity",
+            ));
+        }
+        Ok(Self {
+            container,
+            image_id,
+            image_reference,
+            model,
+            model_revision,
+            prompt,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn proof_argument(
+    arguments: &mut impl Iterator<Item = OsString>,
+    name: &str,
+) -> Result<String, io::Error> {
+    arguments
+        .next()
+        .and_then(|argument| argument.into_string().ok())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("--proof-vllm-inference requires UTF-8 {name}"),
+            )
+        })
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct DockerInspection {
+    id: String,
+    image: String,
+    config: DockerConfig,
+    state: DockerState,
+    host_config: DockerHostConfig,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct DockerConfig {
+    image: String,
+    cmd: Vec<String>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct DockerState {
+    running: bool,
+    pid: u32,
+    started_at: String,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct DockerHostConfig {
+    device_requests: Vec<DockerDeviceRequest>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct DockerDeviceRequest {
+    driver: String,
+    count: i64,
+    capabilities: Vec<Vec<String>>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Serialize)]
+struct VllmInferenceProof {
+    schema_version: u32,
+    status: &'static str,
+    server: &'static str,
+    container: DockerInspection,
+    request: Value,
+    response: Value,
+}
+
+#[cfg(target_os = "linux")]
+fn prove_vllm_inference(
+    options: &VllmProofOptions,
+) -> Result<VllmInferenceProof, Box<dyn std::error::Error>> {
+    let before = inspect_vllm_container(&options.container)?;
+    validate_vllm_container(options, &before)?;
+    let request = json!({
+        "model": options.model,
+        "messages": [{"role": "user", "content": options.prompt}],
+        "temperature": 0,
+        "seed": 7,
+        "max_tokens": 32,
+    });
+    let request_bytes = serde_json::to_vec(&request)?;
+    let mut addresses = ("127.0.0.1", 8000).to_socket_addrs()?;
+    let address = addresses
+        .next()
+        .ok_or_else(|| io::Error::other("vLLM address did not resolve"))?;
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(10))?;
+    stream.set_read_timeout(Some(Duration::from_secs(120)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let response_bytes = http_exchange(
+        &mut stream,
+        "127.0.0.1:8000",
+        "POST",
+        "/v1/chat/completions",
+        &request_bytes,
+    )?;
+    let response: Value = serde_json::from_slice(&response_bytes)?;
+    if response.get("model").and_then(Value::as_str) != Some(&options.model)
+        || response
+            .get("choices")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+    {
+        return Err(io::Error::other("vLLM returned an unexpected model response").into());
+    }
+    let after = inspect_vllm_container(&options.container)?;
+    validate_vllm_container(options, &after)?;
+    if before != after {
+        return Err(io::Error::other("vLLM container changed during inference").into());
+    }
+    Ok(VllmInferenceProof {
+        schema_version: 1,
+        status: "vllm_inference_completed",
+        server: "vLLM OpenAI-compatible server",
+        container: after,
+        request,
+        response,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_vllm_container(name: &str) -> Result<DockerInspection, Box<dyn std::error::Error>> {
+    let mut stream = UnixStream::connect("/var/run/docker.sock")?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let body = http_exchange(
+        &mut stream,
+        "docker",
+        "GET",
+        &format!("/containers/{name}/json"),
+        &[],
+    )?;
+    Ok(serde_json::from_slice(&body)?)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_vllm_container(
+    options: &VllmProofOptions,
+    value: &DockerInspection,
+) -> Result<(), io::Error> {
+    let has_model = argument_pair(&value.config.cmd, "--model", &options.model);
+    let has_revision = argument_pair(&value.config.cmd, "--revision", &options.model_revision);
+    let has_served_name = argument_pair(&value.config.cmd, "--served-model-name", &options.model);
+    let has_gpu = value.host_config.device_requests.iter().any(|request| {
+        request.driver == "nvidia"
+            && request.count != 0
+            && request
+                .capabilities
+                .iter()
+                .flatten()
+                .any(|capability| capability == "gpu")
+    });
+    if !value.state.running
+        || value.state.pid == 0
+        || value.image != options.image_id
+        || value.config.image != options.image_reference
+        || !has_model
+        || !has_revision
+        || !has_served_name
+        || !has_gpu
+    {
+        return Err(io::Error::other(
+            "running vLLM container does not match the expected image, model, revision, or GPU policy",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn argument_pair(arguments: &[String], option: &str, value: &str) -> bool {
+    arguments
+        .windows(2)
+        .any(|pair| pair[0] == option && pair[1] == value)
+}
+
+#[cfg(target_os = "linux")]
+fn http_exchange(
+    stream: &mut (impl Read + Write),
+    host: &str,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> Result<Vec<u8>, io::Error> {
+    write!(
+        stream,
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )?;
+    stream.write_all(body)?;
+    stream.flush()?;
+    let mut response = Vec::new();
+    stream
+        .take((MAX_INFERENCE_HTTP_BYTES + 1) as u64)
+        .read_to_end(&mut response)?;
+    if response.len() > MAX_INFERENCE_HTTP_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "HTTP response exceeds 1 MiB",
+        ));
+    }
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP response"))?;
+    let headers = std::str::from_utf8(&response[..header_end])?;
+    if !headers.starts_with("HTTP/1.1 200 ") && !headers.starts_with("HTTP/1.0 200 ") {
+        return Err(io::Error::other(format!(
+            "HTTP request failed: {}",
+            headers.lines().next().unwrap_or("missing status")
+        )));
+    }
+    if headers.lines().any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.eq_ignore_ascii_case("transfer-encoding")
+                && value.trim().eq_ignore_ascii_case("chunked")
+        })
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "chunked HTTP responses are not accepted",
+        ));
+    }
+    Ok(response[header_end..].to_vec())
 }
 
 #[cfg(target_os = "linux")]

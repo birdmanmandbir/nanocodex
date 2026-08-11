@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::{
     fs,
     io::{self, Read as _},
@@ -5,11 +7,44 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use nanocodex_vm::host::{GuestAttestation, VerifiedAttestation};
-use serde::Serialize;
+use nanocodex_vm::host::{
+    AttestedCommandProof, GuestAttestation, VerifiedAttestation, VerifiedCommandProof,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const MAX_ATTESTATION_BYTES: usize = 16 * 1024 * 1024;
+const MAX_MANIFEST_BYTES: usize = 64 * 1024;
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InferenceManifest {
+    pub schema_version: u32,
+    pub policy_id: String,
+    pub guest_program: String,
+    pub guest_executable_sha256: String,
+    pub container: String,
+    pub server_image_id: String,
+    pub server_image_reference: String,
+    pub model: String,
+    pub model_revision: String,
+    pub prompt: String,
+}
+
+impl InferenceManifest {
+    pub fn argv(&self) -> Vec<String> {
+        vec![
+            self.guest_program.clone(),
+            "--proof-vllm-inference".to_owned(),
+            self.container.clone(),
+            self.server_image_id.clone(),
+            self.server_image_reference.clone(),
+            self.model.clone(),
+            self.model_revision.clone(),
+            self.prompt.clone(),
+        ]
+    }
+}
 
 #[derive(Serialize)]
 struct Output<'a> {
@@ -17,8 +52,34 @@ struct Output<'a> {
     status: &'static str,
     policy_id: &'a str,
     hardware_identity: &'a str,
+    components: Vec<ComponentOutput<'a>>,
     guest_public_key_hex: String,
     workload_manifest_sha256: String,
+}
+
+#[derive(Serialize)]
+struct ComponentOutput<'a> {
+    component: String,
+    profile: String,
+    hardware_identity: &'a str,
+    evidence_sha256: String,
+    trusted_boot: bool,
+    debug_disabled: bool,
+    nvidia_fabric: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CommandOutput<'a> {
+    schema_version: u32,
+    status: &'static str,
+    policy_id: &'a str,
+    components: Vec<ComponentOutput<'a>>,
+    workload_manifest_sha256: String,
+    executable_sha256: String,
+    argv: &'a [String],
+    termination: String,
+    stdout: Value,
+    stderr_utf8: String,
 }
 
 pub fn load_attestation(path: &Path) -> Result<GuestAttestation, Box<dyn std::error::Error>> {
@@ -26,8 +87,33 @@ pub fn load_attestation(path: &Path) -> Result<GuestAttestation, Box<dyn std::er
     let mut value: Value = serde_json::from_slice(&bytes)?;
     if let Some(attestation) = value.get_mut("attestation") {
         value = attestation.take();
+    } else if let Some(attestation) = value.pointer_mut("/proof/attestation") {
+        value = attestation.take();
     }
     Ok(serde_json::from_value(value)?)
+}
+
+pub fn load_command_proof(path: &Path) -> Result<AttestedCommandProof, Box<dyn std::error::Error>> {
+    let bytes = read_bounded(path, MAX_ATTESTATION_BYTES)?;
+    let mut value: Value = serde_json::from_slice(&bytes)?;
+    if let Some(proof) = value.get_mut("proof") {
+        value = proof.take();
+    }
+    Ok(serde_json::from_value(value)?)
+}
+
+pub fn load_inference_manifest(
+    path: &Path,
+) -> Result<(InferenceManifest, [u8; 32]), Box<dyn std::error::Error>> {
+    use sha2::{Digest as _, Sha256};
+
+    let bytes = read_bounded(path, MAX_MANIFEST_BYTES)?;
+    let digest = Sha256::digest(&bytes).into();
+    let manifest: InferenceManifest = serde_json::from_slice(&bytes)?;
+    if manifest.schema_version != 1 {
+        return Err(invalid_argument("unsupported inference manifest version").into());
+    }
+    Ok((manifest, digest))
 }
 
 pub fn read_bounded(path: &Path, maximum: usize) -> Result<Vec<u8>, io::Error> {
@@ -79,11 +165,53 @@ pub fn print_verified(
             status: "native_evidence_verified",
             policy_id,
             hardware_identity: cpu.hardware_identity(),
+            components: component_outputs(verified),
             guest_public_key_hex: hex::encode(verified.guest_public_key()),
             workload_manifest_sha256: hex::encode(verified.workload_manifest_digest()),
         })?
     );
     Ok(())
+}
+
+pub fn print_verified_command(
+    verified: &VerifiedAttestation,
+    command: &VerifiedCommandProof,
+    policy_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stdout = serde_json::from_slice(command.stdout())
+        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(command.stdout()).into_owned()));
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&CommandOutput {
+            schema_version: 1,
+            status: "native_evidence_and_command_verified",
+            policy_id,
+            components: component_outputs(verified),
+            workload_manifest_sha256: hex::encode(verified.workload_manifest_digest()),
+            executable_sha256: hex::encode(command.record().executable_sha256()),
+            argv: command.record().argv(),
+            termination: format!("{:?}", command.record().termination()),
+            stdout,
+            stderr_utf8: String::from_utf8_lossy(command.stderr()).into_owned(),
+        })?
+    );
+    Ok(())
+}
+
+fn component_outputs(verified: &VerifiedAttestation) -> Vec<ComponentOutput<'_>> {
+    verified
+        .claims()
+        .iter()
+        .map(|claim| ComponentOutput {
+            component: format!("{:?}", claim.component()),
+            profile: format!("{:?}", claim.profile()),
+            hardware_identity: claim.hardware_identity(),
+            evidence_sha256: hex::encode(claim.evidence_digest()),
+            trusted_boot: claim.trusted_boot(),
+            debug_disabled: claim.debug_disabled(),
+            nvidia_fabric: claim.nvidia_fabric().map(|fabric| format!("{fabric:?}")),
+        })
+        .collect()
 }
 
 pub fn value(

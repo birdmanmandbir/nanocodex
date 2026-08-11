@@ -156,6 +156,64 @@ report binding. `detect_nvidia_attestation_profile` recognizes the reviewed
 `10de:2330` H100 PCI identity and fails closed on mixed H100/B200 systems or a
 non-single H100 topology.
 
+#### Attested inference with vLLM
+
+`confidential_transport_vllm` turns the same boundary into an inference
+receipt without inventing a model server. It drives vLLM's official
+OpenAI-compatible container, pinned by OCI digest, and a public model pinned by
+its Hugging Face revision. The sealed static guest command:
+
+- inspects Docker over its local Unix socket and requires the exact image ID,
+  digest reference, model, revision, served-model name, and NVIDIA GPU request;
+- sends a fixed OpenAI Chat Completions request only to `127.0.0.1:8000`;
+- requires the response to name the expected model and contain a completion;
+- re-inspects Docker and rejects a container identity, process, image, or
+  configuration change during inference; and
+- returns the complete request, response, and container inspection in the
+  signed command receipt.
+
+The relying party writes those expectations into a small JSON manifest:
+
+```json
+{
+  "schema_version": 1,
+  "policy_id": "nanocodex-vllm-qwen25-h100-v1",
+  "guest_program": "/home/georgios/nanocodex-vm-guest",
+  "guest_executable_sha256": "64_LOWERCASE_HEX",
+  "container": "nanocodex-vllm",
+  "server_image_id": "sha256:IMAGE_ID",
+  "server_image_reference": "vllm/vllm-openai@sha256:REPO_DIGEST",
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "model_revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+  "prompt": "Return exactly: CONFIDENTIAL_INFERENCE_OK"
+}
+```
+
+After starting that exact vLLM container on a GCP `a3-highgpu-1g`
+TDX+H100 Confidential VM, collection is one command:
+
+```console
+just prove-inference-gcp-managed-h100-tdx \
+  INSTANCE us-central1-a ./nanocodex-vm-guest ./vllm-manifest.json \
+  > attested-inference.json
+```
+
+The verifier accepts the receipt only when the independently retained
+manifest and local guest bytes match, Intel DCAP appraisal passes, NVIDIA NVAT
+appraisal passes under the checked-in Rego policy, and the exact command exits
+zero. Supplying `command_manifest` and `local_guest` as the last two arguments
+to `just verify-tdx-attestation` performs that complete check and prints every
+verified CPU/GPU component plus the authenticated inference JSON.
+
+This proves that the appraised supervisor inspected the pinned running vLLM
+container and observed the request and response while the appraised H100 was in
+confidential mode. Native GPU evidence does not trace CUDA kernels or prove
+model semantics. On a managed cloud VM, the manifest digest is report-bound
+but not automatically a launch measurement; production secret release must
+also pin a measured/verity image, owned RTMR extension, or cloud image policy.
+The example states this boundary explicitly instead of treating a declared OCI
+digest as hardware-measured state.
+
 An SNP relying party can now appraise a retained response entirely offline:
 
 ```console

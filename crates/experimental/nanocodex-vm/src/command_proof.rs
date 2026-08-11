@@ -477,6 +477,7 @@ pub struct CommandProofExpectation {
     workload_manifest_sha256: [u8; 32],
     executable_sha256: [u8; 32],
     argv: Vec<String>,
+    termination: CommandTermination,
 }
 
 #[cfg(feature = "host")]
@@ -494,7 +495,15 @@ impl CommandProofExpectation {
             workload_manifest_sha256,
             executable_sha256,
             argv,
+            termination: CommandTermination::ExitCode(0),
         }
+    }
+
+    /// Overrides the default requirement that the command exits successfully.
+    #[must_use]
+    pub const fn termination(mut self, termination: CommandTermination) -> Self {
+        self.termination = termination;
+        self
     }
 }
 
@@ -641,7 +650,10 @@ fn verify_receipt(
     if record.challenge != expected.challenge {
         return Err(CommandProofVerificationError::ChallengeMismatch);
     }
-    if record.executable_sha256 != expected.executable_sha256 || record.argv != expected.argv {
+    if record.executable_sha256 != expected.executable_sha256
+        || record.argv != expected.argv
+        || record.termination != expected.termination
+    {
         return Err(CommandProofVerificationError::CommandMismatch);
     }
     if record.argv.is_empty()
@@ -858,12 +870,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_changed_exit_status() {
+    fn rejects_nonzero_exit_status_even_before_signature_check() {
         let (mut receipt, expected, key) = fixture();
         receipt.record.termination = CommandTermination::ExitCode(1);
         assert_eq!(
             verify_receipt(&receipt, key.as_bytes(), &expected),
-            Err(CommandProofVerificationError::SignatureMismatch)
+            Err(CommandProofVerificationError::CommandMismatch)
         );
     }
 }
