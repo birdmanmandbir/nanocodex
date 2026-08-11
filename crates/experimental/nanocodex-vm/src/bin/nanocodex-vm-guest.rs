@@ -396,18 +396,60 @@ fn http_exchange(
             headers.lines().next().unwrap_or("missing status")
         )));
     }
-    if headers.lines().any(|line| {
+    let chunked = headers.lines().any(|line| {
         line.split_once(':').is_some_and(|(name, value)| {
             name.eq_ignore_ascii_case("transfer-encoding")
                 && value.trim().eq_ignore_ascii_case("chunked")
         })
-    }) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "chunked HTTP responses are not accepted",
-        ));
+    });
+    let body = &response[header_end..];
+    if chunked {
+        decode_chunked(body)
+    } else {
+        Ok(body.to_vec())
     }
-    Ok(response[header_end..].to_vec())
+}
+
+#[cfg(target_os = "linux")]
+fn decode_chunked(mut encoded: &[u8]) -> Result<Vec<u8>, io::Error> {
+    let mut decoded = Vec::new();
+    loop {
+        let line_end = encoded
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP chunk"))?;
+        let size_text = std::str::from_utf8(&encoded[..line_end])
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if size_text.is_empty() || size_text.contains(';') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid HTTP chunk size",
+            ));
+        }
+        let size = usize::from_str_radix(size_text, 16)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        encoded = &encoded[line_end + 2..];
+        if size == 0 {
+            if encoded != b"\r\n" {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "HTTP chunk trailers are not accepted",
+                ));
+            }
+            return Ok(decoded);
+        }
+        if size > MAX_INFERENCE_HTTP_BYTES.saturating_sub(decoded.len())
+            || encoded.len() < size + 2
+            || &encoded[size..size + 2] != b"\r\n"
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid or oversized HTTP chunk",
+            ));
+        }
+        decoded.extend_from_slice(&encoded[..size]);
+        encoded = &encoded[size + 2..];
+    }
 }
 
 #[cfg(target_os = "linux")]
