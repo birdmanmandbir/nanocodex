@@ -10,13 +10,19 @@ models, tools, payments, or TEEs. Applications choose identity paths and run
 their own protocols over the resulting topology.
 
 The initial topology uses one durable `Hub` as rendezvous, admission authority,
-and materialized cluster view. A durable `Node` joins that network and remains
-useful without publishing a local service. Applications register a bounded
-`ProtocolId` with `Node::listen` and open an opaque `PeerStream` with
-`Node::connect`. The hub issues a short-lived, single-use grant bound to the
-requester, provider, and protocol. Application bytes then travel directly
-between the authenticated Iroh endpoint identities rather than through the
-hub.
+gossip bootnode, and late-join anti-entropy cache. Every durable `Node` joins a
+private Iroh gossip topic derived from the hub identity and the shared join
+capability. Nodes spread small, signed capability records through that overlay
+and materialize their own local cluster views. The hub is not the source of
+those records and does not fan them out over its control channel.
+
+Applications register a bounded `ProtocolId` with `Node::listen` and open an
+opaque `PeerStream` with `Node::connect`. The hub issues a short-lived,
+single-use grant bound to the requester, provider, and protocol. Application
+bytes then travel over a separate Iroh connection directly between the
+authenticated endpoint identities rather than through the hub. Iroh may use a
+relay when a direct network path is unavailable; the hub never becomes an
+application-data relay.
 
 ```rust,no_run
 # async fn example(node: &nanocodex_network::Node, peer: iroh::EndpointId) -> Result<(), nanocodex_network::NetworkError> {
@@ -32,8 +38,8 @@ let incoming = listener.accept().await;
 ```
 
 Nodes may also publish signed, expiring capability records. Services are typed
-`ProtocolId`s. Other capability facts are application-owned string, unsigned,
-boolean, or string-set attributes, so the networking crate can filter
+`ProtocolId`s. Other capability facts are application-owned string, unsigned
+integer, boolean, or string-set attributes, so the networking crate can filter
 `cpu.arch`, `worker.free_slots`, TEE kinds, and artifact hashes without owning a
 worker model or scheduler.
 
@@ -64,11 +70,24 @@ while let Some(change) = peers.next().await {
 ```
 
 The returned advertisement lease renews in the background. Dropping it stops
-renewal; observers distinguish updates, query mismatches, transport
-disconnects, and signed lease expiration. Records are signed directly by the
-same durable Ed25519 identity authenticated by Iroh, and the wire record does
-not depend on the hub transport. A later gossip implementation can therefore
-disseminate the same records without changing the application-facing API.
+renewal; observers distinguish capability updates, query mismatches, and signed
+lease expiration. Gossip-neighbor changes do not produce worker lifecycle
+events because a node may remain reachable through another overlay branch.
+Records are signed directly by the same durable Ed25519 identity authenticated
+by Iroh. Replays and stale revisions are ignored, while conflicting content at
+one identity and revision is rejected.
+
+The executable example runs a hub, an advertising worker, and a late-joining
+client. The client discovers the worker through gossip and then exchanges
+`ping`/`pong` over a direct peer stream:
+
+```sh
+cargo run -p nanocodex-network --example gossip_cluster -- hub ./hub.identity
+cargo run -p nanocodex-network --example gossip_cluster -- \
+  serve "$JOIN_TICKET" ./worker.identity aarch64
+cargo run -p nanocodex-network --example gossip_cluster -- \
+  dial "$JOIN_TICKET" ./client.identity aarch64
+```
 
 `nanocodex-eval` is not part of this crate's runtime graph. The Nanocodex CLI is
 the current composition root. `TcpBridge` is an optional adapter that publishes
@@ -80,7 +99,9 @@ carried over that adapter.
 The crate does not rank candidates, schedule tasks, define resource semantics,
 supervise workers, validate TEE claims, or own application framing. Those
 contracts stay in consuming applications. Discovery queries only filter the
-node's local authenticated cluster view.
+node's local authenticated cluster view. The current shared join capability is
+also the gossip-topic capability: it is intentionally simple bearer admission,
+not individually revocable worker credentials.
 
 The CLI keeps the same boundary:
 

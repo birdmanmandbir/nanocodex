@@ -381,12 +381,10 @@ impl Query {
 /// One query-relative change in the local cluster view.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PeerChange {
-    /// A connected node began matching the query.
+    /// A node began matching the query.
     Joined(SignedAdvertisement),
-    /// A matching connected node published a newer revision.
+    /// A matching node published a newer revision.
     Updated(SignedAdvertisement),
-    /// A matching node's control connection closed before its lease expired.
-    Disconnected(SignedAdvertisement),
     /// A matching node's advertisement lease expired.
     Expired(SignedAdvertisement),
     /// A newer revision remains online but no longer matches this query.
@@ -400,7 +398,6 @@ impl PeerChange {
         match self {
             Self::Joined(record)
             | Self::Updated(record)
-            | Self::Disconnected(record)
             | Self::Expired(record)
             | Self::Unmatched(record) => record,
         }
@@ -431,7 +428,6 @@ impl std::fmt::Debug for PeerWatcher {
 pub(crate) enum PresenceKind {
     Joined,
     Updated,
-    Disconnected,
     Expired,
 }
 
@@ -439,6 +435,13 @@ pub(crate) enum PresenceKind {
 pub(crate) struct PresenceChange {
     pub kind: PresenceKind,
     pub record: SignedAdvertisement,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IngestOutcome {
+    Broadcast,
+    Replay,
+    Stale,
 }
 
 #[derive(Default)]
@@ -454,7 +457,6 @@ struct ViewState {
 
 struct PeerPresence {
     record: SignedAdvertisement,
-    connected: bool,
 }
 
 struct WatcherState {
@@ -470,7 +472,7 @@ impl ClusterView {
         let mut state = self.state.lock().await;
         let mut matched = HashSet::new();
         for (peer, presence) in &state.peers {
-            if *peer != own_id && presence.connected && query.matches(&presence.record) {
+            if *peer != own_id && query.matches(&presence.record) {
                 matched.insert(*peer);
                 let _ = sender.try_send(PeerChange::Joined(presence.record.clone()));
             }
@@ -484,7 +486,7 @@ impl ClusterView {
         PeerWatcher { incoming }
     }
 
-    pub(crate) async fn apply(&self, change: PresenceChange) {
+    async fn apply(&self, change: PresenceChange) {
         let peer = change.record.node_id();
         let mut state = self.state.lock().await;
         match change.kind {
@@ -493,16 +495,6 @@ impl ClusterView {
                     peer,
                     PeerPresence {
                         record: change.record.clone(),
-                        connected: true,
-                    },
-                );
-            }
-            PresenceKind::Disconnected => {
-                state.peers.insert(
-                    peer,
-                    PeerPresence {
-                        record: change.record.clone(),
-                        connected: false,
                     },
                 );
             }
@@ -534,9 +526,6 @@ impl ClusterView {
                 (PresenceKind::Updated, true, false) => {
                     Some(PeerChange::Unmatched(change.record.clone()))
                 }
-                (PresenceKind::Disconnected, true, _) => {
-                    Some(PeerChange::Disconnected(change.record.clone()))
-                }
                 (PresenceKind::Expired, true, _) => {
                     Some(PeerChange::Expired(change.record.clone()))
                 }
@@ -551,43 +540,78 @@ impl ClusterView {
         });
     }
 
-    pub(crate) async fn disconnect_all(&self) {
-        let records = self
+    pub(crate) async fn ingest(
+        &self,
+        record: SignedAdvertisement,
+    ) -> Result<IngestOutcome, NetworkError> {
+        let kind = {
+            let mut state = self.state.lock().await;
+            match state.peers.get_mut(&record.node_id()) {
+                None => Some(PresenceKind::Joined),
+                Some(previous)
+                    if record.advertisement().revision()
+                        < previous.record.advertisement().revision() =>
+                {
+                    return Ok(IngestOutcome::Stale);
+                }
+                Some(previous)
+                    if record.advertisement().revision()
+                        == previous.record.advertisement().revision() =>
+                {
+                    if !record.same_revision_content(&previous.record) {
+                        return Err(NetworkError::InvalidAdvertisement(
+                            "one revision cannot describe different capability content".to_owned(),
+                        ));
+                    }
+                    if record.expires_at_unix_millis() > previous.record.expires_at_unix_millis() {
+                        previous.record = record;
+                        return Ok(IngestOutcome::Broadcast);
+                    }
+                    return Ok(IngestOutcome::Replay);
+                }
+                Some(_) => Some(PresenceKind::Updated),
+            }
+        };
+        if let Some(kind) = kind {
+            self.apply(PresenceChange { kind, record }).await;
+        }
+        Ok(IngestOutcome::Broadcast)
+    }
+
+    pub(crate) async fn expire(&self) {
+        let now = match unix_millis() {
+            Ok(now) => now,
+            Err(error) => {
+                tracing::warn!(%error, "could not expire capability advertisements");
+                return;
+            }
+        };
+        let expired = self
             .state
             .lock()
             .await
             .peers
             .values()
-            .filter(|presence| presence.connected)
+            .filter(|presence| presence.record.is_expired_at(now))
             .map(|presence| presence.record.clone())
             .collect::<Vec<_>>();
-        for record in records {
-            self.apply(PresenceChange {
-                kind: PresenceKind::Disconnected,
-                record,
-            })
-            .await;
-        }
-    }
-
-    pub(crate) async fn reset(&self) {
-        let records = {
-            let mut state = self.state.lock().await;
-            let records = state
-                .peers
-                .values()
-                .map(|presence| presence.record.clone())
-                .collect::<Vec<_>>();
-            state.peers.clear();
-            records
-        };
-        for record in records {
+        for record in expired {
             self.apply(PresenceChange {
                 kind: PresenceKind::Expired,
                 record,
             })
             .await;
         }
+    }
+
+    pub(crate) async fn active_records(&self) -> Vec<SignedAdvertisement> {
+        self.state
+            .lock()
+            .await
+            .peers
+            .values()
+            .map(|presence| presence.record.clone())
+            .collect()
     }
 }
 

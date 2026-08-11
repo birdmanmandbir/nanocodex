@@ -1,6 +1,7 @@
-//! Durable Iroh identities, admission, and bilateral peer connectivity.
+//! Durable Iroh identities, gossip discovery, admission, and bilateral peer connectivity.
 
 mod discovery;
+mod gossip;
 
 pub use discovery::{
     CapabilityValue, NodeAdvertisement, PeerChange, PeerWatcher, Query, SignedAdvertisement,
@@ -58,8 +59,6 @@ const GRANT_LIFETIME: Duration = Duration::from_secs(30);
 const MAX_CONCURRENT_STREAMS: usize = 32;
 const STREAM_CONTROL: u8 = 1;
 const STREAM_SESSION_REQUEST: u8 = 2;
-const STREAM_ADVERTISEMENT_REQUEST: u8 = 3;
-const ADVERTISEMENT_REAP_INTERVAL: Duration = Duration::from_millis(50);
 const TCP_BRIDGE_PROTOCOL: &str = "nanocodex/tcp-bridge/1";
 const TCP_TICKET_PREFIX: &str = "nanocodex-tcp:";
 const TCP_TICKET_VERSION: u8 = 1;
@@ -110,7 +109,7 @@ pub struct TcpBridgeTicket {
 pub struct Hub {
     router: Router,
     nodes: Arc<NodeRegistry>,
-    _expiry_task: AbortOnDropHandle<()>,
+    _discovery: gossip::GossipDiscovery,
 }
 
 /// One durable node joined to a network.
@@ -119,6 +118,7 @@ pub struct Node {
     dialer: HubDialer,
     listeners: Arc<Mutex<HashMap<ProtocolId, mpsc::Sender<PeerStream>>>>,
     cluster_view: Arc<discovery::ClusterView>,
+    discovery: gossip::GossipDiscovery,
 }
 
 /// A live, automatically renewed capability-advertisement lease.
@@ -152,7 +152,6 @@ struct HubDialer {
     ticket: Arc<JoinTicket>,
     grants: Arc<Mutex<Vec<PendingSessionGrant>>>,
     listeners: Arc<Mutex<HashMap<ProtocolId, mpsc::Sender<PeerStream>>>>,
-    cluster_view: Arc<discovery::ClusterView>,
     connection: Arc<Mutex<Option<ActiveHubConnection>>>,
 }
 
@@ -164,7 +163,6 @@ struct ActiveHubConnection {
 #[derive(Default)]
 struct NodeRegistry {
     peers: Mutex<HashMap<iroh::EndpointId, Arc<RegisteredNode>>>,
-    advertisements: Mutex<HashMap<iroh::EndpointId, SignedAdvertisement>>,
     generation: AtomicU64,
 }
 
@@ -284,35 +282,9 @@ enum ControlMessage {
         protocol: String,
     },
     Granted,
-    AdvertisementChanged {
-        kind: AdvertisementChangeKind,
-        record: SignedAdvertisement,
-    },
-    AdvertisementSnapshotReset,
     Rejected {
         message: String,
     },
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum AdvertisementChangeKind {
-    Joined,
-    Updated,
-    Disconnected,
-    Expired,
-}
-
-#[derive(Serialize, Deserialize)]
-struct AdvertisementPublish {
-    record: SignedAdvertisement,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-enum AdvertisementPublishResponse {
-    Accepted,
-    Rejected { message: String },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -767,19 +739,20 @@ impl Hub {
             nodes: nodes.clone(),
         };
         let token = protocol.token;
-        let router = Router::builder(endpoint).accept(HUB_ALPN, protocol).spawn();
-        let expiry_nodes = Arc::downgrade(&nodes);
-        let expiry_task = AbortOnDropHandle::new(tokio::spawn(async move {
-            let mut interval = tokio::time::interval(ADVERTISEMENT_REAP_INTERVAL);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                let Some(nodes) = expiry_nodes.upgrade() else {
-                    break;
-                };
-                nodes.expire_advertisements().await;
-            }
-        }));
+        let topic = gossip::topic_id(endpoint.id(), &token);
+        let gossip_protocol = iroh_gossip::Gossip::builder().spawn(endpoint.clone());
+        let router = Router::builder(endpoint)
+            .accept(HUB_ALPN, protocol)
+            .accept(iroh_gossip::ALPN, gossip_protocol.clone())
+            .spawn();
+        let discovery = gossip::GossipDiscovery::spawn(
+            gossip_protocol,
+            topic,
+            Vec::new(),
+            Arc::new(discovery::ClusterView::default()),
+            gossip::SnapshotPolicy::All,
+        )
+        .await?;
         if wait_until_online {
             tokio::time::timeout(ONLINE_TIMEOUT, router.endpoint().online())
                 .await
@@ -795,7 +768,7 @@ impl Hub {
             Self {
                 router,
                 nodes,
-                _expiry_task: expiry_task,
+                _discovery: discovery,
             },
             ticket,
         ))
@@ -824,171 +797,6 @@ impl Hub {
     }
 }
 
-impl NodeRegistry {
-    async fn publish(
-        &self,
-        authenticated_node: iroh::EndpointId,
-        record: SignedAdvertisement,
-    ) -> Result<(), NetworkError> {
-        if !self.peers.lock().await.contains_key(&authenticated_node) {
-            return Err(NetworkError::InvalidAdvertisement(
-                "publishing node is no longer connected".to_owned(),
-            ));
-        }
-        record.verify(authenticated_node)?;
-        let change = {
-            let mut advertisements = self.advertisements.lock().await;
-            match advertisements.get(&authenticated_node) {
-                None => {
-                    advertisements.insert(authenticated_node, record.clone());
-                    Some(AdvertisementChangeKind::Joined)
-                }
-                Some(previous)
-                    if record.advertisement().revision() < previous.advertisement().revision() =>
-                {
-                    return Err(NetworkError::InvalidAdvertisement(format!(
-                        "revision {} is older than active revision {}",
-                        record.advertisement().revision(),
-                        previous.advertisement().revision()
-                    )));
-                }
-                Some(previous)
-                    if record.advertisement().revision() == previous.advertisement().revision() =>
-                {
-                    if !record.same_revision_content(previous) {
-                        return Err(NetworkError::InvalidAdvertisement(
-                            "one revision cannot describe different capability content".to_owned(),
-                        ));
-                    }
-                    if record.expires_at_unix_millis() > previous.expires_at_unix_millis() {
-                        advertisements.insert(authenticated_node, record.clone());
-                    }
-                    None
-                }
-                Some(_) => {
-                    advertisements.insert(authenticated_node, record.clone());
-                    Some(AdvertisementChangeKind::Updated)
-                }
-            }
-        };
-        if let Some(kind) = change {
-            self.broadcast_change(kind, record).await;
-        }
-        Ok(())
-    }
-
-    async fn send_snapshot(&self, node: &RegisteredNode) -> Result<(), NetworkError> {
-        let connected = self
-            .peers
-            .lock()
-            .await
-            .keys()
-            .copied()
-            .collect::<std::collections::HashSet<_>>();
-        let now = discovery::unix_millis()?;
-        let records = self
-            .advertisements
-            .lock()
-            .await
-            .values()
-            .filter(|record| connected.contains(&record.node_id()) && !record.is_expired_at(now))
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut control = node.control.lock().await;
-        write_frame(
-            &mut control.send,
-            &ControlMessage::AdvertisementSnapshotReset,
-        )
-        .await?;
-        for record in records {
-            write_frame(
-                &mut control.send,
-                &ControlMessage::AdvertisementChanged {
-                    kind: AdvertisementChangeKind::Joined,
-                    record,
-                },
-            )
-            .await?;
-        }
-        Ok(())
-    }
-
-    async fn node_reconnected(&self, node_id: iroh::EndpointId) {
-        let record = self.advertisements.lock().await.get(&node_id).cloned();
-        if let Some(record) = record {
-            self.broadcast_change(AdvertisementChangeKind::Joined, record)
-                .await;
-        }
-    }
-
-    async fn node_disconnected(&self, node_id: iroh::EndpointId) {
-        let record = self.advertisements.lock().await.get(&node_id).cloned();
-        if let Some(record) = record {
-            self.broadcast_change(AdvertisementChangeKind::Disconnected, record)
-                .await;
-        }
-    }
-
-    async fn expire_advertisements(&self) {
-        let now = match discovery::unix_millis() {
-            Ok(now) => now,
-            Err(error) => {
-                tracing::warn!(%error, "could not reap network advertisements");
-                return;
-            }
-        };
-        let expired = {
-            let mut advertisements = self.advertisements.lock().await;
-            let expired = advertisements
-                .values()
-                .filter(|record| record.is_expired_at(now))
-                .cloned()
-                .collect::<Vec<_>>();
-            for record in &expired {
-                advertisements.remove(&record.node_id());
-            }
-            expired
-        };
-        for record in expired {
-            self.broadcast_change(AdvertisementChangeKind::Expired, record)
-                .await;
-        }
-    }
-
-    async fn broadcast_change(&self, kind: AdvertisementChangeKind, record: SignedAdvertisement) {
-        let peers = self
-            .peers
-            .lock()
-            .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for peer in peers {
-            let mut control = peer.control.lock().await;
-            let result = tokio::time::timeout(
-                AUTH_TIMEOUT,
-                write_frame(
-                    &mut control.send,
-                    &ControlMessage::AdvertisementChanged {
-                        kind,
-                        record: record.clone(),
-                    },
-                ),
-            )
-            .await;
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    tracing::debug!(%error, "could not publish cluster-view change");
-                }
-                Err(_) => {
-                    tracing::debug!("cluster-view change timed out");
-                }
-            }
-        }
-    }
-}
-
 impl Node {
     /// Joins a network with a public-relay-capable durable Iroh endpoint.
     pub async fn join(ticket: JoinTicket, identity: &NodeIdentity) -> Result<Self, NetworkError> {
@@ -1009,6 +817,9 @@ impl Node {
         let grants = Arc::new(Mutex::new(Vec::new()));
         let listeners = Arc::new(Mutex::new(HashMap::new()));
         let cluster_view = Arc::new(discovery::ClusterView::default());
+        let topic = gossip::topic_id(ticket.address.id, &ticket.token);
+        let bootstrap = ticket.address.id;
+        let gossip_protocol = iroh_gossip::Gossip::builder().spawn(endpoint.clone());
         let router = Router::builder(endpoint.clone())
             .accept(
                 NODE_ALPN,
@@ -1018,21 +829,30 @@ impl Node {
                     streams: Arc::new(Semaphore::new(MAX_CONCURRENT_STREAMS)),
                 },
             )
+            .accept(iroh_gossip::ALPN, gossip_protocol.clone())
             .spawn();
         let dialer = HubDialer {
             endpoint,
             ticket: Arc::new(ticket),
             grants,
             listeners: listeners.clone(),
-            cluster_view: cluster_view.clone(),
             connection: Arc::new(Mutex::new(None)),
         };
         dialer.ensure_connected().await?;
+        let discovery = gossip::GossipDiscovery::spawn(
+            gossip_protocol,
+            topic,
+            vec![bootstrap],
+            cluster_view.clone(),
+            gossip::SnapshotPolicy::Own(router.endpoint().id()),
+        )
+        .await?;
         Ok(Self {
             router,
             dialer,
             listeners,
             cluster_view,
+            discovery,
         })
     }
 
@@ -1067,7 +887,8 @@ impl Node {
     /// Opens a direct authenticated stream to `peer` for `protocol`.
     ///
     /// The hub authorizes one short-lived, identity- and protocol-bound grant.
-    /// Application bytes then flow directly between the two nodes.
+    /// Application bytes then flow over a separate Iroh connection between the
+    /// two nodes, directly when possible and through an Iroh relay otherwise.
     pub async fn connect(
         &self,
         peer: iroh::EndpointId,
@@ -1082,18 +903,18 @@ impl Node {
     /// Publishes and automatically renews one signed capability advertisement.
     ///
     /// Dropping the returned lease stops renewal. The record remains visible
-    /// until its signed expiry, so observers can distinguish disconnects from
-    /// lease expiration.
+    /// until its signed expiry. Gossip-neighbor changes do not imply that the
+    /// advertising node has left the network.
     pub async fn advertise(
         &self,
         advertisement: NodeAdvertisement,
     ) -> Result<AdvertisementLease, NetworkError> {
         let record = SignedAdvertisement::sign(advertisement, self.router.endpoint().secret_key())?;
-        self.dialer.publish_advertisement(record.clone()).await?;
+        self.discovery.publisher().publish(record.clone()).await?;
         let node_id = record.node_id();
         let revision = record.advertisement().revision();
         let renewal_delay = record.advertisement().lease_duration() / 2;
-        let dialer = self.dialer.clone();
+        let publisher = self.discovery.publisher();
         let advertisement = record.advertisement().clone();
         let secret_key = self.router.endpoint().secret_key().clone();
         let renewal_task = AbortOnDropHandle::new(tokio::spawn(async move {
@@ -1109,7 +930,7 @@ impl Node {
                         break;
                     }
                 };
-                if let Err(error) = dialer.publish_advertisement(record).await {
+                if let Err(error) = publisher.publish(record).await {
                     tracing::warn!(%error, "network advertisement renewal stopped");
                     break;
                 }
@@ -1370,12 +1191,8 @@ impl HubDialer {
         }
         let grants = self.grants.clone();
         let listeners = self.listeners.clone();
-        let cluster_view = self.cluster_view.clone();
         let control_task = AbortOnDropHandle::new(tokio::spawn(async move {
-            let result =
-                node_control_loop(grants, listeners, cluster_view.clone(), send, recv).await;
-            cluster_view.disconnect_all().await;
-            if let Err(error) = result {
+            if let Err(error) = node_control_loop(grants, listeners, send, recv).await {
                 tracing::debug!(%error, "Iroh node control channel closed");
             }
         }));
@@ -1433,24 +1250,6 @@ impl HubDialer {
             SessionGrant::Rejected { message } => Err(NetworkError::Protocol(format!(
                 "hub rejected protocol {protocol} to {provider}: {message}"
             ))),
-        }
-    }
-
-    async fn publish_advertisement(&self, record: SignedAdvertisement) -> Result<(), NetworkError> {
-        let (mut send, mut recv) = self.open_bi().await?;
-        write_stream_prefix(&mut send, &self.ticket.token, STREAM_ADVERTISEMENT_REQUEST).await?;
-        write_frame(&mut send, &AdvertisementPublish { record }).await?;
-        send.finish()
-            .map_err(|error| NetworkError::Protocol(error.to_string()))?;
-        match tokio::time::timeout(AUTH_TIMEOUT, read_frame(&mut recv))
-            .await
-            .map_err(|_| {
-                NetworkError::Protocol("hub advertisement response timed out".to_owned())
-            })?? {
-            AdvertisementPublishResponse::Accepted => Ok(()),
-            AdvertisementPublishResponse::Rejected { message } => {
-                Err(NetworkError::InvalidAdvertisement(message))
-            }
         }
     }
 
@@ -1532,20 +1331,14 @@ impl ProtocolHandler for HubProtocol {
         }
         streams.abort_all();
         while streams.join_next().await.is_some() {}
-        let removed = {
+        {
             let mut nodes = self.nodes.peers.lock().await;
             if nodes
                 .get(&remote)
                 .is_some_and(|node| node.generation == registered.generation)
             {
                 nodes.remove(&remote);
-                true
-            } else {
-                false
             }
-        };
-        if removed {
-            self.nodes.node_disconnected(remote).await;
         }
         Ok(())
     }
@@ -1605,8 +1398,6 @@ impl HubProtocol {
             .lock()
             .await
             .insert(remote, registered.clone());
-        self.nodes.send_snapshot(&registered).await?;
-        self.nodes.node_reconnected(remote).await;
         tracing::info!(node_endpoint_id = %remote, "registered durable Iroh node identity");
         Ok(registered)
     }
@@ -1624,16 +1415,6 @@ impl HubProtocol {
                 let response = self
                     .grant_session(requester, provider, ProtocolId::new(protocol)?)
                     .await;
-                write_frame(&mut send, &response).await?;
-            }
-            STREAM_ADVERTISEMENT_REQUEST => {
-                let AdvertisementPublish { record } = read_frame(&mut recv).await?;
-                let response = match self.nodes.publish(requester, record).await {
-                    Ok(()) => AdvertisementPublishResponse::Accepted,
-                    Err(error) => AdvertisementPublishResponse::Rejected {
-                        message: error.to_string(),
-                    },
-                };
                 write_frame(&mut send, &response).await?;
             }
             _ => {
@@ -1823,7 +1604,6 @@ impl NodeProtocol {
 async fn node_control_loop(
     grants: Arc<Mutex<Vec<PendingSessionGrant>>>,
     listeners: Arc<Mutex<HashMap<ProtocolId, mpsc::Sender<PeerStream>>>>,
-    cluster_view: Arc<discovery::ClusterView>,
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
 ) -> Result<(), NetworkError> {
@@ -1875,22 +1655,6 @@ async fn node_control_loop(
                         ControlMessage::Granted
                     }
                 }
-            }
-            ControlMessage::AdvertisementChanged { kind, record } => {
-                let kind = match kind {
-                    AdvertisementChangeKind::Joined => discovery::PresenceKind::Joined,
-                    AdvertisementChangeKind::Updated => discovery::PresenceKind::Updated,
-                    AdvertisementChangeKind::Disconnected => discovery::PresenceKind::Disconnected,
-                    AdvertisementChangeKind::Expired => discovery::PresenceKind::Expired,
-                };
-                cluster_view
-                    .apply(discovery::PresenceChange { kind, record })
-                    .await;
-                continue;
-            }
-            ControlMessage::AdvertisementSnapshotReset => {
-                cluster_view.reset().await;
-                continue;
             }
             other => ControlMessage::Rejected {
                 message: format!("unexpected hub control message {}", control_name(&other)),
@@ -2046,8 +1810,6 @@ const fn control_name(message: &ControlMessage) -> &'static str {
         ControlMessage::Ready => "ready",
         ControlMessage::Grant { .. } => "grant",
         ControlMessage::Granted => "granted",
-        ControlMessage::AdvertisementChanged { .. } => "advertisement_changed",
-        ControlMessage::AdvertisementSnapshotReset => "advertisement_snapshot_reset",
         ControlMessage::Rejected { .. } => "rejected",
     }
 }
@@ -2869,8 +2631,6 @@ mod tests {
 
         let first_observer_identity = NodeIdentity::generate().unwrap();
         let first_observer = local_node(ticket.clone(), &first_observer_identity).await;
-        let second_observer_identity = NodeIdentity::generate().unwrap();
-        let second_observer = local_node(ticket.clone(), &second_observer_identity).await;
         let worker_identity = NodeIdentity::generate().unwrap();
         let worker_id = worker_identity.endpoint_id();
         let worker = local_node(ticket.clone(), &worker_identity).await;
@@ -2885,7 +2645,6 @@ mod tests {
             .attribute_contains("artifacts", "sha256:model")
             .unwrap();
         let mut first_view = first_observer.watch(query.clone()).await;
-        let mut second_view = second_observer.watch(query).await;
 
         let first_lease = worker
             .advertise(worker_advertisement(1, 2, 8, &protocol))
@@ -2893,17 +2652,22 @@ mod tests {
             .unwrap();
         assert_eq!(first_lease.node_id(), worker_id);
         assert_eq!(first_lease.revision(), 1);
-        for observed in [
+        assert!(matches!(
             change(&mut first_view).await,
+            PeerChange::Joined(record)
+                if record.node_id() == worker_id
+                    && record.advertisement().revision() == 1
+        ));
+
+        let second_observer_identity = NodeIdentity::generate().unwrap();
+        let second_observer = local_node(ticket.clone(), &second_observer_identity).await;
+        let mut second_view = second_observer.watch(query).await;
+        assert!(matches!(
             change(&mut second_view).await,
-        ] {
-            assert!(matches!(
-                observed,
-                PeerChange::Joined(record)
-                    if record.node_id() == worker_id
-                        && record.advertisement().revision() == 1
-            ));
-        }
+            PeerChange::Joined(record)
+                if record.node_id() == worker_id
+                    && record.advertisement().revision() == 1
+        ));
         tokio::time::sleep(LEASE + Duration::from_millis(150)).await;
         assert!(
             tokio::time::timeout(Duration::from_millis(100), first_view.next())
@@ -2963,20 +2727,21 @@ mod tests {
         drop(listener);
 
         worker.shutdown().await.unwrap();
+        drop(fourth_lease);
         assert!(matches!(
             change(&mut first_view).await,
-            PeerChange::Disconnected(record) if record.node_id() == worker_id
+            PeerChange::Expired(record)
+                if record.node_id() == worker_id && record.advertisement().revision() == 4
         ));
-        drop(fourth_lease);
 
         let restarted = local_node(ticket, &worker_identity).await;
         assert_eq!(restarted.endpoint_id(), worker_id);
+        let restarted_lease = restarted.advertise(fourth_advertisement).await.unwrap();
         assert!(matches!(
             change(&mut first_view).await,
             PeerChange::Joined(record)
                 if record.node_id() == worker_id && record.advertisement().revision() == 4
         ));
-        let restarted_lease = restarted.advertise(fourth_advertisement).await.unwrap();
         drop(restarted_lease);
         assert!(matches!(
             change(&mut first_view).await,
@@ -2987,6 +2752,124 @@ mod tests {
         restarted.shutdown().await.unwrap();
         first_observer.shutdown().await.unwrap();
         second_observer.shutdown().await.unwrap();
+        hub.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gossip_discovery_converges_under_multi_node_churn() {
+        const WORKERS: usize = 64;
+        const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+        async fn local_node(ticket: JoinTicket, label: &str) -> Node {
+            let identity = NodeIdentity::generate().unwrap();
+            let endpoint = Endpoint::builder(presets::Minimal)
+                .secret_key(identity.secret_key)
+                .relay_mode(iroh::RelayMode::Disabled)
+                .clear_ip_transports()
+                .bind_addr("127.0.0.1:0")
+                .unwrap()
+                .bind()
+                .await
+                .unwrap();
+            Node::join_with_endpoint(ticket, endpoint)
+                .await
+                .unwrap_or_else(|error| panic!("{label} could not join: {error}"))
+        }
+
+        let _test_permit = TEST_ENDPOINT_PERMIT.acquire().await.unwrap();
+        let hub_endpoint = Endpoint::builder(presets::Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let (hub, ticket) = Hub::bind_with_endpoint(hub_endpoint, false).await.unwrap();
+        let observer = local_node(ticket.clone(), "observer").await;
+        let protocol = ProtocolId::new("nanocodex.worker/1").unwrap();
+        let query = Query::service(protocol.clone())
+            .attribute_at_least("worker.free_slots", 1)
+            .unwrap();
+        let mut view = observer.watch(query).await;
+
+        let mut workers = Vec::with_capacity(WORKERS);
+        for index in 0..WORKERS {
+            let node = local_node(ticket.clone(), &format!("worker {index}")).await;
+            let id = node.endpoint_id();
+            let listener = node.listen(protocol.clone()).await.unwrap();
+            let lease = node
+                .advertise(
+                    NodeAdvertisement::new(1)
+                        .with_service(protocol.clone())
+                        .with_attribute("worker.index", index as u64)
+                        .with_attribute("worker.free_slots", 1_u64)
+                        .lease_for(Duration::from_secs(2)),
+                )
+                .await
+                .unwrap();
+            workers.push((node, id, listener, Some(lease)));
+        }
+
+        let joined = tokio::time::timeout(TEST_TIMEOUT, async {
+            let mut joined = std::collections::HashSet::new();
+            while joined.len() != WORKERS {
+                if let Some(PeerChange::Joined(record)) = view.next().await {
+                    joined.insert(record.node_id());
+                }
+            }
+            joined
+        })
+        .await
+        .expect("gossip advertisements did not converge");
+        assert_eq!(joined.len(), WORKERS);
+
+        for (node, id, listener, _) in &mut workers {
+            let mut outgoing = observer.connect(*id, &protocol).await.unwrap();
+            let mut incoming = listener.accept().await.unwrap();
+            outgoing.write_all(b"ping").await.unwrap();
+            let mut bytes = [0; 4];
+            incoming.read_exact(&mut bytes).await.unwrap();
+            assert_eq!(&bytes, b"ping");
+            assert_eq!(node.endpoint_id(), *id);
+        }
+
+        for (index, (node, _, _, lease)) in workers.iter_mut().enumerate() {
+            let replacement = node
+                .advertise(
+                    NodeAdvertisement::new(2)
+                        .with_service(protocol.clone())
+                        .with_attribute("worker.index", index as u64)
+                        .with_attribute("worker.free_slots", 0_u64)
+                        .lease_for(Duration::from_secs(2)),
+                )
+                .await
+                .unwrap();
+            drop(lease.replace(replacement));
+        }
+
+        let unmatched = tokio::time::timeout(TEST_TIMEOUT, async {
+            let mut unmatched = std::collections::HashSet::new();
+            while unmatched.len() != WORKERS {
+                if let Some(PeerChange::Unmatched(record)) = view.next().await {
+                    unmatched.insert(record.node_id());
+                }
+            }
+            unmatched
+        })
+        .await
+        .expect("gossip capability updates did not converge");
+        assert_eq!(unmatched, joined);
+
+        let mut shutdowns = JoinSet::new();
+        for (node, _, _, lease) in workers {
+            drop(lease);
+            shutdowns.spawn(node.shutdown());
+        }
+        while let Some(result) = shutdowns.join_next().await {
+            result.unwrap().unwrap();
+        }
+        observer.shutdown().await.unwrap();
         hub.shutdown().await.unwrap();
     }
 
@@ -3010,6 +2893,78 @@ mod tests {
         tampered["advertisement"]["attributes"]["cpu.arch"]["value"] = serde_json::json!("x86_64");
         let tampered: SignedAdvertisement = serde_json::from_value(tampered).unwrap();
         assert!(tampered.verify(identity.public()).is_err());
+    }
+
+    #[tokio::test]
+    async fn local_view_rejects_equivocation_and_ignores_replays() {
+        let identity = iroh::SecretKey::from_bytes(&[0x31; 32]);
+        let observer = iroh::SecretKey::from_bytes(&[0x32; 32]).public();
+        let protocol = ProtocolId::new("nanocodex.worker/1").unwrap();
+        let view = discovery::ClusterView::default();
+        let mut watcher = view.watch(observer, Query::service(protocol.clone())).await;
+
+        let revision_two = SignedAdvertisement::sign(
+            NodeAdvertisement::new(2)
+                .with_service(protocol.clone())
+                .with_attribute("worker.free_slots", 1_u64),
+            &identity,
+        )
+        .unwrap();
+        assert_eq!(
+            view.ingest(revision_two.clone()).await.unwrap(),
+            discovery::IngestOutcome::Broadcast
+        );
+        assert!(matches!(
+            watcher.next().await,
+            Some(PeerChange::Joined(record)) if record.advertisement().revision() == 2
+        ));
+
+        let stale = SignedAdvertisement::sign(
+            NodeAdvertisement::new(1).with_service(protocol.clone()),
+            &identity,
+        )
+        .unwrap();
+        assert_eq!(
+            view.ingest(stale).await.unwrap(),
+            discovery::IngestOutcome::Stale
+        );
+
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let replay =
+            SignedAdvertisement::sign(revision_two.advertisement().clone(), &identity).unwrap();
+        assert_eq!(
+            view.ingest(replay).await.unwrap(),
+            discovery::IngestOutcome::Broadcast
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), watcher.next())
+                .await
+                .is_err(),
+            "lease renewal must not emit a query update"
+        );
+
+        let revision_three = SignedAdvertisement::sign(
+            NodeAdvertisement::new(3)
+                .with_service(protocol.clone())
+                .with_attribute("worker.free_slots", 2_u64),
+            &identity,
+        )
+        .unwrap();
+        view.ingest(revision_three).await.unwrap();
+        assert!(matches!(
+            watcher.next().await,
+            Some(PeerChange::Updated(record))
+                if record.advertisement().revision() == 3
+        ));
+
+        let equivocation = SignedAdvertisement::sign(
+            NodeAdvertisement::new(3)
+                .with_service(protocol)
+                .with_attribute("worker.free_slots", 99_u64),
+            &identity,
+        )
+        .unwrap();
+        assert!(view.ingest(equivocation).await.is_err());
     }
 
     #[tokio::test]

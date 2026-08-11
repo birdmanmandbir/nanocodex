@@ -17,9 +17,12 @@ description = "Durable Iroh identities, admission, and bilateral peer sessions"
 base64.workspace = true
 constant_time_eq.workspace = true
 getrandom.workspace = true
+futures-util.workspace = true
 iroh.workspace = true
+iroh-gossip.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time"] }
