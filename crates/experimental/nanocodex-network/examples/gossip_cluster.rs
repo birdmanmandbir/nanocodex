@@ -1,9 +1,10 @@
-use std::{future, path::Path, time::Duration};
+use std::{collections::HashSet, future, path::Path, time::Duration};
 
 use nanocodex_network::{
     Hub, JoinAuthority, JoinTicket, Node, NodeAdvertisement, NodeIdentity, PeerChange, ProtocolId,
     Query,
 };
+use serde::Serialize;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 const WORKER_PROTOCOL: &str = "nanocodex.worker/1";
@@ -31,8 +32,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             require_end(arguments)?;
             dial(ticket, Path::new(&identity), architecture).await
         }
+        Some("probe") => {
+            let ticket = required(&mut arguments, "join ticket")?.parse()?;
+            let identity = required(&mut arguments, "identity path")?;
+            let architecture = required(&mut arguments, "CPU architecture")?;
+            let workers = required(&mut arguments, "expected worker count")?.parse()?;
+            require_end(arguments)?;
+            probe(ticket, Path::new(&identity), architecture, workers).await
+        }
         _ => Err(usage().into()),
     }
+}
+
+#[derive(Serialize)]
+struct ProbeResult {
+    workers: usize,
+    discovery_millis: u128,
+    dial_millis: u128,
 }
 
 async fn run_hub(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -106,6 +122,67 @@ async fn dial(
     Ok(())
 }
 
+async fn probe(
+    ticket: JoinTicket,
+    identity_path: &Path,
+    architecture: String,
+    expected_workers: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if expected_workers == 0 {
+        return Err("expected worker count must be greater than zero".into());
+    }
+    let identity = NodeIdentity::load_or_create(identity_path)?;
+    let node = Node::join(ticket, &identity).await?;
+    let protocol = ProtocolId::new(WORKER_PROTOCOL)?;
+    let query = Query::service(protocol.clone())
+        .attribute_eq("cpu.arch", architecture)?
+        .attribute_at_least("worker.free_slots", 1)?;
+    let mut changes = node.watch(query).await;
+    let discovery_started = std::time::Instant::now();
+    let providers = tokio::time::timeout(Duration::from_secs(180), async {
+        let mut providers = HashSet::with_capacity(expected_workers);
+        while providers.len() < expected_workers {
+            match changes.next().await {
+                Some(PeerChange::Joined(record) | PeerChange::Updated(record)) => {
+                    providers.insert(record.node_id());
+                }
+                Some(PeerChange::Expired(_) | PeerChange::Unmatched(_)) => {}
+                None => return Err("cluster-view watcher closed"),
+            }
+        }
+        Ok::<_, &str>(providers)
+    })
+    .await
+    .map_err(|_| "timed out waiting for the expected worker fleet")??;
+    let discovery_millis = discovery_started.elapsed().as_millis();
+
+    let dial_started = std::time::Instant::now();
+    for provider in &providers {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut stream = node.connect(*provider, &protocol).await?;
+            stream.write_all(b"ping").await?;
+            let mut response = [0; 4];
+            stream.read_exact(&mut response).await?;
+            if &response != b"pong" {
+                return Err::<(), Box<dyn std::error::Error>>(
+                    "received an unexpected direct-stream response".into(),
+                );
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| format!("timed out dialing provider {provider}"))??;
+    }
+    let result = ProbeResult {
+        workers: providers.len(),
+        discovery_millis,
+        dial_millis: dial_started.elapsed().as_millis(),
+    };
+    println!("{}", serde_json::to_string(&result)?);
+    node.shutdown().await?;
+    Ok(())
+}
+
 fn required(
     arguments: &mut impl Iterator<Item = String>,
     label: &str,
@@ -125,5 +202,5 @@ fn require_end(
 }
 
 const fn usage() -> &'static str {
-    "usage: gossip_cluster hub AUTHORITY_PATH | serve JOIN_TICKET IDENTITY_PATH [CPU_ARCH] | dial JOIN_TICKET IDENTITY_PATH [CPU_ARCH]"
+    "usage: gossip_cluster hub AUTHORITY_PATH | serve JOIN_TICKET IDENTITY_PATH [CPU_ARCH] | dial JOIN_TICKET IDENTITY_PATH [CPU_ARCH] | probe JOIN_TICKET IDENTITY_PATH CPU_ARCH EXPECTED_WORKERS"
 }
