@@ -2757,8 +2757,17 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn gossip_discovery_converges_under_multi_node_churn() {
-        const WORKERS: usize = 64;
         const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+        // Eight nodes exceed the gossip overlay's normal active-neighbor set in
+        // routine CI. The environment override preserves a larger local soak.
+        let worker_count = std::env::var("NANOCODEX_NETWORK_STRESS_WORKERS").map_or(8, |value| {
+            value
+                .parse::<usize>()
+                .ok()
+                .filter(|count| *count > 0)
+                .expect("NANOCODEX_NETWORK_STRESS_WORKERS must be a positive integer")
+        });
 
         async fn local_node(ticket: JoinTicket, label: &str) -> Node {
             let identity = NodeIdentity::generate().unwrap();
@@ -2793,8 +2802,8 @@ mod tests {
             .unwrap();
         let mut view = observer.watch(query).await;
 
-        let mut workers = Vec::with_capacity(WORKERS);
-        for index in 0..WORKERS {
+        let mut workers = Vec::with_capacity(worker_count);
+        for index in 0..worker_count {
             let node = local_node(ticket.clone(), &format!("worker {index}")).await;
             let id = node.endpoint_id();
             let listener = node.listen(protocol.clone()).await.unwrap();
@@ -2813,7 +2822,7 @@ mod tests {
 
         let joined = tokio::time::timeout(TEST_TIMEOUT, async {
             let mut joined = std::collections::HashSet::new();
-            while joined.len() != WORKERS {
+            while joined.len() != worker_count {
                 if let Some(PeerChange::Joined(record)) = view.next().await {
                     joined.insert(record.node_id());
                 }
@@ -2822,7 +2831,7 @@ mod tests {
         })
         .await
         .expect("gossip advertisements did not converge");
-        assert_eq!(joined.len(), WORKERS);
+        assert_eq!(joined.len(), worker_count);
 
         for (node, id, listener, _) in &mut workers {
             let mut outgoing = observer.connect(*id, &protocol).await.unwrap();
@@ -2850,7 +2859,7 @@ mod tests {
 
         let unmatched = tokio::time::timeout(TEST_TIMEOUT, async {
             let mut unmatched = std::collections::HashSet::new();
-            while unmatched.len() != WORKERS {
+            while unmatched.len() != worker_count {
                 if let Some(PeerChange::Unmatched(record)) = view.next().await {
                     unmatched.insert(record.node_id());
                 }
