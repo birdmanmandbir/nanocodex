@@ -1,5 +1,33 @@
 use criterion::{criterion_group, criterion_main};
 
+#[allow(dead_code, unused_imports)]
+#[path = "../src/tui/actions.rs"]
+mod actions_impl;
+#[path = "../src/subagents/mod.rs"]
+mod subagents;
+#[allow(dead_code, unused_imports)]
+#[path = "../src/tui/theme.rs"]
+pub(crate) mod theme_impl;
+use theme_impl as theme;
+#[allow(dead_code, unused_imports)]
+#[path = "../src/tui/context_diagnostics.rs"]
+mod context_diagnostics;
+#[allow(dead_code, unused_imports)]
+#[path = "../src/tui/floating.rs"]
+mod floating;
+#[allow(dead_code, unused_imports)]
+#[path = "../src/tui/keybindings.rs"]
+mod keybindings;
+#[allow(dead_code, unused_imports)]
+#[path = "../src/tui/spinner.rs"]
+mod spinner;
+#[allow(dead_code, unused_imports)]
+#[path = "../src/tui/subagents.rs"]
+mod tui_subagents_impl;
+#[allow(dead_code, unused_imports)]
+#[path = "../src/tui/waved_text.rs"]
+mod waved_text;
+
 mod tui {
     use std::{
         cell::Cell,
@@ -18,6 +46,12 @@ mod tui {
         backend::{CrosstermBackend, TestBackend},
         buffer::Buffer,
         layout::Rect,
+    };
+
+    pub(crate) use crate::theme_impl as theme;
+    use crate::{
+        actions_impl as actions, context_diagnostics, floating, keybindings, spinner,
+        tui_subagents_impl as subagents, waved_text,
     };
 
     #[allow(dead_code, unused_imports)]
@@ -935,8 +969,10 @@ mod tui {
             "catch-up frame changed {} cells",
             sample.changed_cells
         );
+        // The detached-view catch-up frame now also updates the pinned prompt and
+        // explicit follow banner. Keep that intentional chrome within a 4.5 KiB gate.
         assert!(
-            sample.output_bytes <= 4_096,
+            sample.output_bytes <= 4_608,
             "catch-up frame wrote {} bytes",
             sample.output_bytes
         );

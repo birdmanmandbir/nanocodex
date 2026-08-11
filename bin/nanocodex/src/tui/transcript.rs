@@ -63,6 +63,8 @@ pub(super) enum ToolStatus {
 pub(super) struct Transcript {
     entries: Vec<Arc<TranscriptEntry>>,
     editable_users: Vec<usize>,
+    tools: Vec<usize>,
+    tool_expansion_overrides: Vec<Option<bool>>,
     cached_total_height: AtomicU64,
     tool_details_expanded: Arc<AtomicBool>,
     math_renderer: Option<Ratatex>,
@@ -73,6 +75,8 @@ impl Default for Transcript {
         Self {
             entries: Vec::new(),
             editable_users: Vec::new(),
+            tools: Vec::new(),
+            tool_expansion_overrides: Vec::new(),
             cached_total_height: AtomicU64::new(0),
             tool_details_expanded: Arc::new(AtomicBool::new(true)),
             math_renderer: None,
@@ -85,6 +89,8 @@ impl Clone for Transcript {
         Self {
             entries: self.entries.clone(),
             editable_users: self.editable_users.clone(),
+            tools: self.tools.clone(),
+            tool_expansion_overrides: self.tool_expansion_overrides.clone(),
             cached_total_height: AtomicU64::new(self.cached_total_height.load(Ordering::Relaxed)),
             tool_details_expanded: Arc::clone(&self.tool_details_expanded),
             math_renderer: self.math_renderer.clone(),
@@ -124,11 +130,16 @@ impl Transcript {
         {
             Arc::make_mut(entry).remove_trailing_user_separator();
         }
-        self.entries.push(Arc::new(TranscriptEntry::new(
+        let entry = TranscriptEntry::new(
             item,
             Arc::clone(&self.tool_details_expanded),
             self.math_renderer.clone(),
-        )));
+        );
+        if matches!(entry.kind, EntryKind::Tool { .. }) {
+            self.tools.push(self.entries.len());
+        }
+        self.entries.push(Arc::new(entry));
+        self.tool_expansion_overrides.push(None);
         self.invalidate_total_height();
     }
 
@@ -152,10 +163,45 @@ impl Transcript {
     }
 
     pub(super) fn set_tool_details_expanded(&mut self, expanded: bool) {
-        if self.tool_details_expanded.swap(expanded, Ordering::Relaxed) == expanded {
+        let global_changed =
+            self.tool_details_expanded.swap(expanded, Ordering::Relaxed) != expanded;
+        let mut overrides_changed = false;
+        for &index in &self.tools {
+            overrides_changed |= self.tool_expansion_overrides[index].take().is_some();
+        }
+        if !global_changed && !overrides_changed {
             return;
         }
         self.invalidate_total_height();
+    }
+
+    #[cfg(test)]
+    pub(super) fn tool_indices(&self) -> impl DoubleEndedIterator<Item = usize> + '_ {
+        self.tools.iter().copied()
+    }
+
+    pub(super) fn previous_tool(&self, before: Option<usize>) -> Option<usize> {
+        let before = before.unwrap_or(self.entries.len()).min(self.entries.len());
+        previous_index(&self.tools, before)
+    }
+
+    pub(super) fn next_tool(&self, after: usize) -> Option<usize> {
+        next_index(&self.tools, after)
+    }
+
+    pub(super) fn tool_details_expanded(&self, index: usize) -> Option<bool> {
+        matches!(self.entries.get(index)?.kind, EntryKind::Tool { .. }).then(|| {
+            self.tool_expansion_overrides[index]
+                .unwrap_or_else(|| self.tool_details_expanded.load(Ordering::Relaxed))
+        })
+    }
+
+    pub(super) fn toggle_tool_details(&mut self, index: usize) -> Option<bool> {
+        let expanded = !self.tool_details_expanded(index)?;
+        let global = self.tool_details_expanded.load(Ordering::Relaxed);
+        self.tool_expansion_overrides[index] = (expanded != global).then_some(expanded);
+        self.invalidate_total_height();
+        Some(expanded)
     }
 
     pub(super) fn has_tool_parent(&self, call_id: &str) -> bool {
@@ -199,6 +245,7 @@ impl Transcript {
         entry.prompt_id = Some(prompt_id);
         self.editable_users.push(self.entries.len());
         self.entries.push(Arc::new(entry));
+        self.tool_expansion_overrides.push(None);
         self.invalidate_total_height();
     }
 
@@ -248,11 +295,14 @@ impl Transcript {
     }
 
     pub(super) fn tail_height(&self, width: u16) -> Option<usize> {
-        self.entries.last().map(|entry| entry.height(width))
+        let index = self.entries.len().checked_sub(1)?;
+        Some(self.entry_height(index, width))
     }
 
     pub(super) fn height_at(&self, index: usize, width: u16) -> Option<usize> {
-        self.entries.get(index).map(|entry| entry.height(width))
+        self.entries
+            .get(index)
+            .map(|_| self.entry_height(index, width))
     }
 
     pub(super) fn height_from(&self, first: usize, width: u16) -> usize {
@@ -261,7 +311,8 @@ impl Transcript {
         }
         self.entries[first..]
             .iter()
-            .map(|entry| entry.height(width))
+            .enumerate()
+            .map(|(offset, _)| self.entry_height(first.saturating_add(offset), width))
             .sum()
     }
 
@@ -292,8 +343,8 @@ impl Transcript {
             return 0;
         }
         let mut height = 0_usize;
-        for entry in self.entries.iter().rev() {
-            height = height.saturating_add(entry.height(width));
+        for index in (0..self.entries.len()).rev() {
+            height = height.saturating_add(self.entry_height(index, width));
             if height >= limit {
                 return limit;
             }
@@ -303,15 +354,11 @@ impl Transcript {
 
     pub(super) fn previous_user(&self, before: Option<usize>) -> Option<usize> {
         let before = before.unwrap_or(self.entries.len()).min(self.entries.len());
-        let position = self.editable_users.partition_point(|index| *index < before);
-        position
-            .checked_sub(1)
-            .and_then(|position| self.editable_users.get(position).copied())
+        previous_index(&self.editable_users, before)
     }
 
     pub(super) fn next_user(&self, after: usize) -> Option<usize> {
-        let position = self.editable_users.partition_point(|index| *index <= after);
-        self.editable_users.get(position).copied()
+        next_index(&self.editable_users, after)
     }
 
     #[cfg(test)]
@@ -329,6 +376,76 @@ impl Transcript {
             .iter()
             .rev()
             .find_map(|entry| entry.user_message())
+    }
+
+    #[cfg(test)]
+    pub(super) fn visible_user_prompt(
+        &self,
+        scroll_from_bottom: usize,
+        width: u16,
+        viewport_height: u16,
+    ) -> Option<(usize, &str)> {
+        let (first, last) =
+            self.visible_entry_bounds(scroll_from_bottom, width, viewport_height)?;
+        (first..=last).find_map(|index| {
+            self.entries[index]
+                .user_message()
+                .map(|message| (index, message))
+        })
+    }
+
+    pub(super) fn pinned_user_prompt(
+        &self,
+        scroll_from_bottom: usize,
+        width: u16,
+        viewport_height: u16,
+    ) -> Option<(usize, &str)> {
+        let max_scroll = self
+            .total_height(width)
+            .saturating_sub(usize::from(viewport_height));
+        if scroll_from_bottom.min(max_scroll) == 0 {
+            return None;
+        }
+        let (first, last) =
+            self.visible_entry_bounds(scroll_from_bottom, width, viewport_height)?;
+        if (first..=last).any(|index| self.entries[index].user_message().is_some()) {
+            return None;
+        }
+        (0..first).rev().find_map(|index| {
+            self.entries[index]
+                .user_message()
+                .map(|message| (index, message))
+        })
+    }
+
+    fn visible_entry_bounds(
+        &self,
+        scroll_from_bottom: usize,
+        width: u16,
+        viewport_height: u16,
+    ) -> Option<(usize, usize)> {
+        let viewport_height = usize::from(viewport_height);
+        if viewport_height == 0 || self.entries.is_empty() {
+            return None;
+        }
+        let max_scroll = self.total_height(width).saturating_sub(viewport_height);
+        let scroll_from_bottom = scroll_from_bottom.min(max_scroll);
+        let viewport_top_from_bottom = scroll_from_bottom.saturating_add(viewport_height);
+        let mut height_below = 0_usize;
+        let mut first = None;
+        let mut last = None;
+        for index in (0..self.entries.len()).rev() {
+            let entry_top = height_below.saturating_add(self.entry_height(index, width));
+            if entry_top > scroll_from_bottom && height_below < viewport_top_from_bottom {
+                first = Some(index);
+                last.get_or_insert(index);
+            }
+            height_below = entry_top;
+            if height_below >= viewport_top_from_bottom {
+                break;
+            }
+        }
+        first.zip(last)
     }
 
     pub(super) fn semanticize_copy(&self, selected: String) -> String {
@@ -365,6 +482,8 @@ impl Transcript {
             editable_users: self.editable_users
                 [..self.editable_users.partition_point(|i| *i < end)]
                 .to_vec(),
+            tools: self.tools[..self.tools.partition_point(|i| *i < end)].to_vec(),
+            tool_expansion_overrides: self.tool_expansion_overrides[..end].to_vec(),
             cached_total_height: AtomicU64::new(0),
             tool_details_expanded: Arc::clone(&self.tool_details_expanded),
             math_renderer: self.math_renderer.clone(),
@@ -416,7 +535,8 @@ impl Transcript {
         let height = self
             .entries
             .iter()
-            .map(|entry| entry.height(width))
+            .enumerate()
+            .map(|(index, _)| self.entry_height(index, width))
             .sum::<usize>();
         let encoded = (u64::from(width) << 48)
             | u64::try_from(height)
@@ -428,6 +548,10 @@ impl Transcript {
 
     fn invalidate_total_height(&self) {
         self.cached_total_height.store(0, Ordering::Relaxed);
+    }
+
+    fn entry_height(&self, index: usize, width: u16) -> usize {
+        self.entries[index].height_with_tool_expansion(width, self.tool_expansion_overrides[index])
     }
 
     pub(super) const fn widget<'a>(
@@ -459,6 +583,7 @@ impl Transcript {
         }
         let viewport = selection_viewport(
             &self.entries,
+            &self.tool_expansion_overrides,
             area,
             scroll_from_bottom,
             edit.index,
@@ -467,7 +592,13 @@ impl Transcript {
         let mut screen_y = viewport.screen_y;
         let mut local_scroll = viewport.local_scroll;
         for (index, entry) in self.entries.iter().enumerate().skip(viewport.first) {
-            let entry_height = rendered_height(entry, index, area.width, Some(edit));
+            let entry_height = rendered_height(
+                entry,
+                self.tool_expansion_overrides[index],
+                index,
+                area.width,
+                Some(edit),
+            );
             if index == edit.index {
                 let layout = ComposerLayout::new(edit.input, area.width.saturating_sub(2).max(1));
                 let cursor = layout.cursor_position(edit.input, edit.cursor);
@@ -495,6 +626,18 @@ impl Transcript {
         }
         None
     }
+}
+
+fn previous_index(indices: &[usize], before: usize) -> Option<usize> {
+    let position = indices.partition_point(|index| *index < before);
+    position
+        .checked_sub(1)
+        .and_then(|position| indices.get(position).copied())
+}
+
+fn next_index(indices: &[usize], after: usize) -> Option<usize> {
+    let position = indices.partition_point(|index| *index <= after);
+    indices.get(position).copied()
 }
 
 pub(super) struct TranscriptWidget<'a> {
@@ -537,6 +680,7 @@ impl Widget for TranscriptWidget<'_> {
         {
             let viewport = selection_viewport(
                 &self.transcript.entries,
+                &self.transcript.tool_expansion_overrides,
                 area,
                 self.scroll_from_bottom,
                 selected,
@@ -544,6 +688,7 @@ impl Widget for TranscriptWidget<'_> {
             );
             render_entries(
                 &self.transcript.entries,
+                &self.transcript.tool_expansion_overrides,
                 area,
                 buffer,
                 viewport,
@@ -561,8 +706,8 @@ impl Widget for TranscriptWidget<'_> {
         let mut first_visible = None;
         let mut first_visible_height_below = 0_usize;
 
-        for (index, entry) in self.transcript.entries.iter().enumerate().rev() {
-            let entry_height = entry.height(width);
+        for index in (0..self.transcript.entries.len()).rev() {
+            let entry_height = self.transcript.entry_height(index, width);
             let entry_top_from_bottom = height_below.saturating_add(entry_height);
             if entry_top_from_bottom > self.scroll_from_bottom
                 && height_below < viewport_top_from_bottom
@@ -581,6 +726,7 @@ impl Widget for TranscriptWidget<'_> {
             // clamped scroll behavior by rendering from the first entry.
             render_entries(
                 &self.transcript.entries,
+                &self.transcript.tool_expansion_overrides,
                 area,
                 buffer,
                 Viewport {
@@ -598,12 +744,16 @@ impl Widget for TranscriptWidget<'_> {
         let Some(first_visible) = first_visible else {
             return;
         };
-        let first_height = self.transcript.entries[first_visible].height(width);
+        let first_height = self.transcript.entries[first_visible].height_with_tool_expansion(
+            width,
+            self.transcript.tool_expansion_overrides[first_visible],
+        );
         let first_top_from_bottom = first_visible_height_below.saturating_add(first_height);
         let local_scroll = first_top_from_bottom.saturating_sub(viewport_top_from_bottom);
         let screen_y = viewport_top_from_bottom.saturating_sub(first_top_from_bottom);
         render_entries(
             &self.transcript.entries,
+            &self.transcript.tool_expansion_overrides,
             area,
             buffer,
             Viewport {
@@ -627,6 +777,7 @@ struct Viewport {
 
 fn selection_viewport(
     entries: &[Arc<TranscriptEntry>],
+    tool_expansion_overrides: &[Option<bool>],
     area: Rect,
     scroll_from_bottom: usize,
     selected: usize,
@@ -634,8 +785,14 @@ fn selection_viewport(
 ) -> Viewport {
     const REVEAL_PADDING: usize = 1;
 
-    let (current, selected_is_visible) =
-        bottom_viewport(entries, area, scroll_from_bottom, selected, inline_edit);
+    let (current, selected_is_visible) = bottom_viewport(
+        entries,
+        tool_expansion_overrides,
+        area,
+        scroll_from_bottom,
+        selected,
+        inline_edit,
+    );
     if selected_is_visible {
         return current;
     }
@@ -645,7 +802,13 @@ fn selection_viewport(
     let mut local_scroll = 0_usize;
 
     for index in (0..selected).rev() {
-        let height = rendered_height(&entries[index], index, area.width, inline_edit);
+        let height = rendered_height(
+            &entries[index],
+            tool_expansion_overrides[index],
+            index,
+            area.width,
+            inline_edit,
+        );
         first = index;
         if rows_above.saturating_add(height) >= REVEAL_PADDING {
             local_scroll = rows_above
@@ -665,6 +828,7 @@ fn selection_viewport(
 
 fn bottom_viewport(
     entries: &[Arc<TranscriptEntry>],
+    tool_expansion_overrides: &[Option<bool>],
     area: Rect,
     scroll_from_bottom: usize,
     selected: usize,
@@ -679,7 +843,13 @@ fn bottom_viewport(
     let mut first_visible_height_below = 0_usize;
     let mut selected_bounds = None;
     for (index, entry) in entries.iter().enumerate().rev() {
-        let height = rendered_height(entry, index, area.width, inline_edit);
+        let height = rendered_height(
+            entry,
+            tool_expansion_overrides[index],
+            index,
+            area.width,
+            inline_edit,
+        );
         let top_from_bottom = height_below.saturating_add(height);
         if index == selected {
             selected_bounds = Some((height_below, top_from_bottom));
@@ -710,7 +880,13 @@ fn bottom_viewport(
         );
     }
     let first = first_visible.unwrap_or(0);
-    let first_height = rendered_height(&entries[first], first, area.width, inline_edit);
+    let first_height = rendered_height(
+        &entries[first],
+        tool_expansion_overrides[first],
+        first,
+        area.width,
+        inline_edit,
+    );
     let first_top_from_bottom = first_visible_height_below.saturating_add(first_height);
     let visible = selected_bounds.is_some_and(|(bottom, top)| {
         top <= viewport_top_from_bottom.saturating_sub(PADDING.min(viewport_height))
@@ -726,8 +902,13 @@ fn bottom_viewport(
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the viewport renderer keeps geometry and per-entry presentation state explicit"
+)]
 fn render_entries(
     entries: &[Arc<TranscriptEntry>],
+    tool_expansion_overrides: &[Option<bool>],
     area: Rect,
     buffer: &mut Buffer,
     viewport: Viewport,
@@ -742,7 +923,13 @@ fn render_entries(
         if screen_y >= viewport_height {
             break;
         }
-        let entry_height = rendered_height(entry, index, area.width, inline_edit);
+        let entry_height = rendered_height(
+            entry,
+            tool_expansion_overrides[index],
+            index,
+            area.width,
+            inline_edit,
+        );
         let visible_height = entry_height
             .saturating_sub(local_scroll)
             .min(viewport_height.saturating_sub(screen_y));
@@ -765,6 +952,7 @@ fn render_entries(
                     entry_height,
                     selected == Some(index),
                     math_fallback,
+                    tool_expansion_overrides[index],
                 );
             }
             screen_y = screen_y.saturating_add(visible_height);
@@ -775,12 +963,13 @@ fn render_entries(
 
 fn rendered_height(
     entry: &TranscriptEntry,
+    tool_expansion_override: Option<bool>,
     index: usize,
     width: u16,
     inline_edit: Option<InlineEdit<'_>>,
 ) -> usize {
     inline_edit.filter(|edit| edit.index == index).map_or_else(
-        || entry.height(width),
+        || entry.height_with_tool_expansion(width, tool_expansion_override),
         |edit| {
             inline_edit_layout(edit.input, width)
                 .row_count()
@@ -1086,7 +1275,7 @@ impl TranscriptEntry {
         Paragraph::new(match &self.content {
             EntryContent::Static(text) => text.clone(),
             EntryContent::Markdown(markdown) => markdown.materialized_text(80),
-            EntryContent::Tool(tool) => tool.text(80),
+            EntryContent::Tool(tool) => tool.text(80, None),
         })
         .wrap(Wrap { trim: false })
     }
@@ -1118,13 +1307,22 @@ impl TranscriptEntry {
         }
     }
 
+    #[cfg(test)]
     fn height(&self, width: u16) -> usize {
+        self.height_with_tool_expansion(width, None)
+    }
+
+    fn height_with_tool_expansion(
+        &self,
+        width: u16,
+        tool_expansion_override: Option<bool>,
+    ) -> usize {
         const HEIGHT_MASK: u64 = (1_u64 << 47) - 1;
         const TOOL_EXPANDED: u64 = 1_u64 << 47;
 
         let cached = self.cached_height.load(Ordering::Relaxed);
         let tool_expanded = match &self.content {
-            EntryContent::Tool(tool) => Some(tool.details_expanded.load(Ordering::Relaxed)),
+            EntryContent::Tool(tool) => Some(tool.expanded(tool_expansion_override)),
             _ => None,
         };
         let cache_entry_height = !matches!(self.content, EntryContent::Markdown(_));
@@ -1142,7 +1340,7 @@ impl TranscriptEntry {
                 .wrap(Wrap { trim: false })
                 .line_count(width),
             EntryContent::Markdown(markdown) => markdown.height(width),
-            EntryContent::Tool(tool) => tool.height(width),
+            EntryContent::Tool(tool) => tool.height(width, tool_expansion_override),
         };
         let encoded = (u64::from(width) << 48)
             | tool_expanded.map_or(0, |expanded| u64::from(expanded) * TOOL_EXPANDED)
@@ -1155,6 +1353,10 @@ impl TranscriptEntry {
         height
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one entry render receives the complete clipped viewport contract"
+    )]
     fn render(
         &self,
         area: Rect,
@@ -1163,6 +1365,7 @@ impl TranscriptEntry {
         total_height: usize,
         selected: bool,
         math_fallback: bool,
+        tool_expansion_override: Option<bool>,
     ) {
         match &self.content {
             EntryContent::Static(text) => {
@@ -1192,7 +1395,14 @@ impl TranscriptEntry {
                 );
             }
             EntryContent::Tool(tool) => {
-                tool.render(area, buffer, scroll, total_height, selected);
+                tool.render(
+                    area,
+                    buffer,
+                    scroll,
+                    total_height,
+                    selected,
+                    tool_expansion_override,
+                );
             }
         }
     }
@@ -1345,21 +1555,26 @@ impl ToolActivity {
         .then(|| StreamingText::tool_detail(&self.arguments, self.result.as_deref()));
     }
 
-    fn uses_plain_detail(&self) -> bool {
-        self.details_expanded.load(Ordering::Relaxed) && self.plain_detail.is_some()
+    fn expanded(&self, expansion_override: Option<bool>) -> bool {
+        expansion_override.unwrap_or_else(|| self.details_expanded.load(Ordering::Relaxed))
     }
 
-    fn height(&self, width: u16) -> usize {
-        if self.uses_plain_detail()
+    const fn uses_plain_detail(&self, expanded: bool) -> bool {
+        expanded && self.plain_detail.is_some()
+    }
+
+    fn height(&self, width: u16, expansion_override: Option<bool>) -> usize {
+        let expanded = self.expanded(expansion_override);
+        if self.uses_plain_detail(expanded)
             && let Some(detail) = &self.plain_detail
         {
-            let header_height = Paragraph::new(self.plain_header_line())
+            let header_height = Paragraph::new(self.plain_header_line(expanded))
                 .wrap(Wrap { trim: false })
                 .line_count(width)
                 .max(1);
             return header_height.saturating_add(detail.height(width));
         }
-        self.with_rendered(width, |rendered| rendered.height)
+        self.with_rendered(width, expansion_override, |rendered| rendered.height)
     }
 
     fn render(
@@ -1369,9 +1584,11 @@ impl ToolActivity {
         scroll: usize,
         total_height: usize,
         selected: bool,
+        expansion_override: Option<bool>,
     ) {
-        if !self.uses_plain_detail() {
-            self.with_rendered(area.width, |rendered| {
+        let expanded = self.expanded(expansion_override);
+        if !self.uses_plain_detail(expanded) {
+            self.with_rendered(area.width, expansion_override, |rendered| {
                 rendered.render(area, buffer, scroll, total_height, selected);
             });
             return;
@@ -1379,7 +1596,7 @@ impl ToolActivity {
         let Some(detail) = &self.plain_detail else {
             return;
         };
-        let header = self.plain_header_line();
+        let header = self.plain_header_line(expanded);
         let header_height = Paragraph::new(header.clone())
             .wrap(Wrap { trim: false })
             .line_count(area.width)
@@ -1417,8 +1634,13 @@ impl ToolActivity {
         );
     }
 
-    fn with_rendered<R>(&self, width: u16, read: impl FnOnce(&RenderedText) -> R) -> R {
-        let expanded = self.details_expanded.load(Ordering::Relaxed);
+    fn with_rendered<R>(
+        &self,
+        width: u16,
+        expansion_override: Option<bool>,
+        read: impl FnOnce(&RenderedText) -> R,
+    ) -> R {
+        let expanded = self.expanded(expansion_override);
         let mut cached = self
             .cached_layout
             .lock()
@@ -1432,88 +1654,124 @@ impl ToolActivity {
         let layout = cached.get_or_insert_with(|| {
             Box::new(CachedToolLayout {
                 expanded,
-                rendered: RenderedText::new(self.text(width), width),
+                rendered: RenderedText::new(self.text(width, expansion_override), width),
             })
         });
         read(&layout.rendered)
     }
 
-    fn plain_header_line(&self) -> Line<'static> {
+    fn plain_header_line(&self, expanded: bool) -> Line<'static> {
         let (icon, color) = tool_style(self.status);
-        let display_name = if self.name == "exec" {
-            if self.children.is_empty() {
-                "Working"
-            } else {
-                "Tools"
-            }
-        } else {
-            self.name.as_str()
-        };
-        tool_header_line(icon, color, display_name, &self.summary_details())
+        tool_header_line(
+            icon,
+            color,
+            &self.display_name(),
+            &self.summary_subject(),
+            &self.summary_details(),
+            expanded,
+        )
     }
 
     fn summary_details(&self) -> Vec<String> {
         let mut details = Vec::new();
+        if let Some(result) = self.result_excerpt() {
+            details.push(result);
+        } else if matches!(self.status, ToolStatus::Cancelled) {
+            details.push("cancelled".to_owned());
+        } else if matches!(self.status, ToolStatus::Failed) {
+            details.push("failed".to_owned());
+        }
         if let Some(duration_ns) = self.duration_ns {
             details.push(format_duration(duration_ns));
         }
         details
     }
 
-    fn text(&self, width: u16) -> Text<'static> {
-        let details_expanded = self.details_expanded.load(Ordering::Relaxed);
+    fn display_name(&self) -> Cow<'_, str> {
+        match self.name.as_str() {
+            "exec" if self.children.is_empty() => Cow::Borrowed("Code"),
+            "exec" => Cow::Borrowed("Batch"),
+            "exec_command" => Cow::Borrowed("Shell"),
+            "write_stdin" => Cow::Borrowed("Shell input"),
+            "apply_patch" => Cow::Borrowed("Patch"),
+            name => humanize_tool_name(name),
+        }
+    }
+
+    fn summary_subject(&self) -> String {
+        if self.name == "exec" {
+            return match self.children.len() {
+                0 => "code mode".to_owned(),
+                1 => "1 tool".to_owned(),
+                count => format!("{count} tools"),
+            };
+        }
+        if let Some(patch) = &self.patch {
+            return patch.summary.clone();
+        }
+        let preview = compact_activity_preview(&self.arguments);
+        if self.name == "exec_command" && !preview.is_empty() {
+            format!("$ {preview}")
+        } else {
+            preview
+        }
+    }
+
+    fn result_excerpt(&self) -> Option<String> {
+        self.result
+            .as_deref()
+            .and_then(first_nonempty_line)
+            .map(|result| compact_activity_preview(result.trim()))
+            .filter(|result| !result.is_empty())
+    }
+
+    fn text(&self, width: u16, expansion_override: Option<bool>) -> Text<'static> {
+        let details_expanded = self.expanded(expansion_override);
         if details_expanded
             && self.children.is_empty()
             && let Some(patch) = &self.patch
         {
-            let mut lines = patch.lines(width);
+            let (icon, color) = tool_style(self.status);
+            let mut lines = vec![tool_header_line(
+                icon,
+                color,
+                &self.display_name(),
+                &self.summary_subject(),
+                &self.summary_details(),
+                true,
+            )];
+            lines.extend(railed_detail_lines(
+                patch
+                    .lines(width.saturating_sub(6).max(1))
+                    .into_iter()
+                    .skip(1)
+                    .collect(),
+            ));
+            lines.push(detail_footer("patch details"));
             lines.push(Line::raw(""));
             return Text::from(lines);
         }
         let (icon, color) = tool_style(self.status);
-        let display_name = if self.name == "exec" {
-            if self.children.is_empty() {
-                "Working"
-            } else {
-                "Tools"
-            }
-        } else {
-            self.name.as_str()
-        };
+        let display_name = self.display_name();
+        let subject = self.summary_subject();
         let mut details = Vec::new();
-        if !self.children.is_empty() {
-            details.push(format!(
-                "{} call{}",
-                self.children.len(),
-                if self.children.len() == 1 { "" } else { "s" }
-            ));
-        }
-        if let Some(duration_ns) = self.duration_ns {
-            details.push(format_duration(duration_ns));
-        }
-        if !self.children.is_empty()
-            && let Some(result) = self.result.as_deref().filter(|result| !result.is_empty())
-        {
-            details.push(result.to_owned());
-        }
+        details.extend(self.summary_details());
 
         if !details_expanded {
-            return self.collapsed_text(icon, color, display_name, details);
+            return self.collapsed_text(icon, color, &display_name, &subject, details);
         }
 
-        let mut lines = vec![tool_header_line(icon, color, display_name, &details)];
+        let mut lines = vec![tool_header_line(
+            icon,
+            color,
+            &display_name,
+            &subject,
+            &details,
+            true,
+        )];
 
         if self.children.is_empty() && self.name != "exec" {
-            let mut activity_detail = self.arguments.clone();
-            if let Some(result) = self.result.as_deref().filter(|result| !result.is_empty()) {
-                push_detail(&mut activity_detail, result);
-            }
-            if !activity_detail.is_empty() {
-                lines.push(Line::from(vec![
-                    Span::styled("  └─ ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(activity_detail, Style::default().fg(Color::Gray)),
-                ]));
-            }
+            lines.extend(tool_detail_lines(&self.arguments, self.result.as_deref()));
         }
         if !self.children.is_empty() {
             let groups = child_activity_groups(&self.children);
@@ -1531,6 +1789,11 @@ impl ToolActivity {
                     lines.extend(child_lines(child, connector, continuation, width));
                 }
             }
+            lines.push(detail_footer(&format!(
+                "{} tool{}",
+                self.children.len(),
+                if self.children.len() == 1 { "" } else { "s" }
+            )));
         }
         lines.push(Line::raw(""));
         Text::from(lines)
@@ -1541,44 +1804,136 @@ impl ToolActivity {
         icon: &str,
         color: Color,
         display_name: &str,
-        mut details: Vec<String>,
+        subject: &str,
+        details: Vec<String>,
     ) -> Text<'static> {
-        if self.children.is_empty() && self.name != "exec" {
-            let preview = self.patch.as_ref().map_or_else(
-                || compact_activity_preview(&self.arguments),
-                |patch| patch.summary.clone(),
-            );
-            if !preview.is_empty() {
-                details.push(preview);
-            }
-        }
         Text::from(vec![
-            tool_header_line(icon, color, display_name, &details),
+            tool_header_line(icon, color, display_name, subject, &details, false),
             Line::raw(""),
         ])
     }
 }
 
+// Tool summary/chrome grammar is materially derived from Tact's transcript renderer at
+// clabby/tact@4df68c820427643216d6f2d61c58af89acc27a30.
 fn tool_header_line(
     icon: &str,
     color: Color,
     display_name: &str,
+    subject: &str,
     details: &[String],
+    expanded: bool,
 ) -> Line<'static> {
-    Line::from(vec![
+    let mut spans = vec![
+        Span::raw("  "),
+        expansion_marker(expanded),
         Span::styled(
-            format!("{icon} {display_name}"),
+            format!("{icon} "),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            if details.is_empty() {
-                String::new()
-            } else {
-                format!("  {}", details.join(" · "))
-            },
-            Style::default().fg(Color::DarkGray),
+            display_name.to_owned(),
+            Style::default().add_modifier(Modifier::BOLD),
         ),
+    ];
+    if !subject.is_empty() {
+        spans.push(Span::styled(
+            format!("  {subject}"),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+    if !details.is_empty() {
+        spans.push(Span::styled(
+            format!(" · {}", details.join(" · ")),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn expansion_marker(expanded: bool) -> Span<'static> {
+    Span::styled(
+        if expanded { "▼ " } else { "▶ " },
+        Style::default().fg(Color::DarkGray),
+    )
+}
+
+fn humanize_tool_name(name: &str) -> Cow<'_, str> {
+    if !name.contains('_') {
+        return Cow::Borrowed(name);
+    }
+    let mut words = name.split('_').filter(|word| !word.is_empty());
+    let Some(first) = words.next() else {
+        return Cow::Borrowed(name);
+    };
+    let mut title = first.to_owned();
+    if let Some(first) = title.get_mut(..1) {
+        first.make_ascii_uppercase();
+    }
+    for word in words {
+        title.push(' ');
+        title.push_str(word);
+    }
+    Cow::Owned(title)
+}
+
+fn first_nonempty_line(value: &str) -> Option<&str> {
+    value.lines().map(str::trim).find(|line| !line.is_empty())
+}
+
+fn tool_detail_lines(arguments: &str, result: Option<&str>) -> Vec<Line<'static>> {
+    let mut details = Vec::new();
+    details.extend(arguments.lines().map(|line| {
+        Line::from(Span::styled(
+            line.to_owned(),
+            Style::default().fg(Color::Gray),
+        ))
+    }));
+    if let Some(result) = result.filter(|result| !result.is_empty()) {
+        details.push(Line::from(vec![
+            Span::styled("Result  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(result.to_owned(), Style::default().fg(Color::Gray)),
+        ]));
+    }
+    let line_count = details.len();
+    let byte_count = arguments.len().saturating_add(result.map_or(0, str::len));
+    let mut lines = railed_detail_lines(details);
+    if line_count > 0 {
+        lines.push(detail_footer(&format!(
+            "{line_count} line{} · {}",
+            if line_count == 1 { "" } else { "s" },
+            format_bytes(byte_count),
+        )));
+    }
+    lines
+}
+
+fn railed_detail_lines(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .map(|line| {
+            let mut spans = vec![Span::styled("    │ ", Style::default().fg(Color::DarkGray))];
+            spans.extend(line.spans);
+            Line::from(spans).style(line.style)
+        })
+        .collect()
+}
+
+fn detail_footer(label: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("    └ ", Style::default().fg(Color::DarkGray)),
+        Span::styled(label.to_owned(), Style::default().fg(Color::DarkGray)),
     ])
+}
+
+fn format_bytes(bytes: usize) -> String {
+    if bytes >= 1_048_576 {
+        format!("{:.1} MiB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1_024 {
+        format!("{:.1} KiB", bytes as f64 / 1_024.0)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 fn child_lines(
@@ -1590,30 +1945,47 @@ fn child_lines(
     let (icon, color) = tool_style(child.status);
     let argument_lines = child.arguments.lines().collect::<Vec<_>>();
     let detail_style = Style::default().fg(Color::DarkGray);
-    let mut detail = Vec::new();
+    let mut subject = Vec::new();
     if let Some(patch) = &child.patch {
-        push_styled_detail(&mut detail, patch.summary.clone(), detail_style);
+        push_styled_detail(&mut subject, patch.summary.clone(), detail_style);
     } else if argument_lines.len() <= 1 {
-        push_styled_detail(&mut detail, child.arguments.clone(), detail_style);
+        let argument = if child.name == "exec_command" && !child.arguments.is_empty() {
+            format!("$ {}", child.arguments)
+        } else {
+            child.arguments.clone()
+        };
+        push_styled_detail(&mut subject, argument, detail_style);
+    }
+    let mut metadata = Vec::new();
+    if let Some(result) = child.result_excerpt() {
+        push_styled_detail(&mut metadata, result, detail_style);
+    } else if matches!(child.status, ToolStatus::Cancelled) {
+        push_styled_detail(&mut metadata, "cancelled".to_owned(), detail_style);
+    } else if matches!(child.status, ToolStatus::Failed) {
+        push_styled_detail(&mut metadata, "failed".to_owned(), detail_style);
     }
     if let Some(duration_ns) = child.duration_ns {
-        push_styled_detail(&mut detail, format_duration(duration_ns), detail_style);
+        push_styled_detail(&mut metadata, format_duration(duration_ns), detail_style);
     }
-    if let Some(result) = child.result.as_deref().filter(|result| !result.is_empty()) {
-        push_styled_detail(&mut detail, result.to_owned(), detail_style);
-    }
-    let child_name = match (child.name.as_str(), child.status) {
-        ("exec_command", ToolStatus::Running) => "Running",
-        ("exec_command", _) => "Ran",
-        _ => child.name.as_str(),
-    };
+    let child_name = child.display_name();
     let mut header = vec![
         Span::styled(connector, Style::default().fg(Color::DarkGray)),
-        Span::styled(format!(" {icon} {child_name}"), Style::default().fg(color)),
+        Span::styled(
+            format!(" {icon} "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            child_name.into_owned(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
     ];
-    if !detail.is_empty() {
+    if !subject.is_empty() {
         header.push(Span::styled("  ", detail_style));
-        header.extend(detail);
+        header.extend(subject);
+    }
+    if !metadata.is_empty() {
+        header.push(Span::styled(" · ", detail_style));
+        header.extend(metadata);
     }
     let mut lines = vec![Line::from(header)];
     if let Some(patch) = &child.patch {
@@ -1738,18 +2110,24 @@ fn prefixed_patch_lines(lines: &[Line<'static>], prefix: &'static str) -> Vec<Li
         .collect()
 }
 
-fn push_detail(target: &mut String, detail: &str) {
-    if !target.is_empty() {
-        target.push_str(" · ");
-    }
-    target.push_str(detail);
-}
-
 fn compact_activity_preview(detail: &str) -> String {
     const MAX_CHARS: usize = 96;
-    let mut preview = detail.split_whitespace().collect::<Vec<_>>().join(" ");
-    if preview.chars().count() > MAX_CHARS {
-        preview = preview.chars().take(MAX_CHARS - 1).collect();
+    let mut preview = String::with_capacity(MAX_CHARS);
+    let mut character_count = 0_usize;
+    let mut truncated = false;
+    'words: for word in detail.split_whitespace() {
+        let separator = (!preview.is_empty()).then_some(' ');
+        for character in separator.into_iter().chain(word.chars()) {
+            if character_count == MAX_CHARS {
+                truncated = true;
+                break 'words;
+            }
+            preview.push(character);
+            character_count = character_count.saturating_add(1);
+        }
+    }
+    if truncated {
+        preview.pop();
         preview.push('…');
     }
     preview
@@ -2438,20 +2816,42 @@ fn rendered_line_layout(
 impl StreamingText {
     fn tool_detail(arguments: &str, result: Option<&str>) -> Self {
         let body_style = Style::default().fg(Color::Gray);
-        let mut detail = arguments.to_owned();
-        if let Some(result) = result.filter(|result| !result.is_empty()) {
-            push_detail(&mut detail, result);
+        let result = result.filter(|result| !result.is_empty());
+        let line_count = arguments
+            .lines()
+            .count()
+            .saturating_add(result.map_or(0, |value| value.lines().count()));
+        let byte_count = arguments.len().saturating_add(result.map_or(0, str::len));
+        let mut lines = Vec::with_capacity(line_count.saturating_add(1));
+        lines.extend(
+            arguments
+                .lines()
+                .map(|line| StreamingLine::new(format!("    │ {line}"), body_style)),
+        );
+        if let Some(result) = result {
+            let mut result_lines = result.lines();
+            lines.push(StreamingLine::new(
+                format!("    │ Result  {}", result_lines.next().unwrap_or_default()),
+                body_style,
+            ));
+            lines.extend(
+                result_lines
+                    .map(|line| StreamingLine::new(format!("    │         {line}"), body_style)),
+            );
         }
-        let mut parts = detail.split('\n');
-        let mut lines = Vec::with_capacity(detail.lines().count().saturating_add(1));
-        lines.push(StreamingLine::new(
-            format!("  └─ {}", parts.next().unwrap_or_default()),
-            body_style,
-        ));
-        lines.extend(parts.map(|line| StreamingLine::new(format!("     {line}"), body_style)));
+        if line_count > 0 {
+            lines.push(StreamingLine::new(
+                format!(
+                    "    └ {line_count} line{} · {}",
+                    if line_count == 1 { "" } else { "s" },
+                    format_bytes(byte_count),
+                ),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
         Self {
             lines,
-            first_line_prefix_width: 5,
+            first_line_prefix_width: 6,
         }
     }
 
@@ -2476,8 +2876,7 @@ impl StreamingText {
             return;
         };
         let viewport_bottom = scroll.saturating_add(usize::from(area.height));
-        for (offset, line) in self.lines.iter().skip(first).enumerate() {
-            let index = first.saturating_add(offset);
+        for line in self.lines.iter().skip(first) {
             let line_height = line.height(width);
             let line_bottom = line_top.saturating_add(line_height);
             if line_top >= viewport_bottom {
@@ -2498,7 +2897,7 @@ impl StreamingText {
                     visible_top.saturating_sub(line_top),
                     selected,
                 );
-                if index == 0 && visible_top == line_top {
+                if visible_top == line_top {
                     let prefix_width = if line_area.width <= self.first_line_prefix_width {
                         self.first_line_prefix_width.saturating_sub(1)
                     } else {
@@ -2822,7 +3221,11 @@ fn saturating_u16(value: usize) -> u16 {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{Arc, atomic::AtomicBool, mpsc},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
         time::Duration,
     };
 
@@ -2853,6 +3256,69 @@ mod tests {
     #[test]
     fn cancelled_tools_have_a_distinct_neutral_terminal_style() {
         assert_eq!(tool_style(ToolStatus::Cancelled), ("■", Color::Yellow));
+    }
+
+    #[test]
+    fn collapsed_tool_grammar_distinguishes_every_state_and_limits_failure_excerpts() {
+        let mut rendered = Vec::new();
+        for (status, result) in [
+            (ToolStatus::Running, None),
+            (ToolStatus::Completed, Some("exit 0 · 3 lines")),
+            (ToolStatus::Cancelled, None),
+            (
+                ToolStatus::Failed,
+                Some("compilation failed\ninternal diagnostic"),
+            ),
+        ] {
+            let mut tool = ToolActivity::new(
+                "call".to_owned(),
+                "exec_command".to_owned(),
+                "cargo test".to_owned(),
+                status,
+                Arc::new(AtomicBool::new(false)),
+            );
+            tool.result = result.map(str::to_owned);
+            rendered.push(tool.text(100, Some(false)).lines[0].to_string());
+        }
+
+        assert_eq!(
+            rendered,
+            [
+                "  ▶ ◌ Shell  $ cargo test",
+                "  ▶ ✓ Shell  $ cargo test · exit 0 · 3 lines",
+                "  ▶ ■ Shell  $ cargo test · cancelled",
+                "  ▶ ✗ Shell  $ cargo test · compilation failed",
+            ]
+        );
+        assert!(
+            rendered
+                .iter()
+                .all(|line| !line.contains("internal diagnostic"))
+        );
+    }
+
+    #[test]
+    fn expanded_tool_details_use_a_rail_and_report_size_metadata() {
+        let mut tool = ToolActivity::new(
+            "call".to_owned(),
+            "read_file".to_owned(),
+            "first\nsecond".to_owned(),
+            ToolStatus::Completed,
+            Arc::new(AtomicBool::new(true)),
+        );
+        tool.result = Some("2 lines".to_owned());
+        let rendered = tool
+            .text(80, Some(true))
+            .lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered[0], "  ▼ ✓ Read file  first second · 2 lines");
+        assert_eq!(rendered[1], "    │ first");
+        assert_eq!(rendered[2], "    │ second");
+        assert_eq!(rendered[3], "    │ Result  2 lines");
+        assert_eq!(rendered[4], "    └ 3 lines · 19 B");
     }
 
     #[test]
@@ -3339,17 +3805,17 @@ R_{\mu\nu}-\frac12R\,g_{\mu\nu}+\Lambda g_{\mu\nu}
         tool.children.push(child);
 
         for width in [40, 120] {
-            let height = tool.height(width);
+            let height = tool.height(width, None);
             for scroll in [0, height / 2, height.saturating_sub(8)] {
                 let area = Rect::new(0, 0, width, 8);
                 let mut expected = Buffer::empty(area);
-                Paragraph::new(tool.text(width))
+                Paragraph::new(tool.text(width, None))
                     .wrap(Wrap { trim: false })
                     .scroll((saturating_u16(scroll), 0))
                     .render(area, &mut expected);
 
                 let mut actual = Buffer::empty(area);
-                tool.render(area, &mut actual, scroll, height, false);
+                tool.render(area, &mut actual, scroll, height, false, None);
                 assert_eq!(actual, expected, "width={width} scroll={scroll}");
             }
         }
@@ -3476,16 +3942,16 @@ R_{\mu\nu}-\frac12R\,g_{\mu\nu}+\Lambda g_{\mu\nu}
             })
             .unwrap();
         let rendered = terminal.backend().to_string();
-        assert!(rendered.contains("✓ Tools  3 calls · 120ms"));
+        assert!(rendered.contains("✓ Batch  3 tools · 120ms"));
         assert!(!rendered.contains("overlapping"));
         assert!(!rendered.contains("sequence"));
         assert!(!rendered.contains("javascript"));
         assert!(!rendered.contains("const tasks"));
-        assert!(rendered.contains("├─┬ ✓ Ran"));
+        assert!(rendered.contains("├─┬ ✓ Shell"));
         assert!(rendered.contains("cargo test \\"));
         assert!(rendered.contains("--workspace"));
-        assert!(rendered.contains("│ └ ✓ apply_patch  src/main.rs · 80ms · applied"));
-        assert!(rendered.contains("└── ✓ Ran  jq -s add /tmp/parts/*.json"));
+        assert!(rendered.contains("│ └ ✓ Patch  src/main.rs · applied · 80ms"));
+        assert!(rendered.contains("└── ✓ Shell  $ jq -s add /tmp/parts/*.json"));
     }
 
     #[test]
@@ -3515,8 +3981,8 @@ R_{\mu\nu}-\frac12R\,g_{\mu\nu}+\Lambda g_{\mu\nu}
             })
             .unwrap();
         let running = terminal.backend().to_string();
-        assert!(running.contains("◌ Running  sleep 0.08"));
-        assert!(running.contains("◌ Running  sleep 0.01"));
+        assert!(running.contains("◌ Shell  $ sleep 0.08"));
+        assert!(running.contains("◌ Shell  $ sleep 0.01"));
 
         assert!(transcript.set_tool_result_timing(
             "call-1/code-2",
@@ -3531,8 +3997,8 @@ R_{\mu\nu}-\frac12R\,g_{\mu\nu}+\Lambda g_{\mu\nu}
             })
             .unwrap();
         let rendered = terminal.backend().to_string();
-        assert!(rendered.contains("◌ Running  sleep 0.08"));
-        assert!(rendered.contains("✓ Ran  sleep 0.01 · 10ms · exit 0"));
+        assert!(rendered.contains("◌ Shell  $ sleep 0.08"));
+        assert!(rendered.contains("✓ Shell  $ sleep 0.01 · exit 0 · 10ms"));
     }
 
     #[test]
@@ -3551,7 +4017,7 @@ R_{\mu\nu}-\frac12R\,g_{\mu\nu}+\Lambda g_{\mu\nu}
                 frame.render_widget(transcript.widget(0, None, None, "empty"), frame.area());
             })
             .unwrap();
-        assert!(terminal.backend().to_string().contains("◌ Working"));
+        assert!(terminal.backend().to_string().contains("◌ Code  code mode"));
         assert!(!terminal.backend().to_string().contains(source));
 
         assert!(transcript.push_tool_child(
@@ -3566,7 +4032,7 @@ R_{\mu\nu}-\frac12R\,g_{\mu\nu}+\Lambda g_{\mu\nu}
             })
             .unwrap();
         let rendered = terminal.backend().to_string();
-        assert!(rendered.contains("◌ Tools  1 call"));
+        assert!(rendered.contains("◌ Batch  1 tool"));
         assert!(rendered.contains("cargo test --workspace"));
         assert!(!rendered.contains(source));
     }
@@ -3623,7 +4089,7 @@ R_{\mu\nu}-\frac12R\,g_{\mu\nu}+\Lambda g_{\mu\nu}
             })
             .unwrap();
         let rendered = folded.backend().to_string();
-        assert!(rendered.contains("✓ exec_command"));
+        assert!(rendered.contains("✓ Shell"));
         assert!(rendered.contains("cargo test --workspace second detail line"));
         assert!(!rendered.contains("└─"));
     }
@@ -3645,6 +4111,127 @@ R_{\mu\nu}-\frac12R\,g_{\mu\nu}+\Lambda g_{\mu\nu}
     }
 
     #[test]
+    fn individual_tool_expansion_overrides_global_state_until_the_next_global_change() {
+        let mut transcript = Transcript::default();
+        transcript.push(TranscriptItem::User("before tools".to_owned()));
+        for (call_id, detail) in [("tool-1", "first\ndetail"), ("tool-2", "second\ndetail")] {
+            transcript.push(TranscriptItem::Tool {
+                call_id: call_id.to_owned(),
+                name: "exec_command".to_owned(),
+                arguments: detail.to_owned(),
+                status: ToolStatus::Completed,
+            });
+        }
+
+        assert_eq!(transcript.tool_indices().collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(transcript.previous_tool(None), Some(2));
+        assert_eq!(transcript.previous_tool(Some(2)), Some(1));
+        assert_eq!(transcript.next_tool(1), Some(2));
+        assert_eq!(transcript.next_tool(2), None);
+        assert_eq!(transcript.toggle_tool_details(1), Some(false));
+        assert_eq!(transcript.tool_details_expanded(1), Some(false));
+        assert_eq!(transcript.tool_details_expanded(2), Some(true));
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(transcript.widget(0, None, None, "empty"), frame.area());
+            })
+            .unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("first detail"));
+        assert!(!rendered.contains("│ first"));
+        assert!(rendered.contains("│ second"));
+        assert!(rendered.contains('▶'));
+        assert!(rendered.contains('▼'));
+
+        transcript.set_tool_details_expanded(false);
+        assert_eq!(transcript.tool_details_expanded(1), Some(false));
+        assert_eq!(transcript.tool_details_expanded(2), Some(false));
+        assert_eq!(transcript.toggle_tool_details(1), Some(true));
+        transcript.set_tool_details_expanded(false);
+        assert_eq!(transcript.tool_details_expanded(1), Some(false));
+        assert_eq!(transcript.tool_details_expanded(2), Some(false));
+    }
+
+    #[test]
+    fn individual_tool_toggle_invalidates_total_height_and_reuses_other_entry_caches() {
+        let mut transcript = Transcript::default();
+        transcript.push(TranscriptItem::Tool {
+            call_id: "tool-1".to_owned(),
+            name: "exec_command".to_owned(),
+            arguments: (1..=8)
+                .map(|line| format!("detail {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            status: ToolStatus::Completed,
+        });
+        transcript.push(TranscriptItem::Assistant("cached neighbor".to_owned()));
+        let neighbor = Arc::clone(&transcript.entries[1]);
+        let expanded_height = transcript.height_from(0, 40);
+        assert_ne!(transcript.cached_total_height.load(Ordering::Relaxed), 0);
+
+        assert_eq!(transcript.toggle_tool_details(0), Some(false));
+        assert_eq!(transcript.cached_total_height.load(Ordering::Relaxed), 0);
+        let collapsed_height = transcript.height_from(0, 40);
+
+        assert!(collapsed_height < expanded_height);
+        assert!(Arc::ptr_eq(&neighbor, &transcript.entries[1]));
+        assert_eq!(transcript.toggle_tool_details(0), Some(true));
+        assert_eq!(transcript.height_from(0, 40), expanded_height);
+    }
+
+    #[test]
+    fn pinned_prompt_tracks_the_turn_above_a_bottom_relative_viewport() {
+        let mut transcript = Transcript::default();
+        transcript.push(TranscriptItem::User("prompt one".to_owned()));
+        transcript.push(TranscriptItem::Assistant(
+            (1..=12)
+                .map(|line| format!("first answer {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+        transcript.push(TranscriptItem::User("prompt two".to_owned()));
+        transcript.push(TranscriptItem::Assistant(
+            (1..=12)
+                .map(|line| format!("second answer {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+        let width = 40;
+        let viewport_height = 4;
+        let second_answer_height = transcript.height_at(3, width).unwrap();
+        let second_prompt_height = transcript.height_at(2, width).unwrap();
+
+        assert_eq!(
+            transcript.pinned_user_prompt(2, width, viewport_height),
+            Some((2, "prompt two"))
+        );
+        assert_eq!(
+            transcript.pinned_user_prompt(
+                second_answer_height
+                    .saturating_add(second_prompt_height)
+                    .saturating_add(2),
+                width,
+                viewport_height,
+            ),
+            Some((0, "prompt one"))
+        );
+        assert_eq!(
+            transcript.visible_user_prompt(second_answer_height, width, viewport_height),
+            Some((2, "prompt two"))
+        );
+        assert_eq!(
+            transcript.pinned_user_prompt(second_answer_height, width, viewport_height),
+            None
+        );
+        assert_eq!(
+            transcript.pinned_user_prompt(0, width, viewport_height),
+            None
+        );
+    }
+
+    #[test]
     fn apply_patch_activity_renders_paths_counts_and_hunks() {
         let mut transcript = Transcript::default();
         transcript.push(TranscriptItem::Tool {
@@ -3663,7 +4250,7 @@ R_{\mu\nu}-\frac12R\,g_{\mu\nu}+\Lambda g_{\mu\nu}
             })
             .unwrap();
         let rendered = terminal.backend().to_string();
-        assert!(rendered.contains("• Edited src/main.rs (+1 -1)"));
+        assert!(rendered.contains("✓ Patch  Edited src/main.rs (+1 -1)"));
         assert!(rendered.contains("1 -old();"));
         assert!(rendered.contains("1 +new();"));
     }

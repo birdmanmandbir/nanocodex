@@ -1,19 +1,27 @@
+mod actions;
 mod app;
 mod clipboard;
 mod composer;
+mod context_diagnostics;
 mod diff;
 mod eval_attach;
 mod external_editor;
+mod floating;
+mod keybindings;
 mod markdown;
 mod notification;
 mod resume_picker;
 mod scheduler;
 mod selection;
 mod simplify;
+mod spinner;
+mod subagents;
 mod telemetry;
 mod terminal;
+mod theme;
 mod transcript;
 mod view;
+mod waved_text;
 
 use std::{
     collections::VecDeque,
@@ -48,7 +56,8 @@ use tokio::{
 use tracing::{Instrument, info_span};
 
 use self::{
-    app::{App, EscapeAction, PaneId, ReasoningPickerAction, SubmittedPrompt},
+    actions::{Action, ActionsUpdate},
+    app::{App, EscapeAction, InfoOverlay, PaneId, ReasoningPickerAction, SubmittedPrompt},
     notification::Notifier,
     scheduler::{ANIMATION_TICK_INTERVAL, RenderScheduler, RenderScope, STREAM_FRAME_INTERVAL},
     telemetry::{StreamTelemetry, ViewTelemetry},
@@ -59,6 +68,7 @@ use crate::config::AgentArgs;
 
 pub(crate) use eval_attach::attach_evaluation;
 pub(crate) use resume_picker::select_resume_session;
+pub(crate) use theme::ThemeMode;
 
 const BTW_BOUNDARY: &str = r"You are answering an ephemeral BTW side question.
 Treat inherited conversation history only as reference context. Do not resume or complete an
@@ -71,6 +81,7 @@ const DEFAULT_JAEGER_UI_URL: &str = "http://127.0.0.1:16686";
 const JAEGER_UI_URL_ENV: &str = "NANOCODEX_JAEGER_UI_URL";
 const MOUSE_SCROLL_ROWS: usize = 3;
 const MAX_AGENT_EVENTS_PER_BATCH: usize = 256;
+const SYSTEM_THEME_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 pub(crate) struct InitialPrompt {
     display: String,
@@ -594,6 +605,8 @@ pub(crate) async fn run(
         .map_or_else(|| config.model(), DurableSession::model);
     let initial_thinking = config.thinking();
     let initial_fast_mode = config.fast_mode();
+    let initial_theme = config.theme();
+    let initial_max_subagents = config.max_subagents();
     let restored_transcript = resume
         .as_ref()
         .map(|session| session.transcript().to_vec())
@@ -612,6 +625,9 @@ pub(crate) async fn run(
     let realtime = configured.realtime;
     let root_session_id = Arc::<str>::from(agent_events.request_id());
     let child_agents = configured.child_agents;
+    let mut subagent_updates = child_agents
+        .as_ref()
+        .map(|child_agents| child_agents.subscribe_updates());
     let mpp_adapter = configured.mpp_adapter;
     let mcp = configured.mcp;
     let browser = configured.browser;
@@ -645,10 +661,16 @@ pub(crate) async fn run(
     );
     let mut input_events = EventStream::new();
     let mut ticker = ui_ticker();
+    let mut system_theme_ticker = interval(SYSTEM_THEME_POLL_INTERVAL);
+    system_theme_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut app = App::new(cwd)
         .with_model(initial_model)
         .with_thinking(initial_thinking)
-        .with_fast_mode(initial_fast_mode);
+        .with_fast_mode(initial_fast_mode)
+        .with_theme(initial_theme);
+    if child_agents.is_some() {
+        app.configure_subagent_view(root_session_id.to_string(), initial_max_subagents);
+    }
     app.set_math_renderer(math_renderer.clone());
     app.restore_transcript(restored_transcript);
     let mut ui = UiModel::new(app, Arc::clone(&root_session_id));
@@ -728,11 +750,45 @@ pub(crate) async fn run(
                     break Ok(());
                 }
             }
+            update = async {
+                subagent_updates
+                    .as_mut()
+                    .expect("guarded subagent update receiver")
+                    .recv()
+                    .await
+            }, if subagent_updates.is_some() => {
+                match update {
+                    Ok(update) => {
+                        if let Some(view) = ui.app.subagent_view_mut() {
+                            view.apply_update(&update);
+                        }
+                        if ui.app.subagents_open() {
+                            scheduler.request_streaming(Instant::now());
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                        if let Some(view) = ui.app.subagent_view_mut() {
+                            view.note_missed_updates(count);
+                        }
+                        if ui.app.subagents_open() {
+                            scheduler.request_streaming(Instant::now());
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        subagent_updates = None;
+                    }
+                }
+            }
             _ = ticker.tick(), if ui.app.main.running
                 || ui.app.btw.as_ref().is_some_and(|btw| btw.conversation.running)
                 || ui.app.mouse_selection_needs_redraw() => {
                 if apply_update(ui.update(UiAction::Tick, &worker_tx)?, &mut scheduler) {
                     break Ok(());
+                }
+            }
+            _ = system_theme_ticker.tick(), if ui.app.theme().mode() == ThemeMode::Auto => {
+                if ui.app.refresh_auto_theme() {
+                    scheduler.request_immediate(Instant::now());
                 }
             }
             _ = math_update_rx.recv() => {
@@ -2206,9 +2262,14 @@ fn handle_terminal_event(
         }
         Event::Paste(text) => {
             let _ = app.clear_mouse_selection();
-            app.handle_paste(&text);
+            if app.actions_palette().is_some() {
+                handle_actions_paste(app, &text);
+            } else if app.info_overlay().is_none() && !app.subagents_open() {
+                app.handle_paste(&text);
+            }
             Ok(TerminalAction::Redraw)
         }
+        Event::Mouse(_) if app.info_overlay().is_some() => Ok(TerminalAction::Ignore),
         Event::Mouse(mouse) => match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let changed = app.begin_mouse_selection((mouse.column, mouse.row).into());
@@ -2260,12 +2321,63 @@ fn handle_key(
     root_session_id: &str,
     commands: &mpsc::UnboundedSender<WorkerCommand>,
 ) -> Result<TerminalAction> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
+        return Ok(TerminalAction::Quit);
+    }
+
+    if app.info_overlay().is_some() {
+        if key.code == KeyCode::Esc {
+            app.dismiss_info_overlay();
+        }
+        return Ok(TerminalAction::Redraw);
+    }
+
     if matches!(key.code, KeyCode::Char('v' | 'V'))
         && key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
     {
         paste_clipboard_image(app, clipboard::paste_image_to_temp_png);
+        return Ok(TerminalAction::Redraw);
+    }
+
+    if app.subagents_open() {
+        let _ = app.handle_subagent_key(key);
+        return Ok(TerminalAction::Redraw);
+    }
+
+    if app.actions_palette().is_some() {
+        return handle_actions_key(key, app, root_session_id, commands);
+    }
+
+    if app.tool_focus_active() {
+        match key.code {
+            KeyCode::Esc => app.dismiss_tool_focus(),
+            KeyCode::Enter => {
+                let _ = app.toggle_focused_tool();
+            }
+            KeyCode::Up | KeyCode::Char('k') => app.move_tool_focus(true),
+            KeyCode::Down | KeyCode::Char('j') => app.move_tool_focus(false),
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let _ = app.toggle_tool_details();
+            }
+            _ => {}
+        }
+        return Ok(TerminalAction::Redraw);
+    }
+
+    if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('o') {
+        let _ = app.focus_latest_tool();
+        return Ok(TerminalAction::Redraw);
+    }
+
+    if key.modifiers.is_empty() && key.code == KeyCode::Char('?') && !app.has_input() {
+        app.open_info_overlay(InfoOverlay::Keybindings);
+        return Ok(TerminalAction::Redraw);
+    }
+
+    if key.modifiers.is_empty() && key.code == KeyCode::Char('/') && !app.has_input() {
+        app.open_actions();
         return Ok(TerminalAction::Redraw);
     }
 
@@ -2291,7 +2403,6 @@ fn handle_key(
 
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
-            KeyCode::Char('c') => return Ok(TerminalAction::Quit),
             KeyCode::Char('g') => return Ok(TerminalAction::ExternalEditor),
             KeyCode::Char('o') => {
                 let _ = app.toggle_tool_details();
@@ -2367,6 +2478,104 @@ fn handle_key(
         | KeyCode::Modifier(_) => {}
     }
     Ok(TerminalAction::Redraw)
+}
+
+fn handle_actions_paste(app: &mut App, text: &str) {
+    let transfer = if let Some(palette) = app.actions_palette_mut() {
+        let _ = palette.insert_paste(text);
+        palette.matched_actions().is_empty()
+    } else {
+        false
+    };
+    if transfer {
+        transfer_unmatched_action_query(app);
+    }
+}
+
+fn transfer_unmatched_action_query(app: &mut App) {
+    let command = app
+        .actions_palette()
+        .map(|palette| format!("/{}", palette.query()))
+        .unwrap_or_default();
+    app.dismiss_actions();
+    app.replace_input(command);
+}
+
+fn handle_actions_key(
+    key: KeyEvent,
+    app: &mut App,
+    root_session_id: &str,
+    commands: &mpsc::UnboundedSender<WorkerCommand>,
+) -> Result<TerminalAction> {
+    let update = app
+        .actions_palette_mut()
+        .map_or(ActionsUpdate::Ignored, |palette| palette.handle_key(key));
+    match update {
+        ActionsUpdate::Dismiss => app.dismiss_actions(),
+        ActionsUpdate::Trigger(action) => {
+            app.dismiss_actions();
+            dispatch_action(action, app, root_session_id, commands)?;
+        }
+        ActionsUpdate::Changed => {
+            let transfer = app
+                .actions_palette()
+                .is_some_and(|palette| palette.matched_actions().is_empty());
+            if transfer {
+                transfer_unmatched_action_query(app);
+            }
+        }
+        ActionsUpdate::Ignored => {}
+    }
+    Ok(TerminalAction::Redraw)
+}
+
+fn dispatch_action(
+    action: Action,
+    app: &mut App,
+    root_session_id: &str,
+    commands: &mpsc::UnboundedSender<WorkerCommand>,
+) -> Result<()> {
+    match action {
+        Action::Reasoning => app.open_reasoning_picker(),
+        Action::FastMode => send_command(
+            commands,
+            WorkerCommand::SetFastMode {
+                enabled: !app.fast_mode(),
+            },
+        )?,
+        Action::Theme => {
+            let mode = app.cycle_theme();
+            app.set_active_status(format!("Theme: {mode}"));
+        }
+        Action::GlobalToolDetails => {
+            let _ = app.toggle_tool_details();
+        }
+        Action::Subagents => {
+            if !app.open_subagents() {
+                app.set_active_status("Subagents are disabled for this session");
+            }
+        }
+        Action::Keybindings => app.open_info_overlay(InfoOverlay::Keybindings),
+        Action::ContextDiagnostics => {
+            app.open_info_overlay(InfoOverlay::ContextDiagnostics);
+        }
+        Action::Simplify => app.replace_input("/simplify ".to_owned()),
+        Action::Btw => submit_action_command("/btw", app, root_session_id, commands)?,
+        Action::Trace => submit_action_command("/trace", app, root_session_id, commands)?,
+        Action::Voice => submit_action_command("/voice", app, root_session_id, commands)?,
+        Action::CloseBtw => submit_action_command("/close", app, root_session_id, commands)?,
+    }
+    Ok(())
+}
+
+fn submit_action_command(
+    command: &str,
+    app: &mut App,
+    root_session_id: &str,
+    commands: &mpsc::UnboundedSender<WorkerCommand>,
+) -> Result<()> {
+    app.replace_input(command.to_owned());
+    submit(app, root_session_id, commands, SubmitIntent::Immediate)
 }
 
 fn handle_reasoning_picker_key(
@@ -2953,9 +3162,10 @@ mod tests {
         spawn_agent_worker,
     };
     use crate::tui::{
-        app::App,
+        app::{App, InfoOverlay},
         scheduler::{RenderScheduler, STREAM_FRAME_INTERVAL},
         telemetry::StreamTelemetry,
+        transcript::{ToolStatus, TranscriptItem},
     };
 
     fn mouse_scroll(kind: MouseEventKind) -> Event {
@@ -3168,9 +3378,9 @@ mod tests {
         let mut app = App::new("/workspace".into());
         let btw_id = app.begin_btw();
         app.main.scroll_from_bottom = 11;
-        app.main.has_unseen_output = true;
+        app.main.unseen_updates = 1;
         app.btw.as_mut().unwrap().conversation.scroll_from_bottom = 8;
-        app.btw.as_mut().unwrap().conversation.has_unseen_output = true;
+        app.btw.as_mut().unwrap().conversation.unseen_updates = 1;
 
         let key = KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL);
         assert_eq!(
@@ -3179,10 +3389,10 @@ mod tests {
         );
 
         assert_eq!(app.main.scroll_from_bottom, 11);
-        assert!(app.main.has_unseen_output);
+        assert!(app.main.has_unseen_output());
         let btw = &app.btw.as_ref().unwrap().conversation;
         assert_eq!(btw.scroll_from_bottom, 0);
-        assert!(!btw.has_unseen_output);
+        assert!(!btw.has_unseen_output());
         assert_eq!(app.focus, PaneId::Btw(btw_id));
     }
 
@@ -3932,6 +4142,145 @@ mod tests {
             TerminalAction::Redraw
         );
         assert!(!app.tool_details_expanded());
+    }
+
+    #[test]
+    fn slash_opens_searchable_actions_and_preserves_unmatched_commands() {
+        let (commands, _worker) = mpsc::unbounded_channel();
+        let mut app = App::new("/workspace".into());
+        app.configure_subagent_view("main-session".to_owned(), 4);
+
+        handle_key(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            &mut app,
+            "main-session",
+            &commands,
+        )
+        .unwrap();
+        for character in "agents".chars() {
+            handle_key(
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                &mut app,
+                "main-session",
+                &commands,
+            )
+            .unwrap();
+        }
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app,
+            "main-session",
+            &commands,
+        )
+        .unwrap();
+        assert!(app.subagents_open());
+
+        let mut app = App::new("/workspace".into());
+        for character in "/mcp".chars() {
+            handle_key(
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                &mut app,
+                "main-session",
+                &commands,
+            )
+            .unwrap();
+        }
+        assert_eq!(app.input, "/mcp");
+        assert!(app.actions_palette().is_none());
+    }
+
+    #[test]
+    fn question_mark_opens_help_and_escape_closes_it_without_editing_the_draft() {
+        let (commands, _worker) = mpsc::unbounded_channel();
+        let mut app = App::new("/workspace".into());
+
+        assert_eq!(
+            handle_key(
+                KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+                &mut app,
+                "main-session",
+                &commands,
+            )
+            .unwrap(),
+            TerminalAction::Redraw
+        );
+        assert_eq!(app.info_overlay(), Some(InfoOverlay::Keybindings));
+        assert!(app.input.is_empty());
+
+        handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut app,
+            "main-session",
+            &commands,
+        )
+        .unwrap();
+        assert_eq!(app.info_overlay(), None);
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn actions_opens_context_diagnostics_as_a_read_only_overlay() {
+        let (commands, _worker) = mpsc::unbounded_channel();
+        let mut app = App::new("/workspace".into());
+
+        handle_key(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            &mut app,
+            "main-session",
+            &commands,
+        )
+        .unwrap();
+        for character in "context".chars() {
+            handle_key(
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                &mut app,
+                "main-session",
+                &commands,
+            )
+            .unwrap();
+        }
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app,
+            "main-session",
+            &commands,
+        )
+        .unwrap();
+
+        assert_eq!(app.info_overlay(), Some(InfoOverlay::ContextDiagnostics));
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn alt_o_focuses_and_enter_toggles_one_tool() {
+        let (commands, _worker) = mpsc::unbounded_channel();
+        let mut app = App::new("/workspace".into());
+        app.main.transcript.push(TranscriptItem::Tool {
+            call_id: "call-1".to_owned(),
+            name: "Read file".to_owned(),
+            arguments: "src/main.rs".to_owned(),
+            status: ToolStatus::Completed,
+        });
+
+        handle_key(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::ALT),
+            &mut app,
+            "main-session",
+            &commands,
+        )
+        .unwrap();
+        assert!(app.tool_focus_active());
+        assert_eq!(app.main.transcript.tool_details_expanded(0), Some(true));
+
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app,
+            "main-session",
+            &commands,
+        )
+        .unwrap();
+        assert_eq!(app.main.transcript.tool_details_expanded(0), Some(false));
+        assert!(app.tool_details_expanded());
     }
 
     #[test]

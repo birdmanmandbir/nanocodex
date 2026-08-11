@@ -29,6 +29,7 @@ use crate::browser::{BrowserArgs, ConfiguredBrowser};
 use crate::mcp::{ConfiguredMcp, McpArgs};
 use crate::mpp::{MppAdapter, MppArgs};
 use crate::subagents::{self, ChildAgents, DEFAULT_MAX_SUBAGENTS, SubagentToolSet};
+use crate::tui::ThemeMode;
 use crate::vm::{ConfiguredVm, VmArgs};
 
 pub(crate) struct ConfiguredAgent {
@@ -136,6 +137,10 @@ pub(crate) struct AgentArgs {
     )]
     fast_mode: bool,
 
+    /// Terminal color theme: auto, light, or dark.
+    #[arg(long, env = "NANOCODEX_THEME", default_value_t)]
+    theme: ThemeMode,
+
     /// Replace the standard system/developer instructions.
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
     instructions: Option<String>,
@@ -239,6 +244,14 @@ impl AgentArgs {
 
     pub(crate) const fn fast_mode(&self) -> bool {
         self.fast_mode
+    }
+
+    pub(crate) const fn max_subagents(&self) -> usize {
+        self.max_subagents
+    }
+
+    pub(crate) const fn theme(&self) -> ThemeMode {
+        self.theme
     }
 
     pub(crate) const fn model(&self) -> Model {

@@ -9,8 +9,8 @@ use nanocodex::{
     Model, Thinking,
     agent::{
         events::{
-            AgentEvent, AgentEventData, AgentEventKind, AssistantEvent, ReasoningEvent, RunEvent,
-            RunStatus,
+            AgentEvent, AgentEventData, AgentEventKind, AssistantEvent, EventUsage, ReasoningEvent,
+            RunEvent, RunStatus,
         },
         input::{Prompt, UserInput},
         rollout::RolloutTranscriptItem,
@@ -20,6 +20,8 @@ use ratatex::Ratatex;
 use ratatui::{
     buffer::Buffer,
     layout::{Position, Rect},
+    style::Color,
+    text::Span,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -29,6 +31,13 @@ use super::selection::{
     ScreenSelection, SelectionClick, SelectionScrollDirection, SelectionScrollRequest,
 };
 use super::transcript::{ToolStatus, Transcript, TranscriptItem};
+use super::{
+    actions::ActionsPalette,
+    spinner::Spinner,
+    subagents::SubagentViewModel,
+    theme::{Theme, ThemeMode},
+    waved_text::WavedText,
+};
 
 const MAX_TOOL_ARGUMENT_CHARS: usize = 180;
 const MAX_MULTILINE_TOOL_ARGUMENT_CHARS: usize = 4_000;
@@ -240,15 +249,22 @@ struct PendingCodeExec {
     arguments: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TranscriptSelection {
+    User(usize),
+    Tool(usize),
+}
+
 pub(super) struct Conversation {
     pub(super) transcript: Transcript,
-    pub(super) selected_user: Option<usize>,
+    selection: Option<TranscriptSelection>,
     pub(super) pending_turns: usize,
     pub(super) running: bool,
     pub(super) status: String,
     pub(super) last_cost_usd: Option<String>,
+    last_run_diagnostics: Option<LastRunDiagnostics>,
     pub(super) scroll_from_bottom: usize,
-    pub(super) has_unseen_output: bool,
+    pub(super) unseen_updates: usize,
     smooth_scroll_from_bottom: usize,
     viewport_width: Option<u16>,
     viewport_height: Option<u16>,
@@ -256,6 +272,7 @@ pub(super) struct Conversation {
     streamed_this_turn: bool,
     pending_run_error: Option<String>,
     run_started_at: Option<Instant>,
+    retry_backoff: Option<RetryBackoff>,
     pending_code_execs: HashMap<String, PendingCodeExec>,
     hidden_terminal_calls: HashMap<String, i64>,
     running_shell_sessions: HashMap<i64, ContinuedTool>,
@@ -271,17 +288,26 @@ pub(super) struct Conversation {
     interrupting_steers: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct LastRunDiagnostics {
+    pub(super) usage: EventUsage,
+    pub(super) model_calls: u32,
+    pub(super) compactions: u32,
+    pub(super) response_retries: u32,
+}
+
 impl Conversation {
     fn new(status: impl Into<String>) -> Self {
         Self {
             transcript: Transcript::default(),
-            selected_user: None,
+            selection: None,
             pending_turns: 0,
             running: false,
             status: status.into(),
             last_cost_usd: None,
+            last_run_diagnostics: None,
             scroll_from_bottom: 0,
-            has_unseen_output: false,
+            unseen_updates: 0,
             smooth_scroll_from_bottom: 0,
             viewport_width: None,
             viewport_height: None,
@@ -289,6 +315,7 @@ impl Conversation {
             streamed_this_turn: false,
             pending_run_error: None,
             run_started_at: None,
+            retry_backoff: None,
             pending_code_execs: HashMap::new(),
             hidden_terminal_calls: HashMap::new(),
             running_shell_sessions: HashMap::new(),
@@ -407,6 +434,7 @@ impl Conversation {
                 self.streamed_this_turn = false;
                 self.pending_run_error = None;
                 self.run_started_at = Some(Instant::now());
+                self.retry_backoff = None;
                 self.pending_code_execs.clear();
                 self.hidden_terminal_calls.clear();
                 self.hidden_cell_waits.clear();
@@ -463,6 +491,7 @@ impl Conversation {
                 }
                 self.running = false;
                 self.run_started_at = None;
+                self.retry_backoff = None;
                 self.pending_code_execs.clear();
                 self.reconcile_applied_steers();
                 "Ready".clone_into(&mut self.status);
@@ -480,12 +509,19 @@ impl Conversation {
             | AgentEventKind::ModelCompactionStarted
             | AgentEventKind::ModelCompactionCompleted
             | AgentEventKind::ModelCompactionFailed
-            | AgentEventKind::ModelAttemptStarted
             | AgentEventKind::ModelAttemptFailed
-            | AgentEventKind::ModelAttemptRetrying
             | AgentEventKind::ModelConnectionStarted
             | AgentEventKind::ModelConnectionCompleted
             | AgentEventKind::ModelConnectionFailed => return false,
+            AgentEventKind::ModelAttemptStarted => {
+                self.retry_backoff = None;
+            }
+            AgentEventKind::ModelAttemptRetrying => {
+                let Ok(payload) = event.decode_payload::<RetryBackoffPayload>() else {
+                    return false;
+                };
+                self.retry_backoff = Some(RetryBackoff::new(payload, Instant::now()));
+            }
         }
         true
     }
@@ -619,7 +655,6 @@ impl Conversation {
             self.transcript
                 .set_tool_result(&payload.call_id, status, payload.duration_ns, result)
         };
-        self.note_unseen_output();
         "Working".clone_into(&mut self.status);
         true
     }
@@ -696,23 +731,20 @@ impl Conversation {
         result: Option<String>,
     ) -> bool {
         self.note_tail_will_change();
-        let updated = self.transcript.set_tool_result_timing(
+        self.transcript.set_tool_result_timing(
             &continued.call_id,
             status,
             continued.started_after_ns,
             continued.duration_ns,
             result,
-        );
-        if updated {
-            self.note_unseen_output();
-        }
-        updated
+        )
     }
 
     fn run_failed(&mut self, event: &AgentEvent) {
         self.capture_terminal_cost(event);
         self.running = false;
         self.run_started_at = None;
+        self.retry_backoff = None;
         self.pending_code_execs.clear();
         self.reconcile_applied_steers();
         let cancelled = event.data().map_or_else(
@@ -737,11 +769,22 @@ impl Conversation {
     }
 
     fn capture_terminal_cost(&mut self, event: &AgentEvent) {
-        self.last_cost_usd = event.data().ok().and_then(|data| match data {
-            AgentEventData::Run(RunEvent::Completed(payload) | RunEvent::Failed(payload)) => {
-                payload.estimated_cost.map(|cost| cost.amount().decimal())
-            }
-            _ => None,
+        let Ok(AgentEventData::Run(RunEvent::Completed(payload) | RunEvent::Failed(payload))) =
+            event.data()
+        else {
+            self.last_cost_usd = None;
+            self.last_run_diagnostics = None;
+            return;
+        };
+        self.last_cost_usd = payload
+            .estimated_cost
+            .as_ref()
+            .map(|cost| cost.amount().decimal());
+        self.last_run_diagnostics = Some(LastRunDiagnostics {
+            usage: payload.metrics.usage,
+            model_calls: payload.metrics.model_calls,
+            compactions: payload.metrics.compactions,
+            response_retries: payload.metrics.response_retries,
         });
     }
 
@@ -851,7 +894,7 @@ impl Conversation {
                     .scroll_from_bottom
                     .saturating_add(changed_tail_rows)
                     .saturating_add(new_entry_rows);
-            } else if self.selected_user.is_none()
+            } else if self.selected_entry().is_none()
                 && pending.width == width
                 && pending.viewport_height == height
             {
@@ -920,17 +963,80 @@ impl Conversation {
     }
 
     fn select_older_user(&mut self) {
-        if let Some(index) = self.transcript.previous_user(self.selected_user) {
-            self.selected_user = Some(index);
+        if let Some(index) = self.transcript.previous_user(self.selected_user()) {
+            self.selection = Some(TranscriptSelection::User(index));
+        }
+    }
+
+    fn focus_latest_tool(&mut self) -> bool {
+        let selected = self.transcript.previous_tool(None);
+        self.selection = selected.map(TranscriptSelection::Tool);
+        selected.is_some()
+    }
+
+    fn select_older_tool(&mut self) {
+        self.selection = self
+            .transcript
+            .previous_tool(self.selected_tool())
+            .map(TranscriptSelection::Tool);
+    }
+
+    fn select_newer_tool(&mut self) {
+        let Some(selected) = self.selected_tool() else {
+            return;
+        };
+        if let Some(index) = self.transcript.next_tool(selected) {
+            self.selection = Some(TranscriptSelection::Tool(index));
+        }
+    }
+
+    fn toggle_selected_tool(&mut self) -> bool {
+        self.selected_tool()
+            .and_then(|index| self.transcript.toggle_tool_details(index))
+            .is_some()
+    }
+
+    pub(super) const fn selected_entry(&self) -> Option<usize> {
+        match self.selection {
+            Some(TranscriptSelection::User(index) | TranscriptSelection::Tool(index)) => {
+                Some(index)
+            }
+            None => None,
+        }
+    }
+
+    const fn selected_user(&self) -> Option<usize> {
+        match self.selection {
+            Some(TranscriptSelection::User(index)) => Some(index),
+            Some(TranscriptSelection::Tool(_)) | None => None,
+        }
+    }
+
+    const fn selected_tool(&self) -> Option<usize> {
+        match self.selection {
+            Some(TranscriptSelection::Tool(index)) => Some(index),
+            Some(TranscriptSelection::User(_)) | None => None,
+        }
+    }
+
+    const fn clear_user_selection(&mut self) {
+        if matches!(self.selection, Some(TranscriptSelection::User(_))) {
+            self.selection = None;
+        }
+    }
+
+    const fn clear_tool_selection(&mut self) {
+        if matches!(self.selection, Some(TranscriptSelection::Tool(_))) {
+            self.selection = None;
         }
     }
 
     fn select_newer_user_or_composer(&mut self) {
-        let Some(selected) = self.selected_user else {
+        let Some(selected) = self.selected_user() else {
             return;
         };
         if let Some(index) = self.transcript.next_user(selected) {
-            self.selected_user = Some(index);
+            self.selection = Some(TranscriptSelection::User(index));
         } else {
             self.jump_to_bottom();
         }
@@ -942,8 +1048,8 @@ impl Conversation {
     }
 
     fn note_tail_will_change(&mut self) {
-        self.has_unseen_output |= self.scroll_from_bottom > 0 || self.selected_user.is_some();
-        if self.selected_user.is_some() {
+        self.note_unseen_update();
+        if self.selected_entry().is_some() {
             return;
         }
         let Some(width) = self.viewport_width else {
@@ -979,8 +1085,8 @@ impl Conversation {
     }
 
     fn note_new_entry(&mut self) {
-        self.has_unseen_output |= self.scroll_from_bottom > 0 || self.selected_user.is_some();
-        if self.selected_user.is_some() {
+        self.note_unseen_update();
+        if self.selected_entry().is_some() {
             return;
         }
         let Some(width) = self.viewport_width else {
@@ -1005,19 +1111,77 @@ impl Conversation {
         pending.new_entries_start.get_or_insert(first);
     }
 
-    const fn note_unseen_output(&mut self) {
-        if self.scroll_from_bottom > 0 || self.selected_user.is_some() {
-            self.has_unseen_output = true;
+    const fn note_unseen_update(&mut self) {
+        if self.scroll_from_bottom > 0 || self.selected_entry().is_some() {
+            self.unseen_updates = self.unseen_updates.saturating_add(1);
         }
     }
 
+    pub(super) const fn has_unseen_output(&self) -> bool {
+        self.unseen_updates != 0
+    }
+
     const fn jump_to_bottom(&mut self) {
-        self.selected_user = None;
+        self.selection = None;
         self.scroll_from_bottom = 0;
         self.smooth_scroll_from_bottom = 0;
-        self.has_unseen_output = false;
+        self.unseen_updates = 0;
         self.pending_scroll_anchor = None;
     }
+
+    pub(super) fn retry_status(&self, now: Instant) -> Option<String> {
+        self.retry_backoff.as_ref().map(|retry| retry.label(now))
+    }
+
+    pub(super) const fn last_run_diagnostics(&self) -> Option<LastRunDiagnostics> {
+        self.last_run_diagnostics
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RetryBackoff {
+    next_attempt: u32,
+    max_attempts: u32,
+    error_class: String,
+    deadline: Instant,
+}
+
+impl RetryBackoff {
+    fn new(payload: RetryBackoffPayload, now: Instant) -> Self {
+        let delay = Duration::from_nanos(payload.delay_ns);
+        Self {
+            next_attempt: payload.next_attempt,
+            max_attempts: payload.max_attempts,
+            error_class: payload.error_class,
+            deadline: now.checked_add(delay).unwrap_or(now),
+        }
+    }
+
+    fn label(&self, now: Instant) -> String {
+        let remaining = self.deadline.saturating_duration_since(now);
+        let tenths = remaining.as_millis().saturating_add(99) / 100;
+        let seconds = tenths / 10;
+        let fraction = tenths % 10;
+        if remaining.is_zero() {
+            format!(
+                "Retrying attempt {}/{} · {}",
+                self.next_attempt, self.max_attempts, self.error_class
+            )
+        } else {
+            format!(
+                "Retrying attempt {}/{} in {seconds}.{fraction}s · {}",
+                self.next_attempt, self.max_attempts, self.error_class
+            )
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RetryBackoffPayload {
+    next_attempt: u32,
+    max_attempts: u32,
+    error_class: String,
+    delay_ns: u64,
 }
 
 fn smooth_scroll_drain(pending_rows: usize) -> usize {
@@ -1193,6 +1357,18 @@ pub(super) struct App {
     model: Model,
     thinking: Thinking,
     reasoning_picker: Option<ReasoningPicker>,
+    actions_palette: Option<ActionsPalette>,
+    info_overlay: Option<InfoOverlay>,
+    subagent_view: Option<SubagentViewModel>,
+    activity_spinner: Spinner,
+    activity_wave: WavedText,
+    theme: Theme,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum InfoOverlay {
+    Keybindings,
+    ContextDiagnostics,
 }
 
 #[derive(Clone, Copy)]
@@ -1214,6 +1390,7 @@ pub(super) enum EscapeAction {
 
 impl App {
     pub(super) fn new(cwd: PathBuf) -> Self {
+        let now = Instant::now();
         Self {
             cwd,
             main: Conversation::new("Ready"),
@@ -1245,7 +1422,108 @@ impl App {
             model: Model::default(),
             thinking: Thinking::default(),
             reasoning_picker: None,
+            actions_palette: None,
+            info_overlay: None,
+            subagent_view: None,
+            activity_spinner: Spinner::new(now),
+            activity_wave: WavedText::new("", Color::Yellow),
+            theme: Theme::default(),
         }
+    }
+
+    pub(super) fn configure_subagent_view(
+        &mut self,
+        root_session_id: String,
+        max_concurrency: usize,
+    ) {
+        self.subagent_view = Some(SubagentViewModel::new(root_session_id, max_concurrency));
+    }
+
+    pub(super) fn with_theme(mut self, mode: ThemeMode) -> Self {
+        self.theme = Theme::new(mode);
+        self
+    }
+
+    pub(super) const fn theme(&self) -> &Theme {
+        &self.theme
+    }
+
+    pub(super) fn cycle_theme(&mut self) -> ThemeMode {
+        self.theme.cycle()
+    }
+
+    pub(super) fn refresh_auto_theme(&mut self) -> bool {
+        self.theme.refresh_auto()
+    }
+
+    pub(super) fn open_actions(&mut self) {
+        self.actions_palette = Some(ActionsPalette::new());
+    }
+
+    pub(super) fn dismiss_actions(&mut self) {
+        self.actions_palette = None;
+    }
+
+    pub(super) const fn actions_palette(&self) -> Option<&ActionsPalette> {
+        self.actions_palette.as_ref()
+    }
+
+    pub(super) const fn actions_palette_mut(&mut self) -> Option<&mut ActionsPalette> {
+        self.actions_palette.as_mut()
+    }
+
+    pub(super) const fn info_overlay(&self) -> Option<InfoOverlay> {
+        self.info_overlay
+    }
+
+    pub(super) const fn open_info_overlay(&mut self, overlay: InfoOverlay) {
+        self.info_overlay = Some(overlay);
+    }
+
+    pub(super) const fn dismiss_info_overlay(&mut self) {
+        self.info_overlay = None;
+    }
+
+    pub(super) fn activity_visual(
+        &mut self,
+        text: &str,
+        color: Color,
+        active: bool,
+        now: Instant,
+    ) -> (Option<&'static str>, Vec<Span<'static>>) {
+        self.activity_wave.set_text(text);
+        self.activity_wave.set_base_color(color);
+        self.activity_wave.set_active(active, now);
+        (
+            active.then_some(self.activity_spinner.symbol()),
+            self.activity_wave.spans(),
+        )
+    }
+
+    pub(super) fn open_subagents(&mut self) -> bool {
+        let Some(view) = self.subagent_view.as_mut() else {
+            return false;
+        };
+        view.open();
+        true
+    }
+
+    pub(super) fn subagents_open(&self) -> bool {
+        self.subagent_view
+            .as_ref()
+            .is_some_and(SubagentViewModel::is_open)
+    }
+
+    pub(super) const fn subagent_view_mut(&mut self) -> Option<&mut SubagentViewModel> {
+        self.subagent_view.as_mut()
+    }
+
+    pub(super) fn handle_subagent_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
+        let Some(view) = self.subagent_view.as_mut().filter(|view| view.is_open()) else {
+            return false;
+        };
+        view.handle_key(key);
+        true
     }
 
     pub(super) fn restore_transcript(
@@ -1468,7 +1746,7 @@ impl App {
     pub(super) fn move_up(&mut self) {
         let focus = self.focus;
         if let Some(conversation) = self.conversation_mut(focus)
-            && conversation.selected_user.is_some()
+            && conversation.selected_user().is_some()
         {
             conversation.select_older_user();
             return;
@@ -1483,7 +1761,7 @@ impl App {
     pub(super) fn move_down(&mut self) {
         let focus = self.focus;
         if let Some(conversation) = self.conversation_mut(focus)
-            && conversation.selected_user.is_some()
+            && conversation.selected_user().is_some()
         {
             conversation.select_newer_user_or_composer();
             return;
@@ -1710,7 +1988,7 @@ impl App {
     }
 
     pub(super) fn transcript_selection_active(&self) -> bool {
-        self.active_conversation().selected_user.is_some()
+        self.active_conversation().selected_user().is_some()
     }
 
     pub(super) fn historical_editor_index(&self) -> Option<usize> {
@@ -1738,7 +2016,7 @@ impl App {
             "Close /btw before editing history".clone_into(&mut self.main.status);
             return false;
         }
-        let Some(transcript_index) = self.main.selected_user else {
+        let Some(transcript_index) = self.main.selected_user() else {
             return false;
         };
         let Some((prompt_id, prompt)) = self
@@ -1904,7 +2182,7 @@ impl App {
         {
             return false;
         }
-        self.main.selected_user = None;
+        self.main.clear_user_selection();
         self.branch_navigator = Some(self.main_branch_id);
         true
     }
@@ -2134,8 +2412,39 @@ impl App {
         expanded
     }
 
+    #[cfg(test)]
     pub(super) const fn tool_details_expanded(&self) -> bool {
         self.tool_details_expanded
+    }
+
+    pub(super) fn focus_latest_tool(&mut self) -> bool {
+        self.conversation_mut(self.focus)
+            .is_some_and(Conversation::focus_latest_tool)
+    }
+
+    pub(super) fn tool_focus_active(&self) -> bool {
+        self.active_conversation().selected_tool().is_some()
+    }
+
+    pub(super) fn move_tool_focus(&mut self, older: bool) {
+        if let Some(conversation) = self.conversation_mut(self.focus) {
+            if older {
+                conversation.select_older_tool();
+            } else {
+                conversation.select_newer_tool();
+            }
+        }
+    }
+
+    pub(super) fn toggle_focused_tool(&mut self) -> bool {
+        self.conversation_mut(self.focus)
+            .is_some_and(Conversation::toggle_selected_tool)
+    }
+
+    pub(super) fn dismiss_tool_focus(&mut self) {
+        if let Some(conversation) = self.conversation_mut(self.focus) {
+            conversation.clear_tool_selection();
+        }
     }
 
     pub(super) fn btw_id(&self) -> Option<u64> {
@@ -2421,7 +2730,7 @@ impl App {
         if let Some(conversation) = self.conversation_mut(target) {
             conversation.scroll_down(rows);
             if conversation.scroll_from_bottom == 0 {
-                conversation.has_unseen_output = false;
+                conversation.unseen_updates = 0;
             }
         }
     }
@@ -2435,6 +2744,16 @@ impl App {
     pub(super) fn on_tick(&mut self) {
         self.frame = self.frame.wrapping_add(1);
         let now = Instant::now();
+        if self.activity_wave.is_active() && self.activity_spinner.deadline() <= now {
+            let _ = self.activity_spinner.advance(now);
+        }
+        if self
+            .activity_wave
+            .animation_deadline()
+            .is_some_and(|deadline| deadline <= now)
+        {
+            let _ = self.activity_wave.advance(now);
+        }
         self.expire_cancel_confirmation(now);
         let _ = self.screen_selection.advance(now);
         if let Some(request) = self.screen_selection.scroll_request() {
@@ -2511,12 +2830,12 @@ impl App {
         let focus = self.focus;
         let history_selected = self
             .conversation(focus)
-            .is_some_and(|conversation| conversation.selected_user.is_some());
+            .is_some_and(|conversation| conversation.selected_user().is_some());
         let changed = self.cursor != cursor || history_selected;
         self.cursor = cursor;
         self.preferred_column = None;
         if let Some(conversation) = self.conversation_mut(focus) {
-            conversation.selected_user = None;
+            conversation.clear_user_selection();
         }
         changed
     }
@@ -3312,8 +3631,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        App, EscapeAction, PaneId, SubmittedPrompt, present_tool_name, smooth_scroll_drain,
-        summarize_tool_arguments,
+        App, Conversation, EscapeAction, PaneId, SubmittedPrompt, present_tool_name,
+        smooth_scroll_drain, summarize_tool_arguments,
     };
     use crate::tui::transcript::TranscriptItem;
 
@@ -3347,6 +3666,43 @@ mod tests {
             app.main.transcript.latest_user_message(),
             Some("visible prompt")
         );
+    }
+
+    #[test]
+    fn typed_retry_event_exposes_a_live_countdown_until_the_next_attempt() {
+        let mut conversation = Conversation::new("Working");
+        assert!(conversation.on_agent_event(&event(
+            AgentEventKind::ModelAttemptRetrying,
+            &json!({
+                "next_attempt": 2,
+                "max_attempts": 4,
+                "error_class": "rate_limit",
+                "delay_ns": 1_500_000_000_u64,
+            }),
+        )));
+
+        let status = conversation.retry_status(Instant::now()).unwrap();
+        assert!(status.contains("Retrying attempt 2/4 in"));
+        assert!(status.contains("rate_limit"));
+
+        assert!(
+            conversation.on_agent_event(&event(AgentEventKind::ModelAttemptStarted, &json!({}),))
+        );
+        assert!(conversation.retry_status(Instant::now()).is_none());
+    }
+
+    #[test]
+    fn detached_transcript_counts_updates_and_following_clears_them() {
+        let mut conversation = Conversation::new("Ready");
+        conversation.scroll_from_bottom = 3;
+        conversation.push_output(TranscriptItem::Assistant("one".to_owned()));
+        conversation.push_output(TranscriptItem::Assistant("two".to_owned()));
+        assert_eq!(conversation.unseen_updates, 2);
+        assert!(conversation.has_unseen_output());
+
+        conversation.jump_to_bottom();
+        assert_eq!(conversation.unseen_updates, 0);
+        assert!(!conversation.has_unseen_output());
     }
 
     #[test]
@@ -3709,7 +4065,7 @@ mod tests {
             .unwrap();
         app.move_up();
 
-        assert_eq!(app.main.selected_user, Some(2));
+        assert_eq!(app.main.selected_user(), Some(2));
         assert_eq!(
             app.main.transcript.user_edit_target(2),
             Some((prompt_id, "fix this typo"))
@@ -3718,7 +4074,7 @@ mod tests {
         let mut buffer = Buffer::empty(area);
         app.main
             .transcript
-            .widget(0, app.main.selected_user, None, "empty")
+            .widget(0, app.main.selected_user(), None, "empty")
             .render(area, &mut buffer);
         assert!(buffer.content.iter().any(|cell| cell.symbol() == "f"));
 
@@ -3731,7 +4087,7 @@ mod tests {
             3,
             "prompt must not be duplicated"
         );
-        assert_eq!(app.main.selected_user, Some(2));
+        assert_eq!(app.main.selected_user(), Some(2));
     }
 
     #[test]
@@ -3782,7 +4138,7 @@ mod tests {
             .widget(app.main.scroll_from_bottom, None, None, "empty")
             .render(area, &mut after);
         assert!(app.main.scroll_from_bottom > old_offset);
-        assert!(app.main.has_unseen_output);
+        assert!(app.main.has_unseen_output());
         assert_eq!(after, before);
     }
 
@@ -3861,7 +4217,7 @@ mod tests {
             .transcript
             .widget(app.main.scroll_from_bottom, None, None, "empty")
             .render(area, &mut after);
-        assert!(app.main.has_unseen_output);
+        assert!(app.main.has_unseen_output());
         assert_eq!(after, before);
     }
 
@@ -3896,30 +4252,30 @@ mod tests {
             .settle_viewport(40, 10);
 
         assert_eq!(app.main.scroll_from_bottom, 9);
-        assert!(!app.main.has_unseen_output);
+        assert!(!app.main.has_unseen_output());
         let btw = &app.btw.as_ref().unwrap().conversation;
         assert!(btw.scroll_from_bottom > 7);
-        assert!(btw.has_unseen_output);
+        assert!(btw.has_unseen_output());
     }
 
     #[test]
     fn page_down_and_jump_to_bottom_clear_unseen_output_at_the_tail() {
         let mut app = App::new(".".into());
         app.main.scroll_from_bottom = 15;
-        app.main.has_unseen_output = true;
+        app.main.unseen_updates = 1;
 
         app.scroll_down(12);
         assert_eq!(app.main.scroll_from_bottom, 3);
-        assert!(app.main.has_unseen_output);
+        assert!(app.main.has_unseen_output());
         app.scroll_down(12);
         assert_eq!(app.main.scroll_from_bottom, 0);
-        assert!(!app.main.has_unseen_output);
+        assert!(!app.main.has_unseen_output());
 
         app.main.scroll_from_bottom = 4;
-        app.main.has_unseen_output = true;
+        app.main.unseen_updates = 1;
         app.jump_to_bottom();
         assert_eq!(app.main.scroll_from_bottom, 0);
-        assert!(!app.main.has_unseen_output);
+        assert!(!app.main.has_unseen_output());
     }
 
     #[test]
@@ -4111,7 +4467,7 @@ mod tests {
         assert_eq!(
             app.main
                 .transcript
-                .user_message(app.main.selected_user.unwrap()),
+                .user_message(app.main.selected_user().unwrap()),
             Some("newer prompt")
         );
 
@@ -4119,18 +4475,18 @@ mod tests {
         assert_eq!(
             app.main
                 .transcript
-                .user_message(app.main.selected_user.unwrap()),
+                .user_message(app.main.selected_user().unwrap()),
             Some("older prompt")
         );
-        let oldest = app.main.selected_user;
+        let oldest = app.main.selected_user();
         app.move_up();
-        assert_eq!(app.main.selected_user, oldest, "history must not wrap");
+        assert_eq!(app.main.selected_user(), oldest, "history must not wrap");
 
         app.move_down();
         assert_eq!(
             app.main
                 .transcript
-                .user_message(app.main.selected_user.unwrap()),
+                .user_message(app.main.selected_user().unwrap()),
             Some("newer prompt")
         );
         app.move_down();
@@ -4351,7 +4707,7 @@ mod tests {
         app.main.settle_viewport(10, 6);
 
         assert!(app.main.scroll_from_bottom > 6);
-        assert!(app.main.has_unseen_output);
+        assert!(app.main.has_unseen_output());
     }
 
     #[test]
@@ -4564,7 +4920,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let first = rendered.find("• First thought").unwrap();
-        let tool = rendered.find("◌ Tools").unwrap();
+        let tool = rendered.find("◌ Batch").unwrap();
         let second = rendered.find("• Second thought").unwrap();
         assert!(first < tool && tool < second);
     }

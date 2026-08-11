@@ -3,15 +3,28 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph},
 };
 use std::time::Instant;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{
-    app::{App, Conversation, PaneId, ReasoningPicker, STANDARD_THINKING_OPTIONS},
+    app::{App, Conversation, InfoOverlay, PaneId, ReasoningPicker, STANDARD_THINKING_OPTIONS},
     composer::ComposerLayout,
+    context_diagnostics::{ContextDiagnostics, ContextDiagnosticsPanel},
+    floating::{Floating, FooterShortcut},
     transcript::InlineEdit,
 };
+
+const ACTIONS_FOOTER: [FooterShortcut<'static>; 3] = [
+    FooterShortcut::new("↑/↓", "move"),
+    FooterShortcut::new("enter", "open"),
+    FooterShortcut::new("esc", "close"),
+];
+const REASONING_FOOTER: [FooterShortcut<'static>; 2] = [
+    FooterShortcut::new("enter", "confirm"),
+    FooterShortcut::new("esc", "back"),
+];
 
 pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
     let layout = view_layout(frame.area(), app);
@@ -28,14 +41,131 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
     ));
     render_footer(frame, app, layout.footer);
     app.render_mouse_selection(frame.buffer_mut(), selectable_areas.as_slice());
-    render_reasoning_picker(frame, app);
+    render_overlays(frame, app);
 }
 
 pub(super) fn render_animation(frame: &mut Frame<'_>, app: &mut App) {
     let layout = view_layout(frame.area(), app);
     render_composer(frame, app, layout.composer, &layout.composer_layout);
     render_footer(frame, app, layout.footer);
+    render_overlays(frame, app);
+}
+
+fn render_overlays(frame: &mut Frame<'_>, app: &mut App) {
     render_reasoning_picker(frame, app);
+    render_actions_palette(frame, app);
+    render_subagents(frame, app);
+    render_info_overlay(frame, app);
+}
+
+fn render_actions_palette(frame: &mut Frame<'_>, app: &App) {
+    let Some(palette) = app.actions_palette() else {
+        return;
+    };
+    let height = (palette.matched_actions().len() as u16).saturating_add(4);
+    let layout = Floating::new("Actions", 68, height, &ACTIONS_FOOTER).render(
+        frame,
+        frame.area(),
+        app.theme(),
+    );
+    let [search, actions] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(layout.body);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" Search: ", Style::default().fg(app.theme().muted())),
+            Span::styled(palette.query(), Style::default().fg(app.theme().text())),
+        ])),
+        search,
+    );
+    let items = palette
+        .matched_actions()
+        .iter()
+        .enumerate()
+        .map(|(index, action)| {
+            let marker = if palette.selected_index() == Some(index) {
+                "› "
+            } else {
+                "  "
+            };
+            let color = if palette.selected_index() == Some(index) {
+                app.theme().accent()
+            } else {
+                app.theme().text()
+            };
+            ListItem::new(Line::styled(
+                format!("{marker}{}", action.label()),
+                Style::default().fg(color),
+            ))
+        })
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        frame.render_widget(
+            Paragraph::new("  No matching actions").style(Style::default().fg(app.theme().error())),
+            actions,
+        );
+    } else {
+        frame.render_widget(
+            List::new(items).style(Style::default().bg(app.theme().code_background())),
+            actions,
+        );
+    }
+}
+
+fn render_subagents(frame: &mut Frame<'_>, app: &mut App) {
+    if !app.subagents_open() {
+        return;
+    }
+    let area = frame.area();
+    let popup = Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    );
+    frame.render_widget(Clear, popup);
+    let theme = *app.theme();
+    if let Some(model) = app.subagent_view_mut() {
+        super::subagents::render(frame, popup, model, &theme);
+    }
+}
+
+fn render_info_overlay(frame: &mut Frame<'_>, app: &App) {
+    let Some(overlay) = app.info_overlay() else {
+        return;
+    };
+    match overlay {
+        InfoOverlay::Keybindings => {
+            super::keybindings::KeybindingsHelp.render(frame, frame.area(), app.theme());
+        }
+        InfoOverlay::ContextDiagnostics => {
+            let now = Instant::now();
+            let conversation = app.active_conversation();
+            let retry = conversation.retry_status(now);
+            let cost = conversation
+                .last_cost_usd
+                .as_deref()
+                .map(|value| format!("${value}"));
+            let last_run = conversation.last_run_diagnostics();
+            let diagnostics = ContextDiagnostics {
+                model: app.model().as_str(),
+                reasoning: app.thinking().as_str(),
+                fast_mode: app.fast_mode(),
+                context_used_tokens: None,
+                context_limit_tokens: Some(nanocodex::oai::CONTEXT_WINDOW_TOKENS),
+                input_tokens: last_run.map(|run| run.usage.input_tokens),
+                cached_input_tokens: last_run.map(|run| run.usage.cached_input_tokens),
+                model_calls: last_run.map(|run| run.model_calls),
+                compactions: last_run.map(|run| run.compactions),
+                response_retries: last_run.map(|run| run.response_retries),
+                retry: retry.as_deref(),
+                turn_status: &conversation.status,
+                queued_turns: conversation.pending_turns,
+                turn_elapsed: conversation.running.then(|| conversation.run_elapsed(now)),
+                last_cost: cost.as_deref(),
+            };
+            ContextDiagnosticsPanel::new(diagnostics).render(frame, frame.area(), app.theme());
+        }
+    }
 }
 
 struct ViewLayout {
@@ -96,20 +226,13 @@ fn render_reasoning_picker(frame: &mut Frame<'_>, app: &App) {
     let Some(picker) = app.reasoning_picker() else {
         return;
     };
-    let area = frame.area();
     let popup_height = match picker {
-        ReasoningPicker::Standard { .. } => 9,
+        ReasoningPicker::Standard { .. } => 10,
         ReasoningPicker::Advanced => 7,
-    }
-    .min(area.height);
-    let popup_width = area.width.min(80);
-    let popup = Rect::new(
-        area.x + area.width.saturating_sub(popup_width) / 2,
-        area.y + area.height.saturating_sub(popup_height),
-        popup_width,
-        popup_height,
-    );
-    frame.render_widget(Clear, popup);
+    };
+    let popup = Floating::new("Reasoning", 80, popup_height, &REASONING_FOOTER)
+        .render(frame, frame.area(), app.theme())
+        .body;
 
     let mut lines = Vec::new();
     match picker {
@@ -134,6 +257,7 @@ fn render_reasoning_picker(frame: &mut Frame<'_>, app: &App) {
                     index + 1,
                     &label,
                     description,
+                    app.theme().accent(),
                 ));
             }
             lines.push(reasoning_option_line(
@@ -141,6 +265,7 @@ fn render_reasoning_picker(frame: &mut Frame<'_>, app: &App) {
                 STANDARD_THINKING_OPTIONS.len() + 1,
                 "More reasoning…",
                 "Max consumes usage limits faster",
+                app.theme().accent(),
             ));
         }
         ReasoningPicker::Advanced => {
@@ -150,7 +275,7 @@ fn render_reasoning_picker(frame: &mut Frame<'_>, app: &App) {
             ));
             lines.push(Line::styled(
                 "  ⚠ Consumes usage limits faster",
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(app.theme().accent()),
             ));
             lines.push(Line::default());
             let label = if app.thinking() == nanocodex::Thinking::Max {
@@ -163,14 +288,10 @@ fn render_reasoning_picker(frame: &mut Frame<'_>, app: &App) {
                 1,
                 label,
                 "For difficult problems when quality matters more than speed · higher usage",
+                app.theme().accent(),
             ));
         }
     }
-    lines.push(Line::default());
-    lines.push(Line::styled(
-        "  Press enter to confirm or esc to go back",
-        Style::default().fg(Color::DarkGray),
-    ));
     frame.render_widget(Paragraph::new(lines), popup);
 }
 
@@ -179,10 +300,11 @@ fn reasoning_option_line(
     number: usize,
     label: &str,
     description: &str,
+    accent: Color,
 ) -> Line<'static> {
     let marker = if selected { "›" } else { " " };
     let style = if selected {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(accent)
     } else {
         Style::default()
     };
@@ -217,6 +339,7 @@ fn render_transcripts(
     transcript_area: Rect,
     selectable_areas: &mut SelectableAreas,
 ) {
+    let theme = *app.theme();
     let historical_editor_index = app.historical_editor_index();
     let inline_edit = historical_editor_index.map(|index| InlineEdit {
         index,
@@ -234,6 +357,7 @@ fn render_transcripts(
                 frame,
                 &mut app.main,
                 main_area,
+                &theme,
                 TranscriptRenderOptions {
                     title: " Main ",
                     focused: app.focus == PaneId::Main,
@@ -247,6 +371,7 @@ fn render_transcripts(
                 frame,
                 &mut btw.conversation,
                 btw_area,
+                &theme,
                 TranscriptRenderOptions {
                     title: " BTW · forked context ",
                     focused: app.focus == PaneId::Btw(btw.id),
@@ -268,6 +393,7 @@ fn render_transcripts(
                 frame,
                 conversation,
                 main_area,
+                &theme,
                 TranscriptRenderOptions {
                     title: &title,
                     focused: true,
@@ -285,6 +411,7 @@ fn render_transcripts(
             frame,
             &mut app.main,
             transcript_area,
+            &theme,
             TranscriptRenderOptions {
                 title: " Main ",
                 focused: true,
@@ -301,21 +428,27 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Span::styled(
             " nanocodex ",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(
+                    if app.theme().resolved_mode() == super::theme::ThemeMode::Light {
+                        Color::White
+                    } else {
+                        Color::Black
+                    },
+                )
+                .bg(app.theme().accent())
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
         Span::styled(
             app.cwd.display().to_string(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(app.theme().muted()),
         ),
     ];
     let graph = app.main_branch_graph();
     if graph != "0*" {
         spans.push(Span::styled(
             format!("  branches {graph} · Ctrl+Alt+B browse · Ctrl+Alt+↑/↓ cycle"),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(app.theme().warning()),
         ));
     }
     let title = Line::from(spans);
@@ -394,6 +527,7 @@ fn render_transcript(
     frame: &mut Frame<'_>,
     conversation: &mut Conversation,
     area: Rect,
+    theme: &super::theme::Theme,
     options: TranscriptRenderOptions<'_>,
 ) -> Rect {
     let TranscriptRenderOptions {
@@ -403,82 +537,150 @@ fn render_transcript(
         empty_message,
         preserve_view,
     } = options;
-    let title = if conversation.has_unseen_output {
-        format!("{title}↓ New output · Ctrl+End ")
-    } else {
-        title.to_owned()
-    };
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(if focused {
-            Color::Cyan
+            theme.accent()
         } else {
-            Color::DarkGray
+            theme.border()
         }));
     let inner = block.inner(area);
-    conversation.settle_viewport_with_selection(inner.width, inner.height, preserve_view);
-    let scroll_from_bottom = conversation.display_scroll_from_bottom();
+    let show_updates = conversation.has_unseen_output();
+    let [available_transcript, updates_area] = if show_updates && inner.height > 1 {
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner)
+    } else {
+        [inner, Rect::default()]
+    };
+    conversation.settle_viewport_with_selection(
+        available_transcript.width,
+        available_transcript.height,
+        preserve_view,
+    );
+    let mut scroll_from_bottom = conversation.display_scroll_from_bottom();
+    let pinned = conversation
+        .transcript
+        .pinned_user_prompt(
+            scroll_from_bottom,
+            available_transcript.width,
+            available_transcript.height,
+        )
+        .map(|(_, message)| message.lines().next().unwrap_or_default().to_owned());
+    let [pinned_area, transcript_inner] = if pinned.is_some() && available_transcript.height > 1 {
+        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(available_transcript)
+    } else {
+        [Rect::default(), available_transcript]
+    };
+    if pinned.is_some() {
+        conversation.settle_viewport_with_selection(
+            transcript_inner.width,
+            transcript_inner.height,
+            preserve_view,
+        );
+        scroll_from_bottom = conversation.display_scroll_from_bottom();
+    }
     frame.render_widget(block, area);
+
+    if let Some(message) = pinned
+        && !pinned_area.is_empty()
+    {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    " › You · ",
+                    Style::default()
+                        .fg(theme.accent())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(message, Style::default().fg(theme.text())),
+            ]))
+            .style(Style::default().bg(theme.selection())),
+            pinned_area,
+        );
+    }
 
     frame.render_widget(
         conversation
             .transcript
             .widget(
                 scroll_from_bottom,
-                conversation.selected_user,
+                conversation.selected_entry(),
                 inline_edit,
                 empty_message,
             )
             .math_fallback(preserve_view),
-        inner,
+        transcript_inner,
     );
+    if show_updates && !updates_area.is_empty() {
+        let unseen_updates = conversation.unseen_updates;
+        let noun = if unseen_updates == 1 {
+            "update"
+        } else {
+            "updates"
+        };
+        frame.render_widget(
+            Paragraph::new(format!("↓ {} {noun} · Ctrl+End to follow", unseen_updates))
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(theme.accent())),
+            updates_area,
+        );
+    }
     if let Some(edit) = inline_edit
         && let Some(position) = conversation.transcript.inline_edit_cursor(
-            inner,
+            transcript_inner,
             scroll_from_bottom,
-            conversation.selected_user,
+            conversation.selected_entry(),
             edit,
         )
     {
         frame.set_cursor_position(position);
     }
-    inner
+    transcript_inner
 }
 
-fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect, layout: &ComposerLayout) -> Rect {
-    let conversation = app.active_conversation();
+fn render_composer(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    area: Rect,
+    layout: &ComposerLayout,
+) -> Rect {
+    let active_subagents = app
+        .subagent_view_mut()
+        .map_or(0, |subagents| subagents.active_count());
+    let conversation_running = app.active_conversation().running;
     let target = match app.focus {
         PaneId::Main => "Main",
         PaneId::Btw(_) => "BTW",
     };
-    let title = if app.historical_editor_active() {
-        format!(
-            " Draft parked · editing branch {} message above ",
-            app.historical_editor_source_branch().unwrap_or_default()
-        )
-    } else if app.branch_navigator_active() {
-        " Message composer · browsing branches ".to_owned()
-    } else if conversation.running {
-        format!(" Message → {target} (Enter steers · Tab queues) ")
-    } else {
-        format!(" Message → {target} ")
-    };
-    let block = Block::default()
-        .title(title)
+    let chrome = composer_chrome(app, active_subagents, target, area.width, Instant::now());
+    // Visual behavior derived from clabby/tact's Pi-style composer at
+    // 4df68c820427643216d6f2d61c58af89acc27a30 (Apache-2.0).
+    let top_titles_width = chrome.top_left.width() + chrome.top_right.width();
+    let bottom_titles_width = chrome.bottom_left.width() + chrome.bottom_right.width();
+    let mut block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(if conversation.running {
-            Color::Yellow
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(if conversation_running {
+            app.theme().warning()
         } else {
-            Color::Cyan
-        }));
+            app.theme().accent()
+        }))
+        .title_top(chrome.top_right.right_aligned())
+        .title_bottom(chrome.bottom_right.right_aligned());
+    let title_width = usize::from(area.width.saturating_sub(2));
+    if top_titles_width < title_width {
+        block = block.title_top(chrome.top_left);
+    }
+    if bottom_titles_width < title_width {
+        block = block.title_bottom(chrome.bottom_left);
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if app.historical_editor_active() || app.branch_navigator_active() {
         frame.render_widget(
             Paragraph::new(Line::styled(
                 " draft preserved ",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(app.theme().muted()),
             )),
             inner,
         );
@@ -507,10 +709,229 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect, layout: &Compos
     inner
 }
 
-fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
+struct ComposerChrome {
+    top_left: Line<'static>,
+    top_right: Line<'static>,
+    bottom_left: Line<'static>,
+    bottom_right: Line<'static>,
+}
+
+fn composer_chrome(
+    app: &mut App,
+    active_subagents: usize,
+    target: &str,
+    width: u16,
+    now: Instant,
+) -> ComposerChrome {
+    let capacity = usize::from(width.saturating_sub(2));
+    let top_right = composer_identity(app, capacity, now);
+    let left_budget = capacity.saturating_sub(top_right.width()).saturating_sub(1);
+    let top_left = composer_activity(app, active_subagents, target, left_budget, now);
+
+    let workspace_budget = capacity.min(if width >= 72 { 32 } else { 20 });
+    let workspace = truncate_left(
+        &app.cwd.display().to_string(),
+        workspace_budget.saturating_sub(2),
+    );
+    let bottom_right = Line::styled(
+        format!(" {workspace} "),
+        Style::default().fg(app.theme().muted()),
+    );
+    let hint_budget = capacity
+        .saturating_sub(bottom_right.width())
+        .saturating_sub(1);
+    let bottom_left = composer_input_hint(app, hint_budget);
+
+    ComposerChrome {
+        top_left,
+        top_right,
+        bottom_left,
+        bottom_right,
+    }
+}
+
+fn composer_identity(app: &App, budget: usize, now: Instant) -> Line<'static> {
+    let model = format!(" {} ", app.model().as_str());
+    if model.width() > budget {
+        return Line::styled(
+            truncate_right(&model, budget),
+            Style::default().fg(app.theme().accent()),
+        );
+    }
+
+    let effort = if app.thinking() == nanocodex::Thinking::None {
+        " default ".to_owned()
+    } else {
+        format!(" {} ", app.thinking().as_str())
+    };
+    let timer = app.active_conversation().running.then(|| {
+        format!(
+            " {} ",
+            format_elapsed(app.active_conversation().run_elapsed(now))
+        )
+    });
+    let fast = app.fast_mode().then_some(" ⚡ ");
+
+    let mut used = model.width();
+    let show_effort = used + effort.width() <= budget;
+    used += usize::from(show_effort) * effort.width();
+    let show_timer = timer
+        .as_deref()
+        .is_some_and(|timer| used + timer.width() <= budget);
+    if show_timer {
+        used += timer.as_deref().map_or(0, UnicodeWidthStr::width);
+    }
+    let show_fast = fast.is_some_and(|fast| used + fast.width() <= budget);
+
+    let mut spans = Vec::new();
+    if show_timer {
+        spans.push(Span::styled(
+            timer.unwrap_or_default(),
+            Style::default().fg(app.theme().muted()),
+        ));
+    }
+    spans.push(Span::styled(
+        model,
+        Style::default()
+            .fg(app.theme().accent())
+            .add_modifier(Modifier::BOLD),
+    ));
+    if show_effort {
+        let effort_color = app.theme().effort(app.thinking());
+        spans.push(Span::styled(
+            effort,
+            Style::default()
+                .fg(effort_color)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if show_fast {
+        spans.push(Span::styled(
+            fast.unwrap_or_default(),
+            Style::default()
+                .fg(app.theme().warning())
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn composer_activity(
+    app: &mut App,
+    active_subagents: usize,
+    target: &str,
+    budget: usize,
+    now: Instant,
+) -> Line<'static> {
+    if budget < 3 {
+        return Line::default();
+    }
     let conversation = app.active_conversation();
-    let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let running = conversation.running;
+    let status = conversation.status.clone();
+    let retry = conversation.retry_status(now);
+    let last_cost = conversation.last_cost_usd.clone();
+    let pending_steers = conversation.pending_steers.len();
+    let queued = conversation
+        .pending_turns
+        .saturating_sub(usize::from(conversation.running));
     let state = if app.branch_navigator_active() {
+        "Browsing branches".to_owned()
+    } else if app.historical_editor_active() {
+        format!(
+            "Draft parked · branch {}",
+            app.historical_editor_source_branch().unwrap_or_default()
+        )
+    } else if running {
+        retry.unwrap_or(status.clone())
+    } else {
+        status.clone()
+    };
+    let color = if running {
+        app.theme().warning()
+    } else if status == "Ready" {
+        app.theme().success()
+    } else {
+        app.theme().muted()
+    };
+    let spinner_width = usize::from(running) * 2;
+    let base = truncate_right(
+        &format!(" {state} → {target} "),
+        budget.saturating_sub(spinner_width),
+    );
+    let (spinner, waved) = app.activity_visual(&base, color, running, now);
+    let mut spans = Vec::with_capacity(waved.len().saturating_add(5));
+    if let Some(spinner) = spinner {
+        spans.push(Span::styled(
+            format!(" {spinner}"),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.extend(waved);
+    let mut used: usize = spans.iter().map(Span::width).sum();
+    let mut push = |text: String, style: Style| {
+        if used + text.width() <= budget {
+            used += text.width();
+            spans.push(Span::styled(text, style));
+        }
+    };
+    if active_subagents > 0 {
+        let noun = if active_subagents == 1 {
+            "subagent"
+        } else {
+            "subagents"
+        };
+        push(
+            format!("· {active_subagents} {noun} "),
+            Style::default()
+                .fg(app.theme().warning())
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    if let Some(cost) = last_cost {
+        push(
+            format!("· ${cost} "),
+            Style::default().fg(app.theme().muted()),
+        );
+    }
+    let queue = footer_queue(pending_steers, queued);
+    if !queue.is_empty() {
+        push(
+            format!("{} ", queue.trim_start()),
+            Style::default().fg(app.theme().muted()),
+        );
+    }
+    Line::from(spans)
+}
+
+fn composer_input_hint(app: &App, budget: usize) -> Line<'static> {
+    if !app.input.is_empty() || app.historical_editor_active() || app.branch_navigator_active() {
+        return Line::default();
+    }
+    let action = if app.active_conversation().running {
+        "steer"
+    } else {
+        "send"
+    };
+    let hints = [
+        format!(" / actions · Enter {action} · Tab queue · Ctrl+V image "),
+        format!(" / actions · Enter {action} "),
+        " / actions ".to_owned(),
+    ];
+    let hint = hints
+        .into_iter()
+        .find(|hint| hint.width() <= budget)
+        .unwrap_or_default();
+    Line::styled(
+        hint,
+        Style::default()
+            .fg(app.theme().muted())
+            .add_modifier(Modifier::DIM),
+    )
+}
+
+fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let help = if app.branch_navigator_active() {
         "Branches — ↑/↓ or j/k switch + preview · Esc close".to_owned()
     } else if app.historical_editor_active() {
         let branch = app.historical_editor_source_branch().unwrap_or_default();
@@ -523,84 +944,29 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 "Editing branch {branch} — Enter forks here · Shift+Enter newline · Esc cancel · Ctrl+G $EDITOR"
             )
         }
+    } else if app.tool_focus_active() {
+        "Tools — ↑/↓ select · Enter expand/collapse · Ctrl+O all · Esc return".to_owned()
     } else if app.transcript_selection_active() {
         "History — ↑/↓ select · e edit/fork · Esc return".to_owned()
     } else if app.cancel_confirmation_active() {
         "Stop Agent Turn — Esc again to confirm".to_owned()
-    } else if conversation.running {
-        format!(
-            "{} Working ({})",
-            spinner[app.frame % spinner.len()],
-            format_elapsed(conversation.run_elapsed(Instant::now()))
-        )
+    } else if area.width >= 100 && app.btw.is_some() {
+        "BackTab switch · / actions · Alt+O tools · Ctrl+O details · Ctrl+V image · Shift+Enter newline · Esc Esc stop · Ctrl+C quit".to_owned()
+    } else if area.width >= 100 {
+        "/ actions · Alt+O tools · Ctrl+O details · /btw side fork · Ctrl+V image · Shift+Enter newline · Esc Esc stop · Ctrl+C quit".to_owned()
+    } else if area.width >= 58 {
+        "/ actions · Alt+O tools · Ctrl+O details · Shift+Enter newline · Esc Esc stop".to_owned()
+    } else if area.width >= 36 {
+        "/ actions · Alt+O tools · Esc Esc stop".to_owned()
     } else {
-        conversation.status.clone()
+        "/ actions · Esc Esc stop".to_owned()
     };
-    let queued = conversation
-        .pending_turns
-        .saturating_sub(usize::from(conversation.running));
-    let steers = conversation.pending_steers.len();
-    let queue = footer_queue(steers, queued);
-    let cost = conversation
-        .last_cost_usd
-        .as_deref()
-        .map_or_else(String::new, |usd| format!(" · ${usd}"));
-    let escape_help = if steers == 0 {
-        "Esc Esc stop"
-    } else {
-        "Esc interrupt/send"
-    };
-    let tool_help = if app.tool_details_expanded() {
-        "Ctrl+O fold tools"
-    } else {
-        "Ctrl+O expand tools"
-    };
-    let help = if app.btw.is_some() {
-        format!(
-            "  BackTab switch · {tool_help} · Ctrl+V image · /close dismiss · Enter send/steer · Tab queue · {escape_help} · Ctrl+C quit"
-        )
-    } else {
-        format!(
-            "  /simplify [focus] cleanup · /btw <question> side fork · /voice [voice] · {tool_help} · Ctrl+V image · Enter send/steer · Tab queue · {escape_help} · Ctrl+C quit"
-        )
-    };
-    let model_width = app.model().as_str().len() + 3 + "default".len() + 7 + 1;
-    let model_width = saturating_u16(model_width).min(area.width);
-    let [left, right] =
-        Layout::horizontal([Constraint::Min(0), Constraint::Length(model_width)]).areas(area);
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!(" {state}{cost}{queue}"),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(help, Style::default().fg(Color::DarkGray)),
-        ])),
-        left,
-    );
-    let mut model = vec![Span::styled(
-        app.model().as_str(),
-        Style::default().fg(Color::Cyan),
-    )];
-    let thinking = if app.thinking() == nanocodex::Thinking::None {
-        "default"
-    } else {
-        app.thinking().as_str()
-    };
-    model.push(Span::styled(
-        format!(" · {thinking}"),
-        Style::default().fg(Color::DarkGray),
-    ));
-    if app.fast_mode() {
-        model.push(Span::styled(
-            " · fast",
-            Style::default().fg(Color::LightYellow),
-        ));
-    }
-    model.push(Span::raw(" "));
-    frame.render_widget(
-        Paragraph::new(Line::from(model)).alignment(Alignment::Right),
-        right,
+        Paragraph::new(Line::styled(
+            format!(" {help}"),
+            Style::default().fg(app.theme().muted()),
+        )),
+        area,
     );
 }
 
@@ -733,6 +1099,50 @@ fn saturating_u16(value: usize) -> u16 {
     u16::try_from(value).unwrap_or(u16::MAX)
 }
 
+fn truncate_right(value: &str, width: usize) -> String {
+    if value.width() <= width {
+        return value.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut output = String::new();
+    let content_width = width.saturating_sub(1);
+    let mut used = 0;
+    for character in value.chars() {
+        let character_width = character.width().unwrap_or(0);
+        if used + character_width > content_width {
+            break;
+        }
+        output.push(character);
+        used += character_width;
+    }
+    output.push('…');
+    output
+}
+
+fn truncate_left(value: &str, width: usize) -> String {
+    if value.width() <= width {
+        return value.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let content_width = width.saturating_sub(1);
+    let mut suffix = Vec::new();
+    let mut used = 0;
+    for character in value.chars().rev() {
+        let character_width = character.width().unwrap_or(0);
+        if used + character_width > content_width {
+            break;
+        }
+        suffix.push(character);
+        used += character_width;
+    }
+    suffix.reverse();
+    format!("…{}", suffix.into_iter().collect::<String>())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -762,7 +1172,7 @@ mod tests {
         let rendered = terminal.backend().to_string();
         assert!(rendered.contains("Main"));
         assert!(rendered.contains("BTW · forked context"));
-        assert!(rendered.contains("Message → BTW"));
+        assert!(rendered.contains("→ BTW"));
         assert!(rendered.contains("BackTab switch"));
     }
 
@@ -788,7 +1198,7 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let rendered = terminal.backend().to_string();
-        assert!(rendered.contains("Enter steers · Tab queues"));
+        assert!(rendered.contains("Enter steer · Tab queue"));
         assert!(rendered.contains("Pending input"));
         assert!(rendered.contains("↳ steer"));
         assert!(rendered.contains("use the database implementation"));
@@ -797,7 +1207,7 @@ mod tests {
     }
 
     #[test]
-    fn running_footer_uses_one_elapsed_working_indicator() {
+    fn running_composer_shows_activity_and_one_elapsed_timer() {
         let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
         let mut app = App::new("/workspace".into());
         app.main.running = true;
@@ -810,8 +1220,9 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let rendered = terminal.backend().to_string();
-        assert!(rendered.contains("Working (1m 05s)"));
-        assert!(!rendered.contains("Running exec_command"));
+        assert!(rendered.contains("Running exec_command → Main"));
+        assert!(rendered.contains("1m 05s"));
+        assert_eq!(rendered.matches("1m 05s").count(), 1);
     }
 
     #[test]
@@ -840,17 +1251,14 @@ mod tests {
     }
 
     #[test]
-    fn footer_keeps_model_on_the_bottom_right_and_marks_fast_mode() {
+    fn composer_keeps_model_on_the_top_right_and_marks_fast_mode() {
         let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
         let mut app = App::new("/workspace".into());
         app.fast_mode_changed(true);
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let footer = terminal.backend().buffer().content[15 * 80..16 * 80]
-            .iter()
-            .map(ratatui::buffer::Cell::symbol)
-            .collect::<String>();
-        assert!(footer.ends_with("gpt-5.6-sol · high · fast "));
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("gpt-5.6-sol  high  ⚡"));
     }
 
     #[test]
@@ -860,12 +1268,34 @@ mod tests {
         app.main.last_cost_usd = Some("0.012345".to_owned());
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let footer = terminal.backend().buffer().content[15 * 80..16 * 80]
-            .iter()
-            .map(ratatui::buffer::Cell::symbol)
-            .collect::<String>();
-        assert!(footer.contains("Ready · $0.012345"));
-        assert!(footer.ends_with("gpt-5.6-sol · high "));
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("Ready → Main · $0.012345"));
+        assert!(rendered.contains("gpt-5.6-sol  high"));
+    }
+
+    #[test]
+    fn composer_reports_active_subagents_in_the_activity_chrome() {
+        use crate::subagents::{AgentDescriptor, AgentId, AgentUpdate, ScopedAgentUpdate};
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        let mut app = App::new("/workspace".into());
+        app.configure_subagent_view("root".to_owned(), 4);
+        app.subagent_view_mut()
+            .unwrap()
+            .apply_update(&ScopedAgentUpdate {
+                root_session_id: "root".to_owned(),
+                update: AgentUpdate::Added(AgentDescriptor {
+                    id: AgentId::new(1),
+                    session_id: "child".to_owned(),
+                    role: "reviewer".to_owned(),
+                    task: "review composer".to_owned(),
+                    parent: None,
+                }),
+            });
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert!(terminal.backend().to_string().contains("1 subagent"));
     }
 
     #[test]
@@ -895,7 +1325,7 @@ mod tests {
     }
 
     #[test]
-    fn narrow_footer_preserves_the_model_before_help() {
+    fn narrow_composer_preserves_the_model_before_help() {
         let mut terminal = Terminal::new(TestBackend::new(24, 10)).unwrap();
         let mut app = App::new("/workspace".into());
 
@@ -1276,7 +1706,7 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let rendered = terminal.backend().to_string();
-        assert!(rendered.contains("Draft parked · editing branch 0 message above"));
+        assert!(rendered.contains("Draft parked · branch 0"));
         assert!(rendered.contains("Editing branch 0 — Enter stops live turn + forks"));
     }
 
@@ -1349,12 +1779,12 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
         let mut app = App::new("/workspace".into());
         let btw_id = app.begin_btw();
-        app.main.has_unseen_output = true;
+        app.main.unseen_updates = 1;
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let rendered = terminal.backend().to_string();
-        assert!(rendered.contains("Main ↓ New output · Ctrl+End"));
-        assert!(!rendered.contains("BTW · forked context ↓ New output"));
+        assert!(rendered.contains("↓ 1 update · Ctrl+End to follow"));
+        assert_eq!(rendered.matches("Ctrl+End to follow").count(), 1);
         assert_eq!(app.focus, crate::tui::app::PaneId::Btw(btw_id));
     }
 
@@ -1376,10 +1806,10 @@ mod tests {
                 "\"│                                              │\"\n",
                 "\"│                                              │\"\n",
                 "\"└──────────────────────────────────────────────┘\"\n",
-                "\"┌ Message → Main ──────────────────────────────┐\"\n",
+                "\"╭ Ready → Main ───────────── gpt-5.6-sol  high ╮\"\n",
                 "\"│                                              │\"\n",
-                "\"└──────────────────────────────────────────────┘\"\n",
-                "\" Ready  /simplify [          gpt-5.6-sol · high \"\n",
+                "\"╰ / actions · Enter send ────────── /workspace ╯\"\n",
+                "\" / actions · Alt+O tools · Esc Esc stop         \"\n",
             )
         );
     }
@@ -1470,7 +1900,7 @@ mod tests {
         app.input.push('x');
         app.cursor = app.input.len();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        assert_eq!(terminal.backend().draw_counts[2], 1);
+        assert_eq!(terminal.backend().draw_counts[2], 25);
     }
 
     struct CountingBackend {

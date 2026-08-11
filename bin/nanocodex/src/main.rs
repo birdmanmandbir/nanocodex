@@ -242,6 +242,17 @@ async fn run(cli: Cli) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn tui_theme_is_explicitly_configurable() {
+        let cli = Cli::try_parse_from(["nanocodex", "--theme", "light"]).unwrap();
+        assert_eq!(cli.agent.theme(), tui::ThemeMode::Light);
+
+        let Err(error) = Cli::try_parse_from(["nanocodex", "--theme", "sepia"]) else {
+            panic!("unknown themes must be rejected");
+        };
+        assert!(error.to_string().contains("auto, light, or dark"));
+    }
+
     #[cfg(feature = "tempo")]
     #[test]
     fn tempo_flag_selects_the_tui_transport() {
