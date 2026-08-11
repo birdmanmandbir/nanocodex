@@ -51,6 +51,9 @@ struct ProbeResult {
     workers: usize,
     discovery_millis: u128,
     dial_millis: u128,
+    dial_p50_millis: u128,
+    dial_p95_millis: u128,
+    dial_max_millis: u128,
 }
 
 async fn run_hub(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -159,15 +162,19 @@ async fn probe(
     let discovery_millis = discovery_started.elapsed().as_millis();
 
     let dial_started = std::time::Instant::now();
-    stream::iter(providers.iter().copied())
+    let mut dial_latencies = stream::iter(providers.iter().copied())
         .map(|provider| ping(&node, provider, &protocol))
         .buffer_unordered(PROBE_DIAL_CONCURRENCY)
         .try_collect::<Vec<_>>()
         .await?;
+    dial_latencies.sort_unstable();
     let result = ProbeResult {
         workers: providers.len(),
         discovery_millis,
         dial_millis: dial_started.elapsed().as_millis(),
+        dial_p50_millis: percentile(&dial_latencies, 50),
+        dial_p95_millis: percentile(&dial_latencies, 95),
+        dial_max_millis: *dial_latencies.last().ok_or("probe completed no dials")?,
     };
     println!("{}", serde_json::to_string(&result)?);
     node.shutdown().await?;
@@ -178,8 +185,9 @@ async fn ping(
     node: &Node,
     provider: iroh::EndpointId,
     protocol: &ProtocolId,
-) -> Result<(), Box<dyn std::error::Error>> {
-    tokio::time::timeout(Duration::from_secs(30), async {
+) -> Result<u128, Box<dyn std::error::Error>> {
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(Duration::from_secs(30), async {
         let mut stream = node.connect(provider, protocol).await?;
         stream.write_all(b"ping").await?;
         let mut response = [0; 4];
@@ -192,7 +200,20 @@ async fn ping(
         Ok(())
     })
     .await
-    .map_err(|_| format!("timed out dialing provider {provider}"))?
+    .map_err(|_| format!("timed out dialing provider {provider}"))?;
+    outcome.map_err(|error| format!("provider {provider}: {error}"))?;
+    Ok(started.elapsed().as_millis())
+}
+
+fn percentile(sorted: &[u128], percentile: usize) -> u128 {
+    debug_assert!(!sorted.is_empty());
+    debug_assert!((1..=100).contains(&percentile));
+    let rank = sorted
+        .len()
+        .saturating_mul(percentile)
+        .div_ceil(100)
+        .saturating_sub(1);
+    sorted[rank]
 }
 
 fn required(
@@ -215,4 +236,17 @@ fn require_end(
 
 const fn usage() -> &'static str {
     "usage: gossip_cluster hub AUTHORITY_PATH | serve JOIN_TICKET IDENTITY_PATH [CPU_ARCH] | dial JOIN_TICKET IDENTITY_PATH [CPU_ARCH] | probe JOIN_TICKET IDENTITY_PATH CPU_ARCH EXPECTED_WORKERS"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::percentile;
+
+    #[test]
+    fn percentile_uses_nearest_rank() {
+        let values = (1..=100).collect::<Vec<_>>();
+        assert_eq!(percentile(&values, 50), 50);
+        assert_eq!(percentile(&values, 95), 95);
+        assert_eq!(percentile(&[7], 95), 7);
+    }
 }
