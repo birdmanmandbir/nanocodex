@@ -77,6 +77,13 @@ Records are signed directly by the same durable Ed25519 identity authenticated
 by Iroh. Replays and stale revisions are ignored, while conflicting content at
 one identity and revision is rejected.
 
+Each watcher coalesces pending changes by durable identity. Slow consumers see
+the latest query-relative state for every changed peer instead of accumulating
+an update-frequency-dependent queue, and initial snapshots are not capped at a
+fixed fleet size. Advertisement renewal times are deterministically staggered
+by identity within a safe pre-expiry window to avoid synchronized renewal
+bursts after a fleet starts together.
+
 The executable example runs a hub, an advertising worker, and a late-joining
 client. The client discovers the worker through gossip and then exchanges
 `ping`/`pong` over a direct peer stream:
