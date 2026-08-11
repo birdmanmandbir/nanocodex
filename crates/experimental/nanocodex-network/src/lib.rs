@@ -913,7 +913,8 @@ impl Node {
         self.discovery.publisher().publish(record.clone()).await?;
         let node_id = record.node_id();
         let revision = record.advertisement().revision();
-        let renewal_delay = record.advertisement().lease_duration() / 2;
+        let renewal_delay =
+            advertisement_renewal_delay(record.advertisement().lease_duration(), record.node_id());
         let publisher = self.discovery.publisher();
         let advertisement = record.advertisement().clone();
         let secret_key = self.router.endpoint().secret_key().clone();
@@ -955,6 +956,15 @@ impl Node {
             .await
             .map_err(|error| NetworkError::Endpoint(error.to_string()))
     }
+}
+
+fn advertisement_renewal_delay(lease_duration: Duration, node_id: iroh::EndpointId) -> Duration {
+    let lease_millis = u64::try_from(lease_duration.as_millis()).unwrap_or(u64::MAX);
+    let spread = lease_millis / 5;
+    let mut identity_prefix = [0_u8; 8];
+    identity_prefix.copy_from_slice(&node_id.as_bytes()[..8]);
+    let identity_offset = u64::from_le_bytes(identity_prefix) % spread.saturating_add(1);
+    Duration::from_millis(lease_millis.saturating_mul(2) / 5 + identity_offset)
 }
 
 impl AdvertisementLease {
@@ -2047,6 +2057,29 @@ mod tests {
             reader.await.unwrap().unwrap(),
             ControlMessage::Granted
         ));
+    }
+
+    #[test]
+    fn advertisement_renewals_are_identity_jittered_before_expiry() {
+        let lease = Duration::from_secs(10);
+        let delays = (1_u8..=64)
+            .map(|seed| {
+                advertisement_renewal_delay(
+                    lease,
+                    iroh::SecretKey::from_bytes(&[seed; 32]).public(),
+                )
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(
+            delays
+                .iter()
+                .all(|delay| { (Duration::from_secs(4)..=Duration::from_secs(6)).contains(delay) })
+        );
+        assert!(
+            delays.len() > 48,
+            "durable identities must spread a renewal burst across the safe window"
+        );
     }
 
     #[test]
