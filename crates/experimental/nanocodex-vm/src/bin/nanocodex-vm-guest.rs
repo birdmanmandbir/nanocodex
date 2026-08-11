@@ -327,7 +327,7 @@ fn validate_vllm_container(
     let has_revision = argument_pair(&value.config.cmd, "--revision", &options.model_revision);
     let has_served_name = argument_pair(&value.config.cmd, "--served-model-name", &options.model);
     let has_gpu = value.host_config.device_requests.iter().any(|request| {
-        request.driver == "nvidia"
+        (request.driver.is_empty() || request.driver == "nvidia")
             && request.count != 0
             && request
                 .capabilities
