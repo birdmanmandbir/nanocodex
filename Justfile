@@ -252,6 +252,22 @@ prove-command-libkrun-tdx qgs="/run/tdx-qgs/qgs.socket" message="confidential-vm
       --guest target/x86_64-unknown-linux-musl/debug/nanocodex-vm-guest \
       --qgs "{{qgs}}"
 
+# Drive an already-running managed Confidential VM through an untrusted gcloud
+# SSH stdio transport. `local_guest` must be byte-identical to `guest_program`.
+prove-command-gcp-managed profile instance zone local_guest project="nanocodex-tee-lab" guest_program="/home/georgios/nanocodex-vm-guest" message="attested-managed-tool-call":
+    cargo run --locked --quiet -p nanocodex-vm \
+      --example confidential_transport_command -- \
+      --profile "{{profile}}" --local-guest "{{local_guest}}" \
+      --guest-program "{{guest_program}}" --message "{{message}}" \
+      --transport gcloud \
+      --transport-arg compute --transport-arg ssh \
+      --transport-arg "{{instance}}" \
+      --transport-arg --project --transport-arg "{{project}}" \
+      --transport-arg --zone --transport-arg "{{zone}}" \
+      --transport-arg --command \
+      --transport-arg "sudo {{guest_program}} /" \
+      --transport-arg --quiet
+
 # Exercise the real KVM VM, sealed execution, retained key, signatures, and
 # verifier without claiming hardware trust. The native verifier deliberately
 # rejects the development evidence profile.

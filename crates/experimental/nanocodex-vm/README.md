@@ -127,6 +127,26 @@ relays guest configfs GetQuote exits to the selected QGS Unix socket with QGS
 The guest collector also rejects a successful configfs read with an empty
 `outblob`; QGS or provisioning failure cannot become a zero-byte attestation.
 
+The same typed session and command-proof contract can drive an already-running
+managed Confidential VM through any subprocess transport whose stdin/stdout
+reach `nanocodex-vm-guest`. For example, after uploading a byte-identical static
+guest to a GCP SNP or TDX VM:
+
+```console
+just prove-command-gcp-managed snp INSTANCE us-central1-a ./nanocodex-vm-guest
+just prove-command-gcp-managed tdx INSTANCE us-central1-a ./nanocodex-vm-guest
+```
+
+The outside process treats `gcloud ssh` as an untrusted transport. The returned
+proof signs the fresh challenge, executable hash, complete argv, stream hashes,
+and termination with the native-evidence-bound guest key. Appraise the exact
+embedded AMD or Intel evidence and then pass the resulting
+`VerifiedAttestation` to `verify_command_proof`; transport success alone is not
+trust. On a managed VM, a caller-supplied workload digest is report-bound but
+is not automatically part of the launch measurement. Exact workload identity
+therefore additionally requires a measured/verity image, an owned RTMR
+extension, or a cloud image-digest attestation policy.
+
 An SNP relying party can now appraise a retained response entirely offline:
 
 ```console
