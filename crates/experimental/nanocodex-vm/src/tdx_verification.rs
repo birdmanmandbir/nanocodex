@@ -264,7 +264,14 @@ fn validate_report(
     if report.mr_td != policy.mr_td
         || [report.rt_mr0, report.rt_mr1, report.rt_mr2, report.rt_mr3] != policy.rt_mrs
     {
-        return Err(error("TDX MRTD or RTMR measurements do not match policy"));
+        return Err(error(format!(
+            "TDX MRTD or RTMR measurements do not match policy (actual MRTD={}, RTMR0={}, RTMR1={}, RTMR2={}, RTMR3={})",
+            hex::encode(report.mr_td),
+            hex::encode(report.rt_mr0),
+            hex::encode(report.rt_mr1),
+            hex::encode(report.rt_mr2),
+            hex::encode(report.rt_mr3),
+        )));
     }
     if policy
         .mr_config_id
