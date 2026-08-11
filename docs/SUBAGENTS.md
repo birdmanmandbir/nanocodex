@@ -2,11 +2,12 @@
 
 Nanocodex’s native CLI ports the subagent runtime from
 [`clabby/tact@1d9ccaefd1d8613dab020812af04a91cd9b4c52c`](https://github.com/clabby/tact/tree/1d9ccaefd1d8613dab020812af04a91cd9b4c52c)
-under Apache-2.0. The runtime source, schemas, prompts, lifecycle, messaging,
-capacity policy, and focused tests are retained 1:1. The integration changes
-are limited to Nanocodex module paths, removal of Tact’s separate memory-tool
-coupling, CLI configuration, event draining, shutdown wiring, and explicit
-propagation of Nanocodex’s originating tool span into the child harness.
+under Apache-2.0. The runtime source, schemas, child prompts, lifecycle,
+messaging, capacity policy, and focused tests are retained 1:1. The integration
+changes are limited to Nanocodex module paths, removal of Tact’s separate
+memory-tool coupling, CLI configuration and root orchestration guidance, event
+draining, shutdown wiring, and explicit propagation of Nanocodex’s originating
+tool span into the child harness.
 
 Subagents are enabled by default for TUI and one-shot runs:
 
@@ -18,10 +19,25 @@ nanocodex run --max-subagents 32 "implement the change"
 Pass `--subagents false` or set `NANOCODEX_SUBAGENTS=false` to disable the
 general-purpose subagent tools for a session.
 
-When enabled, the root agent also receives Tact's fixed orchestration guidance:
-delegate only meaningful separable work, run independent children concurrently,
-use their typed outputs for dependent stages, avoid repeating delegated work,
-verify their findings, and keep concurrent write scopes disjoint.
+When enabled, the root agent also receives an advisory default development
+policy built on Tact's orchestration primitives. It remains the sole
+production-code writer and works top down from the consuming CLI, example, or
+observable behavior through the public API and ownership boundaries, then
+events and OTEL, and finally internal implementation. It starts bounded
+read-only scouts, reviewers, validators, and measurement agents early,
+continues non-conflicting work while they run, and consumes results at natural
+checkpoints instead of waiting at a barrier after every stage.
+
+Completed agents are reusable for later focused checks. The root owns every
+reader and explicitly prohibits production edits and further delegation in
+each task. It consumes direction-changing feedback before dependent work but
+does not stop unrelated work to wait for a review. The root also owns test
+creation: tests follow stable behavior and APIs and cover only public contracts
+or demonstrated regressions.
+
+This split is guidance, not a capability sandbox. Children retain the root's
+base tools and process authority, so each reader task must explicitly prohibit
+production edits and the root must inspect the final diff.
 
 `--max-subagents` bounds active child turns across the complete task tree. Idle
 reusable sessions consume no capacity. Lowering the limit does not cancel work;

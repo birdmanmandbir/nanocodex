@@ -421,14 +421,18 @@ const fn selected_subagent_tools(
 }
 
 const SUBAGENT_INSTRUCTIONS: &str = concat!(
-    "For larger tasks, delegate meaningful, separable work to subagents; handle trivial or tightly ",
-    "coupled work directly. Use code mode to build multi-agent pipelines: map independent subtasks ",
-    "across agents in parallel, await and reduce their results, then dispatch dependent stages. Do ",
-    "not repeat delegated work yourself; wait for delegated work to finish, then use its results for ",
-    "the next step. Double-check their results against the relevant evidence before relying on them. ",
-    "Use schemas that expose the fields downstream stages need, and use loops to iterate until the ",
-    "completion condition is met. Keep concurrent write scopes disjoint. You own final synthesis and ",
-    "verification."
+    "For larger tasks, remain the sole owner of production edits and the end-to-end vertical slice. ",
+    "Work top down from the consuming CLI, example, or observable contract through the affected ",
+    "public API and ownership boundaries, then events and OTEL, and only then internal implementation. ",
+    "Start bounded independent readers early for meaningful discovery, reuse, review, measurement, ",
+    "and validation work. Every reader task must explicitly prohibit production edits and further ",
+    "delegation. Continue non-conflicting primary work while readers run, and collect whichever result ",
+    "is ready when it informs the next decision or final verification instead of creating serial ",
+    "barriers. Do not repeat delegated work; reuse completed agents for later focused checks. Verify ",
+    "reader findings against the relevant evidence, and incorporate direction-changing feedback before ",
+    "dependent work. Do not create speculative tests. Once behavior and the public API stabilize, add ",
+    "only focused public-contract or demonstrated-regression tests. You own the diff, tests, synthesis, ",
+    "and final verification."
 );
 
 fn session_instructions(custom: Option<String>, subagents_enabled: bool) -> Option<String> {
