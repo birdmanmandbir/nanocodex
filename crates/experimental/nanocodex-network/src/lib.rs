@@ -1469,7 +1469,7 @@ async fn node_control_loop(
     mut recv: iroh::endpoint::RecvStream,
 ) -> Result<(), NetworkError> {
     loop {
-        let message = read_control(&mut recv).await?;
+        let message = read_idle_control(&mut recv).await?;
         let response = match message {
             ControlMessage::Grant {
                 token,
@@ -1551,6 +1551,12 @@ async fn read_control(
     tokio::time::timeout(AUTH_TIMEOUT, read_frame(recv))
         .await
         .map_err(|_| NetworkError::Protocol("control response timed out".to_owned()))?
+}
+
+async fn read_idle_control(
+    recv: &mut (impl AsyncRead + Unpin),
+) -> Result<ControlMessage, NetworkError> {
+    read_frame(recv).await
 }
 
 async fn write_stream_prefix(
@@ -1877,6 +1883,23 @@ mod tests {
         .await
         .unwrap();
         read_frame(&mut recv).await.unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_control_channel_does_not_reuse_the_authentication_timeout() {
+        let (mut send, mut recv) = tokio::io::duplex(MAX_CONTROL_BYTES);
+        let reader = tokio::spawn(async move { read_idle_control(&mut recv).await });
+
+        tokio::time::advance(AUTH_TIMEOUT + Duration::from_secs(1)).await;
+        assert!(!reader.is_finished());
+
+        write_frame(&mut send, &ControlMessage::Granted)
+            .await
+            .unwrap();
+        assert!(matches!(
+            reader.await.unwrap().unwrap(),
+            ControlMessage::Granted
+        ));
     }
 
     #[test]

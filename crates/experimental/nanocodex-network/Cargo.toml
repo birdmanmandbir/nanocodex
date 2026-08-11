@@ -28,7 +28,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 hex.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 
 [lints]
 workspace = true
