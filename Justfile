@@ -119,6 +119,17 @@ build-vm-guest:
     cargo build -p nanocodex-vm --bin nanocodex-vm-guest \
       --no-default-features --features guest-runtime --target "$target"
 
+# Build the static supervisor with a pinned compiler, deterministic release
+# profile, source-path remapping, no build ID, and epoch build time.
+build-vm-guest-reproducible target="" target_dir="target/reproducible-guest":
+    ./scripts/build-reproducible-vm-guest.sh "{{target}}" "{{target_dir}}"
+
+# Publish the bit-reproducible minimal ext4 root and its strict artifact
+# manifest. This is an image input, not yet a complete measured-launch claim.
+build-reproducible-guest-image guest output cache=".cache/nanocodex/reproducible-guest":
+    cargo run --locked --quiet -p nanocodex-vm --example build_reproducible_guest -- \
+      --guest "{{guest}}" --output "{{output}}" --cache "{{cache}}"
+
 # Build the same guest with an explicitly untrusted software evidence source.
 # This exists only to exercise the complete proof protocol on ordinary KVM.
 build-vm-guest-development:
@@ -173,6 +184,26 @@ build-vm-host-intel-tdx:
     cargo build --locked -p nanocodex-bin --bin nanocodex \
       --features libkrun-intel-tdx --target-dir target/libkrun-intel-tdx
 
+# Build one exact, content-addressed SEV or TDX libkrunfw artifact in the pinned
+# Linux x86_64 toolchain. The output retains the embedded boot components.
+build-confidential-libkrunfw variant output:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{variant}}" in sev|tdx) ;; *) echo "variant must be sev or tdx" >&2; exit 2 ;; esac
+    docker build --platform linux/amd64 \
+      --file "{{justfile_directory()}}/scripts/confidential-libkrunfw.Dockerfile" \
+      --tag nanocodex-confidential-libkrunfw-builder:20251201 \
+      "{{justfile_directory()}}"
+    mkdir -p "{{output}}"
+    output=$(cd "{{output}}" && pwd -P)
+    docker run --rm --platform linux/amd64 \
+      --user "$(id -u):$(id -g)" \
+      --env HOME=/tmp \
+      --volume "{{justfile_directory()}}:/workspace:ro" \
+      --volume "$output:/output" \
+      nanocodex-confidential-libkrunfw-builder:20251201 \
+      /workspace/scripts/build-confidential-libkrunfw.sh "{{variant}}" /output
+
 # Collect real native evidence when run inside an SNP VM, TDX TD, or Nitro
 # Enclave. A relying party should pass its own nonce with the expanded Cargo
 # command documented in the VM crate README.
@@ -223,6 +254,12 @@ verify-tdx-attestation input collateral mrtd rtmr0 rtmr1 rtmr2 rtmr3 allow_dynam
     fi
     cargo run --locked --quiet -p nanocodex-vm \
       --example verify_tdx_attestation -- "${args[@]}"
+
+# Fetch quote-specific Intel PCS collateral and emit it only after the raw
+# quote passes the production-root cryptographic and TCB verification path.
+fetch-tdx-collateral quote:
+    cargo run --locked --quiet -p nanocodex-vm --features collateral-fetch \
+      --example fetch_tdx_collateral -- "{{quote}}"
 
 # Verify a collected Nitro JSON response against one pinned AWS root and PCR.
 # Repeat --pcr through the expanded Cargo command when policy pins more PCRs.
@@ -289,10 +326,14 @@ prove-command-gcp-managed-h100-tdx instance zone local_guest project="nanocodex-
 
 # Bind one request and response from an exact vLLM OCI image/model revision to
 # fresh TDX and H100 evidence. The manifest is the relying party's policy input.
-prove-inference-gcp-managed-h100-tdx instance zone local_guest manifest project="nanocodex-tee-lab" guest_program="/home/georgios/nanocodex-vm-guest":
+prove-inference-gcp-managed-h100-tdx instance zone local_guest manifest prompt collateral authorization_history authorization_key authorization_head project="nanocodex-tee-lab" guest_program="/home/georgios/nanocodex-vm-guest" nvidia_policy="crates/experimental/nanocodex-vm/examples/nvidia-h100-single.rego":
     cargo run --locked --quiet -p nanocodex-vm \
       --example confidential_transport_vllm -- \
-      --local-guest "{{local_guest}}" --manifest "{{manifest}}" \
+      --local-guest "{{local_guest}}" --manifest "{{manifest}}" --prompt "{{prompt}}" \
+      --collateral "{{collateral}}" --nvidia-policy "{{nvidia_policy}}" \
+      --authorization-history "{{authorization_history}}" \
+      --authorization-key "{{authorization_key}}" \
+      --authorization-head "{{authorization_head}}" \
       --transport gcloud \
       --transport-arg compute --transport-arg ssh \
       --transport-arg "{{instance}}" \
@@ -317,20 +358,20 @@ prove-command-libkrun-development message="kvm-command-proof-smoke": build-vm-gu
 # Launch either reviewed B200 topology in an SNP VM. `runtime` is a measured
 # ext4 image whose /nanocodex-vm-guest entrypoint initializes the matching
 # NVIDIA driver and then execs the protocol guest; nvattest must be on PATH.
-attest-libkrun-snp-b200 topology bundle runtime: build-vm-host-amd-sev
+attest-libkrun-snp-b200 topology bundle runtime manifest: build-vm-host-amd-sev
     @test "$(uname -m)" = x86_64 || { echo "SEV-SNP requires x86_64" >&2; exit 2; }
     cargo run --locked --quiet -p nanocodex-vm --example confidential_attestation -- \
       --profile snp --nvidia "{{topology}}" --device-bundle "{{bundle}}" \
       --vmm target/libkrun-amd-sev/debug/nanocodex \
-      --runtime-disk "{{runtime}}"
+      --runtime-disk "{{runtime}}" --image-manifest "{{manifest}}"
 
 # Launch either reviewed B200 topology in a TDX VM and relay configfs GetQuote.
-attest-libkrun-tdx-b200 topology bundle runtime qgs="/run/tdx-qgs/qgs.socket": build-vm-host-intel-tdx
+attest-libkrun-tdx-b200 topology bundle runtime manifest qgs="/run/tdx-qgs/qgs.socket": build-vm-host-intel-tdx
     @test "$(uname -m)" = x86_64 || { echo "Intel TDX requires x86_64" >&2; exit 2; }
     cargo run --locked --quiet -p nanocodex-vm --example confidential_attestation -- \
       --profile tdx --nvidia "{{topology}}" --device-bundle "{{bundle}}" \
       --vmm target/libkrun-intel-tdx/debug/nanocodex \
-      --runtime-disk "{{runtime}}" \
+      --runtime-disk "{{runtime}}" --image-manifest "{{manifest}}" \
       --qgs "{{qgs}}"
 
 build-vm-example:

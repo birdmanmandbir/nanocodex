@@ -47,8 +47,9 @@ use zeroize::Zeroizing;
 
 use super::protocol::{
     AttestResponse, CancelRequest, ControlResponse, CreateDirectoryRequest, ExecuteRequest,
-    ExecuteResponse, MemoryResponse, ProveCommandResponse, ReadFileRequest, ReadFileResponse,
-    SessionRequest, SessionResponse, ShutdownRequest, ToolResponse, WriteFileRequest,
+    ExecuteResponse, MemoryResponse, ProveCommandResponse, ProveConfidentialCommandResponse,
+    ReadFileRequest, ReadFileResponse, SessionRequest, SessionResponse, ShutdownRequest,
+    ToolResponse, WriteFileRequest,
 };
 #[cfg(all(feature = "guest-runtime", target_os = "linux"))]
 use crate::guest_attestation::GuestAttestationIdentity;
@@ -61,7 +62,10 @@ use crate::{
         ExecutionRecord, MAX_ATTESTED_EXECUTABLE_BYTES,
     },
     guest_attestation::GuestAttestationError,
-    secret_release::{SecretReleaseEnvelope, SecretReleaseError},
+    secret_release::{
+        ConfidentialCommandProof, SecretReleaseEnvelope, SecretReleaseError,
+        seal_confidential_proof,
+    },
 };
 
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
@@ -487,23 +491,23 @@ async fn execute_request(
                 })
             }
         }
-        SessionRequest::ProveSecretCommand(request) => {
+        SessionRequest::ProveConfidentialCommand(request) => {
             #[cfg(all(feature = "guest-runtime", target_os = "linux"))]
             {
                 let result = async {
                     let identity = attestation_identity
                         .get_or_try_init(|| async { GuestAttestationIdentity::generate() })
                         .await?;
-                    prove_released_secret(identity, request.envelope).await
+                    prove_confidential_command(identity, request.envelope).await
                 }
                 .await;
-                SessionResponse::ProveSecretCommand(match result {
-                    Ok(proof) => ProveCommandResponse {
+                SessionResponse::ProveConfidentialCommand(match result {
+                    Ok(proof) => ProveConfidentialCommandResponse {
                         id: request.id,
                         proof: Some(proof),
                         error: None,
                     },
-                    Err(error) => ProveCommandResponse {
+                    Err(error) => ProveConfidentialCommandResponse {
                         id: request.id,
                         proof: None,
                         error: Some(error.to_string()),
@@ -512,7 +516,7 @@ async fn execute_request(
             }
             #[cfg(not(all(feature = "guest-runtime", target_os = "linux")))]
             {
-                SessionResponse::ProveSecretCommand(ProveCommandResponse {
+                SessionResponse::ProveConfidentialCommand(ProveConfidentialCommandResponse {
                     id: request.id,
                     proof: None,
                     error: Some(
@@ -973,14 +977,15 @@ async fn prove_command(
 }
 
 #[cfg(all(feature = "guest-runtime", target_os = "linux"))]
-async fn prove_released_secret(
+async fn prove_confidential_command(
     identity: &GuestAttestationIdentity,
     envelope: SecretReleaseEnvelope,
-) -> Result<AttestedCommandProof, GuestCommandProofError> {
+) -> Result<ConfidentialCommandProof, GuestCommandProofError> {
     use sha2::Digest as _;
 
-    let opened = identity.open_secret_release(&envelope).await?;
-    let (request, expected_executable_sha256, secret) = opened.into_parts();
+    let opened = identity.open_confidential_command(&envelope).await?;
+    let (request, expected_executable_sha256, secret, response_key, request_envelope_sha256) =
+        opened.into_parts();
     let (parameters, command) = request.into_parts();
     let executable = read_attested_executable(command.program()).await?;
     let executable_sha256 = sha2::Sha256::digest(&executable).into();
@@ -1037,7 +1042,12 @@ async fn prove_released_secret(
     let signature = identity.sign_execution_record(&record);
     let receipt = AttestedCommandReceipt::new(record, output.stdout, output.stderr, signature);
     let attestation = identity.collect(parameters).await?;
-    Ok(AttestedCommandProof::new(attestation, receipt))
+    let proof = AttestedCommandProof::new(attestation, receipt);
+    Ok(seal_confidential_proof(
+        &proof,
+        &response_key,
+        request_envelope_sha256,
+    )?)
 }
 
 #[cfg(all(feature = "guest-runtime", target_os = "linux"))]

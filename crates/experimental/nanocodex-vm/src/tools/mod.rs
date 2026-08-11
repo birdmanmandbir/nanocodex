@@ -133,7 +133,10 @@ pub use guest::VmGuestError;
         all(target_os = "macos", target_arch = "aarch64")
     )
 ))]
-pub use runtime_disk::{GuestRuntimeDisk, GuestRuntimeDiskError, GuestRuntimeDiskStatus};
+pub use runtime_disk::{
+    GuestImageFile, GuestImageFilesystem, GuestImageManifestV1, GuestImageVerity, GuestRootImage,
+    GuestRuntimeDisk, GuestRuntimeDiskError, GuestRuntimeDiskStatus,
+};
 #[cfg(all(
     feature = "host",
     any(

@@ -77,6 +77,8 @@ mod confidential;
     )
 ))]
 mod config;
+#[cfg(feature = "host")]
+mod deployment_history;
 #[cfg(all(feature = "host", target_os = "linux", not(target_env = "musl")))]
 mod devices;
 #[cfg(all(
@@ -111,6 +113,14 @@ pub mod image;
     )
 ))]
 mod krun;
+#[cfg(all(
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
+mod measured_guest;
 #[cfg(all(
     feature = "host",
     any(
@@ -248,16 +258,28 @@ pub mod host {
             ConfidentialNvidiaProfile, ConfidentialVmError, ConfidentialVmProfile, CpuTee,
         },
         config::{BlockDevice, Network, RootFilesystem, SharedDirectory, VmConfig},
+        deployment_history::{
+            DeploymentAuthorizationAction, DeploymentHistoryEntry, DeploymentHistoryError,
+            VerifiedDeploymentHistory,
+        },
         egress::{
             EgressError, EgressFile, EgressLease, EgressMount, GUEST_EGRESS_ROOT,
             MAX_EGRESS_FILE_BYTES,
         },
         gvproxy::{Gvproxy, GvproxyError},
         krun::{KrunVm, KrunVmControl, VmError},
+        measured_guest::{
+            AuthenticatedGuestRootV1, DmVerityRootV1, MAX_MEASURED_GUEST_MANIFEST_BYTES,
+            ManifestSha256, ManifestSha384, MeasuredArtifactV1, MeasuredGuestArtifactsV1,
+            MeasuredGuestCpuV1, MeasuredGuestLaunchV1, MeasuredGuestManifestError,
+            MeasuredGuestManifestV1, MeasuredGuestReferenceV1, MeasuredGuestSourceV1,
+            MeasuredWorkloadV1, WorkloadComponentKindV1, WorkloadComponentV1,
+        },
         overlay::{OverlayDiskError, create_sparse_overlay_disk, overlay_guest_command},
         process::{PrivateVmProcessConfig, VmProcessConfig, VmProcessError},
         secret_release::{
-            MAX_SECRET_RELEASE_BYTES, SecretReleaseEnvelope, SecretReleaseError, seal_secret,
+            ConfidentialCommand, MAX_SECRET_RELEASE_BYTES, SecretReleaseError,
+            seal_confidential_command,
         },
         verification::{
             AttestationVerificationError, CpuVerifierSet, NativeEvidenceVerifier,
@@ -287,7 +309,6 @@ pub mod guest {
             GuestAttestationError, GuestAttestationIdentity, collect_attestation,
             detect_cpu_attestation_profile, detect_nvidia_attestation_profile,
         },
-        secret_release::{SecretReleaseEnvelope, SecretReleaseError},
     };
 }
 

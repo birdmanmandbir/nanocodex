@@ -316,10 +316,12 @@ impl VerifiedAttestation {
         &self.bundle
     }
 
-    /// Encrypts a secret and exact execution policy to this appraised guest.
+    /// Encrypts a command/input to this guest and retains the response key.
     ///
     /// The resulting envelope is safe to carry over an untrusted transport;
     /// only the X25519 key bound into this exact native evidence can open it.
+    /// The returned command keeps a relying-party-only key used to authenticate
+    /// and decrypt the guest's complete signed proof.
     /// `now_unix_seconds` is explicit so release authorization uses the
     /// relying party's trusted clock.
     ///
@@ -327,17 +329,15 @@ impl VerifiedAttestation {
     ///
     /// Returns an error for a legacy signing-only guest identity, an oversized
     /// secret, randomness failure, or authenticated-encryption failure.
-    pub fn seal_secret(
+    pub fn seal_confidential_command(
         &self,
         now_unix_seconds: u64,
         command: crate::command_proof::AttestedCommand,
         executable_sha256: [u8; 32],
         secret: &[u8],
-    ) -> Result<
-        crate::secret_release::SecretReleaseEnvelope,
-        crate::secret_release::SecretReleaseError,
-    > {
-        crate::secret_release::seal_secret(
+    ) -> Result<crate::secret_release::ConfidentialCommand, crate::secret_release::SecretReleaseError>
+    {
+        crate::secret_release::seal_confidential_command(
             self,
             now_unix_seconds,
             command,
@@ -735,7 +735,7 @@ mod tests {
                 .await
                 .unwrap();
         assert!(matches!(
-            verified.seal_secret(
+            verified.seal_confidential_command(
                 2_001,
                 AttestedCommand::new("/bin/consumer").unwrap(),
                 [5; 32],
@@ -750,14 +750,15 @@ mod tests {
         let stdin = b"released secret";
         let executable_sha256 = [5; 32];
         let argv = vec!["/bin/consumer".to_owned()];
-        let envelope = verified
-            .seal_secret(
+        let confidential_command = verified
+            .seal_confidential_command(
                 1_999,
                 AttestedCommand::new("/bin/consumer").unwrap(),
                 executable_sha256,
                 stdin,
             )
             .unwrap();
+        let (envelope, _, _) = confidential_command.into_parts();
         assert!(
             !serde_json::to_string(&envelope)
                 .unwrap()

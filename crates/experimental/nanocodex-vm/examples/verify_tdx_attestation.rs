@@ -44,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let proof = load_command_proof(&options.input)?;
             let (manifest, manifest_digest) = load_inference_manifest(manifest_path)?;
             let executable_digest: [u8; 32] = Sha256::digest(std::fs::read(local_guest)?).into();
-            if hex::encode(executable_digest) != manifest.guest_executable_sha256 {
+            if executable_digest != manifest.guest_executable_sha256() {
                 return Err(invalid_argument(
                     "--local-guest does not match guest_executable_sha256 in the manifest",
                 )

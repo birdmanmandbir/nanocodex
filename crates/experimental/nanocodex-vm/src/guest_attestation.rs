@@ -31,8 +31,8 @@ use crate::attestation::{
 };
 use crate::command_proof::{ExecutionRecord, receipt_signature_message};
 use crate::secret_release::{
-    MAX_OPENED_SECRET_RELEASES, OpenedSecretRelease, SecretReleaseEnvelope, SecretReleaseError,
-    open_secret,
+    MAX_OPENED_SECRET_RELEASES, OpenedConfidentialCommand, SecretReleaseEnvelope,
+    SecretReleaseError, open_confidential_command,
 };
 
 const TSM_REPORT_ROOT: &str = "/sys/kernel/config/tsm/report";
@@ -305,11 +305,11 @@ impl GuestAttestationIdentity {
             .to_bytes()
     }
 
-    pub(crate) async fn open_secret_release(
+    pub(crate) async fn open_confidential_command(
         &self,
         envelope: &SecretReleaseEnvelope,
-    ) -> Result<OpenedSecretRelease, SecretReleaseError> {
-        let opened = open_secret(envelope, &self.encryption_key)?;
+    ) -> Result<OpenedConfidentialCommand, SecretReleaseError> {
+        let opened = open_confidential_command(envelope, &self.encryption_key)?;
         let digest = envelope.digest();
         let mut consumed = self.opened_secret_releases.lock().await;
         register_secret_release(&mut consumed, digest)?;

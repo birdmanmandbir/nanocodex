@@ -17,7 +17,7 @@ use crate::{
     config::VmConfig,
     egress::EgressLease,
     process::{PrivateVmProcessConfig, VmProcessConfig, VmProcessError},
-    secret_release::SecretReleaseEnvelope,
+    secret_release::{ConfidentialCommand, SecretReleaseError, open_confidential_proof},
 };
 use nanocodex_tools::{ToolContext, ToolInput, ToolOutput, ToolResult, standard::StandardTool};
 use thiserror::Error;
@@ -33,10 +33,10 @@ use super::{
     protocol::{
         AttestRequest, AttestResponse, CancelRequest, ControlResponse, CreateDirectoryRequest,
         ExecuteRequest, ExecuteResponse, MemoryRequest, MemoryResponse, ProveCommandRequest,
-        ProveCommandResponse, ProveSecretCommandRequest, ReadFileRequest, ReadFileResponse,
-        ReadyRequest, SessionRequest, SessionResponse, ShutdownRequest,
-        TerminateToolProcessesRequest, ToolRequest, WireToolContext, WireToolInput,
-        WriteFileRequest,
+        ProveCommandResponse, ProveConfidentialCommandRequest, ProveConfidentialCommandResponse,
+        ReadFileRequest, ReadFileResponse, ReadyRequest, SessionRequest, SessionResponse,
+        ShutdownRequest, TerminateToolProcessesRequest, ToolRequest, WireToolContext,
+        WireToolInput, WriteFileRequest,
     },
 };
 
@@ -233,6 +233,10 @@ pub enum VmToolSessionError {
     /// The guest returned an application-level tool error.
     #[error("guest tool execution failed: {0}")]
     Guest(String),
+
+    /// The relying party could not authenticate or decode the encrypted proof.
+    #[error("confidential command response failed: {0}")]
+    ConfidentialCommand(#[source] SecretReleaseError),
 
     /// A trusted host-control command exceeded its deadline.
     #[error("guest command exceeded {timeout:?}")]
@@ -756,17 +760,17 @@ impl VmToolSession {
         self.handle.prove_command(request).await
     }
 
-    /// Decrypts an appraisal-gated secret in the guest and proves its authorized use.
+    /// Runs a verify-before-encrypt command without exposing request or response.
     ///
     /// # Errors
     ///
-    /// Returns an error when envelope authentication, exact executable
-    /// enforcement, execution, evidence collection, or transport fails.
-    pub async fn prove_secret_command(
+    /// Returns an error when request or response authentication, exact
+    /// executable enforcement, execution, evidence collection, or transport fails.
+    pub async fn prove_confidential_command(
         &self,
-        envelope: SecretReleaseEnvelope,
+        command: ConfidentialCommand,
     ) -> Result<AttestedCommandProof, VmToolSessionError> {
-        self.handle.prove_secret_command(envelope).await
+        self.handle.prove_confidential_command(command).await
     }
 
     /// Returns the best-effort peak memory observed for this VM session.
@@ -1054,25 +1058,33 @@ impl VmToolSessionHandle {
         }
     }
 
-    /// Decrypts an appraisal-gated secret and executes its encrypted command policy.
-    pub async fn prove_secret_command(
+    /// Executes an appraisal-gated policy and decrypts its signed proof locally.
+    pub async fn prove_confidential_command(
         &self,
-        envelope: SecretReleaseEnvelope,
+        command: ConfidentialCommand,
     ) -> Result<AttestedCommandProof, VmToolSessionError> {
+        let (envelope, response_key, envelope_sha256) = command.into_parts();
         let response = self
             .control_request(|id| {
-                SessionRequest::ProveSecretCommand(ProveSecretCommandRequest { id, envelope })
+                SessionRequest::ProveConfidentialCommand(ProveConfidentialCommandRequest {
+                    id,
+                    envelope,
+                })
             })
             .await?;
-        let SessionResponse::ProveSecretCommand(ProveCommandResponse { proof, error, .. }) =
-            response
+        let SessionResponse::ProveConfidentialCommand(ProveConfidentialCommandResponse {
+            proof,
+            error,
+            ..
+        }) = response
         else {
             return Err(VmToolSessionError::Protocol(
-                "expected a prove-secret-command response",
+                "expected a prove-confidential-command response",
             ));
         };
         match (proof, error) {
-            (Some(proof), None) => Ok(proof),
+            (Some(proof), None) => open_confidential_proof(&proof, &response_key, envelope_sha256)
+                .map_err(VmToolSessionError::ConfidentialCommand),
             (None, Some(error)) => Err(VmToolSessionError::Guest(error)),
             _ => Err(VmToolSessionError::Protocol(
                 "expected exactly one of proof or error",
@@ -1936,7 +1948,7 @@ const fn set_request_id(request: &mut SessionRequest, id: u64) {
         SessionRequest::Memory(request) => request.id = id,
         SessionRequest::Attest(request) => request.id = id,
         SessionRequest::ProveCommand(request) => request.id = id,
-        SessionRequest::ProveSecretCommand(request) => request.id = id,
+        SessionRequest::ProveConfidentialCommand(request) => request.id = id,
         SessionRequest::Execute(request) => request.id = id,
         SessionRequest::Cancel(request) => request.id = id,
         SessionRequest::TerminateToolProcesses(request) => request.id = id,

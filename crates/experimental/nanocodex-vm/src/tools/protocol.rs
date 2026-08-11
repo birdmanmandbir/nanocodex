@@ -4,7 +4,7 @@ use serde_json::value::RawValue;
 
 use crate::attestation::{GuestAttestation, GuestAttestationParameters};
 use crate::command_proof::{AttestedCommandProof, AttestedCommandRequest};
-use crate::secret_release::SecretReleaseEnvelope;
+use crate::secret_release::{ConfidentialCommandProof, SecretReleaseEnvelope};
 
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
@@ -17,7 +17,7 @@ pub(crate) enum SessionRequest {
     Memory(MemoryRequest),
     Attest(AttestRequest),
     ProveCommand(ProveCommandRequest),
-    ProveSecretCommand(ProveSecretCommandRequest),
+    ProveConfidentialCommand(ProveConfidentialCommandRequest),
     Execute(ExecuteRequest),
     Cancel(CancelRequest),
     TerminateToolProcesses(TerminateToolProcessesRequest),
@@ -36,7 +36,7 @@ impl SessionRequest {
             Self::Memory(request) => request.id,
             Self::Attest(request) => request.id,
             Self::ProveCommand(request) => request.id,
-            Self::ProveSecretCommand(request) => request.id,
+            Self::ProveConfidentialCommand(request) => request.id,
             Self::Execute(request) => request.id,
             Self::Cancel(request) => request.id,
             Self::TerminateToolProcesses(request) => request.id,
@@ -56,7 +56,7 @@ pub(crate) enum SessionResponse {
     Memory(MemoryResponse),
     Attest(AttestResponse),
     ProveCommand(ProveCommandResponse),
-    ProveSecretCommand(ProveCommandResponse),
+    ProveConfidentialCommand(ProveConfidentialCommandResponse),
     Execute(ExecuteResponse),
     Cancel(ControlResponse),
     TerminateToolProcesses(ControlResponse),
@@ -77,7 +77,7 @@ impl SessionResponse {
             Self::Memory(response) => response.id,
             Self::Attest(response) => response.id,
             Self::ProveCommand(response) => response.id,
-            Self::ProveSecretCommand(response) => response.id,
+            Self::ProveConfidentialCommand(response) => response.id,
             Self::Execute(response) => response.id,
         }
     }
@@ -209,7 +209,7 @@ pub(crate) struct ProveCommandRequest {
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ProveSecretCommandRequest {
+pub(crate) struct ProveConfidentialCommandRequest {
     pub id: u64,
     pub envelope: SecretReleaseEnvelope,
 }
@@ -219,6 +219,14 @@ pub(crate) struct ProveSecretCommandRequest {
 pub(crate) struct ProveCommandResponse {
     pub id: u64,
     pub proof: Option<AttestedCommandProof>,
+    pub error: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProveConfidentialCommandResponse {
+    pub id: u64,
+    pub proof: Option<ConfidentialCommandProof>,
     pub error: Option<String>,
 }
 
@@ -306,16 +314,17 @@ mod tests {
         AttestationChallenge, CpuAttestationProfile, GuestAttestationParameters,
     };
     use crate::command_proof::{AttestedCommand, AttestedCommandRequest};
-    use crate::secret_release::SecretReleaseEnvelope;
+    use crate::secret_release::{SecretReleaseEnvelope, test_seal_response};
     use nanocodex_tools::{ToolInput, ToolOutput, standard::StandardTool};
     use serde_json::{json, value::to_raw_value};
 
     use super::{
         AttestRequest, CancelRequest, ControlResponse, CreateDirectoryRequest, ExecuteRequest,
         ExecuteResponse, MemoryRequest, MemoryResponse, ProveCommandRequest,
-        ProveSecretCommandRequest, ReadFileRequest, ReadFileResponse, ReadyRequest, SessionRequest,
-        SessionResponse, ShutdownRequest, TerminateToolProcessesRequest, ToolRequest, ToolResponse,
-        WireToolContext, WireToolInput, WriteFileRequest,
+        ProveConfidentialCommandRequest, ProveConfidentialCommandResponse, ReadFileRequest,
+        ReadFileResponse, ReadyRequest, SessionRequest, SessionResponse, ShutdownRequest,
+        TerminateToolProcessesRequest, ToolRequest, ToolResponse, WireToolContext, WireToolInput,
+        WriteFileRequest,
     };
 
     #[test]
@@ -383,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn secret_release_request_round_trips_as_ciphertext_only() {
+    fn confidential_command_request_round_trips_as_ciphertext_only() {
         let envelope: SecretReleaseEnvelope = serde_json::from_value(json!({
             "version": 1,
             "recipient_key_sha256": vec![1; 32],
@@ -392,19 +401,48 @@ mod tests {
             "ciphertext": "AQIDBA=="
         }))
         .unwrap();
-        let request =
-            SessionRequest::ProveSecretCommand(ProveSecretCommandRequest { id: 13, envelope });
+        let request = SessionRequest::ProveConfidentialCommand(ProveConfidentialCommandRequest {
+            id: 13,
+            envelope,
+        });
         let encoded = serde_json::to_string(&request).unwrap();
 
         assert!(
-            encoded.starts_with(r#"{"kind":"prove_secret_command","payload":{"id":13,"envelope":"#)
+            encoded.starts_with(
+                r#"{"kind":"prove_confidential_command","payload":{"id":13,"envelope":"#
+            )
         );
         assert!(!encoded.contains("released secret"));
         let decoded = serde_json::from_str::<SessionRequest>(&encoded).unwrap();
-        let SessionRequest::ProveSecretCommand(decoded) = decoded else {
-            panic!("secret-release request changed variants");
+        let SessionRequest::ProveConfidentialCommand(decoded) = decoded else {
+            panic!("confidential-command request changed variants");
         };
         assert_eq!(decoded.id, 13);
+    }
+
+    #[test]
+    fn confidential_command_response_round_trips_as_ciphertext_only() {
+        let sentinel = b"dashboard-private-response-sentinel";
+        let response =
+            SessionResponse::ProveConfidentialCommand(ProveConfidentialCommandResponse {
+                id: 14,
+                proof: Some(test_seal_response(sentinel, &[0x31; 32], [0x72; 32])),
+                error: None,
+            });
+        let encoded = serde_json::to_vec(&response).unwrap();
+
+        assert!(
+            !encoded
+                .windows(sentinel.len())
+                .any(|window| window == sentinel)
+        );
+        let decoded = serde_json::from_slice::<SessionResponse>(&encoded).unwrap();
+        let SessionResponse::ProveConfidentialCommand(decoded) = decoded else {
+            panic!("confidential-command response changed variants");
+        };
+        assert_eq!(decoded.id, 14);
+        assert!(decoded.proof.is_some());
+        assert!(decoded.error.is_none());
     }
 
     #[test]

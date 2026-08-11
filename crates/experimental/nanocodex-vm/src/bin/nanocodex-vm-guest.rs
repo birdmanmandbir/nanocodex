@@ -21,6 +21,8 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 const MAX_ATTESTATION_REQUEST_BYTES: usize = 64 * 1024;
 #[cfg(target_os = "linux")]
 const MAX_INFERENCE_HTTP_BYTES: usize = 1024 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_INFERENCE_PROMPT_BYTES: usize = 64 * 1024;
 
 #[cfg(target_os = "linux")]
 #[tokio::main(flavor = "current_thread")]
@@ -47,6 +49,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 io::Error::new(io::ErrorKind::InvalidInput, "proof message must be UTF-8")
             })?
         );
+        return Ok(());
+    }
+    if first.as_deref() == Some(OsStr::new("--proof-stdin")) {
+        if arguments.next().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--proof-stdin accepts no arguments",
+            )
+            .into());
+        }
+        let mut input = Vec::new();
+        io::stdin()
+            .take((MAX_INFERENCE_PROMPT_BYTES + 1) as u64)
+            .read_to_end(&mut input)?;
+        if input.is_empty() || input.len() > MAX_INFERENCE_PROMPT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "proof input must contain 1 to 65536 bytes",
+            )
+            .into());
+        }
+        io::stdout().lock().write_all(&input)?;
         return Ok(());
     }
     if first.as_deref() == Some(OsStr::new("--proof-vllm-inference")) {
@@ -137,7 +161,6 @@ struct VllmProofOptions {
     image_reference: String,
     model: String,
     model_revision: String,
-    prompt: String,
 }
 
 #[cfg(target_os = "linux")]
@@ -148,11 +171,10 @@ impl VllmProofOptions {
         let image_reference = proof_argument(&mut arguments, "IMAGE_REFERENCE")?;
         let model = proof_argument(&mut arguments, "MODEL")?;
         let model_revision = proof_argument(&mut arguments, "MODEL_REVISION")?;
-        let prompt = proof_argument(&mut arguments, "PROMPT")?;
         if arguments.next().is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "--proof-vllm-inference accepts exactly six arguments",
+                "--proof-vllm-inference accepts exactly five arguments and reads the prompt from stdin",
             ));
         }
         if container.is_empty()
@@ -175,7 +197,6 @@ impl VllmProofOptions {
             image_reference,
             model,
             model_revision,
-            prompt,
         })
     }
 }
@@ -255,11 +276,24 @@ struct VllmInferenceProof {
 fn prove_vllm_inference(
     options: &VllmProofOptions,
 ) -> Result<VllmInferenceProof, Box<dyn std::error::Error>> {
+    let mut prompt = Vec::new();
+    io::stdin()
+        .take((MAX_INFERENCE_PROMPT_BYTES + 1) as u64)
+        .read_to_end(&mut prompt)?;
+    if prompt.is_empty() || prompt.len() > MAX_INFERENCE_PROMPT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "inference prompt must contain 1 to 65536 bytes",
+        )
+        .into());
+    }
+    let prompt = String::from_utf8(prompt)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "prompt must be UTF-8"))?;
     let before = inspect_vllm_container(&options.container)?;
     validate_vllm_container(options, &before)?;
     let request = json!({
         "model": options.model,
-        "messages": [{"role": "user", "content": options.prompt}],
+        "messages": [{"role": "user", "content": prompt}],
         "temperature": 0,
         "seed": 7,
         "max_tokens": 32,

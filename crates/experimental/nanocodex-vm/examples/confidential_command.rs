@@ -48,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = Options::parse()?;
     let executable_digest: [u8; 32] = Sha256::digest(std::fs::read(&options.guest)?).into();
     let runtime = GuestRuntimeDisk::prepare(&options.guest, &options.cache)?;
-    let runtime_digest = decode_digest(runtime.digest())?;
+    let workload_manifest_digest = decode_digest(runtime.manifest_digest())?;
     let (vm_profile, cpu_profile) = match options.cpu {
         #[cfg(feature = "development-attestation")]
         CpuProfile::Development => (None, CpuAttestationProfile::Development),
@@ -62,12 +62,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     };
 
-    let mut vm = VmConfig::ext4(runtime.path()).network(Network::Disabled);
+    let mut vm = match &vm_profile {
+        Some(_) => {
+            VmConfig::authenticated_ext4(runtime.path(), runtime.manifest().authenticated_root()?)
+        }
+        None => VmConfig::ext4(runtime.path()),
+    }
+    .network(Network::Disabled);
     if let Some(vm_profile) = vm_profile {
         vm = vm.confidential(vm_profile);
     }
     if matches!(options.cpu, CpuProfile::Snp) {
-        vm = vm.snp_launch_commitment(runtime_digest);
+        vm = vm.snp_launch_commitment(workload_manifest_digest);
     }
     if let Some(qgs) = options.qgs {
         vm = vm.tdx_quote_generation_socket(qgs);
@@ -99,8 +105,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let command = AttestedCommand::new(&argv[0])?
         .arg(&argv[1])?
         .arg(&argv[2])?;
-    let mut parameters =
-        GuestAttestationParameters::new(challenge.clone(), runtime_digest, cpu_profile, None);
+    let mut parameters = GuestAttestationParameters::new(
+        challenge.clone(),
+        workload_manifest_digest,
+        cpu_profile,
+        None,
+    );
     if matches!(options.cpu, CpuProfile::Tdx) {
         parameters = parameters.measure_workload_in_tdx_rtmr3();
     }
@@ -108,7 +118,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proof = tokio::time::timeout(Duration::from_secs(180), session.prove_command(request))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "command proof exceeded 180s"))??;
-    let expected = CommandProofExpectation::new(challenge, runtime_digest, executable_digest, argv);
+    let expected =
+        CommandProofExpectation::new(challenge, workload_manifest_digest, executable_digest, argv);
     let collected = verify_collected_command_proof(&proof, &expected)?;
     if collected.stdout() != format!("{}\n", options.message).as_bytes() {
         return Err(io::Error::other("authenticated command output was unexpected").into());
@@ -223,7 +234,7 @@ fn decode_digest(encoded: &str) -> Result<[u8; 32], io::Error> {
     bytes.try_into().map_err(|bytes: Vec<u8>| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("runtime digest was {} bytes; expected 32", bytes.len()),
+            format!("manifest digest was {} bytes; expected 32", bytes.len()),
         )
     })
 }

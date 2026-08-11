@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::confidential::ConfidentialVmProfile;
 #[cfg(all(target_os = "linux", not(target_env = "musl")))]
 use crate::devices::ConfidentialDeviceBundle;
+use crate::measured_guest::AuthenticatedGuestRootV1;
 
 /// Root filesystem exposed to one guest.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -13,6 +14,13 @@ pub enum RootFilesystem {
     Directory(PathBuf),
     /// A raw ext4 image attached as the guest's writable root block device.
     Ext4(PathBuf),
+    /// A read-only ext4 image authenticated before a confidential guest uses it.
+    AuthenticatedExt4 {
+        /// Combined ext4 data and dm-verity hash-tree device.
+        path: PathBuf,
+        /// Trusted UUID and dm-verity parameters measured at launch.
+        policy: AuthenticatedGuestRootV1,
+    },
     /// A guest OverlayFS with an immutable ext4 lower and writable ext4 upper.
     OverlayExt4 {
         /// Read-only disk containing the static Nanocodex guest runtime.
@@ -203,6 +211,27 @@ impl VmConfig {
         }
     }
 
+    /// Creates a confidential VM root whose dm-verity mapping must be selected
+    /// by measured early boot before the external filesystem is mounted.
+    pub fn authenticated_ext4(root: impl Into<PathBuf>, policy: AuthenticatedGuestRootV1) -> Self {
+        Self {
+            root: RootFilesystem::AuthenticatedExt4 {
+                path: root.into(),
+                policy,
+            },
+            cpus: 2,
+            memory_mib: 1_024,
+            network: Network::Internet,
+            block_devices: Vec::new(),
+            shared_directories: Vec::new(),
+            confidential_profile: None,
+            tdx_qgs_socket: None,
+            snp_launch_commitment: None,
+            #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+            confidential_devices: None,
+        }
+    }
+
     /// Creates a VM whose effective root is assembled by the guest.
     ///
     /// The runtime disk boots read-only as `/dev/vda`; the immutable lower is
@@ -319,6 +348,7 @@ impl VmConfig {
     pub fn root(&self) -> &Path {
         match &self.root {
             RootFilesystem::Directory(path) | RootFilesystem::Ext4(path) => path,
+            RootFilesystem::AuthenticatedExt4 { path, .. } => path,
             RootFilesystem::OverlayExt4 { runtime, .. } => runtime,
         }
     }

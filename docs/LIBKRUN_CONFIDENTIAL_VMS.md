@@ -9,6 +9,14 @@ It is intentionally about the VM and its attached confidential devices. Agent
 scheduling, fleet placement, model behavior, and proof that an arbitrary
 command executed are separate consumers and are not part of this program.
 
+The release-quality acceptance overlay is
+[`CONFIDENTIAL_DASHBOARD_GATES.md`](CONFIDENTIAL_DASHBOARD_GATES.md). A primitive
+is not treated as complete merely because it has an internal positive test: a
+thin deployed consumer and standalone verifier must prove every applicable
+dashboard and DevProof Stage 1 link before plaintext is sent.
+The signed manifest authorization and withdrawal contract is documented in
+[`CONFIDENTIAL_RELEASE_HISTORY.md`](CONFIDENTIAL_RELEASE_HISTORY.md).
+
 The outcome is a caller-selected confidential-VM profile which:
 
 1. fails before launch when the local host, libkrun artifact, firmware, or
@@ -316,11 +324,13 @@ different.
 
 ## libkrun upstream workstream
 
-Implementation uses a dedicated worktree and pins the reviewed `2.0.0-dev`
-fork revision `a638d2eef67ee3c602d80eb0d337befcf6eb351b`. It consists of the
+Implementation pins the reviewed `gakonst/libkrun` `2.0.0-dev` fork revision
+`220e328ef34a7ede8fedbf703071eabec5844b45`. It consists of the
 typed TEE base, TDX configfs GetQuote-to-QGS relay (`589ee44a`), Linux
 VFIO-cdev/IOMMUFD PCI assignment (`742f08c0`), configured TDX memory layout
-fix (`afb7a27`), and GetQuote KVM-exit dispatch fix (`a638d2e`). Nanocodex
+fix (`afb7a27`), GetQuote KVM-exit dispatch fix (`a638d2e`), authenticated
+`/dev/dm-0` TEE root selection (`b899185`), and vm-memory-independent block I/O
+integration (`220e328`). Nanocodex
 consumes the exact SHA so the active VMM boundary is reproducible. The changes
 are also maintained as upstream libkrun draft PR #812; its rebased head can
 move independently and is not an implicit dependency.
@@ -337,8 +347,8 @@ Remaining libkrun work after the implemented quote and PCI boundaries:
    not perform the prior KBS/LUKS attestation flow.
 2. Replace stale JSON fields and file-only TEE configuration with explicit,
    typed C/Rust APIs where the VMM needs policy or measurement inputs.
-3. Make TEE block-root and init behavior explicit so callers do not reference
-   APIs compiled out under `feature = "tee"`.
+3. Upstream the explicit TEE authenticated-root capability and `/dev/dm-0`
+   selection after live SNP and TDX boot validation.
 4. Complete production-quote validation on a KVM TDX host whose platform is
    enrolled with Intel PCS; launch, measured memory, GetQuote exit dispatch,
    QGS framing, and the guest configfs path are hardware-validated.
@@ -381,8 +391,23 @@ construct `AttestedVm` without a successful result.
 
 - [x] Add a bounded evidence-collection mode to the minimal static guest
   executable, separate from agent orchestration.
+- [x] Make the static supervisor and minimal ext4-plus-verity artifact
+  reproducible from a pinned compiler/lockfile, with bit-identical
+  independent-build tests and a strict timestamp-free image manifest.
+- [x] Generate a deterministic no-superblock dm-verity tree, publish its exact
+  table/root hash and whole-device identity, and reject tree corruption.
+- [x] Reject plain ext4 confidential roots, emit the exact dm-verity table as
+  measured kernel input, attach the combined device read-only, and require a
+  dedicated libkrun authenticated-root capability so older init code fails
+  preflight.
+- [x] Define a strict measured-launch manifest covering source/toolchain, VMM,
+  libkrun, firmware, kernel, initrd, command line, supervisor, authenticated
+  root, resources, application/container/model/configuration identities, and
+  backend-native reference values.
 - [ ] Produce a manifest covering VMM, libkrun, firmware, kernel, initrd,
   command line, attester, root image, and dm-verity root.
+- [ ] Pin the reviewed libkrun TEE-init revision and SEV/TDX libkrunfw builds
+  with built-in dm-init, dm-verity, and SHA-256 support.
 - [ ] Make immutable confidential roots reproducible and verifiable before
   mounting writable state.
 - [x] Add a single-request challenge/evidence protocol with bounded input,

@@ -24,6 +24,16 @@ members = [
 default-members = ["crates/nanocodex"]
 resolver = "2"
 
+[profile.reproducible-guest]
+inherits = "release"
+codegen-units = 1
+debug = 0
+incremental = false
+lto = "fat"
+opt-level = "z"
+panic = "abort"
+strip = "symbols"
+
 [workspace.package]
 version = "0.3.0"
 edition = "2024"
@@ -71,7 +81,7 @@ hudsucker = { version = "0.25.0", git = "https://github.com/gakonst/hudsucker", 
 ignore = "0.4.31"
 jiff = { version = "0.2.35", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 jsonschema = { version = "0.48.5", default-features = false }
-krun = { package = "libkrun", version = "=2.0.0-dev", git = "https://github.com/gakonst/libkrun", rev = "ed8ea578073c795ca156cf5de0bcb9ad92571e99", features = ["blk", "net"] }
+krun = { package = "libkrun", version = "=2.0.0-dev", git = "https://github.com/gakonst/libkrun", rev = "220e328ef34a7ede8fedbf703071eabec5844b45", features = ["blk", "net"] }
 mpp = { version = "=0.11.0", git = "https://github.com/tempoxyz/mpp-rs", rev = "3e37469bb19434982b433ae44ea8c713f7ea923a", default-features = false }
 nanocodex = { version = "0.3.0", path = "crates/nanocodex" }
 nanocodex-agent = { version = "0.3.0", path = "crates/nanocodex-agent" }

@@ -32,10 +32,10 @@ pub enum KrunFeature {
     AwsNitro = 9,
     /// `VirGL` resource-map version 2 support.
     VirglResourceMap2 = 10,
-    /// Embedded guest init-blob support.
-    InitBlob = 11,
     /// Linux VFIO cdev and IOMMUFD PCI assignment support.
     Vfio = 12,
+    /// TEE init support for a fail-closed authenticated root mapper.
+    TeeAuthenticatedRoot = 13,
 }
 
 const FEATURES: [KrunFeature; 11] = [
@@ -48,8 +48,8 @@ const FEATURES: [KrunFeature; 11] = [
     KrunFeature::IntelTdx,
     KrunFeature::AwsNitro,
     KrunFeature::VirglResourceMap2,
-    KrunFeature::InitBlob,
     KrunFeature::Vfio,
+    KrunFeature::TeeAuthenticatedRoot,
 ];
 
 /// Host and build capabilities relevant when configuring a VM.
@@ -77,7 +77,7 @@ impl Capabilities {
         )?;
         let mut features = BTreeSet::new();
         for feature in FEATURES {
-            if bool_status(
+            if optional_feature_status(
                 krun::krun_has_feature(feature as u64),
                 "query compiled feature",
             )? {
@@ -133,6 +133,14 @@ impl Capabilities {
     }
 }
 
+const fn optional_feature_status(status: i32, operation: &'static str) -> Result<bool, VmError> {
+    if status == -nix::libc::EINVAL {
+        Ok(false)
+    } else {
+        bool_status(status, operation)
+    }
+}
+
 fn positive(status: i32, operation: &'static str) -> Result<u32, VmError> {
     u32::try_from(status).map_err(|_| VmError::Libkrun {
         operation,
@@ -148,5 +156,17 @@ const fn bool_status(status: i32, operation: &'static str) -> Result<bool, VmErr
             operation,
             errno: status.saturating_neg(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_feature_added_after_the_linked_libkrun_is_reported_unavailable() {
+        assert!(!optional_feature_status(-nix::libc::EINVAL, "test").unwrap());
+        assert!(optional_feature_status(1, "test").unwrap());
+        assert!(optional_feature_status(-nix::libc::EIO, "test").is_err());
     }
 }

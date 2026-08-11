@@ -50,6 +50,9 @@ guest-runtime = [
 # transport and receipt path on an ordinary KVM host. Native verification always
 # rejects this profile.
 development-attestation = []
+# Host-only online Intel PCS retrieval for the operational collateral example.
+# The production verifier remains offline unless callers select this explicitly.
+collateral-fetch = ["host", "dcap-qvl/report"]
 # Dedicated host artifacts select exactly one libkrun TEE implementation. These
 # features are intentionally not part of `host` or the ordinary workspace build.
 libkrun-amd-sev = ["host", "krun/amd-sev", "krun/vfio"]
@@ -114,6 +117,22 @@ required-features = ["guest-runtime"]
 
 [[example]]
 name = "confidential_host"
+required-features = ["host"]
+
+[[example]]
+name = "build_reproducible_guest"
+required-features = ["host"]
+
+[[example]]
+name = "authorize_confidential_manifest"
+required-features = ["host"]
+
+[[example]]
+name = "fetch_tdx_collateral"
+required-features = ["collateral-fetch"]
+
+[[example]]
+name = "confidential_transport_secret"
 required-features = ["host"]
 
 [[example]]

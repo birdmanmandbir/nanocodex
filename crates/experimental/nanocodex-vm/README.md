@@ -43,9 +43,16 @@ Linux VMM artifacts opt into exactly one compile-time libkrun variant with
 `just build-vm-host-amd-sev` or `just build-vm-host-intel-tdx`. The builds use
 separate target directories, and selecting both crate features is a compile
 error. The requested profile is then selected through libkrun's typed TEE API
-before CPU and memory configuration; TEE roots use libkrun's fixed `/dev/vda`
-guest-init path and split IRQ-chip mode. These launch mechanics do not open the
-attestation gate described above.
+before CPU and memory configuration and uses split IRQ-chip mode. Confidential
+profiles accept only [`host::VmConfig::authenticated_ext4`]: Nanocodex appends
+the exact dm-verity table to measured kernel input, attaches `/dev/vda`
+read-only, and requires libkrun TEE init support that mounts only `/dev/dm-0`.
+The workspace pins the reviewed `gakonst/libkrun` revision
+`220e328ef34a7ede8fedbf703071eabec5844b45` and its explicit authenticated-root
+capability. Matching SEV/TDX firmware builds pin `gakonst/libkrunfw` revision
+`5c2a7dd1d1bf62a8773e1e4dfac06b240cc5fe10` and verify built-in dm-init,
+dm-verity, device mapper, and SHA-256 support. These launch mechanics alone do
+not open the attestation gate described above.
 
 ```no_run
 use nanocodex_vm::host::{Capabilities, ConfidentialVmProfile};
@@ -78,6 +85,33 @@ host report is discovery rather than attestation: only evidence from the
 particular launched guest can eventually authorize an `AttestedVm` or secret
 release. Command receipts are implemented as a separate consumer below;
 ordinary agent execution is not treated as an attestation claim.
+
+### Reproducible guest artifacts and measured manifests
+
+`just build-vm-guest-reproducible` builds the static supervisor with a pinned
+compiler and deterministic release profile. `just build-reproducible-guest-image`
+then publishes bit-identical ext4 bytes with an appended no-superblock
+dm-verity tree plus a strict
+[`tools::GuestImageManifestV1`]. Independent builds of identical supervisor
+bytes must produce identical filesystem, verity tree, root-device, and manifest
+bytes. The manifest's verity root is ready to enter measured boot, but current
+libkrun guest init does not yet select or enforce that mapping.
+
+The image manifest is artifact identity, not a complete attestation policy.
+[`host::MeasuredGuestManifestV1`] separately covers the source/toolchain,
+VMM, libkrun, firmware, kernel, initrd, command line, supervisor, authenticated
+root, resources, application/container/model/configuration identities, argv,
+and CPU-specific offline reference values. It deliberately has no constructor
+for a plain read-only root; production use requires a dm-verity policy enforced
+by measured early guest code. Plain [`host::VmConfig::ext4`] is rejected for a
+confidential profile rather than serving as a compatibility fallback.
+
+The exact commands, schema boundary, provenance design, and remaining libkrun
+enforcement gate are documented in
+[`docs/REPRODUCIBLE_CONFIDENTIAL_GUEST.md`](../../../docs/REPRODUCIBLE_CONFIDENTIAL_GUEST.md).
+The external acceptance bar and current gaps against Andrew Miller's
+private-inference dashboard and DevProof Stage 1 are tracked in
+[`docs/CONFIDENTIAL_DASHBOARD_GATES.md`](../../../docs/CONFIDENTIAL_DASHBOARD_GATES.md).
 
 Run `just confidential-capabilities` on any host to print each profile's
 launch blockers separately from claims which can only be checked after launch.
@@ -127,7 +161,7 @@ just attest-libkrun-tdx /run/tdx-qgs/qgs.socket
 ```
 
 These build the static guest and matching dedicated libkrun VMM, create the
-minimal measured ext4 runtime, launch the confidential VM, send a fresh host
+minimal reproducible ext4 runtime, launch the confidential VM, send a fresh host
 challenge through [`tools::VmToolSession::attest`], verify the guest's Ed25519
 possession proof, print the bundle, and shut down. The TDX form additionally
 relays guest configfs GetQuote exits to the selected QGS Unix socket with QGS
@@ -391,13 +425,15 @@ let secret = b"one-time model or tool credential";
 let secret_sha256: [u8; 32] = Sha256::digest(secret).into();
 let program = "/opt/secret-consumer";
 let command = AttestedCommand::new(program)?.arg("--once")?;
-let envelope = verified.seal_secret(
+let confidential_command = verified.seal_confidential_command(
     now_unix_seconds,
     command,
     executable_sha256,
     secret,
 )?;
-let proof = session.prove_secret_command(envelope).await?;
+let proof = session
+    .prove_confidential_command(confidential_command)
+    .await?;
 
 let expected = CommandProofExpectation::new(
     verified.bundle().request().challenge().clone(),
@@ -413,8 +449,11 @@ assert_eq!(result.record().stdin_sha256(), &secret_sha256);
 ```
 
 The guest decrypts only after appraisal, checks the executable's exact bytes,
-executes them from a sealed `memfd`, writes the secret only to stdin, zeroizes
-plaintext buffers, and signs the stdin/output/termination receipt. Each
+executes them from a sealed `memfd`, writes the secret only to stdin, encrypts
+the complete signed stdin/output/termination proof to the relying-party-only
+response key, and zeroizes plaintext buffers. Request and response keys use
+distinct HKDF domains; the response AEAD also binds the request-envelope
+digest. Each
 envelope is one-time for a retained identity; exact replay is rejected and the
 in-memory replay ledger is bounded. A newly sealed envelope is a new relying-
 party authorization.
@@ -467,8 +506,8 @@ just attest-libkrun-tdx-b200 b200-single b200-single.json nvidia-runtime.ext4 /r
 just attest-libkrun-tdx-b200 b200-hgx8 b200-hgx8.json nvidia-runtime.ext4 /run/tdx-qgs/qgs.socket
 ```
 
-Unlike the CPU-only recipe, a B200 launch cannot use the generated 128 MiB
-single-binary runtime: native GPU evidence requires NVIDIA's guest kernel
+Unlike the CPU-only recipe, a B200 launch cannot use the generated minimal
+single-binary authenticated root: native GPU evidence requires NVIDIA's guest kernel
 driver and `nvattest`. The required `runtime` argument is a caller-built,
 reviewed ext4 image containing `/nanocodex-vm-guest`, the NVIDIA guest stack
 matching libkrun's guest kernel, and `nvattest` on `PATH`. Its
@@ -725,9 +764,12 @@ gvproxy workspaces do not receive host resolver injection. Directory roots are
 host-backed development escape hatches and are not rewritten.
 
 [`tools::GuestRuntimeDisk::prepare`] hashes the exact companion ELF and
-atomically publishes a reusable 128 MiB ext4 disk. The runtime disk is mounted
-read-only, independently from the writable project root. That keeps the guest
-implementation identical across a sweep without mutating every root image.
+atomically publishes a reusable 128 MiB ext4 data region with an appended
+dm-verity tree. The runtime device is mounted read-only, independently from the
+writable project root. Current libkrun guest init mounts the ext4 region
+directly; confidential release remains gated until measured early boot selects
+the published verity root. The separate device keeps the guest implementation
+identical across a sweep without mutating every project image.
 
 Directory roots are a lower-level development escape hatch. They must already
 contain `/usr/local/bin/nanocodex-vm-guest`, and direct virtiofs access does

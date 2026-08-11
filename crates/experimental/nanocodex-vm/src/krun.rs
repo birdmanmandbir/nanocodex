@@ -32,6 +32,7 @@ use crate::{
     command::GuestCommand,
     confidential::{ConfidentialVmError, ConfidentialVmProfile, CpuTee},
     config::{BlockDevice, Network, RootFilesystem, SharedDirectory, VmConfig},
+    measured_guest::AuthenticatedGuestRootV1,
 };
 
 #[cfg(not(any(feature = "libkrun-amd-sev", feature = "libkrun-intel-tdx")))]
@@ -220,6 +221,10 @@ pub struct KrunVm {
 enum ResolvedRoot {
     Directory(PathBuf),
     Ext4(PathBuf),
+    AuthenticatedExt4 {
+        path: PathBuf,
+        policy: AuthenticatedGuestRootV1,
+    },
     OverlayExt4 {
         runtime: PathBuf,
         lower: PathBuf,
@@ -261,6 +266,9 @@ impl KrunVm {
             configure_confidential_context(context, profile)?;
             attach_snp_host_data(context, config)?;
         }
+        if let ResolvedRoot::AuthenticatedExt4 { policy, .. } = &root {
+            configure_authenticated_root(context, policy)?;
+        }
 
         check(
             krun::krun_set_vm_config(context, config.cpus_value(), config.memory_mib_value()),
@@ -273,6 +281,9 @@ impl KrunVm {
             }
             ResolvedRoot::Ext4(root) => {
                 attach_root_disk(context, &root, false)?;
+            }
+            ResolvedRoot::AuthenticatedExt4 { path, .. } => {
+                attach_root_disk(context, &path, true)?;
             }
             ResolvedRoot::OverlayExt4 {
                 runtime,
@@ -430,6 +441,16 @@ fn resolve_root(root: &RootFilesystem) -> Result<ResolvedRoot, VmError> {
             }
             Ok(ResolvedRoot::Ext4(resolved))
         }
+        RootFilesystem::AuthenticatedExt4 { path, policy } => {
+            let resolved = resolve_root_path(path)?;
+            if !resolved.is_file() {
+                return Err(VmError::RootNotFile(resolved));
+            }
+            Ok(ResolvedRoot::AuthenticatedExt4 {
+                path: resolved,
+                policy: policy.clone(),
+            })
+        }
         RootFilesystem::OverlayExt4 {
             runtime,
             lower,
@@ -496,6 +517,47 @@ fn attach_root_disk(context: u32, path: &std::path::Path, read_only: bool) -> Re
             "select root disk",
         )
     }
+}
+
+fn configure_authenticated_root(
+    context: u32,
+    policy: &AuthenticatedGuestRootV1,
+) -> Result<(), VmError> {
+    for argument in authenticated_root_kernel_arguments(policy)? {
+        let argument = c_string(OsStr::new(&argument), "authenticated-root kernel argument")?;
+        // SAFETY: the C string remains valid for the call and libkrun copies
+        // the argument into its owned context.
+        check(
+            unsafe { krun::krun_append_kernel_cmdline(context, argument.as_ptr()) },
+            "configure authenticated root",
+        )?;
+    }
+    Ok(())
+}
+
+fn authenticated_root_kernel_arguments(
+    policy: &AuthenticatedGuestRootV1,
+) -> Result<[String; 3], VmError> {
+    let verity = policy.verity();
+    let sectors_per_block = u64::from(verity.data_block_bytes() / 512);
+    let sectors = verity
+        .data_blocks()
+        .checked_mul(sectors_per_block)
+        .ok_or(VmError::InvalidConfig("dm-verity sector count overflow"))?;
+    let table = format!(
+        "dm-mod.create=\"nanocodex-root,,,ro,0 {sectors} verity 1 /dev/vda /dev/vda {} {} {} {} sha256 {} {}\"",
+        verity.data_block_bytes(),
+        verity.hash_block_bytes(),
+        verity.data_blocks(),
+        verity.hash_start_block(),
+        verity.root_hash().to_hex(),
+        verity.salt().to_hex(),
+    );
+    Ok([
+        "dm-mod.waitfor=/dev/vda".to_owned(),
+        table,
+        "KRUN_TEE_AUTHENTICATED_ROOT=/dev/dm-0".to_owned(),
+    ])
 }
 
 #[cfg(not(any(feature = "libkrun-amd-sev", feature = "libkrun-intel-tdx")))]
@@ -840,6 +902,14 @@ fn validate_guest_command(command: &GuestCommand) -> Result<(), VmError> {
 
 fn validate_confidential_config(config: &VmConfig) -> Result<(), ConfidentialVmError> {
     let Some(profile) = config.confidential_profile() else {
+        if matches!(
+            config.root_filesystem(),
+            RootFilesystem::AuthenticatedExt4 { .. }
+        ) {
+            return Err(ConfidentialVmError::InvalidConfig(
+                "an authenticated ext4 root requires a confidential VM profile",
+            ));
+        }
         if config.tdx_qgs_socket().is_some() {
             return Err(ConfidentialVmError::InvalidConfig(
                 "Intel QGS transport requires an Intel TDX profile",
@@ -858,9 +928,12 @@ fn validate_confidential_config(config: &VmConfig) -> Result<(), ConfidentialVmE
         }
         return Ok(());
     };
-    if !matches!(config.root_filesystem(), RootFilesystem::Ext4(_)) {
+    if !matches!(
+        config.root_filesystem(),
+        RootFilesystem::AuthenticatedExt4 { .. }
+    ) {
         return Err(ConfidentialVmError::InvalidConfig(
-            "confidential VMs require one raw ext4 root disk",
+            "confidential VMs require one authenticated ext4 root disk",
         ));
     }
     if !config.shared_directories().is_empty() {
@@ -992,12 +1065,32 @@ mod tests {
     use std::{ffi::OsStr, path::Path};
 
     use super::{
-        GuestCommand, VmError, array_string, validate_confidential_config, validate_guest_command,
+        GuestCommand, VmError, array_string, authenticated_root_kernel_arguments,
+        validate_confidential_config, validate_guest_command,
     };
     use crate::{
         confidential::{ConfidentialVmError, ConfidentialVmProfile},
         config::{SharedDirectory, VmConfig},
+        measured_guest::{AuthenticatedGuestRootV1, DmVerityRootV1, ManifestSha256},
     };
+
+    fn authenticated_root() -> AuthenticatedGuestRootV1 {
+        AuthenticatedGuestRootV1::dm_verity(
+            "1aeaa032-f3de-8440-9a74-d2f15581bfba",
+            DmVerityRootV1::new(
+                ManifestSha256::digest(b"root hash"),
+                ManifestSha256::digest(b"salt"),
+                32_768,
+                32_768,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn authenticated_config(path: &str) -> VmConfig {
+        VmConfig::authenticated_ext4(path, authenticated_root())
+    }
 
     #[test]
     fn libkrun_array_values_reject_unrepresentable_quotes() {
@@ -1030,11 +1123,28 @@ mod tests {
         assert!(matches!(
             validate_confidential_config(&directory_root),
             Err(ConfidentialVmError::InvalidConfig(
-                "confidential VMs require one raw ext4 root disk"
+                "confidential VMs require one authenticated ext4 root disk"
             ))
         ));
 
-        let shared = VmConfig::ext4("root.ext4")
+        let plain_ext4 =
+            VmConfig::ext4("root.ext4").confidential(ConfidentialVmProfile::amd_sev_snp());
+        assert!(matches!(
+            validate_confidential_config(&plain_ext4),
+            Err(ConfidentialVmError::InvalidConfig(
+                "confidential VMs require one authenticated ext4 root disk"
+            ))
+        ));
+
+        let no_profile = authenticated_config("root.ext4.verity");
+        assert!(matches!(
+            validate_confidential_config(&no_profile),
+            Err(ConfidentialVmError::InvalidConfig(
+                "an authenticated ext4 root requires a confidential VM profile"
+            ))
+        ));
+
+        let shared = authenticated_config("root.ext4.verity")
             .shared_directory(SharedDirectory::read_only("host", "/host"))
             .confidential(ConfidentialVmProfile::amd_sev_snp());
         assert!(matches!(
@@ -1054,7 +1164,7 @@ mod tests {
             ConfidentialVmError::InvalidConfig("Intel QGS transport requires an Intel TDX profile")
         );
 
-        let config = VmConfig::ext4("root.ext4")
+        let config = authenticated_config("root.ext4.verity")
             .confidential(ConfidentialVmProfile::amd_sev_snp())
             .tdx_quote_generation_socket("/run/tdx-qgs/qgs.socket");
 
@@ -1079,7 +1189,7 @@ mod tests {
             )
         );
 
-        let missing = VmConfig::ext4("root.ext4")
+        let missing = authenticated_config("root.ext4.verity")
             .confidential(ConfidentialVmProfile::amd_sev_snp().nvidia_b200_single());
         assert_eq!(
             validate_confidential_config(&missing).unwrap_err(),
@@ -1088,7 +1198,7 @@ mod tests {
             )
         );
 
-        let matching = VmConfig::ext4("root.ext4")
+        let matching = authenticated_config("root.ext4.verity")
             .confidential(ConfidentialVmProfile::amd_sev_snp().nvidia_b200_single())
             .confidential_devices(bundle);
         validate_confidential_config(&matching).unwrap();
@@ -1096,7 +1206,7 @@ mod tests {
 
     #[test]
     fn confidential_preflight_fails_before_root_or_context_creation() {
-        let config = VmConfig::ext4("/path/which/must/not/be-resolved.ext4")
+        let config = authenticated_config("/path/which/must/not/be-resolved.ext4.verity")
             .confidential(ConfidentialVmProfile::amd_sev_snp());
 
         let error = match super::KrunVm::new(&config) {
@@ -1110,5 +1220,24 @@ mod tests {
         {
             assert!(!missing.is_empty());
         }
+    }
+
+    #[test]
+    fn authenticated_root_kernel_arguments_are_exact_and_fail_closed() {
+        let policy = authenticated_root();
+        let verity = policy.verity();
+
+        assert_eq!(
+            authenticated_root_kernel_arguments(&policy).unwrap(),
+            [
+                "dm-mod.waitfor=/dev/vda".to_owned(),
+                format!(
+                    "dm-mod.create=\"nanocodex-root,,,ro,0 262144 verity 1 /dev/vda /dev/vda 4096 4096 32768 32768 sha256 {} {}\"",
+                    verity.root_hash().to_hex(),
+                    verity.salt().to_hex(),
+                ),
+                "KRUN_TEE_AUTHENTICATED_ROOT=/dev/dm-0".to_owned(),
+            ]
+        );
     }
 }

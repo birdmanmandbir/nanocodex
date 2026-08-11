@@ -8,27 +8,30 @@ use std::{
 };
 
 use nanocodex_vm::host::{
-    AttestedCommandProof, GuestAttestation, VerifiedAttestation, VerifiedCommandProof,
+    AttestedCommandProof, GuestAttestation, ManifestSha256, MeasuredGuestCpuV1,
+    MeasuredGuestManifestV1, MeasuredGuestReferenceV1, VerifiedAttestation, VerifiedCommandProof,
+    WorkloadComponentKindV1,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const MAX_ATTESTATION_BYTES: usize = 16 * 1024 * 1024;
-const MAX_MANIFEST_BYTES: usize = 64 * 1024;
+const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
+const INFERENCE_CONFIG_DOMAIN: &[u8] = b"nanocodex-vm-vllm-inference-config-v1\0";
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InferenceManifest {
     pub schema_version: u32,
     pub policy_id: String,
+    pub measured_guest: MeasuredGuestManifestV1,
     pub guest_program: String,
-    pub guest_executable_sha256: String,
     pub container: String,
     pub server_image_id: String,
     pub server_image_reference: String,
     pub model: String,
     pub model_revision: String,
-    pub prompt: String,
+    pub model_snapshot_sha256: String,
 }
 
 impl InferenceManifest {
@@ -41,9 +44,52 @@ impl InferenceManifest {
             self.server_image_reference.clone(),
             self.model.clone(),
             self.model_revision.clone(),
-            self.prompt.clone(),
         ]
     }
+
+    pub const fn guest_executable_sha256(&self) -> [u8; 32] {
+        *self
+            .measured_guest
+            .artifacts()
+            .supervisor()
+            .sha256()
+            .as_bytes()
+    }
+
+    pub fn tdx_reference(&self) -> Result<([u8; 48], [[u8; 48]; 4]), io::Error> {
+        let MeasuredGuestReferenceV1::IntelTdx {
+            mrtd,
+            rtmr0,
+            rtmr1,
+            rtmr2,
+            rtmr3_baseline,
+        } = self.measured_guest.reference()
+        else {
+            return Err(invalid_argument(
+                "inference manifest does not contain TDX reference values",
+            ));
+        };
+        Ok((
+            *mrtd.as_bytes(),
+            [
+                *rtmr0.as_bytes(),
+                *rtmr1.as_bytes(),
+                *rtmr2.as_bytes(),
+                *rtmr3_baseline.as_bytes(),
+            ],
+        ))
+    }
+}
+
+#[derive(Serialize)]
+struct InferenceConfiguration<'a> {
+    policy_id: &'a str,
+    guest_program: &'a str,
+    container: &'a str,
+    server_image_id: &'a str,
+    server_image_reference: &'a str,
+    model: &'a str,
+    model_revision: &'a str,
 }
 
 #[derive(Serialize)]
@@ -105,14 +151,73 @@ pub fn load_command_proof(path: &Path) -> Result<AttestedCommandProof, Box<dyn s
 pub fn load_inference_manifest(
     path: &Path,
 ) -> Result<(InferenceManifest, [u8; 32]), Box<dyn std::error::Error>> {
-    use sha2::{Digest as _, Sha256};
-
     let bytes = read_bounded(path, MAX_MANIFEST_BYTES)?;
-    let digest = Sha256::digest(&bytes).into();
     let manifest: InferenceManifest = serde_json::from_slice(&bytes)?;
     if manifest.schema_version != 1 {
         return Err(invalid_argument("unsupported inference manifest version").into());
     }
+    if manifest.measured_guest.cpu() != MeasuredGuestCpuV1::IntelTdx
+        || manifest.measured_guest.workload().argv() != manifest.argv()
+    {
+        return Err(invalid_argument(
+            "inference policy requires a TDX measured guest with the exact vLLM argv",
+        )
+        .into());
+    }
+    let image_sha256 = manifest
+        .server_image_reference
+        .rsplit_once("@sha256:")
+        .ok_or_else(|| invalid_argument("server_image_reference must pin an OCI digest"))?
+        .1;
+    let image_sha256 = ManifestSha256::from_hex(image_sha256)?;
+    let model_sha256 = ManifestSha256::from_hex(&manifest.model_snapshot_sha256)?;
+    let config = serde_json::to_vec(&InferenceConfiguration {
+        policy_id: &manifest.policy_id,
+        guest_program: &manifest.guest_program,
+        container: &manifest.container,
+        server_image_id: &manifest.server_image_id,
+        server_image_reference: &manifest.server_image_reference,
+        model: &manifest.model,
+        model_revision: &manifest.model_revision,
+    })?;
+    let mut config_preimage = INFERENCE_CONFIG_DOMAIN.to_vec();
+    config_preimage.extend_from_slice(&config);
+    let config_sha256 = ManifestSha256::digest(config_preimage);
+    for (kind, name, expected) in [
+        (
+            WorkloadComponentKindV1::ContainerImage,
+            "vllm-image",
+            image_sha256,
+        ),
+        (
+            WorkloadComponentKindV1::ModelWeights,
+            "model-snapshot",
+            model_sha256,
+        ),
+        (
+            WorkloadComponentKindV1::Configuration,
+            "vllm-inference-config",
+            config_sha256,
+        ),
+    ] {
+        if !manifest
+            .measured_guest
+            .workload()
+            .components()
+            .iter()
+            .any(|component| {
+                component.kind() == kind
+                    && component.name() == name
+                    && component.sha256() == expected
+            })
+        {
+            return Err(invalid_argument(format!(
+                "measured guest is missing exact {name} component {expected:?}"
+            ))
+            .into());
+        }
+    }
+    let digest = *manifest.measured_guest.digest()?.as_bytes();
     Ok((manifest, digest))
 }
 

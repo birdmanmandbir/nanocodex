@@ -438,6 +438,38 @@ impl GuestAttestationParameters {
         }
     }
 
+    /// Creates parameters from the canonical digest and CPU profile of a
+    /// complete measured-guest manifest.
+    ///
+    /// TDX manifests automatically select the hardware RTMR3 extension path;
+    /// SNP and Nitro retain their backend-native launch/PCR binding. The caller
+    /// must still configure SNP `HOST_DATA` with the same digest before launch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest cannot be canonically encoded.
+    #[cfg(feature = "host")]
+    pub fn from_measured_guest_manifest(
+        challenge: AttestationChallenge,
+        manifest: &crate::measured_guest::MeasuredGuestManifestV1,
+        nvidia_profile: Option<NvidiaAttestationProfile>,
+    ) -> Result<Self, crate::measured_guest::MeasuredGuestManifestError> {
+        use crate::measured_guest::MeasuredGuestCpuV1;
+
+        let cpu = match manifest.cpu() {
+            MeasuredGuestCpuV1::AmdSevSnp => CpuAttestationProfile::AmdSevSnp,
+            MeasuredGuestCpuV1::IntelTdx => CpuAttestationProfile::IntelTdx,
+            MeasuredGuestCpuV1::AwsNitro => CpuAttestationProfile::AwsNitro,
+        };
+        let digest = *manifest.digest()?.as_bytes();
+        let parameters = Self::new(challenge, digest, cpu, nvidia_profile);
+        Ok(if cpu == CpuAttestationProfile::IntelTdx {
+            parameters.measure_workload_in_tdx_rtmr3()
+        } else {
+            parameters
+        })
+    }
+
     /// Requires a hardware RTMR3 extension of the workload manifest before a TDX quote.
     #[must_use]
     pub const fn measure_workload_in_tdx_rtmr3(mut self) -> Self {

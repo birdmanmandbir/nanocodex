@@ -121,9 +121,9 @@ jobs:
           RUSTDOCFLAGS: -D warnings
 
   vm-guest:
-    name: static Linux VM guest
+    name: reproducible static Linux VM guest
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
@@ -132,7 +132,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
         with:
-          toolchain: stable
+          toolchain: 1.97.1
           targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         with:
@@ -142,12 +142,29 @@ jobs:
         run: >-
           cargo check --locked --package nanocodex-vm --all-targets
           --no-default-features --features guest-runtime
-      - name: Build the actual static guest artifact
-        run: >-
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
-          cargo build --locked --package nanocodex-vm
-          --bin nanocodex-vm-guest --no-default-features
-          --features guest-runtime --target x86_64-unknown-linux-musl
+      - name: Reproduce the static guest and published image
+        run: |
+          ./scripts/build-reproducible-vm-guest.sh \
+            x86_64-unknown-linux-musl target/reproducible-guest-a
+          ./scripts/build-reproducible-vm-guest.sh \
+            x86_64-unknown-linux-musl target/reproducible-guest-b
+          cmp \
+            target/reproducible-guest-a/x86_64-unknown-linux-musl/reproducible-guest/nanocodex-vm-guest \
+            target/reproducible-guest-b/x86_64-unknown-linux-musl/reproducible-guest/nanocodex-vm-guest
+          cargo run --locked --package nanocodex-vm \
+            --example build_reproducible_guest -- \
+            --guest target/reproducible-guest-a/x86_64-unknown-linux-musl/reproducible-guest/nanocodex-vm-guest \
+            --cache target/reproducible-image-cache-a \
+            --output target/reproducible-image-a
+          cargo run --locked --package nanocodex-vm \
+            --example build_reproducible_guest -- \
+            --guest target/reproducible-guest-b/x86_64-unknown-linux-musl/reproducible-guest/nanocodex-vm-guest \
+            --cache target/reproducible-image-cache-b \
+            --output target/reproducible-image-b
+          cmp target/reproducible-image-a/guest-root.ext4.verity \
+            target/reproducible-image-b/guest-root.ext4.verity
+          cmp target/reproducible-image-a/guest-image-manifest.json \
+            target/reproducible-image-b/guest-image-manifest.json
 
   policy:
     name: dependencies and spelling

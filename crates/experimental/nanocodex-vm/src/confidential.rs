@@ -161,6 +161,8 @@ pub enum ConfidentialCapability {
     KvmDevice,
     /// The active libkrun artifact was built with its TEE feature.
     LibkrunTee,
+    /// TEE init fails closed unless it mounts the authenticated root mapper.
+    LibkrunTeeAuthenticatedRoot,
     /// The active libkrun artifact was built for AMD SEV.
     LibkrunAmdSev,
     /// The active libkrun artifact was built for Intel TDX.
@@ -204,6 +206,7 @@ impl fmt::Display for ConfidentialCapability {
             Self::X86_64Host => "x86-64 host",
             Self::KvmDevice => "read-write /dev/kvm",
             Self::LibkrunTee => "TEE-enabled libkrun artifact",
+            Self::LibkrunTeeAuthenticatedRoot => "libkrun TEE authenticated-root init support",
             Self::LibkrunAmdSev => "AMD SEV libkrun artifact",
             Self::LibkrunIntelTdx => "Intel TDX libkrun artifact",
             Self::LibkrunAwsNitro => "AWS Nitro libkrun artifact",
@@ -282,7 +285,7 @@ impl ConfidentialHostReport {
         measured_guest_attester: bool,
         nvidia: NvidiaFacts,
     ) -> Self {
-        let mut checks = Vec::with_capacity(12);
+        let mut checks = Vec::with_capacity(13);
         checks.push(ConfidentialCapabilityCheck::new(
             ConfidentialCapability::LinuxHost,
             host.linux,
@@ -299,6 +302,10 @@ impl ConfidentialHostReport {
                     ConfidentialCapabilityCheck::new(
                         ConfidentialCapability::LibkrunTee,
                         libkrun.tee,
+                    ),
+                    ConfidentialCapabilityCheck::new(
+                        ConfidentialCapability::LibkrunTeeAuthenticatedRoot,
+                        libkrun.tee_authenticated_root,
                     ),
                     ConfidentialCapabilityCheck::new(
                         ConfidentialCapability::LibkrunAmdSev,
@@ -324,6 +331,10 @@ impl ConfidentialHostReport {
                     ConfidentialCapabilityCheck::new(
                         ConfidentialCapability::LibkrunTee,
                         libkrun.tee,
+                    ),
+                    ConfidentialCapabilityCheck::new(
+                        ConfidentialCapability::LibkrunTeeAuthenticatedRoot,
+                        libkrun.tee_authenticated_root,
                     ),
                     ConfidentialCapabilityCheck::new(
                         ConfidentialCapability::LibkrunIntelTdx,
@@ -549,6 +560,7 @@ impl HostFacts {
 #[derive(Clone, Copy)]
 struct LibkrunFacts {
     tee: bool,
+    tee_authenticated_root: bool,
     amd_sev: bool,
     intel_tdx: bool,
     aws_nitro: bool,
@@ -603,6 +615,7 @@ impl From<&Capabilities> for LibkrunFacts {
     fn from(capabilities: &Capabilities) -> Self {
         Self {
             tee: capabilities.has(KrunFeature::Tee),
+            tee_authenticated_root: capabilities.has(KrunFeature::TeeAuthenticatedRoot),
             amd_sev: capabilities.has(KrunFeature::AmdSev),
             intel_tdx: capabilities.has(KrunFeature::IntelTdx),
             aws_nitro: capabilities.has(KrunFeature::AwsNitro),
@@ -657,6 +670,7 @@ mod tests {
     fn snp_libkrun() -> LibkrunFacts {
         LibkrunFacts {
             tee: true,
+            tee_authenticated_root: true,
             amd_sev: true,
             intel_tdx: false,
             aws_nitro: false,
@@ -687,6 +701,7 @@ mod tests {
         host.amd_sev_snp_kvm = false;
         let mut libkrun = snp_libkrun();
         libkrun.amd_sev = false;
+        libkrun.tee_authenticated_root = false;
         let report = ConfidentialHostReport::evaluate(
             &profile,
             host,
@@ -698,6 +713,7 @@ mod tests {
         assert_eq!(
             report.missing().collect::<Vec<_>>(),
             [
+                ConfidentialCapability::LibkrunTeeAuthenticatedRoot,
                 ConfidentialCapability::LibkrunAmdSev,
                 ConfidentialCapability::AmdSevDevice,
                 ConfidentialCapability::AmdSevSnpKvm,
@@ -758,6 +774,7 @@ mod tests {
             },
             LibkrunFacts {
                 tee: true,
+                tee_authenticated_root: true,
                 amd_sev: false,
                 intel_tdx: true,
                 aws_nitro: false,

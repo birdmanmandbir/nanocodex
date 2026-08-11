@@ -94,7 +94,7 @@ let workspace = image
 
 `GuestRuntimeDisk::prepare` hashes the exact guest ELF, validates an existing
 cache entry when present, and otherwise formats and atomically publishes one
-read-only 128 MiB ext4 runtime disk. Same-key processes
+read-only 128 MiB ext4 data region with an appended dm-verity tree. Same-key processes
 single-flight on a filesystem lock. The returned path remains in the
 caller-selected cache after the value is dropped.
 
