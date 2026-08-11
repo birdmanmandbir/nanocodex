@@ -388,7 +388,8 @@ fn http_exchange(
         .position(|window| window == b"\r\n\r\n")
         .map(|index| index + 4)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP response"))?;
-    let headers = std::str::from_utf8(&response[..header_end])?;
+    let headers = std::str::from_utf8(&response[..header_end])
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     if !headers.starts_with("HTTP/1.1 200 ") && !headers.starts_with("HTTP/1.0 200 ") {
         return Err(io::Error::other(format!(
             "HTTP request failed: {}",
