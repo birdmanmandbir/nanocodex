@@ -17,6 +17,7 @@ use crate::{
     config::VmConfig,
     egress::EgressLease,
     process::{PrivateVmProcessConfig, VmProcessConfig, VmProcessError},
+    secret_release::SecretReleaseEnvelope,
 };
 use nanocodex_tools::{ToolContext, ToolInput, ToolOutput, ToolResult, standard::StandardTool};
 use thiserror::Error;
@@ -32,9 +33,10 @@ use super::{
     protocol::{
         AttestRequest, AttestResponse, CancelRequest, ControlResponse, CreateDirectoryRequest,
         ExecuteRequest, ExecuteResponse, MemoryRequest, MemoryResponse, ProveCommandRequest,
-        ProveCommandResponse, ReadFileRequest, ReadFileResponse, ReadyRequest, SessionRequest,
-        SessionResponse, ShutdownRequest, TerminateToolProcessesRequest, ToolRequest,
-        WireToolContext, WireToolInput, WriteFileRequest,
+        ProveCommandResponse, ProveSecretCommandRequest, ReadFileRequest, ReadFileResponse,
+        ReadyRequest, SessionRequest, SessionResponse, ShutdownRequest,
+        TerminateToolProcessesRequest, ToolRequest, WireToolContext, WireToolInput,
+        WriteFileRequest,
     },
 };
 
@@ -754,6 +756,19 @@ impl VmToolSession {
         self.handle.prove_command(request).await
     }
 
+    /// Decrypts an appraisal-gated secret in the guest and proves its authorized use.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when envelope authentication, exact executable
+    /// enforcement, execution, evidence collection, or transport fails.
+    pub async fn prove_secret_command(
+        &self,
+        envelope: SecretReleaseEnvelope,
+    ) -> Result<AttestedCommandProof, VmToolSessionError> {
+        self.handle.prove_secret_command(envelope).await
+    }
+
     /// Returns the best-effort peak memory observed for this VM session.
     ///
     /// Host RSS remains available when the guest protocol has already failed.
@@ -1028,6 +1043,32 @@ impl VmToolSessionHandle {
         else {
             return Err(VmToolSessionError::Protocol(
                 "expected a prove-command response",
+            ));
+        };
+        match (proof, error) {
+            (Some(proof), None) => Ok(proof),
+            (None, Some(error)) => Err(VmToolSessionError::Guest(error)),
+            _ => Err(VmToolSessionError::Protocol(
+                "expected exactly one of proof or error",
+            )),
+        }
+    }
+
+    /// Decrypts an appraisal-gated secret and executes its encrypted command policy.
+    pub async fn prove_secret_command(
+        &self,
+        envelope: SecretReleaseEnvelope,
+    ) -> Result<AttestedCommandProof, VmToolSessionError> {
+        let response = self
+            .control_request(|id| {
+                SessionRequest::ProveSecretCommand(ProveSecretCommandRequest { id, envelope })
+            })
+            .await?;
+        let SessionResponse::ProveSecretCommand(ProveCommandResponse { proof, error, .. }) =
+            response
+        else {
+            return Err(VmToolSessionError::Protocol(
+                "expected a prove-secret-command response",
             ));
         };
         match (proof, error) {
@@ -1895,6 +1936,7 @@ const fn set_request_id(request: &mut SessionRequest, id: u64) {
         SessionRequest::Memory(request) => request.id = id,
         SessionRequest::Attest(request) => request.id = id,
         SessionRequest::ProveCommand(request) => request.id = id,
+        SessionRequest::ProveSecretCommand(request) => request.id = id,
         SessionRequest::Execute(request) => request.id = id,
         SessionRequest::Cancel(request) => request.id = id,
         SessionRequest::TerminateToolProcesses(request) => request.id = id,

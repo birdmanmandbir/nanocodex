@@ -29,7 +29,9 @@ pub const MAX_ATTESTED_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 /// One deterministic command executed by the measured guest supervisor.
 ///
 /// The supervisor fixes the current directory to `/`, clears the environment,
-/// sets only `LANG=C`, and supplies an empty standard input. It copies the
+/// sets only `LANG=C`, and supplies an empty standard input for an ordinary
+/// command proof. Attestation-gated secret release uses this same policy but
+/// supplies the released bytes on standard input. The supervisor copies the
 /// selected ELF into a sealed Linux `memfd` before execution, so the receipt's
 /// executable digest identifies the exact bytes passed to `execve` rather than
 /// a mutable guest path.
@@ -264,11 +266,53 @@ impl ExecutionRecord {
         stderr: &[u8],
         termination: CommandTermination,
     ) -> Self {
+        Self::new_with_stdin(
+            challenge,
+            executable_sha256,
+            argv,
+            &[],
+            stdout,
+            stderr,
+            termination,
+        )
+    }
+
+    #[cfg(any(test, all(feature = "guest-runtime", target_os = "linux")))]
+    pub(crate) fn new_with_stdin(
+        challenge: AttestationChallenge,
+        executable_sha256: [u8; 32],
+        argv: Vec<String>,
+        stdin: &[u8],
+        stdout: &[u8],
+        stderr: &[u8],
+        termination: CommandTermination,
+    ) -> Self {
+        Self::new_with_stdin_sha256(
+            challenge,
+            executable_sha256,
+            argv,
+            Sha256::digest(stdin).into(),
+            stdout,
+            stderr,
+            termination,
+        )
+    }
+
+    #[cfg(any(test, all(feature = "guest-runtime", target_os = "linux")))]
+    pub(crate) fn new_with_stdin_sha256(
+        challenge: AttestationChallenge,
+        executable_sha256: [u8; 32],
+        argv: Vec<String>,
+        stdin_sha256: [u8; 32],
+        stdout: &[u8],
+        stderr: &[u8],
+        termination: CommandTermination,
+    ) -> Self {
         Self {
             challenge,
             executable_sha256,
             argv,
-            stdin_sha256: Sha256::digest([]).into(),
+            stdin_sha256,
             stdout_sha256: Sha256::digest(stdout).into(),
             stderr_sha256: Sha256::digest(stderr).into(),
             termination,
@@ -293,7 +337,7 @@ impl ExecutionRecord {
         &self.argv
     }
 
-    /// Returns the digest of the fixed empty stdin stream.
+    /// Returns the digest of the exact stdin stream (empty for ordinary proofs).
     #[must_use]
     pub const fn stdin_sha256(&self) -> &[u8; 32] {
         &self.stdin_sha256
@@ -445,7 +489,7 @@ pub struct AttestedCommandProof {
 }
 
 impl AttestedCommandProof {
-    #[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+    #[cfg(any(test, all(feature = "guest-runtime", target_os = "linux")))]
     pub(crate) const fn new(
         attestation: GuestAttestation,
         receipt: AttestedCommandReceipt,
@@ -477,6 +521,7 @@ pub struct CommandProofExpectation {
     workload_manifest_sha256: [u8; 32],
     executable_sha256: [u8; 32],
     argv: Vec<String>,
+    stdin_sha256: [u8; 32],
     termination: CommandTermination,
 }
 
@@ -484,7 +529,7 @@ pub struct CommandProofExpectation {
 impl CommandProofExpectation {
     /// Creates an exact challenge, executable, and argument expectation.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         challenge: AttestationChallenge,
         workload_manifest_sha256: [u8; 32],
         executable_sha256: [u8; 32],
@@ -495,6 +540,7 @@ impl CommandProofExpectation {
             workload_manifest_sha256,
             executable_sha256,
             argv,
+            stdin_sha256: Sha256::digest([]).into(),
             termination: CommandTermination::ExitCode(0),
         }
     }
@@ -503,6 +549,13 @@ impl CommandProofExpectation {
     #[must_use]
     pub const fn termination(mut self, termination: CommandTermination) -> Self {
         self.termination = termination;
+        self
+    }
+
+    /// Requires the receipt to authenticate this exact stdin stream digest.
+    #[must_use]
+    pub const fn stdin_sha256(mut self, stdin_sha256: [u8; 32]) -> Self {
+        self.stdin_sha256 = stdin_sha256;
         self
     }
 }
@@ -572,11 +625,13 @@ pub fn verify_collected_command_proof(
     {
         return Err(CommandProofVerificationError::WorkloadManifestMismatch);
     }
-    verify_receipt(
-        &proof.receipt,
-        proof.attestation.bundle().request().guest_public_key(),
-        expected,
-    )?;
+    let signing_key = proof
+        .attestation
+        .bundle()
+        .request()
+        .guest_signing_public_key()
+        .map_err(|_| CommandProofVerificationError::InvalidGuestKey)?;
+    verify_receipt(&proof.receipt, signing_key, expected)?;
     if proof.receipt.record.challenge() != proof.attestation.bundle().request().challenge() {
         return Err(CommandProofVerificationError::ChallengeMismatch);
     }
@@ -640,10 +695,43 @@ pub fn verify_command_proof(
     })
 }
 
+/// Verifies use of a secret released to a previously appraised retained guest key.
+///
+/// Unlike [`verify_command_proof`], this accepts a fresh post-execution native
+/// evidence object because quote bytes are not stable. It requires the exact
+/// same evidence-bound request and guest key that authorized the encrypted
+/// release, then verifies the key proof and signed receipt. The fresh native
+/// evidence in `proof` is retained for audit but is not independently trusted
+/// by this function.
+///
+/// # Errors
+///
+/// Returns an error if the proof changed the appraised guest identity,
+/// challenge, workload, command, stdin digest, output, or receipt signature.
+#[cfg(feature = "host")]
+pub fn verify_released_secret_proof(
+    proof: &AttestedCommandProof,
+    release_attestation: &VerifiedAttestation,
+    expected: &CommandProofExpectation,
+) -> Result<VerifiedCommandProof, CommandProofVerificationError> {
+    if proof.attestation.bundle().request() != release_attestation.bundle().request() {
+        return Err(CommandProofVerificationError::ReleaseIdentityMismatch);
+    }
+    if release_attestation.workload_manifest_digest() != &expected.workload_manifest_sha256 {
+        return Err(CommandProofVerificationError::WorkloadManifestMismatch);
+    }
+    let collected = verify_collected_command_proof(proof, expected)?;
+    Ok(VerifiedCommandProof {
+        record: collected.record,
+        stdout: collected.stdout,
+        stderr: collected.stderr,
+    })
+}
+
 #[cfg(feature = "host")]
 fn verify_receipt(
     receipt: &AttestedCommandReceipt,
-    guest_public_key: &[u8],
+    guest_public_key: &[u8; 32],
     expected: &CommandProofExpectation,
 ) -> Result<(), CommandProofVerificationError> {
     let record = &receipt.record;
@@ -664,7 +752,7 @@ fn verify_receipt(
             .any(|argument| argument.len() > MAX_ARGUMENT_BYTES)
         || record.argv.iter().map(String::len).sum::<usize>()
             > MAX_TOTAL_ARGUMENT_BYTES + MAX_PROGRAM_BYTES
-        || record.stdin_sha256 != Sha256::digest([]).as_slice()
+        || record.stdin_sha256 != expected.stdin_sha256
     {
         return Err(CommandProofVerificationError::InvalidRecord);
     }
@@ -673,9 +761,7 @@ fn verify_receipt(
     {
         return Err(CommandProofVerificationError::OutputMismatch);
     }
-    let public_key = <&[u8; 32]>::try_from(guest_public_key)
-        .map_err(|_| CommandProofVerificationError::InvalidGuestKey)?;
-    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(public_key)
+    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(guest_public_key)
         .map_err(|_| CommandProofVerificationError::InvalidGuestKey)?;
     let signature = ed25519_dalek::Signature::from_slice(&receipt.signature)
         .map_err(|_| CommandProofVerificationError::InvalidSignature)?;
@@ -721,6 +807,9 @@ pub enum CommandProofVerificationError {
     /// The proof did not contain the exact appraised evidence bundle.
     #[error("command proof does not contain the appraised attestation bundle")]
     AttestationMismatch,
+    /// The released-secret proof changed the appraised request or guest key.
+    #[error("released-secret proof does not match the appraised guest identity and request")]
+    ReleaseIdentityMismatch,
     /// The guest-key possession proof was invalid.
     #[error(transparent)]
     AttestedKey(#[from] AttestedGuestKeyProofError),
@@ -866,6 +955,16 @@ mod tests {
         assert_eq!(
             verify_receipt(&receipt, key.as_bytes(), &expected),
             Err(CommandProofVerificationError::OutputMismatch)
+        );
+    }
+
+    #[test]
+    fn rejects_changed_released_secret_digest() {
+        let (receipt, expected, key) = fixture();
+        let expected = expected.stdin_sha256(Sha256::digest(b"released secret").into());
+        assert_eq!(
+            verify_receipt(&receipt, key.as_bytes(), &expected),
+            Err(CommandProofVerificationError::InvalidRecord)
         );
     }
 

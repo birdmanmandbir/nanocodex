@@ -186,24 +186,32 @@ attest-example:
 
 # Verify a collected SNP JSON response offline. Fresh CRL evidence is required
 # unless the caller explicitly adds --allow-missing-crl to the Cargo example.
-verify-snp-attestation input measurement crl="":
+verify-snp-attestation input measurement crl="" host_data="":
     #!/usr/bin/env bash
     set -euo pipefail
     args=(--input "{{input}}" --measurement "{{measurement}}")
     if [ -n "{{crl}}" ]; then
       args+=(--crl "{{crl}}")
     fi
+    if [ -n "{{host_data}}" ]; then
+      args+=(--host-data "{{host_data}}")
+    fi
     cargo run --locked --quiet -p nanocodex-vm \
       --example verify_snp_attestation -- "${args[@]}"
 
 # Verify a collected TDX JSON response with retained Intel DCAP collateral.
-verify-tdx-attestation input collateral mrtd rtmr0 rtmr1 rtmr2 rtmr3 allow_dynamic_platform="false" allow_cached_keys="false" allow_smt="false" nvidia_policy="" nvattest="nvattest" command_manifest="" local_guest="":
+verify-tdx-attestation input collateral mrtd rtmr0 rtmr1 rtmr2 rtmr3 allow_dynamic_platform="false" allow_cached_keys="false" allow_smt="false" nvidia_policy="" nvattest="nvattest" command_manifest="" local_guest="" rtmr3_is_baseline="false":
     #!/usr/bin/env bash
     set -euo pipefail
     args=(
       --input "{{input}}" --collateral "{{collateral}}" --mrtd "{{mrtd}}"
-      --rtmr0 "{{rtmr0}}" --rtmr1 "{{rtmr1}}" --rtmr2 "{{rtmr2}}" --rtmr3 "{{rtmr3}}"
+      --rtmr0 "{{rtmr0}}" --rtmr1 "{{rtmr1}}" --rtmr2 "{{rtmr2}}"
     )
+    if [ "{{rtmr3_is_baseline}}" = true ]; then
+      args+=(--rtmr3-baseline "{{rtmr3}}")
+    else
+      args+=(--rtmr3 "{{rtmr3}}")
+    fi
     if [ "{{allow_dynamic_platform}}" = true ]; then args+=(--allow-dynamic-platform); fi
     if [ "{{allow_cached_keys}}" = true ]; then args+=(--allow-cached-keys); fi
     if [ "{{allow_smt}}" = true ]; then args+=(--allow-smt); fi

@@ -66,6 +66,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(vm_profile) = vm_profile {
         vm = vm.confidential(vm_profile);
     }
+    if matches!(options.cpu, CpuProfile::Snp) {
+        vm = vm.snp_launch_commitment(runtime_digest);
+    }
     if let Some(qgs) = options.qgs {
         vm = vm.tdx_quote_generation_socket(qgs);
     }
@@ -96,8 +99,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let command = AttestedCommand::new(&argv[0])?
         .arg(&argv[1])?
         .arg(&argv[2])?;
-    let parameters =
+    let mut parameters =
         GuestAttestationParameters::new(challenge.clone(), runtime_digest, cpu_profile, None);
+    if matches!(options.cpu, CpuProfile::Tdx) {
+        parameters = parameters.measure_workload_in_tdx_rtmr3();
+    }
     let request = AttestedCommandRequest::new(parameters, command);
     let proof = tokio::time::timeout(Duration::from_secs(180), session.prove_command(request))
         .await

@@ -57,17 +57,22 @@ libkrun-intel-tdx = ["host", "krun/tdx", "krun/vfio"]
 
 [dependencies]
 base64.workspace = true
+chacha20poly1305.workspace = true
 ed25519-dalek.workspace = true
 filetime.workspace = true
 getrandom.workspace = true
 hex.workspace = true
+hkdf.workspace = true
 nanocodex-tools = { path = "../../nanocodex-tools", version = "0.3.0", default-features = false }
 nix = { workspace = true, optional = true, features = ["fs", "mount"] }
 serde.workspace = true
 serde_cbor = { workspace = true, optional = true }
 serde_json.workspace = true
 sha2.workspace = true
+sha2_10.workspace = true
 thiserror.workspace = true
+x25519-dalek.workspace = true
+zeroize.workspace = true
 tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "process", "rt", "rt-multi-thread", "sync", "time"] }
 
 aws-nitro-enclaves-nsm-api = { version = "0.5.2", optional = true, default-features = false }

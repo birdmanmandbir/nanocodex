@@ -24,6 +24,7 @@ struct Options {
     nvattest: PathBuf,
     mr_td: [u8; 48],
     rt_mrs: [[u8; 48]; 4],
+    rtmr3_baseline: Option<[u8; 48]>,
     mr_config_id: Option<[u8; 48]>,
     mr_owner: Option<[u8; 48]>,
     mr_owner_config: Option<[u8; 48]>,
@@ -82,6 +83,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         options.mr_td,
         options.rt_mrs,
     )?;
+    if let Some(baseline) = options.rtmr3_baseline {
+        policy = policy.with_workload_rtmr3(baseline);
+    }
     if let Some(path) = options.intel_root {
         policy = policy.with_intel_root(read_bounded(&path, MAX_ROOT_BYTES)?);
     }
@@ -141,6 +145,7 @@ impl Options {
         let mut nvattest = PathBuf::from("nvattest");
         let mut mr_td = None;
         let mut rt_mrs = [None; 4];
+        let mut rtmr3_baseline = None;
         let mut mr_config_id = None;
         let mut mr_owner = None;
         let mut mr_owner_config = None;
@@ -167,6 +172,12 @@ impl Options {
                         &value(&mut arguments, &argument)?,
                         &argument[2..].to_ascii_uppercase(),
                     )?);
+                }
+                "--rtmr3-baseline" => {
+                    rtmr3_baseline = Some(parse_hex(
+                        &value(&mut arguments, "--rtmr3-baseline")?,
+                        "RTMR3 baseline",
+                    )?)
                 }
                 "--mr-config-id" => {
                     mr_config_id = Some(parse_hex(
@@ -195,13 +206,19 @@ impl Options {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "usage: verify_tdx_attestation --input PATH|- --collateral PATH --mrtd 96_HEX --rtmr0 96_HEX --rtmr1 96_HEX --rtmr2 96_HEX --rtmr3 96_HEX [--intel-root DER_PATH] [--nvidia-policy REGO_PATH] [--nvattest PATH] [--mr-config-id 96_HEX] [--mr-owner 96_HEX] [--mr-owner-config 96_HEX] [--xfam 16_HEX] [--allow-dynamic-platform] [--allow-cached-keys] [--allow-smt] [--command-manifest PATH --local-guest PATH]"
+                        "usage: verify_tdx_attestation --input PATH|- --collateral PATH --mrtd 96_HEX --rtmr0 96_HEX --rtmr1 96_HEX --rtmr2 96_HEX (--rtmr3 96_HEX|--rtmr3-baseline 96_HEX) [--intel-root DER_PATH] [--nvidia-policy REGO_PATH] [--nvattest PATH] [--mr-config-id 96_HEX] [--mr-owner 96_HEX] [--mr-owner-config 96_HEX] [--xfam 16_HEX] [--allow-dynamic-platform] [--allow-cached-keys] [--allow-smt] [--command-manifest PATH --local-guest PATH]"
                     );
                     std::process::exit(0);
                 }
                 other => return Err(invalid_argument(format!("unknown argument {other:?}"))),
             }
         }
+        if rt_mrs[3].is_some() == rtmr3_baseline.is_some() {
+            return Err(invalid_argument(
+                "supply exactly one of --rtmr3 or --rtmr3-baseline",
+            ));
+        }
+        rt_mrs[3] = rt_mrs[3].or(rtmr3_baseline);
         Ok(Self {
             input: input.ok_or_else(|| invalid_argument("missing --input"))?,
             collateral: collateral.ok_or_else(|| invalid_argument("missing --collateral"))?,
@@ -215,6 +232,7 @@ impl Options {
                     std::process::exit(2);
                 })
             }),
+            rtmr3_baseline,
             mr_config_id,
             mr_owner,
             mr_owner_config,

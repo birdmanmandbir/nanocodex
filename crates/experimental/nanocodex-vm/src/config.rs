@@ -160,6 +160,8 @@ pub struct VmConfig {
     confidential_profile: Option<ConfidentialVmProfile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tdx_qgs_socket: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snp_launch_commitment: Option<[u8; 32]>,
     #[cfg(all(target_os = "linux", not(target_env = "musl")))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     confidential_devices: Option<ConfidentialDeviceBundle>,
@@ -178,6 +180,7 @@ impl VmConfig {
             shared_directories: Vec::new(),
             confidential_profile: None,
             tdx_qgs_socket: None,
+            snp_launch_commitment: None,
             #[cfg(all(target_os = "linux", not(target_env = "musl")))]
             confidential_devices: None,
         }
@@ -194,6 +197,7 @@ impl VmConfig {
             shared_directories: Vec::new(),
             confidential_profile: None,
             tdx_qgs_socket: None,
+            snp_launch_commitment: None,
             #[cfg(all(target_os = "linux", not(target_env = "musl")))]
             confidential_devices: None,
         }
@@ -222,6 +226,7 @@ impl VmConfig {
             shared_directories: Vec::new(),
             confidential_profile: None,
             tdx_qgs_socket: None,
+            snp_launch_commitment: None,
             #[cfg(all(target_os = "linux", not(target_env = "musl")))]
             confidential_devices: None,
         }
@@ -281,6 +286,16 @@ impl VmConfig {
     #[must_use]
     pub fn tdx_quote_generation_socket(mut self, socket: impl Into<PathBuf>) -> Self {
         self.tdx_qgs_socket = Some(socket.into());
+        self
+    }
+
+    /// Sets the exact guest-owner commitment returned in SNP `HOST_DATA`.
+    ///
+    /// Use the approved workload-manifest digest to tie every report from the
+    /// VM to the workload selected before launch.
+    #[must_use]
+    pub const fn snp_launch_commitment(mut self, commitment: [u8; 32]) -> Self {
+        self.snp_launch_commitment = Some(commitment);
         self
     }
 
@@ -354,6 +369,12 @@ impl VmConfig {
     #[must_use]
     pub fn tdx_qgs_socket(&self) -> Option<&Path> {
         self.tdx_qgs_socket.as_deref()
+    }
+
+    /// Returns the configured SEV-SNP launch commitment.
+    #[must_use]
+    pub const fn snp_host_data(&self) -> Option<&[u8; 32]> {
+        self.snp_launch_commitment.as_ref()
     }
 
     /// Returns the exact host PCI bundle requested for confidential assignment.

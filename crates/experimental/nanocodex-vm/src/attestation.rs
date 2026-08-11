@@ -5,20 +5,61 @@ use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
     de::{SeqAccess, Visitor},
 };
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha384};
 use thiserror::Error;
 
 const TRANSCRIPT_DOMAIN: &[u8] = b"nanocodex-vm-attestation-transcript\0";
-const TRANSCRIPT_VERSION: u32 = 1;
+const TRANSCRIPT_VERSION: u32 = 2;
+const TDX_WORKLOAD_MEASUREMENT_DOMAIN: &[u8] = b"nanocodex-vm-tdx-workload-measurement\0";
+const TDX_WORKLOAD_MEASUREMENT_VERSION: u32 = 1;
 pub(crate) const KEY_PROOF_DOMAIN: &[u8] = b"nanocodex-vm-attested-key-proof\0";
 const MAX_POLICY_ID_BYTES: usize = 256;
 const MAX_GUEST_PUBLIC_KEY_BYTES: usize = 4 * 1024;
 const MAX_CHILD_EVIDENCE: usize = 256;
 const MAX_MEDIA_TYPE_BYTES: usize = 128;
 const MAX_BUNDLE_EVIDENCE: usize = 11;
+const GUEST_KEY_BUNDLE_HEADER: &[u8; 8] = b"NCVMKEY\x01";
 
 /// Maximum native evidence size accepted for one attested component.
 pub const MAX_RAW_EVIDENCE_BYTES: usize = 16 * 1024 * 1024;
+
+#[cfg(any(test, all(feature = "guest-runtime", target_os = "linux")))]
+pub(crate) fn encode_guest_public_keys(
+    signing_key: &[u8; 32],
+    encryption_key: &[u8; 32],
+) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(GUEST_KEY_BUNDLE_HEADER.len() + 64);
+    encoded.extend_from_slice(GUEST_KEY_BUNDLE_HEADER);
+    encoded.extend_from_slice(signing_key);
+    encoded.extend_from_slice(encryption_key);
+    encoded
+}
+
+fn decode_guest_public_keys(
+    encoded: &[u8],
+) -> Result<(&[u8; 32], Option<&[u8; 32]>), AttestedGuestKeyFormatError> {
+    if let Ok(signing_key) = <&[u8; 32]>::try_from(encoded) {
+        return Ok((signing_key, None));
+    }
+    let expected = GUEST_KEY_BUNDLE_HEADER.len() + 64;
+    if encoded.len() != expected
+        || &encoded[..GUEST_KEY_BUNDLE_HEADER.len()] != GUEST_KEY_BUNDLE_HEADER
+    {
+        return Err(AttestedGuestKeyFormatError);
+    }
+    let signing_start = GUEST_KEY_BUNDLE_HEADER.len();
+    let encryption_start = signing_start + 32;
+    let signing_key = <&[u8; 32]>::try_from(&encoded[signing_start..encryption_start])
+        .map_err(|_| AttestedGuestKeyFormatError)?;
+    let encryption_key = <&[u8; 32]>::try_from(&encoded[encryption_start..])
+        .map_err(|_| AttestedGuestKeyFormatError)?;
+    Ok((signing_key, Some(encryption_key)))
+}
+
+/// The evidence-bound guest key encoding is malformed or unsupported.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[error("attested guest public-key encoding is malformed")]
+pub struct AttestedGuestKeyFormatError;
 
 /// Fresh relying-party input which native hardware evidence must bind.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -109,6 +150,7 @@ pub struct AttestationBinding {
     challenge: AttestationChallenge,
     guest_public_key: Vec<u8>,
     workload_manifest_digest: [u8; 32],
+    workload_measurement: WorkloadMeasurement,
     child_evidence_digests: Vec<[u8; 32]>,
 }
 
@@ -122,10 +164,27 @@ impl AttestationBinding {
     ///
     /// Returns an error for an empty or oversized key, too many child
     /// components, or duplicate child evidence digests.
+    #[cfg(any(feature = "host", test))]
     pub fn new(
         challenge: AttestationChallenge,
         guest_public_key: impl Into<Vec<u8>>,
         workload_manifest_digest: [u8; 32],
+        child_evidence_digests: Vec<[u8; 32]>,
+    ) -> Result<Self, AttestationInputError> {
+        Self::new_with_measurement(
+            challenge,
+            guest_public_key,
+            workload_manifest_digest,
+            WorkloadMeasurement::ReportData,
+            child_evidence_digests,
+        )
+    }
+
+    pub(crate) fn new_with_measurement(
+        challenge: AttestationChallenge,
+        guest_public_key: impl Into<Vec<u8>>,
+        workload_manifest_digest: [u8; 32],
+        workload_measurement: WorkloadMeasurement,
         child_evidence_digests: Vec<[u8; 32]>,
     ) -> Result<Self, AttestationInputError> {
         let guest_public_key = guest_public_key.into();
@@ -155,6 +214,7 @@ impl AttestationBinding {
             challenge,
             guest_public_key,
             workload_manifest_digest,
+            workload_measurement,
             child_evidence_digests,
         })
     }
@@ -173,11 +233,32 @@ impl AttestationBinding {
         &self.guest_public_key
     }
 
+    /// Returns the Ed25519 key used for transcript and command-receipt signatures.
+    #[cfg(feature = "host")]
+    pub fn guest_signing_public_key(&self) -> Result<&[u8; 32], AttestedGuestKeyFormatError> {
+        decode_guest_public_keys(&self.guest_public_key).map(|(signing, _)| signing)
+    }
+
+    /// Returns the X25519 secret-release key when the guest supplied one.
+    #[cfg(feature = "host")]
+    pub fn guest_encryption_public_key(
+        &self,
+    ) -> Result<Option<&[u8; 32]>, AttestedGuestKeyFormatError> {
+        decode_guest_public_keys(&self.guest_public_key).map(|(_, encryption)| encryption)
+    }
+
     /// Returns the expected measured-workload manifest digest.
     #[must_use]
     #[cfg(feature = "host")]
     pub const fn workload_manifest_digest(&self) -> &[u8; 32] {
         &self.workload_manifest_digest
+    }
+
+    /// Returns how the workload commitment is represented in native evidence.
+    #[must_use]
+    #[cfg(feature = "host")]
+    pub const fn workload_measurement(&self) -> WorkloadMeasurement {
+        self.workload_measurement
     }
 
     /// Returns child evidence digests in canonical component order.
@@ -201,6 +282,10 @@ impl AttestationBinding {
         hasher.update(self.challenge.expires_at_unix_seconds.to_be_bytes());
         hash_bytes(&mut hasher, &self.guest_public_key);
         hash_bytes(&mut hasher, &self.workload_manifest_digest);
+        hasher.update([match self.workload_measurement {
+            WorkloadMeasurement::ReportData => 0,
+            WorkloadMeasurement::TdxRtmr3 => 1,
+        }]);
         hasher.update((self.child_evidence_digests.len() as u32).to_be_bytes());
         for digest in &self.child_evidence_digests {
             hash_bytes(&mut hasher, digest);
@@ -241,6 +326,36 @@ pub enum CpuAttestationProfile {
     IntelTdx,
     /// AWS Nitro Enclaves through the Nitro Secure Module.
     AwsNitro,
+}
+
+/// Hardware-backed runtime measurement requested for the workload manifest.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkloadMeasurement {
+    /// Bind the manifest to fresh native report data without mutating a register.
+    #[default]
+    ReportData,
+    /// Extend a domain-separated manifest digest into Intel TDX RTMR3 before quoting.
+    TdxRtmr3,
+}
+
+/// Calculates the 48-byte event extended into TDX RTMR3 for a workload manifest.
+#[must_use]
+pub fn tdx_workload_measurement_event(workload_manifest_digest: &[u8; 32]) -> [u8; 48] {
+    let mut hasher = Sha384::new();
+    hasher.update(TDX_WORKLOAD_MEASUREMENT_DOMAIN);
+    hasher.update(TDX_WORKLOAD_MEASUREMENT_VERSION.to_be_bytes());
+    hasher.update(workload_manifest_digest);
+    hasher.finalize().into()
+}
+
+/// Calculates the RTMR value produced by extending one 48-byte event.
+#[must_use]
+pub fn tdx_rtmr_extend(previous: &[u8; 48], event: &[u8; 48]) -> [u8; 48] {
+    let mut hasher = Sha384::new();
+    hasher.update(previous);
+    hasher.update(event);
+    hasher.finalize().into()
 }
 
 impl CpuAttestationProfile {
@@ -301,6 +416,8 @@ pub struct GuestAttestationParameters {
     workload_manifest_digest: [u8; 32],
     cpu_profile: CpuAttestationProfile,
     nvidia_profile: Option<NvidiaAttestationProfile>,
+    #[serde(default)]
+    workload_measurement: WorkloadMeasurement,
 }
 
 impl GuestAttestationParameters {
@@ -317,7 +434,15 @@ impl GuestAttestationParameters {
             workload_manifest_digest,
             cpu_profile,
             nvidia_profile,
+            workload_measurement: WorkloadMeasurement::ReportData,
         }
+    }
+
+    /// Requires a hardware RTMR3 extension of the workload manifest before a TDX quote.
+    #[must_use]
+    pub const fn measure_workload_in_tdx_rtmr3(mut self) -> Self {
+        self.workload_measurement = WorkloadMeasurement::TdxRtmr3;
+        self
     }
 
     /// Returns the relying-party challenge.
@@ -344,17 +469,24 @@ impl GuestAttestationParameters {
         self.nvidia_profile
     }
 
+    /// Returns the requested workload-measurement mechanism.
+    #[must_use]
+    pub const fn workload_measurement(&self) -> WorkloadMeasurement {
+        self.workload_measurement
+    }
+
     #[cfg(any(test, all(feature = "guest-runtime", target_os = "linux")))]
     pub(crate) fn into_request(
         self,
         guest_public_key: Vec<u8>,
     ) -> Result<GuestAttestationRequest, AttestationInputError> {
-        GuestAttestationRequest::new(
+        GuestAttestationRequest::new_with_measurement(
             self.challenge,
             guest_public_key,
             self.workload_manifest_digest,
             self.cpu_profile,
             self.nvidia_profile,
+            self.workload_measurement,
         )
     }
 }
@@ -421,6 +553,8 @@ pub struct GuestAttestationRequest {
     workload_manifest_digest: [u8; 32],
     cpu_profile: CpuAttestationProfile,
     nvidia_profile: Option<NvidiaAttestationProfile>,
+    #[serde(default)]
+    workload_measurement: WorkloadMeasurement,
 }
 
 impl<'de> Deserialize<'de> for GuestAttestationRequest {
@@ -437,15 +571,18 @@ impl<'de> Deserialize<'de> for GuestAttestationRequest {
             workload_manifest_digest: [u8; 32],
             cpu_profile: CpuAttestationProfile,
             nvidia_profile: Option<NvidiaAttestationProfile>,
+            #[serde(default)]
+            workload_measurement: WorkloadMeasurement,
         }
 
         let wire = WireRequest::deserialize(deserializer)?;
-        Self::new(
+        Self::new_with_measurement(
             wire.challenge,
             wire.guest_public_key,
             wire.workload_manifest_digest,
             wire.cpu_profile,
             wire.nvidia_profile,
+            wire.workload_measurement,
         )
         .map_err(serde::de::Error::custom)
     }
@@ -464,11 +601,35 @@ impl GuestAttestationRequest {
         cpu_profile: CpuAttestationProfile,
         nvidia_profile: Option<NvidiaAttestationProfile>,
     ) -> Result<Self, AttestationInputError> {
+        Self::new_with_measurement(
+            challenge,
+            guest_public_key,
+            workload_manifest_digest,
+            cpu_profile,
+            nvidia_profile,
+            WorkloadMeasurement::ReportData,
+        )
+    }
+
+    pub(crate) fn new_with_measurement(
+        challenge: AttestationChallenge,
+        guest_public_key: impl Into<Vec<u8>>,
+        workload_manifest_digest: [u8; 32],
+        cpu_profile: CpuAttestationProfile,
+        nvidia_profile: Option<NvidiaAttestationProfile>,
+        workload_measurement: WorkloadMeasurement,
+    ) -> Result<Self, AttestationInputError> {
+        if workload_measurement == WorkloadMeasurement::TdxRtmr3
+            && cpu_profile != CpuAttestationProfile::IntelTdx
+        {
+            return Err(AttestationInputError::IncompatibleWorkloadMeasurement);
+        }
         let guest_public_key = guest_public_key.into();
-        AttestationBinding::new(
+        AttestationBinding::new_with_measurement(
             challenge.clone(),
             guest_public_key.clone(),
             workload_manifest_digest,
+            workload_measurement,
             Vec::new(),
         )?;
         Ok(Self {
@@ -477,6 +638,7 @@ impl GuestAttestationRequest {
             workload_manifest_digest,
             cpu_profile,
             nvidia_profile,
+            workload_measurement,
         })
     }
 
@@ -490,6 +652,18 @@ impl GuestAttestationRequest {
     #[must_use]
     pub fn guest_public_key(&self) -> &[u8] {
         &self.guest_public_key
+    }
+
+    /// Returns the Ed25519 key used for transcript and command-receipt signatures.
+    pub fn guest_signing_public_key(&self) -> Result<&[u8; 32], AttestedGuestKeyFormatError> {
+        decode_guest_public_keys(&self.guest_public_key).map(|(signing, _)| signing)
+    }
+
+    /// Returns the X25519 secret-release key when the guest supplied one.
+    pub fn guest_encryption_public_key(
+        &self,
+    ) -> Result<Option<&[u8; 32]>, AttestedGuestKeyFormatError> {
+        decode_guest_public_keys(&self.guest_public_key).map(|(_, encryption)| encryption)
     }
 
     /// Returns the measured workload manifest digest.
@@ -510,15 +684,33 @@ impl GuestAttestationRequest {
         self.nvidia_profile
     }
 
+    /// Returns the requested workload-measurement mechanism.
+    #[must_use]
+    pub const fn workload_measurement(&self) -> WorkloadMeasurement {
+        self.workload_measurement
+    }
+
+    #[cfg(feature = "host")]
+    pub(crate) fn parameters(&self) -> GuestAttestationParameters {
+        GuestAttestationParameters {
+            challenge: self.challenge.clone(),
+            workload_manifest_digest: self.workload_manifest_digest,
+            cpu_profile: self.cpu_profile,
+            nvidia_profile: self.nvidia_profile,
+            workload_measurement: self.workload_measurement,
+        }
+    }
+
     #[cfg(any(test, all(feature = "guest-runtime", target_os = "linux")))]
     pub(crate) fn binding(
         &self,
         child_evidence_digests: Vec<[u8; 32]>,
     ) -> Result<AttestationBinding, AttestationInputError> {
-        AttestationBinding::new(
+        AttestationBinding::new_with_measurement(
             self.challenge.clone(),
             self.guest_public_key.clone(),
             self.workload_manifest_digest,
+            self.workload_measurement,
             child_evidence_digests,
         )
     }
@@ -655,7 +847,10 @@ impl GuestAttestation {
         if self.bundle.transcript_digest != transcript_digest {
             return Err(AttestedGuestKeyProofError::TranscriptMismatch);
         }
-        let public_key = <&[u8; 32]>::try_from(self.bundle.request().guest_public_key())
+        let public_key = self
+            .bundle
+            .request()
+            .guest_signing_public_key()
             .map_err(|_| AttestedGuestKeyProofError::InvalidPublicKeyLength)?;
         let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(public_key)
             .map_err(|_| AttestedGuestKeyProofError::InvalidPublicKey)?;
@@ -707,10 +902,11 @@ impl GuestAttestation {
             .iter()
             .map(RawEvidence::digest)
             .collect();
-        AttestationBinding::new(
+        AttestationBinding::new_with_measurement(
             self.bundle.request.challenge.clone(),
             self.bundle.request.guest_public_key.clone(),
             self.bundle.request.workload_manifest_digest,
+            self.bundle.request.workload_measurement,
             child_evidence_digests,
         )
         .map(|binding| binding.transcript_digest())
@@ -864,6 +1060,9 @@ pub enum AttestationInputError {
         /// Protocol maximum.
         maximum: usize,
     },
+    /// The requested runtime measurement does not exist for the selected TEE.
+    #[error("TDX RTMR3 workload measurement requires the Intel TDX CPU profile")]
+    IncompatibleWorkloadMeasurement,
     /// Too many child component digests were supplied.
     #[error("attestation transcript has {actual} child digests; maximum is {maximum}")]
     TooManyChildEvidenceDigests {
@@ -1072,7 +1271,7 @@ mod tests {
 
         assert_eq!(
             hex::encode(binding.transcript_digest()),
-            "6db25d05b8bbf1d7cbc88535cd4b5c58f9de823cb23cf236db7bd620e0a0c096"
+            "03a7f26d58a381634eef0ccde5fa7f71d911f6e50680e80222f8f67c2b15b057"
         );
     }
 
@@ -1082,6 +1281,69 @@ mod tests {
             AttestationBinding::new(challenge(), vec![1, 2, 3], [4; 32], vec![[5; 32], [5; 32]],)
                 .unwrap_err(),
             AttestationInputError::DuplicateChildEvidenceDigest
+        );
+    }
+
+    #[test]
+    fn tdx_rtmr_extend_matches_live_hardware_formula() {
+        assert_eq!(
+            hex::encode(tdx_rtmr_extend(&[0; 48], &[0; 48])),
+            "f57bb7ed82c6ae4a29e6c9879338c592c7d42a39135583e8ccbe3940f2344b0eb6eb8503db0ffd6a39ddd00cd07d8317"
+        );
+        assert_ne!(
+            tdx_workload_measurement_event(&[1; 32]),
+            tdx_workload_measurement_event(&[2; 32])
+        );
+    }
+
+    #[test]
+    fn tdx_runtime_measurement_is_profile_checked_and_transcript_bound() {
+        let error = GuestAttestationRequest::new_with_measurement(
+            challenge(),
+            vec![1; 32],
+            [2; 32],
+            CpuAttestationProfile::AmdSevSnp,
+            None,
+            WorkloadMeasurement::TdxRtmr3,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            AttestationInputError::IncompatibleWorkloadMeasurement
+        );
+
+        let report_data =
+            AttestationBinding::new(challenge(), vec![1; 32], [2; 32], Vec::new()).unwrap();
+        let measured = AttestationBinding::new_with_measurement(
+            challenge(),
+            vec![1; 32],
+            [2; 32],
+            WorkloadMeasurement::TdxRtmr3,
+            Vec::new(),
+        )
+        .unwrap();
+        assert_ne!(
+            report_data.transcript_digest(),
+            measured.transcript_digest()
+        );
+    }
+
+    #[test]
+    fn composite_guest_keys_preserve_independent_signing_and_encryption_keys() {
+        let encoded = encode_guest_public_keys(&[0x11; 32], &[0x22; 32]);
+        let request = GuestAttestationRequest::new(
+            challenge(),
+            encoded,
+            [0x33; 32],
+            CpuAttestationProfile::IntelTdx,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(request.guest_signing_public_key().unwrap(), &[0x11; 32]);
+        assert_eq!(
+            request.guest_encryption_public_key().unwrap(),
+            Some(&[0x22; 32])
         );
     }
 

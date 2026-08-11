@@ -8,7 +8,10 @@ use dcap_qvl::{
 use serde::Deserialize;
 
 use crate::{
-    attestation::{AttestedComponent, EvidenceProfile, RawEvidence},
+    attestation::{
+        AttestedComponent, EvidenceProfile, RawEvidence, WorkloadMeasurement, tdx_rtmr_extend,
+        tdx_workload_measurement_event,
+    },
     verification::{
         NativeEvidenceVerifier, NativeVerificationContext, NativeVerificationError,
         VerifiedNativeBinding, VerifiedNativeEvidence,
@@ -26,6 +29,7 @@ pub struct TdxVerificationPolicy {
     intel_root_der: Option<Vec<u8>>,
     mr_td: [u8; 48],
     rt_mrs: [[u8; 48]; 4],
+    workload_rtmr3_base: Option<[u8; 48]>,
     mr_config_id: Option<[u8; 48]>,
     mr_owner: Option<[u8; 48]>,
     mr_owner_config: Option<[u8; 48]>,
@@ -59,6 +63,7 @@ impl TdxVerificationPolicy {
             intel_root_der: None,
             mr_td,
             rt_mrs,
+            workload_rtmr3_base: None,
             mr_config_id: None,
             mr_owner: None,
             mr_owner_config: None,
@@ -67,6 +72,17 @@ impl TdxVerificationPolicy {
             allow_cached_keys: false,
             allow_smt: false,
         })
+    }
+
+    /// Derives the required RTMR3 from this baseline and the attested workload.
+    ///
+    /// RTMR0 through RTMR2 remain exact. RTMR3 must equal one SHA-384 extend of
+    /// the domain-separated workload-manifest event over `baseline`.
+    #[must_use]
+    pub const fn with_workload_rtmr3(mut self, baseline: [u8; 48]) -> Self {
+        self.rt_mrs[3] = baseline;
+        self.workload_rtmr3_base = Some(baseline);
+        self
     }
 
     /// Replaces the built-in Intel production root with caller-reviewed DER.
@@ -177,6 +193,13 @@ impl NativeEvidenceVerifier for TdxVerifier {
             .policies
             .get(context.challenge().policy_id())
             .ok_or_else(|| error("no TDX policy matches the challenge policy id"))?;
+        if policy.workload_rtmr3_base.is_some()
+            && context.attestation_binding().workload_measurement() != WorkloadMeasurement::TdxRtmr3
+        {
+            return Err(error(
+                "TDX workload-RTMR3 policy requires an RTMR3-measured attestation request",
+            ));
+        }
         let document: TsmEvidenceDocument = serde_json::from_slice(evidence.bytes())
             .map_err(|source| error(format!("invalid TDX TSM evidence document: {source}")))?;
         if document.provider != TDX_PROVIDER || document.generation != 1 {
@@ -217,7 +240,12 @@ impl NativeEvidenceVerifier for TdxVerifier {
             Report::TD15(report) => &report.base,
             Report::SgxEnclave(_) => return Err(error("DCAP evidence contains an SGX report")),
         };
-        validate_report(report, context.transcript_digest(), policy)?;
+        validate_report(
+            report,
+            context.transcript_digest(),
+            context.attestation_binding().workload_manifest_digest(),
+            policy,
+        )?;
 
         Ok(VerifiedNativeEvidence::new(
             evidence.digest(),
@@ -254,6 +282,7 @@ fn error(message: impl Into<String>) -> NativeVerificationError {
 fn validate_report(
     report: &dcap_qvl::quote::TDReport10,
     transcript_digest: &[u8; 32],
+    workload_manifest_digest: &[u8; 32],
     policy: &TdxVerificationPolicy,
 ) -> Result<(), NativeVerificationError> {
     if report.report_data[..32] != transcript_digest[..] || report.report_data[32..] != [0; 32] {
@@ -261,8 +290,15 @@ fn validate_report(
             "TDX REPORTDATA does not contain the canonical transcript binding",
         ));
     }
+    let expected_rtmr3 = policy.workload_rtmr3_base.map_or(policy.rt_mrs[3], |base| {
+        tdx_rtmr_extend(
+            &base,
+            &tdx_workload_measurement_event(workload_manifest_digest),
+        )
+    });
     if report.mr_td != policy.mr_td
-        || [report.rt_mr0, report.rt_mr1, report.rt_mr2, report.rt_mr3] != policy.rt_mrs
+        || [report.rt_mr0, report.rt_mr1, report.rt_mr2] != policy.rt_mrs[..3]
+        || report.rt_mr3 != expected_rtmr3
     {
         return Err(error(format!(
             "TDX MRTD or RTMR measurements do not match policy (actual MRTD={}, RTMR0={}, RTMR1={}, RTMR2={}, RTMR3={})",

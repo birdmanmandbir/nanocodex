@@ -315,6 +315,36 @@ impl VerifiedAttestation {
     pub const fn bundle(&self) -> &GuestAttestationBundle {
         &self.bundle
     }
+
+    /// Encrypts a secret and exact execution policy to this appraised guest.
+    ///
+    /// The resulting envelope is safe to carry over an untrusted transport;
+    /// only the X25519 key bound into this exact native evidence can open it.
+    /// `now_unix_seconds` is explicit so release authorization uses the
+    /// relying party's trusted clock.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a legacy signing-only guest identity, an oversized
+    /// secret, randomness failure, or authenticated-encryption failure.
+    pub fn seal_secret(
+        &self,
+        now_unix_seconds: u64,
+        command: crate::command_proof::AttestedCommand,
+        executable_sha256: [u8; 32],
+        secret: &[u8],
+    ) -> Result<
+        crate::secret_release::SecretReleaseEnvelope,
+        crate::secret_release::SecretReleaseError,
+    > {
+        crate::secret_release::seal_secret(
+            self,
+            now_unix_seconds,
+            command,
+            executable_sha256,
+            secret,
+        )
+    }
 }
 
 /// Composite verification failure. No attested handle is issued on any variant.
@@ -412,10 +442,11 @@ where
         .iter()
         .map(RawEvidence::digest)
         .collect();
-    let binding = AttestationBinding::new(
+    let binding = AttestationBinding::new_with_measurement(
         expected_challenge.clone(),
         bundle.request().guest_public_key().to_vec(),
         *bundle.request().workload_manifest_digest(),
+        bundle.request().workload_measurement(),
         child_digests,
     )
     .map_err(|_| AttestationVerificationError::TranscriptMismatch)?;
@@ -561,8 +592,23 @@ fn validate_fabric(
 
 #[cfg(test)]
 mod tests {
+    use ed25519_dalek::{Signer as _, SigningKey};
+    use sha2::Digest as _;
+    use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519Secret};
+
     use super::*;
-    use crate::attestation::GuestAttestationRequest;
+    use crate::{
+        attestation::{
+            AttestedGuestKeyProof, GuestAttestation, GuestAttestationRequest,
+            encode_guest_public_keys, key_proof_message,
+        },
+        command_proof::{
+            AttestedCommand, AttestedCommandProof, AttestedCommandReceipt, CommandProofExpectation,
+            CommandProofVerificationError, CommandTermination, ExecutionRecord,
+            receipt_signature_message, verify_command_proof, verify_released_secret_proof,
+        },
+        secret_release::SecretReleaseError,
+    };
 
     struct AcceptingVerifier;
 
@@ -651,6 +697,99 @@ mod tests {
         .unwrap();
         assert_eq!(verified.claims().len(), 2);
         assert_eq!(verified.guest_public_key(), [1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn released_secret_proof_accepts_fresh_quote_for_same_appraised_key() {
+        let signing_key = SigningKey::from_bytes(&[0x33; 32]);
+        let encryption_key = X25519Secret::from([0x44; 32]);
+        let guest_keys = encode_guest_public_keys(
+            signing_key.verifying_key().as_bytes(),
+            X25519PublicKey::from(&encryption_key).as_bytes(),
+        );
+        let request = GuestAttestationRequest::new(
+            challenge(),
+            guest_keys,
+            [4; 32],
+            CpuAttestationProfile::AmdSevSnp,
+            None,
+        )
+        .unwrap();
+        let transcript = request.binding(Vec::new()).unwrap().transcript_digest();
+        let key_proof = AttestedGuestKeyProof::new(
+            signing_key.sign(&key_proof_message(&transcript)).to_bytes(),
+        );
+        let cpu = |byte: u8| {
+            RawEvidence::new(
+                AttestedComponent::CpuVm,
+                EvidenceProfile::AmdSevSnp,
+                "application/octet-stream",
+                [byte],
+            )
+            .unwrap()
+        };
+        let appraised_bundle =
+            GuestAttestationBundle::new(request.clone(), transcript, vec![cpu(1)]);
+        let verified =
+            verify_attestation(appraised_bundle, &challenge(), 1_999, &AcceptingVerifier)
+                .await
+                .unwrap();
+        assert!(matches!(
+            verified.seal_secret(
+                2_001,
+                AttestedCommand::new("/bin/consumer").unwrap(),
+                [5; 32],
+                b"stale secret",
+            ),
+            Err(SecretReleaseError::ChallengeExpired {
+                expires_at: 2_000,
+                now: 2_001,
+            })
+        ));
+
+        let stdin = b"released secret";
+        let executable_sha256 = [5; 32];
+        let argv = vec!["/bin/consumer".to_owned()];
+        let envelope = verified
+            .seal_secret(
+                1_999,
+                AttestedCommand::new("/bin/consumer").unwrap(),
+                executable_sha256,
+                stdin,
+            )
+            .unwrap();
+        assert!(
+            !serde_json::to_string(&envelope)
+                .unwrap()
+                .contains("released secret")
+        );
+        let record = ExecutionRecord::new_with_stdin(
+            challenge(),
+            executable_sha256,
+            argv.clone(),
+            stdin,
+            b"used\n",
+            b"",
+            CommandTermination::ExitCode(0),
+        );
+        let receipt_signature = signing_key
+            .sign(&receipt_signature_message(&record))
+            .to_bytes();
+        let receipt =
+            AttestedCommandReceipt::new(record, b"used\n".to_vec(), Vec::new(), receipt_signature);
+        let fresh_attestation = GuestAttestation::new(
+            GuestAttestationBundle::new(request, transcript, vec![cpu(2)]),
+            key_proof,
+        );
+        let proof = AttestedCommandProof::new(fresh_attestation, receipt);
+        let expected = CommandProofExpectation::new(challenge(), [4; 32], executable_sha256, argv)
+            .stdin_sha256(sha2::Sha256::digest(stdin).into());
+
+        verify_released_secret_proof(&proof, &verified, &expected).unwrap();
+        assert!(matches!(
+            verify_command_proof(&proof, &verified, &expected),
+            Err(CommandProofVerificationError::AttestationMismatch)
+        ));
     }
 
     #[tokio::test]

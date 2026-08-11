@@ -47,6 +47,7 @@ arcbox-ext4 = "0.1.2"
 axum = { version = "0.8.9", default-features = false, features = ["form", "http1", "json", "query", "tokio"] }
 bm25 = { version = "2.3.2", default-features = false }
 chrono = { version = "0.4.43", default-features = false, features = ["clock", "std", "wasmbind"] }
+chacha20poly1305 = "0.10.1"
 chromiumoxide = "0.9.1"
 clap = { version = "4.5.54", features = ["derive", "env"] }
 cpal = "0.16.0"
@@ -65,11 +66,12 @@ hex = "0.4.3"
 http = "1.3.1"
 http-body-util = "0.1.3"
 hmac = "0.13.0"
+hkdf = "0.12.4"
 hudsucker = { version = "0.25.0", git = "https://github.com/gakonst/hudsucker", rev = "9a13609adc4b37b3e7fba28a320546bf672f0f4d", default-features = false, features = ["rcgen-ca", "ring", "rustls-client"] }
 ignore = "0.4.31"
 jiff = { version = "0.2.35", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 jsonschema = { version = "0.48.5", default-features = false }
-krun = { package = "libkrun", version = "=2.0.0-dev", git = "https://github.com/gakonst/libkrun", rev = "a638d2eef67ee3c602d80eb0d337befcf6eb351b", features = ["blk", "net"] }
+krun = { package = "libkrun", version = "=2.0.0-dev", git = "https://github.com/gakonst/libkrun", rev = "ed8ea578073c795ca156cf5de0bcb9ad92571e99", features = ["blk", "net"] }
 mpp = { version = "=0.11.0", git = "https://github.com/tempoxyz/mpp-rs", rev = "3e37469bb19434982b433ae44ea8c713f7ea923a", default-features = false }
 nanocodex = { version = "0.3.0", path = "crates/nanocodex" }
 nanocodex-agent = { version = "0.3.0", path = "crates/nanocodex-agent" }
@@ -125,6 +127,7 @@ serde_json = { version = "1.0.149", features = ["raw_value"] }
 sev = { version = "8.0.0", default-features = false, features = ["crypto_nossl", "snp"] }
 sha1 = "0.11.0"
 sha2 = { version = "0.11.0", default-features = false }
+sha2_10 = { package = "sha2", version = "0.10.9", default-features = false }
 shlex = "2.0.1"
 simd-json = "=0.15.1"
 smallvec = { version = "1.15.1", features = ["serde"] }
@@ -150,6 +153,8 @@ unicode-width = "0.2"
 url = "2.5.7"
 uuid = { version = "1", features = ["js", "serde", "v4", "v5", "v7"] }
 x509-parser = { version = "0.18.1", features = ["verify"] }
+x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
+zeroize = { version = "1.8.2", features = ["derive", "serde"] }
 v8-heap-parser = "1.1.0"
 vergen = { version = "8", default-features = false }
 wasm-bindgen = "0.2.105"

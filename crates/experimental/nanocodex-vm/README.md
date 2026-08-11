@@ -30,9 +30,9 @@ public profile. [`host::Capabilities::confidential_report`] reports every
 required host, active-libkrun-artifact, measured-guest, device-assignment,
 attestation, and topology capability without selecting a weaker profile.
 
-The measured guest attester is implemented. It lazily generates a retained
-Ed25519 identity, binds its public key and the canonical
-[`host::AttestationBinding`] transcript into native evidence, and signs the
+The measured guest attester is implemented. It lazily generates retained
+Ed25519 signing and X25519 secret-release keys, binds both public keys and the
+canonical [`host::AttestationBinding`] transcript into native evidence, and signs the
 transcript to prove possession of the guest key. [`tools::VmToolSession::attest`]
 returns this typed response over the existing bounded host/guest channel.
 Issuing [`host::VerifiedAttestation`] remains a separate relying-party action:
@@ -106,6 +106,14 @@ cargo run --locked --quiet -p nanocodex-vm --bin nanocodex-vm-guest \
   --attest-example --nonce-hex "$RELYING_PARTY_NONCE_HEX"
 ```
 
+On TDX kernels exposing the upstream RTMR sysfs interface, add
+`--measure-workload-in-tdx-rtmr3`. The guest extends a domain-separated
+SHA-384 event for the workload-manifest digest into RTMR3, checks the exact
+hardware read-back, and only then requests the quote. The relying party uses
+`TdxVerificationPolicy::with_workload_rtmr3(pre_extend_rtmr3)`; it derives the
+only accepted post-extend value and rejects a transcript which did not
+explicitly select RTMR3 measurement.
+
 The guest-generated challenge used by bare `just attest-example` demonstrates
 native collection only. The JSON labels its nonce origin and warns that vendor
 appraisal is still required.
@@ -143,10 +151,11 @@ proof signs the fresh challenge, executable hash, complete argv, stream hashes,
 and termination with the native-evidence-bound guest key. Appraise the exact
 embedded AMD or Intel evidence and then pass the resulting
 `VerifiedAttestation` to `verify_command_proof`; transport success alone is not
-trust. On a managed VM, a caller-supplied workload digest is report-bound but
-is not automatically part of the launch measurement. Exact workload identity
-therefore additionally requires a measured/verity image, an owned RTMR
-extension, or a cloud image-digest attestation policy.
+trust. On TDX, use the RTMR3 mode above to make a post-boot workload commitment
+hardware-verifiable. Without that mode, a caller-supplied workload digest is
+REPORTDATA-bound but is not automatically part of the launch measurement. On
+SNP, only launch pages are hardware-measured after boot; use an exact launch
+measurement plus the pre-launch `HOST_DATA` commitment and REPORTDATA binding.
 
 The H100 recipe requests exactly one Hopper GPU evidence object from NVIDIA's
 `nvattest` C++ CLI using the same 32-byte challenge as the command receipt. The
@@ -225,7 +234,8 @@ An SNP relying party can now appraise a retained response entirely offline:
 
 ```console
 just verify-snp-attestation attestation.json \
-  "$EXPECTED_SNP_MEASUREMENT_HEX" amd-generation.crl
+  "$EXPECTED_SNP_MEASUREMENT_HEX" amd-generation.crl \
+  "$EXPECTED_WORKLOAD_MANIFEST_SHA256"
 ```
 
 [`host::SnpVerifier`] uses pure Rust cryptography and pinned AMD Milan, Genoa,
@@ -237,6 +247,14 @@ fresh signed CRL by default and accepts it as separately retained relying-party
 collateral. An identical CRL embedded in the guest certificate table remains
 compatible. `--allow-missing-crl` exists only as an explicit offline
 availability policy; any CRL which is present is still verified.
+
+For libkrun SNP launches, `VmConfig::snp_launch_commitment` copies the approved
+32-byte manifest digest into `SNP_LAUNCH_FINISH.HOST_DATA` before vCPUs run.
+Require the same value through `SnpVerificationPolicy::with_host_data` (or the
+last `just verify-snp-attestation` argument). `HOST_DATA` is report-authenticated
+guest-owner policy data, not an additional SNP page measurement; the relying
+party must still pin the exact launch measurement which contains the supervisor
+that enforces the manifest.
 
 TDX and Nitro responses have equivalent offline appraisal entry points:
 
@@ -254,6 +272,11 @@ the transcript-bound REPORTDATA. Optional policy pins cover MRCONFIGID,
 MROWNER, MROWNERCONFIG, and XFAM. The collateral is an appraisal input and must
 be obtained and retained by the relying party; quote collection never silently
 fetches trust material.
+
+For the hardware workload-extension mode, supply the trusted pre-extend RTMR3
+as the same positional value and set the final `rtmr3_is_baseline` recipe
+argument to `true`, or use the expanded example's `--rtmr3-baseline` option.
+RTMR0 through RTMR2 and MRTD remain exact policy values.
 
 DCAP's dynamic-platform, cached-key, and SMT PCK flags are denied by default.
 Cloud platforms which intentionally use one of those modes must opt into each
@@ -339,6 +362,71 @@ example uses the static guest-binary digest as its workload-manifest identity;
 production acceptance remains gated on the reproducible firmware, kernel,
 initrd, command-line, supervisor, and authenticated-root manifest described in
 the confidential-VM plan.
+
+### Release a secret only after appraisal
+
+[`host::VerifiedAttestation`] is also the capability required to encrypt a
+secret to the guest's evidence-bound X25519 key. The untrusted VM transport
+sees only an XChaCha20-Poly1305 envelope. Its encrypted payload authorizes one
+exact challenge, workload, static executable digest, argv, timeout, output
+bound, and secret value:
+
+```no_run
+use nanocodex_vm::{
+    host::{
+        AttestedCommand, CommandProofExpectation, VerifiedAttestation,
+        verify_released_secret_proof,
+    },
+    tools::VmToolSession,
+};
+use sha2::{Digest as _, Sha256};
+
+# async fn release(
+#   verified: &VerifiedAttestation,
+#   session: &VmToolSession,
+#   executable_sha256: [u8; 32],
+#   now_unix_seconds: u64,
+# ) -> Result<(), Box<dyn std::error::Error>> {
+let secret = b"one-time model or tool credential";
+let secret_sha256: [u8; 32] = Sha256::digest(secret).into();
+let program = "/opt/secret-consumer";
+let command = AttestedCommand::new(program)?.arg("--once")?;
+let envelope = verified.seal_secret(
+    now_unix_seconds,
+    command,
+    executable_sha256,
+    secret,
+)?;
+let proof = session.prove_secret_command(envelope).await?;
+
+let expected = CommandProofExpectation::new(
+    verified.bundle().request().challenge().clone(),
+    *verified.workload_manifest_digest(),
+    executable_sha256,
+    vec![program.to_owned(), "--once".to_owned()],
+)
+.stdin_sha256(secret_sha256);
+let result = verify_released_secret_proof(&proof, verified, &expected)?;
+assert_eq!(result.record().stdin_sha256(), &secret_sha256);
+# Ok(())
+# }
+```
+
+The guest decrypts only after appraisal, checks the executable's exact bytes,
+executes them from a sealed `memfd`, writes the secret only to stdin, zeroizes
+plaintext buffers, and signs the stdin/output/termination receipt. Each
+envelope is one-time for a retained identity; exact replay is rejected and the
+in-memory replay ledger is bounded. A newly sealed envelope is a new relying-
+party authorization.
+
+`verify_released_secret_proof` deliberately differs from ordinary
+`verify_command_proof`: a fresh post-execution quote is byte-distinct from the
+quote used to authorize release. It therefore requires the exact previously
+appraised request and guest key, verifies both guest signatures and the command
+receipt, and treats the new native evidence as audit material rather than
+silently appraising it. This proves use by the measured retained supervisor; it
+does not prove the secret caused an external side effect or that output is
+semantically correct.
 
 ### B200 assignment
 

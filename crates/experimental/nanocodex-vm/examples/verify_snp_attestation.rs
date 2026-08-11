@@ -16,6 +16,7 @@ struct Options {
     minimum_guest_svn: u32,
     allow_smt: bool,
     require_single_socket: bool,
+    host_data: Option<[u8; 32]>,
     revocation: SnpRevocationPolicy,
 }
 
@@ -34,6 +35,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .with_minimum_guest_svn(options.minimum_guest_svn)
     .with_smt_allowed(options.allow_smt)
     .with_single_socket_required(options.require_single_socket);
+    if let Some(host_data) = options.host_data {
+        policy = policy.with_host_data(host_data);
+    }
     if let Some(crl) = options.crl {
         policy = policy.with_crl_der(attestation_support::read_bounded(&crl, 4 * 1024 * 1024)?)?;
     }
@@ -53,6 +57,7 @@ impl Options {
         let mut minimum_guest_svn = 0;
         let mut allow_smt = false;
         let mut require_single_socket = false;
+        let mut host_data = None;
         let mut revocation = SnpRevocationPolicy::RequireFreshCrl;
         let mut arguments = std::env::args().skip(1);
         while let Some(argument) = arguments.next() {
@@ -83,10 +88,16 @@ impl Options {
                 }
                 "--allow-smt" => allow_smt = true,
                 "--require-single-socket" => require_single_socket = true,
+                "--host-data" => {
+                    host_data = Some(parse_hex(
+                        &value(&mut arguments, "--host-data")?,
+                        "host data",
+                    )?)
+                }
                 "--allow-missing-crl" => revocation = SnpRevocationPolicy::AllowUnavailable,
                 "--help" | "-h" => {
                     println!(
-                        "usage: verify_snp_attestation --input PATH|- --measurement 96_HEX [--crl AMD_CRL.der] [--minimum-fmc N] [--minimum-bootloader N] [--minimum-tee N] [--minimum-snp N] [--minimum-microcode N] [--minimum-guest-svn N] [--allow-smt] [--require-single-socket] [--allow-missing-crl]"
+                        "usage: verify_snp_attestation --input PATH|- --measurement 96_HEX [--host-data 64_HEX] [--crl AMD_CRL.der] [--minimum-fmc N] [--minimum-bootloader N] [--minimum-tee N] [--minimum-snp N] [--minimum-microcode N] [--minimum-guest-svn N] [--allow-smt] [--require-single-socket] [--allow-missing-crl]"
                     );
                     std::process::exit(0);
                 }
@@ -101,6 +112,7 @@ impl Options {
             minimum_guest_svn,
             allow_smt,
             require_single_socket,
+            host_data,
             revocation,
         })
     }

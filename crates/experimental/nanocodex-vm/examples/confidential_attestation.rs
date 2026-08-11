@@ -95,6 +95,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut vm = VmConfig::ext4(runtime_path)
         .network(nanocodex_vm::host::Network::Disabled)
         .confidential(vm_profile);
+    if matches!(options.cpu, CpuProfile::Snp) {
+        vm = vm.snp_launch_commitment(manifest_digest);
+    }
     if let Some(qgs) = options.qgs {
         vm = vm.tdx_quote_generation_socket(qgs);
     }
@@ -120,8 +123,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         now.checked_add(300)
             .ok_or_else(|| io::Error::other("attestation expiry overflow"))?,
     )?;
-    let parameters =
+    let mut parameters =
         GuestAttestationParameters::new(challenge, manifest_digest, cpu_profile, nvidia_profile);
+    if matches!(options.cpu, CpuProfile::Tdx) {
+        parameters = parameters.measure_workload_in_tdx_rtmr3();
+    }
     let collection =
         tokio::time::timeout(Duration::from_secs(180), session.attest(parameters)).await;
     let result = match collection {

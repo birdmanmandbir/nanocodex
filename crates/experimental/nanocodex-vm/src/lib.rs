@@ -146,6 +146,17 @@ mod overlay;
     )
 ))]
 mod process;
+#[cfg(any(
+    feature = "guest-runtime",
+    all(
+        feature = "host",
+        any(
+            all(target_os = "linux", not(target_env = "musl")),
+            all(target_os = "macos", target_arch = "aarch64")
+        )
+    )
+))]
+mod secret_release;
 #[cfg(all(
     feature = "host",
     any(
@@ -221,6 +232,7 @@ pub mod host {
             AttestedGuestKeyProof, AttestedGuestKeyProofError, CpuAttestationProfile,
             EvidenceProfile, GuestAttestation, GuestAttestationBundle, GuestAttestationParameters,
             GuestAttestationRequest, MAX_RAW_EVIDENCE_BYTES, NvidiaAttestationProfile, RawEvidence,
+            WorkloadMeasurement,
         },
         capabilities::{Capabilities, KrunFeature},
         command::GuestCommand,
@@ -229,7 +241,7 @@ pub mod host {
             CollectedCommandProof, CommandProofExpectation, CommandProofInputError,
             CommandProofVerificationError, CommandTermination, ExecutionRecord,
             MAX_ATTESTED_COMMAND_OUTPUT_BYTES, MAX_ATTESTED_EXECUTABLE_BYTES, VerifiedCommandProof,
-            verify_collected_command_proof, verify_command_proof,
+            verify_collected_command_proof, verify_command_proof, verify_released_secret_proof,
         },
         confidential::{
             ConfidentialCapability, ConfidentialCapabilityCheck, ConfidentialHostReport,
@@ -244,6 +256,9 @@ pub mod host {
         krun::{KrunVm, KrunVmControl, VmError},
         overlay::{OverlayDiskError, create_sparse_overlay_disk, overlay_guest_command},
         process::{PrivateVmProcessConfig, VmProcessConfig, VmProcessError},
+        secret_release::{
+            MAX_SECRET_RELEASE_BYTES, SecretReleaseEnvelope, SecretReleaseError, seal_secret,
+        },
         verification::{
             AttestationVerificationError, CpuVerifierSet, NativeEvidenceVerifier,
             NativeVerificationContext, NativeVerificationError, NativeVerifierSet,
@@ -261,7 +276,7 @@ pub mod guest {
             AttestationChallenge, AttestationInputError, AttestedGuestKeyProof,
             AttestedGuestKeyProofError, CpuAttestationProfile, GuestAttestation,
             GuestAttestationBundle, GuestAttestationParameters, GuestAttestationRequest,
-            NvidiaAttestationProfile,
+            NvidiaAttestationProfile, WorkloadMeasurement,
         },
         command_proof::{
             AttestedCommand, AttestedCommandProof, AttestedCommandReceipt, AttestedCommandRequest,
@@ -272,6 +287,7 @@ pub mod guest {
             GuestAttestationError, GuestAttestationIdentity, collect_attestation,
             detect_cpu_attestation_profile, detect_nvidia_attestation_profile,
         },
+        secret_release::{SecretReleaseEnvelope, SecretReleaseError},
     };
 }
 

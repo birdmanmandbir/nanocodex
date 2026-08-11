@@ -468,6 +468,7 @@ struct ExampleOptions {
     policy_id: String,
     manifest_digest: Option<[u8; 32]>,
     nvidia: ExampleNvidia,
+    measure_workload_in_tdx_rtmr3: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -478,6 +479,7 @@ impl ExampleOptions {
             policy_id: "nanocodex-attestation-example-v1".to_owned(),
             manifest_digest: None,
             nvidia: ExampleNvidia::Auto,
+            measure_workload_in_tdx_rtmr3: false,
         };
         let mut arguments = arguments.peekable();
         while let Some(argument) = arguments.next() {
@@ -512,9 +514,12 @@ impl ExampleOptions {
                         }
                     };
                 }
+                "--measure-workload-in-tdx-rtmr3" => {
+                    options.measure_workload_in_tdx_rtmr3 = true;
+                }
                 "--help" | "-h" => {
                     eprintln!(
-                        "usage: nanocodex-vm-guest --attest-example [--nonce-hex 64_HEX] [--policy-id ID] [--manifest-sha256 64_HEX] [--nvidia auto|off|h100-single|b200-single|b200-hgx8]"
+                        "usage: nanocodex-vm-guest --attest-example [--nonce-hex 64_HEX] [--policy-id ID] [--manifest-sha256 64_HEX] [--measure-workload-in-tdx-rtmr3] [--nvidia auto|off|h100-single|b200-single|b200-hgx8]"
                     );
                     std::process::exit(0);
                 }
@@ -592,8 +597,11 @@ async fn collect_example(
         now.checked_add(300)
             .ok_or_else(|| io::Error::other("attestation expiry overflow"))?,
     )?;
-    let parameters =
+    let mut parameters =
         GuestAttestationParameters::new(challenge, manifest_digest, cpu_profile, nvidia_profile);
+    if options.measure_workload_in_tdx_rtmr3 {
+        parameters = parameters.measure_workload_in_tdx_rtmr3();
+    }
     let identity = GuestAttestationIdentity::generate()?;
     let attestation = identity.collect(parameters).await?;
     attestation.verify_key_proof()?;

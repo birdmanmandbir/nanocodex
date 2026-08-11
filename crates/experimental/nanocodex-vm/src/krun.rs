@@ -259,6 +259,7 @@ impl KrunVm {
 
         if let Some(profile) = config.confidential_profile() {
             configure_confidential_context(context, profile)?;
+            attach_snp_host_data(context, config)?;
         }
 
         check(
@@ -844,6 +845,11 @@ fn validate_confidential_config(config: &VmConfig) -> Result<(), ConfidentialVmE
                 "Intel QGS transport requires an Intel TDX profile",
             ));
         }
+        if config.snp_host_data().is_some() {
+            return Err(ConfidentialVmError::InvalidConfig(
+                "SNP launch commitment requires an AMD SEV-SNP profile",
+            ));
+        }
         #[cfg(all(target_os = "linux", not(target_env = "musl")))]
         if config.confidential_device_bundle().is_some() {
             return Err(ConfidentialVmError::InvalidConfig(
@@ -865,6 +871,11 @@ fn validate_confidential_config(config: &VmConfig) -> Result<(), ConfidentialVmE
     if config.tdx_qgs_socket().is_some() && profile.cpu_tee() != CpuTee::IntelTdx {
         return Err(ConfidentialVmError::InvalidConfig(
             "Intel QGS transport requires an Intel TDX profile",
+        ));
+    }
+    if config.snp_host_data().is_some() && profile.cpu_tee() != CpuTee::AmdSevSnp {
+        return Err(ConfidentialVmError::InvalidConfig(
+            "SNP launch commitment requires an AMD SEV-SNP profile",
         ));
     }
     #[cfg(all(target_os = "linux", not(target_env = "musl")))]
@@ -910,6 +921,31 @@ fn configure_confidential_context(
 #[cfg(feature = "libkrun-amd-sev")]
 fn configure_amd_sev_context(context: u32) -> Result<(), VmError> {
     check(krun::krun_set_tee_type(context, 0), "select AMD SEV-SNP")
+}
+
+#[cfg(feature = "libkrun-amd-sev")]
+fn attach_snp_host_data(context: u32, config: &VmConfig) -> Result<(), VmError> {
+    let Some(host_data) = config.snp_host_data() else {
+        return Ok(());
+    };
+    // SAFETY: the fixed-size array remains readable for the duration of the
+    // call and libkrun copies its bytes into the owned VM context.
+    check(
+        unsafe { krun::krun_set_snp_host_data(context, host_data.as_ptr(), host_data.len()) },
+        "configure AMD SEV-SNP launch commitment",
+    )
+}
+
+#[cfg(not(feature = "libkrun-amd-sev"))]
+fn attach_snp_host_data(_context: u32, config: &VmConfig) -> Result<(), VmError> {
+    if config.snp_host_data().is_none() {
+        Ok(())
+    } else {
+        Err(ConfidentialVmError::InvalidConfig(
+            "SNP launch commitment requires the AMD SEV-SNP libkrun artifact",
+        )
+        .into())
+    }
 }
 
 #[cfg(not(feature = "libkrun-amd-sev"))]

@@ -43,6 +43,7 @@ use tokio::{
     sync::mpsc,
     task::JoinSet,
 };
+use zeroize::Zeroizing;
 
 use super::protocol::{
     AttestResponse, CancelRequest, ControlResponse, CreateDirectoryRequest, ExecuteRequest,
@@ -60,6 +61,7 @@ use crate::{
         ExecutionRecord, MAX_ATTESTED_EXECUTABLE_BYTES,
     },
     guest_attestation::GuestAttestationError,
+    secret_release::{SecretReleaseEnvelope, SecretReleaseError},
 };
 
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
@@ -485,6 +487,40 @@ async fn execute_request(
                 })
             }
         }
+        SessionRequest::ProveSecretCommand(request) => {
+            #[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+            {
+                let result = async {
+                    let identity = attestation_identity
+                        .get_or_try_init(|| async { GuestAttestationIdentity::generate() })
+                        .await?;
+                    prove_released_secret(identity, request.envelope).await
+                }
+                .await;
+                SessionResponse::ProveSecretCommand(match result {
+                    Ok(proof) => ProveCommandResponse {
+                        id: request.id,
+                        proof: Some(proof),
+                        error: None,
+                    },
+                    Err(error) => ProveCommandResponse {
+                        id: request.id,
+                        proof: None,
+                        error: Some(error.to_string()),
+                    },
+                })
+            }
+            #[cfg(not(all(feature = "guest-runtime", target_os = "linux")))]
+            {
+                SessionResponse::ProveSecretCommand(ProveCommandResponse {
+                    id: request.id,
+                    proof: None,
+                    error: Some(
+                        "attestation-gated secret execution requires a Linux guest runtime".into(),
+                    ),
+                })
+            }
+        }
         SessionRequest::Execute(request) => {
             SessionResponse::Execute(execute_command(request).await)
         }
@@ -866,8 +902,12 @@ enum GuestCommandProofError {
     OutputLimitExceeded,
     #[error("attestable command did not expose an exit code or terminating signal")]
     MissingTermination,
+    #[error("released-secret command executable does not match its authorized digest")]
+    ExecutableDigestMismatch,
     #[error(transparent)]
     Attestation(#[from] GuestAttestationError),
+    #[error(transparent)]
+    SecretRelease(#[from] SecretReleaseError),
 }
 
 #[cfg(all(feature = "guest-runtime", target_os = "linux"))]
@@ -922,6 +962,74 @@ async fn prove_command(
         parameters.challenge().clone(),
         executable_sha256,
         argv,
+        &output.stdout,
+        &output.stderr,
+        termination,
+    );
+    let signature = identity.sign_execution_record(&record);
+    let receipt = AttestedCommandReceipt::new(record, output.stdout, output.stderr, signature);
+    let attestation = identity.collect(parameters).await?;
+    Ok(AttestedCommandProof::new(attestation, receipt))
+}
+
+#[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+async fn prove_released_secret(
+    identity: &GuestAttestationIdentity,
+    envelope: SecretReleaseEnvelope,
+) -> Result<AttestedCommandProof, GuestCommandProofError> {
+    use sha2::Digest as _;
+
+    let opened = identity.open_secret_release(&envelope).await?;
+    let (request, expected_executable_sha256, secret) = opened.into_parts();
+    let (parameters, command) = request.into_parts();
+    let executable = read_attested_executable(command.program()).await?;
+    let executable_sha256 = sha2::Sha256::digest(&executable).into();
+    if executable_sha256 != expected_executable_sha256 {
+        return Err(GuestCommandProofError::ExecutableDigestMismatch);
+    }
+    let executable = sealed_executable(&executable)?;
+    let argv = command.argv();
+    let path = format!("/proc/self/fd/{}", executable.as_raw_fd());
+    let mut process = Command::new(path);
+    process
+        .as_std_mut()
+        .arg0(&argv[0])
+        .args(&argv[1..])
+        .current_dir("/")
+        .env_clear()
+        .env("LANG", "C")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    process.process_group(0);
+    let stdin_sha256 = sha2::Sha256::digest(&secret).into();
+    let outcome = command_output_with_stdin(
+        &mut process,
+        Duration::from_millis(command.timeout_millis_value()),
+        command.max_output_bytes_value(),
+        secret,
+    )
+    .await?;
+    let output = match outcome {
+        CommandOutcome::Completed(output) => output,
+        CommandOutcome::TimedOut { .. } => return Err(GuestCommandProofError::TimedOut),
+        CommandOutcome::OutputLimitExceeded => {
+            return Err(GuestCommandProofError::OutputLimitExceeded);
+        }
+    };
+    use std::os::unix::process::ExitStatusExt as _;
+    let termination = if let Some(code) = output.status.code() {
+        CommandTermination::ExitCode(code)
+    } else if let Some(signal) = output.status.signal() {
+        CommandTermination::Signal(signal)
+    } else {
+        return Err(GuestCommandProofError::MissingTermination);
+    };
+    let record = ExecutionRecord::new_with_stdin_sha256(
+        parameters.challenge().clone(),
+        executable_sha256,
+        argv,
+        stdin_sha256,
         &output.stdout,
         &output.stderr,
         termination,
@@ -1089,7 +1197,53 @@ async fn command_output(
     stdout_mirror: Option<File>,
     stderr_mirror: Option<File>,
 ) -> std::io::Result<CommandOutcome> {
+    command_output_inner(
+        command,
+        timeout,
+        max_output_bytes,
+        stdout_mirror,
+        stderr_mirror,
+        None,
+    )
+    .await
+}
+
+#[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+async fn command_output_with_stdin(
+    command: &mut Command,
+    timeout: Duration,
+    max_output_bytes: usize,
+    stdin: Zeroizing<Vec<u8>>,
+) -> std::io::Result<CommandOutcome> {
+    command_output_inner(command, timeout, max_output_bytes, None, None, Some(stdin)).await
+}
+
+async fn command_output_inner(
+    command: &mut Command,
+    timeout: Duration,
+    max_output_bytes: usize,
+    stdout_mirror: Option<File>,
+    stderr_mirror: Option<File>,
+    #[cfg_attr(
+        not(all(feature = "guest-runtime", target_os = "linux")),
+        allow(unused_variables)
+    )]
+    stdin: Option<Zeroizing<Vec<u8>>>,
+) -> std::io::Result<CommandOutcome> {
     let mut child = command.spawn()?;
+    #[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+    let stdin_writer = if let Some(stdin) = stdin {
+        let mut pipe = child
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::other("guest command stdin was not piped"))?;
+        Some(tokio::spawn(async move {
+            pipe.write_all(&stdin).await?;
+            pipe.shutdown().await
+        }))
+    } else {
+        None
+    };
     let process_group = child
         .id()
         .and_then(|id| i32::try_from(id).ok())
@@ -1147,6 +1301,13 @@ async fn command_output(
             "guest command descendants kept output pipes open",
         ))
     })?;
+    #[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+    if let Some(mut writer) = stdin_writer {
+        tokio::time::timeout(Duration::from_secs(1), &mut writer)
+            .await
+            .map_err(|_| std::io::Error::other("guest command did not consume released secret"))?
+            .map_err(std::io::Error::other)??;
+    }
     process_group_guard.disarm();
     let output_limit_exceeded = retained.load(Ordering::Relaxed) > max_output_bytes;
     match outcome {

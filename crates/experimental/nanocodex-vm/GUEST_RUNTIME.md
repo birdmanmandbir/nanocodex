@@ -23,8 +23,10 @@ inside an SNP VM, TDX TD, or Nitro Enclave:
 nanocodex-vm-guest --attest-example
 ```
 
-This auto-detects the CPU TEE and exact supported B200 topology, generates an
-Ed25519 guest identity, and emits a JSON evidence bundle with a signed
-key-possession proof. Supply `--nonce-hex` with a relying-party nonce for
-remote freshness. Collection is not vendor signature or measurement-policy
-appraisal.
+This auto-detects the CPU TEE and exact supported NVIDIA topology, generates
+retained Ed25519 signing and X25519 secret-release keys, and emits a JSON
+evidence bundle with a signed key-possession proof. Supply `--nonce-hex` with a
+relying-party nonce for remote freshness. On TDX, add
+`--measure-workload-in-tdx-rtmr3` to extend and verify the workload commitment
+through the kernel's hardware RTMR interface before quoting. Collection is not
+vendor signature or measurement-policy appraisal.

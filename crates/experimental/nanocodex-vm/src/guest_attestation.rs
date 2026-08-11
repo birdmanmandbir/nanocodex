@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     io,
     path::{Path, PathBuf},
     process::Stdio,
@@ -13,20 +14,32 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::{
     fs,
-    io::{AsyncRead, AsyncReadExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
+    sync::Mutex,
     time::timeout,
 };
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519Secret};
+use zeroize::Zeroizing;
 
 use crate::attestation::{
     AttestationInputError, AttestedComponent, AttestedGuestKeyProof, CpuAttestationProfile,
     EvidenceProfile, GuestAttestation, GuestAttestationBundle, GuestAttestationParameters,
     GuestAttestationRequest, MAX_RAW_EVIDENCE_BYTES, NvidiaAttestationProfile, RawEvidence,
-    key_proof_message,
+    WorkloadMeasurement, encode_guest_public_keys, key_proof_message, tdx_rtmr_extend,
+    tdx_workload_measurement_event,
 };
 use crate::command_proof::{ExecutionRecord, receipt_signature_message};
+use crate::secret_release::{
+    MAX_OPENED_SECRET_RELEASES, OpenedSecretRelease, SecretReleaseEnvelope, SecretReleaseError,
+    open_secret,
+};
 
 const TSM_REPORT_ROOT: &str = "/sys/kernel/config/tsm/report";
+const TDX_RTMR3_PATHS: [&str; 2] = [
+    "/sys/class/misc/tdx_guest/measurements/rtmr3:sha384",
+    "/sys/devices/virtual/misc/tdx_guest/measurements/rtmr3:sha384",
+];
 const NVATTEST: &str = "nvattest";
 const NVATTEST_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_COMMAND_OUTPUT_BYTES: usize = MAX_RAW_EVIDENCE_BYTES;
@@ -41,7 +54,7 @@ pub enum GuestAttestationError {
     /// The request contains invalid binding inputs.
     #[error("invalid guest attestation request: {0}")]
     InvalidRequest(#[from] AttestationInputError),
-    /// The guest could not create its retained Ed25519 attestation identity.
+    /// The guest could not create its retained signing and secret-release identity.
     #[error("failed to generate the guest attestation identity: {0}")]
     IdentityRandom(#[from] getrandom::Error),
     /// No supported confidential CPU environment was visible to the guest.
@@ -119,6 +132,34 @@ pub enum GuestAttestationError {
         /// Observed generation counter.
         actual: u64,
     },
+    /// This kernel does not expose the upstream TDX RTMR measurement interface.
+    #[error("Intel TDX RTMR3 is unavailable; expected {path}")]
+    TdxRtmrUnavailable {
+        /// Preferred upstream sysfs path.
+        path: &'static str,
+    },
+    /// A TDX measurement-register read or write failed.
+    #[error("Intel TDX RTMR3 operation at {path} failed: {source}")]
+    TdxRtmrIo {
+        /// Measurement-register sysfs path.
+        path: PathBuf,
+        /// Underlying filesystem failure.
+        source: io::Error,
+    },
+    /// The kernel returned a malformed TDX measurement register.
+    #[error("Intel TDX RTMR3 at {path} is {actual} bytes; expected 48")]
+    TdxRtmrSize {
+        /// Measurement-register sysfs path.
+        path: PathBuf,
+        /// Returned byte length.
+        actual: usize,
+    },
+    /// RTMR3 did not contain the expected extend result after the write.
+    #[error("Intel TDX RTMR3 read-back does not match the workload extension")]
+    TdxRtmrReadbackMismatch,
+    /// One retained identity was asked to represent more than one measured workload.
+    #[error("an attested guest identity can measure only one workload manifest into RTMR3")]
+    MeasuredWorkloadChanged,
     /// The NVIDIA attestation executable could not be started or awaited.
     #[error("failed to run {program}: {source}")]
     CommandIo {
@@ -193,9 +234,12 @@ pub enum GuestAttestationError {
     },
 }
 
-/// Guest-retained Ed25519 identity bound into native attestation evidence.
+/// Guest-retained signing and secret-release identity bound into native evidence.
 pub struct GuestAttestationIdentity {
     signing_key: SigningKey,
+    encryption_key: X25519Secret,
+    measured_workload: Mutex<Option<[u8; 32]>>,
+    opened_secret_releases: Mutex<BTreeSet<[u8; 32]>>,
 }
 
 impl GuestAttestationIdentity {
@@ -205,10 +249,15 @@ impl GuestAttestationIdentity {
     ///
     /// Returns an error when the guest kernel cannot provide secure randomness.
     pub fn generate() -> Result<Self, GuestAttestationError> {
-        let mut secret = [0_u8; 32];
-        getrandom::fill(&mut secret)?;
+        let mut secret = Zeroizing::new([0_u8; 32]);
+        getrandom::fill(secret.as_mut())?;
+        let mut encryption_secret = Zeroizing::new([0_u8; 32]);
+        getrandom::fill(encryption_secret.as_mut())?;
         Ok(Self {
             signing_key: SigningKey::from_bytes(&secret),
+            encryption_key: X25519Secret::from(*encryption_secret),
+            measured_workload: Mutex::new(None),
+            opened_secret_releases: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -216,6 +265,15 @@ impl GuestAttestationIdentity {
     #[must_use]
     pub fn public_key(&self) -> [u8; 32] {
         self.signing_key.verifying_key().to_bytes()
+    }
+
+    /// Returns the canonical signing/encryption key bundle bound into evidence.
+    #[must_use]
+    pub fn public_keys(&self) -> Vec<u8> {
+        encode_guest_public_keys(
+            &self.public_key(),
+            X25519PublicKey::from(&self.encryption_key).as_bytes(),
+        )
     }
 
     /// Collects native evidence and proves possession of its bound guest key.
@@ -228,8 +286,9 @@ impl GuestAttestationIdentity {
         &self,
         parameters: GuestAttestationParameters,
     ) -> Result<GuestAttestation, GuestAttestationError> {
-        let request = parameters.into_request(self.public_key().to_vec())?;
-        let bundle = collect_attestation(request).await?;
+        let request = parameters.into_request(self.public_keys())?;
+        self.prepare_workload_measurement(&request).await?;
+        let bundle = collect_attestation_prepared(request).await?;
         let signature = self
             .signing_key
             .sign(&key_proof_message(bundle.transcript_digest()))
@@ -245,6 +304,50 @@ impl GuestAttestationIdentity {
             .sign(&receipt_signature_message(record))
             .to_bytes()
     }
+
+    pub(crate) async fn open_secret_release(
+        &self,
+        envelope: &SecretReleaseEnvelope,
+    ) -> Result<OpenedSecretRelease, SecretReleaseError> {
+        let opened = open_secret(envelope, &self.encryption_key)?;
+        let digest = envelope.digest();
+        let mut consumed = self.opened_secret_releases.lock().await;
+        register_secret_release(&mut consumed, digest)?;
+        Ok(opened)
+    }
+
+    async fn prepare_workload_measurement(
+        &self,
+        request: &GuestAttestationRequest,
+    ) -> Result<(), GuestAttestationError> {
+        if request.workload_measurement() != WorkloadMeasurement::TdxRtmr3 {
+            return Ok(());
+        }
+        let workload = *request.workload_manifest_digest();
+        let mut measured = self.measured_workload.lock().await;
+        match *measured {
+            Some(existing) if existing == workload => return Ok(()),
+            Some(_) => return Err(GuestAttestationError::MeasuredWorkloadChanged),
+            None => {}
+        }
+        extend_tdx_workload_rtmr3(&workload).await?;
+        *measured = Some(workload);
+        Ok(())
+    }
+}
+
+fn register_secret_release(
+    consumed: &mut BTreeSet<[u8; 32]>,
+    digest: [u8; 32],
+) -> Result<(), SecretReleaseError> {
+    if consumed.contains(&digest) {
+        return Err(SecretReleaseError::Replay);
+    }
+    if consumed.len() >= MAX_OPENED_SECRET_RELEASES {
+        return Err(SecretReleaseError::ReleaseLimit(MAX_OPENED_SECRET_RELEASES));
+    }
+    consumed.insert(digest);
+    Ok(())
 }
 
 /// Detects the confidential CPU architecture visible inside the current guest.
@@ -359,14 +462,24 @@ pub async fn collect_attestation(
     request: GuestAttestationRequest,
 ) -> Result<GuestAttestationBundle, GuestAttestationError> {
     // Deserialization does not get to bypass the constructor's input bounds.
-    let validated = GuestAttestationRequest::new(
+    let validated = GuestAttestationRequest::new_with_measurement(
         request.challenge().clone(),
         request.guest_public_key().to_vec(),
         *request.workload_manifest_digest(),
         request.cpu_profile(),
         request.nvidia_profile(),
+        request.workload_measurement(),
     )?;
 
+    if validated.workload_measurement() == WorkloadMeasurement::TdxRtmr3 {
+        extend_tdx_workload_rtmr3(validated.workload_manifest_digest()).await?;
+    }
+    collect_attestation_prepared(validated).await
+}
+
+async fn collect_attestation_prepared(
+    validated: GuestAttestationRequest,
+) -> Result<GuestAttestationBundle, GuestAttestationError> {
     let mut evidence = collect_nvidia_evidence(&validated).await?;
     let binding = validated.binding(evidence.iter().map(RawEvidence::digest).collect())?;
     let transcript_digest = binding.transcript_digest();
@@ -377,6 +490,60 @@ pub async fn collect_attestation(
         transcript_digest,
         evidence,
     ))
+}
+
+async fn extend_tdx_workload_rtmr3(
+    workload_manifest_digest: &[u8; 32],
+) -> Result<(), GuestAttestationError> {
+    let mut path = None;
+    for candidate in TDX_RTMR3_PATHS {
+        if fs::metadata(candidate).await.is_ok() {
+            path = Some(PathBuf::from(candidate));
+            break;
+        }
+    }
+    let path = path.ok_or(GuestAttestationError::TdxRtmrUnavailable {
+        path: TDX_RTMR3_PATHS[0],
+    })?;
+    let previous = read_rtmr3(&path).await?;
+    let event = tdx_workload_measurement_event(workload_manifest_digest);
+    let expected = tdx_rtmr_extend(&previous, &event);
+    let mut register = fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .await
+        .map_err(|source| GuestAttestationError::TdxRtmrIo {
+            path: path.clone(),
+            source,
+        })?;
+    register
+        .write_all(&event)
+        .await
+        .map_err(|source| GuestAttestationError::TdxRtmrIo {
+            path: path.clone(),
+            source,
+        })?;
+    drop(register);
+    let actual = read_rtmr3(&path).await?;
+    if actual != expected {
+        return Err(GuestAttestationError::TdxRtmrReadbackMismatch);
+    }
+    Ok(())
+}
+
+async fn read_rtmr3(path: &Path) -> Result<[u8; 48], GuestAttestationError> {
+    let bytes = fs::read(path)
+        .await
+        .map_err(|source| GuestAttestationError::TdxRtmrIo {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    bytes
+        .try_into()
+        .map_err(|bytes: Vec<u8>| GuestAttestationError::TdxRtmrSize {
+            path: path.to_path_buf(),
+            actual: bytes.len(),
+        })
 }
 
 async fn collect_nvidia_evidence(
@@ -882,5 +1049,26 @@ mod tests {
                 if provider == "tdx_guest"
         ));
         validate_tsm_report("tdx_guest", &[1]).unwrap();
+    }
+
+    #[test]
+    fn secret_release_ledger_is_one_time_and_bounded() {
+        let mut consumed = BTreeSet::new();
+        register_secret_release(&mut consumed, [7; 32]).unwrap();
+        assert!(matches!(
+            register_secret_release(&mut consumed, [7; 32]),
+            Err(SecretReleaseError::Replay)
+        ));
+
+        consumed.clear();
+        for value in 0..MAX_OPENED_SECRET_RELEASES {
+            let mut digest = [0_u8; 32];
+            digest[..8].copy_from_slice(&(value as u64).to_be_bytes());
+            register_secret_release(&mut consumed, digest).unwrap();
+        }
+        assert!(matches!(
+            register_secret_release(&mut consumed, [0xff; 32]),
+            Err(SecretReleaseError::ReleaseLimit(MAX_OPENED_SECRET_RELEASES))
+        ));
     }
 }
