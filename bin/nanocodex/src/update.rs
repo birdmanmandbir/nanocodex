@@ -73,18 +73,14 @@ struct Release {
 
 #[derive(Debug, Deserialize)]
 struct ReleaseAsset {
-    id: u64,
     name: String,
-    browser_download_url: String,
+    url: String,
 }
 
 impl ReleaseAsset {
     fn download_url(&self) -> Result<Url> {
-        let mut url = Url::parse(&self.browser_download_url)
-            .wrap_err_with(|| format!("GitHub returned an invalid URL for {}", self.name))?;
-        url.query_pairs_mut()
-            .append_pair("asset_id", &self.id.to_string());
-        Ok(url)
+        Url::parse(&self.url)
+            .wrap_err_with(|| format!("GitHub returned an invalid API URL for {}", self.name))
     }
 }
 
@@ -282,7 +278,13 @@ async fn download(client: &Client, asset: &ReleaseAsset) -> Result<Vec<u8>> {
     let url = asset.download_url()?;
     for attempt in 0..DOWNLOAD_ATTEMPTS {
         let result: reqwest::Result<Vec<u8>> = async {
-            let response = client.get(url.clone()).send().await?.error_for_status()?;
+            let response = client
+                .get(url.clone())
+                .header(header::ACCEPT, "application/octet-stream")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .send()
+                .await?
+                .error_for_status()?;
             Ok(response.bytes().await?.to_vec())
         }
         .await;
@@ -469,18 +471,16 @@ mod tests {
     }
 
     #[test]
-    fn cache_busts_mutable_release_assets_with_their_identity() {
+    fn uses_the_immutable_release_asset_api_url() {
         let asset = ReleaseAsset {
-            id: 496_045_871,
             name: CHECKSUMS_ASSET.to_owned(),
-            browser_download_url:
-                "https://github.com/gakonst/nanocodex/releases/download/nightly/SHA256SUMS"
-                    .to_owned(),
+            url: "https://api.github.com/repos/gakonst/nanocodex/releases/assets/496045871"
+                .to_owned(),
         };
 
         assert_eq!(
             asset.download_url().unwrap().as_str(),
-            "https://github.com/gakonst/nanocodex/releases/download/nightly/SHA256SUMS?asset_id=496045871"
+            "https://api.github.com/repos/gakonst/nanocodex/releases/assets/496045871"
         );
     }
 
