@@ -18,8 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - [eval] Define canonical host workflow
 
+### Features
+
+- [update] Show download progress
+
 ### Miscellaneous Tasks
 
+- [release] Refresh 0.5.1 changelogs
 - [release] Prepare 0.5.1
 
 ### Other
