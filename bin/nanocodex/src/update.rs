@@ -9,6 +9,8 @@ use std::{
 use clap::{Args, ValueHint};
 use eyre::{Context, Result, bail, eyre};
 use flate2::read::GzDecoder;
+use futures_util::StreamExt;
+use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::{Client, StatusCode, Url, header};
 use semver::Version;
 use serde::Deserialize;
@@ -162,9 +164,9 @@ impl Update {
         let asset_name = release_asset_name()?;
         let binary = find_asset(&release, &asset_name)?;
         let checksums = find_asset(&release, CHECKSUMS_ASSET)?;
-        let checksum_manifest = download(&client, checksums).await?;
+        let checksum_manifest = download(&client, checksums, false).await?;
         let expected = checksum_for(&checksum_manifest, &asset_name)?;
-        let archive = download(&client, binary).await?;
+        let archive = download(&client, binary, true).await?;
         let actual = hex::encode(Sha256::digest(&archive));
         if actual != expected {
             bail!("checksum mismatch for {asset_name}: expected {expected}, downloaded {actual}");
@@ -278,24 +280,20 @@ fn report_activation(previous: &str, selected: &str, downloaded: bool) {
     }
 }
 
-async fn download(client: &Client, asset: &ReleaseAsset) -> Result<Vec<u8>> {
+async fn download(client: &Client, asset: &ReleaseAsset, show_progress: bool) -> Result<Vec<u8>> {
     let url = asset.download_url()?;
+    if show_progress {
+        eprintln!("downloading {}...", asset.name);
+    }
     for attempt in 0..DOWNLOAD_ATTEMPTS {
-        let result: reqwest::Result<Vec<u8>> = async {
-            let response = client
-                .get(url.clone())
-                .header(header::ACCEPT, "application/octet-stream")
-                .header("X-GitHub-Api-Version", "2022-11-28")
-                .send()
-                .await?
-                .error_for_status()?;
-            Ok(response.bytes().await?.to_vec())
-        }
-        .await;
+        let result = download_once(client, url.clone(), show_progress).await;
 
         match result {
             Ok(contents) => return Ok(contents),
             Err(error) if attempt + 1 < DOWNLOAD_ATTEMPTS && retryable_download_error(&error) => {
+                if show_progress {
+                    eprintln!("download interrupted; retrying...");
+                }
                 tokio::time::sleep(DOWNLOAD_RETRY_DELAY.saturating_mul(1 << attempt)).await;
             }
             Err(error) => {
@@ -312,6 +310,61 @@ async fn download(client: &Client, asset: &ReleaseAsset) -> Result<Vec<u8>> {
     }
 
     unreachable!("the download attempt loop always returns")
+}
+
+async fn download_once(client: &Client, url: Url, show_progress: bool) -> reqwest::Result<Vec<u8>> {
+    let response = client
+        .get(url)
+        .header(header::ACCEPT, "application/octet-stream")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .await?
+        .error_for_status()?;
+    if !show_progress {
+        return Ok(response.bytes().await?.to_vec());
+    }
+
+    let progress = download_progress(response.content_length());
+    let mut contents = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(chunk) => {
+                progress.inc(chunk.len() as u64);
+                contents.extend_from_slice(&chunk);
+            }
+            Err(error) => {
+                progress.finish_and_clear();
+                return Err(error);
+            }
+        }
+    }
+    progress.finish_and_clear();
+    Ok(contents)
+}
+
+fn download_progress(total_size: Option<u64>) -> ProgressBar {
+    match total_size {
+        Some(size) => {
+            let progress = ProgressBar::new(size);
+            progress.set_style(
+                ProgressStyle::default_bar()
+                    .template("{spinner:.green} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+                    .expect("the download progress template is valid")
+                    .progress_chars("#>-"),
+            );
+            progress
+        }
+        None => {
+            let progress = ProgressBar::new_spinner();
+            progress.set_style(
+                ProgressStyle::default_spinner()
+                    .template("{spinner:.green} {bytes} downloaded")
+                    .expect("the download progress template is valid"),
+            );
+            progress
+        }
+    }
 }
 
 fn retryable_download_error(error: &reqwest::Error) -> bool {
