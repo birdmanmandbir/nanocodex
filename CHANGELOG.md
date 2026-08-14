@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - [eval] Define canonical host workflow
 
+### Miscellaneous Tasks
+
+- [release] Prepare 0.5.1
+
 ### Other
 
 - Merge pull request [#138](https://github.com/gakonst/nanocodex/issues/138) from Giulio2002/fix/browser-missing-brave
