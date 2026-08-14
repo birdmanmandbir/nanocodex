@@ -5,13 +5,27 @@ All notable changes to Nanocodex are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## [0.5.1](https://github.com/gakonst/nanocodex/releases/tag/v0.5.1) - 2026-08-14
 
 ### Bug Fixes
 
-- [cli] Fall back to another installed Chromium-family browser when the default
-  Brave installation is absent, or omit browser tools when none is available,
-  while keeping explicit browser selection strict.
+- [update] Download release assets through API
+- [mcp] Harden OAuth token refresh
+- [tui] Preserve colors under NO_COLOR
+- [cli] Tolerate missing default browser
+
+### Documentation
+
+- [eval] Define canonical host workflow
+
+### Other
+
+- Merge pull request [#138](https://github.com/gakonst/nanocodex/issues/138) from Giulio2002/fix/browser-missing-brave
+- Merge pull request [#163](https://github.com/gakonst/nanocodex/issues/163) from gakonst/agent/document-dev-georgios-workflow
+
+### Performance
+
+- [distribution] Ship gzip-compressed binaries
 
 ## [0.5.0](https://github.com/gakonst/nanocodex/releases/tag/v0.5.0) - 2026-08-12
 
@@ -34,11 +48,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Miscellaneous Tasks
 
+- [release] Refresh 0.5.0 changelogs
 - [release] Prepare 0.5.0
 - [eval] Remove deprecated Python Harbor stack
 
 ### Other
 
+- Merge pull request [#169](https://github.com/gakonst/nanocodex/issues/169) from gakonst/release/0.5.0
 - Merge pull request [#167](https://github.com/gakonst/nanocodex/issues/167) from clabby/cl/structured-events
 - :broom:
 - Merge pull request [#168](https://github.com/gakonst/nanocodex/issues/168) from clabby/cl/fix-orphaned-notifs
