@@ -144,7 +144,8 @@ jobs:
         shell: bash
         run: |
           mkdir dist
-          cp "target/${{ matrix.target }}/release/nanocodex" "dist/${{ matrix.artifact }}"
+          gzip -n -9 -c "target/${{ matrix.target }}/release/nanocodex" \
+            > "dist/${{ matrix.artifact }}.gz"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.artifact }}
@@ -254,7 +255,7 @@ jobs:
         shell: bash
         run: |
           cd dist
-          sha256sum nanocodex-* > SHA256SUMS
+          sha256sum nanocodex-*.gz > SHA256SUMS
       - name: Upload binary assets to draft release
         env:
           GH_TOKEN: ${{ github.token }}

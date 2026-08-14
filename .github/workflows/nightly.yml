@@ -67,9 +67,16 @@ jobs:
               --target ${{ matrix.target }}
       - name: Stage artifact
         shell: bash
+        env:
+          PR_NUMBER: ${{ inputs.pr }}
         run: |
           mkdir dist
-          cp "target/${{ matrix.target }}/nightly/nanocodex" "dist/${{ matrix.artifact }}"
+          if [[ -n "$PR_NUMBER" ]]; then
+            cp "target/${{ matrix.target }}/nightly/nanocodex" "dist/${{ matrix.artifact }}"
+          else
+            gzip -n -9 -c "target/${{ matrix.target }}/nightly/nanocodex" \
+              > "dist/${{ matrix.artifact }}.gz"
+          fi
       - name: Stage PR provenance and checksum
         if: github.event_name == 'workflow_dispatch' && inputs.pr != ''
         shell: bash
@@ -112,7 +119,7 @@ jobs:
         shell: bash
         run: |
           cd dist
-          sha256sum nanocodex-* > SHA256SUMS
+          sha256sum nanocodex-*.gz > SHA256SUMS
       - name: Publish immutable and rolling releases
         env:
           GH_TOKEN: ${{ github.token }}

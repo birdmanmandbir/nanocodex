@@ -1,12 +1,14 @@
 use std::{
     borrow::Cow,
     fs,
+    io::Read,
     path::{Path, PathBuf},
     time::Duration,
 };
 
 use clap::{Args, ValueHint};
 use eyre::{Context, Result, bail, eyre};
+use flate2::read::GzDecoder;
 use reqwest::{Client, StatusCode, Url, header};
 use semver::Version;
 use serde::Deserialize;
@@ -27,6 +29,7 @@ const TAGGED_RELEASE_API: &str = "https://api.github.com/repos/gakonst/nanocodex
 const CHECKSUMS_ASSET: &str = "SHA256SUMS";
 const DOWNLOAD_ATTEMPTS: usize = 5;
 const DOWNLOAD_RETRY_DELAY: Duration = Duration::from_millis(250);
+const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Args)]
 pub(crate) struct Update {
@@ -157,15 +160,16 @@ impl Update {
         }
 
         let asset_name = release_asset_name()?;
-        let binary = find_asset(&release, asset_name)?;
+        let binary = find_asset(&release, &asset_name)?;
         let checksums = find_asset(&release, CHECKSUMS_ASSET)?;
         let checksum_manifest = download(&client, checksums).await?;
-        let expected = checksum_for(&checksum_manifest, asset_name)?;
-        let contents = download(&client, binary).await?;
-        let actual = hex::encode(Sha256::digest(&contents));
+        let expected = checksum_for(&checksum_manifest, &asset_name)?;
+        let archive = download(&client, binary).await?;
+        let actual = hex::encode(Sha256::digest(&archive));
         if actual != expected {
             bail!("checksum mismatch for {asset_name}: expected {expected}, downloaded {actual}");
         }
+        let contents = decompress_release_asset(&archive, &asset_name)?;
 
         store.install(&key, &contents)?;
         store.activate(&key)?;
@@ -236,7 +240,7 @@ fn install_local_binary(path: &Path, store: &VersionStore, previous: &str) -> Re
 }
 
 async fn install_pr_binary(number: u64, store: &VersionStore, previous: &str) -> Result<()> {
-    let asset_name = release_asset_name()?;
+    let asset_name = binary_asset_name()?;
     let artifact = pr::download(number, asset_name).await?;
     let key = format!("pr-{number}-{}", artifact.head_sha);
     store.install(&key, &artifact.contents)?;
@@ -361,11 +365,15 @@ fn checksum_for(manifest: &[u8], asset_name: &str) -> Result<String> {
     bail!("SHA256SUMS does not contain {asset_name}")
 }
 
-fn release_asset_name() -> Result<&'static str> {
-    release_asset_name_for(std::env::consts::OS, std::env::consts::ARCH)
+fn release_asset_name() -> Result<String> {
+    Ok(format!("{}.gz", binary_asset_name()?))
 }
 
-fn release_asset_name_for(os: &str, arch: &str) -> Result<&'static str> {
+fn binary_asset_name() -> Result<&'static str> {
+    binary_asset_name_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn binary_asset_name_for(os: &str, arch: &str) -> Result<&'static str> {
     match (os, arch) {
         ("linux", "x86_64") => Ok("nanocodex-x86_64-unknown-linux-gnu"),
         ("macos", "aarch64") => Ok("nanocodex-aarch64-apple-darwin"),
@@ -373,10 +381,24 @@ fn release_asset_name_for(os: &str, arch: &str) -> Result<&'static str> {
     }
 }
 
+fn decompress_release_asset(archive: &[u8], asset_name: &str) -> Result<Vec<u8>> {
+    let mut contents = Vec::new();
+    GzDecoder::new(archive)
+        .take(MAX_BINARY_BYTES + 1)
+        .read_to_end(&mut contents)
+        .wrap_err_with(|| format!("failed to decompress {asset_name}"))?;
+    if contents.len() as u64 > MAX_BINARY_BYTES {
+        bail!("decompressed {asset_name} exceeds the 256 MiB limit");
+    }
+    Ok(contents)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::{Parser, Subcommand};
+    use flate2::{Compression, write::GzEncoder};
+    use std::io::Write;
 
     #[derive(Parser)]
     struct TestCli {
@@ -415,16 +437,16 @@ mod tests {
     #[test]
     fn publishes_only_linux_x86_64_and_apple_silicon_assets() {
         assert_eq!(
-            release_asset_name_for("linux", "x86_64").unwrap(),
+            binary_asset_name_for("linux", "x86_64").unwrap(),
             "nanocodex-x86_64-unknown-linux-gnu"
         );
         assert_eq!(
-            release_asset_name_for("macos", "aarch64").unwrap(),
+            binary_asset_name_for("macos", "aarch64").unwrap(),
             "nanocodex-aarch64-apple-darwin"
         );
-        assert!(release_asset_name_for("linux", "aarch64").is_err());
-        assert!(release_asset_name_for("macos", "x86_64").is_err());
-        assert!(release_asset_name_for("windows", "x86_64").is_err());
+        assert!(binary_asset_name_for("linux", "aarch64").is_err());
+        assert!(binary_asset_name_for("macos", "x86_64").is_err());
+        assert!(binary_asset_name_for("windows", "x86_64").is_err());
     }
 
     #[test]
@@ -468,6 +490,19 @@ mod tests {
     fn rejects_missing_and_malformed_checksums() {
         assert!(checksum_for(b"abcd  nanocodex-test\n", "nanocodex-test").is_err());
         assert!(checksum_for(b"", "nanocodex-test").is_err());
+    }
+
+    #[test]
+    fn decompresses_release_assets() {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(b"nanocodex binary").unwrap();
+        let archive = encoder.finish().unwrap();
+
+        assert_eq!(
+            decompress_release_asset(&archive, "nanocodex-test.gz").unwrap(),
+            b"nanocodex binary"
+        );
+        assert!(decompress_release_asset(b"not gzip", "nanocodex-test.gz").is_err());
     }
 
     #[test]

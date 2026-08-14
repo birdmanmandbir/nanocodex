@@ -8,8 +8,9 @@ Foundry's label-grouped, contributor-attributed GitHub release notes.
 
 The `Nightly Release` workflow runs daily and may also be dispatched manually.
 Each successful run publishes an immutable `nightly-<full SHA>` prerelease and
-refreshes the rolling `nightly` prerelease with the same binaries and
-`SHA256SUMS`. The rolling tag is what `nanocodex update --nightly` follows.
+refreshes the rolling `nightly` prerelease with the same gzip-compressed
+binaries and `SHA256SUMS`. The rolling tag is what
+`nanocodex update --nightly` follows.
 
 ## JavaScript package previews
 
@@ -117,7 +118,7 @@ The tag starts the release workflow. It:
 5. publishes the six crates to crates.io in dependency order;
 6. builds, tests, and publishes the Node/browser WASM package to npm with
    provenance;
-7. attaches the binaries and `SHA256SUMS` to the draft.
+7. attaches the gzip-compressed binaries and `SHA256SUMS` to the draft.
 
 Open the draft at <https://github.com/gakonst/nanocodex/releases>, inspect the
 notes, verify `SHA256SUMS`, and smoke-test a downloaded platform binary. Then
