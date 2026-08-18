@@ -3,8 +3,8 @@ import { test } from "node:test";
 
 import { CredentialVault } from "./credentialVault.ts";
 
-const CURRENT_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY";
-const PREVIOUS_KEY = "ZmVkY2JhOTg3NjU0MzIxMGZlZGNiYTk4NzY1NDMyMTA";
+const CURRENT_KEY = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const PREVIOUS_KEY = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
 
 test("credential vault round-trips without storing plaintext", async () => {
   const vault = new CredentialVault(
