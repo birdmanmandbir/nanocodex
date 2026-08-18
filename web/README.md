@@ -44,10 +44,15 @@ view opens. Startup does not generate or rewrite repository blobs. Set
 repository data is published separately to R2 by `npm run
 publish:repository`. The publisher derives one coherent generation from a Git
 commit, uploads only previously unseen source blobs and commit patches, uploads
-a complete clone pack, and atomically advances a Durable Object publication
-pointer. A failed or concurrent publication therefore cannot expose a mixed
-tree and history. The commit view loads only the selected patch and parses it in
-bounded batches, yielding between batches so scrolling stays responsive.
+one complete clone pack for exactly the advertised refs, and stores new Git
+objects once in bounded immutable pack-entry shards. The Worker streams the
+complete pack for a fresh clone, but uses the object graph and reusable shards
+to send only the closure missing from an incremental or shallow fetch. Shards
+are compacted after a bounded number of generations. Publication advances one
+Durable Object pointer only after every referenced R2 object exists, so a failed
+or concurrent publisher cannot expose mixed tree, history, or Git data. The
+commit view loads only the selected patch and parses it in bounded batches,
+yielding between batches so scrolling stays responsive.
 
 For this single-repository deployment, R2 owns immutable bytes and one Durable
 Object owns the current generation with compare-and-swap publication. D1 is

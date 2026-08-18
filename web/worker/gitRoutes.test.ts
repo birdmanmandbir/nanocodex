@@ -111,7 +111,7 @@ test("repository reads hit edge cache before the publication Durable Object", as
     commitsKey: `generations/${head}/commits.json`,
     inventoryKey: `generations/${head}/inventory.json`,
     packKey: `generations/${head}/repository.pack`,
-    packIndexKey: `generations/${head}/repository.idx`,
+    objectManifestKey: `generations/${head}/objects.json`,
     packHash: "b".repeat(40),
     publishedAt: "2026-08-17T00:00:00.000Z",
   };

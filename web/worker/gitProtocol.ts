@@ -57,7 +57,7 @@ export function repositoryAdvertisement(): Uint8Array {
     encodePacketLine("version 2\n"),
     encodePacketLine("agent=nanocodex-cloudflare/1\n"),
     encodePacketLine("ls-refs=unborn\n"),
-    encodePacketLine("fetch\n"),
+    encodePacketLine("fetch=shallow\n"),
     encodePacketLine("object-format=sha1\n"),
     flushPacket,
   ]);
@@ -97,6 +97,7 @@ export function buildLsRefsResponse(
   const refs = publication.refs.filter(
     (ref) => prefixes.length === 0 || prefixes.some((prefix) => ref.name.startsWith(prefix)),
   );
+  const includePeeled = arguments_.includes("peel");
   const headRef = `refs/heads/${publication.branch}`;
   const head = publication.refs.find((ref) => ref.name === headRef) ?? {
     name: headRef,
@@ -104,25 +105,71 @@ export function buildLsRefsResponse(
   };
   return concatenate([
     encodePacketLine(`${head.oid} HEAD symref-target:${headRef}\n`),
-    ...refs.map(formatRefPacket),
+    ...refs.map((ref) => formatRefPacket(ref, includePeeled)),
     flushPacket,
   ]);
 }
 
-function formatRefPacket(ref: RepositoryRef): Uint8Array {
-  return encodePacketLine(`${ref.oid} ${ref.name}\n`);
+function formatRefPacket(ref: RepositoryRef, includePeeled: boolean): Uint8Array {
+  const peeled = includePeeled && ref.peeled != null ? ` peeled:${ref.peeled}` : "";
+  return encodePacketLine(`${ref.oid} ${ref.name}${peeled}\n`);
 }
 
-export function buildNegotiationResponse(): Uint8Array {
+export type GitFetchRequest = {
+  wants: string[];
+  haves: string[];
+  shallow: string[];
+  deepen: number;
+  deepenRelative: boolean;
+  done: boolean;
+};
+
+export function parseFetchArguments(arguments_: readonly string[]): GitFetchRequest {
+  const request: GitFetchRequest = {
+    wants: [],
+    haves: [],
+    shallow: [],
+    deepen: 0,
+    deepenRelative: false,
+    done: false,
+  };
+  for (const argument of arguments_) {
+    if (argument.startsWith("want ")) request.wants.push(parseOid(argument.slice(5), "want"));
+    else if (argument.startsWith("have ")) request.haves.push(parseOid(argument.slice(5), "have"));
+    else if (argument.startsWith("shallow ")) {
+      request.shallow.push(parseOid(argument.slice(8), "shallow"));
+    } else if (argument.startsWith("deepen ")) {
+      const depth = Number(argument.slice(7));
+      if (!Number.isSafeInteger(depth) || depth <= 0 || depth > 0x7fffffff) {
+        throw new Error("invalid deepen argument");
+      }
+      request.deepen = depth;
+    } else if (argument === "done") request.done = true;
+    else if (argument === "deepen-relative") request.deepenRelative = true;
+    else if (
+      argument.startsWith("deepen-since ") ||
+      argument.startsWith("deepen-not ")
+    ) {
+      throw new Error("unsupported shallow fetch mode");
+    }
+  }
+  return request;
+}
+
+export function buildNegotiationResponse(commonHaves: readonly string[]): Uint8Array {
   return concatenate([
     encodePacketLine("acknowledgments\n"),
-    encodePacketLine("NAK\n"),
+    ...(commonHaves.length === 0
+      ? [encodePacketLine("NAK\n")]
+      : commonHaves.map((oid) => encodePacketLine(`ACK ${oid}\n`))),
     flushPacket,
   ]);
 }
 
 export function buildFullPackResponse(
   pack: ReadableStream<Uint8Array>,
+  shallow: readonly string[] = [],
+  unshallow: readonly string[] = [],
 ): ReadableStream<Uint8Array> {
   const reader = pack.getReader();
   let chunk: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
@@ -130,6 +177,12 @@ export function buildFullPackResponse(
   let finished = false;
   return new ReadableStream<Uint8Array>({
     start(controller) {
+      if (shallow.length > 0 || unshallow.length > 0) {
+        controller.enqueue(encodePacketLine("shallow-info\n"));
+        for (const oid of shallow) controller.enqueue(encodePacketLine(`shallow ${oid}\n`));
+        for (const oid of unshallow) controller.enqueue(encodePacketLine(`unshallow ${oid}\n`));
+        controller.enqueue(delimiterPacket);
+      }
       controller.enqueue(encodePacketLine("packfile\n"));
     },
     async pull(controller) {
@@ -159,6 +212,12 @@ export function buildFullPackResponse(
 }
 
 export const flushPacket = encoder.encode("0000");
+export const delimiterPacket = encoder.encode("0001");
+
+function parseOid(value: string, field: string): string {
+  if (!/^[a-f0-9]{40}$/.test(value)) throw new Error(`invalid ${field} object id`);
+  return value;
+}
 
 function concatenate(chunks: readonly Uint8Array[]): Uint8Array {
   const length = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);

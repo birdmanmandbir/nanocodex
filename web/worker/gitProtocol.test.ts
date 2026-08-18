@@ -5,6 +5,7 @@ import {
   buildFullPackResponse,
   buildLsRefsResponse,
   encodePacketLine,
+  parseFetchArguments,
   parsePacketLines,
   parseV2Command,
   repositoryAdvertisement,
@@ -19,12 +20,15 @@ const publication: RepositoryPublication = {
   version: 1,
   head: hash,
   branch: "master",
-  refs: [{ name: "refs/heads/master", oid: hash }],
+  refs: [
+    { name: "refs/heads/master", oid: hash },
+    { name: "refs/tags/v1", oid: "b".repeat(40), peeled: hash },
+  ],
   snapshotKey: `generations/${hash}/repository.json`,
   commitsKey: `generations/${hash}/commits.json`,
   inventoryKey: `generations/${hash}/inventory.json`,
   packKey: `generations/${hash}/repository.pack`,
-  packIndexKey: `generations/${hash}/repository.idx`,
+  objectManifestKey: `generations/${hash}/objects.json`,
   packHash: "c".repeat(40),
   publishedAt: "2026-08-17T00:00:00.000Z",
 };
@@ -46,6 +50,24 @@ test("packet-line framing rejects truncation and parses command sections", () =>
   assert.throws(() => parsePacketLines(encoder.encode("zzzz")), /invalid/);
 });
 
+test("fetch arguments preserve negotiation and shallow state", () => {
+  assert.deepEqual(parseFetchArguments([
+    `want ${hash}`,
+    `have ${"b".repeat(40)}`,
+    `shallow ${"c".repeat(40)}`,
+    "deepen 3",
+    "done",
+  ]), {
+    wants: [hash],
+    haves: ["b".repeat(40)],
+    shallow: ["c".repeat(40)],
+    deepen: 3,
+    deepenRelative: false,
+    done: true,
+  });
+  assert.equal(parseFetchArguments(["deepen-relative"]).deepenRelative, true);
+});
+
 test("advertisement and ls-refs expose only the published generation", () => {
   const advertisement = parsePacketLines(repositoryAdvertisement())
     .filter((packet) => packet.kind === "data")
@@ -54,7 +76,7 @@ test("advertisement and ls-refs expose only the published generation", () => {
     "version 2\n",
     "agent=nanocodex-cloudflare/1\n",
     "ls-refs=unborn\n",
-    "fetch\n",
+    "fetch=shallow\n",
     "object-format=sha1\n",
   ]);
 
@@ -64,6 +86,14 @@ test("advertisement and ls-refs expose only the published generation", () => {
   assert.deepEqual(refs, [
     `${hash} HEAD symref-target:refs/heads/master\n`,
     `${hash} refs/heads/master\n`,
+  ]);
+
+  const tags = parsePacketLines(buildLsRefsResponse(publication, ["peel", "ref-prefix refs/tags/"]))
+    .filter((packet) => packet.kind === "data")
+    .map((packet) => decoder.decode(packet.data));
+  assert.deepEqual(tags, [
+    `${hash} HEAD symref-target:refs/heads/master\n`,
+    `${"b".repeat(40)} refs/tags/v1 peeled:${hash}\n`,
   ]);
 });
 

@@ -2,17 +2,25 @@ import {
   buildFullPackResponse,
   buildLsRefsResponse,
   buildNegotiationResponse,
+  parseFetchArguments,
   parseV2Command,
   repositoryAdvertisement,
 } from "./gitProtocol.ts";
+import {
+  isGitObjectManifest,
+  selectGitObjects,
+  type GitObjectManifest,
+} from "./gitObjectManifest.ts";
+import { createSelectedPackStream } from "./gitObjectPack.ts";
 import {
   isRepositoryPublication,
   type RepositoryPublication,
 } from "./gitRepository.ts";
 
 const SHA1_PATTERN = /^[a-f0-9]{40}$/;
-const generationFilePattern = /^(repository\.json|commits\.json|inventory\.json|repository\.pack|repository\.idx)$/;
+const generationFilePattern = /^(repository\.json|commits\.json|inventory\.json|repository\.pack|objects\.json)$/;
 const generationCommitPagePattern = /^commits\/(\d{4})\.json$/;
+const generationObjectShardPattern = /^objects\/(\d{4})\.pack$/;
 const immutableCacheControl = "public, max-age=31536000, immutable";
 
 export type GitStorageEnv = {
@@ -63,9 +71,16 @@ export async function handleGitRequest(
     if (publication instanceof Response) return publication;
     const inventory = await requireBucket(env).get(publication.inventoryKey);
     if (inventory == null) return storageFailure("published inventory is missing");
+    const objectManifest = await requireBucket(env).get(publication.objectManifestKey);
+    if (objectManifest == null) return storageFailure("published object manifest is missing");
+    const parsedManifest: unknown = await objectManifest.json();
+    if (!isGitObjectManifest(parsedManifest) || parsedManifest.head !== publication.head) {
+      return storageFailure("published object manifest is invalid");
+    }
     return Response.json({
       publication,
       inventory: await inventory.json(),
+      objectManifest: parsedManifest,
     }, { headers: { "cache-control": "no-store" } });
   }
 
@@ -115,12 +130,34 @@ export async function handleGitRequest(
       publication.commitsKey,
       publication.inventoryKey,
       publication.packKey,
-      publication.packIndexKey,
     ];
     const objects = await Promise.all(requiredKeys.map((key) => requireBucket(env).head(key)));
     const missing = requiredKeys.filter((_, index) => objects[index] == null);
     if (missing.length > 0) {
       return Response.json({ error: "publication_objects_missing", missing }, { status: 409 });
+    }
+    const storedManifest = await requireBucket(env).get(publication.objectManifestKey);
+    if (storedManifest == null) {
+      return Response.json(
+        { error: "publication_objects_missing", missing: [publication.objectManifestKey] },
+        { status: 409 },
+      );
+    }
+    const manifest: unknown = await storedManifest.json();
+    if (!isGitObjectManifest(manifest) || manifest.head !== publication.head) {
+      return Response.json({ error: "invalid_object_manifest" }, { status: 409 });
+    }
+    const shards = await Promise.all(
+      manifest.shards.map((shard) => requireBucket(env).head(shard.key)),
+    );
+    const missingShards = manifest.shards
+      .filter((_, index) => shards[index] == null)
+      .map((shard) => shard.key);
+    if (missingShards.length > 0) {
+      return Response.json(
+        { error: "publication_objects_missing", missing: missingShards },
+        { status: 409 },
+      );
     }
     return repositoryStub(env).fetch("https://repository.internal/publication", {
       method: "PUT",
@@ -158,19 +195,49 @@ export async function handleGitRequest(
     if (command.command !== "fetch") {
       return new Response("unsupported git protocol command\n", { status: 400 });
     }
-    const wants = command.arguments
-      .filter((argument) => argument.startsWith("want "))
-      .map((argument) => argument.slice("want ".length));
-    const advertisedOids = new Set([publication.head, ...publication.refs.map((ref) => ref.oid)]);
-    if (wants.length === 0 || wants.some((oid) => !advertisedOids.has(oid))) {
+    let fetchRequest: ReturnType<typeof parseFetchArguments>;
+    try {
+      fetchRequest = parseFetchArguments(command.arguments);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "invalid fetch arguments";
+      return new Response(`${message}\n`, { status: 400 });
+    }
+    const manifest = await getObjectManifest(env, publication);
+    if (manifest instanceof Response) return manifest;
+    if (
+      fetchRequest.wants.length === 0 ||
+      fetchRequest.wants.some((oid) => manifest.objects[oid] == null)
+    ) {
       return new Response("invalid fetch wants\n", { status: 400 });
     }
-    if (!command.arguments.includes("done")) {
-      return gitUploadResponse(byteBody(buildNegotiationResponse()));
+    const commonHaves = [...new Set(
+      fetchRequest.haves.filter((oid) => manifest.objects[oid] != null),
+    )];
+    if (!fetchRequest.done) {
+      return gitUploadResponse(byteBody(buildNegotiationResponse(commonHaves)));
     }
-    const pack = await requireBucket(env).get(publication.packKey);
-    if (pack == null) return storageFailure("published pack is missing");
-    return gitUploadResponse(buildFullPackResponse(pack.body));
+    if (
+      fetchRequest.haves.length === 0 &&
+      fetchRequest.shallow.length === 0 &&
+      fetchRequest.deepen === 0
+    ) {
+      const pack = await requireBucket(env).get(publication.packKey);
+      if (pack == null) return storageFailure("published pack is missing");
+      return gitUploadResponse(buildFullPackResponse(pack.body));
+    }
+    const selection = selectGitObjects(
+      manifest,
+      fetchRequest.wants,
+      fetchRequest.haves,
+      fetchRequest.shallow,
+      fetchRequest.deepen,
+      fetchRequest.deepenRelative,
+    );
+    return gitUploadResponse(buildFullPackResponse(
+      createSelectedPackStream(requireBucket(env), manifest, selection.objectIds),
+      selection.shallow,
+      selection.unshallow,
+    ));
   }
 
   return undefined;
@@ -315,6 +382,31 @@ async function getPublication(env: GitStorageEnv): Promise<RepositoryPublication
     : storageFailure("repository publication is invalid");
 }
 
+const objectManifestMemo = new WeakMap<object, Map<string, GitObjectManifest>>();
+
+async function getObjectManifest(
+  env: GitStorageEnv,
+  publication: RepositoryPublication,
+): Promise<GitObjectManifest | Response> {
+  const bucket = requireBucket(env);
+  let manifests = objectManifestMemo.get(bucket as object);
+  const cached = manifests?.get(publication.head);
+  if (cached != null) return cached;
+  const stored = await bucket.get(publication.objectManifestKey);
+  if (stored == null) return storageFailure("published object manifest is missing");
+  const value: unknown = await stored.json();
+  if (!isGitObjectManifest(value) || value.head !== publication.head) {
+    return storageFailure("published object manifest is invalid");
+  }
+  if (manifests == null) {
+    manifests = new Map();
+    objectManifestMemo.set(bucket as object, manifests);
+  }
+  manifests.set(publication.head, value);
+  while (manifests.size > 2) manifests.delete(manifests.keys().next().value!);
+  return value;
+}
+
 function repositoryStub(env: GitStorageEnv): DurableObjectStub {
   if (!env.GIT_REPOSITORY) throw new Error("GIT_REPOSITORY is not configured");
   return env.GIT_REPOSITORY.get(env.GIT_REPOSITORY.idFromName("nanocodex"));
@@ -340,6 +432,12 @@ function objectKeyFromUploadPath(pathname: string): string | null {
   );
   if (commitPage && generationCommitPagePattern.test(commitPage[2])) {
     return `generations/${commitPage[1]}/${commitPage[2]}`;
+  }
+  const objectShard = relative.match(
+    /^generations\/([a-f0-9]{40})\/(objects\/\d{4}\.pack)$/,
+  );
+  if (objectShard && generationObjectShardPattern.test(objectShard[2])) {
+    return `generations/${objectShard[1]}/${objectShard[2]}`;
   }
   return null;
 }

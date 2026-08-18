@@ -58,7 +58,7 @@ function publication(head: string): RepositoryPublication {
     commitsKey: `${prefix}commits.json`,
     inventoryKey: `${prefix}inventory.json`,
     packKey: `${prefix}repository.pack`,
-    packIndexKey: `${prefix}repository.idx`,
+    objectManifestKey: `${prefix}objects.json`,
     packHash: "c".repeat(40),
     publishedAt: "2026-08-17T00:00:00.000Z",
   };

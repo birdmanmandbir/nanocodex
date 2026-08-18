@@ -4,6 +4,7 @@ const REF_PATTERN = /^refs\/(heads|tags)\/[A-Za-z0-9][A-Za-z0-9._\/-]*$/;
 export type RepositoryRef = {
   name: string;
   oid: string;
+  peeled?: string;
 };
 
 export type RepositoryPublication = {
@@ -15,7 +16,7 @@ export type RepositoryPublication = {
   commitsKey: string;
   inventoryKey: string;
   packKey: string;
-  packIndexKey: string;
+  objectManifestKey: string;
   packHash: string;
   publishedAt: string;
 };
@@ -104,7 +105,9 @@ export function isRepositoryPublication(
         typeof ref.name === "string" &&
         REF_PATTERN.test(ref.name) &&
         typeof ref.oid === "string" &&
-        SHA1_PATTERN.test(ref.oid),
+        SHA1_PATTERN.test(ref.oid) &&
+        (ref.peeled === undefined ||
+          (typeof ref.peeled === "string" && SHA1_PATTERN.test(ref.peeled))),
     )
   ) {
     return false;
@@ -114,7 +117,7 @@ export function isRepositoryPublication(
     publication.commitsKey === `${prefix}commits.json` &&
     publication.inventoryKey === `${prefix}inventory.json` &&
     publication.packKey === `${prefix}repository.pack` &&
-    publication.packIndexKey === `${prefix}repository.idx`;
+    publication.objectManifestKey === `${prefix}objects.json`;
 }
 
 function isPublishRequest(value: unknown): value is PublishRequest {
