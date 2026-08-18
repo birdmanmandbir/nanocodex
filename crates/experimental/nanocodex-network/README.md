@@ -9,25 +9,51 @@ The crate has no dependency on Nanocodex agents, evaluations, VMs, SQLite,
 models, tools, payments, or TEEs. Applications choose identity paths and run
 their own protocols over the resulting topology.
 
-The normal `Hub::bind` and `Node::join` path is deliberately LAN-only. It uses
-direct IP transports, publishes no DNS address records, and configures no Iroh
-relay, internet probes, or gateway port mapping. Join tickets carry the hub's
-current direct addresses, so every member must have a directly reachable path
-to the host. Model inference is outside this crate; a consuming Nanocodex agent
-may still call OpenAI over WAN.
+The convenience `Hub::bind` and `Node::join` path uses Iroh's internet-capable
+`N0` preset. Reachability policy is otherwise caller-owned. Durable identities
+produce ordinary Iroh endpoint builders, so an application can compose LAN
+addresses, self-hosted relays, DNS, mDNS, DHT-backed address lookup, endpoint
+hooks, or custom transports before passing the bound endpoint to
+`Hub::from_endpoint` or `Node::from_endpoint`. The library verifies that a
+supplied endpoint uses the requested durable identity.
+
+For example, an application can deliberately create a direct LAN endpoint
+without changing the network or protocol APIs:
+
+```rust,no_run
+use iroh::{RelayMode, endpoint::presets};
+use nanocodex_network::{Hub, JoinAuthority};
+
+# async fn example(authority: &JoinAuthority) -> Result<(), Box<dyn std::error::Error>> {
+let endpoint = authority
+    .endpoint_builder(presets::Minimal)
+    .relay_mode(RelayMode::Disabled)
+    .clear_address_lookup()
+    .bind()
+    .await?;
+let (_hub, _ticket) = Hub::from_endpoint(authority, endpoint).await?;
+# Ok(())
+# }
+```
+
+Model inference and application egress remain outside this crate. A LAN-only
+peer topology may still call OpenAI directly or route application traffic
+through a separately authorized gateway peer.
 
 The initial topology uses one durable `Hub` as rendezvous, admission authority,
 gossip bootnode, and late-join anti-entropy cache. Every durable `Node` joins a
 private Iroh gossip topic derived from the hub identity and the shared join
 capability. Nodes spread small, signed capability records through that overlay
-and materialize their own local cluster views. The hub is not the source of
+and merge them into their local peer catalogs. The hub is not the source of
 those records and does not fan them out over its control channel.
 
 Applications register a bounded `ProtocolId` with `Node::listen` and open an
 opaque `PeerStream` with `Node::connect`. The hub issues a short-lived,
 single-use grant bound to the requester, provider, and protocol. Application
-bytes then travel over a separate direct Iroh connection between the
-authenticated LAN-reachable endpoint identities rather than through the hub.
+bytes then travel over a separate Iroh connection between the authenticated
+endpoint identities rather than through the hub. Iroh and the
+application-configured endpoint decide whether that path is direct, relayed,
+or carried by a custom transport.
 
 ```rust,no_run
 # async fn example(node: &nanocodex_network::Node, peer: iroh::EndpointId) -> Result<(), nanocodex_network::NetworkError> {
@@ -89,6 +115,15 @@ fixed fleet size. Advertisement renewal times are deterministically staggered
 by identity within a safe pre-expiry window to avoid synchronized renewal
 bursts after a fleet starts together.
 
+`Node::catalog` and `Hub::catalog` return a cloneable `PeerCatalog` over the
+same authenticated view fed by gossip. Applications can ingest a
+`SignedAdvertisement` obtained from Kademlia, a control plane, retained cache,
+or another discovery mechanism. Every source shares the same signature,
+expiry, monotonic-revision, replay, and equivocation checks; callers may also
+take deterministic filtered snapshots. Address lookup remains an independent
+Iroh endpoint concern, so discovering a service and finding candidate network
+paths do not collapse into one trust boundary.
+
 The executable example runs a hub, an advertising worker, and a late-joining
 client. The client discovers the worker through gossip and then exchanges
 `ping`/`pong` over a direct peer stream:
@@ -129,9 +164,11 @@ carried over that adapter.
 The crate does not rank candidates, schedule tasks, define resource semantics,
 supervise workers, validate TEE claims, or own application framing. Those
 contracts stay in consuming applications. Discovery queries only filter the
-node's local authenticated cluster view. The current shared join capability is
-also the gossip-topic capability: it is intentionally simple bearer admission,
-not individually revocable worker credentials.
+node's merged local authenticated catalog. The current shared join capability
+is also the gossip-topic capability: it is intentionally simple bearer
+admission, not individually revocable worker credentials. OIDC enrollment,
+Biscuit authorization, MCP aggregation, and peer-provided egress can consume
+this library without becoming transport requirements.
 
 The CLI keeps the same boundary:
 

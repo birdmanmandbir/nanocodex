@@ -11,10 +11,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::task::AbortOnDropHandle;
 
-use crate::{
-    NetworkError, SignedAdvertisement,
-    discovery::{ClusterView, IngestOutcome},
-};
+use crate::{CatalogIngest, NetworkError, SignedAdvertisement, discovery::ClusterView};
 
 const MESSAGE_VERSION: u8 = 1;
 const TOPIC_DOMAIN: &[u8] = b"nanocodex-network-discovery-topic\0";
@@ -212,9 +209,9 @@ async fn handle_command(command: Command, sender: &GossipSender, view: &ClusterV
                 record.verify(record.node_id())?;
                 let message = encode(&record)?;
                 match view.ingest(record).await? {
-                    IngestOutcome::Broadcast => {}
-                    IngestOutcome::Replay => return Ok(()),
-                    IngestOutcome::Stale => {
+                    CatalogIngest::Applied => {}
+                    CatalogIngest::Replay => return Ok(()),
+                    CatalogIngest::Stale => {
                         return Err(NetworkError::InvalidAdvertisement(
                             "advertisement revision is older than the local active revision"
                                 .to_owned(),

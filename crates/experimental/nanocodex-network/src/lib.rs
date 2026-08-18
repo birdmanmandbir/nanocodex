@@ -4,7 +4,8 @@ mod discovery;
 mod gossip;
 
 pub use discovery::{
-    CapabilityValue, NodeAdvertisement, PeerChange, PeerWatcher, Query, SignedAdvertisement,
+    CapabilityValue, CatalogIngest, NodeAdvertisement, PeerCatalog, PeerChange, PeerWatcher, Query,
+    SignedAdvertisement,
 };
 
 use std::{
@@ -26,8 +27,8 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use constant_time_eq::constant_time_eq_32;
 use iroh::{
-    Endpoint, EndpointAddr, RelayMode,
-    endpoint::{NetReportConfig, PortmapperConfig, presets},
+    Endpoint, EndpointAddr,
+    endpoint::presets,
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use serde::{Deserialize, Serialize};
@@ -54,6 +55,7 @@ const MAX_PROTOCOL_BYTES: usize = 128;
 const TOKEN_BYTES: usize = 32;
 const NONCE_BYTES: usize = 32;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+const ONLINE_TIMEOUT: Duration = Duration::from_secs(60);
 const GRANT_LIFETIME: Duration = Duration::from_secs(30);
 const MAX_CONCURRENT_STREAMS: usize = 32;
 const STREAM_CONTROL: u8 = 1;
@@ -108,6 +110,7 @@ pub struct TcpBridgeTicket {
 pub struct Hub {
     router: Router,
     nodes: Arc<NodeRegistry>,
+    catalog: PeerCatalog,
     _discovery: gossip::GossipDiscovery,
 }
 
@@ -116,7 +119,7 @@ pub struct Node {
     router: Router,
     dialer: HubDialer,
     listeners: Arc<Mutex<HashMap<ProtocolId, mpsc::Sender<PeerStream>>>>,
-    cluster_view: Arc<discovery::ClusterView>,
+    catalog: PeerCatalog,
     discovery: gossip::GossipDiscovery,
 }
 
@@ -202,6 +205,14 @@ pub enum NetworkError {
     /// Creating or shutting down an Iroh endpoint failed.
     #[error("network Iroh endpoint failed: {0}")]
     Endpoint(String),
+    /// A caller-supplied endpoint does not use the requested durable identity.
+    #[error("Iroh endpoint identity {actual} does not match durable identity {expected}")]
+    EndpointIdentityMismatch {
+        /// Public identity required by the authority or node identity.
+        expected: iroh::EndpointId,
+        /// Public identity configured on the supplied endpoint.
+        actual: iroh::EndpointId,
+    },
     /// Durable identity I/O failed.
     #[error("failed to {operation} network identity at {}: {source}", path.display())]
     IdentityIo {
@@ -387,6 +398,18 @@ impl JoinAuthority {
         self.secret_key.public()
     }
 
+    /// Starts a caller-configurable Iroh endpoint builder with this durable identity.
+    ///
+    /// The caller retains the complete Iroh policy surface: presets, relays,
+    /// address-lookup sources, port mapping, endpoint hooks, and custom transports.
+    /// Pass the bound endpoint to [`Hub::from_endpoint`].
+    pub fn endpoint_builder(
+        &self,
+        preset: impl iroh::endpoint::presets::Preset,
+    ) -> iroh::endpoint::Builder {
+        Endpoint::builder(preset).secret_key(self.secret_key.clone())
+    }
+
     fn generate() -> Result<Self, NetworkError> {
         let mut secret_key = [0; 32];
         let mut token = [0; TOKEN_BYTES];
@@ -462,6 +485,18 @@ impl NodeIdentity {
     #[must_use]
     pub fn endpoint_id(&self) -> iroh::EndpointId {
         self.secret_key.public()
+    }
+
+    /// Starts a caller-configurable Iroh endpoint builder with this durable identity.
+    ///
+    /// The caller retains the complete Iroh policy surface: presets, relays,
+    /// address-lookup sources, port mapping, endpoint hooks, and custom transports.
+    /// Pass the bound endpoint to [`Node::from_endpoint`].
+    pub fn endpoint_builder(
+        &self,
+        preset: impl iroh::endpoint::presets::Preset,
+    ) -> iroh::endpoint::Builder {
+        Endpoint::builder(preset).secret_key(self.secret_key.clone())
     }
 
     #[cfg(test)]
@@ -703,30 +738,40 @@ impl FromStr for TcpBridgeTicket {
 }
 
 impl Hub {
-    /// Starts a LAN-only Iroh endpoint with a durable identity.
+    /// Starts an internet-capable Iroh endpoint with a durable identity.
     ///
-    /// The endpoint publishes no address records and configures no relay. The
-    /// returned ticket carries its current direct IP addresses plus the shared
-    /// join capability, so peers must be able to reach one another directly.
+    /// This convenience path uses Iroh's `N0` preset and waits for a public
+    /// relay route before returning the ticket. Applications that need LAN-only,
+    /// self-hosted, DHT-backed, or otherwise custom connectivity should bind an
+    /// endpoint from [`JoinAuthority::endpoint_builder`] and call
+    /// [`Hub::from_endpoint`].
     pub async fn bind(identity: &JoinAuthority) -> Result<(Self, JoinTicket), NetworkError> {
-        let endpoint = Endpoint::builder(presets::Minimal)
-            .secret_key(identity.secret_key.clone())
-            .relay_mode(RelayMode::Disabled)
-            .clear_address_lookup()
-            .portmapper_config(PortmapperConfig::Disabled)
-            .net_report_config(NetReportConfig::minimal())
+        let endpoint = identity
+            .endpoint_builder(presets::N0)
             .bind()
             .await
             .map_err(|error| NetworkError::Endpoint(error.to_string()))?;
-        Self::spawn_with_token(endpoint, identity.token).await
+        tokio::time::timeout(ONLINE_TIMEOUT, endpoint.online())
+            .await
+            .map_err(|_| {
+                NetworkError::Endpoint(format!(
+                    "did not connect to a relay within {} seconds",
+                    ONLINE_TIMEOUT.as_secs()
+                ))
+            })?;
+        Self::from_endpoint(identity, endpoint).await
     }
 
-    /// Starts a hub from an application-configured endpoint.
-    #[doc(hidden)]
-    pub async fn bind_with_endpoint(
+    /// Starts a hub from a bound, application-configured Iroh endpoint.
+    ///
+    /// The endpoint must have been built from `identity`; mismatches fail before
+    /// any protocol tasks start. Endpoint readiness is caller-owned, so this
+    /// method does not require a relay or any other external infrastructure.
+    pub async fn from_endpoint(
+        identity: &JoinAuthority,
         endpoint: Endpoint,
     ) -> Result<(Self, JoinTicket), NetworkError> {
-        let identity = JoinAuthority::generate()?;
+        require_endpoint_identity(&endpoint, identity.endpoint_id())?;
         Self::spawn_with_token(endpoint, identity.token).await
     }
 
@@ -743,6 +788,8 @@ impl Hub {
         let token = protocol.token;
         let topic = gossip::topic_id(endpoint.id(), &token);
         let gossip_protocol = iroh_gossip::Gossip::builder().spawn(endpoint.clone());
+        let own_id = endpoint.id();
+        let cluster_view = Arc::new(discovery::ClusterView::default());
         let router = Router::builder(endpoint)
             .accept(HUB_ALPN, protocol)
             .accept(iroh_gossip::ALPN, gossip_protocol.clone())
@@ -751,7 +798,7 @@ impl Hub {
             gossip_protocol,
             topic,
             Vec::new(),
-            Arc::new(discovery::ClusterView::default()),
+            cluster_view.clone(),
             gossip::SnapshotPolicy::All,
         )
         .await?;
@@ -760,6 +807,7 @@ impl Hub {
             Self {
                 router,
                 nodes,
+                catalog: PeerCatalog::new(own_id, cluster_view),
                 _discovery: discovery,
             },
             ticket,
@@ -780,6 +828,15 @@ impl Hub {
         nodes
     }
 
+    /// Returns the hub's mergeable authenticated peer catalog.
+    ///
+    /// Gossip updates it automatically. Applications can clone the handle into
+    /// DHT, control-plane, cache, or other discovery-source tasks.
+    #[must_use]
+    pub fn catalog(&self) -> PeerCatalog {
+        self.catalog.clone()
+    }
+
     /// Gracefully closes the Iroh endpoint and its active sessions.
     pub async fn shutdown(self) -> Result<(), NetworkError> {
         self.router
@@ -790,26 +847,30 @@ impl Hub {
 }
 
 impl Node {
-    /// Joins a network with a LAN-only durable Iroh endpoint.
+    /// Joins a network with an internet-capable durable Iroh endpoint.
+    ///
+    /// This convenience path uses Iroh's `N0` preset. Applications select LAN,
+    /// self-hosted relay, custom address lookup, or custom transport policy with
+    /// [`NodeIdentity::endpoint_builder`] and [`Node::from_endpoint`].
     pub async fn join(ticket: JoinTicket, identity: &NodeIdentity) -> Result<Self, NetworkError> {
-        let endpoint = Endpoint::builder(presets::Minimal)
-            .secret_key(identity.secret_key.clone())
-            .relay_mode(RelayMode::Disabled)
-            .clear_address_lookup()
-            .portmapper_config(PortmapperConfig::Disabled)
-            .net_report_config(NetReportConfig::minimal())
+        let endpoint = identity
+            .endpoint_builder(presets::N0)
             .bind()
             .await
             .map_err(|error| NetworkError::Endpoint(error.to_string()))?;
-        Self::join_with_endpoint(ticket, endpoint).await
+        Self::from_endpoint(ticket, identity, endpoint).await
     }
 
-    /// Joins from an application-configured endpoint.
-    #[doc(hidden)]
-    pub async fn join_with_endpoint(
+    /// Joins from a bound, application-configured Iroh endpoint.
+    ///
+    /// The endpoint must have been built from `identity`; mismatches fail before
+    /// the network is contacted.
+    pub async fn from_endpoint(
         ticket: JoinTicket,
+        identity: &NodeIdentity,
         endpoint: Endpoint,
     ) -> Result<Self, NetworkError> {
+        require_endpoint_identity(&endpoint, identity.endpoint_id())?;
         let grants = Arc::new(Mutex::new(Vec::new()));
         let listeners = Arc::new(Mutex::new(HashMap::new()));
         let cluster_view = Arc::new(discovery::ClusterView::default());
@@ -843,11 +904,12 @@ impl Node {
             gossip::SnapshotPolicy::Own(router.endpoint().id()),
         )
         .await?;
+        let catalog = PeerCatalog::new(router.endpoint().id(), cluster_view);
         Ok(Self {
             router,
             dialer,
             listeners,
-            cluster_view,
+            catalog,
             discovery,
         })
     }
@@ -856,6 +918,15 @@ impl Node {
     #[must_use]
     pub fn endpoint_id(&self) -> iroh::EndpointId {
         self.router.endpoint().id()
+    }
+
+    /// Returns this node's mergeable authenticated peer catalog.
+    ///
+    /// Gossip updates it automatically. Applications can clone the handle into
+    /// DHT, control-plane, cache, or other discovery-source tasks.
+    #[must_use]
+    pub fn catalog(&self) -> PeerCatalog {
+        self.catalog.clone()
     }
 
     /// Registers one application protocol on this node.
@@ -880,11 +951,11 @@ impl Node {
         })
     }
 
-    /// Opens a direct authenticated stream to `peer` for `protocol`.
+    /// Opens an authenticated Iroh stream to `peer` for `protocol`.
     ///
     /// The hub authorizes one short-lived, identity- and protocol-bound grant.
-    /// Application bytes then flow over a separate direct Iroh connection
-    /// between the two LAN-reachable nodes.
+    /// Application bytes then flow over a separate peer connection using the
+    /// direct, relay, or custom path policy of the supplied Iroh endpoints.
     pub async fn connect(
         &self,
         peer: iroh::EndpointId,
@@ -940,9 +1011,9 @@ impl Node {
         })
     }
 
-    /// Opens a filtered stream over this node's local authenticated cluster view.
+    /// Opens a filtered stream over this node's merged authenticated catalog.
     pub async fn watch(&self, query: Query) -> PeerWatcher {
-        self.cluster_view.watch(self.endpoint_id(), query).await
+        self.catalog.watch(query).await
     }
 
     /// Gracefully leaves the network and closes direct sessions.
@@ -952,6 +1023,17 @@ impl Node {
             .await
             .map_err(|error| NetworkError::Endpoint(error.to_string()))
     }
+}
+
+fn require_endpoint_identity(
+    endpoint: &Endpoint,
+    expected: iroh::EndpointId,
+) -> Result<(), NetworkError> {
+    let actual = endpoint.id();
+    if actual != expected {
+        return Err(NetworkError::EndpointIdentityMismatch { expected, actual });
+    }
+    Ok(())
 }
 
 fn advertisement_renewal_delay(lease_duration: Duration, node_id: iroh::EndpointId) -> Duration {
@@ -2018,6 +2100,23 @@ mod tests {
         directory.join("node.json")
     }
 
+    async fn bind_test_hub(endpoint: Endpoint) -> Result<(Hub, JoinTicket), NetworkError> {
+        let mut token = [0_u8; TOKEN_BYTES];
+        getrandom::fill(&mut token).map_err(|error| NetworkError::Endpoint(error.to_string()))?;
+        let identity = JoinAuthority {
+            secret_key: endpoint.secret_key().clone(),
+            token,
+        };
+        Hub::from_endpoint(&identity, endpoint).await
+    }
+
+    async fn join_test_node(ticket: JoinTicket, endpoint: Endpoint) -> Result<Node, NetworkError> {
+        let identity = NodeIdentity {
+            secret_key: endpoint.secret_key().clone(),
+        };
+        Node::from_endpoint(ticket, &identity, endpoint).await
+    }
+
     async fn present_session_grant(
         endpoint: &Endpoint,
         address: EndpointAddr,
@@ -2039,20 +2138,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_endpoints_use_direct_lan_addresses_without_relays() {
+    async fn identity_bound_endpoints_preserve_caller_owned_lan_policy() {
         let _test_permit = TEST_ENDPOINT_PERMIT.acquire().await.unwrap();
         let authority = JoinAuthority::generate().unwrap();
-        let (hub, ticket) = Hub::bind(&authority).await.unwrap();
+        let hub_endpoint = authority
+            .endpoint_builder(presets::Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .clear_address_lookup()
+            .bind()
+            .await
+            .unwrap();
+        let (hub, ticket) = Hub::from_endpoint(&authority, hub_endpoint).await.unwrap();
 
         assert!(ticket.address.relay_urls().next().is_none());
         assert!(ticket.address.ip_addrs().next().is_some());
 
         let identity = NodeIdentity::generate().unwrap();
-        let node = Node::join(ticket, &identity).await.unwrap();
+        let node_endpoint = identity
+            .endpoint_builder(presets::Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .clear_address_lookup()
+            .bind()
+            .await
+            .unwrap();
+        let node = Node::from_endpoint(ticket, &identity, node_endpoint)
+            .await
+            .unwrap();
         assert!(node.router.endpoint().addr().relay_urls().next().is_none());
 
         node.shutdown().await.unwrap();
         hub.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn custom_endpoints_must_match_the_durable_identity() {
+        let _test_permit = TEST_ENDPOINT_PERMIT.acquire().await.unwrap();
+        let authority = JoinAuthority::generate().unwrap();
+        let other = JoinAuthority::generate().unwrap();
+        let endpoint = other
+            .endpoint_builder(presets::Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+
+        let Err(error) = Hub::from_endpoint(&authority, endpoint).await else {
+            panic!("mismatched endpoint identity unexpectedly started a hub");
+        };
+        assert!(matches!(
+            error,
+            NetworkError::EndpointIdentityMismatch { expected, actual }
+                if expected == authority.endpoint_id() && actual == other.endpoint_id()
+        ));
     }
 
     #[tokio::test(start_paused = true)]
@@ -2298,7 +2435,7 @@ mod tests {
             .bind()
             .await
             .unwrap();
-        let provider = Node::join_with_endpoint(second_ticket.clone(), provider_endpoint)
+        let provider = join_test_node(second_ticket.clone(), provider_endpoint)
             .await
             .unwrap();
         let protocol = ProtocolId::new("nanocodex/restart-test/1").unwrap();
@@ -2314,7 +2451,7 @@ mod tests {
             .bind()
             .await
             .unwrap();
-        let requester = Node::join_with_endpoint(second_ticket, requester_endpoint)
+        let requester = join_test_node(second_ticket, requester_endpoint)
             .await
             .unwrap();
         let mut outgoing = requester
@@ -2408,7 +2545,7 @@ mod tests {
             .bind()
             .await
             .unwrap();
-        let (server, ticket) = Hub::bind_with_endpoint(server_endpoint).await.unwrap();
+        let (server, ticket) = bind_test_hub(server_endpoint).await.unwrap();
 
         let provider_identity = NodeIdentity::generate().unwrap();
         let provider_endpoint = Endpoint::builder(presets::Minimal)
@@ -2420,7 +2557,7 @@ mod tests {
             .bind()
             .await
             .unwrap();
-        let provider = Node::join_with_endpoint(ticket.clone(), provider_endpoint)
+        let provider = join_test_node(ticket.clone(), provider_endpoint)
             .await
             .unwrap();
         let protocol = ProtocolId::new("nanocodex/multiplex-test/1").unwrap();
@@ -2436,9 +2573,7 @@ mod tests {
             .bind()
             .await
             .unwrap();
-        let requester = Node::join_with_endpoint(ticket, requester_endpoint)
-            .await
-            .unwrap();
+        let requester = join_test_node(ticket, requester_endpoint).await.unwrap();
 
         let mut connection_ids = Vec::new();
         for _ in 0..2 {
@@ -2483,7 +2618,7 @@ mod tests {
             .bind()
             .await
             .unwrap();
-        let (hub, ticket) = Hub::bind_with_endpoint(server_endpoint).await.unwrap();
+        let (hub, ticket) = bind_test_hub(server_endpoint).await.unwrap();
 
         let first_identity = NodeIdentity::generate().unwrap();
         let first_id = first_identity.endpoint_id();
@@ -2496,7 +2631,7 @@ mod tests {
             .bind()
             .await
             .unwrap();
-        let first = Node::join_with_endpoint(ticket.clone(), first_endpoint)
+        let first = join_test_node(ticket.clone(), first_endpoint)
             .await
             .unwrap();
 
@@ -2511,9 +2646,7 @@ mod tests {
             .bind()
             .await
             .unwrap();
-        let second = Node::join_with_endpoint(ticket, second_endpoint)
-            .await
-            .unwrap();
+        let second = join_test_node(ticket, second_endpoint).await.unwrap();
 
         let protocol = ProtocolId::new("nanocodex/example/1").unwrap();
         let mut second_listener = second.listen(protocol.clone()).await.unwrap();
@@ -2630,7 +2763,7 @@ mod tests {
                 .bind()
                 .await
                 .unwrap();
-            Node::join_with_endpoint(ticket, endpoint).await.unwrap()
+            join_test_node(ticket, endpoint).await.unwrap()
         }
 
         async fn change(watcher: &mut PeerWatcher) -> PeerChange {
@@ -2667,7 +2800,7 @@ mod tests {
             .bind()
             .await
             .unwrap();
-        let (hub, ticket) = Hub::bind_with_endpoint(hub_endpoint).await.unwrap();
+        let (hub, ticket) = bind_test_hub(hub_endpoint).await.unwrap();
 
         let first_observer_identity = NodeIdentity::generate().unwrap();
         let first_observer = local_node(ticket.clone(), &first_observer_identity).await;
@@ -2820,7 +2953,7 @@ mod tests {
                 .bind()
                 .await
                 .unwrap();
-            Node::join_with_endpoint(ticket, endpoint)
+            join_test_node(ticket, endpoint)
                 .await
                 .unwrap_or_else(|error| panic!("{label} could not join: {error}"))
         }
@@ -2834,7 +2967,7 @@ mod tests {
             .bind()
             .await
             .unwrap();
-        let (hub, ticket) = Hub::bind_with_endpoint(hub_endpoint).await.unwrap();
+        let (hub, ticket) = bind_test_hub(hub_endpoint).await.unwrap();
         let observer = local_node(ticket.clone(), "observer").await;
         let protocol = ProtocolId::new("nanocodex.worker/1").unwrap();
         let query = Query::service(protocol.clone())
@@ -2961,7 +3094,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             view.ingest(revision_two.clone()).await.unwrap(),
-            discovery::IngestOutcome::Broadcast
+            CatalogIngest::Applied
         );
         assert!(matches!(
             watcher.next().await,
@@ -2973,18 +3106,12 @@ mod tests {
             &identity,
         )
         .unwrap();
-        assert_eq!(
-            view.ingest(stale).await.unwrap(),
-            discovery::IngestOutcome::Stale
-        );
+        assert_eq!(view.ingest(stale).await.unwrap(), CatalogIngest::Stale);
 
         tokio::time::sleep(Duration::from_millis(2)).await;
         let replay =
             SignedAdvertisement::sign(revision_two.advertisement().clone(), &identity).unwrap();
-        assert_eq!(
-            view.ingest(replay).await.unwrap(),
-            discovery::IngestOutcome::Broadcast
-        );
+        assert_eq!(view.ingest(replay).await.unwrap(), CatalogIngest::Applied);
         assert!(
             tokio::time::timeout(Duration::from_millis(50), watcher.next())
                 .await
@@ -3032,7 +3159,7 @@ mod tests {
             .bind()
             .await
             .unwrap();
-        let (server, ticket) = Hub::bind_with_endpoint(server_endpoint).await.unwrap();
+        let (server, ticket) = bind_test_hub(server_endpoint).await.unwrap();
 
         let invalid_client = Endpoint::builder(presets::Minimal)
             .relay_mode(iroh::RelayMode::Disabled)
@@ -3072,7 +3199,7 @@ mod tests {
             .bind()
             .await
             .unwrap();
-        let provider = Node::join_with_endpoint(ticket.clone(), provider_endpoint)
+        let provider = join_test_node(ticket.clone(), provider_endpoint)
             .await
             .unwrap();
         let bridge_listener = TcpBridge::listen(&provider).await.unwrap();
@@ -3098,9 +3225,7 @@ mod tests {
             .bind()
             .await
             .unwrap();
-        let node = Node::join_with_endpoint(ticket, client_endpoint)
-            .await
-            .unwrap();
+        let node = join_test_node(ticket, client_endpoint).await.unwrap();
         let connector =
             tokio::spawn(async move { TcpBridge::connect(&node, provider_id, downstream).await });
 

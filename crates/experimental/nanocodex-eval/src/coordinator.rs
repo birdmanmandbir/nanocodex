@@ -1423,7 +1423,7 @@ impl TryFrom<WireTreatment> for EvaluationTreatment {
 mod tests {
     use std::{fs, path::Path};
 
-    use nanocodex_network::{Hub, Node, TcpBridge};
+    use nanocodex_network::{Hub, JoinAuthority, Node, NodeIdentity, TcpBridge};
     use rusqlite::Connection;
     use tokio::task::JoinHandle;
 
@@ -1525,7 +1525,10 @@ thinking = ["high"]
             .await
             .unwrap();
         let coordinator_address = coordinator_listener.local_addr().unwrap();
-        let server_endpoint = ::iroh::Endpoint::builder(::iroh::endpoint::presets::Minimal)
+        let authority =
+            JoinAuthority::load_or_create(directory.path().join("iroh-authority.json")).unwrap();
+        let server_endpoint = authority
+            .endpoint_builder(::iroh::endpoint::presets::Minimal)
             .relay_mode(::iroh::RelayMode::Disabled)
             .clear_ip_transports()
             .bind_addr("127.0.0.1:0")
@@ -1533,8 +1536,13 @@ thinking = ["high"]
             .bind()
             .await
             .unwrap();
-        let (iroh_server, ticket) = Hub::bind_with_endpoint(server_endpoint).await.unwrap();
-        let provider_endpoint = ::iroh::Endpoint::builder(::iroh::endpoint::presets::Minimal)
+        let (iroh_server, ticket) = Hub::from_endpoint(&authority, server_endpoint)
+            .await
+            .unwrap();
+        let provider_identity =
+            NodeIdentity::load_or_create(directory.path().join("iroh-provider.json")).unwrap();
+        let provider_endpoint = provider_identity
+            .endpoint_builder(::iroh::endpoint::presets::Minimal)
             .relay_mode(::iroh::RelayMode::Disabled)
             .clear_ip_transports()
             .bind_addr("127.0.0.1:0")
@@ -1542,7 +1550,7 @@ thinking = ["high"]
             .bind()
             .await
             .unwrap();
-        let provider = Node::join_with_endpoint(ticket.clone(), provider_endpoint)
+        let provider = Node::from_endpoint(ticket.clone(), &provider_identity, provider_endpoint)
             .await
             .unwrap();
         let provider_id = provider.endpoint_id();
@@ -1551,7 +1559,10 @@ thinking = ["high"]
             .await
             .unwrap();
         let bridge_address = bridge_listener.local_addr().unwrap();
-        let client_endpoint = ::iroh::Endpoint::builder(::iroh::endpoint::presets::Minimal)
+        let client_identity =
+            NodeIdentity::load_or_create(directory.path().join("iroh-client.json")).unwrap();
+        let client_endpoint = client_identity
+            .endpoint_builder(::iroh::endpoint::presets::Minimal)
             .relay_mode(::iroh::RelayMode::Disabled)
             .clear_ip_transports()
             .bind_addr("127.0.0.1:0")
@@ -1559,7 +1570,7 @@ thinking = ["high"]
             .bind()
             .await
             .unwrap();
-        let node = Node::join_with_endpoint(ticket, client_endpoint)
+        let node = Node::from_endpoint(ticket, &client_identity, client_endpoint)
             .await
             .unwrap();
         let server = tokio::spawn(async move {

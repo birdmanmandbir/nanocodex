@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
-    sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard},
+    sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -414,6 +414,71 @@ pub struct PeerWatcher {
     changed: watch::Receiver<u64>,
 }
 
+/// One identity-keyed local view merging signed records from any discovery source.
+///
+/// Iroh gossip feeds this catalog automatically. Applications may also ingest the
+/// same signed record shape from a DHT, control plane, retained cache, or another
+/// application-owned source. Signature, expiry, revision, and equivocation checks
+/// are identical regardless of provenance.
+#[derive(Clone)]
+pub struct PeerCatalog {
+    own_id: EndpointId,
+    view: Arc<ClusterView>,
+}
+
+/// Result of merging one authenticated record into a [`PeerCatalog`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CatalogIngest {
+    /// The record added a peer, advanced its revision, or renewed its lease.
+    Applied,
+    /// The exact record or a newer renewal was already present.
+    Replay,
+    /// A newer content revision was already present.
+    Stale,
+}
+
+impl PeerCatalog {
+    pub(crate) const fn new(own_id: EndpointId, view: Arc<ClusterView>) -> Self {
+        Self { own_id, view }
+    }
+
+    /// Merges one transport-independent signed advertisement from an external source.
+    ///
+    /// Invalid signatures, expired records, and same-revision equivocation are
+    /// rejected. An accepted record updates every watcher sharing this catalog.
+    pub async fn ingest(&self, record: SignedAdvertisement) -> Result<CatalogIngest, NetworkError> {
+        record.verify(record.node_id())?;
+        self.view.ingest(record).await
+    }
+
+    /// Opens a filtered watcher over the merged authenticated view.
+    pub async fn watch(&self, query: Query) -> PeerWatcher {
+        self.view.watch(self.own_id, query).await
+    }
+
+    /// Returns a deterministic snapshot of peers currently matching `query`.
+    pub async fn snapshot(&self, query: &Query) -> Vec<SignedAdvertisement> {
+        let mut records = self
+            .view
+            .active_records()
+            .await
+            .into_iter()
+            .filter(|record| record.node_id() != self.own_id && query.matches(record))
+            .collect::<Vec<_>>();
+        records.sort_unstable_by_key(SignedAdvertisement::node_id);
+        records
+    }
+}
+
+impl std::fmt::Debug for PeerCatalog {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PeerCatalog")
+            .field("own_id", &self.own_id)
+            .finish_non_exhaustive()
+    }
+}
+
 impl PeerWatcher {
     /// Waits for the next matching cluster-view change.
     pub async fn next(&mut self) -> Option<PeerChange> {
@@ -447,13 +512,6 @@ pub(crate) enum PresenceKind {
 pub(crate) struct PresenceChange {
     pub kind: PresenceKind,
     pub record: SignedAdvertisement,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum IngestOutcome {
-    Broadcast,
-    Replay,
-    Stale,
 }
 
 #[derive(Default)]
@@ -607,7 +665,7 @@ impl ClusterView {
     pub(crate) async fn ingest(
         &self,
         record: SignedAdvertisement,
-    ) -> Result<IngestOutcome, NetworkError> {
+    ) -> Result<CatalogIngest, NetworkError> {
         let mut state = self.state.lock().await;
         let kind = match state.peers.get_mut(&record.node_id()) {
             None => PresenceKind::Joined,
@@ -615,7 +673,7 @@ impl ClusterView {
                 if record.advertisement().revision()
                     < previous.record.advertisement().revision() =>
             {
-                return Ok(IngestOutcome::Stale);
+                return Ok(CatalogIngest::Stale);
             }
             Some(previous)
                 if record.advertisement().revision()
@@ -628,9 +686,9 @@ impl ClusterView {
                 }
                 if record.expires_at_unix_millis() > previous.record.expires_at_unix_millis() {
                     previous.record = record;
-                    return Ok(IngestOutcome::Broadcast);
+                    return Ok(CatalogIngest::Applied);
                 }
-                return Ok(IngestOutcome::Replay);
+                return Ok(CatalogIngest::Replay);
             }
             Some(_) => PresenceKind::Updated,
         };
@@ -641,7 +699,7 @@ impl ClusterView {
             },
         );
         state.notify_watchers(PresenceChange { kind, record });
-        Ok(IngestOutcome::Broadcast)
+        Ok(CatalogIngest::Applied)
     }
 
     pub(crate) async fn expire(&self) {
@@ -797,6 +855,44 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn catalog_merges_authenticated_records_from_independent_sources() {
+        let observer = SecretKey::from_bytes(&[0x31; 32]).public();
+        let provider = SecretKey::from_bytes(&[0x32; 32]);
+        let protocol = ProtocolId::new("nanocodex.egress.http/1").unwrap();
+        let catalog = PeerCatalog::new(observer, Arc::new(ClusterView::default()));
+        let mut watcher = catalog.watch(Query::service(protocol.clone())).await;
+        let record = SignedAdvertisement::sign(
+            NodeAdvertisement::new(1)
+                .with_service(protocol.clone())
+                .with_attribute("gateway.internet", true),
+            &provider,
+        )
+        .unwrap();
+
+        assert_eq!(
+            catalog.ingest(record.clone()).await.unwrap(),
+            CatalogIngest::Applied
+        );
+        assert!(matches!(
+            watcher.next().await,
+            Some(PeerChange::Joined(joined)) if joined == record
+        ));
+        assert_eq!(
+            catalog.ingest(record.clone()).await.unwrap(),
+            CatalogIngest::Replay
+        );
+        assert_eq!(
+            catalog.snapshot(&Query::service(protocol)).await,
+            vec![record.clone()]
+        );
+
+        let mut encoded = serde_json::to_value(&record).unwrap();
+        encoded["advertisement"]["revision"] = serde_json::json!(2);
+        let forged: SignedAdvertisement = serde_json::from_value(encoded).unwrap();
+        assert!(catalog.ingest(forged).await.is_err());
+    }
+
+    #[tokio::test]
     async fn initial_watch_snapshot_does_not_drop_large_fleets() {
         const PEERS: usize = 320;
 
@@ -811,7 +907,7 @@ mod tests {
                 &identity,
             )
             .unwrap();
-            assert_eq!(view.ingest(record).await.unwrap(), IngestOutcome::Broadcast);
+            assert_eq!(view.ingest(record).await.unwrap(), CatalogIngest::Applied);
         }
 
         let observer = SecretKey::from_bytes(&[0xff; 32]).public();

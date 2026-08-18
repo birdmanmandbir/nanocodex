@@ -12,7 +12,10 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use eyre::{Context as _, Result, bail, eyre};
 use futures_util::StreamExt as _;
-use iroh::EndpointId;
+use iroh::{
+    Endpoint, EndpointId, RelayMode,
+    endpoint::{Builder as EndpointBuilder, NetReportConfig, PortmapperConfig, presets},
+};
 use nanocodex::{
     Nanocodex, OpenAi, Thinking, Tools,
     agent::events::{AgentEventData, AssistantEvent, RunEvent},
@@ -160,13 +163,15 @@ async fn main() -> Result<()> {
 async fn host(state: &Path) -> Result<()> {
     let authority = JoinAuthority::load_or_create(state.join("authority.json"))
         .wrap_err("failed to load the LAN party authority")?;
-    let (hub, join_ticket) = Hub::bind(&authority)
+    let hub_endpoint = bind_lan_endpoint(authority.endpoint_builder(presets::Minimal)).await?;
+    let (hub, join_ticket) = Hub::from_endpoint(&authority, hub_endpoint)
         .await
         .wrap_err("failed to bind the LAN-only Iroh hub")?;
     let identity = NodeIdentity::load_or_create(state.join("host.json"))
         .wrap_err("failed to load the LAN party host identity")?;
+    let host_endpoint = bind_lan_endpoint(identity.endpoint_builder(presets::Minimal)).await?;
     let node = Arc::new(
-        Node::join(join_ticket.clone(), &identity)
+        Node::from_endpoint(join_ticket.clone(), &identity, host_endpoint)
             .await
             .wrap_err("failed to join the LAN party host node")?,
     );
@@ -301,7 +306,8 @@ async fn join(ticket: PartyTicket, state: &Path, name: String) -> Result<()> {
     validate_name(&name)?;
     let identity = NodeIdentity::load_or_create(state.join("agent.json"))
         .wrap_err("failed to load the LAN party agent identity")?;
-    let node = Node::join(ticket.network.clone(), &identity)
+    let endpoint = bind_lan_endpoint(identity.endpoint_builder(presets::Minimal)).await?;
+    let node = Node::from_endpoint(ticket.network.clone(), &identity, endpoint)
         .await
         .wrap_err("failed to join the LAN-only Iroh network")?;
     let protocol = ProtocolId::new(AGENT_PROTOCOL)?;
@@ -365,6 +371,17 @@ async fn join(ticket: PartyTicket, state: &Path, name: String) -> Result<()> {
     node.shutdown()
         .await
         .wrap_err("failed to stop the LAN party agent node")
+}
+
+async fn bind_lan_endpoint(builder: EndpointBuilder) -> Result<Endpoint> {
+    builder
+        .relay_mode(RelayMode::Disabled)
+        .clear_address_lookup()
+        .portmapper_config(PortmapperConfig::Disabled)
+        .net_report_config(NetReportConfig::minimal())
+        .bind()
+        .await
+        .wrap_err("failed to bind a direct LAN-only Iroh endpoint")
 }
 
 fn build_agent(name: &str) -> Result<Nanocodex> {

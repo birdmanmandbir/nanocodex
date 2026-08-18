@@ -15,8 +15,9 @@ being exercised and revised:
   scheduling, verification, durable evidence, and live stock-Codex
   differential analysis.
 - [`nanocodex-network`](nanocodex-network/README.md): durable Iroh identities,
-  bootstrap admission, named application protocols, authenticated peer
-  streams, and bounded local bridges.
+  caller-configured endpoint policy, merged authenticated discovery,
+  bootstrap admission, named application protocols, peer streams, and bounded
+  local bridges.
 
 Experimental means API stability, not reduced engineering standards. These
 packages remain workspace members and must pass the normal formatting, Clippy,
