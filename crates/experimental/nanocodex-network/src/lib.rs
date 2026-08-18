@@ -1,4 +1,4 @@
-//! Durable Iroh identities, gossip discovery, admission, and bilateral peer connectivity.
+//! Durable Iroh identities, merged discovery, application authorization, and peer streams.
 
 mod discovery;
 mod gossip;
@@ -11,6 +11,7 @@ pub use discovery::{
 use std::{
     collections::HashMap,
     fmt, fs,
+    future::Future,
     io::Write as _,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -35,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf},
     net::{TcpListener, TcpStream},
-    sync::{Mutex, Semaphore, mpsc},
+    sync::{Mutex, Semaphore, mpsc, watch},
     task::JoinSet,
 };
 use tokio_util::task::AbortOnDropHandle;
@@ -44,7 +45,7 @@ const HUB_ALPN: &[u8] = b"nanocodex-network/hub/1";
 const NODE_ALPN: &[u8] = b"nanocodex-network/node/1";
 const TICKET_PREFIX: &str = "nanocodex-net:";
 const TICKET_VERSION: u8 = 1;
-const CONTROL_VERSION: u8 = 1;
+const CONTROL_VERSION: u8 = 2;
 const IDENTITY_VERSION: u8 = 1;
 const MAX_IDENTITY_BYTES: u64 = 4 * 1024;
 const MAX_TICKET_BYTES: usize = 16 * 1024;
@@ -52,9 +53,12 @@ const MAX_CONTROL_BYTES: usize = 16 * 1024;
 const MAX_PENDING_GRANTS: usize = 128;
 const MAX_PENDING_SESSIONS: usize = 32;
 const MAX_PROTOCOL_BYTES: usize = 128;
+const MAX_SESSION_CREDENTIAL_BYTES: usize = 8 * 1024;
 const TOKEN_BYTES: usize = 32;
 const NONCE_BYTES: usize = 32;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+const SESSION_POLICY_TIMEOUT: Duration = Duration::from_secs(5);
+const SESSION_GRANT_TIMEOUT: Duration = Duration::from_secs(20);
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(60);
 const GRANT_LIFETIME: Duration = Duration::from_secs(30);
 const MAX_CONCURRENT_STREAMS: usize = 32;
@@ -114,6 +118,13 @@ pub struct Hub {
     _discovery: gossip::GossipDiscovery,
 }
 
+/// Configures application-owned session authorization before starting a hub.
+pub struct HubBuilder {
+    endpoint: Endpoint,
+    token: [u8; TOKEN_BYTES],
+    session_authorizer: Arc<dyn SessionAuthorizer>,
+}
+
 /// One durable node joined to a network.
 pub struct Node {
     router: Router,
@@ -127,7 +138,14 @@ pub struct Node {
 pub struct AdvertisementLease {
     node_id: iroh::EndpointId,
     revision: u64,
+    records: watch::Receiver<SignedAdvertisement>,
     _renewal_task: AbortOnDropHandle<()>,
+}
+
+/// Coalesced feed of one node's freshly signed advertisement renewals.
+pub struct AdvertisementWatcher {
+    records: watch::Receiver<SignedAdvertisement>,
+    initial: bool,
 }
 
 /// Receiver for authenticated streams addressed to one application protocol.
@@ -143,6 +161,71 @@ pub struct PeerStream {
     _connection: iroh::endpoint::Connection,
     send: iroh::endpoint::SendStream,
     recv: iroh::endpoint::RecvStream,
+}
+
+/// Bounded opaque evidence presented to an application's hub authorization policy.
+///
+/// The networking crate never interprets this value. Applications can carry a
+/// Biscuit, a short-lived grant derived from OIDC enrollment, or another
+/// protocol-specific capability. Debug output always redacts its contents.
+#[derive(Clone, Default, Eq, PartialEq)]
+pub struct SessionCredential(Vec<u8>);
+
+/// Authenticated facts available to an application's session authorization policy.
+#[derive(Clone)]
+pub struct SessionAuthorization {
+    requester: iroh::EndpointId,
+    provider: iroh::EndpointId,
+    protocol: ProtocolId,
+    credential: SessionCredential,
+}
+
+/// One application-owned authorization decision for a peer session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionDecision {
+    /// Issue the short-lived requester/provider/protocol-bound session grant.
+    Allow,
+    /// Reject the request without disclosing policy details to the requester.
+    Deny,
+}
+
+/// Application policy evaluated by the hub before each bilateral session grant.
+///
+/// The request contains authenticated endpoint identities, the requested
+/// protocol, and caller-supplied opaque evidence. Returning a future keeps
+/// policy engines free to consult application state; the network bounds the
+/// evaluation with its authentication timeout.
+pub trait SessionAuthorizer: Send + Sync + 'static {
+    /// Evaluates one authenticated session request.
+    fn authorize<'a>(
+        &'a self,
+        request: SessionAuthorization,
+    ) -> Pin<Box<dyn Future<Output = SessionDecision> + Send + 'a>>;
+}
+
+impl<F, Fut> SessionAuthorizer for F
+where
+    F: Fn(SessionAuthorization) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = SessionDecision> + Send + 'static,
+{
+    fn authorize<'a>(
+        &'a self,
+        request: SessionAuthorization,
+    ) -> Pin<Box<dyn Future<Output = SessionDecision> + Send + 'a>> {
+        Box::pin((self)(request))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AllowAllSessions;
+
+impl SessionAuthorizer for AllowAllSessions {
+    fn authorize<'a>(
+        &'a self,
+        _request: SessionAuthorization,
+    ) -> Pin<Box<dyn Future<Output = SessionDecision> + Send + 'a>> {
+        Box::pin(async { SessionDecision::Allow })
+    }
 }
 
 /// Optional bounded adapter between loopback TCP and network streams.
@@ -196,6 +279,9 @@ pub enum NetworkError {
     /// An application protocol name is empty, too long, or contains unsupported bytes.
     #[error("invalid network protocol: {0}")]
     InvalidProtocol(String),
+    /// Session authorization evidence exceeds the bounded control-plane payload.
+    #[error("invalid network session credential: {0}")]
+    InvalidSessionCredential(String),
     /// A capability advertisement is malformed, stale, oversized, or has an invalid signature.
     #[error("invalid network advertisement: {0}")]
     InvalidAdvertisement(String),
@@ -298,9 +384,11 @@ enum ControlMessage {
 }
 
 #[derive(Serialize, Deserialize)]
-struct SessionRequest {
+#[serde(deny_unknown_fields)]
+struct WireSessionRequest {
     provider: iroh::EndpointId,
     protocol: String,
+    credential: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -331,6 +419,7 @@ enum SessionOpenResponse {
 #[derive(Clone)]
 struct HubProtocol {
     token: [u8; TOKEN_BYTES],
+    session_authorizer: Arc<dyn SessionAuthorizer>,
     streams: Arc<Semaphore>,
     nodes: Arc<NodeRegistry>,
 }
@@ -356,6 +445,79 @@ impl fmt::Debug for NodeProtocol {
         formatter
             .debug_struct("NodeProtocol")
             .finish_non_exhaustive()
+    }
+}
+
+impl SessionCredential {
+    /// Creates bounded opaque authorization evidence for one session request.
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Result<Self, NetworkError> {
+        let bytes = bytes.into();
+        if bytes.len() > MAX_SESSION_CREDENTIAL_BYTES {
+            return Err(NetworkError::InvalidSessionCredential(format!(
+                "credential exceeds {MAX_SESSION_CREDENTIAL_BYTES} bytes"
+            )));
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Creates an empty credential for policies based only on authenticated identities.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self(Vec::new())
+    }
+
+    /// Returns the opaque bytes for application-owned verification.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SessionCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionCredential")
+            .field("bytes", &"<redacted>")
+            .field("len", &self.0.len())
+            .finish()
+    }
+}
+
+impl SessionAuthorization {
+    /// Returns the authenticated node requesting a session.
+    #[must_use]
+    pub const fn requester_id(&self) -> iroh::EndpointId {
+        self.requester
+    }
+
+    /// Returns the authenticated provider the requester wants to reach.
+    #[must_use]
+    pub const fn provider_id(&self) -> iroh::EndpointId {
+        self.provider
+    }
+
+    /// Returns the requested application protocol.
+    #[must_use]
+    pub const fn protocol(&self) -> &ProtocolId {
+        &self.protocol
+    }
+
+    /// Returns the caller-supplied opaque authorization evidence.
+    #[must_use]
+    pub const fn credential(&self) -> &SessionCredential {
+        &self.credential
+    }
+}
+
+impl fmt::Debug for SessionAuthorization {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionAuthorization")
+            .field("requester", &self.requester)
+            .field("provider", &self.provider)
+            .field("protocol", &self.protocol)
+            .field("credential", &self.credential)
+            .finish()
     }
 }
 
@@ -738,6 +900,23 @@ impl FromStr for TcpBridgeTicket {
 }
 
 impl Hub {
+    /// Starts configuring a hub around one bound identity-matched endpoint.
+    ///
+    /// The default session policy allows every joined member. Install an
+    /// application policy with [`HubBuilder::session_authorizer`] when protocol
+    /// access requires identity allowlists, Biscuits, or other credentials.
+    pub fn builder(
+        identity: &JoinAuthority,
+        endpoint: Endpoint,
+    ) -> Result<HubBuilder, NetworkError> {
+        require_endpoint_identity(&endpoint, identity.endpoint_id())?;
+        Ok(HubBuilder {
+            endpoint,
+            token: identity.token,
+            session_authorizer: Arc::new(AllowAllSessions),
+        })
+    }
+
     /// Starts an internet-capable Iroh endpoint with a durable identity.
     ///
     /// This convenience path uses Iroh's `N0` preset and waits for a public
@@ -771,18 +950,27 @@ impl Hub {
         identity: &JoinAuthority,
         endpoint: Endpoint,
     ) -> Result<(Self, JoinTicket), NetworkError> {
-        require_endpoint_identity(&endpoint, identity.endpoint_id())?;
-        Self::spawn_with_token(endpoint, identity.token).await
+        Self::builder(identity, endpoint)?.spawn().await
     }
 
+    #[cfg(test)]
     async fn spawn_with_token(
         endpoint: Endpoint,
         token: [u8; TOKEN_BYTES],
+    ) -> Result<(Self, JoinTicket), NetworkError> {
+        Self::spawn_with_authorizer(endpoint, token, Arc::new(AllowAllSessions)).await
+    }
+
+    async fn spawn_with_authorizer(
+        endpoint: Endpoint,
+        token: [u8; TOKEN_BYTES],
+        session_authorizer: Arc<dyn SessionAuthorizer>,
     ) -> Result<(Self, JoinTicket), NetworkError> {
         let nodes = Arc::new(NodeRegistry::default());
         let protocol = HubProtocol {
             streams: Arc::new(Semaphore::new(MAX_CONCURRENT_STREAMS)),
             token,
+            session_authorizer,
             nodes: nodes.clone(),
         };
         let token = protocol.token;
@@ -843,6 +1031,42 @@ impl Hub {
             .shutdown()
             .await
             .map_err(|error| NetworkError::Endpoint(error.to_string()))
+    }
+}
+
+impl HubBuilder {
+    /// Installs the application policy evaluated before every session grant.
+    #[must_use]
+    pub fn session_authorizer(mut self, authorizer: impl SessionAuthorizer) -> Self {
+        self.session_authorizer = Arc::new(authorizer);
+        self
+    }
+
+    /// Installs an authorization closure with inferred request and future types.
+    #[must_use]
+    pub fn session_authorizer_fn<F, Fut>(mut self, authorizer: F) -> Self
+    where
+        F: Fn(SessionAuthorization) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = SessionDecision> + Send + 'static,
+    {
+        self.session_authorizer = Arc::new(authorizer);
+        self
+    }
+
+    /// Starts the hub with the selected endpoint and authorization policy.
+    pub async fn spawn(self) -> Result<(Hub, JoinTicket), NetworkError> {
+        Hub::spawn_with_authorizer(self.endpoint, self.token, self.session_authorizer).await
+    }
+}
+
+impl fmt::Debug for HubBuilder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HubBuilder")
+            .field("endpoint_id", &self.endpoint.id())
+            .field("token", &"<redacted>")
+            .field("session_authorizer", &"<application policy>")
+            .finish()
     }
 }
 
@@ -961,10 +1185,25 @@ impl Node {
         peer: iroh::EndpointId,
         protocol: &ProtocolId,
     ) -> Result<PeerStream, NetworkError> {
+        self.connect_with_credential(peer, protocol, SessionCredential::none())
+            .await
+    }
+
+    /// Opens an authenticated stream while presenting application-owned evidence.
+    ///
+    /// The credential is encrypted to the hub and evaluated by its
+    /// [`SessionAuthorizer`]. It is not forwarded to the provider or retained
+    /// by the networking crate.
+    pub async fn connect_with_credential(
+        &self,
+        peer: iroh::EndpointId,
+        protocol: &ProtocolId,
+        credential: SessionCredential,
+    ) -> Result<PeerStream, NetworkError> {
         if peer == self.endpoint_id() {
             return Err(NetworkError::SameNode);
         }
-        self.dialer.connect_peer(peer, protocol).await
+        self.dialer.connect_peer(peer, protocol, &credential).await
     }
 
     /// Publishes and automatically renews one signed capability advertisement.
@@ -978,6 +1217,7 @@ impl Node {
     ) -> Result<AdvertisementLease, NetworkError> {
         let record = SignedAdvertisement::sign(advertisement, self.router.endpoint().secret_key())?;
         self.discovery.publisher().publish(record.clone()).await?;
+        let (records, record_updates) = watch::channel(record.clone());
         let node_id = record.node_id();
         let revision = record.advertisement().revision();
         let renewal_delay =
@@ -998,15 +1238,17 @@ impl Node {
                         break;
                     }
                 };
-                if let Err(error) = publisher.publish(record).await {
+                if let Err(error) = publisher.publish(record.clone()).await {
                     tracing::warn!(%error, "network advertisement renewal stopped");
                     break;
                 }
+                records.send_replace(record);
             }
         }));
         Ok(AdvertisementLease {
             node_id,
             revision,
+            records: record_updates,
             _renewal_task: renewal_task,
         })
     }
@@ -1057,6 +1299,24 @@ impl AdvertisementLease {
     pub const fn revision(&self) -> u64 {
         self.revision
     }
+
+    /// Returns the most recently signed record for immediate mirroring.
+    #[must_use]
+    pub fn latest(&self) -> SignedAdvertisement {
+        self.records.borrow().clone()
+    }
+
+    /// Subscribes to the initial record and coalesced future renewals.
+    ///
+    /// A DHT, control-plane, or cache adapter can forward each returned signed
+    /// record without receiving access to this node's private identity.
+    #[must_use]
+    pub fn subscribe(&self) -> AdvertisementWatcher {
+        AdvertisementWatcher {
+            records: self.records.clone(),
+            initial: true,
+        }
+    }
 }
 
 impl fmt::Debug for AdvertisementLease {
@@ -1065,6 +1325,26 @@ impl fmt::Debug for AdvertisementLease {
             .debug_struct("AdvertisementLease")
             .field("node_id", &self.node_id)
             .field("revision", &self.revision)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AdvertisementWatcher {
+    /// Returns the current signed record first, then each latest renewal.
+    pub async fn next(&mut self) -> Option<SignedAdvertisement> {
+        if self.initial {
+            self.initial = false;
+            return Some(self.records.borrow().clone());
+        }
+        self.records.changed().await.ok()?;
+        Some(self.records.borrow().clone())
+    }
+}
+
+impl fmt::Debug for AdvertisementWatcher {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AdvertisementWatcher")
             .finish_non_exhaustive()
     }
 }
@@ -1197,6 +1477,20 @@ impl TcpBridge {
         provider: iroh::EndpointId,
         listener: TcpListener,
     ) -> Result<(), NetworkError> {
+        Self::connect_with_credential(node, provider, listener, SessionCredential::none()).await
+    }
+
+    /// Forwards loopback TCP while authorizing every peer session with one credential.
+    ///
+    /// This is the low-level seam used by an application-owned MCP or internet
+    /// egress gateway. The credential is re-presented for each independently
+    /// authorized downstream session.
+    pub async fn connect_with_credential(
+        node: &Node,
+        provider: iroh::EndpointId,
+        listener: TcpListener,
+        credential: SessionCredential,
+    ) -> Result<(), NetworkError> {
         require_loopback(listener.local_addr()?)?;
         let protocol = ProtocolId::new(TCP_BRIDGE_PROTOCOL)?;
         let mut connections = JoinSet::new();
@@ -1206,8 +1500,9 @@ impl TcpBridge {
                     let (stream, peer) = accepted?;
                     let node = node.dialer.clone();
                     let protocol = protocol.clone();
+                    let credential = credential.clone();
                     connections.spawn(async move {
-                        if let Err(error) = forward_downstream(node, provider, protocol, stream).await {
+                        if let Err(error) = forward_downstream(node, provider, protocol, credential, stream).await {
                             tracing::warn!(%peer, %error, "network TCP bridge downstream closed");
                         }
                     });
@@ -1226,9 +1521,10 @@ async fn forward_downstream(
     node: HubDialer,
     provider: iroh::EndpointId,
     protocol: ProtocolId,
+    credential: SessionCredential,
     mut stream: TcpStream,
 ) -> Result<(), NetworkError> {
-    let mut session = node.connect_peer(provider, &protocol).await?;
+    let mut session = node.connect_peer(provider, &protocol, &credential).await?;
     tokio::io::copy_bidirectional(&mut stream, &mut session).await?;
     Ok(())
 }
@@ -1317,20 +1613,22 @@ impl HubDialer {
         &self,
         provider: iroh::EndpointId,
         protocol: &ProtocolId,
+        credential: &SessionCredential,
     ) -> Result<(EndpointAddr, [u8; TOKEN_BYTES]), NetworkError> {
         let (mut send, mut recv) = self.open_bi().await?;
         write_stream_prefix(&mut send, &self.ticket.token, STREAM_SESSION_REQUEST).await?;
         write_frame(
             &mut send,
-            &SessionRequest {
+            &WireSessionRequest {
                 provider,
                 protocol: protocol.to_string(),
+                credential: credential.as_bytes().to_vec(),
             },
         )
         .await?;
         send.finish()
             .map_err(|error| NetworkError::Protocol(error.to_string()))?;
-        match tokio::time::timeout(AUTH_TIMEOUT, read_frame(&mut recv))
+        match tokio::time::timeout(SESSION_GRANT_TIMEOUT, read_frame(&mut recv))
             .await
             .map_err(|_| NetworkError::Protocol("hub session grant timed out".to_owned()))??
         {
@@ -1345,8 +1643,9 @@ impl HubDialer {
         &self,
         peer: iroh::EndpointId,
         protocol: &ProtocolId,
+        credential: &SessionCredential,
     ) -> Result<PeerStream, NetworkError> {
-        let (address, token) = self.request_session(peer, protocol).await?;
+        let (address, token) = self.request_session(peer, protocol, credential).await?;
         let connection = self
             .endpoint
             .connect(address, NODE_ALPN)
@@ -1499,9 +1798,14 @@ impl HubProtocol {
         let kind = read_stream_kind(&mut recv, &self.token).await?;
         match kind {
             STREAM_SESSION_REQUEST => {
-                let SessionRequest { provider, protocol } = read_frame(&mut recv).await?;
+                let WireSessionRequest {
+                    provider,
+                    protocol,
+                    credential,
+                } = read_frame(&mut recv).await?;
+                let credential = SessionCredential::new(credential)?;
                 let response = self
-                    .grant_session(requester, provider, ProtocolId::new(protocol)?)
+                    .grant_session(requester, provider, ProtocolId::new(protocol)?, credential)
                     .await;
                 write_frame(&mut send, &response).await?;
             }
@@ -1521,6 +1825,7 @@ impl HubProtocol {
         requester: iroh::EndpointId,
         provider: iroh::EndpointId,
         protocol: ProtocolId,
+        credential: SessionCredential,
     ) -> SessionGrant {
         if requester == provider {
             return SessionGrant::Rejected {
@@ -1541,6 +1846,32 @@ impl HubProtocol {
             };
             provider_peer
         };
+        let authorization = SessionAuthorization {
+            requester,
+            provider,
+            protocol: protocol.clone(),
+            credential,
+        };
+        match tokio::time::timeout(
+            SESSION_POLICY_TIMEOUT,
+            self.session_authorizer.authorize(authorization),
+        )
+        .await
+        {
+            Ok(SessionDecision::Allow) => {}
+            Ok(SessionDecision::Deny) => {
+                tracing::info!(%requester, %provider, %protocol, "application policy denied peer session");
+                return SessionGrant::Rejected {
+                    message: "application policy denied the peer session".to_owned(),
+                };
+            }
+            Err(_) => {
+                tracing::warn!(%requester, %provider, %protocol, "application session policy timed out");
+                return SessionGrant::Rejected {
+                    message: "application session policy timed out".to_owned(),
+                };
+            }
+        }
         let token = match random_bytes::<TOKEN_BYTES>() {
             Ok(token) => token,
             Err(error) => {
@@ -2110,6 +2441,26 @@ mod tests {
         Hub::from_endpoint(&identity, endpoint).await
     }
 
+    async fn bind_test_hub_with_authorizer<F, Fut>(
+        endpoint: Endpoint,
+        authorizer: F,
+    ) -> Result<(Hub, JoinTicket), NetworkError>
+    where
+        F: Fn(SessionAuthorization) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = SessionDecision> + Send + 'static,
+    {
+        let mut token = [0_u8; TOKEN_BYTES];
+        getrandom::fill(&mut token).map_err(|error| NetworkError::Endpoint(error.to_string()))?;
+        let identity = JoinAuthority {
+            secret_key: endpoint.secret_key().clone(),
+            token,
+        };
+        Hub::builder(&identity, endpoint)?
+            .session_authorizer_fn(authorizer)
+            .spawn()
+            .await
+    }
+
     async fn join_test_node(ticket: JoinTicket, endpoint: Endpoint) -> Result<Node, NetworkError> {
         let identity = NodeIdentity {
             secret_key: endpoint.secret_key().clone(),
@@ -2526,6 +2877,17 @@ mod tests {
     }
 
     #[test]
+    fn session_credentials_are_bounded_and_redacted() {
+        let credential = SessionCredential::new(b"private-biscuit".to_vec()).unwrap();
+        assert_eq!(credential.as_bytes(), b"private-biscuit");
+        assert!(!format!("{credential:?}").contains("private-biscuit"));
+        assert!(matches!(
+            SessionCredential::new(vec![0; MAX_SESSION_CREDENTIAL_BYTES + 1]),
+            Err(NetworkError::InvalidSessionCredential(_))
+        ));
+    }
+
+    #[test]
     fn forwarding_accepts_only_loopback_tcp_addresses() {
         assert!(require_loopback("127.0.0.1:8789".parse().unwrap()).is_ok());
         assert!(require_loopback("[::1]:8789".parse().unwrap()).is_ok());
@@ -2606,6 +2968,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hub_authorizes_each_protocol_session_with_opaque_evidence() {
+        let _test_permit = TEST_ENDPOINT_PERMIT.acquire().await.unwrap();
+        let provider_identity = NodeIdentity::generate().unwrap();
+        let provider_id = provider_identity.endpoint_id();
+        let requester_identity = NodeIdentity::generate().unwrap();
+        let requester_id = requester_identity.endpoint_id();
+        let protocol = ProtocolId::new("nanocodex/egress/1").unwrap();
+        let expected_protocol = protocol.clone();
+        let decisions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = decisions.clone();
+
+        let hub_endpoint = Endpoint::builder(presets::Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let (hub, ticket) = bind_test_hub_with_authorizer(hub_endpoint, move |request| {
+            let expected_protocol = expected_protocol.clone();
+            let observed = observed.clone();
+            async move {
+                let decision = if request.protocol() == &expected_protocol
+                    && request.credential().as_bytes() == b"biscuit:internet-egress"
+                {
+                    SessionDecision::Allow
+                } else {
+                    SessionDecision::Deny
+                };
+                observed.lock().unwrap().push(request);
+                decision
+            }
+        })
+        .await
+        .unwrap();
+
+        let provider_endpoint = provider_identity
+            .endpoint_builder(presets::Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let provider = Node::from_endpoint(ticket.clone(), &provider_identity, provider_endpoint)
+            .await
+            .unwrap();
+        let mut listener = provider.listen(protocol.clone()).await.unwrap();
+
+        let requester_endpoint = requester_identity
+            .endpoint_builder(presets::Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let requester = Node::from_endpoint(ticket, &requester_identity, requester_endpoint)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            requester.connect(provider_id, &protocol).await,
+            Err(NetworkError::Protocol(message))
+                if message.contains("application policy denied")
+        ));
+        let credential = SessionCredential::new(b"biscuit:internet-egress".to_vec()).unwrap();
+        let outgoing = requester
+            .connect_with_credential(provider_id, &protocol, credential)
+            .await
+            .unwrap();
+        let incoming = listener.accept().await.unwrap();
+        assert_eq!(outgoing.peer_id(), provider_id);
+        assert_eq!(incoming.peer_id(), requester_id);
+
+        {
+            let decisions = decisions.lock().unwrap();
+            assert_eq!(decisions.len(), 2);
+            for request in decisions.iter() {
+                assert_eq!(request.requester_id(), requester_id);
+                assert_eq!(request.provider_id(), provider_id);
+                assert_eq!(request.protocol(), &protocol);
+            }
+            assert!(decisions[0].credential().as_bytes().is_empty());
+            assert_eq!(
+                decisions[1].credential().as_bytes(),
+                b"biscuit:internet-egress"
+            );
+        }
+
+        drop(outgoing);
+        drop(incoming);
+        drop(listener);
+        requester.shutdown().await.unwrap();
+        provider.shutdown().await.unwrap();
+        hub.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn nodes_exchange_application_bytes_over_protocol_bound_sessions() {
         const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -2665,7 +3129,7 @@ mod tests {
 
         let (address, token) = first
             .dialer
-            .request_session(second_id, &protocol)
+            .request_session(second_id, &protocol, &SessionCredential::none())
             .await
             .unwrap();
         let wrong_protocol = ProtocolId::new("nanocodex/wrong-protocol/1").unwrap();
@@ -2825,6 +3289,19 @@ mod tests {
             .unwrap();
         assert_eq!(first_lease.node_id(), worker_id);
         assert_eq!(first_lease.revision(), 1);
+        let initial_record = first_lease.latest();
+        let mut exported_records = first_lease.subscribe();
+        assert_eq!(exported_records.next().await, Some(initial_record.clone()));
+        let renewed_record = tokio::time::timeout(LEASE, exported_records.next())
+            .await
+            .expect("advertisement export did not observe a renewal")
+            .expect("advertisement export closed before renewal");
+        assert_eq!(renewed_record.node_id(), worker_id);
+        assert_eq!(renewed_record.advertisement().revision(), 1);
+        assert!(
+            renewed_record.expires_at_unix_millis() > initial_record.expires_at_unix_millis(),
+            "external discovery sources need each freshly signed lease"
+        );
         assert!(matches!(
             change(&mut first_view).await,
             PeerChange::Joined(record)

@@ -124,6 +124,86 @@ take deterministic filtered snapshots. Address lookup remains an independent
 Iroh endpoint concern, so discovering a service and finding candidate network
 paths do not collapse into one trust boundary.
 
+The publication side is composable too. `AdvertisementLease::latest` returns
+the current signed record and `AdvertisementLease::subscribe` yields that
+record followed by freshly signed renewals. An application can mirror those
+opaque records into Kademlia, an operational control plane, or a retained cache
+without receiving the node's private key. All consumers later feed the same
+record shape back through `PeerCatalog::ingest`:
+
+```rust,no_run
+# async fn mirror(
+#     lease: &nanocodex_network::AdvertisementLease,
+#     catalog: &nanocodex_network::PeerCatalog,
+# ) -> Result<(), nanocodex_network::NetworkError> {
+let mut signed_records = lease.subscribe();
+while let Some(record) = signed_records.next().await {
+    // A real adapter would put `record` in a DHT or control plane here.
+    catalog.ingest(record).await?;
+}
+# Ok(())
+# }
+```
+
+Protocol access has an independent application-policy seam. `Hub::builder`
+defaults to the existing allow-all behavior, but an application can install an
+async `SessionAuthorizer`. Every decision receives authenticated requester and
+provider identities, the bounded `ProtocolId`, and a bounded opaque
+`SessionCredential`. `Node::connect_with_credential` encrypts that credential
+to the hub; the network never forwards it to the provider, logs it, interprets
+it, or retains it. Policy evaluation is bounded by the normal authentication
+timeout and denials reveal no engine details to the requester.
+
+```rust,no_run
+use nanocodex_network::{
+    Hub, JoinAuthority, SessionCredential, SessionDecision,
+};
+
+# async fn example(
+#     authority: &JoinAuthority,
+#     endpoint: iroh::Endpoint,
+#     node: &nanocodex_network::Node,
+#     gateway: iroh::EndpointId,
+#     egress: nanocodex_network::ProtocolId,
+# ) -> Result<(), nanocodex_network::NetworkError> {
+let (_hub, _ticket) = Hub::builder(authority, endpoint)?
+    .session_authorizer_fn(|request| async move {
+        if request.protocol().as_str() == "nanocodex/egress/1"
+            && request.credential().as_bytes() == b"example-offline-biscuit"
+        {
+            SessionDecision::Allow
+        } else {
+            SessionDecision::Deny
+        }
+    })
+    .spawn()
+    .await?;
+
+let biscuit = SessionCredential::new(b"example-offline-biscuit".to_vec())?;
+let stream = node
+    .connect_with_credential(gateway, &egress, biscuit)
+    .await?;
+# drop(stream);
+# Ok(())
+# }
+```
+
+This is the intended OIDC/Biscuit split: an application performs OIDC
+enrollment while it has an identity-provider path, issues a short-lived
+protocol-scoped Biscuit or equivalent grant, and verifies that credential in
+the hub policy. Verification can remain fully offline on the LAN. The same
+policy can authorize `nanocodex/mcp/1`, `nanocodex/egress/1`, worker, or
+control protocols without making Biscuit, OIDC, MCP, HTTP, or proxy semantics a
+network dependency.
+
+For peer-provided internet access, an online peer advertises an application
+egress protocol. An offline peer discovers it from any merged source, presents
+its scoped credential, and opens an authenticated `PeerStream`; the consuming
+application terminates that stream into `nanocodex-egress` or another bounded
+gateway. The network library supplies identity, discovery, authorization, and
+the byte stream—not a transparent system-wide proxy or an ambient right to use
+another peer's WAN connection.
+
 The executable example runs a hub, an advertising worker, and a late-joining
 client. The client discovers the worker through gossip and then exchanges
 `ping`/`pong` over a direct peer stream:
@@ -165,10 +245,11 @@ The crate does not rank candidates, schedule tasks, define resource semantics,
 supervise workers, validate TEE claims, or own application framing. Those
 contracts stay in consuming applications. Discovery queries only filter the
 node's merged local authenticated catalog. The current shared join capability
-is also the gossip-topic capability: it is intentionally simple bearer
-admission, not individually revocable worker credentials. OIDC enrollment,
-Biscuit authorization, MCP aggregation, and peer-provided egress can consume
-this library without becoming transport requirements.
+is also the gossip-topic capability: it remains simple bootstrap admission and
+is not individually revocable. Per-session authorization protects application
+protocols independently; rotating or replacing cluster bootstrap admission is
+a separate future boundary. OIDC enrollment, Biscuit verification, MCP
+aggregation, operational policy, and peer-provided egress stay in consumers.
 
 The CLI keeps the same boundary:
 
