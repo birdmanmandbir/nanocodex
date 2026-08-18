@@ -1,3 +1,5 @@
+mod auth;
+
 use std::{
     collections::{BTreeMap, VecDeque},
     fmt,
@@ -29,6 +31,8 @@ use tokio::{
     task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
+
+use self::auth::load_codex_auth;
 
 const AGENT_PROTOCOL: &str = "nanocodex.lan-party.agent/1";
 const AGENT_NAME_ATTRIBUTE: &str = "party.agent.name";
@@ -358,9 +362,13 @@ async fn join(ticket: PartyTicket, state: &Path, name: String) -> Result<()> {
 }
 
 fn build_agent(name: &str) -> Result<Nanocodex> {
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .wrap_err("OPENAI_API_KEY is required on every laptop providing an agent")?;
-    let openai = OpenAi::new(api_key)?;
+    let openai = match std::env::var("OPENAI_API_KEY") {
+        Ok(api_key) if !api_key.trim().is_empty() => OpenAi::new(api_key)?,
+        Ok(_) | Err(std::env::VarError::NotPresent) => OpenAi::new(load_codex_auth()?)?,
+        Err(error @ std::env::VarError::NotUnicode(_)) => {
+            return Err(error).wrap_err("OPENAI_API_KEY is not valid Unicode");
+        }
+    };
     let tools = Tools::builder().without_defaults().build()?;
     let (agent, events) = Nanocodex::builder(openai)
         .thinking(Thinking::Low)

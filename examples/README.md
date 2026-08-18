@@ -89,8 +89,10 @@ laptop owns one retained Nanocodex session and streams only assistant-facing
 events back to the host; raw OpenAI events and local state are not shared. A
 bounded transcript of completed answers is included as collaboration context
 in the next round, so agents can compare and build on their peers' prior work.
-`OPENAI_API_KEY` is required on joining laptops because inference still uses
-OpenAI over WAN, while discovery and agent traffic stay entirely on the LAN.
+Joining agents prefer `OPENAI_API_KEY` when set and otherwise use the shared
+Codex credential selected by `NANOCODEX_AUTH_FILE` or `CODEX_HOME`. Inference
+still uses OpenAI over WAN, while discovery and agent traffic stay entirely on
+the LAN.
 
 `vm-tools` does not call the model. It proves all VM-backed standard workspace
 tools against one retained guest and accepts either a directory root containing

@@ -114,6 +114,10 @@ cargo run -p nanocodex-examples --bin lan-party -- \
   join "$PARTY_TICKET" ./.party-alice alice
 ```
 
+Each joining machine prefers `OPENAI_API_KEY` when set and otherwise uses its
+existing Codex login. Only inference uses WAN; discovery and peer streams do
+not.
+
 `nanocodex-eval` is not part of this crate's runtime graph. The Nanocodex CLI is
 the current composition root. `TcpBridge` is an optional adapter that publishes
 one fixed loopback service from a provider node and exposes it on another joined
