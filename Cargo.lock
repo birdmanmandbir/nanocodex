@@ -6110,7 +6110,7 @@ dependencies = [
 name = "nanocodex-examples"
 version = "0.5.0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "dotenvy",
  "eyre",
  "futures-util",
