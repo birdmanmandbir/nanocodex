@@ -91,7 +91,10 @@ bounded transcript of completed answers is included as collaboration context
 in the next round, so agents can compare and build on their peers' prior work.
 The host terminal labels every outbound prompt and inbound stream, while each
 agent terminal prints the exact expanded prompt it receives and the assistant
-stream it sends back.
+stream it sends back. Its invitation ticket carries bounded application
+evidence: the hub admits only host-originated agent sessions, each agent checks
+the host locally, and the host verifies the agent's attestation before sending
+prompt bytes.
 Joining agents prefer `OPENAI_API_KEY` when set and otherwise use the shared
 Codex credential selected by `NANOCODEX_AUTH_FILE` or `CODEX_HOME`. Inference
 still uses OpenAI over WAN, while discovery and agent traffic stay entirely on

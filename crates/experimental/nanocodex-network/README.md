@@ -145,18 +145,26 @@ while let Some(record) = signed_records.next().await {
 # }
 ```
 
-Protocol access has an independent application-policy seam. `Hub::builder`
-defaults to the existing allow-all behavior, but an application can install an
-async `SessionAuthorizer`. Every decision receives authenticated requester and
-provider identities, the bounded `ProtocolId`, and a bounded opaque
-`SessionCredential`. `Node::connect_with_credential` encrypts that credential
-to the hub; the network never forwards it to the provider, logs it, interprets
-it, or retains it. Policy evaluation is bounded by the normal authentication
-timeout and denials reveal no engine details to the requester.
+Protocol access has three independent application-policy seams. `Hub::builder`
+can authorize routing, a provider's `NodeBuilder` can independently authorize
+the incoming peer, and a caller's `NodeBuilder` can verify the provider's
+attestation before receiving a usable stream. Every decision receives
+authenticated requester and provider identities, the bounded `ProtocolId`, and
+boundary-specific bounded opaque evidence. Policies default to allow-all for
+compatibility, are time-bounded, and do not leak engine details in denials.
+
+`Node::connect_with_credential` preserves the authority-only path: its evidence
+is encrypted to the hub and never forwarded to the provider. Bilateral callers
+use `Node::connect_with_credentials` and a `SessionCredentials` value containing
+separate authority and end-to-end peer evidence. After provider-local policy
+allows the request, the provider returns evidence from its `peer_attestor`; the
+caller's `peer_verifier` must allow that evidence before application bytes can
+flow through the returned `PeerStream`. The network never logs, interprets, or
+persists any of these opaque values.
 
 ```rust,no_run
 use nanocodex_network::{
-    Hub, JoinAuthority, SessionCredential, SessionDecision,
+    Hub, JoinAuthority, SessionCredential, SessionCredentials, SessionDecision,
 };
 
 # async fn example(
@@ -180,21 +188,29 @@ let (_hub, _ticket) = Hub::builder(authority, endpoint)?
     .await?;
 
 let biscuit = SessionCredential::new(b"example-offline-biscuit".to_vec())?;
+let credentials = SessionCredentials::shared(biscuit);
 let stream = node
-    .connect_with_credential(gateway, &egress, biscuit)
+    .connect_with_credentials(gateway, &egress, credentials)
     .await?;
 # drop(stream);
 # Ok(())
 # }
 ```
 
-This is the intended OIDC/Biscuit split: an application performs OIDC
-enrollment while it has an identity-provider path, issues a short-lived
-protocol-scoped Biscuit or equivalent grant, and verifies that credential in
-the hub policy. Verification can remain fully offline on the LAN. The same
-policy can authorize `nanocodex/mcp/1`, `nanocodex/egress/1`, worker, or
-control protocols without making Biscuit, OIDC, MCP, HTTP, or proxy semantics a
-network dependency.
+The provider configures its local side with
+`NodeBuilder::incoming_session_authorizer` and either a fixed
+`peer_attestation` or asynchronous `peer_attestor`; the caller uses
+`NodeBuilder::peer_verifier`. This is the intended OIDC/Biscuit split: an
+application performs OIDC enrollment while it has an identity-provider path,
+issues short-lived endpoint- and protocol-scoped Biscuits, and evaluates them
+at all required boundaries. The async attestor can read refreshed or revoked
+credential state for every session without restarting the node. A provider can
+enforce local sovereignty after hub policy allows a route, while a caller can
+verify control-plane-attested provider claims before sending an MCP request,
+prompt, or egress payload. Verification can remain fully offline on the LAN.
+The same seams can authorize
+`nanocodex/mcp/1`, `nanocodex/egress/1`, worker, or control protocols without
+making Biscuit, OIDC, MCP, HTTP, or proxy semantics a network dependency.
 
 For peer-provided internet access, an online peer advertises an application
 egress protocol. An offline peer discovers it from any merged source, presents
@@ -229,10 +245,13 @@ cargo run -p nanocodex-examples --bin lan-party -- \
   join "$PARTY_TICKET" ./.party-alice alice
 ```
 
-Each joining machine prefers `OPENAI_API_KEY` when set and otherwise uses its
-existing Codex login. Only inference uses WAN; discovery and peer streams do
-not. The host labels outbound prompts and inbound streams, and every agent
-terminal shows its received prompt and streamed reply.
+The party ticket also carries a bounded application credential. The hub allows
+only host-originated agent sessions, every agent independently verifies the host
+identity and credential, and the host verifies each agent's attestation before
+sending a prompt. Each joining machine prefers `OPENAI_API_KEY` when set and
+otherwise uses its existing Codex login. Only inference uses WAN; discovery and
+peer streams do not. The host labels outbound prompts and inbound streams, and
+every agent terminal shows its received prompt and streamed reply.
 
 `nanocodex-eval` is not part of this crate's runtime graph. The Nanocodex CLI is
 the current composition root. `TcpBridge` is an optional adapter that publishes

@@ -15,6 +15,7 @@ base64.workspace = true
 dotenvy.workspace = true
 eyre.workspace = true
 futures-util.workspace = true
+getrandom.workspace = true
 http.workspace = true
 iroh.workspace = true
 nanocodex = { workspace = true, features = ["realtime"] }

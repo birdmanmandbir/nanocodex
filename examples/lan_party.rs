@@ -22,7 +22,8 @@ use nanocodex::{
 };
 use nanocodex_network::{
     CapabilityValue, Hub, JoinAuthority, JoinTicket, Node, NodeAdvertisement, NodeIdentity,
-    PeerChange, PeerStream, ProtocolId, Query, SignedAdvertisement,
+    PeerChange, PeerStream, ProtocolId, Query, SessionCredential, SessionCredentials,
+    SessionDecision, SignedAdvertisement,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::{
@@ -40,7 +41,7 @@ use self::auth::load_codex_auth;
 const AGENT_PROTOCOL: &str = "nanocodex.lan-party.agent/1";
 const AGENT_NAME_ATTRIBUTE: &str = "party.agent.name";
 const PARTY_TICKET_PREFIX: &str = "nanocodex-party:";
-const PARTY_VERSION: u8 = 1;
+const PARTY_VERSION: u8 = 2;
 const MAX_TICKET_BYTES: usize = 32 * 1024;
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_NAME_BYTES: usize = 96;
@@ -54,6 +55,7 @@ const MAX_AGENT_REQUESTS: usize = 8;
 struct PartyTicket {
     network: JoinTicket,
     host: EndpointId,
+    credential: SessionCredential,
     encoded: String,
 }
 
@@ -63,6 +65,7 @@ struct WirePartyTicket {
     version: u8,
     network: String,
     host: String,
+    credential: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -130,6 +133,7 @@ struct AgentCallFinished {
 struct OutboundAgentCall {
     agent_id: EndpointId,
     agent: String,
+    credentials: SessionCredentials,
     request: AgentRequest,
 }
 
@@ -161,23 +165,57 @@ async fn main() -> Result<()> {
 }
 
 async fn host(state: &Path) -> Result<()> {
+    let identity = NodeIdentity::load_or_create(state.join("host.json"))
+        .wrap_err("failed to load the LAN party host identity")?;
+    let host_id = identity.endpoint_id();
+    let mut credential_bytes = [0_u8; 32];
+    getrandom::fill(&mut credential_bytes)
+        .map_err(|error| eyre!("failed to generate the LAN party credential: {error}"))?;
+    let credential = SessionCredential::new(credential_bytes.to_vec())?;
     let authority = JoinAuthority::load_or_create(state.join("authority.json"))
         .wrap_err("failed to load the LAN party authority")?;
     let hub_endpoint = bind_lan_endpoint(authority.endpoint_builder(presets::Minimal)).await?;
-    let (hub, join_ticket) = Hub::from_endpoint(&authority, hub_endpoint)
+    let expected_credential = credential.clone();
+    let (hub, join_ticket) = Hub::builder(&authority, hub_endpoint)?
+        .session_authorizer_fn(move |request| {
+            let expected_credential = expected_credential.clone();
+            async move {
+                if request.requester_id() == host_id
+                    && request.protocol().as_str() == AGENT_PROTOCOL
+                    && request.credential() == &expected_credential
+                {
+                    SessionDecision::Allow
+                } else {
+                    SessionDecision::Deny
+                }
+            }
+        })
+        .spawn()
         .await
         .wrap_err("failed to bind the LAN-only Iroh hub")?;
-    let identity = NodeIdentity::load_or_create(state.join("host.json"))
-        .wrap_err("failed to load the LAN party host identity")?;
     let host_endpoint = bind_lan_endpoint(identity.endpoint_builder(presets::Minimal)).await?;
+    let expected_attestation = credential.clone();
     let node = Arc::new(
-        Node::from_endpoint(join_ticket.clone(), &identity, host_endpoint)
+        Node::builder(join_ticket.clone(), &identity, host_endpoint)?
+            .peer_verifier_fn(move |request| {
+                let expected_attestation = expected_attestation.clone();
+                async move {
+                    if request.protocol().as_str() == AGENT_PROTOCOL
+                        && request.credential() == &expected_attestation
+                    {
+                        SessionDecision::Allow
+                    } else {
+                        SessionDecision::Deny
+                    }
+                }
+            })
+            .spawn()
             .await
             .wrap_err("failed to join the LAN party host node")?,
     );
     let protocol = ProtocolId::new(AGENT_PROTOCOL)?;
     let mut discovered = node.watch(Query::service(protocol.clone())).await;
-    let party_ticket = PartyTicket::new(join_ticket, node.endpoint_id())?;
+    let party_ticket = PartyTicket::new(join_ticket, node.endpoint_id(), credential)?;
 
     println!("{party_ticket}");
     std::io::stdout()
@@ -241,10 +279,13 @@ async fn host(state: &Path) -> Result<()> {
                     let agent = agent_name.clone();
                     let display_sender = display_sender.clone();
                     let shared_transcript = shared_transcript.clone();
+                    let credentials =
+                        SessionCredentials::shared(party_ticket.credential.clone());
                     calls.spawn(async move {
                         let call = OutboundAgentCall {
                             agent_id,
                             agent,
+                            credentials,
                             request: AgentRequest {
                                 version: PARTY_VERSION,
                                 round,
@@ -307,7 +348,24 @@ async fn join(ticket: PartyTicket, state: &Path, name: String) -> Result<()> {
     let identity = NodeIdentity::load_or_create(state.join("agent.json"))
         .wrap_err("failed to load the LAN party agent identity")?;
     let endpoint = bind_lan_endpoint(identity.endpoint_builder(presets::Minimal)).await?;
-    let node = Node::from_endpoint(ticket.network.clone(), &identity, endpoint)
+    let expected_host = ticket.host;
+    let expected_credential = ticket.credential.clone();
+    let node = Node::builder(ticket.network.clone(), &identity, endpoint)?
+        .incoming_session_authorizer_fn(move |request| {
+            let expected_credential = expected_credential.clone();
+            async move {
+                if request.requester_id() == expected_host
+                    && request.protocol().as_str() == AGENT_PROTOCOL
+                    && request.credential() == &expected_credential
+                {
+                    SessionDecision::Allow
+                } else {
+                    SessionDecision::Deny
+                }
+            }
+        })
+        .peer_attestation(ticket.credential.clone())
+        .spawn()
         .await
         .wrap_err("failed to join the LAN-only Iroh network")?;
     let protocol = ProtocolId::new(AGENT_PROTOCOL)?;
@@ -526,7 +584,7 @@ async fn call_agent(
     display: mpsc::Sender<DisplayEvent>,
 ) -> Result<()> {
     let mut stream = node
-        .connect(call.agent_id, protocol)
+        .connect_with_credentials(call.agent_id, protocol, call.credentials.clone())
         .await
         .wrap_err_with(|| format!("failed to connect to agent {}", call.agent))?;
     write_frame(&mut stream, &call.request).await?;
@@ -706,11 +764,12 @@ fn model_prompt(request: &AgentRequest) -> String {
 }
 
 impl PartyTicket {
-    fn new(network: JoinTicket, host: EndpointId) -> Result<Self> {
+    fn new(network: JoinTicket, host: EndpointId, credential: SessionCredential) -> Result<Self> {
         let payload = serde_json::to_vec(&WirePartyTicket {
             version: PARTY_VERSION,
             network: network.to_string(),
             host: host.to_string(),
+            credential: URL_SAFE_NO_PAD.encode(credential.as_bytes()),
         })?;
         if payload.len() > MAX_TICKET_BYTES {
             bail!("LAN party ticket exceeds {MAX_TICKET_BYTES} bytes");
@@ -719,6 +778,7 @@ impl PartyTicket {
         Ok(Self {
             network,
             host,
+            credential,
             encoded,
         })
     }
@@ -750,7 +810,10 @@ impl FromStr for PartyTicket {
             .host
             .parse()
             .wrap_err("LAN party ticket contains an invalid host identity")?;
-        Self::new(network, host)
+        let credential = URL_SAFE_NO_PAD
+            .decode(wire.credential)
+            .wrap_err("LAN party ticket contains an invalid session credential")?;
+        Self::new(network, host, SessionCredential::new(credential)?)
     }
 }
 
