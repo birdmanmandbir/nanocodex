@@ -29,8 +29,26 @@ export type WebTuiMessage = TuiMessage
   | { type: "mppJsonl"; line: string }
   | { type: "artifact"; artifact: ArtifactDocument };
 
+let prewarmedWorker: Worker | undefined;
+let workerClaimed = false;
+
+function createAgentWorker() {
+  return new Worker(new URL("./agent.worker.ts", import.meta.url), { type: "module" });
+}
+
+export function prewarmNanocodexWorker() {
+  if (workerClaimed) return;
+  prewarmedWorker ??= createAgentWorker();
+  prewarmedWorker.postMessage({ type: "warmup" });
+}
+
 /** Website-owned wiring for the publishable React package. */
 export const nanocodexConfig = createConfig<WebTuiCommand, WebTuiMessage>({
   autoStart: false,
-  worker: () => new Worker(new URL("./agent.worker.ts", import.meta.url), { type: "module" }),
+  worker: () => {
+    workerClaimed = true;
+    const worker = prewarmedWorker ?? createAgentWorker();
+    prewarmedWorker = undefined;
+    return worker;
+  },
 });

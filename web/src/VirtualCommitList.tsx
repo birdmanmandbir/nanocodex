@@ -1,12 +1,14 @@
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { ChevronRight } from "lucide-react";
-import { memo, useRef } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import type { HarnessCommit } from "./NanocodexApp";
 
 type VirtualCommitListProps = {
   commits: HarnessCommit[];
+  hasMore: boolean;
   selectedHash?: string;
   onClearSearch(): void;
+  onLoadMore(): Promise<boolean>;
   onSelectCommit(commit: HarnessCommit): void;
 };
 
@@ -33,11 +35,14 @@ function relativeDate(value: string) {
 
 export const VirtualCommitList = memo(function VirtualCommitList({
   commits,
+  hasMore,
   selectedHash,
   onClearSearch,
+  onLoadMore,
   onSelectCommit,
 }: VirtualCommitListProps) {
   const listRef = useRef<HTMLDivElement>(null);
+  const [loadError, setLoadError] = useState(false);
   const virtualizer = useVirtualizer({
     count: commits.length,
     getScrollElement: () => listRef.current,
@@ -45,6 +50,22 @@ export const VirtualCommitList = memo(function VirtualCommitList({
     getItemKey: (index) => commits[index]?.hash ?? index,
     overscan: 8,
   });
+  const virtualItems = virtualizer.getVirtualItems();
+
+  const loadMore = useCallback(() => {
+    setLoadError(false);
+    void onLoadMore().catch((error) => {
+      console.warn("Failed to load commit metadata", error);
+      setLoadError(true);
+    });
+  }, [onLoadMore]);
+
+  useEffect(() => {
+    const last = virtualItems.at(-1);
+    if (hasMore && !loadError && last != null && last.index >= commits.length - 8) {
+      loadMore();
+    }
+  }, [commits.length, hasMore, loadError, loadMore, virtualItems]);
 
   return (
     <div className="commit-list" ref={listRef}>
@@ -55,7 +76,7 @@ export const VirtualCommitList = memo(function VirtualCommitList({
             height: `${virtualizer.getTotalSize()}px`,
           }}
         >
-          {virtualizer.getVirtualItems().map((virtualRow) => {
+          {virtualItems.map((virtualRow) => {
             const commit = commits[virtualRow.index];
             if (!commit) return null;
             const isSelected = commit.hash === selectedHash;
@@ -95,6 +116,12 @@ export const VirtualCommitList = memo(function VirtualCommitList({
           </button>
         </div>
       )}
+      {loadError ? (
+        <div className="commit-list-tail-error" role="alert">
+          <span>Couldn’t load more commits.</span>
+          <button type="button" onClick={loadMore}>Try again</button>
+        </div>
+      ) : null}
     </div>
   );
 });

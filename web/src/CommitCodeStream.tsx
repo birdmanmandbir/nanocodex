@@ -31,9 +31,11 @@ import type { HarnessCommit, Theme } from "./NanocodexApp";
 
 type CommitCodeStreamProps = {
   commits: HarnessCommit[];
+  hasMoreCommits: boolean;
   onOpenCommitRail?: () => void;
-  patchUrl: string;
+  onLoadMoreCommits(): Promise<boolean>;
   theme: Theme;
+  totalCommitCount: number;
 };
 
 export type CommitCodeStreamHandle = {
@@ -48,13 +50,21 @@ const CommitCodeStreamComponent = forwardRef<
   CommitCodeStreamHandle,
   CommitCodeStreamProps
 >(function CommitCodeStream(
-  { commits, onOpenCommitRail, patchUrl, theme },
+  {
+    commits,
+    hasMoreCommits,
+    onOpenCommitRail,
+    onLoadMoreCommits,
+    theme,
+    totalCommitCount,
+  },
   forwardedRef,
 ) {
   const renderer = usePierreRenderer();
   const scrollRef = useRef<HTMLDivElement>(null);
   const viewerRef = useRef<CodeViewHandle<undefined> | null>(null);
   const pendingJumpRef = useRef<number | null>(null);
+  const metadataLoadRef = useRef<Promise<void> | null>(null);
   const [diffStyle, setDiffStyle] = useState<"split" | "unified">("split");
   const [collapseMode, setCollapseMode] = useState<
     "expanded" | "collapsed"
@@ -64,6 +74,8 @@ const CommitCodeStreamComponent = forwardRef<
   const [diffIndicators, setDiffIndicators] =
     useState<DiffIndicators>("bars");
   const [lineNumbers, setLineNumbers] = useState(true);
+  const [streamStartIndex, setStreamStartIndex] = useState(0);
+  const [metadataLoadError, setMetadataLoadError] = useState(false);
 
   useEffect(() => {
     const mediaQuery = window.matchMedia("(max-width: 767px)");
@@ -81,14 +93,19 @@ const CommitCodeStreamComponent = forwardRef<
 
   const {
     applyCollapseModeToLoaded,
+    firstLoadedCommitIndex,
+    hasMore,
     initialItems,
+    loadedCommitCount,
+    loadMore,
     loadState,
+    loadThrough,
     retryLoad,
     viewerKey,
   } = useCommitStreamLoader({
     collapseMode,
     commits,
-    patchUrl,
+    startCommitIndex: streamStartIndex,
     viewerRef,
   });
 
@@ -115,13 +132,22 @@ const CommitCodeStreamComponent = forwardRef<
       const itemId = commitItemId(commit);
       if (viewer == null || viewer.getItem(itemId) == null) {
         pendingJumpRef.current = index;
+        const isNearbyOlderCommit =
+          index >= firstLoadedCommitIndex && index < loadedCommitCount + 4;
+        if (isNearbyOlderCommit) loadThrough(index + 1);
+        else setStreamStartIndex(index);
         return;
       }
 
       pendingJumpRef.current = null;
       viewer.scrollTo({ type: "item", id: itemId, align: "start" });
     },
-    [commits],
+    [
+      commits,
+      firstLoadedCommitIndex,
+      loadedCommitCount,
+      loadThrough,
+    ],
   );
 
   useImperativeHandle(
@@ -131,20 +157,48 @@ const CommitCodeStreamComponent = forwardRef<
   );
 
   useEffect(() => {
-    if (loadState !== "ready" || pendingJumpRef.current == null) return;
+    if (pendingJumpRef.current == null) return;
     scrollToCommit(pendingJumpRef.current);
-  }, [loadState, scrollToCommit]);
+  }, [loadedCommitCount, scrollToCommit]);
 
-  const viewerAvailable =
-    renderer.ready &&
-    (loadState === "ready" ||
-      (loadState === "streaming" && initialItems.length > 0));
+  const loadMoreMetadata = useCallback(() => {
+    if (!hasMoreCommits || metadataLoadRef.current != null) return;
+    setMetadataLoadError(false);
+    metadataLoadRef.current = onLoadMoreCommits()
+      .then((loaded) => {
+        if (loaded) requestAnimationFrame(() => loadMore());
+      })
+      .catch((error) => {
+        console.warn("Failed to load commit metadata", error);
+        setMetadataLoadError(true);
+      })
+      .finally(() => {
+        metadataLoadRef.current = null;
+      });
+  }, [hasMoreCommits, loadMore, onLoadMoreCommits]);
+
+  const handleScroll = useCallback(
+    (scrollTop: number, viewer: {
+      getHeight(): number;
+      getScrollHeight(): number;
+    }) => {
+      if (loadState === "fetching") return;
+      const remaining =
+        viewer.getScrollHeight() - scrollTop - viewer.getHeight();
+      if (remaining > Math.max(1_200, viewer.getHeight() * 2)) return;
+      if (hasMore) loadMore();
+      else loadMoreMetadata();
+    },
+    [hasMore, loadMore, loadMoreMetadata, loadState],
+  );
+
+  const viewerAvailable = renderer.ready && initialItems.length > 0;
 
   return (
     <>
       <CommitStreamToolbar
         collapseMode={collapseMode}
-        commitCount={commits.length}
+        commitCount={totalCommitCount}
         diffIndicators={diffIndicators}
         diffStyle={diffStyle}
         lineNumbers={lineNumbers}
@@ -167,6 +221,7 @@ const CommitCodeStreamComponent = forwardRef<
           disableWorkerPool={renderer.disableWorkerPool}
           initialItems={initialItems}
           lineNumbers={lineNumbers}
+          onScroll={handleScroll}
           overflow={overflow}
           scrollRef={scrollRef}
           showBackgrounds={showBackgrounds}
@@ -177,6 +232,17 @@ const CommitCodeStreamComponent = forwardRef<
         <div className="commit-stream-error" role="alert">
           <p>Couldn’t load commits.</p>
           <button type="button" onClick={retryLoad}>
+            Try again
+          </button>
+        </div>
+      ) : null}
+      {viewerAvailable && (loadState === "error" || metadataLoadError) ? (
+        <div className="commit-stream-tail-error" role="alert">
+          <span>Couldn’t load more commits.</span>
+          <button
+            type="button"
+            onClick={loadState === "error" ? retryLoad : loadMoreMetadata}
+          >
             Try again
           </button>
         </div>
@@ -231,7 +297,7 @@ const CommitStreamToolbar = memo(function CommitStreamToolbar({
             <PanelLeft aria-hidden="true" />
           </button>
         ) : null}
-        <strong>All commits</strong>
+        <strong>{commitCount === 1 ? "Commit" : "Commits"}</strong>
         <span>{commitCount}</span>
       </div>
       <div className="commit-view-controls">

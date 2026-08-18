@@ -8,8 +8,9 @@ import { createBrowserTools } from "./browserTools";
 import type { WebTuiCommand } from "./nanocodex";
 import { createPaymentSessionOwner } from "./paymentSessionOwner";
 import { MPP_RESPONSES_WEBSOCKET_URL } from "./tempo-constants";
+import { createWorkerManagedWebSocket } from "./workerManagedWebSocket";
 
-type IncomingMessage = WebTuiCommand;
+type IncomingMessage = WebTuiCommand | { type: "warmup" };
 type PaymentSession = Awaited<ReturnType<(typeof import("./tempo"))["createTempoMppSession"]>>;
 const CHATGPT_API_BASE_URL = "https://chatgpt.com/backend-api/codex";
 
@@ -31,6 +32,12 @@ const controller = createAgentController({
 let commands = Promise.resolve();
 
 worker.onmessage = ({ data }: MessageEvent<IncomingMessage>) => {
+  if (data.type === "warmup") {
+    commands = commands.then(() => Agent.prewarm()).catch((error) => {
+      console.warn(error);
+    });
+    return;
+  }
   commands = commands
     .then(() => controller.handle(data))
     .catch((error) => {
@@ -106,11 +113,8 @@ async function createAgent(
       },
     );
   }
-  const createWebSocket = (endpoint: string, sessionId: string) => {
-    const url = new URL(endpoint);
-    url.searchParams.set("session_id", sessionId);
-    return new WebSocket(url);
-  };
+  const createWebSocket = (endpoint: string, sessionId: string) =>
+    createWorkerManagedWebSocket(endpoint, sessionId);
   if (start.transport === "chatgpt") {
     return {
       agent: await Agent.create({
