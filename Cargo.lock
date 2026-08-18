@@ -6110,13 +6110,16 @@ dependencies = [
 name = "nanocodex-examples"
 version = "0.5.0"
 dependencies = [
+ "base64",
  "dotenvy",
  "eyre",
  "futures-util",
  "http",
+ "iroh",
  "nanocodex",
  "nanocodex-browser",
  "nanocodex-egress",
+ "nanocodex-network",
  "nanocodex-vm",
  "nanocodex-voice",
  "reflink-copy",
@@ -6126,6 +6129,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite 0.30.0",
+ "tokio-util",
  "tower",
 ]
 

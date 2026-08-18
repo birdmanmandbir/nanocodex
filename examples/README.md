@@ -2,7 +2,7 @@
 
 All language consumers live at this repository boundary:
 
-- Rust: `minimal.rs`, `voice.rs`, `realtime_pipe.rs`, `follow_on.rs`, `lifecycle.rs`,
+- Rust: `minimal.rs`, `voice.rs`, `realtime_pipe.rs`, `lan_party.rs`, `follow_on.rs`, `lifecycle.rs`,
   `custom_tool.rs`, `subagents.rs`, `resume.rs`, `fork_conversations.rs`,
   `fork_checkpoint_bench.rs`, `secret_egress.rs`, and `mcp.rs` are binaries in the
   `nanocodex-examples` package.
@@ -44,6 +44,10 @@ cargo run -p nanocodex-examples --bin subagents -- \
 NANOCODEX_SUBAGENT_JSONL=1 cargo run -p nanocodex-examples --bin subagents
 cargo run -p nanocodex-examples --bin mcp
 cargo run -p nanocodex-examples --bin secret-egress -- host
+# Host on one LAN machine, then paste its ticket into each joining command.
+cargo run -p nanocodex-examples --bin lan-party -- host ./.party-host
+cargo run -p nanocodex-examples --bin lan-party -- \
+  join "$PARTY_TICKET" ./.party-alice alice
 just build-vm-example
 target/debug/vm-tools ROOTFS [GUEST_RUNTIME_BINARY_OR_EXT4]
 just smoke-python
@@ -77,6 +81,16 @@ The other command-line examples use `OPENAI_API_KEY` by default. The browser
 example instead asks the
 embedding application for an already-authorized Responses WebSocket URL;
 standard browser WebSockets cannot attach the upgrade authorization header.
+
+`lan-party` is a deliberately application-owned multiplayer composition. The
+host creates a private, relay-free Iroh LAN, discovers signed agent leases, and
+fans each stdin prompt out over bounded bilateral streams. Every joining
+laptop owns one retained Nanocodex session and streams only assistant-facing
+events back to the host; raw OpenAI events and local state are not shared. A
+bounded transcript of completed answers is included as collaboration context
+in the next round, so agents can compare and build on their peers' prior work.
+`OPENAI_API_KEY` is required on joining laptops because inference still uses
+OpenAI over WAN, while discovery and agent traffic stay entirely on the LAN.
 
 `vm-tools` does not call the model. It proves all VM-backed standard workspace
 tools against one retained guest and accepts either a directory root containing

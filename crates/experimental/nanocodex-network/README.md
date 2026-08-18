@@ -9,6 +9,13 @@ The crate has no dependency on Nanocodex agents, evaluations, VMs, SQLite,
 models, tools, payments, or TEEs. Applications choose identity paths and run
 their own protocols over the resulting topology.
 
+The normal `Hub::bind` and `Node::join` path is deliberately LAN-only. It uses
+direct IP transports, publishes no DNS address records, and configures no Iroh
+relay, internet probes, or gateway port mapping. Join tickets carry the hub's
+current direct addresses, so every member must have a directly reachable path
+to the host. Model inference is outside this crate; a consuming Nanocodex agent
+may still call OpenAI over WAN.
+
 The initial topology uses one durable `Hub` as rendezvous, admission authority,
 gossip bootnode, and late-join anti-entropy cache. Every durable `Node` joins a
 private Iroh gossip topic derived from the hub identity and the shared join
@@ -19,10 +26,8 @@ those records and does not fan them out over its control channel.
 Applications register a bounded `ProtocolId` with `Node::listen` and open an
 opaque `PeerStream` with `Node::connect`. The hub issues a short-lived,
 single-use grant bound to the requester, provider, and protocol. Application
-bytes then travel over a separate Iroh connection directly between the
-authenticated endpoint identities rather than through the hub. Iroh may use a
-relay when a direct network path is unavailable; the hub never becomes an
-application-data relay.
+bytes then travel over a separate direct Iroh connection between the
+authenticated LAN-reachable endpoint identities rather than through the hub.
 
 ```rust,no_run
 # async fn example(node: &nanocodex_network::Node, peer: iroh::EndpointId) -> Result<(), nanocodex_network::NetworkError> {
@@ -94,6 +99,19 @@ cargo run -p nanocodex-network --example gossip_cluster -- \
   serve "$JOIN_TICKET" ./worker.identity aarch64
 cargo run -p nanocodex-network --example gossip_cluster -- \
   dial "$JOIN_TICKET" ./client.identity aarch64
+```
+
+The public examples package composes the independent network and agent crates
+into a real multiplayer consumer. One laptop hosts an authoritative round;
+other laptops advertise retained Nanocodex agents, and every typed prompt and
+streamed response crosses a direct authenticated peer session. Party traffic
+stays on the LAN while each participating agent performs OpenAI inference over
+its own WAN connection:
+
+```sh
+cargo run -p nanocodex-examples --bin lan-party -- host ./.party-host
+cargo run -p nanocodex-examples --bin lan-party -- \
+  join "$PARTY_TICKET" ./.party-alice alice
 ```
 
 `nanocodex-eval` is not part of this crate's runtime graph. The Nanocodex CLI is

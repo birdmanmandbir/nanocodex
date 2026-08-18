@@ -1533,9 +1533,7 @@ thinking = ["high"]
             .bind()
             .await
             .unwrap();
-        let (iroh_server, ticket) = Hub::bind_with_endpoint(server_endpoint, false)
-            .await
-            .unwrap();
+        let (iroh_server, ticket) = Hub::bind_with_endpoint(server_endpoint).await.unwrap();
         let provider_endpoint = ::iroh::Endpoint::builder(::iroh::endpoint::presets::Minimal)
             .relay_mode(::iroh::RelayMode::Disabled)
             .clear_ip_transports()
