@@ -227,6 +227,9 @@ async fn host(state: &Path) -> Result<()> {
                 let shared_transcript = transcript.snapshot();
                 for (&agent_id, agent_name) in &roster {
                     active_calls += 1;
+                    eprintln!(
+                        "[round {round}:{agent_name}] SEND prompt\n{prompt}"
+                    );
                     let node = Arc::clone(&node);
                     let protocol = protocol.clone();
                     let prompt = prompt.to_owned();
@@ -334,8 +337,11 @@ async fn join(ticket: PartyTicket, state: &Path, name: String) -> Result<()> {
                     continue;
                 }
                 let agent = agent.clone();
+                let agent_name = name.clone();
                 let cancellation = cancellation.clone();
-                requests.spawn(async move { serve_agent_request(agent, stream, cancellation).await });
+                requests.spawn(async move {
+                    serve_agent_request(agent, agent_name, stream, cancellation).await
+                });
             }
             completed = requests.join_next(), if !requests.is_empty() => {
                 if let Some(completed) = completed {
@@ -385,6 +391,7 @@ fn build_agent(name: &str) -> Result<Nanocodex> {
 
 async fn serve_agent_request(
     agent: Nanocodex,
+    agent_name: String,
     stream: PeerStream,
     cancellation: CancellationToken,
 ) -> Result<()> {
@@ -392,6 +399,10 @@ async fn serve_agent_request(
     let request: AgentRequest = read_frame(&mut reader).await?;
     validate_request(&request)?;
     let prompt = model_prompt(&request);
+    eprintln!(
+        "\n[{agent_name}:round {}] RECV host prompt\n{prompt}\n",
+        request.round
+    );
     let mut turn = agent
         .prompt(prompt)
         .await
@@ -401,6 +412,10 @@ async fn serve_agent_request(
     {
         return cancel_after_write_failure(&turn, error).await;
     }
+    eprintln!(
+        "[{agent_name}:round {}] SEND assistant stream",
+        request.round
+    );
     let mut run_error = None;
 
     loop {
@@ -422,15 +437,17 @@ async fn serve_agent_request(
                 };
                 match event.data() {
                     Ok(AgentEventData::Assistant(AssistantEvent::Delta(delta))) => {
+                        let text = delta.text;
                         if let Err(error) = write_response(
                             &mut writer,
                             request.round,
-                            AgentResponseEvent::Delta { text: delta.text },
+                            AgentResponseEvent::Delta { text: text.clone() },
                         )
                         .await
                         {
                             return cancel_after_write_failure(&turn, error).await;
                         }
+                        eprint!("{text}");
                     }
                     Ok(AgentEventData::Run(RunEvent::Error(error))) => {
                         run_error = Some(error.message);
@@ -453,17 +470,25 @@ async fn serve_agent_request(
                     message: result.into_final_message(),
                 },
             )
-            .await
+            .await?;
+            eprintln!("\n[{agent_name}:round {}] SEND completed", request.round);
+            Ok(())
         }
         Err(error) => {
+            let message = run_error.unwrap_or_else(|| error.to_string());
             write_response(
                 &mut writer,
                 request.round,
                 AgentResponseEvent::Failed {
-                    message: run_error.unwrap_or_else(|| error.to_string()),
+                    message: message.clone(),
                 },
             )
-            .await
+            .await?;
+            eprintln!(
+                "\n[{agent_name}:round {}] SEND failed: {message}",
+                request.round
+            );
+            Ok(())
         }
     }
 }
@@ -563,11 +588,11 @@ fn advertisement_name(record: &SignedAdvertisement) -> String {
 fn print_display(event: DisplayEvent) -> Result<()> {
     match event {
         DisplayEvent::Started { round, agent } => {
-            eprintln!("[round {round}:{agent}] started");
+            eprintln!("[round {round}:{agent}] RECV started");
         }
         DisplayEvent::Delta { round, agent, text } => {
             eprintln!(
-                "[round {round}:{agent}] delta={}",
+                "[round {round}:{agent}] RECV delta={}",
                 serde_json::to_string(&text)?
             );
         }
@@ -576,14 +601,14 @@ fn print_display(event: DisplayEvent) -> Result<()> {
             agent,
             message,
         } => {
-            eprintln!("[round {round}:{agent}] completed\n{message}");
+            eprintln!("[round {round}:{agent}] RECV completed\n{message}");
         }
         DisplayEvent::Failed {
             round,
             agent,
             message,
         } => {
-            eprintln!("[round {round}:{agent}] failed: {message}");
+            eprintln!("[round {round}:{agent}] RECV failed: {message}");
         }
     }
     Ok(())

@@ -89,6 +89,9 @@ laptop owns one retained Nanocodex session and streams only assistant-facing
 events back to the host; raw OpenAI events and local state are not shared. A
 bounded transcript of completed answers is included as collaboration context
 in the next round, so agents can compare and build on their peers' prior work.
+The host terminal labels every outbound prompt and inbound stream, while each
+agent terminal prints the exact expanded prompt it receives and the assistant
+stream it sends back.
 Joining agents prefer `OPENAI_API_KEY` when set and otherwise use the shared
 Codex credential selected by `NANOCODEX_AUTH_FILE` or `CODEX_HOME`. Inference
 still uses OpenAI over WAN, while discovery and agent traffic stay entirely on

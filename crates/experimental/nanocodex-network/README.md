@@ -116,7 +116,8 @@ cargo run -p nanocodex-examples --bin lan-party -- \
 
 Each joining machine prefers `OPENAI_API_KEY` when set and otherwise uses its
 existing Codex login. Only inference uses WAN; discovery and peer streams do
-not.
+not. The host labels outbound prompts and inbound streams, and every agent
+terminal shows its received prompt and streamed reply.
 
 `nanocodex-eval` is not part of this crate's runtime graph. The Nanocodex CLI is
 the current composition root. `TcpBridge` is an optional adapter that publishes
