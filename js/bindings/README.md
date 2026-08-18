@@ -258,6 +258,81 @@ The root owns the task tree. `agent.session.shutdown()` closes every child
 before stopping the root driver; applications do not maintain a parallel JS
 scheduler or reimplement the communication tools.
 
+## Browser agent mesh
+
+The browser entrypoint exposes the same Rust `nanocodex-network` mesh core under
+`Network`: durable Iroh identities, admission tickets, private gossip, signed
+capability advertisements, merged discovery sources, three-boundary session
+policy, and authenticated protocol byte streams. The JavaScript layer owns only
+callback routing and typed data conversion; generated WASM handles remain
+private. Iroh is a separate, runtime-lazy browser WASM module, so importing or
+creating an ordinary `Agent` does not download or instantiate networking code.
+
+```js
+import { Network } from "nanocodex/browser";
+// Bundlers may instead import the precompiled module from
+// "nanocodex/browser/network/wasm" and pass it to Network.prewarm({ module }).
+
+const relayUrl = "https://iroh-relay.lan.example";
+const hub = await Network.host({
+  relayUrl,
+  authorizeSession: async ({ requesterId, providerId, protocol, credential }) =>
+    verifyBiscuit({ requesterId, providerId, protocol, credential }),
+});
+
+// Send hub.ticket to admitted peers. Persist these secret bytes in an
+// application-owned encrypted store before shutting down.
+const authoritySecret = hub.exportAuthority();
+
+const node = await Network.join({
+  ticket: hub.ticket,
+  relayUrl,
+  authorizeIncoming: ({ requesterId, protocol, credential }) =>
+    verifyBiscuit({ requesterId, protocol, credential }),
+  attest: ({ providerId, protocol }) => currentProviderAttestation(providerId, protocol),
+  verifyPeer: ({ providerId, protocol, credential }) =>
+    verifyProviderAttestation({ providerId, protocol, credential }),
+});
+
+const lease = await node.advertise({
+  revision: 1,
+  services: ["nanocodex/agents/1", "nanocodex/mcp/1"],
+  attributes: { browser: true, freeSlots: 2, models: ["gpt-5.6"] },
+});
+
+const peers = await node.watch({
+  services: ["nanocodex/agents/1"],
+  minimums: { freeSlots: 1 },
+});
+for await (const change of peers) {
+  if (change.type !== "joined") continue;
+  const stream = await node.connect(
+    change.record.node_id,
+    "nanocodex/agents/1",
+    { authority: routingBiscuit, peer: agentBiscuit },
+  );
+  await stream.write(new TextEncoder().encode("prompt bytes"));
+  await stream.finish();
+}
+```
+
+`lease.latest()` and the lease's async iterator return signed records that can
+be mirrored into Kademlia, an operational control plane, or a retained cache.
+`node.ingestAdvertisement(record)` merges records from any such source through
+the same signature, expiry, revision, replay, and equivocation checks as gossip.
+OIDC enrollment, Biscuit issuance and verification, MCP framing, agent messages,
+and egress policy remain application protocols over the byte stream.
+
+Browsers cannot send UDP or establish Iroh's native direct LAN path. They use
+Iroh over WebSocket relays. To keep all mesh traffic offline and on the LAN,
+self-host an Iroh relay there, configure a browser-trusted HTTPS/WSS certificate,
+and pass that relay URL to every `Network.host` and `Network.join`. Omitting
+`relayUrl` uses Iroh's public relay network. The native relay-disabled LAN-party
+configuration does not work in a browser. OpenAI inference may still use WAN
+independently, and a peer-provided internet gateway remains an explicitly
+advertised, bilaterally authorized application protocol rather than ambient
+browser networking authority.
+
 ## Persistent workspaces
 
 Runtime-specific `Workspace` adapters give an embedding application one file

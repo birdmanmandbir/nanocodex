@@ -30,6 +30,7 @@ js/tui/dist/
 js/tui-react/node_modules/
 js/tui-react/dist/
 js/bindings/pkg-node/
+js/bindings/pkg-network/
 js/bindings/pkg-web/
 examples/node/node_modules/
 examples/rivet-actors/dist/

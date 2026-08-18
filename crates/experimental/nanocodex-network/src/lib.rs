@@ -10,11 +10,8 @@ pub use discovery::{
 
 use std::{
     collections::HashMap,
-    fmt, fs,
+    fmt,
     future::Future,
-    io::Write as _,
-    net::SocketAddr,
-    path::{Path, PathBuf},
     pin::Pin,
     str::FromStr,
     sync::{
@@ -25,6 +22,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use std::{
+    fs,
+    io::Write as _,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
+
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use constant_time_eq::constant_time_eq_32;
 use iroh::{
@@ -33,9 +38,10 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use serde::{Deserialize, Serialize};
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use tokio::net::{TcpListener, TcpStream};
 use tokio::{
     io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf},
-    net::{TcpListener, TcpStream},
     sync::{Mutex, Semaphore, mpsc, watch},
     task::JoinSet,
 };
@@ -46,7 +52,9 @@ const NODE_ALPN: &[u8] = b"nanocodex-network/node/1";
 const TICKET_PREFIX: &str = "nanocodex-net:";
 const TICKET_VERSION: u8 = 1;
 const CONTROL_VERSION: u8 = 3;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 const IDENTITY_VERSION: u8 = 1;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 const MAX_IDENTITY_BYTES: u64 = 4 * 1024;
 const MAX_TICKET_BYTES: usize = 16 * 1024;
 const MAX_CONTROL_BYTES: usize = 16 * 1024;
@@ -64,6 +72,7 @@ const GRANT_LIFETIME: Duration = Duration::from_secs(30);
 const MAX_CONCURRENT_STREAMS: usize = 32;
 const STREAM_CONTROL: u8 = 1;
 const STREAM_SESSION_REQUEST: u8 = 2;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 const TCP_BRIDGE_PROTOCOL: &str = "nanocodex/tcp-bridge/1";
 const TCP_TICKET_PREFIX: &str = "nanocodex-tcp:";
 const TCP_TICKET_VERSION: u8 = 1;
@@ -295,6 +304,7 @@ impl SessionAttestor for FixedSessionAttestor {
 }
 
 /// Optional bounded adapter between loopback TCP and network streams.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub struct TcpBridge;
 
 #[derive(Clone)]
@@ -353,6 +363,7 @@ pub enum NetworkError {
     #[error("invalid network advertisement: {0}")]
     InvalidAdvertisement(String),
     /// A bridge was asked to expose or target a non-loopback TCP address.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     #[error("invalid network loopback bridge address: {0}")]
     InvalidLoopback(SocketAddr),
     /// Creating or shutting down an Iroh endpoint failed.
@@ -367,6 +378,7 @@ pub enum NetworkError {
         actual: iroh::EndpointId,
     },
     /// Durable identity I/O failed.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     #[error("failed to {operation} network identity at {}: {source}", path.display())]
     IdentityIo {
         /// Identity operation that failed.
@@ -378,6 +390,7 @@ pub enum NetworkError {
         source: std::io::Error,
     },
     /// The durable identity is malformed or unsupported.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     #[error("invalid network identity at {}: {message}", path.display())]
     InvalidIdentity {
         /// Durable identity path.
@@ -392,6 +405,7 @@ pub enum NetworkError {
     #[error("network protocol failed: {0}")]
     Protocol(String),
     /// Loopback forwarding failed.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     #[error("network loopback forwarding failed: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -410,6 +424,7 @@ struct WireTcpBridgeTicket {
     provider: iroh::EndpointId,
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireIdentity {
@@ -418,6 +433,7 @@ struct WireIdentity {
     token: [u8; TOKEN_BYTES],
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireNodeIdentity {
@@ -652,6 +668,7 @@ impl fmt::Debug for SessionAuthorization {
 
 impl JoinAuthority {
     /// Loads or atomically creates authority at the caller-owned file path.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub fn load_or_create(path: impl AsRef<Path>) -> Result<Self, NetworkError> {
         let (directory, path) = identity_paths(path.as_ref());
         if let Some(encoded) = read_identity(&path)? {
@@ -701,7 +718,8 @@ impl JoinAuthority {
         Endpoint::builder(preset).secret_key(self.secret_key.clone())
     }
 
-    fn generate() -> Result<Self, NetworkError> {
+    /// Generates in-memory authority material for an application-owned persistence layer.
+    pub fn generate() -> Result<Self, NetworkError> {
         let mut secret_key = [0; 32];
         let mut token = [0; TOKEN_BYTES];
         getrandom::fill(&mut secret_key)
@@ -713,6 +731,27 @@ impl JoinAuthority {
         })
     }
 
+    /// Restores authority material previously returned by [`Self::secret_material`].
+    ///
+    /// The caller must protect both values as network authority secrets.
+    #[must_use]
+    pub fn from_secret_material(secret_key: [u8; 32], token: [u8; TOKEN_BYTES]) -> Self {
+        Self {
+            secret_key: iroh::SecretKey::from_bytes(&secret_key),
+            token,
+        }
+    }
+
+    /// Exports authority material for caller-owned secure persistence.
+    ///
+    /// Possession grants authority over network admission. Never log or expose
+    /// these values to untrusted code.
+    #[must_use]
+    pub fn secret_material(&self) -> ([u8; 32], [u8; TOKEN_BYTES]) {
+        (self.secret_key.to_bytes(), self.token)
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     fn decode(path: &Path, encoded: &[u8]) -> Result<Self, NetworkError> {
         let WireIdentity {
             version,
@@ -737,6 +776,7 @@ impl JoinAuthority {
 
 impl NodeIdentity {
     /// Loads or atomically creates one node identity at the caller-owned file path.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub fn load_or_create(path: impl AsRef<Path>) -> Result<Self, NetworkError> {
         let (directory, path) = identity_paths(path.as_ref());
         if let Some(encoded) = read_identity(&path)? {
@@ -790,8 +830,8 @@ impl NodeIdentity {
         Endpoint::builder(preset).secret_key(self.secret_key.clone())
     }
 
-    #[cfg(test)]
-    fn generate() -> Result<Self, NetworkError> {
+    /// Generates an in-memory identity for an application-owned persistence layer.
+    pub fn generate() -> Result<Self, NetworkError> {
         let mut secret_key = [0; 32];
         getrandom::fill(&mut secret_key)
             .map_err(|error| NetworkError::Endpoint(error.to_string()))?;
@@ -800,6 +840,25 @@ impl NodeIdentity {
         })
     }
 
+    /// Restores an identity from caller-owned secret key bytes.
+    ///
+    /// The caller must protect the bytes as the durable node identity.
+    #[must_use]
+    pub fn from_secret_bytes(secret_key: [u8; 32]) -> Self {
+        Self {
+            secret_key: iroh::SecretKey::from_bytes(&secret_key),
+        }
+    }
+
+    /// Exports this durable identity for caller-owned secure persistence.
+    ///
+    /// Never log or expose the returned bytes to untrusted code.
+    #[must_use]
+    pub fn secret_bytes(&self) -> [u8; 32] {
+        self.secret_key.to_bytes()
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     fn decode(path: &Path, encoded: &[u8]) -> Result<Self, NetworkError> {
         let WireNodeIdentity {
             version,
@@ -1709,6 +1768,7 @@ impl AsyncWrite for PeerStream {
     }
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 impl TcpBridge {
     /// Registers the fixed TCP bridge protocol before advertising a provider.
     pub async fn listen(node: &Node) -> Result<ProtocolListener, NetworkError> {
@@ -1817,6 +1877,7 @@ impl TcpBridge {
     }
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 async fn forward_downstream(
     node: HubDialer,
     provider: iroh::EndpointId,
@@ -2693,6 +2754,7 @@ fn random_bytes<const N: usize>() -> Result<[u8; N], NetworkError> {
     Ok(bytes)
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 const fn require_loopback(address: SocketAddr) -> Result<(), NetworkError> {
     if address.ip().is_loopback() {
         Ok(())
@@ -2701,6 +2763,7 @@ const fn require_loopback(address: SocketAddr) -> Result<(), NetworkError> {
     }
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn identity_paths(path: &Path) -> (PathBuf, PathBuf) {
     let path = path.to_path_buf();
     let directory = path
@@ -2711,6 +2774,7 @@ fn identity_paths(path: &Path) -> (PathBuf, PathBuf) {
     (directory, path)
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn ensure_identity_directory(path: &Path) -> Result<(), NetworkError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_dir() => return Ok(()),
@@ -2748,6 +2812,7 @@ fn ensure_identity_directory(path: &Path) -> Result<(), NetworkError> {
     secure_identity_directory(path)
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn read_identity(path: &Path) -> Result<Option<Vec<u8>>, NetworkError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -2788,6 +2853,7 @@ fn read_identity(path: &Path) -> Result<Option<Vec<u8>>, NetworkError> {
         })
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn persist_identity(directory: &Path, path: &Path, encoded: &[u8]) -> Result<bool, NetworkError> {
     let mut staged =
         tempfile::NamedTempFile::new_in(directory).map_err(|source| NetworkError::IdentityIo {
@@ -2826,6 +2892,7 @@ fn persist_identity(directory: &Path, path: &Path, encoded: &[u8]) -> Result<boo
     }
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn secure_identity_directory(path: &Path) -> Result<(), NetworkError> {
     #[cfg(unix)]
     {
@@ -2842,6 +2909,7 @@ fn secure_identity_directory(path: &Path) -> Result<(), NetworkError> {
     Ok(())
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn secure_identity_file(path: &Path) -> Result<(), NetworkError> {
     #[cfg(unix)]
     {
@@ -2858,6 +2926,7 @@ fn secure_identity_file(path: &Path) -> Result<(), NetworkError> {
     Ok(())
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn sync_identity_directory(path: &Path) -> Result<(), NetworkError> {
     #[cfg(unix)]
     {

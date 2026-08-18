@@ -11,14 +11,18 @@ if [[ "$target_dir" != /* ]]; then
 fi
 
 cargo build --locked -p nanocodex-wasm --target "$wasm_target" --profile wasm
+cargo build --locked -p nanocodex-network-wasm --target "$wasm_target" --profile wasm
 wasm_artifact="$target_dir/$wasm_target/wasm/nanocodex_wasm.wasm"
+network_wasm_artifact="$target_dir/$wasm_target/wasm/nanocodex_network_wasm.wasm"
 stamp_path="js/bindings/pkg-web/.nanocodex-bindgen-stamp"
-fingerprint="$(wasm-bindgen --version; printf 'worker-bundler-v1\n'; cksum < "$wasm_artifact")"
+fingerprint="$(wasm-bindgen --version; printf 'worker-bundler-v1\n'; cksum < "$wasm_artifact"; cksum < "$network_wasm_artifact")"
 if [[ -f "$stamp_path" ]] \
   && [[ -f js/bindings/pkg-web/nanocodex_bg.wasm ]] \
   && [[ -f js/bindings/pkg-web/nanocodex_bg.js ]] \
   && [[ -f js/bindings/pkg-web/nanocodex_worker.js ]] \
   && [[ -f js/bindings/pkg-node/nanocodex_bg.wasm ]] \
+  && [[ -f js/bindings/pkg-network/nanocodex_network.js ]] \
+  && [[ -f js/bindings/pkg-network/nanocodex_network_bg.wasm ]] \
   && [[ "$(<"$stamp_path")" == "$fingerprint" ]]; then
   echo "wasm-bindgen outputs are current"
   exit 0
@@ -41,5 +45,9 @@ wasm-bindgen "$wasm_artifact" \
 cmp "$worker_bindings/nanocodex_bg.wasm" js/bindings/pkg-web/nanocodex_bg.wasm
 cp "$worker_bindings/nanocodex_bg.js" js/bindings/pkg-web/nanocodex_bg.js
 cp "$worker_bindings/nanocodex.js" js/bindings/pkg-web/nanocodex_worker.js
+wasm-bindgen "$network_wasm_artifact" \
+  --target web \
+  --out-dir js/bindings/pkg-network \
+  --out-name nanocodex_network
 node js/bindings/scripts/write-package-types.mjs
 printf '%s\n' "$fingerprint" > "$stamp_path"

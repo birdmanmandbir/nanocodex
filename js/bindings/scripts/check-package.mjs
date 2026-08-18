@@ -22,6 +22,8 @@ export function checkDocumentedBrowserVersion(readme, packageVersion) {
 const requiredFiles = [
   "browser/index.mjs",
   "browser/index.d.mts",
+  "browser/Network.mjs",
+  "browser/Network.d.mts",
   "browser/workspace.mjs",
   "browser/workspace.d.mts",
   "node/index.mjs",
@@ -53,6 +55,10 @@ const requiredFiles = [
   "pkg-node/nanocodex.js",
   "pkg-node/nanocodex.d.ts",
   "pkg-node/nanocodex_bg.wasm",
+  "pkg-network/nanocodex_network.js",
+  "pkg-network/nanocodex_network.d.ts",
+  "pkg-network/nanocodex_network_bg.wasm",
+  "pkg-network/package.json",
 ];
 
 export async function checkPackage(packageRoot = root) {
@@ -66,6 +72,11 @@ export async function checkPackage(packageRoot = root) {
   assert.equal(packageJson.engines?.node, ">=22.13.0");
   assert.equal(packageJson.publishConfig?.access, "public");
   assert.equal(packageJson.exports?.["./browser"]?.import, "./browser/index.mjs");
+  assert.equal(packageJson.exports?.["./browser/network"]?.import, "./browser/Network.mjs");
+  assert.equal(
+    packageJson.exports?.["./browser/network/wasm"]?.import,
+    "./pkg-network/nanocodex_network_bg.wasm",
+  );
   assert.equal(packageJson.exports?.["./browser/workspace"]?.import, "./browser/workspace.mjs");
   assert.equal(packageJson.exports?.["./node"]?.import, "./node/index.mjs");
   assert.equal(packageJson.exports?.["./node/workspace"]?.import, "./node/workspace.mjs");
@@ -90,6 +101,11 @@ export async function checkPackage(packageRoot = root) {
     assert(wasm.byteLength > 100_000, `pkg-${target} WASM is unexpectedly small`);
     assert.deepEqual([...wasm.subarray(0, 4)], [0x00, 0x61, 0x73, 0x6d]);
   }
+  const networkWasm = await readFile(
+    new URL("pkg-network/nanocodex_network_bg.wasm", packageRoot),
+  );
+  assert.ok(networkWasm.byteLength > 100_000, "network WASM is unexpectedly small");
+  assert.deepEqual([...networkWasm.subarray(0, 4)], [0x00, 0x61, 0x73, 0x6d]);
 
   console.log(`nanocodex@${packageJson.version} package artifacts are complete`);
 }

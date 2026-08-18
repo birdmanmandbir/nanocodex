@@ -35,6 +35,14 @@
       "types": "./browser/Transport.d.mts",
       "import": "./browser/Transport.mjs"
     },
+    "./browser/network": {
+      "types": "./browser/Network.d.mts",
+      "import": "./browser/Network.mjs"
+    },
+    "./browser/network/wasm": {
+      "types": "./wasm.d.mts",
+      "import": "./pkg-network/nanocodex_network_bg.wasm"
+    },
     "./subagents": {
       "types": "./runtime/subagents.d.mts",
       "import": "./runtime/subagents.mjs"
@@ -70,6 +78,7 @@
     "node",
     "worker",
     "pkg-node",
+    "pkg-network",
     "pkg-web",
     "runtime",
     "tools",

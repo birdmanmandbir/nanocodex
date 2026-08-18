@@ -40,6 +40,22 @@ Model inference and application egress remain outside this crate. A LAN-only
 peer topology may still call OpenAI directly or route application traffic
 through a separately authorized gateway peer.
 
+The identity, admission, gossip, signed catalog, authorization, and peer-stream
+core also compiles for `wasm32-unknown-unknown`. Browser Iroh cannot open UDP
+sockets or use direct address discovery, so browser endpoints are relay-only.
+For a network that must stay offline and on one LAN, run an Iroh relay on that
+LAN and give every browser node its trusted HTTPS/WSS relay URL. The
+relay-disabled native example above is intentionally not a browser topology.
+Using Iroh's default relay network makes the same API internet-capable instead.
+See Iroh's [browser documentation](https://docs.iroh.computer/languages/wasm-browser)
+for the underlying platform boundary.
+
+Filesystem identity persistence and the loopback `TcpBridge` remain native-only.
+WASM callers generate or import explicit secret bytes and persist them in an
+application-owned encrypted store. Browsers expose raw authenticated byte
+streams; an application can implement agent, MCP, control-plane, or egress
+protocols without pretending the browser can bind a local TCP port.
+
 The initial topology uses one durable `Hub` as rendezvous, admission authority,
 gossip bootnode, and late-join anti-entropy cache. Every durable `Node` joins a
 private Iroh gossip topic derived from the hub identity and the shared join

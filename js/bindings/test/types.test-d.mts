@@ -15,6 +15,7 @@ import {
 } from "../node/index.mjs";
 import {
   Agent as BrowserAgent,
+  Network as BrowserNetwork,
   Subagents as BrowserSubagents,
   Transport as BrowserTransport,
   Workspace as BrowserWorkspace,
@@ -159,6 +160,59 @@ async function check() {
     transport: BrowserTransport.mpp({ session: { async ws() { return {} as WebSocket; } } }),
   });
   await BrowserAgent.create({ transport: BrowserTransport.chatGpt({ subscription }) });
+
+  const hub = await BrowserNetwork.host({
+    relayUrl: "https://relay.lan.example",
+    authorizeSession: ({ requesterId, providerId, protocol, credential }) => {
+      credential.byteLength;
+      return requesterId !== providerId && protocol === "nanocodex/agents/1";
+    },
+  });
+  const networkNode = await BrowserNetwork.join({
+    ticket: hub.ticket,
+    identity: new Uint8Array(32),
+    relayUrl: "https://relay.lan.example",
+    authorizeIncoming: async ({ credential }) => credential.byteLength > 0,
+    verifyPeer: () => true,
+    attest: () => new Uint8Array([1, 2, 3]),
+  });
+  const advertisement = await networkNode.advertise({
+    revision: 1,
+    services: ["nanocodex/agents/1"],
+    attributes: { browser: true, slots: 2, models: ["gpt-5.6"] },
+    leaseMillis: 30_000,
+  });
+  advertisement.latest().node_id;
+  for await (const renewal of advertisement) renewal.advertisement.revision;
+  const watcher = await networkNode.watch({
+    services: ["nanocodex/agents/1"],
+    equals: { browser: true },
+    minimums: { slots: 1 },
+    contains: { models: "gpt-5.6" },
+  });
+  const change = await watcher.next();
+  change?.record.node_id;
+  const records: readonly BrowserNetwork.SignedAdvertisement[] = await networkNode.snapshot();
+  await networkNode.ingestAdvertisement(records[0]!);
+  await hub.ingestAdvertisement(records[0]!);
+  await hub.snapshot({ services: ["nanocodex/agents/1"] });
+  (await hub.watch()).close();
+  const listener: BrowserNetwork.Listener = await networkNode.listen("nanocodex/agents/1");
+  const stream = await networkNode.connect("peer-id", "nanocodex/agents/1", {
+    authority: new Uint8Array([4]),
+    peer: new Uint8Array([5]),
+  });
+  await stream.write(new Uint8Array([6]));
+  const received: Uint8Array = await stream.read();
+  void received;
+  listener.close();
+  watcher.close();
+  advertisement.close();
+  stream.close();
+  networkNode.exportIdentity();
+  hub.exportAuthority();
+  await networkNode.shutdown();
+  await hub.shutdown();
   // @ts-expect-error authentication is not an Agent.create option.
   await BrowserAgent.create({ transport: BrowserTransport.openAi({ apiKey }), hostAuth: true });
   // @ts-expect-error a transport cannot be fabricated from an arbitrary object.

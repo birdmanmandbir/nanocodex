@@ -20,6 +20,7 @@ members = [
     "examples",
     "examples/exe-dev",
     "js/bindings",
+    "js/network-bindings",
     "py/bindings",
 ]
 # Root Cargo commands target the public library facade. Use `just run` or
