@@ -35,6 +35,10 @@
         "class_name": "GitRepository"
       },
       {
+        "name": "THREAD_GIT_REPOSITORY",
+        "class_name": "ThreadGitRepository"
+      },
+      {
         "name": "EVAL_COORDINATOR",
         "class_name": "EvalCoordinator"
       },
@@ -64,6 +68,10 @@
     {
       "tag": "v5",
       "new_sqlite_classes": ["ChatGptEgress"]
+    },
+    {
+      "tag": "v6",
+      "new_sqlite_classes": ["ThreadGitRepository"]
     }
   ],
   "containers": [

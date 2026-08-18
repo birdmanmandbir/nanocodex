@@ -16,6 +16,11 @@ import { routeEvalRead } from "./evalReadApi.ts";
 import { handleGitRequest, type GitStorageEnv } from "./gitRoutes.ts";
 import { GitRepository } from "./gitRepository.ts";
 import {
+  handleThreadGitRequest,
+  type ThreadGitStorageEnv,
+} from "./threadRoutes.ts";
+import { ThreadGitRepository } from "./threadRepository.ts";
+import {
   apiKeyActorId,
   limitAgentOperation,
   limitLoginStart,
@@ -23,7 +28,7 @@ import {
   type PublicSecurityEnv,
 } from "./publicSecurity.ts";
 
-export { ChatGptSession, EvalCoordinator, GitRepository };
+export { ChatGptSession, EvalCoordinator, GitRepository, ThreadGitRepository };
 
 const json = (body: unknown, init?: ResponseInit) =>
   Response.json(body, {
@@ -67,7 +72,7 @@ const SECURE_BYOK_COOKIE = "__Secure-nanocodex_byok_v2";
 const CHATGPT_COOKIE = "nanocodex_chatgpt_v2";
 const SECURE_CHATGPT_COOKIE = "__Secure-nanocodex_chatgpt_v2";
 
-type WorkerEnv = GitStorageEnv & EvalStorageEnv & ChatGptEgressEnv
+type WorkerEnv = GitStorageEnv & ThreadGitStorageEnv & EvalStorageEnv & ChatGptEgressEnv
   & PublicSecurityEnv & CredentialVaultEnv & {
   ENVIRONMENT: string;
   OPENAI_API_KEY?: string;
@@ -110,6 +115,8 @@ export default {
     if (evalRead != null) return evalRead;
     const gitResponse = await handleGitRequest(request, env, url, context);
     if (gitResponse != null) return gitResponse;
+    const threadGitResponse = await handleThreadGitRequest(request, env, url, context);
+    if (threadGitResponse != null) return threadGitResponse;
 
     if (url.pathname === "/api/health" && request.method === "GET") {
       const resolved = await resolveCredential(request, env, "health");

@@ -21,8 +21,6 @@ type WorkerScope = {
 };
 
 const worker = self as unknown as WorkerScope;
-const kernelWorkspace = import("nanocodex/browser/workspace")
-  .then((module) => module.open({ name: "nanocodex-home" }));
 const paymentSessions = createPaymentSessionOwner<PaymentSession>();
 const controller = createAgentController({
   createAgent,
@@ -53,28 +51,26 @@ async function createAgent(
   tools: AgentControllerTools,
 ) {
   await paymentSessions.clear();
-  const workspace = await kernelWorkspace;
-  const { ArtifactStore } = await import("nanocodex-artifacts");
-  const artifacts = new ArtifactStore(workspace);
+  const { execTool, workspace } = await (await import("./browserShell"))
+    .prepareBrowserShell(start.threadId!, self.location.origin);
   const common = {
     filesystem: workspace,
+    filesystemTools: false,
+    instructions: `You are working in a persistent browser filesystem rooted at /workspace.
+Use exec_command for bash commands such as ls, cat, find, grep, and git. The shell is implemented
+in-browser, so it has no host process or PTY. The repository's only publish branch is nanocodex;
+publish with git add, git commit -m "...", and git push origin nanocodex. Use the standard Rust
+apply_patch tool for focused edits. Custom React interfaces live in
+/workspace/.nanocodex/artifacts and are displayed by the web app from that same filesystem. To
+publish one, write a JavaScript source file that defines function App({ sendPrompt }); React and
+the html tagged template helper are already in scope. Then run
+artifact publish <source.js> --id <lowercase-id> --title "<title>". Re-run it after edits.`,
     tools: {
+      exec_command: execTool,
       ...createBrowserTools({
         recentImages: tools.recentImages,
         rememberImage: tools.rememberImage,
       }),
-      render_artifact: artifacts.tool((artifact) => {
-        worker.postMessage({ type: "artifact", artifact });
-      }),
-      browserInfo: {
-        description: "Return basic information about the browser Worker runtime.",
-        parameters: { type: "object", additionalProperties: false },
-        handler: async () => ({
-          language: navigator.language,
-          online: navigator.onLine,
-          userAgent: navigator.userAgent,
-        }),
-      },
     },
     thinking: start.thinking,
     reasoningMode: start.reasoningMode,

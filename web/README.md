@@ -9,6 +9,7 @@ and evaluation record legible.
 - Vite + React
 - Cloudflare Vite plugin and Workers runtime
 - Wrangler for preview and deployment
+- just-bash over the thread's OPFS filesystem, with browser `git` and `gh` compatibility commands
 - Pierre Trees and Diffs for the file tree, source viewer, and the single virtualized commit stream
 - TanStack Virtual for the commit quick-jump and evaluation indexes
 - Derived job, trial, trajectory, and verifier views
@@ -73,6 +74,13 @@ read-only Git protocol-v2 endpoint from that publication. Clone the mirror with
 remote; a workflow publishes each new `master` commit to Cloudflare after it is
 pushed.
 
+Each browser thread owns an OPFS working tree and an `origin` Cloudflare Git
+remote on branch `nanocodex`. The Files and Commits surfaces read that thread's
+actual Git objects in the browser; file blobs and commit patches are generated
+on demand and released when the view refreshes. Push and pull notifications
+cross the page/agent Worker boundary so an open repository view can preserve
+its last complete render until the replacement snapshot is ready.
+
 ### Live eval view
 
 `/evals` is part of the same production Vite and React application as the
@@ -103,7 +111,7 @@ layers:
   hooks manage the module Worker lifecycle, readiness, commands, and event
   subscriptions without imposing presentation policy.
 - `../js/artifacts` publishes `nanocodex-artifacts`, the framework-independent
-  live React source document, bounded workspace store, and `render_artifact` tool.
+  live React source document and bounded workspace store.
 - `AgentTerminal` is the optimized Ratatui-faithful consumer: native colors,
   rendering hierarchy, queue/steer behavior, `/btw`, historical branch editing,
   branch navigation, per-branch drafts, clipboard images, and key bindings over
@@ -111,20 +119,25 @@ layers:
 
 The module Worker loads the generated `nanocodex-wasm` package, and the Rust
 engine owns the persistent Responses session, typed history, event stream, and
-tool loop. It also opens the stable `nanocodex-home` OPFS workspace and exposes
-that same application-owned handle through bounded file tools and the homepage
-file tree/editor. Uploads, downloads, and edits use the same handle, so files
-survive agent, Worker, and page restarts without being copied into conversation
-snapshots or Cloudflare state. The Cloudflare Worker upgrades `/api/responses` and proxies OpenAI
+tool loop. Each thread opens one OPFS workspace shared by just-bash, Rust
+`apply_patch`, isomorphic-git, the file viewer, commit history, uploads,
+downloads, and the artifact dock. The model receives the standard
+`exec_command` and Rust `apply_patch` tools rather than separate list/read/write
+or Git tools. Shell commands include normal virtual Unix commands plus `git`,
+`gh`, and `artifact`; `git push origin nanocodex` publishes the same objects the
+Commits view reads from the Cloudflare thread remote. Files survive agent,
+Worker, and page restarts without being copied into conversation snapshots.
+The Cloudflare Worker upgrades `/api/responses` and proxies OpenAI
 tool calls. It accepts a user-provided OpenAI key into a one-hour Durable Object
 session and returns only an opaque `HttpOnly`, `SameSite=Strict` cookie. The key
 is never placed in a URL, local storage, React state, or WASM configuration.
 
-The homepage also registers an application-owned `render_artifact` tool. The
-agent emits JavaScript source defining a real React `App`, with `React`, an
-`html` tagged-template helper, and `sendPrompt` supplied by an isolated iframe
-runtime. Documents persist under the private `.nanocodex/artifacts` workspace
-directory and open in a fullscreen dock. Reusing an artifact ID replaces the
+Custom interfaces use the shell instead of a model-specific tool. The agent
+writes JavaScript source defining a real React `App`, then runs
+`artifact publish <source.js> --id <id> --title "<title>"`. `React`, an `html`
+tagged-template helper, and `sendPrompt` are supplied by the isolated iframe
+runtime. Published documents live under `.nanocodex/artifacts` in the same Git
+working tree and open in a fullscreen dock. Reusing an artifact ID replaces the
 interface in place, so voice or text turns can continuously retheme and extend
 it. Generated code has no imports, network access, or access to the parent page;
 explicit `sendPrompt` actions re-enter the normal queued prompt lifecycle.

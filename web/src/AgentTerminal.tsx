@@ -4,6 +4,7 @@ import {
   Suspense,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -17,6 +18,7 @@ import type { ArtifactDocument } from "nanocodex-artifacts";
 import type { Address } from "viem";
 import type { TuiTarget } from "nanocodex-tui";
 import "nanocodex-tui-react/structure.css";
+import "./AgentTerminal.css";
 
 import {
   nanocodexConfig,
@@ -27,10 +29,13 @@ import {
   type WebTuiMessage,
 } from "./nanocodex";
 import { ArtifactDock } from "./ArtifactDock";
-import { WorkspacePanel } from "./WorkspacePanel";
+import { getBrowserThread } from "./workspace";
 
 const MppControls = lazy(async () => ({
   default: (await import("./MppControls")).MppControls,
+}));
+const WorkspacePanel = lazy(async () => ({
+  default: (await import("./WorkspacePanel")).WorkspacePanel,
 }));
 let nextArtifactPromptId = 1_000_000_000;
 let nextVoicePromptId = 2_000_000_000;
@@ -46,11 +51,12 @@ export const AgentTerminal = memo(function AgentTerminal() {
 
 function AgentTerminalDemo() {
   const agent = useNanocodex<WebTuiCommand>();
+  const thread = useMemo(getBrowserThread, []);
   const [transport, setTransport] = useState<AgentTransport>("openai");
   const [credentialSource, setCredentialSource] = useState<CredentialSource | undefined>();
   const [payment, setPayment] = useState<PaymentStatus>();
   const [jsonl, setJsonl] = useState<string[]>([]);
-  const [latestArtifact, setLatestArtifact] = useState<ArtifactDocument>();
+  const [mobilePane, setMobilePane] = useState<"files" | "agent" | "ui">("agent");
   const [sessionId, setSessionId] = useState<string>();
   const [voiceStatus, setVoiceStatus] = useState<string>();
   const voice = useRef<import("./browserVoice").BrowserVoiceSession | undefined>(undefined);
@@ -60,7 +66,6 @@ function AgentTerminalDemo() {
     if (message.type === "mppJsonl") {
       setJsonl((current) => [...current.slice(-99), message.line]);
     }
-    if (message.type === "artifact") setLatestArtifact(message.artifact);
     voice.current?.observe(message);
   });
   useEffect(() => {
@@ -77,13 +82,13 @@ function AgentTerminalDemo() {
     setJsonl([]);
     if (transport !== "openai") return;
     if (credentialSource === "subscription") {
-      nanocodexConfig.restart(startCommand("chatgpt"));
+      nanocodexConfig.restart(startCommand("chatgpt", thread.id));
     } else if (credentialSource === "user" || credentialSource === "deployment") {
-      nanocodexConfig.restart(startCommand("openai"));
+      nanocodexConfig.restart(startCommand("openai", thread.id));
     } else {
       nanocodexConfig.disconnect();
     }
-  }, [credentialSource, transport]);
+  }, [credentialSource, thread.id, transport]);
 
   useEffect(() => () => voice.current?.close(), []);
   useEffect(() => {
@@ -94,8 +99,8 @@ function AgentTerminalDemo() {
   }, [credentialSource, transport]);
 
   const startMpp = useCallback((payerAddress: Address, accessKeyAddress: Address) => {
-    nanocodexConfig.restart(startCommand("mpp", payerAddress, accessKeyAddress));
-  }, []);
+    nanocodexConfig.restart(startCommand("mpp", thread.id, payerAddress, accessKeyAddress));
+  }, [thread.id]);
   const disconnectMpp = useCallback(() => nanocodexConfig.disconnect(), []);
   const promptFromArtifact = useCallback((artifact: ArtifactDocument, prompt: string) => {
     agent.dispatch({
@@ -206,8 +211,13 @@ function AgentTerminalDemo() {
           />
         </Suspense>
       )}
-      <div className="agent-workspace-shell">
-        <WorkspacePanel />
+      <nav className="agent-mobile-nav" aria-label="Workspace view">
+        <button type="button" aria-pressed={mobilePane === "files"} onClick={() => setMobilePane("files")}>Files</button>
+        <button type="button" aria-pressed={mobilePane === "agent"} onClick={() => setMobilePane("agent")}>Agent</button>
+        <button type="button" aria-pressed={mobilePane === "ui"} onClick={() => setMobilePane("ui")}>UI</button>
+      </nav>
+      <div className={`agent-workspace-shell mobile-pane-${mobilePane}`}>
+        <Suspense fallback={null}><WorkspacePanel /></Suspense>
         <NanocodexTui
           key={transport}
           enabled={enabled}
@@ -216,7 +226,6 @@ function AgentTerminalDemo() {
           voiceStatus={voiceStatus}
         />
         <ArtifactDock
-          latest={latestArtifact}
           agentReady={agent.status === "ready"}
           onPrompt={promptFromArtifact}
         />
@@ -225,14 +234,16 @@ function AgentTerminalDemo() {
   );
 }
 
-function startCommand(transport: "openai" | "chatgpt"): WebTuiCommand;
+function startCommand(transport: "openai" | "chatgpt", threadId: string): WebTuiCommand;
 function startCommand(
   transport: "mpp",
+  threadId: string,
   payerAddress: Address,
   accessKeyAddress: Address,
 ): WebTuiCommand;
 function startCommand(
   transport: "openai" | "chatgpt" | "mpp",
+  threadId: string,
   payerAddress?: Address,
   accessKeyAddress?: Address,
 ): WebTuiCommand {
@@ -242,6 +253,7 @@ function startCommand(
     return {
       accessKeyAddress,
       type: "start",
+      threadId,
       transport,
       payerAddress,
       thinking: "none",
@@ -250,6 +262,7 @@ function startCommand(
   }
   return {
     type: "start",
+    threadId,
     transport,
     thinking: "high",
     reasoningMode: "standard",

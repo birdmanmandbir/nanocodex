@@ -12,6 +12,7 @@ import {
   Sun,
   X,
 } from "lucide-react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   Suspense,
   lazy,
@@ -27,6 +28,8 @@ import type { CodeBrowserHandle } from "./CodeBrowser";
 import type { CommitCodeStreamHandle } from "./CommitCodeStream";
 import { fuzzyScore } from "./fuzzy";
 import { pathForSurface, surfaceFromUrl, type Surface } from "./navigation";
+import type { HarnessCommit, RepositorySnapshot } from "./threadRepositorySnapshot";
+import { getBrowserThread } from "./workspace";
 
 const Evals = lazy(() =>
   import("./Evals").then((module) => ({ default: module.Evals }))
@@ -36,25 +39,21 @@ const AgentTerminal = lazy(() =>
     default: module.AgentTerminal,
   }))
 );
-const loadPierreWorkerProvider = () => import("./PierreWorkerProvider");
-const loadCodeBrowser = () => import("./CodeBrowser");
-const loadCommitCodeStream = () => import("./CommitCodeStream");
-const loadVirtualCommitList = () => import("./VirtualCommitList");
 const PierreWorkerProvider = lazy(() =>
-  loadPierreWorkerProvider().then((module) => ({
+  import("./PierreWorkerProvider").then((module) => ({
     default: module.PierreWorkerProvider,
   }))
 );
 const CodeBrowser = lazy(() =>
-  loadCodeBrowser().then((module) => ({ default: module.CodeBrowser }))
+  import("./CodeBrowser").then((module) => ({ default: module.CodeBrowser }))
 );
 const CommitCodeStream = lazy(() =>
-  loadCommitCodeStream().then((module) => ({
+  import("./CommitCodeStream").then((module) => ({
     default: module.CommitCodeStream,
   }))
 );
 const VirtualCommitList = lazy(() =>
-  loadVirtualCommitList().then((module) => ({
+  import("./VirtualCommitList").then((module) => ({
     default: module.VirtualCommitList,
   })),
 );
@@ -62,132 +61,21 @@ const VirtualCommitList = lazy(() =>
 export type Theme = "light" | "dark";
 type Scope = "all" | "eval" | "fix" | "docs" | "perf";
 type ProposalState = "ready" | "submitting" | "payment-required";
-type RepositoryFile = {
-  path: string;
-  mode: string;
-  objectId: string;
-  size: number | null;
-  contentUrl: string | null;
-};
-
-export type ChangedFile = {
-  path: string;
-  previousPath: string | null;
-  status: string;
-  additions: number | null;
-  deletions: number | null;
-};
-
-export type HarnessCommit = {
-  hash: string;
-  shortHash: string;
-  parents: string[];
-  author: string;
-  authoredAt: string;
-  refs: string[];
-  subject: string;
-  body: string;
-  files: ChangedFile[];
-  stats: {
-    files: number;
-    additions: number;
-    deletions: number;
-  };
-};
-
-type RepositorySnapshot = {
-  repository: {
-    fullName: string;
-    branch: string;
-    head: string;
-    totalCommits: number;
-    indexedCommits?: number;
-    commitPageSize?: number;
-    dirty: boolean;
-    dirtyCount: number;
-  };
-  generatedAt: string;
-  tree: RepositoryFile[];
-};
 
 const emptyCommits: HarnessCommit[] = [];
-let repositorySnapshotPromise: Promise<RepositorySnapshot> | undefined;
-let repositorySnapshotLoadedAt = 0;
-const repositoryCommitPagePromises = new Map<string, Promise<HarnessCommit[]>>();
-const REPOSITORY_SNAPSHOT_TTL_MS = 60_000;
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      gcTime: 30 * 60 * 1_000,
+      refetchOnWindowFocus: false,
+      retry: 2,
+    },
+  },
+});
 
-function loadRepositorySnapshot(refresh = false): Promise<RepositorySnapshot> {
-  if (
-    repositorySnapshotPromise &&
-    (repositorySnapshotLoadedAt === 0 || !refresh || Date.now() - repositorySnapshotLoadedAt < REPOSITORY_SNAPSHOT_TTL_MS)
-  ) return repositorySnapshotPromise;
-  const url = import.meta.env.DEV
-    ? "/__nanocodex/repository/snapshot"
-    : "/api/repository/snapshot";
-  const request = fetch(url, {
-    cache: import.meta.env.DEV ? "no-store" : "default",
-  }).then(async (response) => {
-    if (!response.ok) {
-      throw new Error(`Repository request failed (${response.status})`);
-    }
-    const snapshot = await response.json() as RepositorySnapshot;
-    const generation = response.headers.get("x-repository-generation");
-    if (generation && generation !== snapshot.repository.head) {
-      throw new Error("Repository snapshot generation mismatch");
-    }
-    repositorySnapshotLoadedAt = Date.now();
-    return snapshot;
-  }).catch((error) => {
-    if (repositorySnapshotPromise === request) repositorySnapshotPromise = undefined;
-    throw error;
-  });
-  repositorySnapshotPromise = request;
-  return request;
-}
-
-function loadRepositoryCommitPage(
-  generation: string,
-  page: number,
-): Promise<HarnessCommit[]> {
-  const cacheKey = `${generation}:${page}`;
-  const existing = repositoryCommitPagePromises.get(cacheKey);
-  if (existing) return existing;
-  const base = import.meta.env.DEV
-    ? "/__nanocodex/repository/commits"
-    : "/api/repository/commits";
-  const url = `${base}?page=${page}&generation=${generation}`;
-  const request = fetch(url, {
-    cache: import.meta.env.DEV ? "no-store" : "default",
-  }).then((response) => {
-    if (!response.ok) {
-      throw new Error(`Commit page request failed (${response.status})`);
-    }
-    const responseGeneration = response.headers.get("x-repository-generation");
-    if (!import.meta.env.DEV && responseGeneration !== generation) {
-      throw new Error("Commit page generation mismatch");
-    }
-    return response.json() as Promise<HarnessCommit[]>;
-  }).catch((error) => {
-    repositoryCommitPagePromises.delete(cacheKey);
-    throw error;
-  });
-  repositoryCommitPagePromises.set(cacheKey, request);
-  return request;
-}
-
-function preloadCodeSurface() {
-  void loadRepositorySnapshot();
-  void loadPierreWorkerProvider();
-  void loadCodeBrowser();
-}
-
-function preloadCommitSurface() {
-  void loadRepositorySnapshot().then((snapshot) =>
-    loadRepositoryCommitPage(snapshot.repository.head, 0)
-  );
-  void loadPierreWorkerProvider();
-  void loadCommitCodeStream();
-  void loadVirtualCommitList();
+function loadRepositorySnapshot(): Promise<RepositorySnapshot> {
+  return import("./threadRepositorySnapshot")
+    .then((module) => module.loadThreadRepositorySnapshot());
 }
 
 const scopes: Array<{ id: Scope; label: string }> = [
@@ -230,23 +118,30 @@ function commitSearchScore(commit: HarnessCommit, tokens: readonly string[]) {
 const installCommand =
   "curl -fsSL https://nanocodex.paradigm.xyz | bash";
 
-function RepositorySurfaceError() {
+function RepositorySurfaceLoading({ failed }: { failed: boolean }) {
+  if (!failed) return null;
   return (
-    <section className="requests-empty page-grid" role="alert">
+    <section className="requests-empty page-grid" aria-live="polite">
       <GitBranch aria-hidden="true" />
       <p className="eyebrow">Repository</p>
-      <h1>Repository data unavailable.</h1>
+      <h1>Thread repository unavailable.</h1>
+      <p>Return to the agent workspace and retry the thread pull.</p>
     </section>
   );
 }
 
 export function NanocodexApp() {
-  return <NanocodexShell />;
+  return (
+    <QueryClientProvider client={queryClient}>
+      <NanocodexShell />
+    </QueryClientProvider>
+  );
 }
 
 function NanocodexShell() {
   const location = useLocation();
   const navigate = useNavigate();
+  const thread = useMemo(getBrowserThread, []);
   const [theme, setTheme] = useState<Theme>(() => {
     const initialTheme = document.documentElement.dataset.theme;
     if (initialTheme === "dark" || initialTheme === "light")
@@ -260,8 +155,6 @@ function NanocodexShell() {
     searchParams: new URLSearchParams(location.search),
   });
   const [snapshot, setSnapshot] = useState<RepositorySnapshot>();
-  const [commits, setCommits] = useState<HarnessCommit[]>(emptyCommits);
-  const [commitsLoaded, setCommitsLoaded] = useState(false);
   const [repositoryLoadError, setRepositoryLoadError] = useState(false);
   const [scope, setScope] = useState<Scope>("all");
   const [query, setQuery] = useState("");
@@ -276,12 +169,11 @@ function NanocodexShell() {
   const headerCenterRef = useRef<HTMLDivElement>(null);
   const codeBrowserRef = useRef<CodeBrowserHandle>(null);
   const commitStreamRef = useRef<CommitCodeStreamHandle>(null);
-  const nextCommitPageRef = useRef(0);
-  const commitPageLoadRef = useRef<Promise<boolean> | null>(null);
-  const repositoryGenerationRef = useRef<string | undefined>(undefined);
-  const indexedCommitCount = snapshot?.repository.indexedCommits ??
-    snapshot?.repository.totalCommits ?? commits.length;
+  const snapshotRef = useRef<RepositorySnapshot | undefined>(undefined);
+  const repositoryRequestId = useRef(0);
+  snapshotRef.current = snapshot;
 
+  const commits = snapshot?.commits ?? emptyCommits;
   const selected = useMemo(
     () =>
       commits.find((commit) => commit.hash === selectedHash) ??
@@ -349,135 +241,54 @@ function NanocodexShell() {
     [commits, queryTokens, searchOpen],
   );
 
-  useEffect(() => {
-    const needsRepository =
-      surface === "code" || surface === "commits" || proposalOpen;
-    if (!needsRepository || snapshot) return;
-    let active = true;
+  const refreshRepository = useCallback(() => {
+    const requestId = ++repositoryRequestId.current;
     setRepositoryLoadError(false);
     void loadRepositorySnapshot().then(
       (loaded) => {
-        if (!active) return;
-        repositoryGenerationRef.current = loaded.repository.head;
-        setSnapshot(loaded);
-        setSelectedHash((current) => current ?? loaded.repository.head);
-      },
-      () => {
-        if (active) setRepositoryLoadError(true);
-      },
-    );
-    return () => {
-      active = false;
-    };
-  }, [proposalOpen, snapshot, surface]);
-
-  useEffect(() => {
-    if (surface === "code") preloadCodeSurface();
-    if (surface === "commits") preloadCommitSurface();
-  }, [surface]);
-
-  useEffect(() => {
-    if (surface !== "home") return;
-    const preload = () => {
-      preloadCodeSurface();
-      preloadCommitSurface();
-    };
-    if ("requestIdleCallback" in window) {
-      const id = window.requestIdleCallback(preload, { timeout: 1_500 });
-      return () => window.cancelIdleCallback(id);
-    }
-    const id = setTimeout(preload, 1_000);
-    return () => clearTimeout(id);
-  }, [surface]);
-
-  useEffect(() => {
-    const needsCommits = surface === "commits" || proposalOpen;
-    if (!needsCommits || commitsLoaded) return;
-    let active = true;
-    setRepositoryLoadError(false);
-    if (!snapshot) return;
-    repositoryGenerationRef.current = snapshot.repository.head;
-    void loadRepositoryCommitPage(snapshot.repository.head, 0).then(
-      (loaded) => {
-        if (!active) return;
-        setCommits(loaded);
-        nextCommitPageRef.current = 1;
-        setCommitsLoaded(true);
-      },
-      () => {
-        if (active) setRepositoryLoadError(true);
-      },
-    );
-    return () => {
-      active = false;
-    };
-  }, [commitsLoaded, proposalOpen, snapshot, surface]);
-
-  const loadNextCommitPage = useCallback((): Promise<boolean> => {
-    if (
-      snapshot == null ||
-      commits.length >= indexedCommitCount
-    ) {
-      return Promise.resolve(false);
-    }
-    if (commitPageLoadRef.current != null) return commitPageLoadRef.current;
-    const page = nextCommitPageRef.current;
-    const generation = snapshot.repository.head;
-    const request = loadRepositoryCommitPage(generation, page)
-      .then((loaded) => {
-        if (repositoryGenerationRef.current !== generation) return false;
-        if (loaded.length === 0) return false;
-        setCommits((current) => {
-          const known = new Set(current.map((commit) => commit.hash));
-          return [...current, ...loaded.filter((commit) => !known.has(commit.hash))];
-        });
-        nextCommitPageRef.current = page + 1;
-        return true;
-      })
-      .finally(() => {
-        commitPageLoadRef.current = null;
-      });
-    commitPageLoadRef.current = request;
-    return request;
-  }, [commits.length, indexedCommitCount, snapshot]);
-
-  useEffect(() => {
-    const needsRepository = surface === "code" || surface === "commits" || proposalOpen;
-    if (!needsRepository || !snapshot) return;
-    let active = true;
-    const refresh = () => {
-      void loadRepositorySnapshot(true).then(async (loaded) => {
-        if (!active || loaded.repository.head === repositoryGenerationRef.current) return;
-        const firstPage = commitsLoaded || surface === "commits" || proposalOpen
-          ? await loadRepositoryCommitPage(loaded.repository.head, 0)
-          : undefined;
-        if (!active) return;
-        repositoryGenerationRef.current = loaded.repository.head;
-        commitPageLoadRef.current = null;
-        nextCommitPageRef.current = firstPage ? 1 : 0;
-        setSnapshot(loaded);
-        if (firstPage) {
-          setCommits(firstPage);
-          setCommitsLoaded(true);
+        if (repositoryRequestId.current !== requestId) {
+          loaded.release();
+          return;
         }
-      }).catch((error) => {
-        console.warn("Failed to refresh repository publication", error);
-      });
-    };
-    const interval = window.setInterval(refresh, REPOSITORY_SNAPSHOT_TTL_MS);
-    return () => {
-      active = false;
-      window.clearInterval(interval);
-    };
-  }, [commitsLoaded, proposalOpen, snapshot, surface]);
+        setSnapshot((current) => {
+          current?.release();
+          return loaded;
+        });
+        setSelectedHash((current) => current && loaded.commits.some(({ hash }) => hash === current)
+          ? current
+          : loaded.repository.head);
+      },
+      () => {
+        if (repositoryRequestId.current === requestId) setRepositoryLoadError(true);
+      },
+    );
+  }, []);
 
   useEffect(() => {
-    const filtering = scope !== "all" || queryTokens.length > 0;
-    if (!filtering || commits.length >= indexedCommitCount) return;
-    void loadNextCommitPage().catch((error) => {
-      console.warn("Failed to complete commit metadata for filtering", error);
+    const needsRepository =
+      surface === "code" || surface === "commits" || proposalOpen;
+    if (needsRepository && !snapshot) refreshRepository();
+  }, [proposalOpen, refreshRepository, snapshot, surface]);
+
+  useEffect(() => {
+    let unsubscribe: (() => void) | undefined;
+    let active = true;
+    void import("./threadGit").then(({ subscribeThreadGitChanges }) => {
+      if (!active) return;
+      unsubscribe = subscribeThreadGitChanges(thread, () => {
+        if (snapshotRef.current) refreshRepository();
+      });
     });
-  }, [commits.length, indexedCommitCount, loadNextCommitPage, queryTokens.length, scope]);
+    return () => {
+      active = false;
+      unsubscribe?.();
+    };
+  }, [refreshRepository, thread]);
+
+  useEffect(() => () => {
+    repositoryRequestId.current++;
+    snapshotRef.current?.release();
+  }, []);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -487,9 +298,13 @@ function NanocodexShell() {
     localStorage.setItem("nanocodex-theme", theme);
   }, [theme]);
 
+  const threadSurfacePath = useCallback(
+    (nextSurface: Surface) => `${pathForSurface(nextSurface)}?thread=${thread.id}`,
+    [thread.id],
+  );
   const navigateToSurface = useCallback((nextSurface: Surface) => {
-    navigate(pathForSurface(nextSurface));
-  }, [navigate]);
+    navigate(threadSurfacePath(nextSurface));
+  }, [navigate, threadSurfacePath]);
 
   useLayoutEffect(() => {
     const headerCenter = headerCenterRef.current;
@@ -600,12 +415,14 @@ function NanocodexShell() {
   }, [navigateToSurface, surface]);
 
   const selectCommit = (commit: HarnessCommit) => {
+    const index = commits.findIndex(
+      (candidate) => candidate.hash === commit.hash
+    );
     setSelectedHash(commit.hash);
-    const index = commits.findIndex((candidate) => candidate.hash === commit.hash);
-    if (index >= 0) commitStreamRef.current?.scrollToCommit(index);
     setSearchOpen(false);
     setCommitRailOpen(false);
     setQuery("");
+    if (index >= 0) commitStreamRef.current?.scrollToCommit(index);
   };
 
   const submitProposal = async () => {
@@ -631,7 +448,7 @@ function NanocodexShell() {
         <header className="site-header">
           <a
             className="wordmark"
-            href="/"
+            href={threadSurfacePath("home")}
             aria-label="nanocodex home"
             onClick={(event) => {
               event.preventDefault();
@@ -644,9 +461,7 @@ function NanocodexShell() {
             <nav className="surface-switch" aria-label="Repository surfaces">
               <a
                 className={surface === "code" ? "is-active" : ""}
-                href={pathForSurface("code")}
-                onPointerEnter={preloadCodeSurface}
-                onFocus={preloadCodeSurface}
+                href={threadSurfacePath("code")}
                 onClick={(event) => {
                   event.preventDefault();
                   navigateToSurface("code");
@@ -656,9 +471,7 @@ function NanocodexShell() {
               </a>
               <a
                 className={surface === "commits" ? "is-active" : ""}
-                href={pathForSurface("commits")}
-                onPointerEnter={preloadCommitSurface}
-                onFocus={preloadCommitSurface}
+                href={threadSurfacePath("commits")}
                 onClick={(event) => {
                   event.preventDefault();
                   navigateToSurface("commits");
@@ -668,7 +481,7 @@ function NanocodexShell() {
               </a>
               <a
                 className={surface === "requests" ? "is-active" : ""}
-                href={pathForSurface("requests")}
+                href={threadSurfacePath("requests")}
                 onClick={(event) => {
                   event.preventDefault();
                   navigateToSurface("requests");
@@ -678,7 +491,7 @@ function NanocodexShell() {
               </a>
               <a
                 className={surface === "evals" ? "is-active" : ""}
-                href={pathForSurface("evals")}
+                href={threadSurfacePath("evals")}
                 onClick={(event) => {
                   event.preventDefault();
                   navigateToSurface("evals");
@@ -734,11 +547,19 @@ function NanocodexShell() {
                     </p>
                   </header>
 
-                  <div className="agent-demo-slot">
-                    <Suspense fallback={null}>
-                      <AgentTerminal />
-                    </Suspense>
-                  </div>
+                  <Suspense
+                    fallback={
+                      <section
+                        className="agent-tui agent-tui-loading"
+                        aria-label="Nanocodex terminal"
+                        aria-busy="true"
+                      >
+                        Loading agent…
+                      </section>
+                    }
+                  >
+                    <AgentTerminal />
+                  </Suspense>
 
                   <section
                     className="home-release-section"
@@ -860,18 +681,19 @@ function NanocodexShell() {
           ) : surface === "code" ? snapshot ? (
             <Suspense fallback={null}>
               <PierreWorkerProvider>
-                <CodeBrowser
-                  ref={codeBrowserRef}
-                  files={snapshot.tree}
-                  branch={snapshot.repository.branch}
+                  <CodeBrowser
+                    key={snapshot.repository.head}
+                    ref={codeBrowserRef}
+                    files={snapshot.tree}
+                    branch={snapshot.repository.branch}
                   head={snapshot.repository.head}
                   theme={theme}
                 />
               </PierreWorkerProvider>
             </Suspense>
           ) : (
-            repositoryLoadError ? <RepositorySurfaceError /> : null
-          ) : surface === "commits" ? snapshot && commitsLoaded ? (
+            <RepositorySurfaceLoading failed={repositoryLoadError} />
+          ) : surface === "commits" ? snapshot ? (
             <Suspense fallback={null}>
               <PierreWorkerProvider>
                 <section
@@ -901,7 +723,7 @@ function NanocodexShell() {
                       <strong id="history-title">Jump to commit</strong>
                       <span>
                         <GitBranch aria-hidden="true" />{" "}
-                        {snapshot.repository.branch} · {indexedCommitCount}
+                        {snapshot.repository.branch} · {snapshot.commits.length}
                       </span>
                     </div>
                     <nav
@@ -939,12 +761,7 @@ function NanocodexShell() {
                         key={item.id}
                         onClick={() => setScope(item.id)}
                       >
-                      {item.label}{" "}
-                      <span>
-                        {item.id === "all"
-                          ? indexedCommitCount
-                          : scopeCounts[item.id]}
-                      </span>
+                      {item.label} <span>{scopeCounts[item.id]}</span>
                       </button>
                     ))}
                   </nav>
@@ -964,39 +781,29 @@ function NanocodexShell() {
                     </div>
                   ) : null}
 
-                  <Suspense fallback={null}>
+                  <Suspense fallback={<div className="commit-list" />}>
                     <VirtualCommitList
                       commits={filteredCommits}
-                      hasMore={
-                        queryTokens.length === 0 &&
-                        scope === "all" &&
-                        commits.length < indexedCommitCount
-                      }
                       selectedHash={selected?.hash}
                       onClearSearch={() => setQuery("")}
-                      onLoadMore={loadNextCommitPage}
                       onSelectCommit={selectCommit}
                     />
                   </Suspense>
                 </aside>
-                {commits.length > 0 ? (
                 <Suspense fallback={null}>
                   <CommitCodeStream
                     ref={commitStreamRef}
                     commits={commits}
-                    hasMoreCommits={commits.length < indexedCommitCount}
                     onOpenCommitRail={() => setCommitRailOpen(true)}
-                    onLoadMoreCommits={loadNextCommitPage}
+                    patchUrl={snapshot.commitPatchUrl}
                     theme={theme}
-                    totalCommitCount={indexedCommitCount}
                   />
                 </Suspense>
-                ) : null}
                 </section>
               </PierreWorkerProvider>
             </Suspense>
           ) : (
-            repositoryLoadError ? <RepositorySurfaceError /> : null
+            <RepositorySurfaceLoading failed={repositoryLoadError} />
           ) : surface === "requests" ? (
             <section
               className="requests-empty page-grid"
@@ -1011,7 +818,7 @@ function NanocodexShell() {
               </p>
             </section>
           ) : (
-            <Suspense fallback={null}>
+            <Suspense fallback={<section className="eval-surface-loading" aria-busy="true">Loading evals…</section>}>
               <Evals />
             </Suspense>
           )}
@@ -1097,12 +904,14 @@ function NanocodexShell() {
               </button>
               <p className="eyebrow">MPP proposal gate · testnet preview</p>
               <h2 id="proposal-title">Propose a change</h2>
-              {!snapshot || !selected ? (
-                repositoryLoadError ? (
-                  <p className="proposal-intro" role="alert">
-                    Repository data is unavailable.
-                  </p>
-                ) : null
+              {!snapshot ? repositoryLoadError ? (
+                <p className="proposal-intro">
+                  The thread repository is unavailable. Return to the agent workspace and retry the pull.
+                </p>
+              ) : null : !selected ? (
+                <p className="proposal-intro">
+                  Commit and push the thread workspace before proposing a change.
+                </p>
               ) : proposalState === "payment-required" ? (
                 <div className="payment-required">
                   <div className="payment-mark">402</div>
@@ -1155,7 +964,9 @@ function NanocodexShell() {
                     disabled={proposalState === "submitting"}
                     onClick={submitProposal}
                   >
-                    Continue to payment
+                    {proposalState === "submitting"
+                      ? "Requesting challenge…"
+                      : "Continue to payment"}
                     <ArrowUpRight aria-hidden="true" />
                   </button>
                 </>
