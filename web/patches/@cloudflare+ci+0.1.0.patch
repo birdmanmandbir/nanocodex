@@ -147,7 +147,7 @@ index aa6068d..9a43284 100644
  
  export type RunStepResult<S> = RunOutput & {
 diff --git a/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts b/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
-index a7f6c05..944da22 100644
+index a7f6c05..b99c385 100644
 --- a/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
 +++ b/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
 @@ -1,7 +1,11 @@
@@ -228,7 +228,7 @@ index a7f6c05..944da22 100644
          {
            cwd: resolveCwd(input.cwd),
            env: {
-@@ -81,61 +100,334 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -81,61 +100,359 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
            autoCleanup: false,
          }
        );
@@ -252,7 +252,8 @@ index a7f6c05..944da22 100644
 +      const persistedLogsPromise = persistLogs(
 +        this.env.BACKUP_BUCKET,
 +        input,
-+        await readLogs(sandbox)
++        await readLogs(sandbox),
++        logMetadata
 +      );
  
        if (exitCode !== 0) {
@@ -408,7 +409,7 @@ index a7f6c05..944da22 100644
 +        }
 +      }
 +      const stream = await sandbox.readFileStream(output.path);
-+      const object = await bucket.put(output.key, stream, {
++      const object = await putFixedLengthStream(bucket, output.key, stream, file.size, {
 +        onlyIf: { etagDoesNotMatch: '*' },
 +        ...(sha256 ? { sha256 } : {}),
 +        ...(output.contentType
@@ -509,12 +510,13 @@ index a7f6c05..944da22 100644
 +  logs: {
 +    stdout: string | ReadableStream<Uint8Array>;
 +    stderr: string | ReadableStream<Uint8Array>;
-+  }
++  },
++  metadata: { stdout: LogCaptureMetadata; stderr: LogCaptureMetadata }
 +) {
 +  const prefix = `runs/${input.sourceSha}/steps/${slugify(input.label)}/attempts/${input.attempt}`;
 +  const [stdout, stderr] = await Promise.all([
-+    persistLog(bucket, `${prefix}/stdout.log`, logs.stdout),
-+    persistLog(bucket, `${prefix}/stderr.log`, logs.stderr),
++    persistLog(bucket, `${prefix}/stdout.log`, logs.stdout, metadata.stdout.bytesStored),
++    persistLog(bucket, `${prefix}/stderr.log`, logs.stderr, metadata.stderr.bytesStored),
 +  ]);
 +  return { stdout, stderr };
 +}
@@ -567,13 +569,36 @@ index a7f6c05..944da22 100644
 +async function persistLog(
 +  bucket: R2Bucket,
 +  key: string,
-+  value: string | ReadableStream<Uint8Array>
++  value: string | ReadableStream<Uint8Array>,
++  size: number
 +) {
-+  const object = await bucket.put(key, value, {
++  const options = {
 +    httpMetadata: { contentType: 'text/plain; charset=utf-8' },
-+  });
++  };
++  const object = typeof value === 'string'
++    ? await bucket.put(key, value, options)
++    : await putFixedLengthStream(bucket, key, value, size, options);
 +  if (!object) throw new Error(`Failed to persist CI failure log ${key}`);
 +  return { key, size: object.size };
++}
++
++async function putFixedLengthStream(
++  bucket: R2Bucket,
++  key: string,
++  stream: ReadableStream<Uint8Array>,
++  size: number,
++  options: R2PutOptions
++) {
++  const fixed = new FixedLengthStream(size);
++  const piping = stream.pipeTo(fixed.writable);
++  try {
++    const object = await bucket.put(key, fixed.readable, options);
++    await piping;
++    return object;
++  } catch (error) {
++    await piping.catch(() => undefined);
++    throw error;
++  }
 +}
 +
 +function shellQuote(value: string) {
@@ -603,7 +628,7 @@ index a7f6c05..944da22 100644
  async function readLogs(sandbox: ReturnType<typeof getSandbox>) {
    const listing = await sandbox.listFiles('/tmp');
    const sizes = new Map(
-@@ -192,51 +484,22 @@ function resolveCwd(cwd: string | undefined) {
+@@ -192,51 +509,22 @@ function resolveCwd(cwd: string | undefined) {
    return posix.join(WORKSPACE_DIR, normalized);
  }
  

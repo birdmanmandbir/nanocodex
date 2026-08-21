@@ -108,6 +108,9 @@ test("terminal gates skip snapshots and publish the website artifact in-place", 
   assert.match(sandboxRunner, /input\.createSnapshot/);
   assert.match(sandboxRunner, /persistOutputs/);
   assert.match(sandboxRunner, /checksum mismatch/);
+  assert.match(sandboxRunner, /new FixedLengthStream\(size\)/);
+  assert.match(sandboxRunner, /metadata\.stdout\.bytesStored/);
+  assert.match(sandboxRunner, /putFixedLengthStream\(bucket, output\.key, stream, file\.size/);
   assert.match(sandboxRunner, /let localRestoreTail = Promise\.resolve\(\)/);
   assert.match(sandboxRunner, /await restoreSnapshot\(sandbox, input\.restore, this\.env\)/);
   assert.match(sandboxRunner, /env\.ENVIRONMENT !== 'development'/);
