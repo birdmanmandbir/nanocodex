@@ -101,14 +101,148 @@ npm run publish:repository
 The replacement is accepted only while the stored publication is invalid; it
 cannot overwrite a valid generation or bypass its compare-and-swap head.
 
+### Cloudflare-native CI
+
+The repository also contains an application-owned CI control plane built from
+Workers, Workflows, Containers, Durable Objects, and R2. It does not use
+GitHub Actions, GitHub webhooks, GitHub status APIs, or Cloudflare Artifacts.
+The existing browser-thread Git receiver remains unchanged and the public Git
+mirror stays read-only.
+
+A trusted publisher creates a deterministic compressed archive of exactly the
+committed `master` tree plus a Git-blob manifest used for dependency-cache
+fingerprints. Git replacement objects, grafts, unsafe local Git configuration,
+global/system Git configuration, untracked files, tracked changes, and gitlinks
+are rejected or isolated before publication. The two objects are uploaded
+immutably to R2 before one Durable Object
+compare-and-swap advances the source head. That same transaction writes a
+dispatch outbox. Its alarm starts the Workflow with the deterministic ID
+`ci-<commit>`, so an upload retry, a lost HTTP response, or a lost Workflow
+create acknowledgement cannot create a second logical run.
+
+Each Workflow checks out its immutable commit archive rather than resolving the
+latest source head. A Cargo cache is keyed by the exact workspace manifest
+graph; a second combined cache is keyed by those manifests plus the exact npm
+project manifests, lockfiles, and patch-package inputs and retains Cargo sources
+plus only the twelve declared project-root `node_modules` trees. Git-sourced
+Cargo packages are restored from an immutable,
+checksum-verified R2 bundle keyed by the committed `Cargo.lock` blob before
+`cargo fetch`; a cold runner never clones those dependencies from GitHub.
+After the shared Cargo download cache, the MSRV, policy, VM, Python, npm, and
+stable-build-snapshot branches start concurrently. The native target snapshot
+is never reused across commits because build scripts and proc macros make it
+executable state; stable tests and quality reuse it only within the same run
+while the other branches continue, reaching
+up to eight-way `standard-4` fanout; ten container slots leave room for parent
+runners that are still draining logs. The bindings gate streams only its small
+tested WASM package to R2 and skips its otherwise multi-gigabyte workspace
+snapshot. The website starts from the retained dependency snapshot, restores
+that checksum-verified WASM package, and streams its tested deployment tar
+straight back to R2. Correctness runners are not skipped by cache or retried;
+only network-backed dependency preparation gets one retry.
+Success and failure logs, step records, final results, required parent/cache
+snapshots, and cache pointers are retained in the
+`nanocodex-ci` R2 bucket; no separate hosted artifact product is required.
+All nine terminal Rust, Python, bindings, and website runners explicitly skip
+workspace snapshots.
+Immutable source archives live in the separately credentialed
+`nanocodex-ci-source` bucket.
+
+Runner output is captured through a bounded 32 MiB head plus 32 MiB tail per
+stream. The step record includes observed/stored byte counts and a truncation
+flag. Every command uploads those bounded logs directly to R2 before its
+Sandbox is destroyed, while Workflow state carries only the small preview and
+R2 references. Timeout cleanup terminates the command process group, drains the
+capture FIFOs, and retains the early diagnostic before recording a typed
+timeout failure. Snapshot creation and log finalization have a separate
+five-minute Workflow margin beyond each command timeout. The pinned
+`@cloudflare/ci` 0.1.0 package is patched by `postinstall` to provide this
+behavior until the runner exposes the same R2 log sink upstream. Runner images
+also pin Node 22.15.0, both Python interpreters, the Rust and MSRV toolchains,
+and every installed Cargo utility; a floating package-manager runtime cannot
+silently change the gate.
+
+Create both buckets, configure S3 API credentials scoped only to the backup
+bucket, and set separate source-publication and Workflow-control tokens before
+the first deployment:
+
+```bash
+cd web
+npx wrangler r2 bucket create nanocodex-ci
+npx wrangler r2 bucket create nanocodex-ci-source
+npx wrangler r2 bucket lifecycle add nanocodex-ci ci-backups backups/ --expire-days 31 --force
+npx wrangler r2 bucket lifecycle add nanocodex-ci ci-cache cache/ --expire-days 31 --force
+npx wrangler r2 bucket lifecycle add nanocodex-ci ci-runs runs/ --expire-days 90 --force
+npx wrangler secret put CI_SOURCE_WRITE_TOKEN
+npx wrangler secret put CI_CONTROL_TOKEN
+npx wrangler secret put R2_ACCESS_KEY_ID
+npx wrangler secret put R2_SECRET_ACCESS_KEY
+npm run deploy
+```
+
+Sandbox TTLs are restore-time checks, not physical deletion. The three
+lifecycle rules above are therefore required to bound backup, cache-pointer,
+and run-evidence storage. The Durable Object separately removes source objects
+when their terminal run ages out of the retained 100-run index. Development
+uses `nanocodex-ci-development` and `nanocodex-ci-source-development`; create
+those buckets and configure separate `--env development` secrets rather than
+reusing production credentials or cache state.
+
+Publish the RustSec snapshot and lockfile-addressed Git dependency bundle, then
+publish a clean committed `master` checkout from the trusted machine. Neither
+dependency publisher contacts a remote: the RustSec publisher rematerializes
+the selected commit through a local shallow fetch into a fresh sanitized Git
+repository, while the Cargo publisher verifies that every required cached Git
+checkout is the exact clean lockfile revision before packing it in offline
+mode. Publisher subprocesses receive no CI publication token. Existing immutable
+objects are reused without rebuilding or uploading bytes.
+
+```bash
+NANOCODEX_CI_ORIGIN=https://nanocodex.me-7fb.workers.dev \
+NANOCODEX_CI_TOKEN=... \
+NANOCODEX_RUSTSEC_REPO=/path/to/advisory-db \
+npm run publish:ci-rustsec
+
+NANOCODEX_CI_ORIGIN=https://nanocodex.me-7fb.workers.dev \
+NANOCODEX_CI_TOKEN=... \
+npm run publish:ci-cargo-vendor
+
+NANOCODEX_CI_ORIGIN=https://nanocodex.me-7fb.workers.dev \
+NANOCODEX_CI_TOKEN=... \
+NANOCODEX_RUSTSEC_REVISION=<full-published-advisory-db-commit> \
+npm run publish:ci-source
+```
+
+`GET /api/ci/runs` and `GET /api/ci/runs/<40-hex-commit>` expose the retained
+Workflow/result state. Successful bindings and website gates export their
+tested archives directly to immutable, checksum-verified R2 and serve them at
+`GET /api/ci/runs/<40-hex-commit>/artifacts/{web-wasm,web-dist}.tar`; this is the
+owned replacement for a hosted artifact service. Step records and logs are available
+under `GET /api/ci/runs/<commit>/steps/<step>/{result.json,stdout.log,stderr.log}`.
+An authenticated `POST` request to
+the latter path's `/terminate` action uses `CI_CONTROL_TOKEN`. Runs are not
+restarted in place because commit-addressed evidence is immutable; publish a
+new commit for a new run. The publisher's
+`NANOCODEX_CI_TOKEN` must contain the value configured as
+`CI_SOURCE_WRITE_TOKEN`. The archive URL is
+public and commit-addressed because this is a public source repository; write
+authority and R2 backup credentials never enter a runner or checkout URL.
+
+This Worker pipeline covers every current Linux test, quality, policy,
+VM-guest, browser/WASM, Python, and website gate. Cloudflare Containers are
+Linux-only, so the existing macOS matrix entry cannot run on this substrate;
+the CodeQL workflow scan, production promotion, release, and nightly workflows
+are outside this first CI slice. Every run pins the exact RustSec
+revision and owned archive checksum, verifies the extracted Git checkout, and
+runs `cargo deny --frozen check`; neither the policy gate nor cold Cargo setup
+contacts GitHub.
+
 Production serves the website indexes, immutable file and patch objects, and a
 read-only Git protocol-v2 endpoint from that publication. Clone the mirror with
-`git clone https://nanocodex.me-7fb.workers.dev/git`. GitHub remains the write
-remote. After each current `master` commit passes CI, the website job deploys
-the exact tested Worker with that SHA, waits for `/api/health` to return it as
-`deployment_sha`, publishes the repository generation, and verifies both the
-snapshot and Git protocol advertise the same SHA. An obsolete queued CI run is
-not allowed to deploy or publish.
+`git clone https://nanocodex.me-7fb.workers.dev/git`. This CI slice deliberately
+stops at the checksum-addressed tested deployment tar; it does not deploy or
+publish production state. Promotion can consume that exact artifact later
+without adding GitHub to the CI runtime.
 
 Each browser thread owns an OPFS working tree and an `origin` Cloudflare Git
 remote on branch `nanocodex`. The Files and Commits surfaces read that thread's
@@ -244,13 +378,9 @@ scrolling are left to Pierre CodeView and the browser's native input behavior.
 
 ## Production
 
-`master` CI can own production deployment after the `CLOUDFLARE_API_TOKEN`
-repository secret, `CLOUDFLARE_ACCOUNT_ID` repository variable, and
-`CLOUDFLARE_DEPLOY_ENABLED=true` repository variable are configured. The
-existing `NANOCODEX_GIT_TOKEN` publishes the matching repository generation.
-Without that explicit enablement, CI still validates the complete production
-graph but does not mutate the hosted Worker. Local commands build and preview
-it:
+Production promotion is intentionally separate from the Cloudflare-native CI
+slice above. CI validates and retains the complete tested deployment graph but
+does not mutate the hosted Worker. Local commands build and preview it:
 
 ```bash
 npm run build
@@ -274,8 +404,7 @@ exact `deployment_sha`. The publisher enforces this ordering independently. An
 authenticated operator can publish the already-deployed master revision with:
 
 ```bash
-gh workflow run mirror-cloudflare-git.yml --ref master -f revision="$revision"
+NANOCODEX_GIT_ORIGIN=https://nanocodex.me-7fb.workers.dev \
+NANOCODEX_GIT_TOKEN=... \
+npm run publish:repository
 ```
-
-For the one-time invalid-publication repair, add
-`-f repair_invalid_publication=true` to that dispatch.

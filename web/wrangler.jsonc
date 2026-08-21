@@ -16,6 +16,9 @@
       "persist": true
     }
   },
+  "secrets": {
+    "required": ["CI_SOURCE_WRITE_TOKEN", "CI_CONTROL_TOKEN", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"]
+  },
   "assets": {
     "binding": "ASSETS",
     "not_found_handling": "none",
@@ -27,6 +30,7 @@
       "/code",
       "/commits",
       "/requests",
+      "/ci",
       "/docs",
       "/docs/*",
       "/evals",
@@ -63,6 +67,14 @@
       {
         "name": "CHATGPT_EGRESS",
         "class_name": "ChatGptEgress"
+      },
+      {
+        "name": "CI_REPOSITORY",
+        "class_name": "CiRepository"
+      },
+      {
+        "name": "SANDBOX",
+        "class_name": "CiSandbox"
       }
     ]
   },
@@ -98,6 +110,17 @@
     {
       "tag": "v8",
       "deleted_classes": ["GuestQuota"]
+    },
+    {
+      "tag": "v9",
+      "new_sqlite_classes": ["CiRepository", "CiSandbox"]
+    }
+  ],
+  "workflows": [
+    {
+      "binding": "CI_WORKFLOW",
+      "name": "nanocodex-ci",
+      "class_name": "NanocodexCI"
     }
   ],
   "containers": [
@@ -106,6 +129,12 @@
       "image": "./container/Dockerfile",
       "max_instances": 1000,
       "instance_type": "lite"
+    },
+    {
+      "class_name": "CiSandbox",
+      "image": "./ci/Dockerfile",
+      "max_instances": 10,
+      "instance_type": "standard-4"
     }
   ],
   "ratelimits": [
@@ -148,6 +177,14 @@
     {
       "binding": "EVALS_ARTIFACTS",
       "bucket_name": "nanocodex-evals"
+    },
+    {
+      "binding": "CI_SOURCE",
+      "bucket_name": "nanocodex-ci-source"
+    },
+    {
+      "binding": "BACKUP_BUCKET",
+      "bucket_name": "nanocodex-ci"
     }
   ],
   "d1_databases": [
@@ -159,11 +196,17 @@
     }
   ],
   "vars": {
-    "ENVIRONMENT": "production"
+    "ENVIRONMENT": "production",
+    "BACKUP_BUCKET_NAME": "nanocodex-ci",
+    "CI_PUBLIC_ORIGIN": "https://nanocodex.me-7fb.workers.dev",
+    "CLOUDFLARE_ACCOUNT_ID": "7fb82fc3b80331b2cd45f097acbd9ffc"
   },
   "env": {
     "development": {
       "name": "nanocodex-development",
+      "secrets": {
+        "required": ["CI_SOURCE_WRITE_TOKEN", "CI_CONTROL_TOKEN", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"]
+      },
       "durable_objects": {
         "bindings": [
           { "name": "BYOK_SESSIONS", "class_name": "ByokSession" },
@@ -171,15 +214,26 @@
           { "name": "GIT_REPOSITORY", "class_name": "GitRepository" },
           { "name": "THREAD_GIT_REPOSITORY", "class_name": "ThreadGitRepository" },
           { "name": "EVAL_COORDINATOR", "class_name": "EvalCoordinator" },
-          { "name": "CHATGPT_EGRESS", "class_name": "ChatGptEgress" }
+          { "name": "CHATGPT_EGRESS", "class_name": "ChatGptEgress" },
+          { "name": "CI_REPOSITORY", "class_name": "CiRepository" },
+          { "name": "SANDBOX", "class_name": "CiSandbox" }
         ]
       },
+      "workflows": [
+        { "binding": "CI_WORKFLOW", "name": "nanocodex-ci-development", "class_name": "NanocodexCI" }
+      ],
       "containers": [
         {
           "class_name": "ChatGptEgress",
           "image": "./container/Dockerfile",
           "max_instances": 1000,
           "instance_type": "lite"
+        },
+        {
+          "class_name": "CiSandbox",
+          "image": "./ci/Dockerfile",
+          "max_instances": 10,
+          "instance_type": "standard-4"
         }
       ],
       "ratelimits": [
@@ -192,7 +246,9 @@
       ],
       "r2_buckets": [
         { "binding": "GIT_OBJECTS", "bucket_name": "nanocodex-git", "remote": true },
-        { "binding": "EVALS_ARTIFACTS", "bucket_name": "nanocodex-evals", "remote": true }
+        { "binding": "EVALS_ARTIFACTS", "bucket_name": "nanocodex-evals", "remote": true },
+        { "binding": "CI_SOURCE", "bucket_name": "nanocodex-ci-source-development" },
+        { "binding": "BACKUP_BUCKET", "bucket_name": "nanocodex-ci-development" }
       ],
       "d1_databases": [
         {
@@ -204,7 +260,10 @@
         }
       ],
       "vars": {
-        "ENVIRONMENT": "development"
+        "ENVIRONMENT": "development",
+        "BACKUP_BUCKET_NAME": "nanocodex-ci-development",
+        "CI_PUBLIC_ORIGIN": "http://host.docker.internal:8787",
+        "CLOUDFLARE_ACCOUNT_ID": "7fb82fc3b80331b2cd45f097acbd9ffc"
       }
     }
   }

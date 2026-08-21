@@ -34,6 +34,8 @@ const loadPublishedRepository = () => import("./publishedRepository");
 
 export const loadEvals = () =>
   loadEvalsModule().then((module) => ({ default: module.Evals }));
+export const loadCi = () =>
+  import("./Ci").then((module) => ({ default: module.Ci }));
 export const loadChangelog = () => import("./Changelog");
 export const loadDocs = () => import("./Docs");
 export const loadHomeFrame = () =>

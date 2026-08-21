@@ -49,6 +49,7 @@ import { useDeploymentRollover } from "./useDeploymentRollover";
 import {
   loadAgentExperience,
   loadChangelog,
+  loadCi,
   loadCodeBrowser,
   loadCommitCodeStream,
   loadDocs,
@@ -63,6 +64,7 @@ import {
 } from "./routeLoaders";
 
 const Evals = lazy(loadEvals);
+const Ci = lazy(loadCi);
 const Changelog = lazy(() =>
   loadChangelog().then((module) => ({ default: module.Changelog }))
 );
@@ -645,6 +647,10 @@ function NanocodexShell({ preparedRoute }: Required<NanocodexAppProps>) {
     }
     if (nextSurface === "code" || nextSurface === "commits") {
       void prepareRepositorySurface(nextSurface).catch(() => undefined);
+      return;
+    }
+    if (nextSurface === "ci") {
+      void loadCi().catch(() => undefined);
       return;
     }
     if (nextSurface === "evals") {
@@ -1323,8 +1329,10 @@ function NanocodexShell({ preparedRoute }: Required<NanocodexAppProps>) {
                 for now.
               </p>
             </section>
-          ) : (
+          ) : surface === "evals" ? (
             <Evals />
+          ) : (
+            <Ci />
           )}
         </main>
 

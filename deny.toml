@@ -1,5 +1,8 @@
 [advisories]
 version = 2
+db-path = "$CARGO_HOME/advisory-dbs"
+db-urls = ["https://github.com/RustSec/advisory-db"]
+maximum-db-staleness = "P90D"
 yanked = "warn"
 ignore = [
     # Transitive through bm25; no maintained drop-in exists at this release.

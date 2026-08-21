@@ -41,7 +41,8 @@ pub const fn terminate_child_with_parent(_command: &mut Command) {}
 mod tests {
     use std::{
         fs,
-        path::PathBuf,
+        io::ErrorKind,
+        path::{Path, PathBuf},
         process::Command,
         thread,
         time::{Duration, Instant},
@@ -85,9 +86,24 @@ mod tests {
         owner.wait().unwrap();
         let process = PathBuf::from("/proc").join(owned_pid.trim());
         let deadline = Instant::now() + Duration::from_secs(5);
-        while process.exists() && Instant::now() < deadline {
+        while process_is_alive(&process) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
-        assert!(!process.exists(), "owned child survived its worker process");
+        assert!(
+            !process_is_alive(&process),
+            "owned child survived its worker process"
+        );
+    }
+
+    fn process_is_alive(process: &Path) -> bool {
+        match fs::read_to_string(process.join("stat")) {
+            Ok(stat) => {
+                stat.rsplit_once(") ")
+                    .and_then(|(_, fields)| fields.as_bytes().first().copied())
+                    != Some(b'Z')
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => false,
+            Err(_) => true,
+        }
     }
 }

@@ -51,7 +51,7 @@ function deferred<T>() {
 
 test("maps every Nanocodex surface to a stable application route", () => {
   assert.deepEqual(
-    ["home", "agent", "changelog", "docs", "code", "commits", "requests", "evals"].map((surface) => [
+    ["home", "agent", "changelog", "docs", "code", "commits", "requests", "ci", "evals"].map((surface) => [
       surface,
       pathForSurface(surface as Parameters<typeof pathForSurface>[0]),
     ]),
@@ -63,6 +63,7 @@ test("maps every Nanocodex surface to a stable application route", () => {
       ["code", "/code"],
       ["commits", "/commits"],
       ["requests", "/requests"],
+      ["ci", "/ci"],
       ["evals", "/evals"],
     ],
   );
@@ -70,6 +71,7 @@ test("maps every Nanocodex surface to a stable application route", () => {
 
 test("resolves direct routes and legacy view links", () => {
   assert.equal(surfaceFromUrl(new URL("https://nanocodex.test/evals")), "evals");
+  assert.equal(surfaceFromUrl(new URL("https://nanocodex.test/ci")), "ci");
   assert.equal(
     surfaceFromUrl(new URL("https://nanocodex.test/evals/worksets/terminal-bench/tasks/fix-git")),
     "evals",

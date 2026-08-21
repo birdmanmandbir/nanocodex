@@ -1,0 +1,837 @@
+diff --git a/node_modules/@cloudflare/ci/src/ci/capabilities.ts b/node_modules/@cloudflare/ci/src/ci/capabilities.ts
+index 9603fd2..27f89a7 100644
+--- a/node_modules/@cloudflare/ci/src/ci/capabilities.ts
++++ b/node_modules/@cloudflare/ci/src/ci/capabilities.ts
+@@ -160,7 +160,11 @@ async function executeStep(
+     timeoutMs: input.commandTimeoutMs,
+     source: prepared.checkout,
+     ttlSeconds: input.snapshotTtlSeconds ?? DEFAULT_SNAPSHOT_TTL_SECONDS,
++    createSnapshot: input.createSnapshot ?? true,
++    outputs: input.outputs,
+     extraEnv: prepared.extraEnv,
++    sourceSha: input.source.sha,
++    attempt: input.attempt ?? 1,
+   };
+ 
+   const cache = prepared.cacheKey
+@@ -178,6 +182,15 @@ async function executeStep(
+       exitCode: 0,
+       logs: { stdout: message, stderr: '' },
+       preview: { stdout: message, stderr: '' },
++      logMetadata: {
++        stdout: {
++          bytesObserved: message.length,
++          bytesStored: message.length,
++          truncated: false,
++        },
++        stderr: { bytesObserved: 0, bytesStored: 0, truncated: false },
++      },
++      timedOut: false,
+       // A hit gives us both: the backup to restore (snapshot) and the pointer
+       // metadata that found it (cachePointer). Distinct roles, same origin.
+       snapshot: cache.snapshot,
+@@ -192,6 +205,10 @@ async function executeStep(
+     exitCode: result.exitCode,
+     logs: result.logs,
+     preview: result.preview,
++    logMetadata: result.logMetadata,
++    persistedLogs: result.persistedLogs,
++    timedOut: result.timedOut,
++    outputs: result.outputs,
+     snapshot: result.snapshot,
+     cacheHit: false,
+   };
+@@ -213,6 +230,9 @@ async function finalizeStep(
+   if (!prepared.cacheKey || execution.cachePointer) {
+     return execution;
+   }
++  if (!execution.snapshot) {
++    throw new Error(`cache(${input.label}): runner did not produce a workspace snapshot`);
++  }
+   // Write the small JSON pointer at the deterministic cache key. It records the
+   // randomly generated id of the sandbox workspace backup so a future run can
+   // rediscover it; the backup already exists, we only add the indirection.
+diff --git a/node_modules/@cloudflare/ci/src/ci/runners/runner.ts b/node_modules/@cloudflare/ci/src/ci/runners/runner.ts
+index aa6068d..9a43284 100644
+--- a/node_modules/@cloudflare/ci/src/ci/runners/runner.ts
++++ b/node_modules/@cloudflare/ci/src/ci/runners/runner.ts
+@@ -1,6 +1,7 @@
+ // Copyright (c) 2026 Cloudflare, Inc.
+ // SPDX-License-Identifier: Apache-2.0
+ 
++import type { RunnerOutput } from '../../pipeline/types';
+ import type { SourceControlCheckout } from '../../source-control';
+ 
+ export type RunStepInput = {
+@@ -12,6 +13,10 @@ export type RunStepInput = {
+   extraEnv?: Record<string, string>;
+   // Snapshot TTL in seconds. Omitted falls back to the sandbox default (3 days).
+   ttlSeconds?: number;
++  createSnapshot: boolean;
++  outputs?: RunnerOutput[];
++  sourceSha: string;
++  attempt: number;
+ };
+ 
+ export type RunOutput = {
+@@ -21,6 +26,34 @@ export type RunOutput = {
+     stderr: string | ReadableStream<Uint8Array>;
+   };
+   preview: { stdout: string; stderr: string };
++  logMetadata: {
++    stdout: LogCaptureMetadata;
++    stderr: LogCaptureMetadata;
++  };
++  persistedLogs?: {
++    stdout: PersistedRunnerLog;
++    stderr: PersistedRunnerLog;
++  };
++  timedOut: boolean;
++  outputs?: PersistedRunnerOutput[];
++};
++
++export type LogCaptureMetadata = {
++  bytesObserved: number;
++  bytesStored: number;
++  truncated: boolean;
++};
++
++export type PersistedRunnerLog = {
++  key: string;
++  size: number;
++};
++
++export type PersistedRunnerOutput = {
++  key: string;
++  size: number;
++  sha256?: string;
++  contentType?: string;
+ };
+ 
+ export type RunStepResult<S> = RunOutput & {
+diff --git a/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts b/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
+index a7f6c05..961e287 100644
+--- a/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
++++ b/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
+@@ -1,7 +1,11 @@
+ // Copyright (c) 2026 Cloudflare, Inc.
+ // SPDX-License-Identifier: Apache-2.0
+ 
+-import { getSandbox, type DirectoryBackup } from '@cloudflare/sandbox';
++import {
++  getSandbox,
++  ProcessReadyTimeoutError,
++  type DirectoryBackup,
++} from '@cloudflare/sandbox';
+ import { posix } from 'node:path';
+ import type { Bindings } from '../../env';
+ import {
+@@ -9,13 +13,21 @@ import {
+   checkoutSourceScript,
+ } from '../../shared/source-checkout';
+ import { slugify } from '../../shared/slugify';
+-import type { RunStepInput, RunStepResult, Runner } from './runner';
++import type {
++  LogCaptureMetadata,
++  PersistedRunnerLog,
++  RunStepInput,
++  RunStepResult,
++  Runner,
++} from './runner';
+ 
+ // Sandbox implementation limits. Pipeline-facing command and Snapshot
+ // retention settings are supplied through RunnerConfig.
+ const WORKSPACE_DIR = '/workspace';
+ const STDOUT_FILE = '/tmp/ci-step.out';
+ const STDERR_FILE = '/tmp/ci-step.err';
++const COMMAND_PID_FILE = '/tmp/ci-step.command.pid';
++const RUN_WITH_BOUNDED_LOGS = '/usr/local/bin/nanocodex-ci-run';
+ const COMMAND_TIMEOUT_MS = 11 * 60 * 1000;
+ const SOURCE_TIMEOUT_MS = 5 * 60 * 1000;
+ const PORT_READY_TIMEOUT_MS = 60_000;
+@@ -45,7 +57,6 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+       containerTimeouts: { portReadyTimeoutMS: PORT_READY_TIMEOUT_MS },
+     });
+ 
+-    let cleanupTransferredToStreams = false;
+     try {
+       if (input.restore) {
+         await sandbox.restoreBackup(input.restore);
+@@ -71,7 +82,7 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+       }
+ 
+       const proc = await sandbox.startProcess(
+-        `(${input.command}) > ${STDOUT_FILE} 2> ${STDERR_FILE}`,
++        captureCommand(input.command),
+         {
+           cwd: resolveCwd(input.cwd),
+           env: {
+@@ -81,61 +92,311 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+           autoCleanup: false,
+         }
+       );
+-      const { exitCode } = await proc.waitForExit(
+-        input.timeoutMs ?? COMMAND_TIMEOUT_MS
+-      );
++      let exitCode: number;
++      let timedOut = false;
++      try {
++        ({ exitCode } = await proc.waitForExit(
++          input.timeoutMs ?? COMMAND_TIMEOUT_MS
++        ));
++      } catch (error) {
++        if (!(error instanceof ProcessReadyTimeoutError)) throw error;
++        timedOut = true;
++        await terminateTimedOutProcess(sandbox, proc);
++        exitCode = 124;
++      }
+       const preview = await readPreviews(sandbox);
++      const logMetadata = await readLogMetadataPair(sandbox);
++      const persistedLogsPromise = persistLogs(
++        this.env.BACKUP_BUCKET,
++        input,
++        await readLogs(sandbox)
++      );
+ 
+       if (exitCode !== 0) {
+-        return { exitCode, logs: preview, preview };
+-      }
+-
+-      const snapshot = await sandbox.createBackup({
+-        dir: WORKSPACE_DIR,
+-        name: input.label,
+-        multipart: true,
+-        ttl: input.ttlSeconds,
+-      });
+-      const rawLogs = await readLogs(sandbox);
+-      const streams = [rawLogs.stdout, rawLogs.stderr].filter(
+-        (value): value is ReadableStream<Uint8Array> =>
+-          typeof value !== 'string'
+-      );
+-      if (streams.length === 0) {
+-        return { exitCode, logs: rawLogs, preview, snapshot };
++        const persistedLogs = await persistedLogsPromise;
++        await persistFailedResult(
++          this.env.BACKUP_BUCKET,
++          input,
++          exitCode,
++          logMetadata,
++          persistedLogs,
++          timedOut
++        );
++        return {
++          exitCode,
++          logs: preview,
++          preview,
++          logMetadata,
++          persistedLogs,
++          timedOut,
++        };
+       }
+ 
+-      let remainingStreams = streams.length;
+-      const releaseStream = async () => {
+-        remainingStreams -= 1;
+-        if (remainingStreams === 0) {
+-          await destroySandbox(sandbox);
+-        }
+-      };
+-      cleanupTransferredToStreams = true;
++      const finalized = await Promise.allSettled([
++        persistedLogsPromise,
++        persistOutputs(this.env.BACKUP_BUCKET, sandbox, input.outputs ?? []),
++        input.createSnapshot
++          ? sandbox.createBackup({
++              dir: WORKSPACE_DIR,
++              name: input.label,
++              multipart: true,
++              ttl: input.ttlSeconds,
++            })
++          : Promise.resolve(undefined),
++      ]);
++      const persistedLogs = fulfilled(finalized[0]);
++      const outputs = fulfilled(finalized[1]);
++      const snapshot = fulfilled(finalized[2]);
+       return {
+         exitCode,
+-        logs: {
+-          stdout:
+-            typeof rawLogs.stdout === 'string'
+-              ? rawLogs.stdout
+-              : withCleanup(rawLogs.stdout, releaseStream),
+-          stderr:
+-            typeof rawLogs.stderr === 'string'
+-              ? rawLogs.stderr
+-              : withCleanup(rawLogs.stderr, releaseStream),
+-        },
++        logs: preview,
+         preview,
+         snapshot,
++        logMetadata,
++        persistedLogs,
++        timedOut,
++        outputs,
+       };
+     } finally {
+-      if (!cleanupTransferredToStreams) {
+-        await destroySandbox(sandbox);
+-      }
++      await destroySandbox(sandbox);
+     }
+   }
+ }
+ 
++function fulfilled<T>(result: PromiseSettledResult<T>): T {
++  if (result.status === 'rejected') {
++    throw result.reason;
++  }
++  return result.value;
++}
++
++async function persistOutputs(
++  bucket: R2Bucket,
++  sandbox: ReturnType<typeof getSandbox>,
++  outputs: NonNullable<RunStepInput['outputs']>
++) {
++  return Promise.all(
++    outputs.map(async (output) => {
++      assertWorkspacePath(output.path, 'output');
++      if (!output.key || output.key.startsWith('/')) {
++        throw new Error(`Invalid CI output key: ${output.key}`);
++      }
++      if (!Number.isSafeInteger(output.maxBytes) || output.maxBytes <= 0) {
++        throw new Error(`Invalid CI output byte limit: ${output.key}`);
++      }
++      const listing = await sandbox.listFiles(posix.dirname(output.path));
++      const file = listing.files.find(
++        (candidate) => candidate.absolutePath === output.path
++      );
++      if (!file || file.size <= 0 || file.size > output.maxBytes) {
++        throw new Error(
++          `CI output exceeds ${output.maxBytes} bytes or is missing: ${output.path}`
++        );
++      }
++      let sha256: string | undefined;
++      if (output.sha256Path) {
++        assertWorkspacePath(output.sha256Path, 'checksum');
++        const checksum = await sandbox.readFile(output.sha256Path, {
++          encoding: 'utf-8',
++        });
++        sha256 = checksum.content.trim().split(/\s+/, 1)[0];
++        if (!checksum.success || !/^[a-f0-9]{64}$/.test(sha256)) {
++          throw new Error(`Invalid CI output checksum: ${output.sha256Path}`);
++        }
++      }
++      const stream = await sandbox.readFileStream(output.path);
++      const object = await bucket.put(output.key, stream, {
++        onlyIf: { etagDoesNotMatch: '*' },
++        ...(sha256 ? { sha256 } : {}),
++        ...(output.contentType
++          ? { httpMetadata: { contentType: output.contentType } }
++          : {}),
++        ...(output.customMetadata || sha256
++          ? {
++              customMetadata: {
++                ...output.customMetadata,
++                ...(sha256 ? { sha256 } : {}),
++              },
++            }
++          : {}),
++      });
++      const resolved = object ?? (await bucket.head(output.key));
++      if (
++        !resolved ||
++        resolved.key !== output.key ||
++        resolved.size <= 0 ||
++        resolved.size > output.maxBytes ||
++        resolved.size !== file.size
++      ) {
++        throw new Error(`CI output upload failed: ${output.key}`);
++      }
++      if (
++        sha256 &&
++        (resolved.checksums.sha256 == null ||
++          checksumHex(resolved.checksums.sha256) !== sha256 ||
++          resolved.customMetadata?.sha256 !== sha256)
++      ) {
++        throw new Error(`CI output checksum mismatch: ${output.key}`);
++      }
++      if (
++        output.contentType &&
++        resolved.httpMetadata?.contentType !== output.contentType
++      ) {
++        throw new Error(`CI output content type mismatch: ${output.key}`);
++      }
++      for (const [name, value] of Object.entries(output.customMetadata ?? {})) {
++        if (resolved.customMetadata?.[name] !== value) {
++          throw new Error(`CI output metadata mismatch: ${output.key}`);
++        }
++      }
++      return {
++        key: output.key,
++        size: resolved.size,
++        ...(sha256 ? { sha256 } : {}),
++        ...(output.contentType ? { contentType: output.contentType } : {}),
++      };
++    })
++  );
++}
++
++function assertWorkspacePath(path: string, kind: string) {
++  if (
++    !path.startsWith(`${WORKSPACE_DIR}/`) ||
++    posix.normalize(path) !== path
++  ) {
++    throw new Error(`Invalid CI ${kind} path: ${path}`);
++  }
++}
++
++function checksumHex(buffer: ArrayBuffer) {
++  return [...new Uint8Array(buffer)]
++    .map((byte) => byte.toString(16).padStart(2, '0'))
++    .join('');
++}
++
++async function terminateTimedOutProcess(
++  sandbox: ReturnType<typeof getSandbox>,
++  proc: Awaited<ReturnType<ReturnType<typeof getSandbox>['startProcess']>>
++) {
++  const pidFile = await sandbox.readFile(COMMAND_PID_FILE, { encoding: 'utf-8' });
++  const pid = pidFile.content.trim();
++  if (!/^\d+$/.test(pid)) throw new Error('Timed-out CI command PID is invalid');
++  await sandbox.exec(
++    `kill -TERM -- -${pid} 2>/dev/null || true; sleep 2; kill -KILL -- -${pid} 2>/dev/null || true`,
++    { cwd: '/', timeout: 10_000 }
++  );
++  await proc.kill('SIGTERM').catch(() => undefined);
++  await proc.waitForExit(30_000).catch(async () => {
++    await proc.kill('SIGKILL').catch(() => undefined);
++    await proc.waitForExit(5_000).catch(() => undefined);
++  });
++  await sandbox.exec(
++    `for attempt in $(seq 1 100); do if test -f ${STDOUT_FILE}.meta.json -a -f ${STDERR_FILE}.meta.json; then exit 0; fi; sleep 0.1; done; exit 1`,
++    { cwd: '/', timeout: 15_000 }
++  );
++}
++
++function captureCommand(command: string) {
++  return `${RUN_WITH_BOUNDED_LOGS} ${shellQuote(command)}`;
++}
++
++async function persistLogs(
++  bucket: R2Bucket,
++  input: RunStepInput,
++  logs: {
++    stdout: string | ReadableStream<Uint8Array>;
++    stderr: string | ReadableStream<Uint8Array>;
++  }
++) {
++  const prefix = `runs/${input.sourceSha}/steps/${slugify(input.label)}/attempts/${input.attempt}`;
++  const [stdout, stderr] = await Promise.all([
++    persistLog(bucket, `${prefix}/stdout.log`, logs.stdout),
++    persistLog(bucket, `${prefix}/stderr.log`, logs.stderr),
++  ]);
++  return { stdout, stderr };
++}
++
++async function persistFailedResult(
++  bucket: R2Bucket,
++  input: RunStepInput,
++  exitCode: number,
++  logMetadata: { stdout: LogCaptureMetadata; stderr: LogCaptureMetadata },
++  persistedLogs: {
++    stdout: PersistedRunnerLog;
++    stderr: PersistedRunnerLog;
++  },
++  timedOut: boolean
++) {
++  const stepPrefix = `runs/${input.sourceSha}/steps/${slugify(input.label)}`;
++  const attemptPrefix = `${stepPrefix}/attempts/${input.attempt}`;
++  const result = JSON.stringify({
++      version: 1,
++      status: 'failure',
++      attempt: input.attempt,
++      exitCode,
++      timedOut,
++      stdout: { ...persistedLogs.stdout, ...logMetadata.stdout },
++      stderr: { ...persistedLogs.stderr, ...logMetadata.stderr },
++      cacheHit: false,
++      snapshot: null,
++      cachePointer: null,
++    });
++  await bucket.put(
++    `${attemptPrefix}/result.json`,
++    result,
++    { httpMetadata: { contentType: 'application/json' } }
++  );
++  await bucket.put(
++    `${stepPrefix}/result.json`,
++    result,
++    { httpMetadata: { contentType: 'application/json' } }
++  );
++}
++
++async function readLogMetadataPair(sandbox: ReturnType<typeof getSandbox>) {
++  const [stdout, stderr] = await Promise.all([
++    readLogMetadata(sandbox, STDOUT_FILE),
++    readLogMetadata(sandbox, STDERR_FILE),
++  ]);
++  return { stdout, stderr };
++}
++
++async function persistLog(
++  bucket: R2Bucket,
++  key: string,
++  value: string | ReadableStream<Uint8Array>
++) {
++  const object = await bucket.put(key, value, {
++    httpMetadata: { contentType: 'text/plain; charset=utf-8' },
++  });
++  if (!object) throw new Error(`Failed to persist CI failure log ${key}`);
++  return { key, size: object.size };
++}
++
++function shellQuote(value: string) {
++  return `'${value.replaceAll("'", `'"'"'`)}'`;
++}
++
++async function readLogMetadata(
++  sandbox: ReturnType<typeof getSandbox>,
++  path: string
++): Promise<LogCaptureMetadata> {
++  const result = await sandbox.readFile(`${path}.meta.json`, {
++    encoding: 'utf-8',
++  });
++  const value: unknown = JSON.parse(result.content);
++  if (
++    value == null ||
++    typeof value !== 'object' ||
++    typeof (value as LogCaptureMetadata).bytesObserved !== 'number' ||
++    typeof (value as LogCaptureMetadata).bytesStored !== 'number' ||
++    typeof (value as LogCaptureMetadata).truncated !== 'boolean'
++  ) {
++    throw new Error(`Invalid CI log metadata for ${path}`);
++  }
++  return value as LogCaptureMetadata;
++}
++
+ async function readLogs(sandbox: ReturnType<typeof getSandbox>) {
+   const listing = await sandbox.listFiles('/tmp');
+   const sizes = new Map(
+@@ -192,51 +453,22 @@ function resolveCwd(cwd: string | undefined) {
+   return posix.join(WORKSPACE_DIR, normalized);
+ }
+ 
+-function withCleanup(
+-  stream: ReadableStream<Uint8Array>,
+-  release: () => Promise<void>
+-) {
+-  const reader = stream.getReader();
+-  let released = false;
+-  const releaseOnce = async () => {
+-    if (!released) {
+-      released = true;
+-      await release();
+-    }
+-  };
+-  return new ReadableStream<Uint8Array>({
+-    async pull(controller) {
+-      try {
+-        const result = await reader.read();
+-        if (result.done) {
+-          controller.close();
+-          await releaseOnce();
+-        } else {
+-          controller.enqueue(result.value);
+-        }
+-      } catch (error) {
+-        controller.error(error);
+-        await releaseOnce();
+-      }
+-    },
+-    async cancel(reason) {
+-      try {
+-        await reader.cancel(reason);
+-      } finally {
+-        await releaseOnce();
+-      }
+-    },
+-  });
+-}
+-
+ function createRunnerId(label: string) {
+   return `${slugify(label).slice(0, 16)}-${crypto.randomUUID()}`;
+ }
+ 
+ async function destroySandbox(sandbox: ReturnType<typeof getSandbox>) {
+-  try {
+-    await sandbox.destroy();
+-  } catch (error) {
+-    console.error('Failed to destroy CI sandbox', { error });
++  let failure: unknown;
++  for (let attempt = 1; attempt <= 3; attempt++) {
++    try {
++      await sandbox.destroy();
++      return;
++    } catch (error) {
++      failure = error;
++      console.error('Failed to destroy CI sandbox', { attempt, error });
++    }
+   }
++  throw new Error('Failed to destroy CI sandbox after 3 attempts', {
++    cause: failure,
++  });
+ }
+diff --git a/node_modules/@cloudflare/ci/src/ci/step-notification.ts b/node_modules/@cloudflare/ci/src/ci/step-notification.ts
+index 2d70c69..34f3d87 100644
+--- a/node_modules/@cloudflare/ci/src/ci/step-notification.ts
++++ b/node_modules/@cloudflare/ci/src/ci/step-notification.ts
+@@ -19,11 +19,19 @@ export type StepExecution = {
+   snapshot?: DirectoryBackup;
+   cachePointer?: CacheSnapshotPointer;
+   cacheHit: boolean;
++  logMetadata: {
++    stdout: { bytesObserved: number; bytesStored: number; truncated: boolean };
++    stderr: { bytesObserved: number; bytesStored: number; truncated: boolean };
++  };
++  persistedLogs?: {
++    stdout: { key: string; size: number };
++    stderr: { key: string; size: number };
++  };
++  timedOut: boolean;
++  outputs?: CiRunStepOutput['outputs'];
+ };
+ 
+-export type CompletedStepExecution = StepExecution & {
+-  snapshot: DirectoryBackup;
+-};
++export type CompletedStepExecution = StepExecution;
+ 
+ /**
+  * Runs and finalizes a runner, then reports success or failure.
+@@ -52,17 +60,12 @@ export async function withStepNotification(
+         execution.preview,
+         input.sensitiveValues
+       );
+-      throw new Error(
+-        `${input.label} failed with exit code ${execution.exitCode}\n=== stdout ===\n${stdout}\n=== stderr ===\n${stderr}`
+-      );
+-    }
+-    if (!execution.snapshot) {
+-      throw new Error(`${input.label} did not produce a workspace snapshot`);
++      const reason = execution.timedOut
++        ? `${input.label} timed out`
++        : `${input.label} failed with exit code ${execution.exitCode}`;
++      throw new Error(`${reason}\n=== stdout ===\n${stdout}\n=== stderr ===\n${stderr}`);
+     }
+-    const completed = await finalize({
+-      ...execution,
+-      snapshot: execution.snapshot,
+-    });
++    const completed = await finalize(execution);
+     execution = completed;
+ 
+     await input.handle?.succeed({
+@@ -75,6 +78,10 @@ export async function withStepNotification(
+     return {
+       exitCode: completed.exitCode,
+       logs: completed.logs,
++      logMetadata: completed.logMetadata,
++      persistedLogs: completed.persistedLogs,
++      timedOut: completed.timedOut,
++      outputs: completed.outputs,
+       snapshot: completed.snapshot,
+       cachePointer: completed.cachePointer,
+     };
+diff --git a/node_modules/@cloudflare/ci/src/pipeline/ci-workflow.ts b/node_modules/@cloudflare/ci/src/pipeline/ci-workflow.ts
+index a0ac164..26084bc 100644
+--- a/node_modules/@cloudflare/ci/src/pipeline/ci-workflow.ts
++++ b/node_modules/@cloudflare/ci/src/pipeline/ci-workflow.ts
+@@ -40,6 +40,7 @@ type ResolvedRunnerConfig = {
+   };
+   commandTimeoutMs: number;
+   snapshotTtlSeconds?: number;
++  createSnapshot: boolean;
+ };
+ 
+ type RunContext = Pick<
+@@ -134,10 +135,6 @@ export abstract class CIWorkflow<
+     };
+     const runners = new RunnerGroup();
+ 
+-    // Every result creates a workspace snapshot so chained runners remain
+-    // durable across Workflow replay and hibernation. The per-runner storage
+-    // cost is accepted to keep the snapshot durable across arbitrarily long
+-    // Workflow waits.
+     const invoke = (
+       options: RunnerOptions,
+       inherited: DirectoryBackup | undefined
+@@ -155,6 +152,8 @@ export abstract class CIWorkflow<
+               commandTimeoutMs: config.commandTimeoutMs,
+               snapshot: inherited,
+               snapshotTtlSeconds: config.snapshotTtlSeconds,
++              createSnapshot: config.createSnapshot,
++              outputs: options.outputs,
+               cloudflareCredentials: options.cloudflareCredentials,
+               sourceControlCredentials: options.sourceControlCredentials,
+               cachePaths: options.cache?.inputs,
+@@ -166,7 +165,13 @@ export abstract class CIWorkflow<
+             Object.freeze({
+               ...output,
+               runner: (nextOptions: RunnerOptions) =>
+-                invoke(nextOptions, output.snapshot),
++                output.snapshot
++                  ? invoke(nextOptions, output.snapshot)
++                  : Promise.reject(
++                      new Error(
++                        `runner(${options.name}): terminal runner has no workspace snapshot`
++                      )
++                    ),
+             })
+           );
+       });
+@@ -206,7 +211,14 @@ function resolveRunnerConfig(options: RunnerOptions): ResolvedRunnerConfig {
+       'snapshotRetentionSeconds'
+     );
+   }
+-  return { workflow, commandTimeoutMs, snapshotTtlSeconds };
++  const createSnapshot = options.config?.snapshot ?? true;
++  if (!createSnapshot && options.cache) {
++    throw new Error(`runner(${options.name}): cached runners must retain a snapshot`);
++  }
++  if (options.outputs && options.cache) {
++    throw new Error(`runner(${options.name}): cached runners cannot publish outputs`);
++  }
++  return { workflow, commandTimeoutMs, snapshotTtlSeconds, createSnapshot };
+ }
+ 
+ function assertPositiveFinite(
+diff --git a/node_modules/@cloudflare/ci/src/pipeline/types.ts b/node_modules/@cloudflare/ci/src/pipeline/types.ts
+index a1f5ff3..8ac5e6d 100644
+--- a/node_modules/@cloudflare/ci/src/pipeline/types.ts
++++ b/node_modules/@cloudflare/ci/src/pipeline/types.ts
+@@ -105,6 +105,9 @@ export type RunnerConfig = StepConfig & {
+   commandTimeoutMs?: number;
+   // How long the workspace Snapshot remains restorable, in seconds.
+   snapshotRetentionSeconds?: number;
++  // Set false for terminal runners whose workspace has no downstream consumer.
++  // Cached runners must retain their snapshot.
++  snapshot?: boolean;
+ };
+ 
+ export type CiRunStepInput = {
+@@ -120,6 +123,8 @@ export type CiRunStepInput = {
+   attempt?: number;
+   snapshot?: DirectoryBackup;
+   snapshotTtlSeconds?: number;
++  createSnapshot?: boolean;
++  outputs?: RunnerOutput[];
+   // Inject the Cloudflare deployment account and API token into the command
+   // env. Scoped per step so build/test/lint commands never see them.
+   cloudflareCredentials?: boolean | { accountId: string };
+@@ -138,11 +143,21 @@ export type CiRunStepInput = {
+ export type CiRunStepOutput = {
+   exitCode: number;
+   logs: CiRunnerLogs;
++  logMetadata: {
++    stdout: { bytesObserved: number; bytesStored: number; truncated: boolean };
++    stderr: { bytesObserved: number; bytesStored: number; truncated: boolean };
++  };
++  persistedLogs?: {
++    stdout: { key: string; size: number };
++    stderr: { key: string; size: number };
++  };
++  timedOut: boolean;
++  outputs?: PersistedRunnerOutput[];
+   // The workspace backup the sandbox writes after every successful runner. The
+   // sandbox SDK stores it under a randomly generated id, so this handle is the
+   // only way to find it again; the next chained runner restores from it.
+-  // Always present.
+-  snapshot: DirectoryBackup;
++  // Present when the runner retained a workspace for a chained or cached step.
++  snapshot?: DirectoryBackup;
+   // Metadata for the deterministic cache pointer, present only when the runner
+   // opted into caching. The pointer is a second-order indirection: a small R2
+   // object at a content-addressed key that records `snapshot`'s random id, so a
+@@ -160,6 +175,10 @@ export type RunnerOptions = {
+   // node_modules/) onto a fresh checkout instead of reusing a full workspace.
+   cache?: { inputs: string[] };
+   config?: RunnerConfig;
++  // Files to stream directly from the Sandbox into BACKUP_BUCKET after a
++  // successful command. This avoids retaining a terminal workspace solely to
++  // export build artifacts.
++  outputs?: RunnerOutput[];
+   cloudflareCredentials?: boolean | { accountId: string };
+   // Inject provider-specific source-control credentials into the command env.
+   sourceControlCredentials?: boolean;
+@@ -167,6 +186,22 @@ export type RunnerOptions = {
+   secrets?: string[];
+ };
+ 
++export type RunnerOutput = {
++  path: string;
++  key: string;
++  maxBytes: number;
++  contentType?: string;
++  sha256Path?: string;
++  customMetadata?: Record<string, string>;
++};
++
++export type PersistedRunnerOutput = {
++  key: string;
++  size: number;
++  sha256?: string;
++  contentType?: string;
++};
++
+ // Metadata for a deterministic cache pointer written when a runner opts into
+ // caching. The sandbox SDK stores workspace backups under random ids, so on its
+ // own a backup can never be found by a later run. To make one reusable we write
+diff --git a/node_modules/@cloudflare/ci/src/shared/source-checkout.ts b/node_modules/@cloudflare/ci/src/shared/source-checkout.ts
+index f83770c..5f6721b 100644
+--- a/node_modules/@cloudflare/ci/src/shared/source-checkout.ts
++++ b/node_modules/@cloudflare/ci/src/shared/source-checkout.ts
+@@ -5,6 +5,7 @@ import type { SourceControlCheckout } from '../source-control';
+ import { shellQuote } from './shell';
+ 
+ const CLONE_DIR = '/tmp/ci-source';
++const ARCHIVE_FILE = '/tmp/ci-source.tar.gz';
+ 
+ /**
+  * Builds a shell script that copies source into the workspace.
+@@ -21,7 +22,21 @@ export function checkoutSourceScript(
+     ? `mkdir -p ${shellQuote(workspace)}`
+     : `rm -rf ${shellQuote(workspace)} && mkdir -p ${shellQuote(workspace)}`;
+   if (source.kind === 'archive') {
+-    return `${prepare} && curl --connect-timeout 10 --max-time 300 --fail --silent --show-error --location ${shellQuote(source.url)} | tar -xz --strip-components=1 -C ${shellQuote(workspace)}`;
++    const verify = source.size === undefined || source.sha256 === undefined
++      ? ''
++      : [
++          `test "$(wc -c < ${shellQuote(ARCHIVE_FILE)} | tr -d ' ')" -eq ${source.size}`,
++          `printf '%s  %s\\n' ${shellQuote(source.sha256)} ${shellQuote(ARCHIVE_FILE)} | sha256sum --check --status`,
++        ].join(' && ');
++    const sizeLimit = source.size === undefined ? '' : ` --max-filesize ${source.size}`;
++    return [
++      prepare,
++      `rm -f ${shellQuote(ARCHIVE_FILE)}`,
++      `curl --connect-timeout 10 --max-time 300 --fail --silent --show-error --location${sizeLimit} --output ${shellQuote(ARCHIVE_FILE)} ${shellQuote(source.url)}`,
++      ...(verify === '' ? [] : [verify]),
++      `tar -xzf ${shellQuote(ARCHIVE_FILE)} --strip-components=1 -C ${shellQuote(workspace)}`,
++      `rm ${shellQuote(ARCHIVE_FILE)}`,
++    ].join(' && ');
+   }
+   return [
+     prepare,
+diff --git a/node_modules/@cloudflare/ci/src/source-control.ts b/node_modules/@cloudflare/ci/src/source-control.ts
+index 83946a3..04fe26c 100644
+--- a/node_modules/@cloudflare/ci/src/source-control.ts
++++ b/node_modules/@cloudflare/ci/src/source-control.ts
+@@ -110,7 +110,7 @@ export interface StepNotifier {
+ 
+ // Providers select a checkout mechanism; the sandbox runner implements it.
+ export type SourceControlCheckout =
+-  | { kind: 'archive'; url: string }
++  | { kind: 'archive'; url: string; size?: number; sha256?: string }
+   | {
+       kind: 'git';
+       remote: string;

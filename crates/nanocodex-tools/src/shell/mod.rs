@@ -146,6 +146,16 @@ impl ShellSessions {
         let started_at = Instant::now();
         let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
         let workdir = resolve_workdir(workspace, command.workdir.as_deref());
+        if !workdir.is_dir() {
+            return ExecCommandResult::failed(
+                started_at.elapsed(),
+                format!(
+                    "exec_command failed for `{}`: CreateProcess {{ message: {:?} }}",
+                    command.script,
+                    format!("working directory does not exist: {}", workdir.display()),
+                ),
+            );
+        }
         let shell = command.shell.as_deref().map_or_else(
             || self.default_shell.clone(),
             selection::get_shell_by_model_provided_path,
@@ -213,9 +223,11 @@ impl ShellSessions {
             .turn_id
             .store(self.current_turn.load(Ordering::Acquire), Ordering::Release);
         let _interaction = session.begin_interaction();
+        let mut interrupt_requested = false;
         if !request.chars.is_empty() {
             let written = if !session.tty {
                 if request.chars == "\u{3}" {
+                    interrupt_requested = true;
                     session.interrupt().await
                 } else {
                     return ExecCommandResult::failed(
@@ -240,9 +252,24 @@ impl ShellSessions {
             (DEFAULT_WRITE_YIELD_MS, 250, 30_000)
         };
         let yield_time = duration_ms(request.yield_time_ms, default, minimum, maximum);
-        let result = session
+        let mut result = session
             .wait_for_output(yield_time, request.max_output_tokens, started_at)
             .await;
+        if interrupt_requested && result.exit_code.is_none() {
+            session.finish_forced_interrupt().await;
+            let (output, original_token_count) =
+                session.take_output(request.max_output_tokens).await;
+            result.output.push_str(&output);
+            result.original_token_count = Some(
+                result
+                    .original_token_count
+                    .unwrap_or_default()
+                    .saturating_add(original_token_count.unwrap_or_default()),
+            );
+            result.wall_time_seconds = started_at.elapsed().as_secs_f64();
+            result.exit_code = Some(130);
+            result.session_id = None;
+        }
         if result.exit_code.is_some() {
             self.sessions.lock().await.remove(session_id);
         }
@@ -427,6 +454,25 @@ impl Session {
 
     async fn interrupt(&self) -> std::io::Result<()> {
         self.process_group.lock().await.interrupt()
+    }
+
+    async fn finish_forced_interrupt(&self) {
+        self.stdin.lock().await.take();
+        if let Err(error) = self.process_group.lock().await.terminate_and_disarm() {
+            tracing::warn!(
+                shell.session.id = self.id,
+                %error,
+                "failed to force-terminate interrupted shell process group"
+            );
+        }
+        if let Err(error) = self.child.lock().await.wait().await {
+            tracing::warn!(
+                shell.session.id = self.id,
+                %error,
+                "failed to reap force-terminated shell process"
+            );
+        }
+        self.finish_drains().await;
     }
 
     async fn write(&self, chars: &str) -> std::io::Result<()> {
@@ -781,6 +827,34 @@ mod tests {
 
         let interrupted = sessions
             .write_stdin(WriteStdin::new(1, "\u{3}".to_owned(), Some(1_000), None))
+            .await;
+
+        assert_eq!(interrupted.exit_code, Some(130));
+        assert_eq!(interrupted.session_id, None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn control_c_force_terminates_a_process_group_that_ignores_sigint() {
+        let sessions = ShellSessions::new();
+        let first = sessions
+            .execute(
+                ExecCommand::new(
+                    "trap '' INT; sleep 30".to_owned(),
+                    None,
+                    Some("/bin/sh".to_owned()),
+                    Some(false),
+                    false,
+                    Some(250),
+                    None,
+                ),
+                std::path::Path::new("/"),
+            )
+            .await;
+        assert_eq!(first.session_id, Some(1));
+
+        let interrupted = sessions
+            .write_stdin(WriteStdin::new(1, "\u{3}".to_owned(), Some(250), None))
             .await;
 
         assert_eq!(interrupted.exit_code, Some(130));

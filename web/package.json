@@ -7,8 +7,12 @@
     "node": "^22.15.0 || ^24.0.0 || ^26.0.0"
   },
   "scripts": {
+    "postinstall": "patch-package",
     "sync": "node scripts/sync-nanocodex.mjs",
     "publish:repository": "node scripts/publish-repository.mjs",
+    "publish:ci-source": "node scripts/publish-ci-source.mjs",
+    "publish:ci-cargo-vendor": "node scripts/publish-ci-cargo-vendor.mjs",
+    "publish:ci-rustsec": "node scripts/publish-ci-rustsec.mjs",
     "wasm": "cd .. && just build-wasm",
     "dev:wasm": "npm run wasm",
     "dev:bootstrap": "npm ci --prefix ../js/bindings && npm run dev:wasm",
@@ -31,7 +35,9 @@
     "deploy:built": "node scripts/deploy-worker.mjs"
   },
   "dependencies": {
+    "@cloudflare/ci": "0.1.0",
     "@cloudflare/containers": "0.3.7",
+    "@cloudflare/sandbox": "0.12.1",
     "@modelcontextprotocol/sdk": "1.30.0",
     "@noble/hashes": "1.8.0",
     "@pierre/diffs": "1.2.12",
@@ -64,6 +70,7 @@
     "@types/react-dom": "19.2.3",
     "@types/ws": "^8.18.1",
     "@vitejs/plugin-react": "6.0.2",
+    "patch-package": "8.0.1",
     "typescript": "5.9.3",
     "vite": "8.2.1",
     "vite-plugin-mkcert": "^1.17.12",

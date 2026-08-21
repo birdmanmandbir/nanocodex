@@ -43,7 +43,7 @@ impl Tool for ExecCommandHandler {
             arguments.max_output_tokens,
         );
         let result = self.sessions.execute(command, &self.workspace).await;
-        Ok(shell_execution(&result))
+        shell_result(&result)
     }
 }
 
@@ -76,14 +76,18 @@ impl Tool for WriteStdinHandler {
             arguments.max_output_tokens,
         );
         let result = self.sessions.write_stdin(request).await;
-        Ok(shell_execution(&result))
+        shell_result(&result)
     }
 }
 
-fn shell_execution(result: &super::ExecCommandResult) -> ToolOutput {
+fn shell_result(result: &super::ExecCommandResult) -> ToolResult {
     if let Some(error) = &result.error {
-        return ToolOutput::error(error);
+        return Err(std::io::Error::other(error.clone()).into());
     }
+    Ok(shell_execution(result))
+}
+
+fn shell_execution(result: &super::ExecCommandResult) -> ToolOutput {
     let structured_result = match serde_json::to_value(result) {
         Ok(value) => value,
         Err(error) => {

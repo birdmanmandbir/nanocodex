@@ -6,6 +6,7 @@ export type Surface =
   | "code"
   | "commits"
   | "requests"
+  | "ci"
   | "evals";
 
 export const productNavigation = [
@@ -14,6 +15,7 @@ export const productNavigation = [
   { surface: "commits", label: "Commits", shortcut: "C" },
   { surface: "docs", label: "Docs", shortcut: "D" },
   { surface: "evals", label: "Evals", shortcut: "E" },
+  { surface: "ci", label: "CI", shortcut: "I" },
   { surface: "code", label: "Source", shortcut: "S" },
 ] as const satisfies ReadonlyArray<{
   surface: Surface;
@@ -29,6 +31,7 @@ const surfacePaths: Record<Surface, string> = {
   code: "/code",
   commits: "/commits",
   requests: "/requests",
+  ci: "/ci",
   evals: "/evals",
 };
 

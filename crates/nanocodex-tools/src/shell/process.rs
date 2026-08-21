@@ -10,7 +10,7 @@ use std::{
 #[cfg(unix)]
 use nix::{
     errno::Errno,
-    sys::signal::{Signal, killpg},
+    sys::signal::{SigSet, SigmaskHow, Signal, kill, killpg, pthread_sigmask},
     unistd::Pid,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -169,7 +169,27 @@ fn spawn_pipes(
     #[cfg(unix)]
     command.process_group(0);
 
-    let mut child = command.spawn()?;
+    #[cfg(unix)]
+    let mut inherited_mask = SigSet::empty();
+    #[cfg(unix)]
+    {
+        // A broad process supervisor may block SIGINT on the spawning thread.
+        // The child inherits that mask across exec, so temporarily unblock it
+        // for the fork and restore the caller's thread immediately afterward.
+        let mut interrupt = SigSet::empty();
+        interrupt.add(Signal::SIGINT);
+        pthread_sigmask(
+            SigmaskHow::SIG_UNBLOCK,
+            Some(&interrupt),
+            Some(&mut inherited_mask),
+        )
+        .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+    }
+    let spawned = command.spawn();
+    #[cfg(unix)]
+    pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&inherited_mask), None)
+        .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+    let mut child = spawned?;
     let pid = child
         .id()
         .ok_or_else(|| io::Error::other("spawned shell without a process identifier"))?;
@@ -276,10 +296,7 @@ impl ProcessGroupGuard {
         let Some(process_group) = self.process_group else {
             return Err(io::Error::other("process identifier exceeds i32::MAX"));
         };
-        match killpg(process_group, Signal::SIGINT) {
-            Ok(()) | Err(Errno::ESRCH) => Ok(()),
-            Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
-        }
+        signal_process_group(process_group, Signal::SIGINT)
     }
 
     #[cfg(not(unix))]
@@ -292,10 +309,7 @@ impl ProcessGroupGuard {
         let Some(process_group) = self.process_group else {
             return Err(io::Error::other("process identifier exceeds i32::MAX"));
         };
-        match killpg(process_group, Signal::SIGKILL) {
-            Ok(()) | Err(Errno::ESRCH) => Ok(()),
-            Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
-        }
+        signal_process_group(process_group, Signal::SIGKILL)
     }
 
     #[cfg(windows)]
@@ -328,6 +342,22 @@ impl ProcessGroupGuard {
         self.terminate()?;
         self.disarm();
         Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn signal_process_group(process_group: Pid, signal: Signal) -> io::Result<()> {
+    match killpg(process_group, signal) {
+        Ok(()) => Ok(()),
+        // Tokio installs setpgid in the child between fork and exec. Under
+        // saturation the parent can try to signal before the child has run
+        // that setup. Signal the child directly so the race cannot turn an
+        // interrupt or cancellation into a surviving process.
+        Err(Errno::ESRCH) => match kill(process_group, signal) {
+            Ok(()) | Err(Errno::ESRCH) => Ok(()),
+            Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
+        },
+        Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
     }
 }
 

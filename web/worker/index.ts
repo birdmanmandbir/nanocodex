@@ -11,6 +11,8 @@ import {
   warmChatGptEgress,
 } from "./chatGptEgressClient.ts";
 import { CredentialVault, type CredentialVaultEnv, type EncryptedEnvelope } from "./credentialVault.ts";
+import { CiRepository } from "./ciRepository.ts";
+import { routeCiRequest, type CiStorageEnv } from "./ciRoutes.ts";
 import { EvalCoordinator, routeEvalMutation, type EvalStorageEnv } from "./evalCoordinator.ts";
 import { routeEvalRead } from "./evalReadApi.ts";
 import { handleGitRequest, type GitStorageEnv } from "./gitRoutes.ts";
@@ -31,7 +33,7 @@ import {
 import { CHATGPT_REALTIME_INSTRUCTIONS } from "nanocodex/browser/realtime";
 import { routeLinkPreview } from "./linkPreview.ts";
 
-export { ChatGptSession, EvalCoordinator, GitRepository, ThreadGitRepository };
+export { ChatGptSession, CiRepository, EvalCoordinator, GitRepository, ThreadGitRepository };
 
 const json = (body: unknown, init?: ResponseInit) =>
   Response.json(body, {
@@ -76,7 +78,7 @@ const CHATGPT_COOKIE = "nanocodex_chatgpt_v2";
 const SECURE_CHATGPT_COOKIE = "__Secure-nanocodex_chatgpt_v2";
 const GIT_SHA_PATTERN = /^[0-9a-f]{40}$/;
 
-type WorkerEnv = GitStorageEnv & ThreadGitStorageEnv & EvalStorageEnv & ChatGptEgressEnv
+type WorkerEnv = GitStorageEnv & ThreadGitStorageEnv & EvalStorageEnv & CiStorageEnv & ChatGptEgressEnv
   & PublicSecurityEnv & CredentialVaultEnv & {
   ASSETS?: Fetcher;
   ENVIRONMENT: string;
@@ -118,6 +120,8 @@ export default {
     if (gitResponse != null) return gitResponse;
     const threadGitResponse = await handleThreadGitRequest(request, env, url, context);
     if (threadGitResponse != null) return threadGitResponse;
+    const ciResponse = await routeCiRequest(request, env, url);
+    if (ciResponse != null) return ciResponse;
     const mcpResponse = await proxyDefaultMcp(request, url, sameOrigin(request, url, env));
     if (mcpResponse != null) return mcpResponse;
 
