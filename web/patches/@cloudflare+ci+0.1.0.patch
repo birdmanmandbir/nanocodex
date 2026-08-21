@@ -110,7 +110,7 @@ index aa6068d..9a43284 100644
  
  export type RunStepResult<S> = RunOutput & {
 diff --git a/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts b/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
-index a7f6c05..ed57947 100644
+index a7f6c05..d759f2f 100644
 --- a/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
 +++ b/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
 @@ -1,7 +1,11 @@
@@ -149,7 +149,16 @@ index a7f6c05..ed57947 100644
  const COMMAND_TIMEOUT_MS = 11 * 60 * 1000;
  const SOURCE_TIMEOUT_MS = 5 * 60 * 1000;
  const PORT_READY_TIMEOUT_MS = 60_000;
-@@ -45,7 +57,6 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -40,12 +52,14 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+   ): Promise<RunStepResult<DirectoryBackup>> {
+     // create the sandbox handle
+     const sandbox = getSandbox(this.env.SANDBOX, createRunnerId(input.label), {
+-      transport: 'http',
++      // Local R2 restores must stream large squashfs archives into the
++      // container. The HTTP transport falls back to one base64 string, which
++      // exceeds V8's string limit for realistic dependency snapshots.
++      transport: this.env.ENVIRONMENT === 'development' ? 'rpc' : 'http',
+       enableDefaultSession: false,
        containerTimeouts: { portReadyTimeoutMS: PORT_READY_TIMEOUT_MS },
      });
  
@@ -157,7 +166,7 @@ index a7f6c05..ed57947 100644
      try {
        if (input.restore) {
          await sandbox.restoreBackup(input.restore);
-@@ -71,7 +82,7 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -71,7 +85,7 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
        }
  
        const proc = await sandbox.startProcess(
@@ -166,7 +175,7 @@ index a7f6c05..ed57947 100644
          {
            cwd: resolveCwd(input.cwd),
            env: {
-@@ -81,61 +92,312 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -81,61 +95,312 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
            autoCleanup: false,
          }
        );
@@ -519,7 +528,7 @@ index a7f6c05..ed57947 100644
  async function readLogs(sandbox: ReturnType<typeof getSandbox>) {
    const listing = await sandbox.listFiles('/tmp');
    const sizes = new Map(
-@@ -192,51 +454,22 @@ function resolveCwd(cwd: string | undefined) {
+@@ -192,51 +457,22 @@ function resolveCwd(cwd: string | undefined) {
    return posix.join(WORKSPACE_DIR, normalized);
  }
  
