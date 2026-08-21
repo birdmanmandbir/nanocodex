@@ -324,7 +324,6 @@ export class NanocodexCI extends CIWorkflow<
       ]);
 
       completed.sort((left, right) => left.name.localeCompare(right.name));
-      gatesCompleted = true;
       await step.do("persist CI success", EVIDENCE_STEP_CONFIG, async () => {
         await this.env.BACKUP_BUCKET.put(
           `runs/${head}/result.json`,
@@ -343,6 +342,7 @@ export class NanocodexCI extends CIWorkflow<
           { httpMetadata: { contentType: "application/json" } },
         );
       });
+      gatesCompleted = true;
     } catch (cause) {
       if (!gatesCompleted) {
         await step.do("persist CI failure", EVIDENCE_STEP_CONFIG, async () => {

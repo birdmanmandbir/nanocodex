@@ -109,6 +109,7 @@ test("terminal gates skip snapshots and publish the website artifact in-place", 
   assert.match(sandboxRunner, /persistOutputs/);
   assert.match(sandboxRunner, /checksum mismatch/);
   assert.match(sandboxRunner, /new FixedLengthStream\(size\)/);
+  assert.match(sandboxRunner, /putMultipartStream\(bucket, key, value, size, options\)/);
   assert.match(sandboxRunner, /metadata\.stdout\.bytesStored/);
   assert.match(sandboxRunner, /putFixedLengthStream\(bucket, output\.key, stream, file\.size/);
   assert.match(sandboxRunner, /let localRestoreTail = Promise\.resolve\(\)/);
@@ -117,4 +118,9 @@ test("terminal gates skip snapshots and publish the website artifact in-place", 
   assert.match(cache, /localBucket: z\.boolean\(\)\.optional\(\)/);
   assert.match(cache, /localBucket: input\.snapshot\.localBucket/);
   assert.match(cache, /env\.ENVIRONMENT === 'development'/);
+  assert.ok(
+    workflow.indexOf('await step.do("persist CI success"') <
+      workflow.indexOf("gatesCompleted = true"),
+    "success is terminal only after its evidence has been persisted",
+  );
 });

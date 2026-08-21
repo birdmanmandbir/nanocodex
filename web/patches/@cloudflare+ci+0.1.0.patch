@@ -88,6 +88,103 @@ index 9603fd2..27f89a7 100644
    // Write the small JSON pointer at the deterministic cache key. It records the
    // randomly generated id of the sandbox workspace backup so a future run can
    // rediscover it; the backup already exists, we only add the indirection.
+diff --git a/node_modules/@cloudflare/ci/src/ci/runners/multipart-stream.d.mts b/node_modules/@cloudflare/ci/src/ci/runners/multipart-stream.d.mts
+new file mode 100644
+index 0000000..85b4b76
+--- /dev/null
++++ b/node_modules/@cloudflare/ci/src/ci/runners/multipart-stream.d.mts
+@@ -0,0 +1,7 @@
++export function putMultipartStream(
++  bucket: R2Bucket,
++  key: string,
++  stream: ReadableStream<Uint8Array>,
++  expectedSize: number,
++  options: R2MultipartOptions,
++): Promise<R2Object>;
+diff --git a/node_modules/@cloudflare/ci/src/ci/runners/multipart-stream.mjs b/node_modules/@cloudflare/ci/src/ci/runners/multipart-stream.mjs
+new file mode 100644
+index 0000000..0b8615e
+--- /dev/null
++++ b/node_modules/@cloudflare/ci/src/ci/runners/multipart-stream.mjs
+@@ -0,0 +1,78 @@
++const MULTIPART_PART_BYTES = 5 * 1024 * 1024;
++
++export async function putMultipartStream(bucket, key, stream, expectedSize, options) {
++  if (!Number.isSafeInteger(expectedSize) || expectedSize < 0) {
++    throw new Error(`Invalid stream size for ${key}: ${expectedSize}`);
++  }
++  const upload = await bucket.createMultipartUpload(key, options);
++  const reader = stream.getReader();
++  const buffered = [];
++  const parts = [];
++  let bufferedBytes = 0;
++  let observedBytes = 0;
++  let partNumber = 1;
++  try {
++    while (true) {
++      const { done, value } = await reader.read();
++      if (done) break;
++      if (!(value instanceof Uint8Array)) {
++        throw new Error(`CI stream yielded a non-byte chunk for ${key}`);
++      }
++      observedBytes += value.byteLength;
++      if (observedBytes > expectedSize) {
++        throw new Error(
++          `CI stream exceeded its declared size for ${key}: expected ${expectedSize}, observed at least ${observedBytes}`,
++        );
++      }
++      buffered.push(value);
++      bufferedBytes += value.byteLength;
++      while (bufferedBytes >= MULTIPART_PART_BYTES) {
++        const part = takeBufferedBytes(buffered, MULTIPART_PART_BYTES);
++        bufferedBytes -= part.byteLength;
++        parts.push(await upload.uploadPart(partNumber++, part));
++      }
++    }
++    if (observedBytes !== expectedSize) {
++      throw new Error(
++        `CI stream ended at the wrong size for ${key}: expected ${expectedSize}, observed ${observedBytes}`,
++      );
++    }
++    if (bufferedBytes > 0 || parts.length === 0) {
++      const part = takeBufferedBytes(buffered, bufferedBytes);
++      bufferedBytes -= part.byteLength;
++      parts.push(await upload.uploadPart(partNumber, part));
++    }
++    const object = await upload.complete(parts);
++    if (object.key !== key || object.size !== expectedSize) {
++      await bucket.delete(key).catch(() => undefined);
++      throw new Error(
++        `CI multipart upload size mismatch for ${key}: expected ${expectedSize}, stored ${object.size}`,
++      );
++    }
++    return object;
++  } catch (error) {
++    await reader.cancel(error).catch(() => undefined);
++    await upload.abort().catch(() => undefined);
++    throw error;
++  } finally {
++    reader.releaseLock();
++  }
++}
++
++function takeBufferedBytes(buffered, size) {
++  const part = new Uint8Array(size);
++  let offset = 0;
++  while (offset < size) {
++    const chunk = buffered[0];
++    if (!chunk) throw new Error("CI multipart stream buffer underflow");
++    const length = Math.min(chunk.byteLength, size - offset);
++    part.set(chunk.subarray(0, length), offset);
++    offset += length;
++    if (length === chunk.byteLength) {
++      buffered.shift();
++    } else {
++      buffered[0] = chunk.subarray(length);
++    }
++  }
++  return part;
++}
 diff --git a/node_modules/@cloudflare/ci/src/ci/runners/runner.ts b/node_modules/@cloudflare/ci/src/ci/runners/runner.ts
 index aa6068d..9a43284 100644
 --- a/node_modules/@cloudflare/ci/src/ci/runners/runner.ts
@@ -147,7 +244,7 @@ index aa6068d..9a43284 100644
  
  export type RunStepResult<S> = RunOutput & {
 diff --git a/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts b/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
-index a7f6c05..b99c385 100644
+index a7f6c05..830f2c4 100644
 --- a/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
 +++ b/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
 @@ -1,7 +1,11 @@
@@ -163,11 +260,12 @@ index a7f6c05..b99c385 100644
  import { posix } from 'node:path';
  import type { Bindings } from '../../env';
  import {
-@@ -9,13 +13,21 @@ import {
+@@ -9,13 +13,22 @@ import {
    checkoutSourceScript,
  } from '../../shared/source-checkout';
  import { slugify } from '../../shared/slugify';
 -import type { RunStepInput, RunStepResult, Runner } from './runner';
++import { putMultipartStream } from './multipart-stream.mjs';
 +import type {
 +  LogCaptureMetadata,
 +  PersistedRunnerLog,
@@ -186,7 +284,7 @@ index a7f6c05..b99c385 100644
  const COMMAND_TIMEOUT_MS = 11 * 60 * 1000;
  const SOURCE_TIMEOUT_MS = 5 * 60 * 1000;
  const PORT_READY_TIMEOUT_MS = 60_000;
-@@ -25,6 +37,11 @@ const TAIL_BYTES = 28_000;
+@@ -25,6 +38,11 @@ const TAIL_BYTES = 28_000;
  // Two inline logs plus result metadata must remain below Workflows' 1 MiB limit.
  const INLINE_LOG_BYTES = 300_000;
  
@@ -198,7 +296,7 @@ index a7f6c05..b99c385 100644
  export class SandboxRunner implements Runner<DirectoryBackup> {
    readonly name = 'sandbox';
  
-@@ -40,15 +57,17 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -40,15 +58,17 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
    ): Promise<RunStepResult<DirectoryBackup>> {
      // create the sandbox handle
      const sandbox = getSandbox(this.env.SANDBOX, createRunnerId(input.label), {
@@ -219,7 +317,7 @@ index a7f6c05..b99c385 100644
          // Overlay (no rm) so cached node_modules survive while tracked source
          // files are refreshed to this commit. The restored archive may carry a
          // different commit's source (e.g. a reused install cache), so this is
-@@ -71,7 +90,7 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -71,7 +91,7 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
        }
  
        const proc = await sandbox.startProcess(
@@ -228,7 +326,7 @@ index a7f6c05..b99c385 100644
          {
            cwd: resolveCwd(input.cwd),
            env: {
-@@ -81,61 +100,359 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -81,61 +101,359 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
            autoCleanup: false,
          }
        );
@@ -577,7 +675,7 @@ index a7f6c05..b99c385 100644
 +  };
 +  const object = typeof value === 'string'
 +    ? await bucket.put(key, value, options)
-+    : await putFixedLengthStream(bucket, key, value, size, options);
++    : await putMultipartStream(bucket, key, value, size, options);
 +  if (!object) throw new Error(`Failed to persist CI failure log ${key}`);
 +  return { key, size: object.size };
 +}
@@ -628,7 +726,7 @@ index a7f6c05..b99c385 100644
  async function readLogs(sandbox: ReturnType<typeof getSandbox>) {
    const listing = await sandbox.listFiles('/tmp');
    const sizes = new Map(
-@@ -192,51 +509,22 @@ function resolveCwd(cwd: string | undefined) {
+@@ -192,51 +510,22 @@ function resolveCwd(cwd: string | undefined) {
    return posix.join(WORKSPACE_DIR, normalized);
  }
  
