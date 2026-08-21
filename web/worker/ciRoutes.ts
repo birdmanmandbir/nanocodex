@@ -422,14 +422,45 @@ async function runStatus(env: RequiredCiEnv, run: CiRunRecord) {
     env.BACKUP_BUCKET.get(`runs/${run.head}/result.json`),
     env.BACKUP_BUCKET.get(`runs/${run.head}/progress.json`),
   ]);
+  const resultValue = result
+    ? await result.json().catch(() => ({ error: "invalid_result" }))
+    : null;
+  const progressValue = progress
+    ? await progress.json().catch(() => ({ error: "invalid_progress" }))
+    : null;
+  const terminated = workflowStatus(workflow) === "terminated";
   return {
     ...run,
     workflow,
-    result: result ? await result.json().catch(() => ({ error: "invalid_result" })) : null,
-    progress: progress
-      ? await progress.json().catch(() => ({ error: "invalid_progress" }))
-      : null,
+    result: terminated ? terminalResult(resultValue) : resultValue,
+    progress: terminated ? terminalProgress(progressValue) : progressValue,
   };
+}
+
+function workflowStatus(value: unknown): string | undefined {
+  return record(value) && typeof value.status === "string" ? value.status : undefined;
+}
+
+function terminalResult(value: unknown): unknown {
+  return record(value) && value.status === "running"
+    ? { ...value, status: "terminated" }
+    : value;
+}
+
+function terminalProgress(value: unknown): unknown {
+  if (!record(value) || !Array.isArray(value.steps)) return value;
+  return {
+    ...value,
+    steps: value.steps.map((step) =>
+      record(step) && step.status === "running"
+        ? { ...step, status: "terminated", message: "terminated by operator" }
+        : step
+    ),
+  };
+}
+
+function record(value: unknown): value is Record<string, unknown> {
+  return value != null && typeof value === "object" && !Array.isArray(value);
 }
 
 async function serveCiArtifact(

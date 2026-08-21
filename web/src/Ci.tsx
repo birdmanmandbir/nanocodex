@@ -26,7 +26,7 @@ const gates = [
 
 type Overview = CiRuns & { latest: CiRunDetail | null };
 type GateView = {
-  status: "pending" | "running" | "success" | "failure";
+  status: "pending" | "running" | "success" | "failure" | "terminated";
   durationMs?: number;
   cacheHit?: boolean;
   exitCode?: number;
@@ -101,7 +101,7 @@ export function Ci() {
   const latest = overview?.latest ?? null;
   const gateViews = gates.map(([slug]) => gateView(latest, slug));
   const completedGates = gateViews.filter(({ status }) =>
-    status === "success" || status === "failure"
+    status !== "pending" && status !== "running"
   ).length;
   const result = validResult(latest?.result);
 
@@ -294,6 +294,8 @@ function GateState({ view }: { view: GateView }) {
     ? "not started"
     : view.status === "running"
     ? "running"
+    : view.status === "terminated"
+    ? "terminated"
     : view.status === "failure"
     ? "failed"
     : view.cacheHit
@@ -395,7 +397,13 @@ function resultLabel(result: CiRunDetail["result"] | undefined) {
 
 function resultTone(result: CiRunDetail["result"] | undefined) {
   if (!result || !("status" in result)) return undefined;
-  return result.status === "success" ? "success" : result.status === "failure" ? "failure" : "active";
+  return result.status === "success"
+    ? "success"
+    : result.status === "failure"
+    ? "failure"
+    : result.status === "terminated"
+    ? "terminated"
+    : "active";
 }
 
 function boundedMessage(message: string) {

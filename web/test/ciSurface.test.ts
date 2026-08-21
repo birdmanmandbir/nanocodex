@@ -34,6 +34,7 @@ test("CI preserves complete state while polling and exposes truthful gate progre
   assert.match(ci, /window\.setTimeout\(\(\) => void poll\(\), 5_000\)/);
   assert.doesNotMatch(ci, /setInterval/);
   assert.match(ci, /status === "running"/);
+  assert.match(ci, /status === "terminated"/);
   assert.match(ci, /not started/);
 });
 

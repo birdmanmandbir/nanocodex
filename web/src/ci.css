@@ -64,6 +64,7 @@
 .ci-metric dd { margin: 0; font-size: 11px; text-transform: lowercase; }
 .ci-metric.is-success dd { color: var(--positive); }
 .ci-metric.is-failure dd { color: var(--negative); }
+.ci-metric.is-terminated dd { color: var(--text-muted); }
 .ci-metric.is-active dd { color: var(--text); }
 
 .ci-error,
@@ -218,6 +219,8 @@
 .ci-gate-state.is-success i { background: var(--positive); border-color: var(--positive); }
 .ci-gate-state.is-failure { color: var(--negative); }
 .ci-gate-state.is-failure i { background: var(--negative); border-color: var(--negative); }
+.ci-gate-state.is-terminated { color: var(--text-muted); }
+.ci-gate-state.is-terminated i { border-style: dashed; }
 
 .ci-log-links { display: flex; gap: 10px; }
 .ci-log-links a {

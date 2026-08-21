@@ -238,6 +238,56 @@ test("published historical archives and Workflow status do not resolve through c
   assert.equal(env.controls.terminations, 1);
 });
 
+test("terminated Workflows reconcile stale running evidence at the read boundary", async () => {
+  const bucket = memoryBucket();
+  const repository = memoryNamespace();
+  const env = configured(bucket, repository);
+  repository.run = {
+    version: 1,
+    head,
+    beforeHead: null,
+    workflowId: `ci-${head}`,
+    state: "dispatched",
+    attempts: 1,
+    publishedAt: "2026-08-21T00:00:00.000Z",
+  };
+  env.controls.status = "terminated";
+  await env.backup.put(`runs/${head}/result.json`, JSON.stringify({
+    version: 1,
+    head,
+    workflowId: `ci-${head}`,
+    status: "running",
+    steps: [],
+  }));
+  await env.backup.put(`runs/${head}/progress.json`, JSON.stringify({
+    version: 1,
+    head,
+    steps: [
+      { name: "Cargo dependencies", slug: "cargo-dependencies", status: "success" },
+      { name: "MSRV workspace tests", slug: "msrv-workspace-tests", status: "running" },
+      { name: "website", slug: "website", status: "pending" },
+    ],
+  }));
+
+  const response = await route(new Request(`https://ci.test/api/ci/runs/${head}`), env);
+  assert.equal(response.status, 200);
+  const detail = await response.json() as {
+    result: { status: string };
+    progress: { steps: Array<{ status: string; message?: string }> };
+  };
+  assert.equal(detail.result.status, "terminated");
+  assert.deepEqual(detail.progress.steps, [
+    { name: "Cargo dependencies", slug: "cargo-dependencies", status: "success" },
+    {
+      name: "MSRV workspace tests",
+      slug: "msrv-workspace-tests",
+      status: "terminated",
+      message: "terminated by operator",
+    },
+    { name: "website", slug: "website", status: "pending" },
+  ]);
+});
+
 function route(request: Request, env: CiStorageEnv): Promise<Response> {
   return routeCiRequest(request, env, new URL(request.url)) as Promise<Response>;
 }
@@ -296,7 +346,7 @@ function controlAuth(extra: HeadersInit = {}): Headers {
 }
 
 function configured(bucket: ReturnType<typeof memoryBucket>, repository: ReturnType<typeof memoryNamespace>) {
-  const controls = { terminations: 0 };
+  const controls = { terminations: 0, status: "running" };
   const backup = memoryBucket();
   return {
     CI_SOURCE: bucket as unknown as R2Bucket,
@@ -307,7 +357,7 @@ function configured(bucket: ReturnType<typeof memoryBucket>, repository: ReturnT
         assert.equal(id, `ci-${head}`);
         return {
           id,
-          status: async () => ({ status: "running" }),
+          status: async () => ({ status: controls.status }),
           terminate: async () => { controls.terminations += 1; },
         };
       },

@@ -23,7 +23,7 @@ export type CiStepSummary = {
 export type CiProgressStep = {
   name: string;
   slug: string;
-  status: "pending" | "running" | "success" | "failure";
+  status: "pending" | "running" | "success" | "failure" | "terminated";
   startedAt?: string;
   completedAt?: string;
   durationMs?: number;
@@ -52,7 +52,7 @@ export type CiResult =
       version: 1;
       head: string;
       workflowId: string;
-      status: "running";
+      status: "running" | "terminated";
       rustSecRevision: string;
       rustSecSha256: string;
       startedAt: string;
