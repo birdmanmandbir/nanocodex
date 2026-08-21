@@ -162,6 +162,14 @@ also pin Node 22.15.0, both Python interpreters, the Rust and MSRV toolchains,
 and every installed Cargo utility; a floating package-manager runtime cannot
 silently change the gate.
 
+For a local run, start OrbStack or another Docker-compatible engine, put the
+four development-only CI values in the repository `.env`, and run
+`npm run dev:ci` from this directory. The command rebuilds the development
+Worker, explicitly enables both container-backed Durable Objects, and serves
+the dashboard plus source API at `http://127.0.0.1:8787/ci`. The explicit
+container opt-in is required because the normal visual-development loop keeps
+containers disabled for startup speed.
+
 Create both buckets, configure S3 API credentials scoped only to the backup
 bucket, and set separate source-publication and Workflow-control tokens before
 the first deployment:

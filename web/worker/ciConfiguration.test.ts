@@ -79,6 +79,17 @@ test("development repeats every non-inherited CI binding", async () => {
   assert.equal(development.vars.BACKUP_BUCKET_NAME, "nanocodex-ci-development");
 });
 
+test("the local CI command enables container execution on the public runner origin", async () => {
+  const packageDocument = JSON.parse(
+    await readFile(new URL("../package.json", import.meta.url), "utf8"),
+  );
+  const command = packageDocument.scripts["dev:ci"] as string;
+  assert.match(command, /NANOCODEX_DEV_CONTAINERS=1/);
+  assert.match(command, /CLOUDFLARE_ENV=development/);
+  assert.match(command, /wrangler\.js dev --enable-containers/);
+  assert.match(command, /--port 8787 --ip 127\.0\.0\.1/);
+});
+
 test("terminal gates skip snapshots and publish the website artifact in-place", async () => {
   const [workflow, sandboxRunner, cache] = await Promise.all([
     readFile(new URL("./ciWorkflow.ts", import.meta.url), "utf8"),
