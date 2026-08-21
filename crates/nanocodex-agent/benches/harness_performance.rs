@@ -176,7 +176,7 @@ impl Service<ResponsesAttempt> for ScriptedResponses {
     }
 }
 
-fn attempt_kind(kind: ResponsesAttemptKind) -> &'static str {
+const fn attempt_kind(kind: ResponsesAttemptKind) -> &'static str {
     match kind {
         ResponsesAttemptKind::Warmup => "warmup",
         ResponsesAttemptKind::Generation => "generation",

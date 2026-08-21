@@ -64,7 +64,7 @@ impl ResponsesObserver {
         }
     }
 
-    fn projects_response_events(&self) -> bool {
+    const fn projects_response_events(&self) -> bool {
         self.response_events.is_none()
     }
 }
