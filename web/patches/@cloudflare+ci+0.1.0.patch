@@ -1,3 +1,40 @@
+diff --git a/node_modules/@cloudflare/ci/src/ci/cache.ts b/node_modules/@cloudflare/ci/src/ci/cache.ts
+index 433f19c..c985dd3 100644
+--- a/node_modules/@cloudflare/ci/src/ci/cache.ts
++++ b/node_modules/@cloudflare/ci/src/ci/cache.ts
+@@ -16,6 +16,7 @@ const BACKUP_ID =
+ const cachePointerSchema = z.object({
+   backupId: z.string().regex(BACKUP_ID),
+   dir: z.literal('/workspace'),
++  localBucket: z.boolean().optional(),
+   producedBySha: z.string().min(1),
+   createdAt: z.string().min(1),
+ });
+@@ -173,7 +174,15 @@ export async function lookupSnapshotCache(
+   }
+   return {
+     status: 'hit',
+-    snapshot: { id: pointer.backupId, dir: pointer.dir },
++    snapshot: {
++      id: pointer.backupId,
++      dir: pointer.dir,
++      // Pointers written before localBucket was persisted still refer to the
++      // same local R2 binding when read by a development worker.
++      localBucket:
++        pointer.localBucket ??
++        (env.ENVIRONMENT === 'development' ? true : undefined),
++    },
+     cachePointer: { key: input.key, ...metadata },
+   };
+ }
+@@ -202,6 +211,7 @@ export async function publishSnapshotCache(
+   await writeCachePointer(env, input.key, {
+     backupId: id,
+     dir,
++    localBucket: input.snapshot.localBucket,
+     producedBySha: input.producedBySha,
+     createdAt: metadata.createdAt,
+   });
 diff --git a/node_modules/@cloudflare/ci/src/ci/capabilities.ts b/node_modules/@cloudflare/ci/src/ci/capabilities.ts
 index 9603fd2..27f89a7 100644
 --- a/node_modules/@cloudflare/ci/src/ci/capabilities.ts

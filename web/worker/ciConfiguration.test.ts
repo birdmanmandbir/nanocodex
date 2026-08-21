@@ -80,10 +80,14 @@ test("development repeats every non-inherited CI binding", async () => {
 });
 
 test("terminal gates skip snapshots and publish the website artifact in-place", async () => {
-  const [workflow, sandboxRunner] = await Promise.all([
+  const [workflow, sandboxRunner, cache] = await Promise.all([
     readFile(new URL("./ciWorkflow.ts", import.meta.url), "utf8"),
     readFile(
       new URL("../node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts", import.meta.url),
+      "utf8",
+    ),
+    readFile(
+      new URL("../node_modules/@cloudflare/ci/src/ci/cache.ts", import.meta.url),
       "utf8",
     ),
   ]);
@@ -104,4 +108,7 @@ test("terminal gates skip snapshots and publish the website artifact in-place", 
   assert.match(sandboxRunner, /input\.createSnapshot/);
   assert.match(sandboxRunner, /persistOutputs/);
   assert.match(sandboxRunner, /checksum mismatch/);
+  assert.match(cache, /localBucket: z\.boolean\(\)\.optional\(\)/);
+  assert.match(cache, /localBucket: input\.snapshot\.localBucket/);
+  assert.match(cache, /env\.ENVIRONMENT === 'development'/);
 });
