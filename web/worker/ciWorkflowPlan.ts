@@ -151,16 +151,12 @@ export function completeDependencyCacheInputs(): string[] {
 }
 
 export function rustBuildCacheInputs(): string[] {
-  return [
-    ...cargoCacheInputs(),
-    ".cargo/**/*",
-    "bin/**/*",
-    "crates/**/*",
-    "examples/**/*.rs",
-    "examples/**/Cargo.toml",
-    "js/bindings/src/**/*",
-    "py/bindings/src/**/*",
-  ];
+  // The snapshot retains only Cargo homes, target output, and a fingerprint of
+  // the source that produced it. A restored runner overlays the exact current
+  // tree and touches every Rust input when that fingerprint changes, so Cargo
+  // safely reuses dependency artifacts while rebuilding affected workspace
+  // crates. Source content therefore must not fragment this reusable layer.
+  return cargoCacheInputs();
 }
 
 export function javascriptDependencyCommand(): string {

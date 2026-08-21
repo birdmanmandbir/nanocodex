@@ -120,16 +120,11 @@ test("dependency and Rust compilation snapshots are content addressed", async ()
     stat(new URL(`../../${project}/package.json`, import.meta.url)),
     stat(new URL(`../../${project}/package-lock.json`, import.meta.url)),
   ]));
-  assert.deepEqual(rustBuildCacheInputs(), [
-    ...cargoCacheInputs(),
-    ".cargo/**/*",
-    "bin/**/*",
-    "crates/**/*",
-    "examples/**/*.rs",
-    "examples/**/Cargo.toml",
-    "js/bindings/src/**/*",
-    "py/bindings/src/**/*",
-  ]);
+  assert.deepEqual(rustBuildCacheInputs(), cargoCacheInputs());
+  assert.ok(
+    rustBuildCacheInputs().every((path) => !path.includes("src") && !path.endsWith("**/*")),
+    "workspace source changes reuse the compatible Cargo target layer",
+  );
   assert.doesNotMatch(javascriptDependencyCommand(), /\.node-modules\.tar|\btar\b/);
   assert.match(javascriptDependencyCommand(), /\.node-modules-staging/);
   assert.match(rustBuildCacheCommand(), /cargo test --workspace --locked --no-run/);
