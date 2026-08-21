@@ -131,6 +131,15 @@ test("terminal gates skip snapshots and publish the website artifact in-place", 
   assert.match(sandboxRunner, /let localRestoreTail = Promise\.resolve\(\)/);
   assert.match(sandboxRunner, /await restoreSnapshot\(sandbox, input\.restore, this\.env\)/);
   assert.match(sandboxRunner, /env\.ENVIRONMENT !== 'development'/);
+  assert.match(sandboxRunner, /await registerActiveSandbox\(/);
+  assert.match(sandboxRunner, /await assertRunActive\(this\.env\.BACKUP_BUCKET, input\.sourceSha\)/);
+  assert.match(sandboxRunner, /runs\/\$\{head\}\/sandboxes\/\$\{runnerId\}\.json/);
+  assert.match(sandboxRunner, /runs\/\$\{head\}\/control\/terminated\.json/);
+  assert.ok(
+    sandboxRunner.indexOf("if (sandbox) await destroySandbox(sandbox)") <
+      sandboxRunner.indexOf("await this.env.BACKUP_BUCKET.delete(registryKey)"),
+    "a Sandbox marker is deleted only after teardown succeeds",
+  );
   assert.match(cache, /localBucket: z\.boolean\(\)\.optional\(\)/);
   assert.match(cache, /localBucket: input\.snapshot\.localBucket/);
   assert.match(cache, /env\.ENVIRONMENT === 'development'/);

@@ -288,6 +288,86 @@ test("terminated Workflows reconcile stale running evidence at the read boundary
   ]);
 });
 
+test("termination tombstones the run and destroys every registered Sandbox", async () => {
+  const bucket = memoryBucket();
+  const repository = memoryNamespace();
+  const env = configured(bucket, repository);
+  repository.run = {
+    version: 1,
+    head,
+    beforeHead: null,
+    workflowId: `ci-${head}`,
+    state: "dispatched",
+    attempts: 1,
+    publishedAt: "2026-08-21T00:00:00.000Z",
+  };
+  const active = [
+    "quality-11111111-1111-4111-8111-111111111111",
+    "python-3-11-22222222-2222-4222-8222-222222222222",
+  ];
+  for (const runnerId of active) {
+    await env.backup.put(`runs/${head}/sandboxes/${runnerId}.json`, "{}");
+  }
+  const unrelated = "website-33333333-3333-4333-8333-333333333333";
+  await env.backup.put(`runs/${"b".repeat(40)}/sandboxes/${unrelated}.json`, "{}");
+
+  const response = await route(new Request(`https://ci.test/api/ci/runs/${head}/terminate`, {
+    method: "POST",
+    headers: controlAuth(),
+  }), env);
+
+  const destroyed = [...active].sort();
+  assert.equal(response.status, 200);
+  assert.deepEqual(env.controls.events, ["workflow", ...destroyed]);
+  assert.equal(env.controls.status, "terminated");
+  assert.deepEqual((await response.json() as {
+    sandboxCleanup: { destroyed: string[]; failed: unknown[] };
+  }).sandboxCleanup, { destroyed, failed: [] });
+  assert.ok(await env.backup.head(`runs/${head}/control/terminated.json`));
+  for (const runnerId of active) {
+    assert.equal(await env.backup.head(`runs/${head}/sandboxes/${runnerId}.json`), null);
+  }
+  assert.ok(await env.backup.head(`runs/${"b".repeat(40)}/sandboxes/${unrelated}.json`));
+});
+
+test("incomplete Sandbox termination is retried and remains recoverable", async () => {
+  const bucket = memoryBucket();
+  const repository = memoryNamespace();
+  const env = configured(bucket, repository);
+  repository.run = {
+    version: 1,
+    head,
+    beforeHead: null,
+    workflowId: `ci-${head}`,
+    state: "dispatched",
+    attempts: 1,
+    publishedAt: "2026-08-21T00:00:00.000Z",
+  };
+  const runnerId = "quality-44444444-4444-4444-8444-444444444444";
+  const marker = `runs/${head}/sandboxes/${runnerId}.json`;
+  await env.backup.put(marker, "{}");
+  env.sandbox.failures.set(runnerId, 3);
+
+  const response = await route(new Request(`https://ci.test/api/ci/runs/${head}/terminate`, {
+    method: "POST",
+    headers: controlAuth(),
+  }), env);
+
+  assert.equal(response.status, 409);
+  assert.deepEqual(await response.json(), {
+    error: "ci_termination_incomplete",
+    sandboxCleanup: {
+      destroyed: [],
+      failed: [{
+        runnerId,
+        error: `failed to destroy active CI Sandbox ${runnerId}`,
+      }],
+    },
+  });
+  assert.equal(env.sandbox.attempts.get(runnerId), 3);
+  assert.ok(await env.backup.head(marker), "failed teardown retains its registry marker");
+});
+
 function route(request: Request, env: CiStorageEnv): Promise<Response> {
   return routeCiRequest(request, env, new URL(request.url)) as Promise<Response>;
 }
@@ -346,8 +426,9 @@ function controlAuth(extra: HeadersInit = {}): Headers {
 }
 
 function configured(bucket: ReturnType<typeof memoryBucket>, repository: ReturnType<typeof memoryNamespace>) {
-  const controls = { terminations: 0, status: "running" };
   const backup = memoryBucket();
+  const controls = { terminations: 0, status: "running", events: [] as string[] };
+  const sandbox = memorySandboxNamespace(controls);
   return {
     CI_SOURCE: bucket as unknown as R2Bucket,
     BACKUP_BUCKET: backup as unknown as R2Bucket,
@@ -358,14 +439,52 @@ function configured(bucket: ReturnType<typeof memoryBucket>, repository: ReturnT
         return {
           id,
           status: async () => ({ status: controls.status }),
-          terminate: async () => { controls.terminations += 1; },
+          terminate: async () => {
+            assert.ok(await backup.head(`runs/${head}/control/terminated.json`));
+            controls.terminations += 1;
+            controls.status = "terminated";
+            controls.events.push("workflow");
+          },
         };
       },
     } as unknown as Workflow,
+    SANDBOX: sandbox.namespace as unknown as DurableObjectNamespace<
+      import("@cloudflare/ci/worker").CiSandbox
+    >,
     CI_SOURCE_WRITE_TOKEN: "write-token",
     CI_CONTROL_TOKEN: "control-token",
     backup,
     controls,
+    sandbox,
+  };
+}
+
+function memorySandboxNamespace(controls: { terminations: number; events: string[] }) {
+  const destroyed: string[] = [];
+  const failures = new Map<string, number>();
+  const attempts = new Map<string, number>();
+  return {
+    namespace: {
+      idFromName(name: string) { return { name }; },
+      get(id: { name: string }) {
+        return {
+          async destroy() {
+            assert.equal(controls.terminations, 1);
+            attempts.set(id.name, (attempts.get(id.name) ?? 0) + 1);
+            const remaining = failures.get(id.name) ?? 0;
+            if (remaining > 0) {
+              failures.set(id.name, remaining - 1);
+              throw new Error("injected Sandbox teardown failure");
+            }
+            destroyed.push(id.name);
+            controls.events.push(id.name);
+          },
+        };
+      },
+    },
+    destroyed,
+    failures,
+    attempts,
   };
 }
 
@@ -425,6 +544,19 @@ function memoryBucket() {
         json: async () => JSON.parse(new TextDecoder().decode(value.body)),
         blob: async () => new Blob([byteBuffer(value.body)]),
       };
+    },
+    async list(options: R2ListOptions = {}) {
+      const keys = [...objects.keys()]
+        .filter((key) => !options.prefix || key.startsWith(options.prefix))
+        .sort();
+      return {
+        objects: keys.map((key) => object(key, objects.get(key)!)),
+        truncated: false as const,
+        delimitedPrefixes: [],
+      };
+    },
+    async delete(keys: string | string[]) {
+      for (const key of typeof keys === "string" ? [keys] : keys) objects.delete(key);
     },
   };
 }

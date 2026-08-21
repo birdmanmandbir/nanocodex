@@ -244,7 +244,7 @@ index aa6068d..9a43284 100644
  
  export type RunStepResult<S> = RunOutput & {
 diff --git a/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts b/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
-index a7f6c05..a403310 100644
+index a7f6c05..4d25b1c 100644
 --- a/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
 +++ b/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
 @@ -1,7 +1,12 @@
@@ -297,28 +297,44 @@ index a7f6c05..a403310 100644
  export class SandboxRunner implements Runner<DirectoryBackup> {
    readonly name = 'sandbox';
  
-@@ -40,15 +59,17 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -38,17 +57,28 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+   async run(
+     input: RunStepInput & { restore?: DirectoryBackup }
    ): Promise<RunStepResult<DirectoryBackup>> {
-     // create the sandbox handle
-     const sandbox = getSandbox(this.env.SANDBOX, createRunnerId(input.label), {
+-    // create the sandbox handle
+-    const sandbox = getSandbox(this.env.SANDBOX, createRunnerId(input.label), {
 -      transport: 'http',
-+      // Local R2 restores must stream large squashfs archives into the
-+      // container. The HTTP transport falls back to one base64 string, which
-+      // exceeds V8's string limit for realistic dependency snapshots.
-+      transport: this.env.ENVIRONMENT === 'development' ? 'rpc' : 'http',
-       enableDefaultSession: false,
-       containerTimeouts: { portReadyTimeoutMS: PORT_READY_TIMEOUT_MS },
-     });
+-      enableDefaultSession: false,
+-      containerTimeouts: { portReadyTimeoutMS: PORT_READY_TIMEOUT_MS },
+-    });
++    const runnerId = createRunnerId(input.label);
++    const registryKey = activeSandboxKey(input.sourceSha, runnerId);
++    await registerActiveSandbox(
++      this.env.BACKUP_BUCKET,
++      registryKey,
++      runnerId,
++      input
++    );
++    let sandbox: ReturnType<typeof getSandbox> | undefined;
  
 -    let cleanupTransferredToStreams = false;
      try {
++      await assertRunActive(this.env.BACKUP_BUCKET, input.sourceSha);
++      sandbox = getSandbox(this.env.SANDBOX, runnerId, {
++        // Local R2 restores must stream large squashfs archives into the
++        // container. The HTTP transport falls back to one base64 string, which
++        // exceeds V8's string limit for realistic dependency snapshots.
++        transport: this.env.ENVIRONMENT === 'development' ? 'rpc' : 'http',
++        enableDefaultSession: false,
++        containerTimeouts: { portReadyTimeoutMS: PORT_READY_TIMEOUT_MS },
++      });
        if (input.restore) {
 -        await sandbox.restoreBackup(input.restore);
 +        await restoreSnapshot(sandbox, input.restore, this.env);
          // Overlay (no rm) so cached node_modules survive while tracked source
          // files are refreshed to this commit. The restored archive may carry a
          // different commit's source (e.g. a reused install cache), so this is
-@@ -71,7 +92,7 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -71,7 +101,7 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
        }
  
        const proc = await sandbox.startProcess(
@@ -327,7 +343,7 @@ index a7f6c05..a403310 100644
          {
            cwd: resolveCwd(input.cwd),
            env: {
-@@ -81,61 +102,389 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -81,61 +111,435 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
            autoCleanup: false,
          }
        );
@@ -439,11 +455,57 @@ index a7f6c05..a403310 100644
 -      if (!cleanupTransferredToStreams) {
 -        await destroySandbox(sandbox);
 -      }
-+      await destroySandbox(sandbox);
++      // Keep the registry marker when teardown fails so the authenticated
++      // control route can retry the exact Sandbox rather than leaking it.
++      if (sandbox) await destroySandbox(sandbox);
++      await this.env.BACKUP_BUCKET.delete(registryKey);
      }
    }
  }
  
++async function registerActiveSandbox(
++  bucket: R2Bucket,
++  key: string,
++  runnerId: string,
++  input: RunStepInput
++) {
++  const registeredAt = new Date().toISOString();
++  await bucket.put(
++    key,
++    JSON.stringify({
++      version: 1,
++      head: input.sourceSha,
++      runnerId,
++      label: input.label,
++      attempt: input.attempt,
++      registeredAt,
++    }),
++    {
++      httpMetadata: { contentType: 'application/json' },
++      customMetadata: {
++        kind: 'active-ci-sandbox',
++        head: input.sourceSha,
++        runnerId,
++        registeredAt,
++      },
++    }
++  );
++}
++
++async function assertRunActive(bucket: R2Bucket, head: string) {
++  if (await bucket.head(terminationMarkerKey(head))) {
++    throw new Error(`CI run ${head} was terminated before Sandbox startup`);
++  }
++}
++
++function activeSandboxKey(head: string, runnerId: string) {
++  return `runs/${head}/sandboxes/${runnerId}.json`;
++}
++
++function terminationMarkerKey(head: string) {
++  return `runs/${head}/control/terminated.json`;
++}
++
 +async function restoreSnapshot(
 +  sandbox: ReturnType<typeof getSandbox>,
 +  snapshot: DirectoryBackup,
@@ -757,7 +819,7 @@ index a7f6c05..a403310 100644
  async function readLogs(sandbox: ReturnType<typeof getSandbox>) {
    const listing = await sandbox.listFiles('/tmp');
    const sizes = new Map(
-@@ -153,7 +502,7 @@ async function readLog(
+@@ -153,7 +557,7 @@ async function readLog(
    size: number
  ): Promise<string | ReadableStream<Uint8Array>> {
    if (size > INLINE_LOG_BYTES) {
@@ -766,7 +828,7 @@ index a7f6c05..a403310 100644
    }
    return (await sandbox.readFile(file, { encoding: 'utf-8' })).content;
  }
-@@ -192,51 +541,22 @@ function resolveCwd(cwd: string | undefined) {
+@@ -192,51 +596,22 @@ function resolveCwd(cwd: string | undefined) {
    return posix.join(WORKSPACE_DIR, normalized);
  }
  

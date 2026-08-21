@@ -17,12 +17,14 @@ const MAX_ARCHIVE_BYTES = 128 * 1024 * 1024;
 const MAX_TREE_BYTES = 16 * 1024 * 1024;
 const MAX_CARGO_VENDOR_BYTES = 16 * 1024 * 1024;
 const MAX_RUSTSEC_ADVISORY_BYTES = 16 * 1024 * 1024;
+const SANDBOX_ID = /^[a-z0-9-]{1,16}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export type CiStorageEnv = {
   CI_SOURCE?: R2Bucket;
   BACKUP_BUCKET?: R2Bucket;
   CI_REPOSITORY?: DurableObjectNamespace;
   CI_WORKFLOW?: Workflow;
+  SANDBOX?: DurableObjectNamespace<import("@cloudflare/ci/worker").CiSandbox>;
   CI_SOURCE_WRITE_TOKEN?: string;
   CI_CONTROL_TOKEN?: string;
 };
@@ -45,7 +47,13 @@ export async function routeCiRequest(
     return unauthorized();
   }
   if (controlRoute && !authenticate(request, env.CI_CONTROL_TOKEN)) return unauthorized();
-  if (!env.CI_SOURCE || !env.BACKUP_BUCKET || !env.CI_REPOSITORY || !env.CI_WORKFLOW) {
+  if (
+    !env.CI_SOURCE ||
+    !env.BACKUP_BUCKET ||
+    !env.CI_REPOSITORY ||
+    !env.CI_WORKFLOW ||
+    !env.SANDBOX
+  ) {
     return error("ci_not_configured", 503);
   }
   const configured = env as RequiredCiEnv;
@@ -131,13 +139,38 @@ export async function routeCiRequest(
     const response = await repository(configured).fetch(`https://ci-repository/runs/${control[1]}`);
     if (!response.ok) return response;
     const record = await response.json<CiRunRecord>();
+    await configured.BACKUP_BUCKET.put(
+      terminationMarkerKey(record.head),
+      JSON.stringify({
+        version: 1,
+        head: record.head,
+        workflowId: record.workflowId,
+        terminatedAt: new Date().toISOString(),
+      }),
+      {
+        httpMetadata: { contentType: "application/json" },
+        customMetadata: { kind: "ci-run-termination", head: record.head },
+      },
+    );
+    let workflowFailure: string | undefined;
     try {
       const instance = await configured.CI_WORKFLOW.get(record.workflowId);
       await instance.terminate();
-    } catch {
-      return error("workflow_control_failed", 409);
+    } catch (cause) {
+      workflowFailure = boundedError(cause);
     }
-    return Response.json(await runStatus(configured, record), noStore());
+    const sandboxCleanup = await terminateActiveSandboxes(configured, record.head);
+    if (workflowFailure || sandboxCleanup.failed.length > 0) {
+      return Response.json({
+        error: "ci_termination_incomplete",
+        ...(workflowFailure ? { workflowFailure } : {}),
+        sandboxCleanup,
+      }, { status: 409, ...noStore() });
+    }
+    return Response.json({
+      ...await runStatus(configured, record),
+      sandboxCleanup,
+    }, noStore());
   }
 
   return error("not_found", 404);
@@ -533,8 +566,82 @@ async function serveRunFile(
 }
 
 type RequiredCiEnv = Required<
-  Pick<CiStorageEnv, "CI_SOURCE" | "BACKUP_BUCKET" | "CI_REPOSITORY" | "CI_WORKFLOW">
+  Pick<
+    CiStorageEnv,
+    "CI_SOURCE" | "BACKUP_BUCKET" | "CI_REPOSITORY" | "CI_WORKFLOW" | "SANDBOX"
+  >
 > & CiStorageEnv;
+
+async function terminateActiveSandboxes(env: RequiredCiEnv, head: string) {
+  const prefix = activeSandboxPrefix(head);
+  const markers = await listAll(env.BACKUP_BUCKET, prefix);
+  const targets = markers.flatMap(({ key }) => {
+    const file = key.slice(prefix.length);
+    const runnerId = file.endsWith(".json") ? file.slice(0, -5) : "";
+    return SANDBOX_ID.test(runnerId) ? [{ key, runnerId }] : [];
+  }).sort((left, right) => left.runnerId.localeCompare(right.runnerId));
+  const settled = await Promise.all(targets.map(async ({ key, runnerId }) => {
+    try {
+      await destroyActiveSandbox(env.SANDBOX, runnerId);
+      await env.BACKUP_BUCKET.delete(key);
+      return { runnerId, status: "destroyed" as const };
+    } catch (cause) {
+      return {
+        runnerId,
+        status: "failed" as const,
+        error: boundedError(cause),
+      };
+    }
+  }));
+  return {
+    destroyed: settled
+      .filter(({ status }) => status === "destroyed")
+      .map(({ runnerId }) => runnerId),
+    failed: settled
+      .filter(({ status }) => status === "failed")
+      .map(({ runnerId, error }) => ({ runnerId, error })),
+  };
+}
+
+async function listAll(bucket: R2Bucket, prefix: string): Promise<R2Object[]> {
+  const objects: R2Object[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await bucket.list({ prefix, cursor, limit: 1_000 });
+    objects.push(...page.objects);
+    if (!page.truncated) break;
+    if (!page.cursor || page.cursor === cursor) {
+      throw new Error("active Sandbox registry pagination did not advance");
+    }
+    cursor = page.cursor;
+  } while (cursor);
+  return objects;
+}
+
+async function destroyActiveSandbox(
+  namespace: RequiredCiEnv["SANDBOX"],
+  runnerId: string,
+) {
+  const sandbox = namespace.get(namespace.idFromName(runnerId));
+  let failure: unknown;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await sandbox.destroy();
+      return;
+    } catch (cause) {
+      failure = cause;
+    }
+  }
+  throw new Error(`failed to destroy active CI Sandbox ${runnerId}`, { cause: failure });
+}
+
+function activeSandboxPrefix(head: string) {
+  return `runs/${head}/sandboxes/`;
+}
+
+function terminationMarkerKey(head: string) {
+  return `runs/${head}/control/terminated.json`;
+}
 
 function repository(env: RequiredCiEnv) {
   return env.CI_REPOSITORY.get(env.CI_REPOSITORY.idFromName("nanocodex"));
