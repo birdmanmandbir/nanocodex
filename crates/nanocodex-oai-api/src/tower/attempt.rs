@@ -7,8 +7,8 @@ use std::{
 };
 
 use crate::{
-    AgentEventKind, EventError, EventSink, Model, ResponseEvent, ResponseItem, ResponsesTransport,
-    Thinking,
+    AgentEventKind, ContentItem, EventError, EventSink, MessagePhase, MessageRole, Model,
+    ResponseEvent, ResponseItem, ResponsesTransport, Thinking,
     responses::{RequestProfile, ResponseHistory, ResponsesInput, WarmupResponse},
     tower::transport_policy::SessionTransport,
 };
@@ -63,6 +63,26 @@ impl ResponsesObserver {
             drop(events.send(event).await);
         }
     }
+
+    fn projects_response_events(&self) -> bool {
+        self.response_events.is_none()
+    }
+}
+
+#[derive(Serialize)]
+struct ProjectedTextDelta<'a> {
+    model_call_index: u32,
+    text: &'a str,
+}
+
+#[derive(Serialize)]
+struct ProjectedAssistantMessage<'a> {
+    model_call_index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    item_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<MessagePhase>,
+    text: String,
 }
 
 /// Shared atomic counters for one transport family.
@@ -310,6 +330,12 @@ impl ResponsesAttempt {
         self.call_index
     }
 
+    /// Returns the stable prompt-cache identity carried by this attempt.
+    #[must_use]
+    pub fn prompt_cache_key(&self) -> &str {
+        self.profile.prompt_cache_key()
+    }
+
     /// Returns the reasoning effort fixed for this replayable attempt.
     #[must_use]
     pub const fn thinking(&self) -> Thinking {
@@ -346,6 +372,53 @@ impl ResponsesAttempt {
     /// that only returns a completed aggregate may omit it; the managed
     /// response stream synthesizes its terminal completion event.
     pub async fn emit(&self, event: ResponseEvent) {
+        if self.observer.projects_response_events() {
+            match &event {
+                ResponseEvent::OutputTextDelta(text) => {
+                    drop(self.observer.emit(
+                        AgentEventKind::AssistantDelta,
+                        ProjectedTextDelta {
+                            model_call_index: self.call_index.unwrap_or_default(),
+                            text,
+                        },
+                    ));
+                }
+                ResponseEvent::ReasoningSummaryDelta { delta, .. } => {
+                    drop(self.observer.emit(
+                        AgentEventKind::ReasoningSummaryDelta,
+                        ProjectedTextDelta {
+                            model_call_index: self.call_index.unwrap_or_default(),
+                            text: delta,
+                        },
+                    ));
+                }
+                ResponseEvent::OutputItemDone(ResponseItem::Message {
+                    id,
+                    role: MessageRole::Assistant,
+                    content,
+                    phase,
+                    ..
+                }) => {
+                    let text = content
+                        .iter()
+                        .filter_map(|item| match item {
+                            ContentItem::OutputText { text, .. } => Some(text.as_ref()),
+                            _ => None,
+                        })
+                        .collect();
+                    drop(self.observer.emit(
+                        AgentEventKind::AssistantMessage,
+                        ProjectedAssistantMessage {
+                            model_call_index: self.call_index.unwrap_or_default(),
+                            item_id: id.as_deref(),
+                            phase: *phase,
+                            text,
+                        },
+                    ));
+                }
+                _ => {}
+            }
+        }
         self.observer.emit_response(event).await;
     }
 
@@ -623,11 +696,60 @@ impl ResponsesAttemptFactory {
 mod tests {
     use super::{ResponseHistory, ResponsesAttemptFactory, TransportStats};
     use crate::{
-        ContentItem, EventSink, MessageRole, Model, ResponseItem, ResponsesTransport, Thinking,
-        responses::RequestProfile,
+        AgentEventData, AgentEventKind, AssistantEvent, ContentItem, EventSink, MessageRole, Model,
+        ResponseEvent, ResponseItem, ResponsesTransport, Thinking, responses::RequestProfile,
     };
     use serde_json::json;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn caller_service_delta_reaches_the_agent_event_stream() {
+        let (events, mut receiver) = EventSink::channel("attempt-test".to_owned());
+        let factory = ResponsesAttemptFactory::new(
+            RequestProfile::new("attempt-test", "attempt-test", Arc::from([])),
+            events,
+            Arc::new(TransportStats::default()),
+        );
+        let attempt = factory.generation(
+            7,
+            ResponseHistory::default(),
+            ResponseHistory::default(),
+            0,
+            None,
+            Model::Sol,
+            Thinking::Medium,
+            false,
+        );
+
+        attempt
+            .emit(ResponseEvent::OutputTextDelta("delta".to_owned()))
+            .await;
+
+        let event = receiver.recv().await.unwrap();
+        assert_eq!(event.kind, AgentEventKind::AssistantDelta);
+        let AgentEventData::Assistant(AssistantEvent::Delta(delta)) = event.data().unwrap() else {
+            panic!("expected an assistant delta");
+        };
+        assert_eq!(delta.model_call_index, 7);
+        assert_eq!(delta.text, "delta");
+        assert_eq!(delta.item_id, None);
+        assert_eq!(delta.phase, None);
+
+        attempt
+            .emit(ResponseEvent::OutputItemDone(ResponseItem::message(
+                MessageRole::Assistant,
+                [ContentItem::output_text("complete")],
+            )))
+            .await;
+        let event = receiver.recv().await.unwrap();
+        assert_eq!(event.kind, AgentEventKind::AssistantMessage);
+        let AgentEventData::Assistant(AssistantEvent::Message(message)) = event.data().unwrap()
+        else {
+            panic!("expected an assistant message");
+        };
+        assert_eq!(message.model_call_index, 7);
+        assert_eq!(message.text, "complete");
+    }
 
     #[test]
     fn retry_preserves_the_attempts_turn_policy() {
@@ -651,6 +773,7 @@ mod tests {
         assert_eq!(attempt.model(), Model::Luna);
         assert_eq!(attempt.thinking(), Thinking::High);
         assert!(attempt.fast_mode());
+        assert_eq!(attempt.prompt_cache_key(), "attempt-test");
         assert!(attempt.prepare_retry());
         assert_eq!(attempt.model(), Model::Luna);
         assert_eq!(attempt.thinking(), Thinking::High);
