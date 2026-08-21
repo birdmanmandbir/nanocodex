@@ -91,6 +91,7 @@ test("terminal gates skip snapshots and publish the website artifact in-place", 
   assert.match(workflow, /runnerConfig\(40 \* 60 \* 1_000, 24 \* 60 \* 60, 0, false\)/);
   assert.match(workflow, /path: "\/workspace\/\.ci-output\/web-wasm\.tar"/);
   assert.match(workflow, /path: "\/workspace\/\.ci-output\/web-dist\.tar"/);
+  assert.match(sandboxRunner, /localBucket: this\.env\.ENVIRONMENT === 'development'/);
   assert.match(workflow, /name: "Node and browser bindings"[\s\S]*?runnerConfig\(60 \* 60 \* 1_000, 24 \* 60 \* 60, 0, false\)/);
   assert.match(workflow, /const website = await completeDependencies\.runner/);
   assert.doesNotMatch(workflow, /const website = await bindings\.runner/);

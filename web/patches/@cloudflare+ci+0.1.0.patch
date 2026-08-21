@@ -110,7 +110,7 @@ index aa6068d..9a43284 100644
  
  export type RunStepResult<S> = RunOutput & {
 diff --git a/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts b/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
-index a7f6c05..961e287 100644
+index a7f6c05..ed57947 100644
 --- a/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
 +++ b/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
 @@ -1,7 +1,11 @@
@@ -166,7 +166,7 @@ index a7f6c05..961e287 100644
          {
            cwd: resolveCwd(input.cwd),
            env: {
-@@ -81,61 +92,311 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -81,61 +92,312 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
            autoCleanup: false,
          }
        );
@@ -244,6 +244,7 @@ index a7f6c05..961e287 100644
 +          ? sandbox.createBackup({
 +              dir: WORKSPACE_DIR,
 +              name: input.label,
++              localBucket: this.env.ENVIRONMENT === 'development',
 +              multipart: true,
 +              ttl: input.ttlSeconds,
 +            })
@@ -518,7 +519,7 @@ index a7f6c05..961e287 100644
  async function readLogs(sandbox: ReturnType<typeof getSandbox>) {
    const listing = await sandbox.listFiles('/tmp');
    const sizes = new Map(
-@@ -192,51 +453,22 @@ function resolveCwd(cwd: string | undefined) {
+@@ -192,51 +454,22 @@ function resolveCwd(cwd: string | undefined) {
    return posix.join(WORKSPACE_DIR, normalized);
  }
  
@@ -643,6 +644,18 @@ index 2d70c69..34f3d87 100644
        snapshot: completed.snapshot,
        cachePointer: completed.cachePointer,
      };
+diff --git a/node_modules/@cloudflare/ci/src/env.ts b/node_modules/@cloudflare/ci/src/env.ts
+index bf35048..e536ac2 100644
+--- a/node_modules/@cloudflare/ci/src/env.ts
++++ b/node_modules/@cloudflare/ci/src/env.ts
+@@ -18,6 +18,7 @@ type Secrets = {
+ // Runtime contract owned by the CI package. A deployable Worker can intersect
+ // this with its Wrangler-generated CloudflareBindings for configuration checks.
+ export type Bindings = Secrets & {
++  ENVIRONMENT?: string;
+   ARTIFACTS: Artifacts;
+   BACKUP_BUCKET: R2Bucket;
+   BACKUP_BUCKET_NAME: string;
 diff --git a/node_modules/@cloudflare/ci/src/pipeline/ci-workflow.ts b/node_modules/@cloudflare/ci/src/pipeline/ci-workflow.ts
 index a0ac164..26084bc 100644
 --- a/node_modules/@cloudflare/ci/src/pipeline/ci-workflow.ts
