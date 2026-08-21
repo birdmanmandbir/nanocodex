@@ -79,7 +79,11 @@ export class CiRepository {
       const runs = [...records.values()]
         .sort((left, right) => right.publishedAt.localeCompare(left.publishedAt))
         .slice(0, 50);
-      return Response.json({ runs });
+      return Response.json({
+        runs,
+        retainedCount: records.size,
+        retentionLimit: MAX_RETAINED_RUNS,
+      });
     }
     if (url.pathname === "/publications" && request.method === "PUT") {
       return this.#publish(request);

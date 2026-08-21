@@ -951,6 +951,8 @@ function NanocodexShell({ preparedRoute }: Required<NanocodexAppProps>) {
           ? "commits"
           : key === "e"
           ? "evals"
+          : key === "i"
+          ? "ci"
           : null;
       if (nextSurface) {
         event.preventDefault();

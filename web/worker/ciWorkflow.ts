@@ -28,6 +28,7 @@ import {
   javascriptDependencyCommand,
   pythonCommand,
   refreshSourceCommand,
+  rustBuildCacheInputs,
   rustBuildCacheCommand,
   rustPipeline,
   websiteCommand,
@@ -51,6 +52,21 @@ const COMMON_ENV = {
   CARGO_TERM_COLOR: "always",
 };
 
+const CI_GATE_NAMES = [
+  "Cargo dependencies",
+  "Rust build cache",
+  "stable workspace tests",
+  "MSRV workspace tests",
+  "quality",
+  "dependency policy",
+  "static VM guest",
+  "Python 3.11",
+  "Python 3.14",
+  "all dependencies",
+  "Node and browser bindings",
+  "website",
+] as const;
+
 export { CiSandbox };
 
 export class NanocodexCI extends CIWorkflow<
@@ -71,21 +87,25 @@ export class NanocodexCI extends CIWorkflow<
     const head = event.payload.sha;
     const source = providerData(event.payload.providerData, head);
     const pipelineStartedAt = Date.now();
+    const progress = new CiProgress(this.env.BACKUP_BUCKET, head, pipelineStartedAt);
     await step.do("persist CI running state", EVIDENCE_STEP_CONFIG, async () => {
-      await this.env.BACKUP_BUCKET.put(
-        `runs/${head}/result.json`,
-        JSON.stringify({
-          version: 1,
-          head,
-          workflowId: event.instanceId,
-          status: "running",
-          rustSecRevision: source.rustSecRevision,
-          rustSecSha256: source.rustSecSha256,
-          startedAt: new Date().toISOString(),
-          steps: [],
-        }),
-        { httpMetadata: { contentType: "application/json" } },
-      );
+      await Promise.all([
+        this.env.BACKUP_BUCKET.put(
+          `runs/${head}/result.json`,
+          JSON.stringify({
+            version: 1,
+            head,
+            workflowId: event.instanceId,
+            status: "running",
+            rustSecRevision: source.rustSecRevision,
+            rustSecSha256: source.rustSecSha256,
+            startedAt: new Date(pipelineStartedAt).toISOString(),
+            steps: [],
+          }),
+          { httpMetadata: { contentType: "application/json" } },
+        ),
+        progress.persistInitial(),
+      ]);
     });
 
     const completed: Array<{
@@ -97,7 +117,7 @@ export class NanocodexCI extends CIWorkflow<
     const artifacts: CiArtifact[] = [];
     let gatesCompleted = false;
     try {
-      const cargoStartedAt = Date.now();
+      const cargoStartedAt = progress.start("Cargo dependencies");
       const dependencies = await ci.runner({
         name: "cargo dependencies",
         command: cargoDependencyCommand(
@@ -114,13 +134,15 @@ export class NanocodexCI extends CIWorkflow<
         head,
         dependencies,
         "cargo-dependencies",
-      ).then((metadata) => {
-        completed.push({
+      ).then(async (metadata) => {
+        const summary = {
           name: "cargo dependencies",
           exitCode: dependencies.exitCode,
           cacheHit: metadata.cacheHit,
           durationMs: Date.now() - cargoStartedAt,
-        });
+        };
+        completed.push(summary);
+        await progress.complete("Cargo dependencies", summary);
       });
 
       const runRustJob = async (
@@ -128,7 +150,7 @@ export class NanocodexCI extends CIWorkflow<
         job: ReturnType<typeof rustPipeline>[number],
         refreshSource: boolean,
       ) => {
-        const startedAt = Date.now();
+        const startedAt = progress.start(job.name);
         const result = await parent.runner({
           name: job.name,
           command: cleanupAfter(
@@ -149,12 +171,14 @@ export class NanocodexCI extends CIWorkflow<
           result,
           slug(job.name),
         );
-        completed.push({
+        const summary = {
           name: job.name,
           exitCode: result.exitCode,
           cacheHit: false,
           durationMs: Date.now() - startedAt,
-        });
+        };
+        completed.push(summary);
+        await progress.complete(job.name, summary);
       };
       const rustJobs = rustPipeline({
         url: `${this.env.CI_PUBLIC_ORIGIN.replace(/\/$/, "")}/api/ci/rustsec-advisory-db/${source.rustSecRevision}/bundle.tar.gz`,
@@ -163,11 +187,12 @@ export class NanocodexCI extends CIWorkflow<
         sha256: source.rustSecSha256,
       });
       const buildCacheBranch = (async () => {
-        const buildCacheStartedAt = Date.now();
+        const buildCacheStartedAt = progress.start("Rust build cache");
         const buildCache = await dependencies.runner({
           name: "Rust build cache",
           command: rustBuildCacheCommand(),
           env: COMMON_ENV,
+          cache: { inputs: rustBuildCacheInputs() },
           config: runnerConfig(45 * 60 * 1_000, 30 * 24 * 60 * 60),
         });
         const buildCachePersistence = persistRunner(
@@ -175,13 +200,15 @@ export class NanocodexCI extends CIWorkflow<
           head,
           buildCache,
           "rust-build-cache",
-        ).then((metadata) => {
-          completed.push({
+        ).then(async (metadata) => {
+          const summary = {
             name: "Rust build cache",
             exitCode: buildCache.exitCode,
             cacheHit: metadata.cacheHit,
             durationMs: Date.now() - buildCacheStartedAt,
-          });
+          };
+          completed.push(summary);
+          await progress.complete("Rust build cache", summary);
         });
         const cachedRustJobs = rustJobs
           .filter(
@@ -198,7 +225,7 @@ export class NanocodexCI extends CIWorkflow<
         .map((job) => runRustJob(dependencies, job, false));
       const pythonJobs = (["3.11", "3.14"] as const).map(async (version) => {
         const name = `Python ${version}`;
-        const startedAt = Date.now();
+        const startedAt = progress.start(name);
         const result = await dependencies.runner({
           name,
           command: cleanupAfter(pythonCommand(version)),
@@ -206,15 +233,17 @@ export class NanocodexCI extends CIWorkflow<
           config: runnerConfig(40 * 60 * 1_000, 24 * 60 * 60, 0, false),
         });
         await persistRunner(this.env.BACKUP_BUCKET, head, result, slug(name));
-        completed.push({
+        const summary = {
           name,
           exitCode: result.exitCode,
           cacheHit: false,
           durationMs: Date.now() - startedAt,
-        });
+        };
+        completed.push(summary);
+        await progress.complete(name, summary);
       });
       const webJob = (async () => {
-        const completeDependenciesStartedAt = Date.now();
+        const completeDependenciesStartedAt = progress.start("all dependencies");
         const completeDependencies = await dependencies.runner({
           name: "all dependencies",
           command: javascriptDependencyCommand(),
@@ -227,15 +256,17 @@ export class NanocodexCI extends CIWorkflow<
           head,
           completeDependencies,
           "all-dependencies",
-        ).then((metadata) => {
-          completed.push({
+        ).then(async (metadata) => {
+          const summary = {
             name: "all dependencies",
             exitCode: completeDependencies.exitCode,
             cacheHit: metadata.cacheHit,
             durationMs: Date.now() - completeDependenciesStartedAt,
-          });
+          };
+          completed.push(summary);
+          await progress.complete("all dependencies", summary);
         });
-        const bindingsStartedAt = Date.now();
+        const bindingsStartedAt = progress.start("Node and browser bindings");
         const wasmArtifactKey = `runs/${head}/artifacts/web-wasm.tar`;
         const bindings = await completeDependencies.runner({
           name: "Node and browser bindings",
@@ -265,15 +296,17 @@ export class NanocodexCI extends CIWorkflow<
           head,
           bindings,
           "node-and-browser-bindings",
-        ).then(() => {
-          completed.push({
+        ).then(async () => {
+          const summary = {
             name: "Node and browser bindings",
             exitCode: bindings.exitCode,
             cacheHit: false,
             durationMs: Date.now() - bindingsStartedAt,
-          });
+          };
+          completed.push(summary);
+          await progress.complete("Node and browser bindings", summary);
         });
-        const websiteStartedAt = Date.now();
+        const websiteStartedAt = progress.start("website");
         const artifactKey = `runs/${head}/artifacts/web-dist.tar`;
         const website = await completeDependencies.runner({
           name: "website",
@@ -308,12 +341,14 @@ export class NanocodexCI extends CIWorkflow<
           ),
         );
         await Promise.all([dependencyPersistence, bindingsPersistence]);
-        completed.push({
+        const summary = {
           name: "website",
           exitCode: website.exitCode,
           cacheHit: false,
           durationMs: Date.now() - websiteStartedAt,
-        });
+        };
+        completed.push(summary);
+        await progress.complete("website", summary);
       })();
       await allSettledOrThrow([
         cargoPersistence,
@@ -345,6 +380,9 @@ export class NanocodexCI extends CIWorkflow<
       gatesCompleted = true;
     } catch (cause) {
       if (!gatesCompleted) {
+        await progress.failRunning(cause).catch((progressCause) => {
+          console.error("Failed to persist CI gate progress", progressCause);
+        });
         await step.do("persist CI failure", EVIDENCE_STEP_CONFIG, async () => {
           await this.env.BACKUP_BUCKET.put(
             `runs/${head}/result.json`,
@@ -552,6 +590,123 @@ type CiArtifact = {
   sha256: string;
   contentType: string;
 };
+
+type CiProgressStep = {
+  name: string;
+  slug: string;
+  status: "pending" | "running" | "success" | "failure";
+  startedAt?: string;
+  completedAt?: string;
+  durationMs?: number;
+  exitCode?: number;
+  cacheHit?: boolean;
+  message?: string;
+};
+
+class CiProgress {
+  readonly #bucket: R2Bucket;
+  readonly #head: string;
+  readonly #startedAt: number;
+  readonly #steps = new Map<string, CiProgressStep>();
+  #writeTail = Promise.resolve();
+  #writeError: unknown;
+
+  constructor(bucket: R2Bucket, head: string, startedAt: number) {
+    this.#bucket = bucket;
+    this.#head = head;
+    this.#startedAt = startedAt;
+    for (const name of CI_GATE_NAMES) {
+      this.#steps.set(name, {
+        name,
+        slug: slug(name),
+        status: "pending",
+      });
+    }
+  }
+
+  persistInitial(): Promise<void> {
+    this.#queueSnapshot();
+    return this.#flush();
+  }
+
+  start(name: string): number {
+    const startedAt = Date.now();
+    const gate = this.#gate(name);
+    gate.status = "running";
+    gate.startedAt = new Date(startedAt).toISOString();
+    delete gate.completedAt;
+    delete gate.durationMs;
+    delete gate.exitCode;
+    delete gate.cacheHit;
+    delete gate.message;
+    this.#queueSnapshot();
+    return startedAt;
+  }
+
+  async complete(
+    name: string,
+    summary: { exitCode: number; cacheHit: boolean; durationMs: number },
+  ): Promise<void> {
+    const gate = this.#gate(name);
+    gate.status = summary.exitCode === 0 ? "success" : "failure";
+    gate.completedAt = new Date().toISOString();
+    gate.durationMs = summary.durationMs;
+    gate.exitCode = summary.exitCode;
+    gate.cacheHit = summary.cacheHit;
+    this.#queueSnapshot();
+    await this.#flush();
+  }
+
+  async failRunning(cause: unknown): Promise<void> {
+    const failure = failureRecord(cause);
+    const completedAt = Date.now();
+    for (const gate of this.#steps.values()) {
+      if (gate.status !== "running") continue;
+      gate.status = "failure";
+      gate.completedAt = new Date(completedAt).toISOString();
+      gate.durationMs = gate.startedAt
+        ? Math.max(0, completedAt - Date.parse(gate.startedAt))
+        : undefined;
+      gate.message = failure.message;
+    }
+    this.#queueSnapshot();
+    await this.#flush();
+  }
+
+  #gate(name: string): CiProgressStep {
+    const gate = this.#steps.get(name);
+    if (!gate) throw new Error(`Unknown CI gate: ${name}`);
+    return gate;
+  }
+
+  #queueSnapshot(): void {
+    const body = JSON.stringify({
+      version: 1,
+      head: this.#head,
+      startedAt: new Date(this.#startedAt).toISOString(),
+      updatedAt: new Date().toISOString(),
+      steps: [...this.#steps.values()],
+    });
+    this.#writeTail = this.#writeTail
+      .then(async () => {
+        if (this.#writeError) return;
+        const object = await this.#bucket.put(
+          `runs/${this.#head}/progress.json`,
+          body,
+          { httpMetadata: { contentType: "application/json" } },
+        );
+        if (!object) throw new Error(`Failed to persist CI progress for ${this.#head}`);
+      })
+      .catch((cause) => {
+        this.#writeError ??= cause;
+      });
+  }
+
+  async #flush(): Promise<void> {
+    await this.#writeTail;
+    if (this.#writeError) throw this.#writeError;
+  }
+}
 
 function artifactRecord(
   output: NonNullable<CiRunnerResult["outputs"]>[number] | undefined,

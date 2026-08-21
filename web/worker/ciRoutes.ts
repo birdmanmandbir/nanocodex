@@ -418,11 +418,17 @@ async function runStatus(env: RequiredCiEnv, run: CiRunRecord) {
       workflow = { status: "unknown", error: boundedError(cause) };
     }
   }
-  const result = await env.BACKUP_BUCKET.get(`runs/${run.head}/result.json`);
+  const [result, progress] = await Promise.all([
+    env.BACKUP_BUCKET.get(`runs/${run.head}/result.json`),
+    env.BACKUP_BUCKET.get(`runs/${run.head}/progress.json`),
+  ]);
   return {
     ...run,
     workflow,
     result: result ? await result.json().catch(() => ({ error: "invalid_result" })) : null,
+    progress: progress
+      ? await progress.json().catch(() => ({ error: "invalid_progress" }))
+      : null,
   };
 }
 

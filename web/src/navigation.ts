@@ -12,10 +12,10 @@ export type Surface =
 export const productNavigation = [
   { surface: "agent", label: "Agent", shortcut: "A" },
   { surface: "changelog", label: "Changelog", shortcut: "H" },
+  { surface: "ci", label: "CI", shortcut: "I" },
   { surface: "commits", label: "Commits", shortcut: "C" },
   { surface: "docs", label: "Docs", shortcut: "D" },
   { surface: "evals", label: "Evals", shortcut: "E" },
-  { surface: "ci", label: "CI", shortcut: "I" },
   { surface: "code", label: "Source", shortcut: "S" },
 ] as const satisfies ReadonlyArray<{
   surface: Surface;

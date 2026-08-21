@@ -81,7 +81,14 @@ test("retention never deletes active or current publications", async () => {
   const state = await memory.durable.fetch(new Request("https://ci.test/state"));
   assert.equal((await state.json() as { publication: CiSourcePublication }).publication.head, expected);
   const runs = await memory.durable.fetch(new Request("https://ci.test/runs"));
-  assert.equal((await runs.json() as { runs: CiRunRecord[] }).runs.length, 50);
+  const history = await runs.json() as {
+    runs: CiRunRecord[];
+    retainedCount: number;
+    retentionLimit: number;
+  };
+  assert.equal(history.runs.length, 50);
+  assert.equal(history.retainedCount, 105);
+  assert.equal(history.retentionLimit, 100);
   assert.equal(
     (await memory.durable.fetch(new Request(`https://ci.test/runs/${"1".padStart(40, "0")}`))).status,
     200,

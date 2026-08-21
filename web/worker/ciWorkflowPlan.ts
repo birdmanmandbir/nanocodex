@@ -153,15 +153,36 @@ export function completeDependencyCacheInputs(): string[] {
   ];
 }
 
+export function rustBuildCacheInputs(): string[] {
+  return [
+    ...cargoCacheInputs(),
+    ".cargo/**/*",
+    "bin/**/*",
+    "crates/**/*",
+    "examples/**/*.rs",
+    "examples/**/Cargo.toml",
+    "js/bindings/src/**/*",
+    "py/bindings/src/**/*",
+  ];
+}
+
 export function javascriptDependencyCommand(): string {
   const nodeModules = JAVASCRIPT_PROJECTS.map(
     (project) => `${project}/node_modules`,
   );
+  const projects = JAVASCRIPT_PROJECTS.map(shellQuote).join(" ");
+  const retainNodeModules = [
+    "staging=/workspace/.node-modules-staging",
+    "rm -rf \"$staging\"",
+    `for project in ${projects}; do mkdir -p "$staging/$project"; mv "/workspace/$project/node_modules" "$staging/$project/node_modules"; done`,
+    "find /workspace -mindepth 1 -maxdepth 1 ! -name .cargo-home ! -name .cargo-target ! -name .node-modules-staging -exec rm -rf -- {} +",
+    `for project in ${projects}; do mkdir -p "/workspace/$project"; mv "$staging/$project/node_modules" "/workspace/$project/node_modules"; done`,
+    "rm -rf \"$staging\"",
+  ].join("; ");
   return [
     `printf '%s\\0' ${JAVASCRIPT_PROJECTS.map(shellQuote).join(" ")} | xargs -0 -n 1 -P 4 sh -c 'npm ci --prefix "$1" || exit 255' sh`,
     `printf '%s\\0' ${nodeModules.map(shellQuote).join(" ")} | xargs -0 -n 1 test -d`,
-    `printf '%s\\0' ${nodeModules.map(shellQuote).join(" ")} | tar --null --files-from=- -cf /workspace/.node-modules.tar`,
-    "find /workspace -mindepth 1 -maxdepth 1 ! -name .cargo-home ! -name .cargo-target ! -name .node-modules.tar -exec rm -rf -- {} +",
+    `sh -eu -c ${shellQuote(retainNodeModules)}`,
   ].join(" && ");
 }
 
@@ -188,13 +209,11 @@ export function refreshSourceCommand(command: string): string {
 }
 
 function sourceFingerprintCommand(): string {
-  return "find /workspace -path '*/node_modules' -prune -o -path /workspace/.cargo-home -prune -o -path /workspace/.cargo-target -prune -o -path /workspace/.rust-source-fingerprint -prune -o -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum";
+  return "{ find /workspace/Cargo.toml /workspace/Cargo.lock /workspace/.cargo /workspace/bin /workspace/crates /workspace/js/bindings/Cargo.toml /workspace/js/bindings/src /workspace/py/bindings/Cargo.toml /workspace/py/bindings/src -type f -print0; find /workspace/examples -type f \\( -name '*.rs' -o -name Cargo.toml \\) -print0; } | sort -z | xargs -0 sha256sum | sha256sum";
 }
 
 export function bindingsCommand(): string {
   return [
-    "tar -xf /workspace/.node-modules.tar -C /workspace",
-    "rm /workspace/.node-modules.tar",
     "cargo clippy --locked --target wasm32-unknown-unknown --package nanocodex-oai-api --package nanocodex-tools --package nanocodex-agent --package nanocodex --package nanocodex-wasm -- -D warnings",
     "npm run build --prefix js/artifacts",
     "npm run build --prefix js/tui",
@@ -228,8 +247,6 @@ export function websiteCommand(
 ): string {
   const wasmBundle = "/tmp/nanocodex-ci-web-wasm.tar";
   return [
-    "tar -xf /workspace/.node-modules.tar -C /workspace",
-    "rm /workspace/.node-modules.tar",
     `curl --fail --location --silent --show-error --output ${wasmBundle} ${shellQuote(wasmUrl)}`,
     `test "$(wc -c < ${wasmBundle} | tr -d ' ')" -eq ${wasmSize}`,
     `printf '%s  %s\\n' ${shellQuote(wasmSha256)} ${wasmBundle} | sha256sum --check --status`,

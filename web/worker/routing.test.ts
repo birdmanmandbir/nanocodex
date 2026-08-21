@@ -14,6 +14,7 @@ test("Cloudflare routes preview documents, images, and protocol endpoints throug
     "/code",
     "/commits",
     "/requests",
+    "/ci",
     "/docs",
     "/docs/*",
     "/evals",

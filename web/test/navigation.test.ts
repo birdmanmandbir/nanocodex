@@ -115,10 +115,11 @@ test("the shared shell presents Source without changing the stable Code route", 
 test("global product shortcuts are visible and browser Find remains native", () => {
   assert.deepEqual(
     productNavigation.map(({ label, shortcut }) => [label, shortcut]),
-    [["Agent", "A"], ["Changelog", "H"], ["Commits", "C"], ["Docs", "D"], ["Evals", "E"], ["Source", "S"]],
+    [["Agent", "A"], ["Changelog", "H"], ["CI", "I"], ["Commits", "C"], ["Docs", "D"], ["Evals", "E"], ["Source", "S"]],
   );
   assert.match(application, /title=\{`\$\{item\.label\} \(\$\{item\.shortcut\}\)`\}/);
   assert.match(application, /key === "h"[\s\S]*?\? "changelog"/);
+  assert.match(application, /key === "i"[\s\S]*?\? "ci"/);
   assert.doesNotMatch(application, /aria-keyshortcuts="H"[\s\S]*Nanocodex home/);
   assert.doesNotMatch(
     application,
@@ -302,7 +303,7 @@ test("direct preloading selects only the work owned by the resolved route", () =
   );
   assert.match(
     preload,
-    /surface === "evals"\) await preloadEvalOverview\(\);\s*return \{\};/,
+    /surface === "ci"\) await loadCi\(\);\s*if \(surface === "evals"\) await preloadEvalOverview\(\);\s*return \{\};/,
   );
 });
 

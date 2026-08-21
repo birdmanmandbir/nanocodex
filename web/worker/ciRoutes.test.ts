@@ -177,6 +177,11 @@ test("published historical archives and Workflow status do not resolve through c
     dispatchedAt: repository.publication.publishedAt,
   };
   await env.backup.put(`runs/${head}/result.json`, JSON.stringify({ status: "success" }));
+  await env.backup.put(`runs/${head}/progress.json`, JSON.stringify({
+    version: 1,
+    head,
+    steps: [{ name: "quality", slug: "quality", status: "success" }],
+  }));
   const artifactBody = new TextEncoder().encode("web deployment");
   const artifactSha = "4".repeat(64);
   await env.backup.put(`runs/${head}/artifacts/web-dist.tar`, artifactBody, {
@@ -202,9 +207,13 @@ test("published historical archives and Workflow status do not resolve through c
   const statusBody = await status.json() as {
     workflow: { status: string };
     result: { status: string };
+    progress: { steps: Array<{ slug: string; status: string }> };
   };
   assert.equal(statusBody.workflow.status, "running");
   assert.equal(statusBody.result.status, "success");
+  assert.deepEqual(statusBody.progress.steps, [
+    { name: "quality", slug: "quality", status: "success" },
+  ]);
   const artifact = await route(new Request(
     `https://ci.test/api/ci/runs/${head}/artifacts/web-dist.tar`,
   ), env);

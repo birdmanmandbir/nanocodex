@@ -7,6 +7,7 @@ import {
   readFile,
   rm,
   stat,
+  symlink,
   utimes,
   writeFile,
 } from "node:fs/promises";
@@ -22,6 +23,7 @@ import {
   javascriptDependencyCommand,
   pythonCommand,
   refreshSourceCommand,
+  rustBuildCacheInputs,
   rustBuildCacheCommand,
   rustPipeline,
   rustSecPolicyCommand,
@@ -67,7 +69,7 @@ test("dependency policy verifies and uses only the pinned owned RustSec database
   assert.ok(command.indexOf("rev-parse") < command.indexOf("cargo deny --frozen"));
 });
 
-test("only the dependency preparation snapshot is content cached", () => {
+test("dependency and Rust compilation snapshots are content addressed", () => {
   assert.deepEqual(cargoCacheInputs(), [
     "Cargo.lock",
     "Cargo.toml",
@@ -117,8 +119,18 @@ test("only the dependency preparation snapshot is content cached", () => {
     ...projects.map((project) => `${project}/package-lock.json`),
     "web/patches/**/*.patch",
   ]);
-  assert.match(javascriptDependencyCommand(), /\.node-modules\.tar/);
-  assert.match(javascriptDependencyCommand(), /! -name \.cargo-home/);
+  assert.deepEqual(rustBuildCacheInputs(), [
+    ...cargoCacheInputs(),
+    ".cargo/**/*",
+    "bin/**/*",
+    "crates/**/*",
+    "examples/**/*.rs",
+    "examples/**/Cargo.toml",
+    "js/bindings/src/**/*",
+    "py/bindings/src/**/*",
+  ]);
+  assert.doesNotMatch(javascriptDependencyCommand(), /\.node-modules\.tar|\btar\b/);
+  assert.match(javascriptDependencyCommand(), /\.node-modules-staging/);
   assert.match(rustBuildCacheCommand(), /cargo test --workspace --locked --no-run/);
   assert.match(rustBuildCacheCommand(), /! -name \.cargo-target/);
   assert.match(refreshSourceCommand("cargo test"), /-exec touch/);
@@ -139,11 +151,12 @@ test("Cargo dependencies restore the exact owned Git bundle before fetching", ()
   assert.ok(command.indexOf("cargo fetch --locked") < command.indexOf("find /workspace"));
 });
 
-test("npm installs use four fail-fast workers before archiving", async () => {
+test("npm installs use four fail-fast workers before snapshot pruning", async () => {
   const directory = await mkdtemp(resolve(tmpdir(), "nanocodex-ci-npm-install-"));
+  const harnessDirectory = await mkdtemp(resolve(tmpdir(), "nanocodex-ci-npm-harness-"));
   try {
-    const executableDirectory = resolve(directory, "bin");
-    const stateDirectory = resolve(directory, "state");
+    const executableDirectory = resolve(harnessDirectory, "bin");
+    const stateDirectory = resolve(harnessDirectory, "state");
     const npm = resolve(executableDirectory, "npm");
     await mkdir(executableDirectory);
     await mkdir(stateDirectory);
@@ -163,19 +176,19 @@ test("npm installs use four fail-fast workers before archiving", async () => {
     );
     await chmod(npm, 0o755);
 
-    const [install, verify, archive] = javascriptDependencyCommand().split(" && ");
+    const [install, verify, retainNodeModules] = javascriptDependencyCommand().split(" && ");
     assert.ok(install);
     assert.ok(verify);
-    assert.ok(archive);
+    assert.ok(retainNodeModules);
     assert.match(install, /xargs -0 -n 1 -P 4/);
     assert.match(install, /npm ci --prefix "\$1" \|\| exit 255/);
     assert.equal((install.match(/'[^']+'/g) ?? []).length, 14);
 
-    const adaptedArchive = `${verify} && ${archive}`.replaceAll(
+    const adaptedSnapshot = `${verify} && ${retainNodeModules}`.replaceAll(
       "/workspace",
       "$CI_TEST_WORKSPACE",
     );
-    const result = spawnSync("bash", ["-c", `${install} && ${adaptedArchive}`], {
+    const result = spawnSync("bash", ["-c", `${install} && ${adaptedSnapshot}`], {
       cwd: directory,
       encoding: "utf8",
       env: {
@@ -196,9 +209,9 @@ test("npm installs use four fail-fast workers before archiving", async () => {
       .map(Number);
     assert.equal(Math.max(...concurrency), 4);
     assert.ok(concurrency.every((count) => count <= 4));
-    await stat(resolve(directory, ".node-modules.tar"));
+    await stat(resolve(directory, "js/bindings/node_modules/example/index.js"));
+    await assert.rejects(stat(resolve(directory, ".node-modules.tar")));
 
-    await rm(resolve(directory, ".node-modules.tar"));
     await rm(resolve(stateDirectory, "projects"));
     await rm(resolve(stateDirectory, "concurrency"));
     await writeFile(
@@ -210,7 +223,7 @@ test("npm installs use four fail-fast workers before archiving", async () => {
         "sleep 0.1",
       ].join("\n"),
     );
-    const failed = spawnSync("bash", ["-c", `${install} && ${adaptedArchive}`], {
+    const failed = spawnSync("bash", ["-c", `${install} && ${adaptedSnapshot}`], {
       cwd: directory,
       encoding: "utf8",
       env: {
@@ -228,6 +241,7 @@ test("npm installs use four fail-fast workers before archiving", async () => {
     await assert.rejects(stat(resolve(directory, ".node-modules.tar")));
   } finally {
     await rm(directory, { recursive: true, force: true });
+    await rm(harnessDirectory, { recursive: true, force: true });
   }
 });
 
@@ -260,7 +274,7 @@ test("bindings, website, and both Python versions preserve the GitHub CI gates",
   }
 });
 
-test("the node_modules cache archive restores project-relative paths", async () => {
+test("the dependency snapshot retains node_modules without duplicating an archive", async () => {
   const directory = await mkdtemp(resolve(tmpdir(), "nanocodex-ci-node-cache-"));
   try {
     const projects = [
@@ -273,16 +287,19 @@ test("the node_modules cache archive restores project-relative paths", async () 
     ));
     const packageDirectory = resolve(directory, "js/bindings/node_modules/example");
     await mkdir(packageDirectory, { recursive: true });
+    await mkdir(resolve(directory, ".cargo-home"), { recursive: true });
+    await mkdir(resolve(directory, ".cargo-target"), { recursive: true });
     await writeFile(resolve(packageDirectory, "index.js"), "export default 1;\n");
-    const archive = javascriptDependencyCommand().split(" && ").find((command) =>
-      command.includes("| tar --null")
+    await writeFile(resolve(directory, "js/bindings/source.js"), "remove me\n");
+    await writeFile(resolve(directory, ".cargo-home/cache"), "cargo\n");
+    await writeFile(resolve(directory, ".cargo-target/cache"), "target\n");
+    await symlink("source.js", resolve(directory, "js/bindings/source-link"));
+    const [, , retainNodeModules] = javascriptDependencyCommand().split(" && ");
+    assert.ok(retainNodeModules);
+    const command = retainNodeModules.replaceAll(
+      "/workspace",
+      "$CI_TEST_WORKSPACE",
     );
-    assert.ok(archive);
-    const command = [
-      archive.replaceAll("/workspace", "$CI_TEST_WORKSPACE"),
-      "rm -rf js",
-      "tar -xf $CI_TEST_WORKSPACE/.node-modules.tar -C $CI_TEST_WORKSPACE",
-    ].join(" && ");
     const result = spawnSync("bash", ["-c", command], {
       cwd: directory,
       encoding: "utf8",
@@ -293,6 +310,11 @@ test("the node_modules cache archive restores project-relative paths", async () 
       await readFile(resolve(directory, "js/bindings/node_modules/example/index.js"), "utf8"),
       "export default 1;\n",
     );
+    assert.equal(await readFile(resolve(directory, ".cargo-home/cache"), "utf8"), "cargo\n");
+    assert.equal(await readFile(resolve(directory, ".cargo-target/cache"), "utf8"), "target\n");
+    await assert.rejects(readFile(resolve(directory, "js/bindings/source.js"), "utf8"));
+    await assert.rejects(stat(resolve(directory, "js/bindings/source-link")));
+    await assert.rejects(stat(resolve(directory, ".node-modules.tar")));
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -301,8 +323,25 @@ test("the node_modules cache archive restores project-relative paths", async () 
 test("the Rust cache preserves exact reruns and refreshes changed source", async () => {
   const directory = await mkdtemp(resolve(tmpdir(), "nanocodex-ci-rust-cache-"));
   try {
-    const source = resolve(directory, "src/lib.rs");
-    await mkdir(resolve(directory, "src"));
+    const source = resolve(directory, "crates/example/src/lib.rs");
+    await Promise.all([
+      mkdir(resolve(directory, ".cargo"), { recursive: true }),
+      mkdir(resolve(directory, "bin"), { recursive: true }),
+      mkdir(resolve(directory, "crates/example/src"), { recursive: true }),
+      mkdir(resolve(directory, "examples"), { recursive: true }),
+      mkdir(resolve(directory, "js/bindings/src"), { recursive: true }),
+      mkdir(resolve(directory, "py/bindings/src"), { recursive: true }),
+      mkdir(resolve(directory, "web"), { recursive: true }),
+    ]);
+    await Promise.all([
+      writeFile(resolve(directory, "Cargo.toml"), "[workspace]\n"),
+      writeFile(resolve(directory, "Cargo.lock"), "version = 4\n"),
+      writeFile(resolve(directory, ".cargo/config.toml"), "[net]\noffline = true\n"),
+      writeFile(resolve(directory, "js/bindings/Cargo.toml"), "[package]\nname = \"js\"\n"),
+      writeFile(resolve(directory, "py/bindings/Cargo.toml"), "[package]\nname = \"py\"\n"),
+      writeFile(resolve(directory, "examples/Cargo.toml"), "[package]\nname = \"examples\"\n"),
+      writeFile(resolve(directory, "web/style.css"), "body { color: black; }\n"),
+    ]);
     await writeFile(source, "pub fn value() -> u8 { 1 }\n");
     const marker = rustBuildCacheCommand().split(" && ")[0]!;
     const adapt = (command: string) => command.replaceAll(
@@ -319,6 +358,13 @@ test("the Rust cache preserves exact reruns and refreshes changed source", async
     await utimes(source, new Date(1_000), new Date(1_000));
     const exact = run(refreshSourceCommand("true"));
     assert.equal(exact.status, 0, exact.stderr);
+    assert.equal((await stat(source)).mtimeMs, 1_000);
+
+    assert.equal(run(marker).status, 0);
+    await writeFile(resolve(directory, "web/style.css"), "body { color: white; }\n");
+    await utimes(source, new Date(1_000), new Date(1_000));
+    const webOnly = run(refreshSourceCommand("true"));
+    assert.equal(webOnly.status, 0, webOnly.stderr);
     assert.equal((await stat(source)).mtimeMs, 1_000);
 
     assert.equal(run(marker).status, 0);

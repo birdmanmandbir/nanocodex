@@ -153,6 +153,7 @@ export async function preloadDirectSurface(url: URL): Promise<PreparedDirectRout
     await module.preloadDocsRoute(url.pathname);
     return { DocsComponent: module.Docs };
   }
+  if (surface === "ci") await loadCi();
   if (surface === "evals") await preloadEvalOverview();
   return {};
 }

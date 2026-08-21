@@ -131,7 +131,7 @@ export function documentStatusForPath(pathname: string): 200 | 404 | null {
   pathname = normalizePath(pathname);
   if (pathname === "/" || pathname === "/agent" || pathname === "/artifact-runtime"
     || pathname === "/changelog" || pathname === "/code" || pathname === "/commits"
-    || pathname === "/requests") return 200;
+    || pathname === "/ci" || pathname === "/requests") return 200;
   if (Object.hasOwn(docsPreview, pathname) || isEvalDocumentPath(pathname)) return 200;
   if (pathname.startsWith("/docs/") || pathname.startsWith("/evals/")) return 404;
   return null;
@@ -214,6 +214,7 @@ async function previewForUrl(url: URL, env: LinkPreviewEnv): Promise<Preview> {
   if (pathname === "/agent") return fixed(pathname, "Browser agent", "Run the Rust-owned Codex lifecycle locally in a browser Worker.");
   if (pathname === "/changelog") return fixed(pathname, "Changelog", "Follow focused Nanocodex SDK, runtime, tooling, and evaluation changes.");
   if (pathname === "/commits") return fixed(pathname, "Commits", "Inspect the published Nanocodex source history and focused patches.");
+  if (pathname === "/ci") return fixed(pathname, "Continuous integration", "Inspect Cloudflare-native validation gates, retained logs, caches, and deployment artifacts.", "CI");
   if (pathname === "/requests") return fixed(pathname, "Requests", "Track proposed changes to the published Nanocodex source tree.", "REQUESTS");
   if (pathname === "/code") {
     const sourcePath = boundedText(url.searchParams.get("path"), 240);

@@ -86,6 +86,7 @@ test("every declared document route and the internal artifact runtime retain the
     "/changelog",
     "/code",
     "/commits",
+    "/ci",
     "/requests",
     "/evals",
     ...Object.keys(docsPreview),
@@ -289,9 +290,9 @@ test("generated PNG images are cacheable, deterministic, bounded, and conditiona
 
 test("Cloudflare routes every preview-owning document and image through the Worker", async () => {
   const config = JSON.parse(await readFile(new URL("../wrangler.jsonc", import.meta.url), "utf8"));
-  assert.deepEqual(config.assets.run_worker_first.slice(0, 12), [
+  assert.deepEqual(config.assets.run_worker_first.slice(0, 13), [
     "/", "/agent", "/artifact-runtime", "/changelog", "/code", "/commits",
-    "/requests", "/docs", "/docs/*", "/evals", "/evals/*", "/og.png",
+    "/requests", "/ci", "/docs", "/docs/*", "/evals", "/evals/*", "/og.png",
   ]);
 });
 

@@ -21,6 +21,7 @@
     "predev": "node scripts/check-dev-wasm.mjs",
     "dev": "CLOUDFLARE_ENV=development CLOUDFLARE_INCLUDE_PROCESS_ENV=true node --env-file-if-exists=../.env ./node_modules/vite/bin/vite.js dev",
     "test": "npm --prefix ../js/artifacts test && node --experimental-strip-types --test worker/*.test.ts test/*.test.ts scripts/*.test.mjs",
+    "test:terminal": "NODE_OPTIONS='--preserve-symlinks --preserve-symlinks-main' node --test ../js/terminal/test/*.test.mjs",
     "typecheck": "tsc --noEmit",
     "check:docs": "node scripts/check-docs.mjs",
     "gen:types": "wrangler types",

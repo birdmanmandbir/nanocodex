@@ -20,6 +20,26 @@ export type CiStepSummary = {
   durationMs: number;
 };
 
+export type CiProgressStep = {
+  name: string;
+  slug: string;
+  status: "pending" | "running" | "success" | "failure";
+  startedAt?: string;
+  completedAt?: string;
+  durationMs?: number;
+  exitCode?: number;
+  cacheHit?: boolean;
+  message?: string;
+};
+
+export type CiProgress = {
+  version: 1;
+  head: string;
+  startedAt: string;
+  updatedAt: string;
+  steps: CiProgressStep[];
+};
+
 export type CiArtifact = {
   key: string;
   size: number;
@@ -66,6 +86,13 @@ export type CiResult =
 export type CiRunDetail = CiRun & {
   workflow: { status?: string; error?: unknown };
   result: CiResult | { error: "invalid_result" } | null;
+  progress: CiProgress | { error: "invalid_progress" } | null;
+};
+
+export type CiRuns = {
+  runs: CiRun[];
+  retainedCount: number;
+  retentionLimit: number;
 };
 
 export class CiApiError extends Error {
@@ -88,10 +115,9 @@ async function request<T>(path: string, signal?: AbortSignal): Promise<T> {
 
 export const ciApi = {
   runs(signal?: AbortSignal) {
-    return request<{ runs: CiRun[] }>("/api/ci/runs", signal);
+    return request<CiRuns>("/api/ci/runs", signal);
   },
   run(head: string, signal?: AbortSignal) {
     return request<CiRunDetail>(`/api/ci/runs/${encodeURIComponent(head)}`, signal);
   },
 };
-

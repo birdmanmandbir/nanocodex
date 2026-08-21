@@ -27,7 +27,7 @@ test("Wrangler owns the Workflow, source, backup, repository, and ten CI slots",
       name === "SANDBOX" && class_name === "CiSandbox",
   ));
   assert.deepEqual(config.migrations.at(-1), {
-    tag: "v7",
+    tag: "v9",
     new_sqlite_classes: ["CiRepository", "CiSandbox"],
   });
   assert.deepEqual(

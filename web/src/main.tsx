@@ -7,10 +7,6 @@ const directPath = directUrl.pathname === "/"
 
 if (directPath === "/artifact-runtime") {
   void import("./artifactRuntime");
-} else if (directPath === "/ci") {
-  void import("./Ci").then(({ CiStandalone }) => {
-    createRoot(document.getElementById("root")!).render(<CiStandalone />);
-  });
 } else {
   const application = import("./NanocodexApp");
   void Promise.all([
