@@ -118,6 +118,11 @@ test("terminal gates skip snapshots and publish the website artifact in-place", 
   assert.doesNotMatch(workflow, /getSandbox/);
   assert.match(sandboxRunner, /input\.createSnapshot/);
   assert.match(sandboxRunner, /persistOutputs/);
+  assert.match(sandboxRunner, /streamFile/);
+  assert.equal(
+    (sandboxRunner.match(/decodeFileStream\(\s*await sandbox\.readFileStream/g) ?? []).length,
+    2,
+  );
   assert.match(sandboxRunner, /checksum mismatch/);
   assert.match(sandboxRunner, /new FixedLengthStream\(size\)/);
   assert.match(sandboxRunner, /putMultipartStream\(bucket, key, value, size, options\)/);

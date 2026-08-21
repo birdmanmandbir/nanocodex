@@ -244,10 +244,10 @@ index aa6068d..9a43284 100644
  
  export type RunStepResult<S> = RunOutput & {
 diff --git a/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts b/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
-index a7f6c05..830f2c4 100644
+index a7f6c05..a403310 100644
 --- a/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
 +++ b/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
-@@ -1,7 +1,11 @@
+@@ -1,7 +1,12 @@
  // Copyright (c) 2026 Cloudflare, Inc.
  // SPDX-License-Identifier: Apache-2.0
  
@@ -255,12 +255,13 @@ index a7f6c05..830f2c4 100644
 +import {
 +  getSandbox,
 +  ProcessReadyTimeoutError,
++  streamFile,
 +  type DirectoryBackup,
 +} from '@cloudflare/sandbox';
  import { posix } from 'node:path';
  import type { Bindings } from '../../env';
  import {
-@@ -9,13 +13,22 @@ import {
+@@ -9,13 +14,22 @@ import {
    checkoutSourceScript,
  } from '../../shared/source-checkout';
  import { slugify } from '../../shared/slugify';
@@ -284,7 +285,7 @@ index a7f6c05..830f2c4 100644
  const COMMAND_TIMEOUT_MS = 11 * 60 * 1000;
  const SOURCE_TIMEOUT_MS = 5 * 60 * 1000;
  const PORT_READY_TIMEOUT_MS = 60_000;
-@@ -25,6 +38,11 @@ const TAIL_BYTES = 28_000;
+@@ -25,6 +39,11 @@ const TAIL_BYTES = 28_000;
  // Two inline logs plus result metadata must remain below Workflows' 1 MiB limit.
  const INLINE_LOG_BYTES = 300_000;
  
@@ -296,7 +297,7 @@ index a7f6c05..830f2c4 100644
  export class SandboxRunner implements Runner<DirectoryBackup> {
    readonly name = 'sandbox';
  
-@@ -40,15 +58,17 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -40,15 +59,17 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
    ): Promise<RunStepResult<DirectoryBackup>> {
      // create the sandbox handle
      const sandbox = getSandbox(this.env.SANDBOX, createRunnerId(input.label), {
@@ -317,7 +318,7 @@ index a7f6c05..830f2c4 100644
          // Overlay (no rm) so cached node_modules survive while tracked source
          // files are refreshed to this commit. The restored archive may carry a
          // different commit's source (e.g. a reused install cache), so this is
-@@ -71,7 +91,7 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -71,7 +92,7 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
        }
  
        const proc = await sandbox.startProcess(
@@ -326,7 +327,7 @@ index a7f6c05..830f2c4 100644
          {
            cwd: resolveCwd(input.cwd),
            env: {
-@@ -81,61 +101,359 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -81,61 +102,389 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
            autoCleanup: false,
          }
        );
@@ -506,7 +507,9 @@ index a7f6c05..830f2c4 100644
 +          throw new Error(`Invalid CI output checksum: ${output.sha256Path}`);
 +        }
 +      }
-+      const stream = await sandbox.readFileStream(output.path);
++      const stream = decodeFileStream(
++        await sandbox.readFileStream(output.path)
++      );
 +      const object = await putFixedLengthStream(bucket, output.key, stream, file.size, {
 +        onlyIf: { etagDoesNotMatch: '*' },
 +        ...(sha256 ? { sha256 } : {}),
@@ -699,6 +702,34 @@ index a7f6c05..830f2c4 100644
 +  }
 +}
 +
++function decodeFileStream(
++  stream: ReadableStream<Uint8Array>
++): ReadableStream<Uint8Array> {
++  const iterator = streamFile(stream);
++  const encoder = new TextEncoder();
++  return new ReadableStream<Uint8Array>({
++    async pull(controller) {
++      try {
++        const next = await iterator.next();
++        if (next.done) {
++          controller.close();
++          return;
++        }
++        controller.enqueue(
++          typeof next.value === 'string'
++            ? encoder.encode(next.value)
++            : next.value
++        );
++      } catch (error) {
++        controller.error(error);
++      }
++    },
++    async cancel() {
++      await iterator.return(undefined as never).catch(() => undefined);
++    },
++  });
++}
++
 +function shellQuote(value: string) {
 +  return `'${value.replaceAll("'", `'"'"'`)}'`;
 +}
@@ -726,7 +757,16 @@ index a7f6c05..830f2c4 100644
  async function readLogs(sandbox: ReturnType<typeof getSandbox>) {
    const listing = await sandbox.listFiles('/tmp');
    const sizes = new Map(
-@@ -192,51 +510,22 @@ function resolveCwd(cwd: string | undefined) {
+@@ -153,7 +502,7 @@ async function readLog(
+   size: number
+ ): Promise<string | ReadableStream<Uint8Array>> {
+   if (size > INLINE_LOG_BYTES) {
+-    return sandbox.readFileStream(file);
++    return decodeFileStream(await sandbox.readFileStream(file));
+   }
+   return (await sandbox.readFile(file, { encoding: 'utf-8' })).content;
+ }
+@@ -192,51 +541,22 @@ function resolveCwd(cwd: string | undefined) {
    return posix.join(WORKSPACE_DIR, normalized);
  }
  
