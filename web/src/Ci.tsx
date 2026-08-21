@@ -1,4 +1,3 @@
-import { RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ciApi,
@@ -34,6 +33,25 @@ type GateView = {
   message?: string;
   hasEvidence: boolean;
 };
+
+function RefreshIcon() {
+  return (
+    <svg
+      aria-hidden="true"
+      fill="none"
+      viewBox="0 0 24 24"
+      stroke="currentColor"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      strokeWidth="2"
+    >
+      <path d="M21 12a9 9 0 0 0-15.17-6.55L3 8" />
+      <path d="M3 3v5h5" />
+      <path d="M3 12a9 9 0 0 0 15.17 6.55L21 16" />
+      <path d="M16 16h5v5" />
+    </svg>
+  );
+}
 
 export function Ci() {
   const [overview, setOverview] = useState<Overview | null>(null);
@@ -124,7 +142,7 @@ export function Ci() {
             <p>{error.message}</p>
           </div>
           <button type="button" onClick={() => void refresh()}>
-            <RefreshCw aria-hidden="true" /> Retry
+            <RefreshIcon /> Retry
           </button>
         </section>
       ) : null}
@@ -200,7 +218,7 @@ export function Ci() {
                 <h2 id="runs-title">Recent runs</h2>
               </div>
               <button type="button" onClick={() => void refresh()} aria-label="Refresh CI runs">
-                <RefreshCw aria-hidden="true" /> Refresh
+                <RefreshIcon /> Refresh
               </button>
             </header>
             {overview.runs.length === 0 ? (
