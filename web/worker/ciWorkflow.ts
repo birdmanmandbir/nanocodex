@@ -223,25 +223,26 @@ export class NanocodexCI extends CIWorkflow<
           ({ name }) => name !== "stable workspace tests" && name !== "quality",
         )
         .map((job) => runRustJob(dependencies, job, false));
-      const pythonJobs = (["3.11", "3.14"] as const).map(async (version) => {
-        const name = `Python ${version}`;
-        const startedAt = progress.start(name);
-        const result = await dependencies.runner({
-          name,
-          command: cleanupAfter(pythonCommand(version)),
-          env: COMMON_ENV,
-          config: runnerConfig(40 * 60 * 1_000, 24 * 60 * 60, 0, false),
+      const runPythonJobs = () =>
+        (["3.11", "3.14"] as const).map(async (version) => {
+          const name = `Python ${version}`;
+          const startedAt = progress.start(name);
+          const result = await dependencies.runner({
+            name,
+            command: cleanupAfter(pythonCommand(version)),
+            env: COMMON_ENV,
+            config: runnerConfig(40 * 60 * 1_000, 24 * 60 * 60, 0, false),
+          });
+          await persistRunner(this.env.BACKUP_BUCKET, head, result, slug(name));
+          const summary = {
+            name,
+            exitCode: result.exitCode,
+            cacheHit: false,
+            durationMs: Date.now() - startedAt,
+          };
+          completed.push(summary);
+          await progress.complete(name, summary);
         });
-        await persistRunner(this.env.BACKUP_BUCKET, head, result, slug(name));
-        const summary = {
-          name,
-          exitCode: result.exitCode,
-          cacheHit: false,
-          durationMs: Date.now() - startedAt,
-        };
-        completed.push(summary);
-        await progress.complete(name, summary);
-      });
       const webJob = (async () => {
         const completeDependenciesStartedAt = progress.start("all dependencies");
         const completeDependencies = await dependencies.runner({
@@ -354,9 +355,11 @@ export class NanocodexCI extends CIWorkflow<
         cargoPersistence,
         buildCacheBranch,
         ...directRustJobs,
-        ...pythonJobs,
         webJob,
       ]);
+      // The binding gates contain wall-clock SLAs. Run both versions together,
+      // but only after compile-heavy gates release their CPU allocations.
+      await allSettledOrThrow(runPythonJobs());
 
       completed.sort((left, right) => left.name.localeCompare(right.name));
       await step.do("persist CI success", EVIDENCE_STEP_CONFIG, async () => {

@@ -134,6 +134,19 @@ test("terminal gates skip snapshots and publish the website artifact in-place", 
   assert.match(cache, /localBucket: z\.boolean\(\)\.optional\(\)/);
   assert.match(cache, /localBucket: input\.snapshot\.localBucket/);
   assert.match(cache, /env\.ENVIRONMENT === 'development'/);
+  const saturationBarrier = workflow.indexOf(
+    "await allSettledOrThrow([\n        cargoPersistence,",
+  );
+  const pythonBarrier = workflow.indexOf("await allSettledOrThrow(runPythonJobs());");
+  assert.ok(
+    saturationBarrier >= 0,
+    "compile-heavy gates have an explicit phase barrier",
+  );
+  assert.ok(
+    pythonBarrier > saturationBarrier,
+    "wall-clock Python gates start only after compile-heavy gates release the host",
+  );
+  assert.match(workflow, /\(\["3\.11", "3\.14"\] as const\)\.map/);
   assert.ok(
     workflow.indexOf('await step.do("persist CI success"') <
       workflow.indexOf("gatesCompleted = true"),
