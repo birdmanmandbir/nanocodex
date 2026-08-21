@@ -69,7 +69,7 @@ test("dependency policy verifies and uses only the pinned owned RustSec database
   assert.ok(command.indexOf("rev-parse") < command.indexOf("cargo deny --frozen"));
 });
 
-test("dependency and Rust compilation snapshots are content addressed", () => {
+test("dependency and Rust compilation snapshots are content addressed", async () => {
   assert.deepEqual(cargoCacheInputs(), [
     "Cargo.lock",
     "Cargo.toml",
@@ -102,9 +102,6 @@ test("dependency and Rust compilation snapshots are content addressed", () => {
     "js/bindings",
     "js/artifacts",
     "js/react",
-    "js/tui",
-    "js/tui-react",
-    "js/terminal",
     "web",
     "examples/node",
     "examples/rivet-actors",
@@ -119,6 +116,10 @@ test("dependency and Rust compilation snapshots are content addressed", () => {
     ...projects.map((project) => `${project}/package-lock.json`),
     "web/patches/**/*.patch",
   ]);
+  await Promise.all(projects.flatMap((project) => [
+    stat(new URL(`../../${project}/package.json`, import.meta.url)),
+    stat(new URL(`../../${project}/package-lock.json`, import.meta.url)),
+  ]));
   assert.deepEqual(rustBuildCacheInputs(), [
     ...cargoCacheInputs(),
     ".cargo/**/*",
@@ -182,7 +183,7 @@ test("npm installs use four fail-fast workers before snapshot pruning", async ()
     assert.ok(retainNodeModules);
     assert.match(install, /xargs -0 -n 1 -P 4/);
     assert.match(install, /npm ci --prefix "\$1" \|\| exit 255/);
-    assert.equal((install.match(/'[^']+'/g) ?? []).length, 14);
+    assert.equal((install.match(/'[^']+'/g) ?? []).length, 11);
 
     const adaptedSnapshot = `${verify} && ${retainNodeModules}`.replaceAll(
       "/workspace",
@@ -202,7 +203,7 @@ test("npm installs use four fail-fast workers before snapshot pruning", async ()
     const projects = (await readFile(resolve(stateDirectory, "projects"), "utf8"))
       .trim()
       .split("\n");
-    assert.equal(projects.length, 12);
+    assert.equal(projects.length, 9);
     const concurrency = (await readFile(resolve(stateDirectory, "concurrency"), "utf8"))
       .trim()
       .split("\n")
@@ -237,7 +238,7 @@ test("npm installs use four fail-fast workers before snapshot pruning", async ()
     const attempted = (await readFile(resolve(stateDirectory, "projects"), "utf8"))
       .trim()
       .split("\n");
-    assert.ok(attempted.length < 12);
+    assert.ok(attempted.length < 9);
     await assert.rejects(stat(resolve(directory, ".node-modules.tar")));
   } finally {
     await rm(directory, { recursive: true, force: true });
@@ -259,10 +260,8 @@ test("bindings, website, and both Python versions preserve the GitHub CI gates",
   );
   assert.match(website, /curl --fail --location/);
   assert.match(website, /sha256sum --check --status/);
-  assert.match(website, /npm run build --prefix js\/tui-react/);
-  assert.match(website, /test:terminal --prefix web/);
-  assert.match(website, /web\/worker\/\*\.test\.ts/);
-  assert.doesNotMatch(website, /npm test --prefix web/);
+  assert.match(website, /npm test --prefix web/);
+  assert.doesNotMatch(website, /js\/(?:tui|tui-react|terminal)|test:terminal/);
   assert.match(website, /build:from-wasm/);
   assert.match(website, /web-dist\.tar/);
   for (const version of ["3.11", "3.14"] as const) {
@@ -278,8 +277,8 @@ test("the dependency snapshot retains node_modules without duplicating an archiv
   const directory = await mkdtemp(resolve(tmpdir(), "nanocodex-ci-node-cache-"));
   try {
     const projects = [
-      "js/bindings", "js/artifacts", "js/react", "js/tui", "js/tui-react",
-      "js/terminal", "web", "examples/node", "examples/rivet-actors",
+      "js/bindings", "js/artifacts", "js/react", "web",
+      "examples/node", "examples/rivet-actors",
       "examples/cloudflare-workers", "examples/vercel-workflows", "examples/react-vite",
     ];
     await Promise.all(projects.map((project) =>
