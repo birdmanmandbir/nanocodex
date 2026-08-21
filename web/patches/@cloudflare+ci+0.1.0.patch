@@ -147,7 +147,7 @@ index aa6068d..9a43284 100644
  
  export type RunStepResult<S> = RunOutput & {
 diff --git a/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts b/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
-index a7f6c05..d759f2f 100644
+index a7f6c05..944da22 100644
 --- a/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
 +++ b/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
 @@ -1,7 +1,11 @@
@@ -186,7 +186,19 @@ index a7f6c05..d759f2f 100644
  const COMMAND_TIMEOUT_MS = 11 * 60 * 1000;
  const SOURCE_TIMEOUT_MS = 5 * 60 * 1000;
  const PORT_READY_TIMEOUT_MS = 60_000;
-@@ -40,12 +52,14 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -25,6 +37,11 @@ const TAIL_BYTES = 28_000;
+ // Two inline logs plus result metadata must remain below Workflows' 1 MiB limit.
+ const INLINE_LOG_BYTES = 300_000;
+ 
++// Miniflare proxies local R2 streams through one process. Serializing only the
++// large restore transfer prevents parallel cache hits from collapsing that
++// proxy while still allowing the restored containers to compile in parallel.
++let localRestoreTail = Promise.resolve();
++
+ export class SandboxRunner implements Runner<DirectoryBackup> {
+   readonly name = 'sandbox';
+ 
+@@ -40,15 +57,17 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
    ): Promise<RunStepResult<DirectoryBackup>> {
      // create the sandbox handle
      const sandbox = getSandbox(this.env.SANDBOX, createRunnerId(input.label), {
@@ -202,8 +214,12 @@ index a7f6c05..d759f2f 100644
 -    let cleanupTransferredToStreams = false;
      try {
        if (input.restore) {
-         await sandbox.restoreBackup(input.restore);
-@@ -71,7 +85,7 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+-        await sandbox.restoreBackup(input.restore);
++        await restoreSnapshot(sandbox, input.restore, this.env);
+         // Overlay (no rm) so cached node_modules survive while tracked source
+         // files are refreshed to this commit. The restored archive may carry a
+         // different commit's source (e.g. a reused install cache), so this is
+@@ -71,7 +90,7 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
        }
  
        const proc = await sandbox.startProcess(
@@ -212,7 +228,7 @@ index a7f6c05..d759f2f 100644
          {
            cwd: resolveCwd(input.cwd),
            env: {
-@@ -81,61 +95,312 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -81,61 +100,334 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
            autoCleanup: false,
          }
        );
@@ -328,6 +344,28 @@ index a7f6c05..d759f2f 100644
    }
  }
  
++async function restoreSnapshot(
++  sandbox: ReturnType<typeof getSandbox>,
++  snapshot: DirectoryBackup,
++  env: Bindings
++) {
++  if (env.ENVIRONMENT !== 'development') {
++    await sandbox.restoreBackup(snapshot);
++    return;
++  }
++  const previous = localRestoreTail;
++  let release!: () => void;
++  localRestoreTail = new Promise<void>((resolve) => {
++    release = resolve;
++  });
++  await previous;
++  try {
++    await sandbox.restoreBackup(snapshot);
++  } finally {
++    release();
++  }
++}
++
 +function fulfilled<T>(result: PromiseSettledResult<T>): T {
 +  if (result.status === 'rejected') {
 +    throw result.reason;
@@ -565,7 +603,7 @@ index a7f6c05..d759f2f 100644
  async function readLogs(sandbox: ReturnType<typeof getSandbox>) {
    const listing = await sandbox.listFiles('/tmp');
    const sizes = new Map(
-@@ -192,51 +457,22 @@ function resolveCwd(cwd: string | undefined) {
+@@ -192,51 +484,22 @@ function resolveCwd(cwd: string | undefined) {
    return posix.join(WORKSPACE_DIR, normalized);
  }
  
