@@ -27,7 +27,7 @@ test("the publisher CLI initializes its module before building a generation", as
   const repository = resolve(directory, "repo");
   const requests = [];
   let deploymentSha;
-  let droppedUpload = false;
+  let stalledUpload = false;
   const server = createServer(async (request, response) => {
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
@@ -49,9 +49,8 @@ test("the publisher CLI initializes its module before building a generation", as
       return;
     }
     if (request.method === "PUT" && request.url?.startsWith("/api/git/objects/")) {
-      if (!droppedUpload) {
-        droppedUpload = true;
-        request.socket.destroy();
+      if (!stalledUpload) {
+        stalledUpload = true;
         return;
       }
       response.writeHead(201, { "content-type": "application/json" });
@@ -102,13 +101,14 @@ test("the publisher CLI initializes its module before building a generation", as
         NANOCODEX_GIT_ORIGIN: `http://127.0.0.1:${address.port}`,
         NANOCODEX_GIT_TOKEN: "publisher-test-token",
         NANOCODEX_REPO: repository,
+        NANOCODEX_GIT_UPLOAD_TIMEOUT_MS: "100",
       },
       encoding: "utf8",
       maxBuffer: 16 * 1024 * 1024,
     });
 
     assert.match(stdout, new RegExp(`Published gakonst/nanocodex ${head.slice(0, 7)}`));
-    assert.equal(droppedUpload, true);
+    assert.equal(stalledUpload, true);
     assert.ok(requests.length > 3);
     assert.equal(requests[0]?.url, "/api/health");
     assert.equal(requests[0]?.authorization, undefined);
@@ -136,7 +136,7 @@ test("the publisher CLI initializes its module before building a generation", as
       requests.some(({ url }) => url === `/api/git/objects/${key}`) &&
       Number.isSafeInteger(size) &&
       size > 0 &&
-      size <= 16 * 1024 * 1024
+      size <= 4 * 1024 * 1024
     ));
     assert.equal(
       requests.some(({ url }) =>
@@ -159,7 +159,7 @@ test("the publisher CLI initializes its module before building a generation", as
       requests.some(({ url }) => url === `/api/git/objects/${key}`) &&
       Number.isSafeInteger(size) &&
       size > 0 &&
-      size <= 16 * 1024 * 1024
+      size <= 4 * 1024 * 1024
     ));
     assert.equal(requests.some(({ url }) => url?.endsWith("/repository.pack")), false);
     const snapshotUpload = requests.find(({ url }) =>
@@ -239,7 +239,7 @@ test("repository publication uploads only content absent from the prior inventor
 test("repository packs are divided into canonical bounded upload parts", () => {
   const head = "a".repeat(40);
   const packHash = "b".repeat(40);
-  const partBytes = 16 * 1024 * 1024;
+  const partBytes = 4 * 1024 * 1024;
   const packSize = (partBytes * 4) + 1_100_465;
   const parts = buildRepositoryPackParts(head, packHash, packSize);
 
@@ -256,7 +256,7 @@ test("repository packs are divided into canonical bounded upload parts", () => {
 
 test("commit-aligned patch pages retain contiguous bounded descriptors", () => {
   const head = "a".repeat(40);
-  const partBytes = 16 * 1024 * 1024;
+  const partBytes = 4 * 1024 * 1024;
   const pages = [
     { name: "0000", path: "/tmp/0000.diff", size: 476_879 },
     { name: "0001", path: "/tmp/0001.diff", size: 2_105_727 },
@@ -301,6 +301,7 @@ test("repository uploads retry bounded transient responses and transport failure
     assert.equal(isRetriableUploadStatus(status), false, `${status} should fail`);
   }
   assert.equal(isRetriableUploadError(new TypeError("fetch failed")), true);
+  assert.equal(isRetriableUploadError(new DOMException("timed out", "TimeoutError")), true);
   assert.equal(isRetriableUploadError(new Error("invalid local input")), false);
 });
 
