@@ -13,6 +13,7 @@
     "deploy": "npm run build && wrangler deploy",
     "test": "node --test worker/*.test.mjs && node --experimental-strip-types --test test/*.test.ts",
     "test:e2e": "playwright test",
+    "bench:browser:model": "playwright test -c playwright.browser-model.config.ts e2e/browser-model-latency.spec.mjs",
     "test:e2e:mpp": "LIVE_MPP_E2E=1 playwright test --headed --grep 'live browser MPP'"
   },
   "dependencies": {
@@ -33,6 +34,7 @@
     "@vitejs/plugin-react": "6.0.2",
     "typescript": "5.9.3",
     "vite": "8.1.5",
-    "wrangler": "^4.112.0"
+    "wrangler": "^4.112.0",
+    "ws": "^8.18.3"
   }
 }
