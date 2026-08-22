@@ -39,6 +39,7 @@ import {
   rustQualityCacheInputs,
   rustPipeline,
   rustSecPolicyCommand,
+  staticVmCacheInputs,
   typosCommand,
   websiteCommand,
   websiteArtifactCommand,
@@ -204,6 +205,12 @@ test("dependency and Rust compilation snapshots are content addressed", async ()
     "benchmarks/codex_parity_workload.json",
     "nanocodex.toml",
   ]);
+  assert.deepEqual(staticVmCacheInputs(), [
+    ...cargoCacheInputs(),
+    "crates/experimental/nanocodex-vm/**/*",
+    "crates/nanocodex-oai-api/**/*",
+    "crates/nanocodex-tools/**/*",
+  ]);
   assert.deepEqual(websiteResultCacheInputs(), [
     ...websiteDependencyCacheInputs(),
     "web/**/*",
@@ -212,7 +219,12 @@ test("dependency and Rust compilation snapshots are content addressed", async ()
     "js/react/**/*",
   ]);
   assert.deepEqual(pythonCacheInputs(), [
-    ...rustQualityCacheInputs(),
+    ...cargoCacheInputs(),
+    "crates/nanocodex/**/*",
+    "crates/nanocodex-agent/**/*",
+    "crates/nanocodex-durability/**/*",
+    "crates/nanocodex-oai-api/**/*",
+    "crates/nanocodex-tools/**/*",
     "py/bindings/**/*",
     "examples/python/**/*",
   ]);

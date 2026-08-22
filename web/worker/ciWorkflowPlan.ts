@@ -257,6 +257,18 @@ export function rustResultCacheInputs(): string[] {
   ];
 }
 
+export function staticVmCacheInputs(): string[] {
+  // This gate builds the guest-runtime feature and all nanocodex-vm targets.
+  // Cargo's resolved local closure is VM -> tools -> oai-api; unrelated SDK,
+  // binding, CLI, and eval source cannot affect the resulting binaries.
+  return [
+    ...cargoCacheInputs(),
+    "crates/experimental/nanocodex-vm/**/*",
+    "crates/nanocodex-oai-api/**/*",
+    "crates/nanocodex-tools/**/*",
+  ];
+}
+
 export function websiteResultCacheInputs(): string[] {
   // The downloaded WASM artifact is content-addressed in the command itself.
   // These are the remaining source inputs consumed by the website tests and
@@ -271,8 +283,16 @@ export function websiteResultCacheInputs(): string[] {
 }
 
 export function pythonCacheInputs(): string[] {
+  // `cargo tree --edges normal -p nanocodex-python` resolves only this local
+  // crate closure. In particular, VM/eval/CLI source cannot affect either
+  // wheel, so it must not evict two expensive Python-version attestations.
   return [
-    ...rustQualityCacheInputs(),
+    ...cargoCacheInputs(),
+    "crates/nanocodex/**/*",
+    "crates/nanocodex-agent/**/*",
+    "crates/nanocodex-durability/**/*",
+    "crates/nanocodex-oai-api/**/*",
+    "crates/nanocodex-tools/**/*",
     "py/bindings/**/*",
     "examples/python/**/*",
   ];

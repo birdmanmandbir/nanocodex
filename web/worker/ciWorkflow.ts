@@ -43,6 +43,7 @@ import {
   rustResultCacheInputs,
   rustQualityCacheInputs,
   rustPipeline,
+  staticVmCacheInputs,
   typosCommand,
   websiteArtifactCommand,
   websiteDependencyCacheInputs,
@@ -333,7 +334,7 @@ export class NanocodexCI extends CIWorkflow<
               return runRustJob(
                 dependencies,
                 { ...job, command: cleanupAfter(job.command) },
-                { cacheInputs: rustQualityCacheInputs() },
+                { cacheInputs: staticVmCacheInputs() },
               );
             }
             if (job.name === "dependency policy") {

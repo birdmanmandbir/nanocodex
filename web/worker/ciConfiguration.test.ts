@@ -116,7 +116,7 @@ test("artifact and deterministic gates use bounded reusable cache entries", asyn
   );
   assert.match(
     workflow,
-    /job\.name === "static VM guest"[\s\S]*?command: cleanupAfter\(job\.command\)[\s\S]*?rustQualityCacheInputs\(\)/,
+    /job\.name === "static VM guest"[\s\S]*?command: cleanupAfter\(job\.command\)[\s\S]*?staticVmCacheInputs\(\)/,
   );
   assert.match(
     workflow,
