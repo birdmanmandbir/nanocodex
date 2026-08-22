@@ -24,6 +24,14 @@ All Rust correctness gates, dependency policy, the VM guest, bindings, website,
 and both Python versions passed. The non-Python deterministic gates restored
 successful results from their exact input closures.
 
+A source-only follow-up, `1757af8fe288fdc0a802d1e4e35e851e8c88c5e3`,
+proved the fully warm path in 23.270 seconds. Fourteen of fifteen gates were
+exact cache hits. Python 3.11 and 3.14 each completed in 16 ms, stable and MSRV
+workspace tests in 21 and 23 ms, and quality in 15 ms. Only the canonical
+whole-tree spelling gate executed, taking 7.679 seconds. Checksum verification
+and publication of the retained WASM and website artifacts took 7.595 and
+7.946 seconds and dominated the remaining wall time.
+
 The Python package now defers its 12.7 MB native module and runtime-only
 `TypedDict` definitions until those APIs are accessed. It still tests the
 installed release wheel and leaves the committed verifier unchanged. On the
