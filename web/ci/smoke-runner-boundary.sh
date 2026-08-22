@@ -141,6 +141,35 @@ root_smoke() {
     NANOCODEX_CI_BOUNDARY_PROBE=must-not-cross \
     /usr/local/bin/nanocodex-ci-run "$smoke_program payload"
 
+  /bin/rm -f /workspace/timeout-ready /tmp/ci-step.*
+  /usr/local/bin/nanocodex-ci-run \
+    "printf 'early diagnostic\\n'; printf 'ready\\n' > /workspace/timeout-ready; sleep 30" &
+  local timeout_runner=$!
+  local timeout_ready=0
+  for _ in {1..400}; do
+    if ! kill -0 "$timeout_runner" 2>/dev/null; then
+      wait "$timeout_runner" || true
+      return 1
+    fi
+    if [[ $(/bin/cat /workspace/timeout-ready 2>/dev/null || true) == ready ]]; then
+      timeout_ready=1
+      break
+    fi
+    sleep 0.05
+  done
+  [[ $timeout_ready -eq 1 ]]
+  kill -TERM "$timeout_runner"
+  if wait "$timeout_runner"; then
+    status=0
+  else
+    status=$?
+  fi
+  [[ $status -eq 124 ]]
+  [[ $(/bin/cat /tmp/ci-step.out) == "early diagnostic" ]]
+  /usr/bin/jq -e \
+    '.bytesObserved == 17 and .bytesStored == 17 and .truncated == false' \
+    /tmp/ci-step.out.meta.json >/dev/null
+
   /bin/rm -f /workspace/escaped.pid
   if /usr/local/bin/nanocodex-ci-run "$smoke_program escape"; then
     status=0
@@ -160,7 +189,7 @@ root_smoke() {
   /usr/bin/ps -e -o ruid= -o euid= -o stat= | \
     /usr/bin/awk '$1 == 10001 || $2 == 10001 { if ($3 !~ /^Z/) exit 1 }'
 
-  /bin/rm -f /workspace/escaped.pid /tmp/ci-step.*
+  /bin/rm -f /workspace/escaped.pid /workspace/timeout-ready /tmp/ci-step.*
   kill "$control_server"
   wait "$control_server" || true
   trap - EXIT

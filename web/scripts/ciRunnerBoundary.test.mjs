@@ -86,6 +86,10 @@ test("Linux CI payloads have one powerless UID and a root UID-wide reap before b
   assert.match(smoke, /WEBSOCKET 401/);
   assert.match(smoke, /http:\/\/\$\(hostname -i\):3000/);
   assert.match(smoke, /! -r \/proc\/\$PPID\/environ/);
+  assert.match(smoke, /timeout-ready/);
+  assert.match(smoke, /kill -TERM "\$timeout_runner"/);
+  assert.match(smoke, /\[\[ \$status -eq 124 \]\]/);
+  assert.match(smoke, /ci-step\.out\.meta\.json/);
 
   assert.match(script, /readonly executor_uid=10001/);
   assert.match(script, /readonly executor_gid=10001/);
@@ -105,7 +109,11 @@ test("Linux CI payloads have one powerless UID and a root UID-wide reap before b
   assert.doesNotMatch(script, /NANOCODEX_CI_(?:UID|GID|EXECUTOR|SETUID)/);
 });
 
-test("CI runner finalizes bounded logs when its command times out", async () => {
+test("CI runner finalizes bounded logs when its command times out", {
+  skip: process.platform === "linux"
+    ? "the production Linux timeout path runs inside the pinned image smoke"
+    : false,
+}, async () => {
   const directory = await mkdtemp(join(tmpdir(), "nanocodex-ci-timeout-"));
   const ready = join(directory, "command-ready");
   try {

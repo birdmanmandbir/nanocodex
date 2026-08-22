@@ -57,7 +57,7 @@ export const PR_PREP_CARGO_PATH =
   "/Library/PrivilegedHelperTools/dev.nanocodex.ci-cargo";
 export const PR_PREP_HELPER_VERSION = "2026-08-22.1";
 export const PR_PREP_HELPER_SHA256 =
-  "41964b11d6b04933d54ebd205127bba8fc28304a65380b0fd4a6fed17c07fce6";
+  "247a453952f53a03aa9189ced4fac97ef98ce6f8c6564d9472ece3127bf41a93";
 export const PR_PREP_HELPER_MAX_BYTES = 1024 * 1024;
 export const PR_PREP_CARGO_MAX_BYTES = 128 * 1024 * 1024;
 export const PR_PREP_NODE_MAX_BYTES = 256 * 1024 * 1024;
