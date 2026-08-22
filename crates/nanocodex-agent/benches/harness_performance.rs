@@ -571,7 +571,7 @@ impl Distribution {
     }
 }
 
-fn percentile(ordered: &[u64], percentile: usize) -> u64 {
+const fn percentile(ordered: &[u64], percentile: usize) -> u64 {
     let index = (ordered.len() - 1).saturating_mul(percentile).div_ceil(100);
     ordered[index]
 }
