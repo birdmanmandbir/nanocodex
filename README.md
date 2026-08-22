@@ -10,7 +10,7 @@ tools, Code Mode, branches, events, retries, and cleanup. Keep your interface,
 data, memory, infrastructure, and policy.
 </p>
 
-[![CI](https://img.shields.io/github/actions/workflow/status/gakonst/nanocodex/ci.yml?branch=master)][ci]
+[![Cloudflare CI](https://nanocodex.me-7fb.workers.dev/api/ci/badge.svg)][ci]
 [![Crates.io](https://img.shields.io/crates/v/nanocodex.svg)][crates]
 [![Docs.rs](https://img.shields.io/docsrs/nanocodex)][docs]
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)][license]
@@ -20,7 +20,7 @@ data, memory, infrastructure, and policy.
 **[Evaluation](#evaluation-is-a-product-boundary)** ·
 **[Deployments](#deployment-proofs)** · **[Status](#what-is-stable)**
 
-[ci]: https://github.com/gakonst/nanocodex/actions/workflows/ci.yml
+[ci]: https://nanocodex.me-7fb.workers.dev/ci
 [crates]: https://crates.io/crates/nanocodex
 [docs]: https://docs.rs/nanocodex
 [license]: LICENSE-MIT

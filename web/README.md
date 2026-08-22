@@ -155,10 +155,12 @@ The independent spelling gate keys the whole repository through one canonical
 synthetic tree blob instead of expanding thousands of paths, so a documentation
 edit reruns only the cheap whole-tree check. JavaScript consumers follow, then
 both Python versions run together.
-Each Python gate is content-addressed by its complete Rust and Python consumer
-inputs plus the pinned runner image. A successful miss tests the installed
-release wheel before retaining only a minimal result snapshot; an exact hit
-does not compile or install that wheel again.
+Each Python gate is content-addressed by the exact local Rust dependency closure
+of the binding, its Python consumer inputs, and the pinned runner image. VM,
+eval, and CLI source therefore cannot evict either wheel attestation. The static
+guest gate follows its own VM -> tools -> OpenAI API closure. A successful
+Python miss tests the installed release wheel before retaining only a minimal
+result snapshot; an exact hit does not compile or install that wheel again.
 Cargo and libtest are explicitly capped at four CPUs, and the MSRV gate uses one
 libtest thread, so a local Containers emulator cannot oversubscribe each runner
 to every host core. Ten container slots leave room for parent runners that are
@@ -272,7 +274,8 @@ npm run publish:ci-source
 ```
 
 `GET /api/ci/runs` and `GET /api/ci/runs/<40-hex-commit>` expose the retained
-Workflow/result state. Successful bindings and website gates export their
+Workflow/result state. `GET /api/ci/badge.svg` renders the current head's status
+directly from that ledger for the repository badge. Successful bindings and website gates export their
 tested archives directly to immutable, checksum-verified R2 and serve them at
 `GET /api/ci/runs/<40-hex-commit>/artifacts/{web-wasm,web-dist}.tar`; this is the
 owned replacement for a hosted artifact service. Step records and logs are available

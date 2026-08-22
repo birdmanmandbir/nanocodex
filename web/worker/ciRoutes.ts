@@ -61,6 +61,13 @@ export async function routeCiRequest(
   }
   const configured = env as RequiredCiEnv;
 
+  if (
+    url.pathname === "/api/ci/badge.svg" &&
+    (request.method === "GET" || request.method === "HEAD")
+  ) {
+    return serveCiBadge(configured, request.method === "HEAD");
+  }
+
   if (url.pathname === "/api/ci/source/state" && request.method === "GET") {
     return repository(configured).fetch("https://ci-repository/state");
   }
@@ -484,6 +491,66 @@ async function runStatus(env: RequiredCiEnv, run: CiRunRecord) {
     result: terminated ? terminalResult(resultValue) : resultValue,
     progress: terminated ? terminalProgress(progressValue) : progressValue,
   };
+}
+
+async function serveCiBadge(
+  env: RequiredCiEnv,
+  headOnly: boolean,
+): Promise<Response> {
+  const state = await repository(env).fetch("https://ci-repository/state");
+  let badge: CiBadge = { message: "unknown", color: "#6b7280" };
+  if (state.ok) {
+    const value = await state.json().catch(() => undefined) as {
+      run?: CiRunRecord;
+    } | undefined;
+    if (value?.run) badge = badgeForRun(await runStatus(env, value.run));
+  }
+  const svg = renderCiBadge(badge);
+  return new Response(headOnly ? null : svg, {
+    headers: {
+      "cache-control": "public, max-age=30, stale-while-revalidate=60",
+      "content-length": String(new TextEncoder().encode(svg).byteLength),
+      "content-type": "image/svg+xml; charset=utf-8",
+      "x-content-type-options": "nosniff",
+    },
+  });
+}
+
+type CiBadge = {
+  message: "passing" | "failing" | "running" | "queued" | "terminated" | "unknown";
+  color: string;
+};
+
+function badgeForRun(value: unknown): CiBadge {
+  if (!record(value)) return { message: "unknown", color: "#6b7280" };
+  const result = record(value.result) ? value.result : undefined;
+  switch (result?.status) {
+    case "success":
+      return { message: "passing", color: "#168a5b" };
+    case "failure":
+      return { message: "failing", color: "#d14343" };
+    case "running":
+      return { message: "running", color: "#2563eb" };
+    case "terminated":
+      return { message: "terminated", color: "#6b7280" };
+  }
+  if (value.state === "pending") return { message: "queued", color: "#b7791f" };
+  const workflow = record(value.workflow) ? value.workflow.status : undefined;
+  if (workflow === "errored") return { message: "failing", color: "#d14343" };
+  if (workflow === "running" || workflow === "queued") {
+    return { message: workflow, color: workflow === "running" ? "#2563eb" : "#b7791f" };
+  }
+  if (workflow === "terminated") return { message: "terminated", color: "#6b7280" };
+  return { message: "unknown", color: "#6b7280" };
+}
+
+function renderCiBadge(badge: CiBadge): string {
+  const label = "cloudflare ci";
+  const labelWidth = 82;
+  const messageWidth = Math.max(54, badge.message.length * 7 + 14);
+  const width = labelWidth + messageWidth;
+  const aria = `${label}: ${badge.message}`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="20" role="img" aria-label="${aria}"><title>${aria}</title><linearGradient id="s" x2="0" y2="100%"><stop offset="0" stop-color="#fff" stop-opacity=".15"/><stop offset="1" stop-opacity=".1"/></linearGradient><clipPath id="r"><rect width="${width}" height="20" rx="3" fill="#fff"/></clipPath><g clip-path="url(#r)"><rect width="${labelWidth}" height="20" fill="#f38020"/><rect x="${labelWidth}" width="${messageWidth}" height="20" fill="${badge.color}"/><rect width="${width}" height="20" fill="url(#s)"/></g><g fill="#fff" text-anchor="middle" font-family="Verdana,DejaVu Sans,sans-serif" font-size="11"><text x="${labelWidth / 2}" y="15" fill="#010101" fill-opacity=".3">${label}</text><text x="${labelWidth / 2}" y="14">${label}</text><text x="${labelWidth + messageWidth / 2}" y="15" fill="#010101" fill-opacity=".3">${badge.message}</text><text x="${labelWidth + messageWidth / 2}" y="14">${badge.message}</text></g></svg>`;
 }
 
 function workflowStatus(value: unknown): string | undefined {

@@ -217,6 +217,20 @@ test("published historical archives and Workflow status do not resolve through c
   assert.deepEqual(statusBody.progress.steps, [
     { name: "quality", slug: "quality", status: "success" },
   ]);
+  const badge = await route(new Request("https://ci.test/api/ci/badge.svg"), env);
+  assert.equal(badge.status, 200);
+  assert.equal(badge.headers.get("content-type"), "image/svg+xml; charset=utf-8");
+  assert.equal(badge.headers.get("x-content-type-options"), "nosniff");
+  assert.match(badge.headers.get("cache-control") ?? "", /max-age=30/);
+  const badgeBody = await badge.text();
+  assert.match(badgeBody, /cloudflare ci: passing/);
+  assert.match(badgeBody, /#f38020/);
+  const badgeHead = await route(new Request("https://ci.test/api/ci/badge.svg", {
+    method: "HEAD",
+  }), env);
+  assert.equal(badgeHead.status, 200);
+  assert.equal(badgeHead.headers.get("content-length"), String(badgeBody.length));
+  assert.equal(await badgeHead.text(), "");
   const artifact = await route(new Request(
     `https://ci.test/api/ci/runs/${head}/artifacts/web-dist.tar`,
   ), env);
@@ -636,6 +650,9 @@ function memoryNamespace() {
       }
       if (path === `/publications/${head}` && state.publication) {
         return Response.json(state.publication);
+      }
+      if (path === "/state" && state.publication && state.run) {
+        return Response.json({ publication: state.publication, run: state.run });
       }
       if (path === `/runs/${head}` && state.run) return Response.json(state.run);
       return Response.json({ error: "not_found" }, { status: 404 });
