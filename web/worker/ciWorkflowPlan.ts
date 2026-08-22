@@ -174,6 +174,10 @@ export function rustBuildCacheInputs(): string[] {
   return cargoCacheInputs();
 }
 
+export function msrvBuildCacheInputs(): string[] {
+  return cargoCacheInputs();
+}
+
 export function bindingsDependencyCommand(): string {
   return javascriptDependencyCommand(BINDINGS_JAVASCRIPT_PROJECTS, true);
 }
@@ -221,10 +225,27 @@ function shellQuote(value: string): string {
 }
 
 export function rustBuildCacheCommand(): string {
+  return rustCompilationCacheCommand(
+    "cargo test --workspace --locked --no-run",
+    ".cargo-target",
+  );
+}
+
+export function msrvBuildCacheCommand(): string {
+  return rustCompilationCacheCommand(
+    "cargo +1.97 test --workspace --locked --no-run",
+    ".cargo-target-msrv",
+  );
+}
+
+function rustCompilationCacheCommand(
+  command: string,
+  targetDirectory: string,
+): string {
   return [
     `${sourceFingerprintCommand()} > /workspace/.rust-source-fingerprint`,
-    "cargo test --workspace --locked --no-run",
-    "find /workspace -mindepth 1 -maxdepth 1 ! -name .cargo-home ! -name .cargo-target ! -name .rust-source-fingerprint -exec rm -rf -- {} +",
+    command,
+    `find /workspace -mindepth 1 -maxdepth 1 ! -name .cargo-home ! -name ${targetDirectory} ! -name .rust-source-fingerprint -exec rm -rf -- {} +`,
   ].join(" && ");
 }
 
@@ -232,7 +253,7 @@ export function refreshSourceCommand(command: string): string {
   return [
     `current_source_fingerprint=$(${sourceFingerprintCommand()})`,
     "cached_source_fingerprint=$(cat /workspace/.rust-source-fingerprint 2>/dev/null || true)",
-    "if [ \"$current_source_fingerprint\" != \"$cached_source_fingerprint\" ]; then find /workspace -path '*/node_modules' -prune -o -path /workspace/.cargo-home -prune -o -path /workspace/.cargo-target -prune -o -path /workspace/.rust-source-fingerprint -prune -o -type f -exec touch -- {} +; fi",
+    "if [ \"$current_source_fingerprint\" != \"$cached_source_fingerprint\" ]; then find /workspace -path '*/node_modules' -prune -o -path /workspace/.cargo-home -prune -o -path /workspace/.cargo-target -prune -o -path /workspace/.cargo-target-msrv -prune -o -path /workspace/.rust-source-fingerprint -prune -o -type f -exec touch -- {} +; fi",
     "rm -f /workspace/.rust-source-fingerprint",
     command,
   ].join(" && ");

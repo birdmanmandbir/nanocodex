@@ -158,11 +158,14 @@ test("terminal gates skip snapshots and publish the website artifact in-place", 
   assert.match(workflow, /RUST_TEST_THREADS: "4"/);
   assert.match(
     workflow,
-    /CARGO_TARGET_DIR: "\/tmp\/nanocodex-msrv-target",[\s\S]*?RUST_TEST_THREADS: "1"/,
+    /const MSRV_ENV = \{[\s\S]*?CARGO_TARGET_DIR: "\/workspace\/\.cargo-target-msrv",[\s\S]*?RUST_TEST_THREADS: "1"/,
   );
   assert.doesNotMatch(runnerGroup, /await Promise\.allSettled/);
   const saturationBarrier = workflow.indexOf(
-    "await Promise.all([\n        cargoPersistence,",
+    "const saturationBarrier = Promise.all([",
+  );
+  const msrvExecution = workflow.indexOf(
+    "await runRustJob(msrvBuildCache, msrvJob, true);",
   );
   const pythonBarrier = workflow.indexOf("await Promise.all(runPythonJobs());");
   assert.ok(
@@ -170,8 +173,16 @@ test("terminal gates skip snapshots and publish the website artifact in-place", 
     "compile-heavy gates have an explicit phase barrier",
   );
   assert.ok(
-    pythonBarrier > saturationBarrier,
+    msrvExecution > saturationBarrier,
+    "deadline-sensitive MSRV tests start only after compile-heavy gates release the host",
+  );
+  assert.ok(
+    pythonBarrier > msrvExecution,
     "wall-clock Python gates start only after compile-heavy gates release the host",
+  );
+  assert.match(
+    workflow,
+    /name: "MSRV build cache"[\s\S]*?cache: \{ inputs: msrvBuildCacheInputs\(\) \}/,
   );
   assert.match(workflow, /\(\["3\.11", "3\.14"\] as const\)\.map/);
   assert.ok(

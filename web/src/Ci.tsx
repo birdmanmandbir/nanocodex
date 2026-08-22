@@ -12,6 +12,11 @@ import "./ci.css";
 const gates = [
   ["cargo-dependencies", "Cargo dependencies", "vendor and registry cache"],
   ["rust-build-cache", "Rust build cache", "shared compilation root"],
+  [
+    "msrv-build-cache",
+    "MSRV build cache",
+    "isolated Rust 1.97 compilation root",
+  ],
   ["stable-workspace-tests", "Stable workspace", "complete Rust test suite"],
   ["msrv-workspace-tests", "MSRV 1.97", "minimum supported Rust"],
   ["quality", "Quality", "rustfmt and warnings-denied Clippy"],

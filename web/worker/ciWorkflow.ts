@@ -26,6 +26,8 @@ import {
   bindingsDependencyCommand,
   cargoCacheInputs,
   cargoDependencyCommand,
+  msrvBuildCacheCommand,
+  msrvBuildCacheInputs,
   pythonCommand,
   refreshSourceCommand,
   rustBuildCacheInputs,
@@ -61,9 +63,16 @@ const COMMON_ENV = {
   RUST_TEST_THREADS: "4",
 };
 
+const MSRV_ENV = {
+  ...COMMON_ENV,
+  CARGO_TARGET_DIR: "/workspace/.cargo-target-msrv",
+  RUST_TEST_THREADS: "1",
+};
+
 const CI_GATE_NAMES = [
   "Cargo dependencies",
   "Rust build cache",
+  "MSRV build cache",
   "stable workspace tests",
   "MSRV workspace tests",
   "quality",
@@ -167,18 +176,7 @@ export class NanocodexCI extends CIWorkflow<
           command: cleanupAfter(
             refreshSource ? refreshSourceCommand(job.command) : job.command,
           ),
-          env:
-            job.name === "MSRV workspace tests"
-              ? {
-                  ...COMMON_ENV,
-                  CARGO_TARGET_DIR: "/tmp/nanocodex-msrv-target",
-                  // MSRV runs the complete workspace from a cold target. Keep
-                  // its deadline-sensitive VM lifecycle tests isolated from
-                  // sibling libtest work while the host is still draining
-                  // cache snapshots.
-                  RUST_TEST_THREADS: "1",
-                }
-              : COMMON_ENV,
+          env: job.name === "MSRV workspace tests" ? MSRV_ENV : COMMON_ENV,
           config: runnerConfig(job.timeoutMs, 24 * 60 * 60, 0, false),
         });
         await persistRunner(
@@ -234,9 +232,41 @@ export class NanocodexCI extends CIWorkflow<
           .map((job) => runRustJob(buildCache, job, true));
         await Promise.all([buildCachePersistence, ...cachedRustJobs]);
       })();
+      const msrvJob = rustJobs.find(
+        ({ name }) => name === "MSRV workspace tests",
+      );
+      if (!msrvJob) throw new Error("MSRV workspace test gate is missing");
+      const msrvBuildCacheBranch = (async () => {
+        const startedAt = progress.start("MSRV build cache");
+        const result = await dependencies.runner({
+          name: "MSRV build cache",
+          command: msrvBuildCacheCommand(),
+          env: MSRV_ENV,
+          cache: { inputs: msrvBuildCacheInputs() },
+          config: runnerConfig(45 * 60 * 1_000, 30 * 24 * 60 * 60),
+        });
+        const metadata = await persistRunner(
+          this.env.BACKUP_BUCKET,
+          head,
+          result,
+          "msrv-build-cache",
+        );
+        const summary = {
+          name: "MSRV build cache",
+          exitCode: result.exitCode,
+          cacheHit: metadata.cacheHit,
+          durationMs: Date.now() - startedAt,
+        };
+        completed.push(summary);
+        await progress.complete("MSRV build cache", summary);
+        return result;
+      })();
       const directRustJobs = rustJobs
         .filter(
-          ({ name }) => name !== "stable workspace tests" && name !== "quality",
+          ({ name }) =>
+            name !== "stable workspace tests" &&
+            name !== "MSRV workspace tests" &&
+            name !== "quality",
         )
         .map((job) => runRustJob(dependencies, job, false));
       const runPythonJobs = () =>
@@ -397,12 +427,21 @@ export class NanocodexCI extends CIWorkflow<
         completed.push(summary);
         await progress.complete("website", summary);
       })();
-      await Promise.all([
+      const saturationBarrier = Promise.all([
         cargoPersistence,
         buildCacheBranch,
         ...directRustJobs,
         webJob,
       ]);
+      const [msrvBuildCache] = await Promise.all([
+        msrvBuildCacheBranch,
+        saturationBarrier,
+      ]);
+      // Compilation can saturate the shared host; the VM lifecycle suite also
+      // contains real wall-clock deadlines. Compile its dedicated MSRV target
+      // in parallel, then execute only after every heavy sibling has released
+      // its allocation. Warm runs restore this target content-addressably.
+      await runRustJob(msrvBuildCache, msrvJob, true);
       // The binding gates contain wall-clock SLAs. Run both versions together,
       // but only after compile-heavy gates release their CPU allocations.
       await Promise.all(runPythonJobs());

@@ -21,6 +21,8 @@ import {
   bindingsDependencyCommand,
   cargoCacheInputs,
   cargoDependencyCommand,
+  msrvBuildCacheCommand,
+  msrvBuildCacheInputs,
   pythonCommand,
   refreshSourceCommand,
   rustBuildCacheInputs,
@@ -130,6 +132,7 @@ test("dependency and Rust compilation snapshots are content addressed", async ()
     stat(new URL(`../../${project}/package-lock.json`, import.meta.url)),
   ]));
   assert.deepEqual(rustBuildCacheInputs(), cargoCacheInputs());
+  assert.deepEqual(msrvBuildCacheInputs(), cargoCacheInputs());
   assert.ok(
     rustBuildCacheInputs().every((path) => !path.includes("src") && !path.endsWith("**/*")),
     "workspace source changes reuse the compatible Cargo target layer",
@@ -139,8 +142,14 @@ test("dependency and Rust compilation snapshots are content addressed", async ()
     assert.match(command, /\.node-modules-staging/);
   }
   assert.match(rustBuildCacheCommand(), /cargo test --workspace --locked --no-run/);
+  assert.match(
+    msrvBuildCacheCommand(),
+    /cargo \+1\.97 test --workspace --locked --no-run/,
+  );
   assert.match(rustBuildCacheCommand(), /! -name \.cargo-target/);
+  assert.match(msrvBuildCacheCommand(), /! -name \.cargo-target-msrv/);
   assert.match(refreshSourceCommand("cargo test"), /-exec touch/);
+  assert.match(refreshSourceCommand("cargo test"), /\.cargo-target-msrv -prune/);
 });
 
 test("Cargo dependencies restore the exact owned Git bundle before fetching", () => {
@@ -433,6 +442,7 @@ test("every generated container command is valid Bash", () => {
     bindingsDependencyCommand(),
     websiteDependencyCommand(),
     rustBuildCacheCommand(),
+    msrvBuildCacheCommand(),
     refreshSourceCommand("cargo test"),
     bindingsCommand(),
     websiteCommand(
