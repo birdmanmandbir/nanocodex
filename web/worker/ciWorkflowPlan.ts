@@ -204,6 +204,14 @@ export function rustQualityCacheInputs(): string[] {
   ];
 }
 
+export function pythonCacheInputs(): string[] {
+  return [
+    ...rustQualityCacheInputs(),
+    "py/bindings/**/*",
+    "examples/python/**/*",
+  ];
+}
+
 export function msrvBuildCacheInputs(): string[] {
   return cargoCacheInputs();
 }

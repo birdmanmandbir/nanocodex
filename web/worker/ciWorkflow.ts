@@ -28,6 +28,7 @@ import {
   cargoDependencyCommand,
   msrvBuildCacheCommand,
   msrvBuildCacheInputs,
+  pythonCacheInputs,
   pythonCommand,
   refreshSourceCommand,
   rustBuildCacheInputs,
@@ -315,13 +316,19 @@ export class NanocodexCI extends CIWorkflow<
             name,
             command: cleanupAfter(pythonCommand(version)),
             env: COMMON_ENV,
-            config: runnerConfig(40 * 60 * 1_000, 24 * 60 * 60, 0, false),
+            cache: { inputs: pythonCacheInputs() },
+            config: runnerConfig(40 * 60 * 1_000, 30 * 24 * 60 * 60),
           });
-          await persistRunner(this.env.BACKUP_BUCKET, head, result, slug(name));
+          const metadata = await persistRunner(
+            this.env.BACKUP_BUCKET,
+            head,
+            result,
+            slug(name),
+          );
           const summary = {
             name,
             exitCode: result.exitCode,
-            cacheHit: false,
+            cacheHit: metadata.cacheHit,
             durationMs: Date.now() - startedAt,
           };
           completed.push(summary);

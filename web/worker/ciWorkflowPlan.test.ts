@@ -24,6 +24,7 @@ import {
   msrvBuildCacheCommand,
   msrvBuildCacheInputs,
   parallelCommandGroups,
+  pythonCacheInputs,
   pythonCommand,
   refreshSourceCommand,
   rustBuildCacheInputs,
@@ -157,6 +158,11 @@ test("dependency and Rust compilation snapshots are content addressed", async ()
     "examples/**/*.rs",
     "js/bindings/src/**/*",
     "py/bindings/src/**/*",
+  ]);
+  assert.deepEqual(pythonCacheInputs(), [
+    ...rustQualityCacheInputs(),
+    "py/bindings/**/*",
+    "examples/python/**/*",
   ]);
   assert.ok(
     rustBuildCacheInputs().every((path) => !path.includes("src") && !path.endsWith("**/*")),

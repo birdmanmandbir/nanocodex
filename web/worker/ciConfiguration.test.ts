@@ -90,7 +90,7 @@ test("the local CI command enables container execution on the public runner orig
   assert.match(command, /--port 8787 --ip 127\.0\.0\.1/);
 });
 
-test("terminal gates skip snapshots while cached quality feeds stable tests", async () => {
+test("artifact gates stream outputs while quality and Python retain reusable snapshots", async () => {
   const [workflow, sandboxRunner, runnerGroup, cache] = await Promise.all([
     readFile(new URL("./ciWorkflow.ts", import.meta.url), "utf8"),
     readFile(
@@ -114,7 +114,10 @@ test("terminal gates skip snapshots while cached quality feeds stable tests", as
     workflow,
     /command: rustQualityCacheCommand\(qualityJob\.command\)[\s\S]*?rustQualityCacheInputs\(\)/,
   );
-  assert.match(workflow, /runnerConfig\(40 \* 60 \* 1_000, 24 \* 60 \* 60, 0, false\)/);
+  assert.match(
+    workflow,
+    /name,[\s\S]*?cache: \{ inputs: pythonCacheInputs\(\) \},[\s\S]*?runnerConfig\(40 \* 60 \* 1_000, 30 \* 24 \* 60 \* 60\)/,
+  );
   assert.match(workflow, /path: "\/workspace\/\.ci-output\/web-wasm\.tar"/);
   assert.match(workflow, /path: "\/workspace\/\.ci-output\/web-dist\.tar"/);
   assert.match(sandboxRunner, /localBucket: this\.env\.ENVIRONMENT === 'development'/);

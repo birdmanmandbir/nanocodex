@@ -146,6 +146,10 @@ rustdoc graph; changed Rust input reruns the full gate and publishes a new
 only after the compile-heavy saturation phase releases the host, so their
 wall-clock lifecycle assertions never compete with a Rust compiler. The
 MSRV and JavaScript consumers follow, then both Python versions run together.
+Each Python gate is content-addressed by its complete Rust and Python consumer
+inputs plus the pinned runner image. A successful miss tests the installed
+release wheel before retaining only a minimal result snapshot; an exact hit
+does not compile or install that wheel again.
 Cargo and libtest are explicitly capped at four CPUs, and the MSRV gate uses one
 libtest thread, so a local Containers emulator cannot oversubscribe each runner
 to every host core. Ten container slots leave room for parent runners that are
@@ -156,14 +160,16 @@ streams only its
 small tested WASM package to R2 and skips its otherwise multi-gigabyte workspace
 snapshot. The website starts from its site-only dependency snapshot, restores
 that checksum-verified WASM package, and streams its tested deployment tar
-straight back to R2. Runtime correctness suites are never skipped, while the
-deterministic quality gate can reuse an exact successful result. No correctness
-runner is retried; only network-backed dependency preparation gets one retry.
+straight back to R2. Deterministic quality and Python gates can reuse an exact
+successful result; source-sensitive Rust, MSRV, JavaScript, and website suites
+still execute. No correctness runner is retried; only network-backed dependency
+preparation gets one retry.
 Success and failure logs, step records, final results, required parent/cache
 snapshots, and cache pointers are retained in the
 `nanocodex-ci` R2 bucket; no separate hosted artifact product is required.
-All eight terminal Rust, Python, bindings, and website runners explicitly skip
-workspace snapshots; quality retains the parent snapshot consumed by stable.
+Six terminal Rust, bindings, and website runners explicitly skip workspace
+snapshots. Quality retains the parent snapshot consumed by stable; each Python
+gate retains an empty workspace solely as its content-addressed success record.
 Immutable source archives live in the separately credentialed
 `nanocodex-ci-source` bucket.
 
