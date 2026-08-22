@@ -669,6 +669,7 @@ Further reading:
 - [Examples and runnable commands](examples/README.md)
 - [Migration guide](docs/MIGRATING.md)
 - [Responses + Tower design](docs/RESPONSES_TOWER.md)
+- [Model-latency scorecard and controlled fx protocol](docs/MODEL_LATENCY.md)
 - [Observability contract](docs/OBSERVABILITY.md)
 - [Subagent design](docs/SUBAGENTS.md)
 - [VM operations](docs/VM.md)

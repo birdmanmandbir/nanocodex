@@ -184,6 +184,56 @@ bench-harness:
     cargo bench -p nanocodex-agent --bench harness_performance -- \
       --source-commit "$(git rev-parse HEAD)"
 
+# Validate the paid paired runner without credentials or provider requests.
+test-model-latency-runner:
+    cargo check -p nanocodex-model-latency-bench --bin model-latency-bench
+    python3 -m unittest -v benchmarks.test_paired_fx_model_latency
+    python3 -m py_compile \
+      benchmarks/paired_fx_model_latency.py \
+      benchmarks/test_paired_fx_model_latency.py
+
+# Run the reviewed immutable fx and Nanocodex artifacts through the six-request
+# provider-free loopback preflight. This is intentionally separate from the
+# portable unit suite because the pinned fx checkout is operator-supplied.
+test-model-latency-actual-binaries fx_source_root fx_bin: test-model-latency-runner
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --locked --release -p nanocodex-model-latency-bench --bin model-latency-bench
+    env \
+      NANOCODEX_PAIRED_FX_SOURCE_ROOT="{{fx_source_root}}" \
+      NANOCODEX_PAIRED_FX_BIN="{{fx_bin}}" \
+      NANOCODEX_PAIRED_NANOCODEX_BIN="{{justfile_directory()}}/target/release/model-latency-bench" \
+      NANOCODEX_PAIRED_NANOCODEX_COMMIT="$(git rev-parse HEAD)" \
+      PYTHONDONTWRITEBYTECODE=1 \
+      python3 -m unittest -v \
+        benchmarks.test_paired_fx_model_latency.ActualBinaryPreflightIntegrationTests.actual_binary_preflight
+
+# Measure native and Chromium prompt-to-typed-model-output tax without provider calls.
+bench-model-latency-local: bench-harness test-model-latency-runner build-wasm
+    npm run bench:browser:model --prefix examples/react-vite
+
+# Run the paid controlled fx comparison with an explicit confirmation literal.
+bench-model-latency-live fx_source_root fx_bin auth_file confirm trials="20" warmup_pairs="2": test-model-latency-runner
+    #!/usr/bin/env bash
+    set -euo pipefail
+    test "{{confirm}}" = "I_ACCEPT_PAID_MODEL_CALLS" || {
+      echo "pass I_ACCEPT_PAID_MODEL_CALLS as the confirm argument" >&2
+      exit 2
+    }
+    mkdir -p "{{justfile_directory()}}/.nanocodex/benchmarks"
+    cargo build --release -p nanocodex-model-latency-bench --bin model-latency-bench
+    python3 benchmarks/paired_fx_model_latency.py \
+      --fx-source-root "{{fx_source_root}}" \
+      --fx-bin "{{fx_bin}}" \
+      --nanocodex-source-root "{{justfile_directory()}}" \
+      --nanocodex-bin "{{justfile_directory()}}/target/release/model-latency-bench" \
+      --nanocodex-commit "$(git rev-parse HEAD)" \
+      --auth-file "{{auth_file}}" \
+      --warmup-pairs "{{warmup_pairs}}" \
+      --trials "{{trials}}" \
+      --output "{{justfile_directory()}}/.nanocodex/benchmarks/paired-fx-model-latency.json" \
+      --confirm-paid-live-run
+
 # Rebuild every PR #50 hot-path estimate, then enforce the checked-in median
 # latency thresholds. TUI frame-count, changed-cell, and output-byte limits are
 # asserted inside the representative benchmark workloads themselves.
