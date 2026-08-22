@@ -71,26 +71,26 @@ incremental request path.
 
 Seven consecutive post-build process launches on 2026-08-22 used
 macOS/aarch64 and source
-`0a37b9314b07c26a8713d4155836df3c1f907b9e`. The release binary and filesystem
+`094476b4dbb8c36f903688586e6f1f8b182af2db`. The release binary and filesystem
 page cache were warm. Each row summarizes the seven per-run p50 values; these
 numbers are a reference shape, not a cross-host regression threshold:
 
 | Measurement | Median run p50 | Observed run-p50 range |
 | --- | ---: | ---: |
-| Process `main` to runtime ready | 132 µs | 127-156 µs |
-| Tokio runtime build | 52 µs | 51-57 µs |
-| Fresh agent build | 18.6 µs | 18.1-69.4 µs |
-| Fresh build-to-first-delta | 264 µs | 261-784 µs |
-| Warm submit-to-first-delta | 72.0 µs | 69.9-153.8 µs |
-| Delta emission-to-receipt | 6.7 µs | 6.5-6.8 µs |
-| Historical fork construction | 207 µs | 199-553 µs |
-| Retained RSS per fork | 85.2 KiB | 84.1-87.8 KiB |
-| 128-fork retained RSS delta | 10.66 MiB | 10.52-10.97 MiB |
+| Process `main` to runtime ready | 132 µs | 126-148 µs |
+| Tokio runtime build | 59 µs | 53-66 µs |
+| Fresh agent build | 18.0 µs | 17.7-18.9 µs |
+| Fresh build-to-first-delta | 275 µs | 269-276 µs |
+| Warm submit-to-first-delta | 73.6 µs | 67.3-77.4 µs |
+| Delta emission-to-receipt | 6.6 µs | 6.5-6.8 µs |
+| Historical fork construction | 211 µs | 209-213 µs |
+| Retained RSS per fork | 85.9 KiB | 85.0-86.5 KiB |
+| 128-fork retained RSS delta | 10.73 MiB | 10.63-10.81 MiB |
 
 Every run observed one stable prompt-cache key, one shared warmup across four
 service instances, three avoided fork warmups, 35/35 incremental generation
 requests, and no full-history generation replay. The 32-turn history plus 128
-retained forks ended at a median 22.23 MiB process RSS.
+retained forks ended at a median 22.25 MiB process RSS.
 
 The startup clock begins inside process `main`; executable loading before
 `main` is a host/package measurement. Warm page-cache results should not be
