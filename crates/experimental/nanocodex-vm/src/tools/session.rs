@@ -341,6 +341,7 @@ struct OutboundCancellation {
     target_id: u64,
     frame: Vec<u8>,
     written: Arc<AtomicBool>,
+    request_slot: Option<OwnedSemaphorePermit>,
 }
 
 #[derive(Default)]
@@ -1484,14 +1485,9 @@ fn queue_cancel(
         target_id,
         frame,
         written,
+        request_slot: Some(request_slot),
     };
-    let queued = inner.cancellations.try_send(cancellation);
-    // The cancellation queue is higher priority than the request queue, so no
-    // newly admitted request can pass this cancellation at the writer. Release
-    // admission here instead of waiting for a potentially backpressured guest
-    // pipe to accept the cancellation frame.
-    drop(request_slot);
-    match queued {
+    match inner.cancellations.try_send(cancellation) {
         Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
         Err(mpsc::error::TrySendError::Full(_)) => {
             inner.closing.store(true, Ordering::Release);
@@ -1525,13 +1521,15 @@ async fn write_requests(
             else => break,
         };
         let result = match outbound {
-            Outbound::Cancellation(cancellation)
-                if !cancellation.written.load(Ordering::Acquire) =>
-            {
-                deferred_cancellations.insert(cancellation.target_id, cancellation);
-                continue;
-            }
-            Outbound::Cancellation(cancellation) => {
+            Outbound::Cancellation(mut cancellation) => {
+                // Receiving the cancellation orders it ahead of every request
+                // admitted after it. Release admission at that boundary, but
+                // keep it bounded while this writer is backpressured.
+                drop(cancellation.request_slot.take());
+                if !cancellation.written.load(Ordering::Acquire) {
+                    deferred_cancellations.insert(cancellation.target_id, cancellation);
+                    continue;
+                }
                 write_request_frame(&mut input, &cancellation.frame).await
             }
             Outbound::Request(request) => {
