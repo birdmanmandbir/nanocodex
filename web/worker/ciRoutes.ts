@@ -12,6 +12,7 @@ import {
 } from "./ciSource.ts";
 import type { CiRunRecord } from "./ciRepository.ts";
 import {
+  failureMarkerKey,
   terminateActiveSandboxes,
   terminationMarkerKey,
 } from "./ciSandboxes.ts";
@@ -23,6 +24,7 @@ const MAX_CARGO_VENDOR_BYTES = 16 * 1024 * 1024;
 const MAX_RUSTSEC_ADVISORY_BYTES = 16 * 1024 * 1024;
 
 export type CiStorageEnv = {
+  ENVIRONMENT?: string;
   CI_SOURCE?: R2Bucket;
   BACKUP_BUCKET?: R2Bucket;
   CI_REPOSITORY?: DurableObjectNamespace;
@@ -60,6 +62,22 @@ export async function routeCiRequest(
     return error("ci_not_configured", 503);
   }
   const configured = env as RequiredCiEnv;
+
+  const localSnapshot = url.pathname.match(
+    /^\/api\/ci\/local-backups\/([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\/data\.sqsh$/i,
+  );
+  if (
+    localSnapshot &&
+    (request.method === "GET" || request.method === "HEAD")
+  ) {
+    if (configured.ENVIRONMENT !== "development") return error("not_found", 404);
+    return serveLocalSnapshot(
+      configured.BACKUP_BUCKET,
+      localSnapshot[1]!,
+      request,
+      url.searchParams.get("run"),
+    );
+  }
 
   if (
     url.pathname === "/api/ci/badge.svg" &&
@@ -441,6 +459,73 @@ async function serveRustSecAdvisory(
     "x-nanocodex-sha256": sha256,
   });
   return new Response(headOnly ? null : (object as R2ObjectBody).body, { headers });
+}
+
+async function serveLocalSnapshot(
+  bucket: R2Bucket,
+  id: string,
+  request: Request,
+  runHead: string | null,
+): Promise<Response> {
+  if (!isSha1(runHead)) return error("invalid_run", 400);
+  const [terminated, failed] = await Promise.all([
+    bucket.head(terminationMarkerKey(runHead)),
+    bucket.head(failureMarkerKey(runHead)),
+  ]);
+  if (terminated || failed) return error("run_inactive", 409);
+
+  const key = `backups/${id}/data.sqsh`;
+  const metadata = await bucket.head(key);
+  if (!metadata || metadata.size <= 0 || !Number.isSafeInteger(metadata.size)) {
+    return error("local_snapshot_missing", 404);
+  }
+  const range = parseByteRange(request.headers.get("range"), metadata.size);
+  if (range === "invalid") {
+    return new Response(null, {
+      status: 416,
+      headers: {
+        "accept-ranges": "bytes",
+        "cache-control": "no-store",
+        "content-range": `bytes */${metadata.size}`,
+        "x-content-type-options": "nosniff",
+      },
+    });
+  }
+  const object = request.method === "HEAD"
+    ? metadata
+    : await bucket.get(key, range ? {
+      range: { offset: range.start, length: range.length },
+    } : undefined);
+  if (!object) return error("local_snapshot_missing", 404);
+  const headers = new Headers({
+    "accept-ranges": "bytes",
+    "cache-control": "no-store",
+    "content-length": String(range?.length ?? metadata.size),
+    "content-type": "application/octet-stream",
+    "x-content-type-options": "nosniff",
+  });
+  if (range) headers.set("content-range", `bytes ${range.start}-${range.end}/${metadata.size}`);
+  return new Response(
+    request.method === "HEAD" ? null : (object as R2ObjectBody).body,
+    { status: range ? 206 : 200, headers },
+  );
+}
+
+function parseByteRange(
+  value: string | null,
+  size: number,
+): { start: number; end: number; length: number } | "invalid" | undefined {
+  if (value == null) return undefined;
+  const match = /^bytes=(\d+)-(\d+)$/.exec(value);
+  if (!match) return "invalid";
+  const start = Number(match[1]);
+  const requestedEnd = Number(match[2]);
+  if (
+    !Number.isSafeInteger(start) || !Number.isSafeInteger(requestedEnd) ||
+    start < 0 || start >= size || requestedEnd < start
+  ) return "invalid";
+  const end = Math.min(requestedEnd, size - 1);
+  return { start, end, length: end - start + 1 };
 }
 
 async function serveArchive(env: RequiredCiEnv, head: string): Promise<Response> {

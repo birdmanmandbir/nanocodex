@@ -244,7 +244,7 @@ index aa6068d..9a43284 100644
  
  export type RunStepResult<S> = RunOutput & {
 diff --git a/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts b/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
-index a7f6c05..26150fc 100644
+index a7f6c05..d9d517b 100644
 --- a/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
 +++ b/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
 @@ -1,7 +1,12 @@
@@ -289,11 +289,11 @@ index a7f6c05..26150fc 100644
  const TAIL_BYTES = 28_000;
  // Two inline logs plus result metadata must remain below Workflows' 1 MiB limit.
  const INLINE_LOG_BYTES = 300_000;
-+// One unbounded local R2 -> Sandbox RPC stream can stop making progress after
-+// roughly 128 MiB. Range each archive into independently acknowledged writes
-+// so multi-gigabyte Rust snapshots remain restorable under Wrangler/OrbStack.
-+const LOCAL_RESTORE_CHUNK_BYTES = 32 * 1024 * 1024;
++// Local RPC file streams stop making progress after enough cumulative data.
++// Pull bounded ranges over ordinary HTTP inside the container instead.
++const LOCAL_RESTORE_CHUNK_BYTES = 64 * 1024 * 1024;
 +const LARGE_LOCAL_RESTORE_BYTES = 64 * 1024 * 1024;
++const LOCAL_RESTORE_TIMEOUT_MS = 8 * 60 * 1000;
 +
 +// Miniflare proxies local R2 streams through one process. Serialize large
 +// restore transfers, but let compact result/artifact snapshots pass without
@@ -306,7 +306,7 @@ index a7f6c05..26150fc 100644
  
  export class SandboxRunner implements Runner<DirectoryBackup> {
    readonly name = 'sandbox';
-@@ -38,23 +66,43 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -38,23 +66,40 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
    async run(
      input: RunStepInput & { restore?: DirectoryBackup }
    ): Promise<RunStepResult<DirectoryBackup>> {
@@ -330,10 +330,7 @@ index a7f6c05..26150fc 100644
      try {
 +      await assertRunActive(this.env.BACKUP_BUCKET, input.sourceSha);
 +      const runnerSandbox = getSandbox(this.env.SANDBOX, runnerId, {
-+        // Local R2 restores must stream large squashfs archives into the
-+        // container. The HTTP transport falls back to one base64 string, which
-+        // exceeds V8's string limit for realistic dependency snapshots.
-+        transport: this.env.ENVIRONMENT === 'development' ? 'rpc' : 'http',
++        transport: 'http',
 +        enableDefaultSession: false,
 +        containerTimeouts: { portReadyTimeoutMS: PORT_READY_TIMEOUT_MS },
 +      });
@@ -359,7 +356,7 @@ index a7f6c05..26150fc 100644
            checkoutSourceScript(input.source, WORKSPACE_DIR, true),
            {
              cwd: '/',
-@@ -63,15 +111,16 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -63,15 +108,16 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
            }
          );
        } else {
@@ -378,7 +375,7 @@ index a7f6c05..26150fc 100644
          {
            cwd: resolveCwd(input.cwd),
            env: {
-@@ -81,61 +130,547 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -81,61 +127,550 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
            autoCleanup: false,
          }
        );
@@ -492,6 +489,7 @@ index a7f6c05..26150fc 100644
      } finally {
 -      if (!cleanupTransferredToStreams) {
 -        await destroySandbox(sandbox);
+-      }
 +      // Keep the registry marker when teardown fails so the authenticated
 +      // control route can retry the exact Sandbox rather than leaking it.
 +      if (sandbox) await destroySandbox(sandbox);
@@ -607,55 +605,58 @@ index a7f6c05..26150fc 100644
 +  sourceSha: string,
 +  size: number
 +) {
-+  const key = `backups/${snapshot.id}/data.sqsh`;
 +  const archivePath = `/var/backups/${snapshot.id}.sqsh`;
 +  const partPath = `${archivePath}.part`;
-+  const initialize = await sandbox.exec(
-+    `mkdir -p /var/backups && rm -f ${shellQuote(archivePath)} ${shellQuote(partPath)} && : > ${shellQuote(archivePath)}`,
-+    { cwd: '/', timeout: 30_000 }
++  const origin = env.CI_PUBLIC_ORIGIN;
++  if (!origin) throw new Error('CI_PUBLIC_ORIGIN is required for local CI snapshot restores');
++  const url = new URL(
++    `/api/ci/local-backups/${snapshot.id}/data.sqsh?run=${sourceSha}`,
++    origin
 +  );
-+  if (initialize.exitCode !== 0) {
-+    throw new Error(`Failed to initialize local CI snapshot restore: ${snapshot.id}`);
++  if (!/^https?:$/.test(url.protocol) || url.username || url.password) {
++    throw new Error('CI_PUBLIC_ORIGIN must be an HTTP(S) origin');
 +  }
++  const restore = [
++    'set -eu',
++    `mkdir -p /var/backups && rm -f ${shellQuote(archivePath)} ${shellQuote(partPath)} && : > ${shellQuote(archivePath)}`,
++    'offset=0',
++    `while [ "$offset" -lt ${size} ]; do`,
++    `  end=$((offset + ${LOCAL_RESTORE_CHUNK_BYTES} - 1))`,
++    `  if [ "$end" -ge ${size} ]; then end=$((${size} - 1)); fi`,
++    '  length=$((end - offset + 1))',
++    '  attempt=1',
++    '  while :; do',
++    `    rm -f ${shellQuote(partPath)}`,
++    `    if curl --connect-timeout 10 --max-time 60 --speed-limit 1048576 --speed-time 15 --fail --silent --show-error --location --max-filesize "$length" --range "$offset-$end" --output ${shellQuote(partPath)} ${shellQuote(url.href)}; then break; fi`,
++    '    if [ "$attempt" -ge 3 ]; then exit 1; fi',
++    '    attempt=$((attempt + 1))',
++    '    sleep 1',
++    '  done',
++    `  test "$(stat -c %s ${shellQuote(partPath)})" -eq "$length"`,
++    `  cat ${shellQuote(partPath)} >> ${shellQuote(archivePath)}`,
++    '  offset=$((end + 1))',
++    'done',
++    `test "$(stat -c %s ${shellQuote(archivePath)})" -eq ${size}`,
++    `/usr/bin/unsquashfs -f -d ${shellQuote(snapshot.dir)} ${shellQuote(archivePath)}`,
++  ].join('\n');
 +  try {
-+    for (let offset = 0; offset < size; offset += LOCAL_RESTORE_CHUNK_BYTES) {
-+      await assertRunActive(env.BACKUP_BUCKET, sourceSha);
-+      const length = Math.min(LOCAL_RESTORE_CHUNK_BYTES, size - offset);
-+      const chunk = await env.BACKUP_BUCKET.get(key, {
-+        range: { offset, length },
-+      });
-+      if (!chunk) {
-+        throw new Error(`Local CI snapshot range is missing at ${offset}: ${snapshot.id}`);
-+      }
-+      const written = await sandbox.writeFile(partPath, chunk.body);
-+      if (!written.success) {
-+        throw new Error(`Local CI snapshot range write failed at ${offset}: ${snapshot.id}`);
-+      }
-+      const appended = await sandbox.exec(
-+        `test "$(stat -c %s ${shellQuote(partPath)})" -eq ${length} && cat ${shellQuote(partPath)} >> ${shellQuote(archivePath)} && rm -f ${shellQuote(partPath)}`,
-+        { cwd: '/', timeout: 60_000 }
-+      );
-+      if (appended.exitCode !== 0) {
-+        throw new Error(`Local CI snapshot range append failed at ${offset}: ${snapshot.id}`);
-       }
-     }
-+    const restored = await sandbox.exec(
-+      `test "$(stat -c %s ${shellQuote(archivePath)})" -eq ${size} && /usr/bin/unsquashfs -f -d ${shellQuote(snapshot.dir)} ${shellQuote(archivePath)}`,
-+      { cwd: '/', timeout: SOURCE_TIMEOUT_MS }
-+    );
++    const restored = await sandbox.exec(restore, {
++      cwd: '/',
++      timeout: LOCAL_RESTORE_TIMEOUT_MS,
++    });
 +    if (restored.exitCode !== 0) {
 +      throw new Error(
 +        `Local CI snapshot extraction failed: ${snapshot.id}: ${restored.stderr.slice(-2_000)}`
 +      );
-+    }
+     }
 +  } finally {
 +    await sandbox.exec(
 +      `rm -f ${shellQuote(archivePath)} ${shellQuote(partPath)}`,
 +      { cwd: '/', timeout: 30_000 }
 +    ).catch(() => undefined);
-   }
- }
- 
++  }
++}
++
 +async function serializeLocalSandboxStart<T>(
 +  env: Bindings,
 +  start: () => Promise<T>
@@ -671,9 +672,9 @@ index a7f6c05..26150fc 100644
 +    return await start();
 +  } finally {
 +    release();
-+  }
-+}
-+
+   }
+ }
+ 
 +function fulfilled<T>(result: PromiseSettledResult<T>): T {
 +  if (result.status === 'rejected') {
 +    throw result.reason;
@@ -1100,14 +1101,15 @@ index 2d70c69..34f3d87 100644
        cachePointer: completed.cachePointer,
      };
 diff --git a/node_modules/@cloudflare/ci/src/env.ts b/node_modules/@cloudflare/ci/src/env.ts
-index bf35048..e536ac2 100644
+index bf35048..4a14973 100644
 --- a/node_modules/@cloudflare/ci/src/env.ts
 +++ b/node_modules/@cloudflare/ci/src/env.ts
-@@ -18,6 +18,7 @@ type Secrets = {
+@@ -18,6 +18,8 @@ type Secrets = {
  // Runtime contract owned by the CI package. A deployable Worker can intersect
  // this with its Wrangler-generated CloudflareBindings for configuration checks.
  export type Bindings = Secrets & {
 +  ENVIRONMENT?: string;
++  CI_PUBLIC_ORIGIN?: string;
    ARTIFACTS: Artifacts;
    BACKUP_BUCKET: R2Bucket;
    BACKUP_BUCKET_NAME: string;

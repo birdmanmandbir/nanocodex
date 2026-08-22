@@ -133,10 +133,7 @@ test("artifact and deterministic gates use bounded reusable cache entries", asyn
   assert.match(workflow, /path: "\/workspace\/\.ci-output\/web-wasm\.tar"/);
   assert.match(workflow, /path: "\/workspace\/\.ci-output\/web-dist\.tar"/);
   assert.match(sandboxRunner, /localBucket: this\.env\.ENVIRONMENT === 'development'/);
-  assert.match(
-    sandboxRunner,
-    /transport: this\.env\.ENVIRONMENT === 'development' \? 'rpc' : 'http'/,
-  );
+  assert.match(sandboxRunner, /transport: 'http'/);
   assert.match(workflow, /name: "Node and browser bindings"[\s\S]*?runnerConfig\(60 \* 60 \* 1_000, 24 \* 60 \* 60, 0, false\)/);
   assert.match(workflow, /prepareCachedLayer\(\s*dependencies,\s*"Bindings build cache"/);
   assert.match(workflow, /prepareCachedLayer\(\s*ci,\s*"Website dependencies"/);
@@ -181,11 +178,14 @@ test("artifact and deterministic gates use bounded reusable cache entries", asyn
     /await restoreSnapshot\([\s\S]*?runnerSandbox,[\s\S]*?input\.restore,[\s\S]*?this\.env,[\s\S]*?input\.sourceSha/,
   );
   assert.match(sandboxRunner, /env\.ENVIRONMENT !== 'development'/);
-  assert.match(sandboxRunner, /LOCAL_RESTORE_CHUNK_BYTES = 32 \* 1024 \* 1024/);
+  assert.match(sandboxRunner, /LOCAL_RESTORE_CHUNK_BYTES = 64 \* 1024 \* 1024/);
   assert.match(
     sandboxRunner,
-    /BACKUP_BUCKET\.get\(key, \{[\s\S]*?range: \{ offset, length \}[\s\S]*?sandbox\.writeFile\(partPath, chunk\.body\)/,
+    /\/api\/ci\/local-backups\/\$\{snapshot\.id\}\/data\.sqsh\?run=\$\{sourceSha\}/,
   );
+  assert.match(sandboxRunner, /curl[\s\S]*?--speed-time 15[\s\S]*?--range "\$offset-\$end"/);
+  assert.doesNotMatch(sandboxRunner, /sandbox\.writeFile\(partPath, chunk\.body\)/);
+  assert.match(sandboxRunner, /transport: 'http'/);
   assert.match(
     sandboxRunner,
     /stat -c %s[\s\S]*?\$\{size\}[\s\S]*?\/usr\/bin\/unsquashfs/,

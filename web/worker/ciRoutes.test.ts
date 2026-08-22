@@ -11,6 +11,8 @@ const archiveBody = new TextEncoder().encode("archive");
 const archiveSha = "1".repeat(64);
 const cargoVendorBody = new TextEncoder().encode("cargo vendor bundle");
 const rustSecBody = new TextEncoder().encode("RustSec advisory database bundle");
+const snapshotId = "123e4567-e89b-42d3-a456-426614174000";
+const snapshotBody = new TextEncoder().encode("0123456789abcdef");
 const treeBody = new TextEncoder().encode(JSON.stringify({
   version: 1,
   head,
@@ -38,6 +40,39 @@ test("CI source mutations authenticate before touching storage", async () => {
     { method: "PUT", body: rustSecBody },
   ), {});
   assert.equal(rustSec.status, 401);
+});
+
+test("local snapshot transport is development-only, ranged, and run-scoped", async () => {
+  const bucket = memoryBucket();
+  const repository = memoryNamespace();
+  const env = configured(bucket, repository);
+  await env.backup.put(`backups/${snapshotId}/data.sqsh`, snapshotBody);
+  const url = `https://ci.test/api/ci/local-backups/${snapshotId}/data.sqsh?run=${head}`;
+
+  const range = await route(new Request(url, {
+    headers: { range: "bytes=3-8" },
+  }), env);
+  assert.equal(range.status, 206);
+  assert.equal(range.headers.get("accept-ranges"), "bytes");
+  assert.equal(range.headers.get("content-range"), `bytes 3-8/${snapshotBody.byteLength}`);
+  assert.equal(range.headers.get("content-length"), "6");
+  assert.equal(await range.text(), "345678");
+
+  const headResponse = await route(new Request(url, { method: "HEAD" }), env);
+  assert.equal(headResponse.status, 200);
+  assert.equal(headResponse.headers.get("content-length"), String(snapshotBody.byteLength));
+  assert.equal(await headResponse.text(), "");
+
+  const invalid = await route(new Request(url, {
+    headers: { range: "bytes=999-1000" },
+  }), env);
+  assert.equal(invalid.status, 416);
+  assert.equal(invalid.headers.get("content-range"), `bytes */${snapshotBody.byteLength}`);
+
+  await env.backup.put(`runs/${head}/control/terminated.json`, "{}");
+  assert.equal((await route(new Request(url, { headers: { range: "bytes=0-1" } }), env)).status, 409);
+  assert.equal((await route(new Request(url.replace(head, "bad")), env)).status, 400);
+  assert.equal((await route(new Request(url), { ...env, ENVIRONMENT: "production" })).status, 404);
 });
 
 test("source objects are immutable and publication verifies both R2 objects", async () => {
@@ -502,6 +537,7 @@ function configured(bucket: ReturnType<typeof memoryBucket>, repository: ReturnT
   const controls = { terminations: 0, status: "running", events: [] as string[] };
   const sandbox = memorySandboxNamespace(controls);
   return {
+    ENVIRONMENT: "development",
     CI_SOURCE: bucket as unknown as R2Bucket,
     BACKUP_BUCKET: backup as unknown as R2Bucket,
     CI_REPOSITORY: repository.namespace as unknown as DurableObjectNamespace,
@@ -601,20 +637,24 @@ function memoryBucket() {
       objects.set(key, value);
       return object(key, value);
     },
-    async get(key: string) {
+    async get(key: string, options: { range?: { offset: number; length: number } } = {}) {
       const value = objects.get(key);
       if (!value) return null;
+      const range = options.range;
+      const body = range
+        ? value.body.slice(range.offset, range.offset + range.length)
+        : value.body;
       return {
         ...object(key, value),
-        body: new Response(byteBuffer(value.body)).body,
+        body: new Response(byteBuffer(body)).body,
         bodyUsed: false,
-        arrayBuffer: async () => value.body.buffer.slice(
-          value.body.byteOffset,
-          value.body.byteOffset + value.body.byteLength,
+        arrayBuffer: async () => body.buffer.slice(
+          body.byteOffset,
+          body.byteOffset + body.byteLength,
         ),
-        text: async () => new TextDecoder().decode(value.body),
-        json: async () => JSON.parse(new TextDecoder().decode(value.body)),
-        blob: async () => new Blob([byteBuffer(value.body)]),
+        text: async () => new TextDecoder().decode(body),
+        json: async () => JSON.parse(new TextDecoder().decode(body)),
+        blob: async () => new Blob([byteBuffer(body)]),
       };
     },
     async list(options: R2ListOptions = {}) {
