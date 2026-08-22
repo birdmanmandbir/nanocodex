@@ -6785,7 +6785,7 @@ fn isolated_launch_config(builder: BrowserConfigBuilder) -> BrowserConfigBuilder
 }
 
 #[cfg(not(target_os = "macos"))]
-fn isolated_launch_config(builder: BrowserConfigBuilder) -> BrowserConfigBuilder {
+const fn isolated_launch_config(builder: BrowserConfigBuilder) -> BrowserConfigBuilder {
     builder
 }
 
