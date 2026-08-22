@@ -164,8 +164,14 @@ test("dependency and Rust compilation snapshots are content addressed", async ()
   );
   assert.match(rustBuildCacheCommand(), /! -name \.cargo-target/);
   assert.match(msrvBuildCacheCommand(), /! -name \.cargo-target-msrv/);
-  assert.match(rustBuildCacheCommand(), /cargo clean --workspace --locked/);
-  assert.match(msrvBuildCacheCommand(), /cargo \+1\.97 clean --workspace --locked/);
+  assert.match(
+    rustBuildCacheCommand(),
+    /cargo check --locked --workspace --all-targets --all-features --exclude nanocodex-bin/,
+  );
+  assert.match(rustBuildCacheCommand(), /--bin nanocodex/);
+  assert.match(rustBuildCacheCommand(), /--bench tui_render/);
+  assert.doesNotMatch(rustBuildCacheCommand(), /cargo clean/);
+  assert.doesNotMatch(msrvBuildCacheCommand(), /cargo .*clean/);
   assert.match(refreshSourceCommand("cargo test"), /-exec touch/);
   assert.match(refreshSourceCommand("cargo test"), /\.cargo-target-msrv -prune/);
 });

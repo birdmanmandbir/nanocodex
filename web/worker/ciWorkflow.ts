@@ -65,9 +65,10 @@ const COMMON_ENV = {
 
 const RUST_TEST_ENV = {
   ...COMMON_ENV,
-  // Test DWARF dominates the reusable workspace snapshot but is not consumed
-  // by any CI gate. Keep test codegen and assertions identical while avoiding
-  // multi-gigabyte cache writes and restores.
+  // DWARF dominates reusable snapshots but is not consumed by any CI gate.
+  // Keep codegen and assertions identical while avoiding multi-gigabyte cache
+  // writes, restores, and Clippy metadata builds.
+  CARGO_PROFILE_DEV_DEBUG: "0",
   CARGO_PROFILE_TEST_DEBUG: "0",
 };
 

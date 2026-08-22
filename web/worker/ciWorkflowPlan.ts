@@ -266,8 +266,12 @@ function shellQuote(value: string): string {
 
 export function rustBuildCacheCommand(): string {
   return rustCompilationCacheCommand(
-    "cargo test --workspace --locked --no-run",
-    "cargo clean --workspace --locked",
+    [
+      "cargo check --locked --workspace --all-targets --all-features --exclude nanocodex-bin",
+      "cargo check --locked --package nanocodex-bin --all-features --bin nanocodex",
+      "cargo check --locked --package nanocodex-bin --all-features --bench tui_render",
+      "cargo test --workspace --locked --no-run",
+    ].join(" && "),
     ".cargo-target",
   );
 }
@@ -275,20 +279,17 @@ export function rustBuildCacheCommand(): string {
 export function msrvBuildCacheCommand(): string {
   return rustCompilationCacheCommand(
     "cargo +1.97 test --workspace --locked --no-run",
-    "cargo +1.97 clean --workspace --locked",
     ".cargo-target-msrv",
   );
 }
 
 function rustCompilationCacheCommand(
   command: string,
-  cleanWorkspaceCommand: string,
   targetDirectory: string,
 ): string {
   return [
     `${sourceFingerprintCommand()} > /workspace/.rust-source-fingerprint`,
     command,
-    cleanWorkspaceCommand,
     `find /workspace -mindepth 1 -maxdepth 1 ! -name .cargo-home ! -name ${targetDirectory} ! -name .rust-source-fingerprint -exec rm -rf -- {} +`,
   ].join(" && ");
 }

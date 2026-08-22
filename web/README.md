@@ -133,8 +133,9 @@ checksum-verified R2 bundle keyed by the committed `Cargo.lock` blob before
 After the shared Cargo download cache, the MSRV, policy, VM, npm, and
 stable-build-snapshot branches start concurrently. The native target snapshot
 is keyed by the exact Cargo graph and runner image rather than workspace source.
-It retains only Cargo homes, target output, and the fingerprint of the source
-that produced it. Every consumer overlays the immutable current source and
+It retains Cargo homes, the completed stable test graph, the all-feature check
+graph used by Clippy, and the fingerprint of the source that produced them.
+Every consumer overlays the immutable current source and
 touches all Rust inputs when that fingerprint changes, so Cargo reuses compatible
 dependency output while rebuilding every affected crate, build script, and proc
 macro. Quality branches from that reusable target and joins the compile-heavy

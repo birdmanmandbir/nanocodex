@@ -172,6 +172,7 @@ test("terminal gates skip snapshots and publish the website artifact in-place", 
     /if \(env\.ENVIRONMENT !== 'development'\) return start\(\)/,
   );
   assert.match(workflow, /CARGO_BUILD_JOBS: "4"/);
+  assert.match(workflow, /CARGO_PROFILE_DEV_DEBUG: "0"/);
   assert.match(workflow, /CARGO_PROFILE_TEST_DEBUG: "0"/);
   assert.match(workflow, /RUST_TEST_THREADS: "4"/);
   assert.match(
