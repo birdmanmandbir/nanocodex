@@ -212,6 +212,12 @@ export class NanocodexCI extends CIWorkflow<
         size: source.rustSecSize,
         sha256: source.rustSecSha256,
       });
+      const stableJob = rustJobs.find(
+        ({ name }) => name === "stable workspace tests",
+      );
+      if (!stableJob) throw new Error("stable workspace test gate is missing");
+      const qualityJob = rustJobs.find(({ name }) => name === "quality");
+      if (!qualityJob) throw new Error("quality gate is missing");
       const buildCacheBranch = (async () => {
         const buildCacheStartedAt = progress.start("Rust build cache");
         const buildCache = await dependencies.runner({
@@ -236,13 +242,12 @@ export class NanocodexCI extends CIWorkflow<
           completed.push(summary);
           await progress.complete("Rust build cache", summary);
         });
-        const cachedRustJobs = rustJobs
-          .filter(
-            ({ name }) =>
-              name === "stable workspace tests" || name === "quality",
-          )
-          .map((job) => runRustJob(buildCache, job, true));
-        await Promise.all([buildCachePersistence, ...cachedRustJobs]);
+        await buildCachePersistence;
+        return buildCache;
+      })();
+      const qualityBranch = (async () => {
+        const buildCache = await buildCacheBranch;
+        await runRustJob(buildCache, qualityJob, true);
       })();
       const msrvJob = rustJobs.find(
         ({ name }) => name === "MSRV workspace tests",
@@ -452,17 +457,21 @@ export class NanocodexCI extends CIWorkflow<
       };
       const saturationBarrier = Promise.all([
         cargoPersistence,
-        buildCacheBranch,
+        qualityBranch,
         ...directRustJobs,
         webPreparation,
       ]);
-      const [msrvBuildCache] = await Promise.all([
+      const [buildCache, msrvBuildCache] = await Promise.all([
+        buildCacheBranch,
         msrvBuildCacheBranch,
         saturationBarrier,
       ]);
-      // Compilation can saturate the shared host. Build every reusable target
-      // and WASM package in parallel, then run the deadline-sensitive MSRV and
-      // JavaScript suites only after the heavy siblings release the host.
+      // Compilation can saturate the shared host. Finish every reusable target
+      // and the compile-heavy quality gate first, then give the stable suite's
+      // wall-clock assertions the host without a competing Rust compiler.
+      await runRustJob(buildCache, stableJob, true);
+      // The remaining MSRV and JavaScript suites are bounded to separate cache
+      // trees and together fit the host after the stable suite releases it.
       await Promise.all([
         runRustJob(msrvBuildCache, msrvJob, true),
         runWebJob(),

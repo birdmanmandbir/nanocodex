@@ -186,6 +186,12 @@ test("terminal gates skip snapshots and publish the website artifact in-place", 
   const saturationBarrier = workflow.indexOf(
     "const saturationBarrier = Promise.all([",
   );
+  const saturationAwait = workflow.indexOf(
+    "const [buildCache, msrvBuildCache] = await Promise.all([",
+  );
+  const stableExecution = workflow.indexOf(
+    "await runRustJob(buildCache, stableJob, true);",
+  );
   const msrvExecution = workflow.indexOf(
     "runRustJob(msrvBuildCache, msrvJob, true),",
   );
@@ -195,13 +201,21 @@ test("terminal gates skip snapshots and publish the website artifact in-place", 
     saturationBarrier >= 0,
     "compile-heavy gates have an explicit phase barrier",
   );
-  assert.ok(
-    msrvExecution > saturationBarrier,
-    "deadline-sensitive MSRV tests start only after compile-heavy gates release the host",
+  assert.match(
+    workflow,
+    /const qualityBranch = \(async \(\) => \{[\s\S]*?await runRustJob\(buildCache, qualityJob, true\);[\s\S]*?const saturationBarrier = Promise\.all\(\[[\s\S]*?qualityBranch,/,
   );
   assert.ok(
-    webExecution > saturationBarrier,
-    "deadline-sensitive JavaScript tests start only after compile-heavy gates release the host",
+    saturationAwait > saturationBarrier && stableExecution > saturationAwait,
+    "stable tests start only after the compile-heavy quality phase releases the host",
+  );
+  assert.ok(
+    msrvExecution > stableExecution,
+    "MSRV tests start only after the stable workspace suite releases the host",
+  );
+  assert.ok(
+    webExecution > stableExecution,
+    "deadline-sensitive JavaScript tests start only after the stable workspace suite releases the host",
   );
   assert.ok(
     pythonBarrier > msrvExecution,
