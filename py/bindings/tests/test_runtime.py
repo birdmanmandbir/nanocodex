@@ -149,7 +149,10 @@ print(json.dumps({{"before": before, "during": during, "after": after}}))
             )
             self.assertEqual(server.connection_count, 8)
         counts = json.loads(completed.stdout)
-        self.assertEqual(
+        # Every agent-owned I/O thread must disappear. A shared transient may
+        # finish during the same shutdown window too, so extra cleanup is safe;
+        # the retained-growth assertion below owns the upper bound.
+        self.assertGreaterEqual(
             counts["during"] - counts["after"],
             8,
             counts,
