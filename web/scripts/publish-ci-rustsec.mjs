@@ -215,6 +215,12 @@ async function materializeRustSecRepository(source, destination, revision) {
   await writeFile(resolve(destination, ".git/HEAD"), `${revision}\n`);
   await gitAt(destination, ["read-tree", "--reset", revision]);
   await gitAt(destination, ["checkout-index", "--all"]);
+  // Rebuild the archived index from the immutable tree after populating the
+  // worktree, then remove Git's host-specific fsmonitor token. This zeroes stat
+  // data and removes the nondeterministic FSMN extension while retaining a
+  // complete index for immediate use by cargo-deny.
+  await gitAt(destination, ["read-tree", "--reset", revision]);
+  await gitAt(destination, ["update-index", "--no-fsmonitor"]);
   await Promise.all([
     rm(resolve(destination, ".git/FETCH_HEAD"), { force: true }),
     rm(resolve(destination, ".git/ORIG_HEAD"), { force: true }),
@@ -609,11 +615,10 @@ async function gitBuffer(repository, args) {
       ...args,
     ], {
       cwd: repository,
-      env: publisherEnvironment(),
       encoding: "buffer",
       maxBuffer: maximumCommandOutputBytes,
       env: {
-        ...process.env,
+        ...publisherEnvironment(),
         GIT_CONFIG_COUNT: "2",
         GIT_CONFIG_KEY_0: "fetch.recurseSubmodules",
         GIT_CONFIG_VALUE_0: "false",
