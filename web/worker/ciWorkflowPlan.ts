@@ -352,19 +352,20 @@ export function bindingsCommand(): string {
   ].join(" && ");
 }
 
-function parallelCommandGroups(
+export function parallelCommandGroups(
   groups: readonly { label: string; command: string }[],
 ): string {
-  const launches = groups.map(({ label, command }, index) => [
-    "(",
-    "group_started=$(date +%s)",
-    `printf 'ci group start: %s\\n' ${shellQuote(label)}`,
-    command,
-    "group_status=$?",
-    `printf 'ci group finish: %s (%ss, exit %s)\\n' ${shellQuote(label)} \"$(( $(date +%s) - group_started ))\" \"$group_status\"`,
-    'exit "$group_status"',
-    `) & group_pid_${index}=$!`,
-  ].join("; "));
+  const launches = groups.map(({ label, command }, index) => {
+    const body = [
+      "group_started=$(date +%s)",
+      `printf 'ci group start: %s\\n' ${shellQuote(label)}`,
+      command,
+      "group_status=$?",
+      `printf 'ci group finish: %s (%ss, exit %s)\\n' ${shellQuote(label)} \"$(( $(date +%s) - group_started ))\" \"$group_status\"`,
+      'exit "$group_status"',
+    ].join("; ");
+    return `( ${body} ) & group_pid_${index}=$!`;
+  });
   const waits = groups.map(
     (_, index) => `wait \"$group_pid_${index}\" || group_failure=1`,
   );

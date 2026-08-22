@@ -23,6 +23,7 @@ import {
   cargoDependencyCommand,
   msrvBuildCacheCommand,
   msrvBuildCacheInputs,
+  parallelCommandGroups,
   pythonCommand,
   refreshSourceCommand,
   rustBuildCacheInputs,
@@ -325,6 +326,28 @@ test("bindings, website, and both Python versions preserve the GitHub CI gates",
     assert.match(python, /mypy --strict/);
     assert.match(python, /benchmark_binding\.py --check/);
   }
+});
+
+test("parallel command groups execute quoted payloads and propagate failures", () => {
+  const success = spawnSync("bash", [
+    "-c",
+    parallelCommandGroups([
+      { label: "first group", command: "printf 'first payload\\n'" },
+      { label: "quoted ' group", command: "printf 'second payload\\n'" },
+    ]),
+  ], { encoding: "utf8" });
+  assert.equal(success.status, 0, success.stderr);
+  assert.match(success.stdout, /first payload/);
+  assert.match(success.stdout, /second payload/);
+
+  const failure = spawnSync("bash", [
+    "-c",
+    parallelCommandGroups([
+      { label: "passing group", command: "true" },
+      { label: "failing group", command: "false" },
+    ]),
+  ], { encoding: "utf8" });
+  assert.equal(failure.status, 1, failure.stderr);
 });
 
 test("the bindings build snapshot retains generated WASM and node_modules only", async () => {
