@@ -136,13 +136,15 @@ that produced it. Every consumer overlays the immutable current source and
 touches all Rust inputs when that fingerprint changes, so Cargo reuses compatible
 dependency output while rebuilding every affected crate, build script, and proc
 macro. Stable tests and quality branch from that reusable target while the other
-heavy gates continue, reaching up to five-way `standard-4` fanout. The two Python
-versions then run together after those compile-heavy branches release the host,
-keeping their wall-clock performance gates meaningful. Ten container slots leave
-room for parent runners that are still draining logs. The bindings gate streams
-only its small tested WASM package to R2 and skips its otherwise multi-gigabyte
-workspace snapshot. The website starts from the retained dependency snapshot,
-restores that checksum-verified WASM package, and streams its tested deployment tar
+heavy gates continue, reaching up to five-way `standard-4` fanout. Cargo and
+libtest are explicitly capped at those four CPUs, so a local Containers emulator
+cannot oversubscribe each runner to every host core. The two Python versions then
+run together after those compile-heavy branches release the host, keeping their
+wall-clock performance gates meaningful. Ten container slots leave room for
+parent runners that are still draining logs. The bindings gate streams only its
+small tested WASM package to R2 and skips its otherwise multi-gigabyte workspace
+snapshot. The website starts from the retained dependency snapshot, restores
+that checksum-verified WASM package, and streams its tested deployment tar
 straight back to R2. Correctness runners are not skipped by cache or retried;
 only network-backed dependency preparation gets one retry.
 Success and failure logs, step records, final results, required parent/cache
@@ -155,9 +157,11 @@ Immutable source archives live in the separately credentialed
 
 Every Sandbox registers its exact runner ID under the run before container work
 starts. An authenticated termination first writes a run tombstone, terminates the
-Workflow, then retries teardown for every registered Sandbox; a runner that races
-with termination observes the tombstone before startup, and a failed teardown
-retains its marker for a safe operator retry.
+Workflow, then reconciles every registered Sandbox across three teardown sweeps;
+a runner rechecks the tombstone between long phases, and a failed teardown retains
+its marker for a safe operator retry. A deterministic gate failure writes its own
+stop marker and immediately tears down active siblings instead of waiting for a
+known-doomed fanout to finish.
 
 Runner output is captured through a bounded 32 MiB head plus 32 MiB tail per
 stream. The step record includes observed/stored byte counts and a truncation

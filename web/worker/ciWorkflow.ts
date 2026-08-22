@@ -33,6 +33,11 @@ import {
   rustPipeline,
   websiteCommand,
 } from "./ciWorkflowPlan.ts";
+import {
+  failureMarkerKey,
+  terminateActiveSandboxes,
+  terminationMarkerKey,
+} from "./ciSandboxes.ts";
 
 type NanocodexSourceProvider = {
   id: "nanocodex-source";
@@ -48,8 +53,10 @@ type NanocodexCiBindings = CiBindings & {
 const COMMON_ENV = {
   CARGO_HOME: "/workspace/.cargo-home",
   CARGO_TARGET_DIR: "/workspace/.cargo-target",
+  CARGO_BUILD_JOBS: "4",
   CARGO_INCREMENTAL: "0",
   CARGO_TERM_COLOR: "always",
+  RUST_TEST_THREADS: "4",
 };
 
 const CI_GATE_NAMES = [
@@ -105,6 +112,7 @@ export class NanocodexCI extends CIWorkflow<
           { httpMetadata: { contentType: "application/json" } },
         ),
         progress.persistInitial(),
+        this.env.BACKUP_BUCKET.delete(failureMarkerKey(head)),
       ]);
     });
 
@@ -216,7 +224,7 @@ export class NanocodexCI extends CIWorkflow<
               name === "stable workspace tests" || name === "quality",
           )
           .map((job) => runRustJob(buildCache, job, true));
-        await allSettledOrThrow([buildCachePersistence, ...cachedRustJobs]);
+        await Promise.all([buildCachePersistence, ...cachedRustJobs]);
       })();
       const directRustJobs = rustJobs
         .filter(
@@ -351,7 +359,7 @@ export class NanocodexCI extends CIWorkflow<
         completed.push(summary);
         await progress.complete("website", summary);
       })();
-      await allSettledOrThrow([
+      await Promise.all([
         cargoPersistence,
         buildCacheBranch,
         ...directRustJobs,
@@ -359,7 +367,7 @@ export class NanocodexCI extends CIWorkflow<
       ]);
       // The binding gates contain wall-clock SLAs. Run both versions together,
       // but only after compile-heavy gates release their CPU allocations.
-      await allSettledOrThrow(runPythonJobs());
+      await Promise.all(runPythonJobs());
 
       completed.sort((left, right) => left.name.localeCompare(right.name));
       await step.do("persist CI success", EVIDENCE_STEP_CONFIG, async () => {
@@ -382,7 +390,36 @@ export class NanocodexCI extends CIWorkflow<
       });
       gatesCompleted = true;
     } catch (cause) {
-      if (!gatesCompleted) {
+      const operatorTerminated = await this.env.BACKUP_BUCKET.head(
+        terminationMarkerKey(head),
+      );
+      if (!gatesCompleted && !operatorTerminated) {
+        await this.env.BACKUP_BUCKET.put(
+          failureMarkerKey(head),
+          JSON.stringify({
+            version: 1,
+            head,
+            failedAt: new Date().toISOString(),
+            failure: failureRecord(cause),
+          }),
+          {
+            onlyIf: { etagDoesNotMatch: "*" },
+            httpMetadata: { contentType: "application/json" },
+            customMetadata: { kind: "ci-run-failure", head },
+          },
+        );
+        const cleanup = await terminateActiveSandboxes(this.env, head, {
+          deleteMarkers: false,
+        }).catch((cleanupCause) => ({
+          destroyed: [],
+          failed: [{
+            runnerId: "registry",
+            error: failureRecord(cleanupCause).message,
+          }],
+        }));
+        if (cleanup.failed.length > 0) {
+          console.error("Failed to stop every CI Sandbox after a gate failure", cleanup);
+        }
         await progress.failRunning(cause).catch((progressCause) => {
           console.error("Failed to persist CI gate progress", progressCause);
         });
@@ -569,15 +606,6 @@ function runnerConfig(
     snapshot,
     retries: { limit: retries, delay: 30_000, backoff: "linear" as const },
   };
-}
-
-async function allSettledOrThrow(promises: Promise<unknown>[]): Promise<void> {
-  const outcomes = await Promise.allSettled(promises);
-  const failed = outcomes.find(
-    (outcome): outcome is PromiseRejectedResult =>
-      outcome.status === "rejected",
-  );
-  if (failed) throw failed.reason;
 }
 
 function runnerCacheHit(result: CiRunnerResult): boolean {

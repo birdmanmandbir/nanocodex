@@ -11,13 +11,16 @@ import {
   type CiSourcePublication,
 } from "./ciSource.ts";
 import type { CiRunRecord } from "./ciRepository.ts";
+import {
+  terminateActiveSandboxes,
+  terminationMarkerKey,
+} from "./ciSandboxes.ts";
 
 const IMMUTABLE_CACHE = "public, max-age=31536000, immutable";
 const MAX_ARCHIVE_BYTES = 128 * 1024 * 1024;
 const MAX_TREE_BYTES = 16 * 1024 * 1024;
 const MAX_CARGO_VENDOR_BYTES = 16 * 1024 * 1024;
 const MAX_RUSTSEC_ADVISORY_BYTES = 16 * 1024 * 1024;
-const SANDBOX_ID = /^[a-z0-9-]{1,16}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export type CiStorageEnv = {
   CI_SOURCE?: R2Bucket;
@@ -571,77 +574,6 @@ type RequiredCiEnv = Required<
     "CI_SOURCE" | "BACKUP_BUCKET" | "CI_REPOSITORY" | "CI_WORKFLOW" | "SANDBOX"
   >
 > & CiStorageEnv;
-
-async function terminateActiveSandboxes(env: RequiredCiEnv, head: string) {
-  const prefix = activeSandboxPrefix(head);
-  const markers = await listAll(env.BACKUP_BUCKET, prefix);
-  const targets = markers.flatMap(({ key }) => {
-    const file = key.slice(prefix.length);
-    const runnerId = file.endsWith(".json") ? file.slice(0, -5) : "";
-    return SANDBOX_ID.test(runnerId) ? [{ key, runnerId }] : [];
-  }).sort((left, right) => left.runnerId.localeCompare(right.runnerId));
-  const settled = await Promise.all(targets.map(async ({ key, runnerId }) => {
-    try {
-      await destroyActiveSandbox(env.SANDBOX, runnerId);
-      await env.BACKUP_BUCKET.delete(key);
-      return { runnerId, status: "destroyed" as const };
-    } catch (cause) {
-      return {
-        runnerId,
-        status: "failed" as const,
-        error: boundedError(cause),
-      };
-    }
-  }));
-  return {
-    destroyed: settled
-      .filter(({ status }) => status === "destroyed")
-      .map(({ runnerId }) => runnerId),
-    failed: settled
-      .filter(({ status }) => status === "failed")
-      .map(({ runnerId, error }) => ({ runnerId, error })),
-  };
-}
-
-async function listAll(bucket: R2Bucket, prefix: string): Promise<R2Object[]> {
-  const objects: R2Object[] = [];
-  let cursor: string | undefined;
-  do {
-    const page = await bucket.list({ prefix, cursor, limit: 1_000 });
-    objects.push(...page.objects);
-    if (!page.truncated) break;
-    if (!page.cursor || page.cursor === cursor) {
-      throw new Error("active Sandbox registry pagination did not advance");
-    }
-    cursor = page.cursor;
-  } while (cursor);
-  return objects;
-}
-
-async function destroyActiveSandbox(
-  namespace: RequiredCiEnv["SANDBOX"],
-  runnerId: string,
-) {
-  const sandbox = namespace.get(namespace.idFromName(runnerId));
-  let failure: unknown;
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      await sandbox.destroy();
-      return;
-    } catch (cause) {
-      failure = cause;
-    }
-  }
-  throw new Error(`failed to destroy active CI Sandbox ${runnerId}`, { cause: failure });
-}
-
-function activeSandboxPrefix(head: string) {
-  return `runs/${head}/sandboxes/`;
-}
-
-function terminationMarkerKey(head: string) {
-  return `runs/${head}/control/terminated.json`;
-}
 
 function repository(env: RequiredCiEnv) {
   return env.CI_REPOSITORY.get(env.CI_REPOSITORY.idFromName("nanocodex"));

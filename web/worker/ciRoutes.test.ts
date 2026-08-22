@@ -318,7 +318,12 @@ test("termination tombstones the run and destroys every registered Sandbox", asy
 
   const destroyed = [...active].sort();
   assert.equal(response.status, 200);
-  assert.deepEqual(env.controls.events, ["workflow", ...destroyed]);
+  assert.deepEqual(env.controls.events, [
+    "workflow",
+    ...destroyed,
+    ...destroyed,
+    ...destroyed,
+  ]);
   assert.equal(env.controls.status, "terminated");
   assert.deepEqual((await response.json() as {
     sandboxCleanup: { destroyed: string[]; failed: unknown[] };
@@ -326,11 +331,12 @@ test("termination tombstones the run and destroys every registered Sandbox", asy
   assert.ok(await env.backup.head(`runs/${head}/control/terminated.json`));
   for (const runnerId of active) {
     assert.equal(await env.backup.head(`runs/${head}/sandboxes/${runnerId}.json`), null);
+    assert.equal(env.sandbox.attempts.get(runnerId), 3);
   }
   assert.ok(await env.backup.head(`runs/${"b".repeat(40)}/sandboxes/${unrelated}.json`));
 });
 
-test("incomplete Sandbox termination is retried and remains recoverable", async () => {
+test("termination reconciles a Sandbox recreated by an in-flight request", async () => {
   const bucket = memoryBucket();
   const repository = memoryNamespace();
   const env = configured(bucket, repository);
@@ -353,6 +359,37 @@ test("incomplete Sandbox termination is retried and remains recoverable", async 
     headers: controlAuth(),
   }), env);
 
+  assert.equal(response.status, 200);
+  assert.deepEqual((await response.json() as {
+    sandboxCleanup: { destroyed: string[]; failed: unknown[] };
+  }).sandboxCleanup, { destroyed: [runnerId], failed: [] });
+  assert.equal(env.sandbox.attempts.get(runnerId), 5);
+  assert.equal(await env.backup.head(marker), null);
+});
+
+test("incomplete Sandbox termination remains recoverable after every sweep", async () => {
+  const bucket = memoryBucket();
+  const repository = memoryNamespace();
+  const env = configured(bucket, repository);
+  repository.run = {
+    version: 1,
+    head,
+    beforeHead: null,
+    workflowId: `ci-${head}`,
+    state: "dispatched",
+    attempts: 1,
+    publishedAt: "2026-08-21T00:00:00.000Z",
+  };
+  const runnerId = "quality-44444444-4444-4444-8444-444444444444";
+  const marker = `runs/${head}/sandboxes/${runnerId}.json`;
+  await env.backup.put(marker, "{}");
+  env.sandbox.failures.set(runnerId, 9);
+
+  const response = await route(new Request(`https://ci.test/api/ci/runs/${head}/terminate`, {
+    method: "POST",
+    headers: controlAuth(),
+  }), env);
+
   assert.equal(response.status, 409);
   assert.deepEqual(await response.json(), {
     error: "ci_termination_incomplete",
@@ -364,7 +401,7 @@ test("incomplete Sandbox termination is retried and remains recoverable", async 
       }],
     },
   });
-  assert.equal(env.sandbox.attempts.get(runnerId), 3);
+  assert.equal(env.sandbox.attempts.get(runnerId), 9);
   assert.ok(await env.backup.head(marker), "failed teardown retains its registry marker");
 });
 

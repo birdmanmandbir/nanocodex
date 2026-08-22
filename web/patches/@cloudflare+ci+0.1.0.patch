@@ -244,7 +244,7 @@ index aa6068d..9a43284 100644
  
  export type RunStepResult<S> = RunOutput & {
 diff --git a/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts b/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
-index a7f6c05..4d25b1c 100644
+index a7f6c05..2c78d92 100644
 --- a/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
 +++ b/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
 @@ -1,7 +1,12 @@
@@ -334,16 +334,18 @@ index a7f6c05..4d25b1c 100644
          // Overlay (no rm) so cached node_modules survive while tracked source
          // files are refreshed to this commit. The restored archive may carry a
          // different commit's source (e.g. a reused install cache), so this is
-@@ -71,7 +101,7 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -70,8 +100,9 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+         });
        }
  
++      await assertRunActive(this.env.BACKUP_BUCKET, input.sourceSha);
        const proc = await sandbox.startProcess(
 -        `(${input.command}) > ${STDOUT_FILE} 2> ${STDERR_FILE}`,
 +        captureCommand(input.command),
          {
            cwd: resolveCwd(input.cwd),
            env: {
-@@ -81,61 +111,435 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -81,61 +112,449 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
            autoCleanup: false,
          }
        );
@@ -362,6 +364,7 @@ index a7f6c05..4d25b1c 100644
 +        await terminateTimedOutProcess(sandbox, proc);
 +        exitCode = 124;
 +      }
++      await assertRunActive(this.env.BACKUP_BUCKET, input.sourceSha);
        const preview = await readPreviews(sandbox);
 +      const logMetadata = await readLogMetadataPair(sandbox);
 +      const persistedLogsPromise = persistLogs(
@@ -397,6 +400,7 @@ index a7f6c05..4d25b1c 100644
 +          persistedLogs,
 +          timedOut
 +        );
++        await assertRunActive(this.env.BACKUP_BUCKET, input.sourceSha);
 +        return {
 +          exitCode,
 +          logs: preview,
@@ -428,6 +432,7 @@ index a7f6c05..4d25b1c 100644
 +            })
 +          : Promise.resolve(undefined),
 +      ]);
++      await assertRunActive(this.env.BACKUP_BUCKET, input.sourceSha);
 +      const persistedLogs = fulfilled(finalized[0]);
 +      const outputs = fulfilled(finalized[1]);
 +      const snapshot = fulfilled(finalized[2]);
@@ -459,10 +464,10 @@ index a7f6c05..4d25b1c 100644
 +      // control route can retry the exact Sandbox rather than leaking it.
 +      if (sandbox) await destroySandbox(sandbox);
 +      await this.env.BACKUP_BUCKET.delete(registryKey);
-     }
-   }
- }
- 
++    }
++  }
++}
++
 +async function registerActiveSandbox(
 +  bucket: R2Bucket,
 +  key: string,
@@ -488,13 +493,20 @@ index a7f6c05..4d25b1c 100644
 +        runnerId,
 +        registeredAt,
 +      },
-+    }
+     }
 +  );
 +}
 +
 +async function assertRunActive(bucket: R2Bucket, head: string) {
-+  if (await bucket.head(terminationMarkerKey(head))) {
-+    throw new Error(`CI run ${head} was terminated before Sandbox startup`);
++  const [terminated, failed] = await Promise.all([
++    bucket.head(terminationMarkerKey(head)),
++    bucket.head(failureMarkerKey(head)),
++  ]);
++  if (terminated) {
++    throw new Error(`CI run ${head} was terminated`);
++  }
++  if (failed) {
++    throw new Error(`CI run ${head} was stopped after a sibling gate failed`);
 +  }
 +}
 +
@@ -504,6 +516,10 @@ index a7f6c05..4d25b1c 100644
 +
 +function terminationMarkerKey(head: string) {
 +  return `runs/${head}/control/terminated.json`;
++}
++
++function failureMarkerKey(head: string) {
++  return `runs/${head}/control/failed.json`;
 +}
 +
 +async function restoreSnapshot(
@@ -632,8 +648,9 @@ index a7f6c05..4d25b1c 100644
 +    posix.normalize(path) !== path
 +  ) {
 +    throw new Error(`Invalid CI ${kind} path: ${path}`);
-+  }
-+}
+   }
+ }
+-
 +
 +function checksumHex(buffer: ArrayBuffer) {
 +  return [...new Uint8Array(buffer)]
@@ -819,7 +836,7 @@ index a7f6c05..4d25b1c 100644
  async function readLogs(sandbox: ReturnType<typeof getSandbox>) {
    const listing = await sandbox.listFiles('/tmp');
    const sizes = new Map(
-@@ -153,7 +557,7 @@ async function readLog(
+@@ -153,7 +572,7 @@ async function readLog(
    size: number
  ): Promise<string | ReadableStream<Uint8Array>> {
    if (size > INLINE_LOG_BYTES) {
@@ -828,7 +845,7 @@ index a7f6c05..4d25b1c 100644
    }
    return (await sandbox.readFile(file, { encoding: 'utf-8' })).content;
  }
-@@ -192,51 +596,22 @@ function resolveCwd(cwd: string | undefined) {
+@@ -192,51 +611,22 @@ function resolveCwd(cwd: string | undefined) {
    return posix.join(WORKSPACE_DIR, normalized);
  }
  
@@ -1028,6 +1045,60 @@ index a0ac164..26084bc 100644
  }
  
  function assertPositiveFinite(
+diff --git a/node_modules/@cloudflare/ci/src/pipeline/runner-group.ts b/node_modules/@cloudflare/ci/src/pipeline/runner-group.ts
+index 5246f0c..edbcda5 100644
+--- a/node_modules/@cloudflare/ci/src/pipeline/runner-group.ts
++++ b/node_modules/@cloudflare/ci/src/pipeline/runner-group.ts
+@@ -8,11 +8,10 @@ type RunnerInvocation = Pick<RunnerOptions, 'name' | 'command' | 'cwd'>;
+-
++
+ /**
+  * Tracks concurrent and chained runners in one pipeline run.
+- * After a failure, it waits for active runners and reports the earliest-started
+- * failed runner with diagnostics for every failure that completed.
++ * A failure is reported immediately so the owning pipeline can cancel active
++ * Sandboxes instead of letting known-doomed sibling work finish.
+  */
+ export class RunnerGroup {
+-  private readonly active = new Set<Promise<CiRunnerResult>>();
+   private readonly failures: CiRunnerFailure[] = [];
+   private readonly invocations: RunnerInvocation[] = [];
+   private nextOrder = 0;
+@@ -37,30 +36,10 @@ export class RunnerGroup {
+       throw failure;
+     });
+-
++
+-    this.active.add(execution);
+-    const remove = () => {
+-      this.active.delete(execution);
+-    };
+-    // Unlike finally(), handling both outcomes consumes the rejection instead
+-    // of creating an ignored rejected promise. `void` marks cleanup as detached.
+-    void execution.then(remove, remove);
+-    return execution.catch((requestedFailure: CiRunnerFailure) =>
+-      this.settle(requestedFailure)
+-    );
++    return execution.catch((failure: CiRunnerFailure) => this.fail(failure));
+   }
+-
++
+-  private async settle(requestedFailure: CiRunnerFailure): Promise<never> {
+-    while (this.active.size > 0) {
+-      // Runners can chain another runner while the current active set settles.
+-      // eslint-disable-next-line no-await-in-loop
+-      await Promise.allSettled([...this.active]);
+-    }
+-
+-    const failure = this.failures.reduce(
+-      (first, candidate) => (candidate.order < first.order ? candidate : first),
+-      requestedFailure
+-    );
+-
++  private fail(failure: CiRunnerFailure): never {
+     failure.diagnostics = {
+       failures: [...this.failures]
+         .sort((left, right) => left.order - right.order)
 diff --git a/node_modules/@cloudflare/ci/src/pipeline/types.ts b/node_modules/@cloudflare/ci/src/pipeline/types.ts
 index a1f5ff3..8ac5e6d 100644
 --- a/node_modules/@cloudflare/ci/src/pipeline/types.ts

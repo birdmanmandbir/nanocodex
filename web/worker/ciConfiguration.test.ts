@@ -91,10 +91,14 @@ test("the local CI command enables container execution on the public runner orig
 });
 
 test("terminal gates skip snapshots and publish the website artifact in-place", async () => {
-  const [workflow, sandboxRunner, cache] = await Promise.all([
+  const [workflow, sandboxRunner, runnerGroup, cache] = await Promise.all([
     readFile(new URL("./ciWorkflow.ts", import.meta.url), "utf8"),
     readFile(
       new URL("../node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts", import.meta.url),
+      "utf8",
+    ),
+    readFile(
+      new URL("../node_modules/@cloudflare/ci/src/pipeline/runner-group.ts", import.meta.url),
       "utf8",
     ),
     readFile(
@@ -135,6 +139,11 @@ test("terminal gates skip snapshots and publish the website artifact in-place", 
   assert.match(sandboxRunner, /await assertRunActive\(this\.env\.BACKUP_BUCKET, input\.sourceSha\)/);
   assert.match(sandboxRunner, /runs\/\$\{head\}\/sandboxes\/\$\{runnerId\}\.json/);
   assert.match(sandboxRunner, /runs\/\$\{head\}\/control\/terminated\.json/);
+  assert.match(sandboxRunner, /runs\/\$\{head\}\/control\/failed\.json/);
+  assert.ok(
+    (sandboxRunner.match(/await assertRunActive\(/g) ?? []).length >= 4,
+    "long Sandbox phases recheck the run tombstone before continuing",
+  );
   assert.ok(
     sandboxRunner.indexOf("if (sandbox) await destroySandbox(sandbox)") <
       sandboxRunner.indexOf("await this.env.BACKUP_BUCKET.delete(registryKey)"),
@@ -143,10 +152,13 @@ test("terminal gates skip snapshots and publish the website artifact in-place", 
   assert.match(cache, /localBucket: z\.boolean\(\)\.optional\(\)/);
   assert.match(cache, /localBucket: input\.snapshot\.localBucket/);
   assert.match(cache, /env\.ENVIRONMENT === 'development'/);
+  assert.match(workflow, /CARGO_BUILD_JOBS: "4"/);
+  assert.match(workflow, /RUST_TEST_THREADS: "4"/);
+  assert.doesNotMatch(runnerGroup, /await Promise\.allSettled/);
   const saturationBarrier = workflow.indexOf(
-    "await allSettledOrThrow([\n        cargoPersistence,",
+    "await Promise.all([\n        cargoPersistence,",
   );
-  const pythonBarrier = workflow.indexOf("await allSettledOrThrow(runPythonJobs());");
+  const pythonBarrier = workflow.indexOf("await Promise.all(runPythonJobs());");
   assert.ok(
     saturationBarrier >= 0,
     "compile-heavy gates have an explicit phase barrier",
