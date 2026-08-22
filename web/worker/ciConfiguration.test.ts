@@ -116,6 +116,10 @@ test("artifact gates stream outputs while quality and Python retain reusable sna
   );
   assert.match(
     workflow,
+    /job\.name === "static VM guest"[\s\S]*?command: cleanupAfter\(job\.command\)[\s\S]*?rustQualityCacheInputs\(\)/,
+  );
+  assert.match(
+    workflow,
     /name,[\s\S]*?cache: \{ inputs: pythonCacheInputs\(\) \},[\s\S]*?runnerConfig\(40 \* 60 \* 1_000, 30 \* 24 \* 60 \* 60\)/,
   );
   assert.match(workflow, /path: "\/workspace\/\.ci-output\/web-wasm\.tar"/);

@@ -307,7 +307,16 @@ export class NanocodexCI extends CIWorkflow<
             name !== "MSRV workspace tests" &&
             name !== "quality",
         )
-        .map((job) => runRustJob(dependencies, job, false));
+        .map((job) =>
+          job.name === "static VM guest"
+            ? runRustJob(
+              dependencies,
+              { ...job, command: cleanupAfter(job.command) },
+              false,
+              rustQualityCacheInputs(),
+            )
+            : runRustJob(dependencies, job, false)
+        );
       const runPythonJobs = () =>
         (["3.11", "3.14"] as const).map(async (version) => {
           const name = `Python ${version}`;

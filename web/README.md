@@ -145,6 +145,8 @@ rustdoc graph; changed Rust input reruns the full gate and publishes a new
 30-day snapshot. Stable tests branch from that exact quality snapshot and start
 only after the compile-heavy saturation phase releases the host, so their
 wall-clock lifecycle assertions never compete with a Rust compiler. The
+static VM build uses the same exact Rust-input key for its compact successful
+result, avoiding an identical cross-target rebuild on website-only changes. The
 MSRV and JavaScript consumers follow, then both Python versions run together.
 Each Python gate is content-addressed by its complete Rust and Python consumer
 inputs plus the pinned runner image. A successful miss tests the installed
@@ -160,16 +162,17 @@ streams only its
 small tested WASM package to R2 and skips its otherwise multi-gigabyte workspace
 snapshot. The website starts from its site-only dependency snapshot, restores
 that checksum-verified WASM package, and streams its tested deployment tar
-straight back to R2. Deterministic quality and Python gates can reuse an exact
-successful result; source-sensitive Rust, MSRV, JavaScript, and website suites
-still execute. No correctness runner is retried; only network-backed dependency
-preparation gets one retry.
+straight back to R2. Deterministic quality, static-VM, and Python gates can reuse
+an exact successful result; source-sensitive Rust, MSRV, JavaScript, and website
+suites still execute. No correctness runner is retried; only network-backed
+dependency preparation gets one retry.
 Success and failure logs, step records, final results, required parent/cache
 snapshots, and cache pointers are retained in the
 `nanocodex-ci` R2 bucket; no separate hosted artifact product is required.
-Six terminal Rust, bindings, and website runners explicitly skip workspace
-snapshots. Quality retains the parent snapshot consumed by stable; each Python
-gate retains an empty workspace solely as its content-addressed success record.
+Five terminal Rust, bindings, and website runners explicitly skip workspace
+snapshots. Quality retains the parent snapshot consumed by stable; static VM and
+each Python gate retain an empty workspace solely as content-addressed success
+records.
 Immutable source archives live in the separately credentialed
 `nanocodex-ci-source` bucket.
 
