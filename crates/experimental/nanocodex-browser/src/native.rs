@@ -7615,8 +7615,8 @@ mod tests {
         BrowserConfig, Chromium, Diagnostics, GateSignals, MAX_ACTION_INPUT_BYTES,
         MAX_CONSOLE_ENTRIES, MAX_DIAGNOSTIC_TEXT_BYTES, MAX_NETWORK_REQUESTS, NetworkSource,
         allowed_cookie_params, build_config, classify_gate, close_chromium, cookie_param,
-        diagnostic_limit, isolated_launch_config, profile_launch_config, session_stopped,
-        trace_browser_configuration, validate_url,
+        diagnostic_limit, profile_launch_config, session_stopped, trace_browser_configuration,
+        validate_url,
     };
     use crate::{
         BraveSession, Browser, BrowserAction, BrowserActionResult, BrowserConsoleEntry,
@@ -7958,7 +7958,7 @@ mod tests {
         std::fs::set_permissions(&executable, permissions)?;
 
         let mut isolated = build_config(
-            isolated_launch_config(BrowserConfig::builder())
+            super::isolated_launch_config(BrowserConfig::builder())
                 .chrome_executable(&executable)
                 .env(
                     "NANOCODEX_TEST_BROWSER_ARGS",
