@@ -74,7 +74,71 @@ test("generation-pinned commit patch pages bypass mutable publication state", as
   assert.equal(requestedKey, `generations/${head}/commit-patches/0002.diff`);
   assert.equal(response?.headers.get("x-repository-generation"), head);
   assert.equal(response?.headers.get("cache-control"), "public, max-age=31536000, immutable");
-  assert.equal(response?.headers.get("content-type"), "text/x-diff; charset=utf-8");
+  assert.equal(response?.headers.get("content-type"), "text/plain; charset=utf-8");
+});
+
+test("patch text bypasses cached legacy representations without changing its public URL", async () => {
+  const originalCaches = Object.getOwnPropertyDescriptor(globalThis, "caches");
+  const cached = new Map<string, Response>([[
+    `https://nanocodex.example/api/repository/commits/${head}/0002.diff`,
+    new Response("legacy", { headers: { "content-type": "text/x-diff" } }),
+  ]]);
+  Object.defineProperty(globalThis, "caches", {
+    configurable: true,
+    value: {
+      default: {
+        match: async (request: Request) => cached.get(request.url)?.clone(),
+        put: async (request: Request, response: Response) => {
+          cached.set(request.url, response.clone());
+        },
+      },
+    },
+  });
+  let objectReads = 0;
+  const bucket = {
+    get: async () => {
+      objectReads += 1;
+      return {
+        body: new Response("current").body,
+        httpEtag: '"patch-page"',
+        writeHttpMetadata: () => {},
+      };
+    },
+  } as unknown as R2Bucket;
+  const pending: Promise<unknown>[] = [];
+  const context = {
+    waitUntil: (promise: Promise<unknown>) => pending.push(promise),
+  } as unknown as ExecutionContext;
+  const request = new Request(
+    `https://nanocodex.example/api/repository/commits/${head}/0002.diff`,
+  );
+
+  try {
+    const first = await handleGitRequest(
+      request,
+      { GIT_OBJECTS: bucket },
+      new URL(request.url),
+      context,
+    );
+    assert.equal(await first?.text(), "current");
+    assert.equal(first?.headers.get("content-type"), "text/plain; charset=utf-8");
+    await Promise.all(pending);
+    assert.ok(cached.has(`${request.url}?__nanocodex_patch=text`));
+
+    const second = await handleGitRequest(
+      request,
+      { GIT_OBJECTS: bucket },
+      new URL(request.url),
+      context,
+    );
+    assert.equal(await second?.text(), "current");
+    assert.equal(objectReads, 1);
+  } finally {
+    Object.defineProperty(globalThis, "caches", originalCaches ?? {
+      configurable: true,
+      value: undefined,
+    });
+  }
 });
 
 test("generation-pinned aggregate commit patches stream immutable R2 bodies without mutable state", async () => {
@@ -140,7 +204,7 @@ test("generation-pinned aggregate commit patches stream immutable R2 bodies with
   assert.equal(response?.status, 200);
   assert.equal(response?.headers.get("x-repository-generation"), head);
   assert.equal(response?.headers.get("cache-control"), "public, max-age=31536000, immutable");
-  assert.equal(response?.headers.get("content-type"), "text/x-diff; charset=utf-8");
+  assert.equal(response?.headers.get("content-type"), "text/plain; charset=utf-8");
   assert.equal(response?.headers.get("content-length"), String(publication.commitPatchSize));
   const body = new Uint8Array(await response!.arrayBuffer());
   assert.equal(manifestReads, 1);
