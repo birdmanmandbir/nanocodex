@@ -116,8 +116,16 @@ test("terminal gates skip snapshots and publish the website artifact in-place", 
     /transport: this\.env\.ENVIRONMENT === 'development' \? 'rpc' : 'http'/,
   );
   assert.match(workflow, /name: "Node and browser bindings"[\s\S]*?runnerConfig\(60 \* 60 \* 1_000, 24 \* 60 \* 60, 0, false\)/);
-  assert.match(workflow, /prepareDependencyLayer\(\s*dependencies,\s*"Bindings dependencies"/);
-  assert.match(workflow, /prepareDependencyLayer\(\s*ci,\s*"Website dependencies"/);
+  assert.match(workflow, /prepareCachedLayer\(\s*dependencies,\s*"Bindings build cache"/);
+  assert.match(workflow, /prepareCachedLayer\(\s*ci,\s*"Website dependencies"/);
+  assert.match(
+    workflow,
+    /const webPreparation = \(async \(\) => \{[\s\S]*?bindingsBuildStatePromise[\s\S]*?websiteDependencyStatePromise[\s\S]*?return \{ bindingsBuildState, websiteDependencyState \};/,
+  );
+  assert.match(
+    workflow,
+    /const bindings = await bindingsBuildState\.result\.runner/,
+  );
   assert.match(workflow, /const website = await websiteDependencyState\.result\.runner/);
   assert.doesNotMatch(workflow, /const website = await bindings\.runner/);
   assert.match(workflow, /outputs\?\.\[0\]/);
@@ -179,8 +187,9 @@ test("terminal gates skip snapshots and publish the website artifact in-place", 
     "const saturationBarrier = Promise.all([",
   );
   const msrvExecution = workflow.indexOf(
-    "await runRustJob(msrvBuildCache, msrvJob, true);",
+    "runRustJob(msrvBuildCache, msrvJob, true),",
   );
+  const webExecution = workflow.indexOf("runWebJob(),");
   const pythonBarrier = workflow.indexOf("await Promise.all(runPythonJobs());");
   assert.ok(
     saturationBarrier >= 0,
@@ -189,6 +198,10 @@ test("terminal gates skip snapshots and publish the website artifact in-place", 
   assert.ok(
     msrvExecution > saturationBarrier,
     "deadline-sensitive MSRV tests start only after compile-heavy gates release the host",
+  );
+  assert.ok(
+    webExecution > saturationBarrier,
+    "deadline-sensitive JavaScript tests start only after compile-heavy gates release the host",
   );
   assert.ok(
     pythonBarrier > msrvExecution,

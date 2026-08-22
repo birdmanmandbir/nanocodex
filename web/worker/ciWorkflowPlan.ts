@@ -48,6 +48,20 @@ const WEBSITE_JAVASCRIPT_PROJECTS = [
   "web",
 ];
 
+const BINDINGS_WASM_INPUTS = [
+  "scripts/build-js-package.sh",
+  "js/bindings/scripts/deduplicate-wasm.mjs",
+  "js/bindings/scripts/write-package-types.mjs",
+  "js/bindings/src/**/*",
+  "crates/nanocodex/src/**/*",
+  "crates/nanocodex-agent/src/**/*",
+  "crates/nanocodex-durability/src/**/*",
+  "crates/nanocodex-oai-api/src/**/*",
+  "crates/nanocodex-subagents/src/**/*",
+  "crates/nanocodex-tools/src/**/*",
+  "crates/experimental/nanocodex-voice-protocol/src/**/*",
+];
+
 export type RustSecAdvisoryBundle = {
   url: string;
   revision: string;
@@ -146,12 +160,13 @@ export function cargoDependencyCommand(
   ].join(" && ");
 }
 
-export function bindingsDependencyCacheInputs(): string[] {
+export function bindingsBuildCacheInputs(): string[] {
   return [
     ...cargoCacheInputs(),
     ...packageInputs(BINDINGS_JAVASCRIPT_PROJECTS),
     "**/.npmrc",
     ...lockfileInputs(BINDINGS_JAVASCRIPT_PROJECTS),
+    ...BINDINGS_WASM_INPUTS,
   ];
 }
 
@@ -178,38 +193,63 @@ export function msrvBuildCacheInputs(): string[] {
   return cargoCacheInputs();
 }
 
-export function bindingsDependencyCommand(): string {
-  return javascriptDependencyCommand(BINDINGS_JAVASCRIPT_PROJECTS, true);
+export function bindingsBuildCacheCommand(): string {
+  const retainedPaths = [
+    ...BINDINGS_JAVASCRIPT_PROJECTS.map((project) => `${project}/node_modules`),
+    "js/bindings/pkg-node",
+    "js/bindings/pkg-web",
+  ];
+  return [
+    javascriptInstallCommand(BINDINGS_JAVASCRIPT_PROJECTS),
+    "cargo clippy --locked --target wasm32-unknown-unknown --package nanocodex-oai-api --package nanocodex-tools --package nanocodex-agent --package nanocodex --package nanocodex-wasm -- -D warnings",
+    "./scripts/build-js-package.sh",
+    retainWorkspacePathsCommand(retainedPaths),
+  ].join(" && ");
 }
 
 export function websiteDependencyCommand(): string {
-  return javascriptDependencyCommand(WEBSITE_JAVASCRIPT_PROJECTS, false);
+  return [
+    javascriptInstallCommand(WEBSITE_JAVASCRIPT_PROJECTS),
+    retainNodeModulesCommand(WEBSITE_JAVASCRIPT_PROJECTS),
+  ].join(" && ");
 }
 
-function javascriptDependencyCommand(
+function javascriptInstallCommand(
   javascriptProjects: readonly string[],
-  retainCargo: boolean,
 ): string {
   const nodeModules = javascriptProjects.map(
     (project) => `${project}/node_modules`,
   );
-  const projects = javascriptProjects.map(shellQuote).join(" ");
-  const retainedCargo = retainCargo
-    ? " ! -name .cargo-home ! -name .cargo-target"
-    : "";
-  const retainNodeModules = [
-    "staging=/workspace/.node-modules-staging",
-    "rm -rf \"$staging\"",
-    `for project in ${projects}; do mkdir -p "$staging/$project"; mv "/workspace/$project/node_modules" "$staging/$project/node_modules"; done`,
-    `find /workspace -mindepth 1 -maxdepth 1${retainedCargo} ! -name .node-modules-staging -exec rm -rf -- {} +`,
-    `for project in ${projects}; do mkdir -p "/workspace/$project"; mv "$staging/$project/node_modules" "/workspace/$project/node_modules"; done`,
-    "rm -rf \"$staging\"",
-  ].join("; ");
   return [
     `printf '%s\\0' ${javascriptProjects.map(shellQuote).join(" ")} | xargs -0 -n 1 -P 4 sh -c 'npm ci --prefix "$1" || exit 255' sh`,
     `printf '%s\\0' ${nodeModules.map(shellQuote).join(" ")} | xargs -0 -n 1 test -d`,
-    `sh -eu -c ${shellQuote(retainNodeModules)}`,
   ].join(" && ");
+}
+
+function retainWorkspacePathsCommand(paths: readonly string[]): string {
+  const retained = paths.map(shellQuote).join(" ");
+  const script = [
+    "staging=/workspace/.ci-cache-staging",
+    "rm -rf \"$staging\"",
+    `for retained in ${retained}; do test -e "/workspace/$retained"; mkdir -p "$staging/$(dirname "$retained")"; mv "/workspace/$retained" "$staging/$retained"; done`,
+    "find /workspace -mindepth 1 -maxdepth 1 ! -name .ci-cache-staging -exec rm -rf -- {} +",
+    `for retained in ${retained}; do mkdir -p "/workspace/$(dirname "$retained")"; mv "$staging/$retained" "/workspace/$retained"; done`,
+    "rm -rf \"$staging\"",
+  ].join("; ");
+  return `sh -eu -c ${shellQuote(script)}`;
+}
+
+function retainNodeModulesCommand(projects: readonly string[]): string {
+  const projectList = projects.map(shellQuote).join(" ");
+  const script = [
+    "staging=/workspace/.node-modules-staging",
+    "rm -rf \"$staging\"",
+    `for project in ${projectList}; do mkdir -p "$staging/$project"; mv "/workspace/$project/node_modules" "$staging/$project/node_modules"; done`,
+    "find /workspace -mindepth 1 -maxdepth 1 ! -name .node-modules-staging -exec rm -rf -- {} +",
+    `for project in ${projectList}; do mkdir -p "/workspace/$project"; mv "$staging/$project/node_modules" "/workspace/$project/node_modules"; done`,
+    "rm -rf \"$staging\"",
+  ].join("; ");
+  return `sh -eu -c ${shellQuote(script)}`;
 }
 
 function packageInputs(projects: readonly string[]): string[] {
@@ -227,6 +267,7 @@ function shellQuote(value: string): string {
 export function rustBuildCacheCommand(): string {
   return rustCompilationCacheCommand(
     "cargo test --workspace --locked --no-run",
+    "cargo clean --workspace --locked",
     ".cargo-target",
   );
 }
@@ -234,17 +275,20 @@ export function rustBuildCacheCommand(): string {
 export function msrvBuildCacheCommand(): string {
   return rustCompilationCacheCommand(
     "cargo +1.97 test --workspace --locked --no-run",
+    "cargo +1.97 clean --workspace --locked",
     ".cargo-target-msrv",
   );
 }
 
 function rustCompilationCacheCommand(
   command: string,
+  cleanWorkspaceCommand: string,
   targetDirectory: string,
 ): string {
   return [
     `${sourceFingerprintCommand()} > /workspace/.rust-source-fingerprint`,
     command,
+    cleanWorkspaceCommand,
     `find /workspace -mindepth 1 -maxdepth 1 ! -name .cargo-home ! -name ${targetDirectory} ! -name .rust-source-fingerprint -exec rm -rf -- {} +`,
   ].join(" && ");
 }
@@ -265,27 +309,72 @@ function sourceFingerprintCommand(): string {
 
 export function bindingsCommand(): string {
   return [
-    "cargo clippy --locked --target wasm32-unknown-unknown --package nanocodex-oai-api --package nanocodex-tools --package nanocodex-agent --package nanocodex --package nanocodex-wasm -- -D warnings",
     "npm run build --prefix js/artifacts",
-    "./scripts/build-js-package.sh",
-    "node --test --test-timeout=15000 js/bindings/test/*.test.mjs",
-    "npm run test:performance --prefix js/bindings",
-    "npm run test:typecheck --prefix js/bindings",
-    "npm run check:package --prefix js/bindings",
-    "npm test --prefix js/artifacts",
-    "npm test --prefix js/react",
-    "node --test examples/browser-cdn/*.test.mjs",
-    "npm test --prefix examples/node",
-    "npm run check --prefix examples/rivet-actors",
-    "npm run check --prefix examples/cloudflare-workers",
-    "npm run check --prefix examples/vercel-workflows",
-    "npm test --prefix examples/react-vite",
-    "npm run build --prefix examples/react-vite",
+    parallelCommandGroups([
+      {
+        label: "bindings runtime",
+        command: [
+          "node --test --test-timeout=15000 js/bindings/test/*.test.mjs",
+          "npm run test:performance --prefix js/bindings",
+        ].join(" && "),
+      },
+      {
+        label: "bindings package",
+        command: [
+          "npm run test:typecheck --prefix js/bindings",
+          "npm run check:package --prefix js/bindings",
+          "node --test examples/browser-cdn/*.test.mjs",
+        ].join(" && "),
+      },
+      {
+        label: "JavaScript packages",
+        command: [
+          "npm test --prefix js/artifacts",
+          "npm test --prefix js/react",
+          "npm test --prefix examples/node",
+        ].join(" && "),
+      },
+      {
+        label: "JavaScript examples",
+        command: [
+          "npm run check --prefix examples/rivet-actors",
+          "npm run check --prefix examples/cloudflare-workers",
+          "npm run check --prefix examples/vercel-workflows",
+          "npm test --prefix examples/react-vite",
+          "npm run build --prefix examples/react-vite",
+        ].join(" && "),
+      },
+    ]),
     "mkdir -p /workspace/.ci-output",
     "tar -C /workspace/js/bindings/pkg-web -cf /workspace/.ci-output/web-wasm.tar .",
     "sha256sum /workspace/.ci-output/web-wasm.tar > /workspace/.ci-output/web-wasm.tar.sha256",
     "rm -rf /workspace/.cargo-home /workspace/.cargo-target",
   ].join(" && ");
+}
+
+function parallelCommandGroups(
+  groups: readonly { label: string; command: string }[],
+): string {
+  const launches = groups.map(({ label, command }, index) => [
+    "(",
+    "group_started=$(date +%s)",
+    `printf 'ci group start: %s\\n' ${shellQuote(label)}`,
+    command,
+    "group_status=$?",
+    `printf 'ci group finish: %s (%ss, exit %s)\\n' ${shellQuote(label)} \"$(( $(date +%s) - group_started ))\" \"$group_status\"`,
+    'exit "$group_status"',
+    `) & group_pid_${index}=$!`,
+  ].join("; "));
+  const waits = groups.map(
+    (_, index) => `wait \"$group_pid_${index}\" || group_failure=1`,
+  );
+  return `bash -c ${shellQuote([
+    "set -u",
+    ...launches,
+    "group_failure=0",
+    ...waits,
+    'exit "$group_failure"',
+  ].join("; "))}`;
 }
 
 export function websiteCommand(

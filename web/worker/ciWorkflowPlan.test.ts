@@ -17,8 +17,8 @@ import { test } from "node:test";
 
 import {
   bindingsCommand,
-  bindingsDependencyCacheInputs,
-  bindingsDependencyCommand,
+  bindingsBuildCacheCommand,
+  bindingsBuildCacheInputs,
   cargoCacheInputs,
   cargoDependencyCommand,
   msrvBuildCacheCommand,
@@ -52,6 +52,19 @@ const BINDINGS_PROJECTS = [
   "examples/react-vite",
 ];
 const WEBSITE_PROJECTS = ["js/bindings", "js/artifacts", "js/react", "web"];
+const BINDINGS_WASM_INPUTS = [
+  "scripts/build-js-package.sh",
+  "js/bindings/scripts/deduplicate-wasm.mjs",
+  "js/bindings/scripts/write-package-types.mjs",
+  "js/bindings/src/**/*",
+  "crates/nanocodex/src/**/*",
+  "crates/nanocodex-agent/src/**/*",
+  "crates/nanocodex-durability/src/**/*",
+  "crates/nanocodex-oai-api/src/**/*",
+  "crates/nanocodex-subagents/src/**/*",
+  "crates/nanocodex-tools/src/**/*",
+  "crates/experimental/nanocodex-voice-protocol/src/**/*",
+];
 
 test("the Cloudflare pipeline owns five deterministic Linux Rust gates", () => {
   const jobs = rustPipeline(RUSTSEC);
@@ -114,11 +127,12 @@ test("dependency and Rust compilation snapshots are content addressed", async ()
     ".cargo/config.toml",
     "web/ci/Dockerfile",
   ]);
-  assert.deepEqual(bindingsDependencyCacheInputs(), [
+  assert.deepEqual(bindingsBuildCacheInputs(), [
     ...cargoCacheInputs(),
     ...BINDINGS_PROJECTS.map((project) => `${project}/package.json`),
     "**/.npmrc",
     ...BINDINGS_PROJECTS.map((project) => `${project}/package-lock.json`),
+    ...BINDINGS_WASM_INPUTS,
   ]);
   assert.deepEqual(websiteDependencyCacheInputs(), [
     "web/ci/Dockerfile",
@@ -137,10 +151,11 @@ test("dependency and Rust compilation snapshots are content addressed", async ()
     rustBuildCacheInputs().every((path) => !path.includes("src") && !path.endsWith("**/*")),
     "workspace source changes reuse the compatible Cargo target layer",
   );
-  for (const command of [bindingsDependencyCommand(), websiteDependencyCommand()]) {
+  for (const command of [bindingsBuildCacheCommand(), websiteDependencyCommand()]) {
     assert.doesNotMatch(command, /\.node-modules\.tar|\btar\b/);
-    assert.match(command, /\.node-modules-staging/);
   }
+  assert.match(bindingsBuildCacheCommand(), /\.ci-cache-staging/);
+  assert.match(websiteDependencyCommand(), /\.node-modules-staging/);
   assert.match(rustBuildCacheCommand(), /cargo test --workspace --locked --no-run/);
   assert.match(
     msrvBuildCacheCommand(),
@@ -148,6 +163,8 @@ test("dependency and Rust compilation snapshots are content addressed", async ()
   );
   assert.match(rustBuildCacheCommand(), /! -name \.cargo-target/);
   assert.match(msrvBuildCacheCommand(), /! -name \.cargo-target-msrv/);
+  assert.match(rustBuildCacheCommand(), /cargo clean --workspace --locked/);
+  assert.match(msrvBuildCacheCommand(), /cargo \+1\.97 clean --workspace --locked/);
   assert.match(refreshSourceCommand("cargo test"), /-exec touch/);
   assert.match(refreshSourceCommand("cargo test"), /\.cargo-target-msrv -prune/);
 });
@@ -192,13 +209,24 @@ test("npm installs use four fail-fast workers before snapshot pruning", async ()
     );
     await chmod(npm, 0o755);
 
-    const [install, verify, retainNodeModules] = bindingsDependencyCommand().split(" && ");
+    const buildParts = bindingsBuildCacheCommand().split(" && ");
+    const install = buildParts[0];
+    const verify = buildParts[1];
+    const retainNodeModules = buildParts.at(-1);
     assert.ok(install);
     assert.ok(verify);
     assert.ok(retainNodeModules);
     assert.match(install, /xargs -0 -n 1 -P 4/);
     assert.match(install, /npm ci --prefix "\$1" \|\| exit 255/);
 
+    await Promise.all([
+      mkdir(resolve(directory, "js/bindings/pkg-node"), { recursive: true }),
+      mkdir(resolve(directory, "js/bindings/pkg-web"), { recursive: true }),
+    ]);
+    await Promise.all([
+      writeFile(resolve(directory, "js/bindings/pkg-node/nanocodex.js"), "node\n"),
+      writeFile(resolve(directory, "js/bindings/pkg-web/nanocodex.js"), "web\n"),
+    ]);
     const adaptedSnapshot = `${verify} && ${retainNodeModules}`.replaceAll(
       "/workspace",
       "$CI_TEST_WORKSPACE",
@@ -225,7 +253,7 @@ test("npm installs use four fail-fast workers before snapshot pruning", async ()
     assert.equal(Math.max(...concurrency), 4);
     assert.ok(concurrency.every((count) => count <= 4));
     await stat(resolve(directory, "js/bindings/node_modules/example/index.js"));
-    await assert.rejects(stat(resolve(directory, ".node-modules.tar")));
+    await assert.rejects(stat(resolve(directory, ".ci-cache-staging")));
 
     await rm(resolve(stateDirectory, "projects"));
     await rm(resolve(stateDirectory, "concurrency"));
@@ -253,7 +281,7 @@ test("npm installs use four fail-fast workers before snapshot pruning", async ()
       .trim()
       .split("\n");
     assert.ok(attempted.length < BINDINGS_PROJECTS.length);
-    await assert.rejects(stat(resolve(directory, ".node-modules.tar")));
+    await assert.rejects(stat(resolve(directory, ".ci-cache-staging")));
   } finally {
     await rm(directory, { recursive: true, force: true });
     await rm(harnessDirectory, { recursive: true, force: true });
@@ -261,12 +289,24 @@ test("npm installs use four fail-fast workers before snapshot pruning", async ()
 });
 
 test("bindings, website, and both Python versions preserve the GitHub CI gates", () => {
+  const bindingsBuild = bindingsBuildCacheCommand();
   const bindings = bindingsCommand();
-  assert.match(bindings, /wasm32-unknown-unknown/);
-  assert.match(bindings, /build-js-package\.sh/);
+  assert.match(bindingsBuild, /wasm32-unknown-unknown/);
+  assert.match(bindingsBuild, /build-js-package\.sh/);
   assert.match(bindings, /examples\/vercel-workflows/);
   assert.match(bindings, /examples\/react-vite/);
   assert.match(bindings, /web-wasm\.tar/);
+  assert.equal((bindings.match(/group_pid_\d+=\$!/g) ?? []).length, 4);
+  assert.equal((bindings.match(/wait "\$group_pid_\d+"/g) ?? []).length, 4);
+  assert.match(bindings, /ci group finish:/);
+  assert.ok(
+    bindings.indexOf("npm run build --prefix js/artifacts") <
+      bindings.indexOf("group_pid_0=$!"),
+  );
+  assert.ok(
+    bindings.indexOf('exit "$group_failure"') <
+      bindings.indexOf("web-wasm.tar"),
+  );
   const website = websiteCommand(
     "https://ci.example/api/ci/runs/0123456789012345678901234567890123456789/artifacts/web-wasm.tar",
     3_500_000,
@@ -287,7 +327,7 @@ test("bindings, website, and both Python versions preserve the GitHub CI gates",
   }
 });
 
-test("the bindings snapshot retains only its node_modules and Cargo roots", async () => {
+test("the bindings build snapshot retains generated WASM and node_modules only", async () => {
   const directory = await mkdtemp(resolve(tmpdir(), "nanocodex-ci-node-cache-"));
   try {
     await Promise.all(BINDINGS_PROJECTS.map((project) =>
@@ -295,14 +335,18 @@ test("the bindings snapshot retains only its node_modules and Cargo roots", asyn
     ));
     const packageDirectory = resolve(directory, "js/bindings/node_modules/example");
     await mkdir(packageDirectory, { recursive: true });
+    await mkdir(resolve(directory, "js/bindings/pkg-node"), { recursive: true });
+    await mkdir(resolve(directory, "js/bindings/pkg-web"), { recursive: true });
     await mkdir(resolve(directory, ".cargo-home"), { recursive: true });
     await mkdir(resolve(directory, ".cargo-target"), { recursive: true });
     await writeFile(resolve(packageDirectory, "index.js"), "export default 1;\n");
+    await writeFile(resolve(directory, "js/bindings/pkg-node/nanocodex.js"), "node\n");
+    await writeFile(resolve(directory, "js/bindings/pkg-web/nanocodex.js"), "web\n");
     await writeFile(resolve(directory, "js/bindings/source.js"), "remove me\n");
     await writeFile(resolve(directory, ".cargo-home/cache"), "cargo\n");
     await writeFile(resolve(directory, ".cargo-target/cache"), "target\n");
     await symlink("source.js", resolve(directory, "js/bindings/source-link"));
-    const [, , retainNodeModules] = bindingsDependencyCommand().split(" && ");
+    const retainNodeModules = bindingsBuildCacheCommand().split(" && ").at(-1);
     assert.ok(retainNodeModules);
     const command = retainNodeModules.replaceAll(
       "/workspace",
@@ -318,11 +362,19 @@ test("the bindings snapshot retains only its node_modules and Cargo roots", asyn
       await readFile(resolve(directory, "js/bindings/node_modules/example/index.js"), "utf8"),
       "export default 1;\n",
     );
-    assert.equal(await readFile(resolve(directory, ".cargo-home/cache"), "utf8"), "cargo\n");
-    assert.equal(await readFile(resolve(directory, ".cargo-target/cache"), "utf8"), "target\n");
+    assert.equal(
+      await readFile(resolve(directory, "js/bindings/pkg-node/nanocodex.js"), "utf8"),
+      "node\n",
+    );
+    assert.equal(
+      await readFile(resolve(directory, "js/bindings/pkg-web/nanocodex.js"), "utf8"),
+      "web\n",
+    );
+    await assert.rejects(stat(resolve(directory, ".cargo-home")));
+    await assert.rejects(stat(resolve(directory, ".cargo-target")));
     await assert.rejects(readFile(resolve(directory, "js/bindings/source.js"), "utf8"));
     await assert.rejects(stat(resolve(directory, "js/bindings/source-link")));
-    await assert.rejects(stat(resolve(directory, ".node-modules.tar")));
+    await assert.rejects(stat(resolve(directory, ".ci-cache-staging")));
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -439,7 +491,7 @@ test("every generated container command is valid Bash", () => {
       3_900_842,
       "a".repeat(64),
     ),
-    bindingsDependencyCommand(),
+    bindingsBuildCacheCommand(),
     websiteDependencyCommand(),
     rustBuildCacheCommand(),
     msrvBuildCacheCommand(),

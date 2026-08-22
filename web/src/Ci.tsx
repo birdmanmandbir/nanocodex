@@ -25,9 +25,9 @@ const gates = [
   ["python-3-11", "Python 3.11", "bindings and consumer tests"],
   ["python-3-14", "Python 3.14", "forward-runtime coverage"],
   [
-    "bindings-dependencies",
+    "bindings-build-cache",
     "Bindings cache",
-    "Cargo plus package-scoped JavaScript dependencies",
+    "generated WASM plus package-scoped JavaScript dependencies",
   ],
   ["website-dependencies", "Website cache", "site-only JavaScript dependencies"],
   ["node-and-browser-bindings", "Node and browser", "WASM and package suites"],

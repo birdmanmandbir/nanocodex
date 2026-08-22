@@ -22,8 +22,8 @@ import {
 } from "./ciSource.ts";
 import {
   bindingsCommand,
-  bindingsDependencyCacheInputs,
-  bindingsDependencyCommand,
+  bindingsBuildCacheCommand,
+  bindingsBuildCacheInputs,
   cargoCacheInputs,
   cargoDependencyCommand,
   msrvBuildCacheCommand,
@@ -88,7 +88,7 @@ const CI_GATE_NAMES = [
   "static VM guest",
   "Python 3.11",
   "Python 3.14",
-  "Bindings dependencies",
+  "Bindings build cache",
   "Website dependencies",
   "Node and browser bindings",
   "website",
@@ -301,9 +301,9 @@ export class NanocodexCI extends CIWorkflow<
           completed.push(summary);
           await progress.complete(name, summary);
         });
-      const prepareDependencyLayer = (
+      const prepareCachedLayer = (
         parent: CiContext | CiRunnerResult,
-        name: "Bindings dependencies" | "Website dependencies",
+        name: "Bindings build cache" | "Website dependencies",
         command: string,
         inputs: string[],
       ) => {
@@ -336,24 +336,35 @@ export class NanocodexCI extends CIWorkflow<
           return { result, persistence };
         });
       };
-      const webJob = (async () => {
-        const [bindingsDependencyState, websiteDependencyState] = await Promise.all([
-          prepareDependencyLayer(
-            dependencies,
-            "Bindings dependencies",
-            bindingsDependencyCommand(),
-            bindingsDependencyCacheInputs(),
-          ),
-          prepareDependencyLayer(
-            ci,
-            "Website dependencies",
-            websiteDependencyCommand(),
-            websiteDependencyCacheInputs(),
-          ),
+      const webPreparation = (async () => {
+        const bindingsBuildStatePromise = prepareCachedLayer(
+          dependencies,
+          "Bindings build cache",
+          bindingsBuildCacheCommand(),
+          bindingsBuildCacheInputs(),
+        );
+        const websiteDependencyStatePromise = prepareCachedLayer(
+          ci,
+          "Website dependencies",
+          websiteDependencyCommand(),
+          websiteDependencyCacheInputs(),
+        );
+        // Observe either independent cache preparation failure immediately;
+        // the saturation barrier below remains their lifecycle owner.
+        void bindingsBuildStatePromise.catch(() => undefined);
+        void websiteDependencyStatePromise.catch(() => undefined);
+        const [bindingsBuildState, websiteDependencyState] = await Promise.all([
+          bindingsBuildStatePromise,
+          websiteDependencyStatePromise,
         ]);
+        return { bindingsBuildState, websiteDependencyState };
+      })();
+      const runWebJob = async () => {
+        const { bindingsBuildState, websiteDependencyState } =
+          await webPreparation;
         const bindingsStartedAt = progress.start("Node and browser bindings");
         const wasmArtifactKey = `runs/${head}/artifacts/web-wasm.tar`;
-        const bindings = await bindingsDependencyState.result.runner({
+        const bindings = await bindingsBuildState.result.runner({
           name: "Node and browser bindings",
           command: cleanupAfter(bindingsCommand(), [".ci-output"]),
           env: COMMON_ENV,
@@ -426,7 +437,7 @@ export class NanocodexCI extends CIWorkflow<
           ),
         );
         await Promise.all([
-          bindingsDependencyState.persistence,
+          bindingsBuildState.persistence,
           websiteDependencyState.persistence,
           bindingsPersistence,
         ]);
@@ -438,22 +449,24 @@ export class NanocodexCI extends CIWorkflow<
         };
         completed.push(summary);
         await progress.complete("website", summary);
-      })();
+      };
       const saturationBarrier = Promise.all([
         cargoPersistence,
         buildCacheBranch,
         ...directRustJobs,
-        webJob,
+        webPreparation,
       ]);
       const [msrvBuildCache] = await Promise.all([
         msrvBuildCacheBranch,
         saturationBarrier,
       ]);
-      // Compilation can saturate the shared host; the VM lifecycle suite also
-      // contains real wall-clock deadlines. Compile its dedicated MSRV target
-      // in parallel, then execute only after every heavy sibling has released
-      // its allocation. Warm runs restore this target content-addressably.
-      await runRustJob(msrvBuildCache, msrvJob, true);
+      // Compilation can saturate the shared host. Build every reusable target
+      // and WASM package in parallel, then run the deadline-sensitive MSRV and
+      // JavaScript suites only after the heavy siblings release the host.
+      await Promise.all([
+        runRustJob(msrvBuildCache, msrvJob, true),
+        runWebJob(),
+      ]);
       // The binding gates contain wall-clock SLAs. Run both versions together,
       // but only after compile-heavy gates release their CPU allocations.
       await Promise.all(runPythonJobs());
