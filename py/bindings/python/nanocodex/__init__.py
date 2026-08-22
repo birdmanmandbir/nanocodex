@@ -1,7 +1,6 @@
 """Embedded Python bindings for the Nanocodex agents SDK."""
 
 from importlib import import_module
-from importlib.metadata import version as distribution_version
 from typing import TypedDict
 
 
@@ -16,10 +15,10 @@ _NATIVE_EXPORTS = frozenset(
     }
 )
 
-# Reading installed package metadata keeps `import nanocodex` cheap. The native
-# extension is loaded on the first agent API access and every export is cached
-# in this module, so normal `from nanocodex import Nanocodex` use is unchanged.
-__version__ = distribution_version("nanocodex")
+# This constant is release-checked against the workspace version. Keeping it in
+# the lightweight Python module avoids loading the native extension or scanning
+# distribution metadata merely to answer `nanocodex.__version__`.
+__version__ = "0.5.0"
 
 
 def __getattr__(name: str) -> object:

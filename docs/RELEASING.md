@@ -71,9 +71,10 @@ Then prepare a release pull request from the latest `master`:
 
 1. Choose a new semantic version and update `workspace.package.version` plus every
    `nanocodex*` entry in `workspace.dependencies` in `Cargo.toml`, and keep
-   `js/bindings/package.json` on that same version. Never reuse a version
-   already published to crates.io; the stable-API refactor after `0.2.0` is
-   source-breaking and therefore requires a new version.
+   `js/bindings/package.json` and the lightweight `__version__` constant in
+   `py/bindings/python/nanocodex/__init__.py` on that same version. Never reuse
+   a version already published to crates.io; the stable-API refactor after
+   `0.2.0` is source-breaking and therefore requires a new version.
 2. Run `cargo check --workspace` to refresh `Cargo.lock`.
 3. Generate the committed changelog after all intended feature commits are in
    the branch:
