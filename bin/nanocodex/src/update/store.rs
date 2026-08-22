@@ -97,11 +97,11 @@ enum EntryState {
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BridgeMutationPoint {
-    BeforeGuestWrite,
-    BeforeGuestCommit,
-    BeforeChecksumWrite,
-    BeforeChecksumCommit,
-    BeforeActivation,
+    GuestWrite,
+    GuestCommit,
+    ChecksumWrite,
+    ChecksumCommit,
+    Activation,
 }
 
 #[cfg(unix)]
@@ -161,18 +161,18 @@ impl VersionStore {
                 Some(&lock),
             )?);
             pinned.require_identity()?;
-            return Ok(LockedVersionStore {
-                store: VersionStore {
+            Ok(LockedVersionStore {
+                store: Self {
                     root: self.root.clone(),
                     pinned: Some(pinned),
                 },
                 _lock: lock,
-            });
+            })
         }
 
         #[cfg(not(unix))]
         Ok(LockedVersionStore {
-            store: VersionStore {
+            store: Self {
                 root: self.root.clone(),
             },
             _lock: lock,
@@ -319,7 +319,7 @@ impl VersionStore {
             else {
                 return Ok(false);
             };
-            return directory.locally_checksummed_entry(BINARY_NAME, CHECKSUM_FILE);
+            directory.locally_checksummed_entry(BINARY_NAME, CHECKSUM_FILE)
         }
 
         #[cfg(not(unix))]
@@ -513,14 +513,13 @@ impl VersionStore {
 
         hook(CoherentInstallMutationPoint::BeforePublish)?;
         pinned.require_identity()?;
-        if let Some(existing) = &existing {
-            if !existing.locally_checksummed_entry(BINARY_NAME, CHECKSUM_FILE)?
+        if let Some(existing) = &existing
+            && (!existing.locally_checksummed_entry(BINARY_NAME, CHECKSUM_FILE)?
                 || (vm_guest.is_some()
                     && !existing
-                        .locally_checksummed_entry(VM_GUEST_BINARY_NAME, VM_GUEST_CHECKSUM_FILE)?)
-            {
-                bail!("Nanocodex version {key} changed before it could be replaced");
-            }
+                        .locally_checksummed_entry(VM_GUEST_BINARY_NAME, VM_GUEST_CHECKSUM_FILE)?))
+        {
+            bail!("Nanocodex version {key} changed before it could be replaced");
         }
         let staged_exact = if let Some(vm_guest_sha256) = &vm_guest_sha256 {
             staging.matches_complete_bridge(&binary_sha256, vm_guest_sha256)?
@@ -560,7 +559,7 @@ impl VersionStore {
             else {
                 return Ok(false);
             };
-            return directory.matches_complete_bridge(binary_sha256, vm_guest_sha256);
+            directory.matches_complete_bridge(binary_sha256, vm_guest_sha256)
         }
 
         #[cfg(not(unix))]
@@ -646,10 +645,10 @@ impl VersionStore {
             }
             (EntryState::Exact, EntryState::Missing) => {}
             (EntryState::Missing, EntryState::Missing) => {
-                hook(BridgeMutationPoint::BeforeGuestWrite)?;
+                hook(BridgeMutationPoint::GuestWrite)?;
                 directory.require_identity_and_cli(binary_sha256, key)?;
                 directory.write_new_entry(VM_GUEST_BINARY_NAME, vm_guest, true, || {
-                    hook(BridgeMutationPoint::BeforeGuestCommit)?;
+                    hook(BridgeMutationPoint::GuestCommit)?;
                     directory.require_identity_and_cli(binary_sha256, key)
                 })?;
             }
@@ -665,7 +664,7 @@ impl VersionStore {
             }
         }
 
-        hook(BridgeMutationPoint::BeforeChecksumWrite)?;
+        hook(BridgeMutationPoint::ChecksumWrite)?;
         directory.require_identity_and_cli(binary_sha256, key)?;
         if directory.hash_entry_state(VM_GUEST_BINARY_NAME, vm_guest_sha256)? != EntryState::Exact {
             bail!(
@@ -677,7 +676,7 @@ impl VersionStore {
             format!("{vm_guest_sha256}\n").as_bytes(),
             false,
             || {
-                hook(BridgeMutationPoint::BeforeChecksumCommit)?;
+                hook(BridgeMutationPoint::ChecksumCommit)?;
                 directory.require_identity_and_cli(binary_sha256, key)?;
                 if directory.hash_entry_state(VM_GUEST_BINARY_NAME, vm_guest_sha256)?
                     != EntryState::Exact
@@ -741,7 +740,7 @@ impl VersionStore {
             bail!("Nanocodex bridge version {key} does not exactly match the release manifest");
         }
         self.activate_symlink_with_check(key, || {
-            hook(BridgeMutationPoint::BeforeActivation)?;
+            hook(BridgeMutationPoint::Activation)?;
             directory.require_complete_bridge(binary_sha256, vm_guest_sha256, key)
         })?;
         self.install_launcher()
@@ -805,11 +804,11 @@ impl VersionStore {
             else {
                 return Ok(false);
             };
-            return Ok(
+            Ok(
                 directory.locally_checksummed_entry(BINARY_NAME, CHECKSUM_FILE)?
                     && directory
                         .locally_checksummed_entry(VM_GUEST_BINARY_NAME, VM_GUEST_CHECKSUM_FILE)?,
-            );
+            )
         }
 
         #[cfg(not(unix))]
@@ -848,7 +847,7 @@ impl VersionStore {
             bail!("Nanocodex version {key} does not contain a coherent Linux VM guest");
         }
         self.activate_symlink_with_check(key, || {
-            hook(BridgeMutationPoint::BeforeActivation)?;
+            hook(BridgeMutationPoint::Activation)?;
             if !directory.locally_checksummed_with_vm_guest()? {
                 bail!("Nanocodex version {key} changed before it could be activated");
             }
@@ -1392,18 +1391,19 @@ impl PinnedVersionDirectory {
         let mut digest = Sha256::new();
         let mut buffer = [0_u8; 64 * 1024];
         let mut total = 0_u64;
-        let mut limited = (&mut file).take(MAX_CACHED_BINARY_BYTES + 1);
-        loop {
-            let read = limited
-                .read(&mut buffer)
-                .wrap_err_with(|| format!("failed to read {name} in {}", self.path.display()))?;
-            if read == 0 {
-                break;
+        {
+            let mut limited = (&mut file).take(MAX_CACHED_BINARY_BYTES + 1);
+            loop {
+                let read = limited.read(&mut buffer).wrap_err_with(|| {
+                    format!("failed to read {name} in {}", self.path.display())
+                })?;
+                if read == 0 {
+                    break;
+                }
+                total += read as u64;
+                digest.update(&buffer[..read]);
             }
-            total += read as u64;
-            digest.update(&buffer[..read]);
         }
-        drop(limited);
         let after = file
             .metadata()
             .wrap_err_with(|| format!("failed to recheck {name} in {}", self.path.display()))?;
@@ -2300,7 +2300,7 @@ mod tests {
 
         let error = store
             .activate_with_vm_guest_inner("candidate", |point| {
-                if point == BridgeMutationPoint::BeforeActivation {
+                if point == BridgeMutationPoint::Activation {
                     fs::remove_file(store.version_dir("candidate").join(VM_GUEST_CHECKSUM_FILE))?;
                 }
                 Ok(())
@@ -2597,7 +2597,7 @@ mod tests {
                 &cli_sha256,
                 &guest_sha256,
                 |point| {
-                    if point == BridgeMutationPoint::BeforeChecksumWrite {
+                    if point == BridgeMutationPoint::ChecksumWrite {
                         bail!("injected interruption before checksum");
                     }
                     Ok(())
@@ -2759,7 +2759,7 @@ mod tests {
                 &cli_sha256,
                 &guest_sha256,
                 |point| {
-                    if point == BridgeMutationPoint::BeforeGuestWrite {
+                    if point == BridgeMutationPoint::GuestWrite {
                         fs::remove_dir_all(store.version_dir(key)).unwrap();
                     }
                     Ok(())
@@ -2790,7 +2790,7 @@ mod tests {
                 &cli_sha256,
                 &guest_sha256,
                 |point| {
-                    if point == BridgeMutationPoint::BeforeGuestCommit {
+                    if point == BridgeMutationPoint::GuestCommit {
                         fs::rename(store.version_dir(key), &displaced).unwrap();
                         store.install(key, b"replacement cli").unwrap();
                     }
@@ -2838,7 +2838,7 @@ mod tests {
 
         let error = store
             .activate_bridge_with_vm_guest_inner(key, &cli_sha256, &guest_sha256, |point| {
-                if point == BridgeMutationPoint::BeforeActivation {
+                if point == BridgeMutationPoint::Activation {
                     fs::rename(store.version_dir(key), &displaced).unwrap();
                     store.install(key, b"replacement cli").unwrap();
                 }

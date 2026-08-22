@@ -194,29 +194,31 @@ impl Update {
         if let Some(path) = &self.path {
             return install_local_binary(path, &store, &previous);
         }
-        if self.pr.is_none() && !self.nightly && !self.force {
-            if let Some(requested) = &self.version {
-                let key = requested.to_string();
-                let is_self_bridge =
-                    running_self_bridge_requires_manifest(&key, &manager_key, requested);
-                // The running bridge is accepted only against raw hashes from the
-                // immutable manifest, which is not available on this shortcut.
-                if !is_self_bridge {
-                    let cached = if stable_version_requires_vm_guest(requested) {
-                        store.is_cached_with_vm_guest(&key)?
+        if self.pr.is_none()
+            && !self.nightly
+            && !self.force
+            && let Some(requested) = &self.version
+        {
+            let key = requested.to_string();
+            let is_self_bridge =
+                running_self_bridge_requires_manifest(&key, &manager_key, requested);
+            // The running bridge is accepted only against raw hashes from the
+            // immutable manifest, which is not available on this shortcut.
+            if !is_self_bridge {
+                let cached = if stable_version_requires_vm_guest(requested) {
+                    store.is_cached_with_vm_guest(&key)?
+                } else {
+                    store.is_cached(&key)?
+                };
+                if cached {
+                    if stable_version_requires_vm_guest(requested) {
+                        store.activate_with_vm_guest(&key)?;
                     } else {
-                        store.is_cached(&key)?
-                    };
-                    if cached {
-                        if stable_version_requires_vm_guest(requested) {
-                            store.activate_with_vm_guest(&key)?;
-                        } else {
-                            store.activate(&key)?;
-                        }
-                        maybe_promote_manager(&store, &key, requested, &manager_version)?;
-                        report_activation(&previous, &key, false);
-                        return Ok(());
+                        store.activate(&key)?;
                     }
+                    maybe_promote_manager(&store, &key, requested, &manager_version)?;
+                    report_activation(&previous, &key, false);
+                    return Ok(());
                 }
             }
         }
@@ -303,10 +305,14 @@ impl Update {
                 store,
                 &key,
                 manager_key,
-                &contents,
-                &guest_contents,
-                &binary_raw.sha256,
-                &guest_raw.sha256,
+                UnpackedReleaseAsset {
+                    contents: &contents,
+                    raw_sha256: &binary_raw.sha256,
+                },
+                UnpackedReleaseAsset {
+                    contents: &guest_contents,
+                    raw_sha256: &guest_raw.sha256,
+                },
                 self.force,
             )?;
         } else {
@@ -409,24 +415,32 @@ fn activate_stable_version(
     }
 }
 
+struct UnpackedReleaseAsset<'a> {
+    contents: &'a [u8],
+    raw_sha256: &'a str,
+}
+
 fn install_stable_with_vm_guest(
     store: &VersionStore,
     key: &str,
     manager_key: &str,
-    binary: &[u8],
-    vm_guest: &[u8],
-    binary_sha256: &str,
-    vm_guest_sha256: &str,
+    binary: UnpackedReleaseAsset<'_>,
+    vm_guest: UnpackedReleaseAsset<'_>,
     force: bool,
 ) -> Result<()> {
     if key == manager_key {
-        store.install_bridge_with_vm_guest(key, binary, vm_guest, binary_sha256, vm_guest_sha256)
+        return store.install_bridge_with_vm_guest(
+            key,
+            binary.contents,
+            vm_guest.contents,
+            binary.raw_sha256,
+            vm_guest.raw_sha256,
+        );
+    }
+    if force {
+        store.reinstall_with_vm_guest(key, binary.contents, vm_guest.contents)
     } else {
-        if force {
-            store.reinstall_with_vm_guest(key, binary, vm_guest)
-        } else {
-            store.install_with_vm_guest(key, binary, vm_guest)
-        }
+        store.install_with_vm_guest(key, binary.contents, vm_guest.contents)
     }
 }
 
@@ -1538,10 +1552,14 @@ mod tests {
             &store,
             &bridge_key,
             &bridge_key,
-            b"bridge cli",
-            b"bridge guest",
-            &hex::encode(Sha256::digest(b"bridge cli")),
-            &hex::encode(Sha256::digest(b"bridge guest")),
+            UnpackedReleaseAsset {
+                contents: b"bridge cli",
+                raw_sha256: &hex::encode(Sha256::digest(b"bridge cli")),
+            },
+            UnpackedReleaseAsset {
+                contents: b"bridge guest",
+                raw_sha256: &hex::encode(Sha256::digest(b"bridge guest")),
+            },
             false,
         )
         .unwrap();
@@ -1554,10 +1572,14 @@ mod tests {
             &store,
             &later_key,
             &bridge_key,
-            b"later cli",
-            b"later guest",
-            &hex::encode(Sha256::digest(b"later cli")),
-            &hex::encode(Sha256::digest(b"later guest")),
+            UnpackedReleaseAsset {
+                contents: b"later cli",
+                raw_sha256: &hex::encode(Sha256::digest(b"later cli")),
+            },
+            UnpackedReleaseAsset {
+                contents: b"later guest",
+                raw_sha256: &hex::encode(Sha256::digest(b"later guest")),
+            },
             false,
         )
         .unwrap_err();
