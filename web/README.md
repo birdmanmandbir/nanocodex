@@ -124,20 +124,25 @@ Each Workflow checks out its immutable commit archive rather than resolving the
 latest source head. A Cargo cache is keyed by the exact workspace manifest
 graph; a second combined cache is keyed by those manifests plus the exact npm
 project manifests, lockfiles, and patch-package inputs and retains Cargo sources
-plus only the twelve declared project-root `node_modules` trees. Git-sourced
+plus only the nine declared project-root `node_modules` trees. Git-sourced
 Cargo packages are restored from an immutable,
 checksum-verified R2 bundle keyed by the committed `Cargo.lock` blob before
 `cargo fetch`; a cold runner never clones those dependencies from GitHub.
-After the shared Cargo download cache, the MSRV, policy, VM, Python, npm, and
+After the shared Cargo download cache, the MSRV, policy, VM, npm, and
 stable-build-snapshot branches start concurrently. The native target snapshot
-is never reused across commits because build scripts and proc macros make it
-executable state; stable tests and quality reuse it only within the same run
-while the other branches continue, reaching
-up to eight-way `standard-4` fanout; ten container slots leave room for parent
-runners that are still draining logs. The bindings gate streams only its small
-tested WASM package to R2 and skips its otherwise multi-gigabyte workspace
-snapshot. The website starts from the retained dependency snapshot, restores
-that checksum-verified WASM package, and streams its tested deployment tar
+is keyed by the exact Cargo graph and runner image rather than workspace source.
+It retains only Cargo homes, target output, and the fingerprint of the source
+that produced it. Every consumer overlays the immutable current source and
+touches all Rust inputs when that fingerprint changes, so Cargo reuses compatible
+dependency output while rebuilding every affected crate, build script, and proc
+macro. Stable tests and quality branch from that reusable target while the other
+heavy gates continue, reaching up to five-way `standard-4` fanout. The two Python
+versions then run together after those compile-heavy branches release the host,
+keeping their wall-clock performance gates meaningful. Ten container slots leave
+room for parent runners that are still draining logs. The bindings gate streams
+only its small tested WASM package to R2 and skips its otherwise multi-gigabyte
+workspace snapshot. The website starts from the retained dependency snapshot,
+restores that checksum-verified WASM package, and streams its tested deployment tar
 straight back to R2. Correctness runners are not skipped by cache or retried;
 only network-backed dependency preparation gets one retry.
 Success and failure logs, step records, final results, required parent/cache
@@ -147,6 +152,12 @@ All nine terminal Rust, Python, bindings, and website runners explicitly skip
 workspace snapshots.
 Immutable source archives live in the separately credentialed
 `nanocodex-ci-source` bucket.
+
+Every Sandbox registers its exact runner ID under the run before container work
+starts. An authenticated termination first writes a run tombstone, terminates the
+Workflow, then retries teardown for every registered Sandbox; a runner that races
+with termination observes the tombstone before startup, and a failed teardown
+retains its marker for a safe operator retry.
 
 Runner output is captured through a bounded 32 MiB head plus 32 MiB tail per
 stream. The step record includes observed/stored byte counts and a truncation
