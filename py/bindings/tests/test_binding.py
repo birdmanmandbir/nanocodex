@@ -1,4 +1,6 @@
 import os
+import subprocess
+import sys
 import unittest
 
 from nanocodex import (
@@ -17,6 +19,21 @@ def drain(events: object) -> None:
 
 
 class BindingTests(unittest.TestCase):
+    def test_package_import_defers_the_native_extension(self) -> None:
+        subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                "import sys; import nanocodex; "
+                "assert 'nanocodex._native' not in sys.modules; "
+                "assert nanocodex.__version__; "
+                "assert nanocodex.Nanocodex; "
+                "assert 'nanocodex._native' in sys.modules",
+            ],
+            check=True,
+        )
+
     def test_constructs_owned_handle_and_event_stream_without_exposing_secret(
         self,
     ) -> None:
