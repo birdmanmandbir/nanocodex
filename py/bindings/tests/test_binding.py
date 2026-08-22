@@ -26,8 +26,11 @@ class BindingTests(unittest.TestCase):
                 "-I",
                 "-c",
                 "import sys; import nanocodex; "
-                "assert 'nanocodex._native' not in sys.modules; "
+                "assert not {'nanocodex._native', 'nanocodex._types'} & sys.modules.keys(); "
                 "assert nanocodex.__version__; "
+                "assert nanocodex.Usage; "
+                "assert 'nanocodex._types' in sys.modules; "
+                "assert 'nanocodex._native' not in sys.modules; "
                 "assert nanocodex.Nanocodex; "
                 "assert 'nanocodex._native' in sys.modules",
             ],
