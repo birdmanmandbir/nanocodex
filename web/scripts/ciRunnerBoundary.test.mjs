@@ -11,12 +11,17 @@ const capture = fileURLToPath(new URL("../ci/log-capture.py", import.meta.url));
 
 test("CI runner finalizes bounded logs when its command times out", async () => {
   const directory = await mkdtemp(join(tmpdir(), "nanocodex-ci-timeout-"));
+  const ready = join(directory, "command-ready");
   try {
-    const child = spawn("bash", [runner, "printf 'early diagnostic\\n'; sleep 30"], {
+    const child = spawn("bash", [
+      runner,
+      "printf 'early diagnostic\\n'; printf 'ready\\n' > \"$NANOCODEX_CI_TEST_READY\"; sleep 30",
+    ], {
       env: {
         ...process.env,
         NANOCODEX_CI_LOG_DIR: directory,
         NANOCODEX_CI_LOG_CAPTURE: capture,
+        NANOCODEX_CI_TEST_READY: ready,
       },
       stdio: "ignore",
     });
@@ -28,7 +33,7 @@ test("CI runner finalizes bounded logs when its command times out", async () => 
         resolve(code);
       });
     });
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await waitForContent(ready, "ready\n");
     assert.equal(child.kill("SIGTERM"), true);
     const exitCode = await closed;
     assert.equal(exitCode, 124);
@@ -41,3 +46,12 @@ test("CI runner finalizes bounded logs when its command times out", async () => 
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+async function waitForContent(path, expected) {
+  const deadline = Date.now() + 5_000;
+  for (;;) {
+    if (await readFile(path, "utf8").catch(() => undefined) === expected) return;
+    if (Date.now() >= deadline) throw new Error("CI child did not become ready");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
