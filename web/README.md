@@ -137,15 +137,14 @@ It retains only Cargo homes, target output, and the fingerprint of the source
 that produced it. Every consumer overlays the immutable current source and
 touches all Rust inputs when that fingerprint changes, so Cargo reuses compatible
 dependency output while rebuilding every affected crate, build script, and proc
-macro. Stable tests and quality branch from that reusable target while the other
-heavy gates continue, reaching up to five-way `standard-4` fanout. Cargo and
-libtest are explicitly capped at those four CPUs, so a local Containers emulator
-cannot oversubscribe each runner to every host core. The cold MSRV gate uses one
-libtest thread so its deadline-sensitive VM lifecycle tests do not contend with
-sibling tests while cache snapshots drain. The two Python versions then
-run together after those compile-heavy branches release the host, keeping their
-wall-clock performance gates meaningful. Ten container slots leave room for
-parent runners that are still draining logs. The two JavaScript dependency
+macro. Quality branches from that reusable target and joins the compile-heavy
+saturation phase. Stable tests start only after that phase releases the host, so
+their wall-clock lifecycle assertions never compete with a Rust compiler. The
+MSRV and JavaScript consumers follow, then both Python versions run together.
+Cargo and libtest are explicitly capped at four CPUs, and the MSRV gate uses one
+libtest thread, so a local Containers emulator cannot oversubscribe each runner
+to every host core. Ten container slots leave room for parent runners that are
+still draining logs. The two JavaScript dependency
 layers seed concurrently on a cold head and avoid restoring the former
 multi-gigabyte combined workspace into either consumer. The bindings gate
 streams only its
