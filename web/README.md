@@ -122,10 +122,12 @@ create acknowledgement cannot create a second logical run.
 
 Each Workflow checks out its immutable commit archive rather than resolving the
 latest source head. A Cargo cache is keyed by the exact workspace manifest
-graph; a second combined cache is keyed by those manifests plus the exact npm
-project manifests, lockfiles, and patch-package inputs and retains Cargo sources
-plus only the nine declared project-root `node_modules` trees. Git-sourced
-Cargo packages are restored from an immutable,
+graph. Bindings and website dependencies use separate content-addressed
+snapshots: the bindings layer retains Cargo sources plus only its eight declared
+project-root `node_modules` trees, while the website layer retains only the four
+linked-package and site dependency trees it actually consumes. Their keys
+include the exact relevant npm manifests, lockfiles, runner image, and
+patch-package inputs. Git-sourced Cargo packages are restored from an immutable,
 checksum-verified R2 bundle keyed by the committed `Cargo.lock` blob before
 `cargo fetch`; a cold runner never clones those dependencies from GitHub.
 After the shared Cargo download cache, the MSRV, policy, VM, npm, and
@@ -143,9 +145,12 @@ libtest thread so its deadline-sensitive VM lifecycle tests do not contend with
 sibling tests while cache snapshots drain. The two Python versions then
 run together after those compile-heavy branches release the host, keeping their
 wall-clock performance gates meaningful. Ten container slots leave room for
-parent runners that are still draining logs. The bindings gate streams only its
+parent runners that are still draining logs. The two JavaScript dependency
+layers seed concurrently on a cold head and avoid restoring the former
+multi-gigabyte combined workspace into either consumer. The bindings gate
+streams only its
 small tested WASM package to R2 and skips its otherwise multi-gigabyte workspace
-snapshot. The website starts from the retained dependency snapshot, restores
+snapshot. The website starts from its site-only dependency snapshot, restores
 that checksum-verified WASM package, and streams its tested deployment tar
 straight back to R2. Correctness runners are not skipped by cache or retried;
 only network-backed dependency preparation gets one retry.

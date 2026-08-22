@@ -17,10 +17,10 @@ import { test } from "node:test";
 
 import {
   bindingsCommand,
+  bindingsDependencyCacheInputs,
+  bindingsDependencyCommand,
   cargoCacheInputs,
   cargoDependencyCommand,
-  completeDependencyCacheInputs,
-  javascriptDependencyCommand,
   pythonCommand,
   refreshSourceCommand,
   rustBuildCacheInputs,
@@ -28,6 +28,8 @@ import {
   rustPipeline,
   rustSecPolicyCommand,
   websiteCommand,
+  websiteDependencyCacheInputs,
+  websiteDependencyCommand,
 } from "./ciWorkflowPlan.ts";
 
 const RUSTSEC = {
@@ -36,6 +38,18 @@ const RUSTSEC = {
   size: 1_368_315,
   sha256: "e".repeat(64),
 };
+
+const BINDINGS_PROJECTS = [
+  "js/bindings",
+  "js/artifacts",
+  "js/react",
+  "examples/node",
+  "examples/rivet-actors",
+  "examples/cloudflare-workers",
+  "examples/vercel-workflows",
+  "examples/react-vite",
+];
+const WEBSITE_PROJECTS = ["js/bindings", "js/artifacts", "js/react", "web"];
 
 test("the Cloudflare pipeline owns five deterministic Linux Rust gates", () => {
   const jobs = rustPipeline(RUSTSEC);
@@ -98,25 +112,20 @@ test("dependency and Rust compilation snapshots are content addressed", async ()
     ".cargo/config.toml",
     "web/ci/Dockerfile",
   ]);
-  const projects = [
-    "js/bindings",
-    "js/artifacts",
-    "js/react",
-    "web",
-    "examples/node",
-    "examples/rivet-actors",
-    "examples/cloudflare-workers",
-    "examples/vercel-workflows",
-    "examples/react-vite",
-  ];
-  assert.deepEqual(completeDependencyCacheInputs(), [
+  assert.deepEqual(bindingsDependencyCacheInputs(), [
     ...cargoCacheInputs(),
-    ...projects.map((project) => `${project}/package.json`),
+    ...BINDINGS_PROJECTS.map((project) => `${project}/package.json`),
     "**/.npmrc",
-    ...projects.map((project) => `${project}/package-lock.json`),
+    ...BINDINGS_PROJECTS.map((project) => `${project}/package-lock.json`),
+  ]);
+  assert.deepEqual(websiteDependencyCacheInputs(), [
+    "web/ci/Dockerfile",
+    ...WEBSITE_PROJECTS.map((project) => `${project}/package.json`),
+    "**/.npmrc",
+    ...WEBSITE_PROJECTS.map((project) => `${project}/package-lock.json`),
     "web/patches/**/*.patch",
   ]);
-  await Promise.all(projects.flatMap((project) => [
+  await Promise.all([...new Set([...BINDINGS_PROJECTS, ...WEBSITE_PROJECTS])].flatMap((project) => [
     stat(new URL(`../../${project}/package.json`, import.meta.url)),
     stat(new URL(`../../${project}/package-lock.json`, import.meta.url)),
   ]));
@@ -125,8 +134,10 @@ test("dependency and Rust compilation snapshots are content addressed", async ()
     rustBuildCacheInputs().every((path) => !path.includes("src") && !path.endsWith("**/*")),
     "workspace source changes reuse the compatible Cargo target layer",
   );
-  assert.doesNotMatch(javascriptDependencyCommand(), /\.node-modules\.tar|\btar\b/);
-  assert.match(javascriptDependencyCommand(), /\.node-modules-staging/);
+  for (const command of [bindingsDependencyCommand(), websiteDependencyCommand()]) {
+    assert.doesNotMatch(command, /\.node-modules\.tar|\btar\b/);
+    assert.match(command, /\.node-modules-staging/);
+  }
   assert.match(rustBuildCacheCommand(), /cargo test --workspace --locked --no-run/);
   assert.match(rustBuildCacheCommand(), /! -name \.cargo-target/);
   assert.match(refreshSourceCommand("cargo test"), /-exec touch/);
@@ -172,13 +183,12 @@ test("npm installs use four fail-fast workers before snapshot pruning", async ()
     );
     await chmod(npm, 0o755);
 
-    const [install, verify, retainNodeModules] = javascriptDependencyCommand().split(" && ");
+    const [install, verify, retainNodeModules] = bindingsDependencyCommand().split(" && ");
     assert.ok(install);
     assert.ok(verify);
     assert.ok(retainNodeModules);
     assert.match(install, /xargs -0 -n 1 -P 4/);
     assert.match(install, /npm ci --prefix "\$1" \|\| exit 255/);
-    assert.equal((install.match(/'[^']+'/g) ?? []).length, 11);
 
     const adaptedSnapshot = `${verify} && ${retainNodeModules}`.replaceAll(
       "/workspace",
@@ -198,7 +208,7 @@ test("npm installs use four fail-fast workers before snapshot pruning", async ()
     const projects = (await readFile(resolve(stateDirectory, "projects"), "utf8"))
       .trim()
       .split("\n");
-    assert.equal(projects.length, 9);
+    assert.deepEqual(projects.sort(), [...BINDINGS_PROJECTS].sort());
     const concurrency = (await readFile(resolve(stateDirectory, "concurrency"), "utf8"))
       .trim()
       .split("\n")
@@ -233,7 +243,7 @@ test("npm installs use four fail-fast workers before snapshot pruning", async ()
     const attempted = (await readFile(resolve(stateDirectory, "projects"), "utf8"))
       .trim()
       .split("\n");
-    assert.ok(attempted.length < 9);
+    assert.ok(attempted.length < BINDINGS_PROJECTS.length);
     await assert.rejects(stat(resolve(directory, ".node-modules.tar")));
   } finally {
     await rm(directory, { recursive: true, force: true });
@@ -268,15 +278,10 @@ test("bindings, website, and both Python versions preserve the GitHub CI gates",
   }
 });
 
-test("the dependency snapshot retains node_modules without duplicating an archive", async () => {
+test("the bindings snapshot retains only its node_modules and Cargo roots", async () => {
   const directory = await mkdtemp(resolve(tmpdir(), "nanocodex-ci-node-cache-"));
   try {
-    const projects = [
-      "js/bindings", "js/artifacts", "js/react", "web",
-      "examples/node", "examples/rivet-actors",
-      "examples/cloudflare-workers", "examples/vercel-workflows", "examples/react-vite",
-    ];
-    await Promise.all(projects.map((project) =>
+    await Promise.all(BINDINGS_PROJECTS.map((project) =>
       mkdir(resolve(directory, project, "node_modules"), { recursive: true })
     ));
     const packageDirectory = resolve(directory, "js/bindings/node_modules/example");
@@ -288,7 +293,7 @@ test("the dependency snapshot retains node_modules without duplicating an archiv
     await writeFile(resolve(directory, ".cargo-home/cache"), "cargo\n");
     await writeFile(resolve(directory, ".cargo-target/cache"), "target\n");
     await symlink("source.js", resolve(directory, "js/bindings/source-link"));
-    const [, , retainNodeModules] = javascriptDependencyCommand().split(" && ");
+    const [, , retainNodeModules] = bindingsDependencyCommand().split(" && ");
     assert.ok(retainNodeModules);
     const command = retainNodeModules.replaceAll(
       "/workspace",
@@ -309,6 +314,52 @@ test("the dependency snapshot retains node_modules without duplicating an archiv
     await assert.rejects(readFile(resolve(directory, "js/bindings/source.js"), "utf8"));
     await assert.rejects(stat(resolve(directory, "js/bindings/source-link")));
     await assert.rejects(stat(resolve(directory, ".node-modules.tar")));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("the website snapshot drops Cargo and unrelated package roots", async () => {
+  const directory = await mkdtemp(resolve(tmpdir(), "nanocodex-ci-web-cache-"));
+  try {
+    await Promise.all([
+      ...WEBSITE_PROJECTS.map((project) =>
+        mkdir(resolve(directory, project, "node_modules/example"), { recursive: true })
+      ),
+      mkdir(resolve(directory, ".cargo-home"), { recursive: true }),
+      mkdir(resolve(directory, ".cargo-target"), { recursive: true }),
+      mkdir(resolve(directory, "examples/node"), { recursive: true }),
+    ]);
+    await Promise.all([
+      writeFile(resolve(directory, "web/node_modules/example/index.js"), "site\n"),
+      writeFile(resolve(directory, "js/artifacts/node_modules/example/index.js"), "artifacts\n"),
+      writeFile(resolve(directory, ".cargo-home/cache"), "remove\n"),
+      writeFile(resolve(directory, ".cargo-target/cache"), "remove\n"),
+      writeFile(resolve(directory, "examples/node/source.js"), "remove\n"),
+    ]);
+    const [, , retainNodeModules] = websiteDependencyCommand().split(" && ");
+    assert.ok(retainNodeModules);
+    const command = retainNodeModules.replaceAll(
+      "/workspace",
+      "$CI_TEST_WORKSPACE",
+    );
+    const result = spawnSync("bash", ["-c", command], {
+      cwd: directory,
+      encoding: "utf8",
+      env: { ...process.env, CI_TEST_WORKSPACE: directory },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(
+      await readFile(resolve(directory, "web/node_modules/example/index.js"), "utf8"),
+      "site\n",
+    );
+    assert.equal(
+      await readFile(resolve(directory, "js/artifacts/node_modules/example/index.js"), "utf8"),
+      "artifacts\n",
+    );
+    await assert.rejects(stat(resolve(directory, ".cargo-home")));
+    await assert.rejects(stat(resolve(directory, ".cargo-target")));
+    await assert.rejects(stat(resolve(directory, "examples/node")));
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -379,7 +430,8 @@ test("every generated container command is valid Bash", () => {
       3_900_842,
       "a".repeat(64),
     ),
-    javascriptDependencyCommand(),
+    bindingsDependencyCommand(),
+    websiteDependencyCommand(),
     rustBuildCacheCommand(),
     refreshSourceCommand("cargo test"),
     bindingsCommand(),

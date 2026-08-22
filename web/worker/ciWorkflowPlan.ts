@@ -30,16 +30,22 @@ const RUST_WORKSPACE_MANIFESTS = [
   "py/bindings/Cargo.toml",
 ];
 
-const JAVASCRIPT_PROJECTS = [
+const BINDINGS_JAVASCRIPT_PROJECTS = [
   "js/bindings",
   "js/artifacts",
   "js/react",
-  "web",
   "examples/node",
   "examples/rivet-actors",
   "examples/cloudflare-workers",
   "examples/vercel-workflows",
   "examples/react-vite",
+];
+
+const WEBSITE_JAVASCRIPT_PROJECTS = [
+  "js/bindings",
+  "js/artifacts",
+  "js/react",
+  "web",
 ];
 
 export type RustSecAdvisoryBundle = {
@@ -140,12 +146,21 @@ export function cargoDependencyCommand(
   ].join(" && ");
 }
 
-export function completeDependencyCacheInputs(): string[] {
+export function bindingsDependencyCacheInputs(): string[] {
   return [
     ...cargoCacheInputs(),
-    ...JAVASCRIPT_PROJECTS.map((project) => `${project}/package.json`),
+    ...packageInputs(BINDINGS_JAVASCRIPT_PROJECTS),
     "**/.npmrc",
-    ...JAVASCRIPT_PROJECTS.map((project) => `${project}/package-lock.json`),
+    ...lockfileInputs(BINDINGS_JAVASCRIPT_PROJECTS),
+  ];
+}
+
+export function websiteDependencyCacheInputs(): string[] {
+  return [
+    "web/ci/Dockerfile",
+    ...packageInputs(WEBSITE_JAVASCRIPT_PROJECTS),
+    "**/.npmrc",
+    ...lockfileInputs(WEBSITE_JAVASCRIPT_PROJECTS),
     "web/patches/**/*.patch",
   ];
 }
@@ -159,24 +174,46 @@ export function rustBuildCacheInputs(): string[] {
   return cargoCacheInputs();
 }
 
-export function javascriptDependencyCommand(): string {
-  const nodeModules = JAVASCRIPT_PROJECTS.map(
+export function bindingsDependencyCommand(): string {
+  return javascriptDependencyCommand(BINDINGS_JAVASCRIPT_PROJECTS, true);
+}
+
+export function websiteDependencyCommand(): string {
+  return javascriptDependencyCommand(WEBSITE_JAVASCRIPT_PROJECTS, false);
+}
+
+function javascriptDependencyCommand(
+  javascriptProjects: readonly string[],
+  retainCargo: boolean,
+): string {
+  const nodeModules = javascriptProjects.map(
     (project) => `${project}/node_modules`,
   );
-  const projects = JAVASCRIPT_PROJECTS.map(shellQuote).join(" ");
+  const projects = javascriptProjects.map(shellQuote).join(" ");
+  const retainedCargo = retainCargo
+    ? " ! -name .cargo-home ! -name .cargo-target"
+    : "";
   const retainNodeModules = [
     "staging=/workspace/.node-modules-staging",
     "rm -rf \"$staging\"",
     `for project in ${projects}; do mkdir -p "$staging/$project"; mv "/workspace/$project/node_modules" "$staging/$project/node_modules"; done`,
-    "find /workspace -mindepth 1 -maxdepth 1 ! -name .cargo-home ! -name .cargo-target ! -name .node-modules-staging -exec rm -rf -- {} +",
+    `find /workspace -mindepth 1 -maxdepth 1${retainedCargo} ! -name .node-modules-staging -exec rm -rf -- {} +`,
     `for project in ${projects}; do mkdir -p "/workspace/$project"; mv "$staging/$project/node_modules" "/workspace/$project/node_modules"; done`,
     "rm -rf \"$staging\"",
   ].join("; ");
   return [
-    `printf '%s\\0' ${JAVASCRIPT_PROJECTS.map(shellQuote).join(" ")} | xargs -0 -n 1 -P 4 sh -c 'npm ci --prefix "$1" || exit 255' sh`,
+    `printf '%s\\0' ${javascriptProjects.map(shellQuote).join(" ")} | xargs -0 -n 1 -P 4 sh -c 'npm ci --prefix "$1" || exit 255' sh`,
     `printf '%s\\0' ${nodeModules.map(shellQuote).join(" ")} | xargs -0 -n 1 test -d`,
     `sh -eu -c ${shellQuote(retainNodeModules)}`,
   ].join(" && ");
+}
+
+function packageInputs(projects: readonly string[]): string[] {
+  return projects.map((project) => `${project}/package.json`);
+}
+
+function lockfileInputs(projects: readonly string[]): string[] {
+  return projects.map((project) => `${project}/package-lock.json`);
 }
 
 function shellQuote(value: string): string {

@@ -116,7 +116,9 @@ test("terminal gates skip snapshots and publish the website artifact in-place", 
     /transport: this\.env\.ENVIRONMENT === 'development' \? 'rpc' : 'http'/,
   );
   assert.match(workflow, /name: "Node and browser bindings"[\s\S]*?runnerConfig\(60 \* 60 \* 1_000, 24 \* 60 \* 60, 0, false\)/);
-  assert.match(workflow, /const website = await completeDependencies\.runner/);
+  assert.match(workflow, /prepareDependencyLayer\(\s*dependencies,\s*"Bindings dependencies"/);
+  assert.match(workflow, /prepareDependencyLayer\(\s*ci,\s*"Website dependencies"/);
+  assert.match(workflow, /const website = await websiteDependencyState\.result\.runner/);
   assert.doesNotMatch(workflow, /const website = await bindings\.runner/);
   assert.match(workflow, /outputs\?\.\[0\]/);
   assert.doesNotMatch(workflow, /getSandbox/);

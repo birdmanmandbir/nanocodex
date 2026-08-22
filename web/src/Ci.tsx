@@ -19,7 +19,12 @@ const gates = [
   ["static-vm-guest", "Static VM guest", "cross-target guest build"],
   ["python-3-11", "Python 3.11", "bindings and consumer tests"],
   ["python-3-14", "Python 3.14", "forward-runtime coverage"],
-  ["all-dependencies", "Dependency fan-in", "immutable JavaScript dependency snapshot"],
+  [
+    "bindings-dependencies",
+    "Bindings cache",
+    "Cargo plus package-scoped JavaScript dependencies",
+  ],
+  ["website-dependencies", "Website cache", "site-only JavaScript dependencies"],
   ["node-and-browser-bindings", "Node and browser", "WASM and package suites"],
   ["website", "Website", "typecheck, tests, and production build"],
 ] as const;
@@ -161,7 +166,7 @@ export function Ci() {
             <header>
               <div>
                 <p className="eyebrow">Validation</p>
-                <h2 id="pipeline-title">Twelve gates. One source.</h2>
+                <h2 id="pipeline-title">{gates.length} gates. One source.</h2>
               </div>
               {latest ? (
                 <a

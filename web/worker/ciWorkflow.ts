@@ -22,16 +22,18 @@ import {
 } from "./ciSource.ts";
 import {
   bindingsCommand,
+  bindingsDependencyCacheInputs,
+  bindingsDependencyCommand,
   cargoCacheInputs,
   cargoDependencyCommand,
-  completeDependencyCacheInputs,
-  javascriptDependencyCommand,
   pythonCommand,
   refreshSourceCommand,
   rustBuildCacheInputs,
   rustBuildCacheCommand,
   rustPipeline,
   websiteCommand,
+  websiteDependencyCacheInputs,
+  websiteDependencyCommand,
 } from "./ciWorkflowPlan.ts";
 import {
   failureMarkerKey,
@@ -69,7 +71,8 @@ const CI_GATE_NAMES = [
   "static VM guest",
   "Python 3.11",
   "Python 3.14",
-  "all dependencies",
+  "Bindings dependencies",
+  "Website dependencies",
   "Node and browser bindings",
   "website",
 ] as const;
@@ -256,33 +259,59 @@ export class NanocodexCI extends CIWorkflow<
           completed.push(summary);
           await progress.complete(name, summary);
         });
-      const webJob = (async () => {
-        const completeDependenciesStartedAt = progress.start("all dependencies");
-        const completeDependencies = await dependencies.runner({
-          name: "all dependencies",
-          command: javascriptDependencyCommand(),
+      const prepareDependencyLayer = (
+        parent: CiContext | CiRunnerResult,
+        name: "Bindings dependencies" | "Website dependencies",
+        command: string,
+        inputs: string[],
+      ) => {
+        const startedAt = progress.start(name);
+        return parent.runner({
+          name,
+          command,
           env: COMMON_ENV,
-          cache: { inputs: completeDependencyCacheInputs() },
+          cache: { inputs },
           config: runnerConfig(30 * 60 * 1_000, 30 * 24 * 60 * 60, 1),
+        }).then((result) => {
+          const persistence = persistRunner(
+            this.env.BACKUP_BUCKET,
+            head,
+            result,
+            slug(name),
+          ).then(async (metadata) => {
+            const summary = {
+              name,
+              exitCode: result.exitCode,
+              cacheHit: metadata.cacheHit,
+              durationMs: Date.now() - startedAt,
+            };
+            completed.push(summary);
+            await progress.complete(name, summary);
+          });
+          // Child gates can outlive this evidence write by minutes. Observe a
+          // rejection immediately while preserving it for the pipeline await.
+          void persistence.catch(() => undefined);
+          return { result, persistence };
         });
-        const dependencyPersistence = persistRunner(
-          this.env.BACKUP_BUCKET,
-          head,
-          completeDependencies,
-          "all-dependencies",
-        ).then(async (metadata) => {
-          const summary = {
-            name: "all dependencies",
-            exitCode: completeDependencies.exitCode,
-            cacheHit: metadata.cacheHit,
-            durationMs: Date.now() - completeDependenciesStartedAt,
-          };
-          completed.push(summary);
-          await progress.complete("all dependencies", summary);
-        });
+      };
+      const webJob = (async () => {
+        const [bindingsDependencyState, websiteDependencyState] = await Promise.all([
+          prepareDependencyLayer(
+            dependencies,
+            "Bindings dependencies",
+            bindingsDependencyCommand(),
+            bindingsDependencyCacheInputs(),
+          ),
+          prepareDependencyLayer(
+            ci,
+            "Website dependencies",
+            websiteDependencyCommand(),
+            websiteDependencyCacheInputs(),
+          ),
+        ]);
         const bindingsStartedAt = progress.start("Node and browser bindings");
         const wasmArtifactKey = `runs/${head}/artifacts/web-wasm.tar`;
-        const bindings = await completeDependencies.runner({
+        const bindings = await bindingsDependencyState.result.runner({
           name: "Node and browser bindings",
           command: cleanupAfter(bindingsCommand(), [".ci-output"]),
           env: COMMON_ENV,
@@ -322,7 +351,7 @@ export class NanocodexCI extends CIWorkflow<
         });
         const websiteStartedAt = progress.start("website");
         const artifactKey = `runs/${head}/artifacts/web-dist.tar`;
-        const website = await completeDependencies.runner({
+        const website = await websiteDependencyState.result.runner({
           name: "website",
           command: cleanupAfter(
             websiteCommand(
@@ -354,7 +383,11 @@ export class NanocodexCI extends CIWorkflow<
             "web-dist",
           ),
         );
-        await Promise.all([dependencyPersistence, bindingsPersistence]);
+        await Promise.all([
+          bindingsDependencyState.persistence,
+          websiteDependencyState.persistence,
+          bindingsPersistence,
+        ]);
         const summary = {
           name: "website",
           exitCode: website.exitCode,
