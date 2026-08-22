@@ -59,6 +59,10 @@ const COMMON_ENV = {
   CARGO_TARGET_DIR: "/workspace/.cargo-target",
   CARGO_BUILD_JOBS: "4",
   CARGO_INCREMENTAL: "0",
+  // Test DWARF dominates the reusable workspace snapshot but is not consumed
+  // by any CI gate. Keep test codegen and assertions identical while avoiding
+  // multi-gigabyte cache writes and restores.
+  CARGO_PROFILE_TEST_DEBUG: "0",
   CARGO_TERM_COLOR: "always",
   RUST_TEST_THREADS: "4",
 };

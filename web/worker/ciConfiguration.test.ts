@@ -155,6 +155,7 @@ test("terminal gates skip snapshots and publish the website artifact in-place", 
   assert.match(cache, /localBucket: input\.snapshot\.localBucket/);
   assert.match(cache, /env\.ENVIRONMENT === 'development'/);
   assert.match(workflow, /CARGO_BUILD_JOBS: "4"/);
+  assert.match(workflow, /CARGO_PROFILE_TEST_DEBUG: "0"/);
   assert.match(workflow, /RUST_TEST_THREADS: "4"/);
   assert.match(
     workflow,
