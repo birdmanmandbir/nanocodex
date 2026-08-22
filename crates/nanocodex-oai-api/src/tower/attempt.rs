@@ -67,6 +67,10 @@ impl ResponsesObserver {
     const fn projects_response_events(&self) -> bool {
         self.response_events.is_none()
     }
+
+    pub(crate) const fn observes_response_events(&self) -> bool {
+        self.response_events.is_some()
+    }
 }
 
 #[derive(Serialize)]

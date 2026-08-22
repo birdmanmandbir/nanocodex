@@ -190,7 +190,7 @@ pub async fn prepare_output_images(output: &mut ToolOutputBody) {
 /// policy. Audio input is retained as an explicit placeholder until supported.
 pub async fn prepare_user_input(input: &PromptInput) -> Vec<ContentItem> {
     let input = match input {
-        PromptInput::Text(text) => vec![UserInput::Text { text: text.clone() }],
+        PromptInput::Text(text) => return vec![input_text(text.clone())],
         PromptInput::Content(items) => items.clone(),
     };
     match tokio::task::spawn_blocking(move || prepare_user_content(input)).await {
@@ -596,6 +596,16 @@ mod tests {
     use image::{DynamicImage, GenericImageView, ImageFormat, Rgba, RgbaImage};
 
     use super::*;
+
+    #[tokio::test]
+    async fn plain_text_input_preserves_bytes_without_image_work() {
+        let content = prepare_user_input(&PromptInput::Text("exact text".to_owned())).await;
+
+        assert!(matches!(
+            content.as_slice(),
+            [ContentItem::InputText { text }] if text.as_ref() == "exact text"
+        ));
+    }
 
     #[test]
     fn detail_policies_match_codex_patch_budgets() {

@@ -514,7 +514,9 @@ where
 
     let decode_started_at = Instant::now();
     let event = decode_event::<ServerEvent>(raw_event)?;
-    if let Some(event) = event.normalized() {
+    if observer.observes_response_events()
+        && let Some(event) = event.normalized()
+    {
         observer.emit_response(event).await;
     }
     timing.pipeline.decode_duration_ns = timing

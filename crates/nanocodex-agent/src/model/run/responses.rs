@@ -72,24 +72,26 @@ where
         if let Some(input_content) = &input_content {
             record_span_content(&span, "model.input", input_content);
         }
-        let execution_steps = self.execution_steps.clone();
-        let step_id = format!("model-{call_index}");
-        let mut recorded_prompt_history = prompt_history.iter().cloned().collect::<Vec<_>>();
-        for item in &mut recorded_prompt_history {
-            item.strip_id();
-        }
-        let step_input = RecordedModelCall {
-            call_index,
-            model: self.model.as_str(),
-            reasoning_mode: self.config.reasoning_mode.as_str(),
-            effort: self.thinking.as_str(),
-            fast_mode: self.fast_mode,
-            prompt_history: &recorded_prompt_history,
-        };
-        let recovered = if let Some(steps) = &execution_steps {
+        let execution_recording = self
+            .execution_steps
+            .clone()
+            .map(|steps| (steps, format!("model-{call_index}")));
+        let recovered = if let Some((steps, step_id)) = &execution_recording {
+            let mut recorded_prompt_history = prompt_history.iter().cloned().collect::<Vec<_>>();
+            for item in &mut recorded_prompt_history {
+                item.strip_id();
+            }
+            let step_input = RecordedModelCall {
+                call_index,
+                model: self.model.as_str(),
+                reasoning_mode: self.config.reasoning_mode.as_str(),
+                effort: self.thinking.as_str(),
+                fast_mode: self.fast_mode,
+                prompt_history: &recorded_prompt_history,
+            };
             match steps
                 .begin::<_, RecordedModelResult>(
-                    &step_id,
+                    step_id,
                     "model_call",
                     &step_input,
                     crate::agent::execution::ExecutionRetry::Idempotent,
@@ -135,8 +137,8 @@ where
                 server_reasoning_included,
                 duration_ns: elapsed_ns(started_at),
             };
-            if let Some(steps) = &execution_steps {
-                steps.complete(&step_id, &output).await?;
+            if let Some((steps, step_id)) = &execution_recording {
+                steps.complete(step_id, &output).await?;
             }
             output
         };
