@@ -244,7 +244,7 @@ index aa6068d..9a43284 100644
  
  export type RunStepResult<S> = RunOutput & {
 diff --git a/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts b/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
-index a7f6c05..2c78d92 100644
+index a7f6c05..8b76660 100644
 --- a/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
 +++ b/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
 @@ -1,7 +1,12 @@
@@ -285,7 +285,7 @@ index a7f6c05..2c78d92 100644
  const COMMAND_TIMEOUT_MS = 11 * 60 * 1000;
  const SOURCE_TIMEOUT_MS = 5 * 60 * 1000;
  const PORT_READY_TIMEOUT_MS = 60_000;
-@@ -25,6 +39,11 @@ const TAIL_BYTES = 28_000;
+@@ -25,6 +39,15 @@ const TAIL_BYTES = 28_000;
  // Two inline logs plus result metadata must remain below Workflows' 1 MiB limit.
  const INLINE_LOG_BYTES = 300_000;
  
@@ -293,11 +293,15 @@ index a7f6c05..2c78d92 100644
 +// large restore transfer prevents parallel cache hits from collapsing that
 +// proxy while still allowing the restored containers to compile in parallel.
 +let localRestoreTail = Promise.resolve();
++// Wrangler can drop its local proxy connection when several new Containers all
++// perform their first RPC simultaneously. Serialize only that initialization
++// boundary; commands run concurrently as soon as their workspace is ready.
++let localSandboxStartTail = Promise.resolve();
 +
  export class SandboxRunner implements Runner<DirectoryBackup> {
    readonly name = 'sandbox';
  
-@@ -38,17 +57,28 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -38,40 +61,55 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
    async run(
      input: RunStepInput & { restore?: DirectoryBackup }
    ): Promise<RunStepResult<DirectoryBackup>> {
@@ -319,8 +323,18 @@ index a7f6c05..2c78d92 100644
  
 -    let cleanupTransferredToStreams = false;
      try {
+-      if (input.restore) {
+-        await sandbox.restoreBackup(input.restore);
+-        // Overlay (no rm) so cached node_modules survive while tracked source
+-        // files are refreshed to this commit. The restored archive may carry a
+-        // different commit's source (e.g. a reused install cache), so this is
+-        // what keeps it correct. Files deleted since then linger; the next
+-        // install/build regenerates derived output.
+-        await sandbox.exec(
+-          checkoutSourceScript(input.source, WORKSPACE_DIR, true),
+-          {
 +      await assertRunActive(this.env.BACKUP_BUCKET, input.sourceSha);
-+      sandbox = getSandbox(this.env.SANDBOX, runnerId, {
++      const runnerSandbox = getSandbox(this.env.SANDBOX, runnerId, {
 +        // Local R2 restores must stream large squashfs archives into the
 +        // container. The HTTP transport falls back to one base64 string, which
 +        // exceeds V8's string limit for realistic dependency snapshots.
@@ -328,15 +342,40 @@ index a7f6c05..2c78d92 100644
 +        enableDefaultSession: false,
 +        containerTimeouts: { portReadyTimeoutMS: PORT_READY_TIMEOUT_MS },
 +      });
-       if (input.restore) {
--        await sandbox.restoreBackup(input.restore);
-+        await restoreSnapshot(sandbox, input.restore, this.env);
-         // Overlay (no rm) so cached node_modules survive while tracked source
-         // files are refreshed to this commit. The restored archive may carry a
-         // different commit's source (e.g. a reused install cache), so this is
-@@ -70,8 +100,9 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
-         });
-       }
++      sandbox = runnerSandbox;
++      await serializeLocalSandboxStart(this.env, async () => {
++        if (input.restore) {
++          await restoreSnapshot(runnerSandbox, input.restore, this.env);
++          // Overlay (no rm) so cached node_modules survive while tracked source
++          // files are refreshed to this commit. The restored archive may carry a
++          // different commit's source (e.g. a reused install cache), so this is
++          // what keeps it correct. Files deleted since then linger; the next
++          // install/build regenerates derived output.
++          await runnerSandbox.exec(
++            checkoutSourceScript(input.source, WORKSPACE_DIR, true),
++            {
++              cwd: '/',
++              timeout: SOURCE_TIMEOUT_MS,
++              env: checkoutSourceEnv(input.source),
++            }
++          );
++        } else {
++          await runnerSandbox.exec(checkoutSourceScript(input.source, WORKSPACE_DIR), {
+             cwd: '/',
+             timeout: SOURCE_TIMEOUT_MS,
+             env: checkoutSourceEnv(input.source),
+-          }
+-        );
+-      } else {
+-        await sandbox.exec(checkoutSourceScript(input.source, WORKSPACE_DIR), {
+-          cwd: '/',
+-          timeout: SOURCE_TIMEOUT_MS,
+-          env: checkoutSourceEnv(input.source),
+-        });
+-      }
++          });
++        }
++      });
  
 +      await assertRunActive(this.env.BACKUP_BUCKET, input.sourceSha);
        const proc = await sandbox.startProcess(
@@ -345,7 +384,7 @@ index a7f6c05..2c78d92 100644
          {
            cwd: resolveCwd(input.cwd),
            env: {
-@@ -81,61 +112,449 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -81,59 +119,465 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
            autoCleanup: false,
          }
        );
@@ -544,10 +583,28 @@ index a7f6c05..2c78d92 100644
 +  }
 +}
 +
++async function serializeLocalSandboxStart<T>(
++  env: Bindings,
++  start: () => Promise<T>
++): Promise<T> {
++  if (env.ENVIRONMENT !== 'development') return start();
++  const previous = localSandboxStartTail;
++  let release!: () => void;
++  localSandboxStartTail = new Promise<void>((resolve) => {
++    release = resolve;
++  });
++  await previous;
++  try {
++    return await start();
++  } finally {
++    release();
++  }
++}
++
 +function fulfilled<T>(result: PromiseSettledResult<T>): T {
 +  if (result.status === 'rejected') {
 +    throw result.reason;
-+  }
+   }
 +  return result.value;
 +}
 +
@@ -648,9 +705,8 @@ index a7f6c05..2c78d92 100644
 +    posix.normalize(path) !== path
 +  ) {
 +    throw new Error(`Invalid CI ${kind} path: ${path}`);
-   }
- }
--
++  }
++}
 +
 +function checksumHex(buffer: ArrayBuffer) {
 +  return [...new Uint8Array(buffer)]
@@ -831,12 +887,10 @@ index a7f6c05..2c78d92 100644
 +    throw new Error(`Invalid CI log metadata for ${path}`);
 +  }
 +  return value as LogCaptureMetadata;
-+}
-+
+ }
+ 
  async function readLogs(sandbox: ReturnType<typeof getSandbox>) {
-   const listing = await sandbox.listFiles('/tmp');
-   const sizes = new Map(
-@@ -153,7 +572,7 @@ async function readLog(
+@@ -153,7 +597,7 @@ async function readLog(
    size: number
  ): Promise<string | ReadableStream<Uint8Array>> {
    if (size > INLINE_LOG_BYTES) {
@@ -845,7 +899,7 @@ index a7f6c05..2c78d92 100644
    }
    return (await sandbox.readFile(file, { encoding: 'utf-8' })).content;
  }
-@@ -192,51 +611,22 @@ function resolveCwd(cwd: string | undefined) {
+@@ -192,51 +636,22 @@ function resolveCwd(cwd: string | undefined) {
    return posix.join(WORKSPACE_DIR, normalized);
  }
  
@@ -1050,8 +1104,7 @@ index 5246f0c..edbcda5 100644
 --- a/node_modules/@cloudflare/ci/src/pipeline/runner-group.ts
 +++ b/node_modules/@cloudflare/ci/src/pipeline/runner-group.ts
 @@ -8,11 +8,10 @@ type RunnerInvocation = Pick<RunnerOptions, 'name' | 'command' | 'cwd'>;
--
-+
+ 
  /**
   * Tracks concurrent and chained runners in one pipeline run.
 - * After a failure, it waits for active runners and reports the earliest-started
@@ -1067,8 +1120,7 @@ index 5246f0c..edbcda5 100644
 @@ -37,30 +36,10 @@ export class RunnerGroup {
        throw failure;
      });
--
-+
+ 
 -    this.active.add(execution);
 -    const remove = () => {
 -      this.active.delete(execution);
@@ -1081,8 +1133,7 @@ index 5246f0c..edbcda5 100644
 -    );
 +    return execution.catch((failure: CiRunnerFailure) => this.fail(failure));
    }
--
-+
+ 
 -  private async settle(requestedFailure: CiRunnerFailure): Promise<never> {
 -    while (this.active.size > 0) {
 -      // Runners can chain another runner while the current active set settles.

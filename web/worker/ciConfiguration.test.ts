@@ -135,7 +135,10 @@ test("terminal gates skip snapshots and publish the website artifact in-place", 
   assert.match(sandboxRunner, /metadata\.stdout\.bytesStored/);
   assert.match(sandboxRunner, /putFixedLengthStream\(bucket, output\.key, stream, file\.size/);
   assert.match(sandboxRunner, /let localRestoreTail = Promise\.resolve\(\)/);
-  assert.match(sandboxRunner, /await restoreSnapshot\(sandbox, input\.restore, this\.env\)/);
+  assert.match(
+    sandboxRunner,
+    /await restoreSnapshot\(runnerSandbox, input\.restore, this\.env\)/,
+  );
   assert.match(sandboxRunner, /env\.ENVIRONMENT !== 'development'/);
   assert.match(sandboxRunner, /await registerActiveSandbox\(/);
   assert.match(sandboxRunner, /await assertRunActive\(this\.env\.BACKUP_BUCKET, input\.sourceSha\)/);
@@ -154,6 +157,12 @@ test("terminal gates skip snapshots and publish the website artifact in-place", 
   assert.match(cache, /localBucket: z\.boolean\(\)\.optional\(\)/);
   assert.match(cache, /localBucket: input\.snapshot\.localBucket/);
   assert.match(cache, /env\.ENVIRONMENT === 'development'/);
+  assert.match(sandboxRunner, /let localSandboxStartTail = Promise\.resolve\(\)/);
+  assert.match(sandboxRunner, /await serializeLocalSandboxStart\(this\.env/);
+  assert.match(
+    sandboxRunner,
+    /if \(env\.ENVIRONMENT !== 'development'\) return start\(\)/,
+  );
   assert.match(workflow, /CARGO_BUILD_JOBS: "4"/);
   assert.match(workflow, /CARGO_PROFILE_TEST_DEBUG: "0"/);
   assert.match(workflow, /RUST_TEST_THREADS: "4"/);
