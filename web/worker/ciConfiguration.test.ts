@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 
-test("Wrangler owns the Workflow, source, backup, repository, and ten CI slots", async () => {
+test("Wrangler owns the Workflow, source, backup, repository, and production CI capacity", async () => {
   const config = JSON.parse(await readFile(new URL("../wrangler.jsonc", import.meta.url), "utf8"));
   assert.deepEqual(config.workflows, [{
     binding: "CI_WORKFLOW",
@@ -14,7 +14,7 @@ test("Wrangler owns the Workflow, source, backup, repository, and ten CI slots",
     {
       class_name: "CiSandbox",
       image: "./ci/Dockerfile",
-      max_instances: 10,
+      max_instances: 32,
       instance_type: "standard-4",
     },
   );
@@ -26,9 +26,17 @@ test("Wrangler owns the Workflow, source, backup, repository, and ten CI slots",
     ({ name, class_name }: { name: string; class_name: string }) =>
       name === "SANDBOX" && class_name === "CiSandbox",
   ));
+  assert.ok(config.durable_objects.bindings.some(
+    ({ name, class_name }: { name: string; class_name: string }) =>
+      name === "CI_MACOS_JOBS" && class_name === "CiMacJobs",
+  ));
+  assert.ok(config.durable_objects.bindings.some(
+    ({ name, class_name }: { name: string; class_name: string }) =>
+      name === "CI_RELEASES" && class_name === "CiReleases",
+  ));
   assert.deepEqual(config.migrations.at(-1), {
-    tag: "v9",
-    new_sqlite_classes: ["CiRepository", "CiSandbox"],
+    tag: "v10",
+    new_sqlite_classes: ["CiMacJobs", "CiReleases"],
   });
   assert.deepEqual(
     config.r2_buckets.filter(({ binding }: { binding: string }) =>
@@ -41,11 +49,17 @@ test("Wrangler owns the Workflow, source, backup, repository, and ten CI slots",
   assert.equal(config.vars.BACKUP_BUCKET_NAME, "nanocodex-ci");
   assert.equal(config.vars.CI_PUBLIC_ORIGIN, "https://nanocodex.me-7fb.workers.dev");
   assert.deepEqual(config.secrets.required, [
-    "CI_SOURCE_WRITE_TOKEN",
+    "GIT_MIRROR_TOKEN",
+    "CI_MASTER_SOURCE_WRITE_TOKEN",
+    "CI_PR_SOURCE_WRITE_TOKEN",
     "CI_CONTROL_TOKEN",
+    "CI_MACOS_RUNNER_TOKEN",
+    "CI_RELEASE_TOKEN",
+    "NANOCODEX_SANDBOX_CONTROL_TOKEN",
     "R2_ACCESS_KEY_ID",
     "R2_SECRET_ACCESS_KEY",
   ]);
+  assert.deepEqual(config.triggers.crons, ["0 5 * * *"]);
   assert.equal(config.r2_buckets.some(
     ({ binding }: { binding: string }) => binding === "ARTIFACTS",
   ), false);
@@ -62,6 +76,12 @@ test("development repeats every non-inherited CI binding", async () => {
   assert.ok(development.durable_objects.bindings.some(
     ({ name }: { name: string }) => name === "CI_REPOSITORY",
   ));
+  assert.ok(development.durable_objects.bindings.some(
+    ({ name }: { name: string }) => name === "CI_MACOS_JOBS",
+  ));
+  assert.ok(development.durable_objects.bindings.some(
+    ({ name }: { name: string }) => name === "CI_RELEASES",
+  ));
   assert.ok(development.r2_buckets.some(
     ({ binding }: { binding: string }) => binding === "CI_SOURCE",
   ));
@@ -77,6 +97,8 @@ test("development repeats every non-inherited CI binding", async () => {
     ],
   );
   assert.equal(development.vars.BACKUP_BUCKET_NAME, "nanocodex-ci-development");
+  assert.deepEqual(development.triggers.crons, []);
+  assert.deepEqual(development.secrets.required, config.secrets.required);
 });
 
 test("the local CI command enables container execution on the public runner origin", async () => {
@@ -88,6 +110,27 @@ test("the local CI command enables container execution on the public runner orig
   assert.match(command, /CLOUDFLARE_ENV=development/);
   assert.match(command, /wrangler\.js dev --enable-containers/);
   assert.match(command, /--port 8787 --ip 127\.0\.0\.1/);
+  assert.equal(
+    packageDocument.scripts["ci:macos-runner"],
+    "node scripts/ci-macos-runner.mjs",
+  );
+  assert.equal(packageDocument.scripts["ci:controller"], "node scripts/ci-controller.mjs");
+  assert.equal(
+    packageDocument.scripts["ci:pr-controller"],
+    "node scripts/ci-pr-controller.mjs",
+  );
+  assert.equal(
+    packageDocument.scripts["ci:release-controller"],
+    "node scripts/ci-release-controller.mjs",
+  );
+  assert.equal(
+    packageDocument.scripts["ci:install-controller-service"],
+    "node scripts/install-ci-controller-service.mjs",
+  );
+  assert.equal(
+    packageDocument.scripts["ci:install-macos-service"],
+    "node scripts/install-ci-macos-service.mjs",
+  );
 });
 
 test("artifact and deterministic gates use bounded reusable cache entries", async () => {
@@ -147,7 +190,7 @@ test("artifact and deterministic gates use bounded reusable cache entries", asyn
   );
   assert.match(
     workflow,
-    /const bindingsArtifact = await bindingsVerification\.runner[\s\S]*?command: bindingsArtifactCommand\(\)[\s\S]*?outputs:/,
+    /const bindingsArtifact = await bindingsVerification\.runner[\s\S]*?command: bindingsArtifactCommand\(npmPreview\?\.mergeHead\)[\s\S]*?outputs:/,
   );
   assert.match(
     workflow,
@@ -325,4 +368,63 @@ test("artifact and deterministic gates use bounded reusable cache entries", asyn
       workflow.indexOf("gatesCompleted = true"),
     "success is terminal only after its evidence has been persisted",
   );
+});
+
+test("the main pipeline requires authenticated macOS evidence", async () => {
+  const workflow = await readFile(new URL("./ciWorkflow.ts", import.meta.url), "utf8");
+  assert.match(workflow, /"macOS stable workspace tests and native CLI"/);
+  assert.match(
+    workflow,
+    /queue macOS native build[\s\S]*?wait for macOS native build[\s\S]*?await Promise\.all\(\[macJob, runLinuxNative/,
+  );
+  assert.match(workflow, /CI_MAC_EVENT_TYPE/);
+  assert.match(workflow, /task: "native-build"/);
+  assert.match(workflow, /promoteMacNativeArtifact/);
+
+});
+
+test("PR npm previews cannot replace the normal release package", async () => {
+  const workflow = await readFile(new URL("./ciWorkflow.ts", import.meta.url), "utf8");
+  assert.match(
+    workflow,
+    /const npmPreview = source\.lane\.type === "pull_request"[\s\S]*?npmPreviewVersion\(head\)/,
+  );
+  assert.match(
+    workflow,
+    /const npmArtifactKey = `runs\/\$\{head\}\/artifacts\/npm-package\.tgz`/,
+  );
+  assert.match(
+    workflow,
+    /source\.lane\.type === "pull_request"[\s\S]*?key: `runs\/\$\{head\}\/artifacts\/npm-preview\.tgz`/,
+  );
+  const promotionStart = workflow.indexOf("async function promoteNpmReleaseArtifact(");
+  const promotionEnd = workflow.indexOf("\nfunction retainedNpmReleaseAsset(", promotionStart);
+  assert.ok(promotionStart >= 0 && promotionEnd > promotionStart);
+  const promotion = workflow.slice(promotionStart, promotionEnd);
+  assert.match(
+    promotion,
+    /const sourceKey = `runs\/\$\{head\}\/artifacts\/npm-package\.tgz`/,
+  );
+  assert.doesNotMatch(promotion, /npm-preview/);
+});
+
+test("distribution stages verified stable assets for trusted publication and auto-finalizes nightly", async () => {
+  const workflow = await readFile(new URL("./ciWorkflow.ts", import.meta.url), "utf8");
+  assert.match(workflow, /isNanocodexCiProviderData\(value, head\)/);
+  assert.match(
+    workflow,
+    /event\.payload\.ref !== source\.lane\.ref[\s\S]*?event\.payload\.branch !== source\.lane\.branch/,
+  );
+  const branch = workflow.indexOf("if (source.distribution)");
+  const normalState = workflow.indexOf("persist CI running state");
+  assert.ok(branch >= 0 && branch < normalState);
+  assert.match(
+    workflow,
+    /const \[linux, mac\] = await Promise\.all\(\[linuxPromise, macPromise\]\)/,
+  );
+  const draft = workflow.indexOf("Failed to stage release");
+  const ready = workflow.indexOf("persist stable distribution ready state");
+  const finalize = workflow.indexOf("Failed to finalize release");
+  assert.ok(draft >= 0 && draft < ready && ready < finalize);
+  assert.doesNotMatch(workflow, /CARGO_REGISTRY_TOKEN|NPM_TOKEN/);
 });

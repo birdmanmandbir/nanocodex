@@ -28,6 +28,7 @@ import {
   exactSourceCacheInputs,
   msrvBuildCacheCommand,
   msrvBuildCacheInputs,
+  npmPreviewVersion,
   parallelCommandGroups,
   pythonCacheInputs,
   pythonCommand,
@@ -266,22 +267,36 @@ test("dependency and Rust compilation snapshots are content addressed", async ()
   assert.doesNotMatch(qualityCache, /! -name \.cargo-target/);
   assert.match(bindingsResultCacheCommand(), /\.ci-output/);
   assert.match(bindingsResultCacheCommand(), /\.ci-cache-staging/);
-  assert.match(bindingsArtifactCommand(), /sha256sum --check/);
+  assert.match(bindingsCommand(), /npm pack --pack-destination/);
+  assert.match(bindingsCommand(), /npm-package\.tgz\.sha256/);
+  assert.match(bindingsArtifactCommand(), /web-wasm\.tar\.sha256/);
+  assert.match(bindingsArtifactCommand(), /npm-package\.tgz\.sha256/);
 });
 
 test("Cargo dependencies restore the exact owned Git bundle before fetching", () => {
   const command = cargoDependencyCommand(
-    "https://ci.example/api/ci/cargo-vendor/0123456789012345678901234567890123456789/bundle.tar.gz",
+    `https://ci.example/api/ci/cargo-vendor/${"0".repeat(40)}/${"a".repeat(64)}/bundle.tar.gz`,
     3_900_842,
     "a".repeat(64),
   );
-  assert.match(command, /curl --fail --location --silent --show-error/);
+  assert.match(command, /curl --fail --silent --show-error/);
+  assert.doesNotMatch(command, /--location/);
   assert.match(command, /test "\$\(wc -c/);
   assert.match(command, /sha256sum --check --status/);
   assert.match(command, /tar --extract --gzip/);
   assert.match(command, /--no-same-owner --no-same-permissions/);
   assert.ok(command.indexOf("tar --extract") < command.indexOf("cargo fetch --locked"));
   assert.ok(command.indexOf("cargo fetch --locked") < command.indexOf("find /workspace"));
+  assert.throws(() => cargoDependencyCommand(
+    `https://ci.example/api/ci/cargo-vendor/${"0".repeat(40)}/${"b".repeat(64)}/bundle.tar.gz`,
+    3_900_842,
+    "a".repeat(64),
+  ), /descriptor is inconsistent/);
+  assert.throws(() => cargoDependencyCommand(
+    `https://ci.example/api/ci/cargo-vendor/${"0".repeat(40)}/bundle.tar.gz`,
+    3_900_842,
+    "a".repeat(64),
+  ), /descriptor is inconsistent/);
 });
 
 test("npm installs use four fail-fast workers before snapshot pruning", async () => {
@@ -433,6 +448,35 @@ test("bindings, website, and both Python versions preserve the GitHub CI gates",
     assert.match(python, /mypy --strict/);
     assert.match(python, /benchmark_binding\.py --check/);
   }
+});
+
+test("PR npm previews use the exact tested merge SHA after the release-grade package", () => {
+  const mergeHead = "a".repeat(40);
+  const packageVersion = `0.0.0-preview-${mergeHead}`;
+  assert.equal(npmPreviewVersion(mergeHead), packageVersion);
+  for (const invalid of ["a".repeat(39), "a".repeat(41), "A".repeat(40), "merge-head"]) {
+    assert.throws(() => npmPreviewVersion(invalid), /full lowercase tested merge SHA/);
+  }
+
+  const standard = bindingsCommand();
+  const preview = bindingsCommand(mergeHead);
+  assert.doesNotMatch(standard, /npm-preview|0\.0\.0-preview/);
+  assert.match(preview, new RegExp(`npm version '${packageVersion}'`));
+  assert.match(preview, /npm run check:package --prefix \/workspace\/js\/bindings/);
+  assert.match(preview, /tar -xOf \/workspace\/\.ci-output\/npm-preview\.tgz package\/package\.json/);
+  assert.ok(
+    preview.indexOf('exit "$group_failure"') <
+      preview.indexOf("/workspace/.ci-output/npm-package.tgz"),
+    "the real bindings gates finish before either package is emitted",
+  );
+  assert.ok(
+    preview.indexOf("/workspace/.ci-output/npm-package.tgz") <
+      preview.indexOf(`npm version '${packageVersion}'`),
+    "the standard release package is sealed before the PR-only version mutation",
+  );
+  assert.doesNotMatch(bindingsArtifactCommand(), /npm-preview/);
+  assert.match(bindingsArtifactCommand(mergeHead), /npm-preview\.tgz\.sha256/);
+  assert.match(bindingsResultCacheCommand(mergeHead), new RegExp(packageVersion));
 });
 
 test("parallel command groups execute quoted payloads and propagate failures", () => {
@@ -638,7 +682,7 @@ test("the Rust cache preserves unchanged crate mtimes and invalidates only chang
 test("every generated container command is valid Bash", () => {
   const commands = [
     cargoDependencyCommand(
-      "https://ci.example/api/ci/cargo-vendor/0123456789012345678901234567890123456789/bundle.tar.gz",
+      `https://ci.example/api/ci/cargo-vendor/${"0".repeat(40)}/${"a".repeat(64)}/bundle.tar.gz`,
       3_900_842,
       "a".repeat(64),
     ),
@@ -648,8 +692,11 @@ test("every generated container command is valid Bash", () => {
     msrvBuildCacheCommand(),
     refreshSourceCommand("cargo test"),
     bindingsCommand(),
+    bindingsCommand("a".repeat(40)),
     bindingsResultCacheCommand(),
+    bindingsResultCacheCommand("a".repeat(40)),
     bindingsArtifactCommand(),
+    bindingsArtifactCommand("a".repeat(40)),
     websiteCommand(
       "https://ci.example/api/ci/runs/0123456789012345678901234567890123456789/artifacts/web-wasm.tar",
       3_500_000,

@@ -1,0 +1,33 @@
+diff --git a/node_modules/@cloudflare/sandbox/dist/sandbox-DKG3H156.js b/node_modules/@cloudflare/sandbox/dist/sandbox-DKG3H156.js
+index ac1c6e0..e297e9f 100644
+--- a/node_modules/@cloudflare/sandbox/dist/sandbox-DKG3H156.js
++++ b/node_modules/@cloudflare/sandbox/dist/sandbox-DKG3H156.js
+@@ -6218,12 +6218,17 @@ var Sandbox = class Sandbox extends Container {
+ 	* transport settings.
+ 	*/
+ 	createSandboxClient() {
++		const controlToken = this.envVars.NANOCODEX_SANDBOX_CONTROL_TOKEN;
++		if (typeof controlToken !== "string" || controlToken.length < 80) throw new Error("NANOCODEX_SANDBOX_CONTROL_TOKEN is missing or invalid");
+ 		return new SandboxClient({
+ 			logger: this.logger,
+ 			port: 3e3,
+ 			stub: this,
+ 			retryTimeoutMs: this.computeRetryTimeoutMs(),
+-			defaultHeaders: { "X-Sandbox-Id": this.ctx.id.toString() },
++			defaultHeaders: {
++				"X-Sandbox-Id": this.ctx.id.toString(),
++				"X-Nanocodex-Sandbox-Control": controlToken
++			},
+ 			...this.transport === "websocket" && {
+ 				transportMode: "websocket",
+ 				wsUrl: "ws://localhost:3000/ws"
+@@ -6265,6 +6270,9 @@ var Sandbox = class Sandbox extends Container {
+ 		["SANDBOX_LOG_LEVEL", "SANDBOX_LOG_FORMAT"].forEach((key) => {
+ 			if (envObj?.[key]) this.envVars[key] = String(envObj[key]);
+ 		});
++		const controlSecret = envObj?.NANOCODEX_SANDBOX_CONTROL_TOKEN;
++		if (typeof controlSecret !== "string" || !/^[a-f0-9]{64}$/.test(controlSecret)) throw new Error("NANOCODEX_SANDBOX_CONTROL_TOKEN must be 32 random bytes encoded as lowercase hex");
++		this.envVars.NANOCODEX_SANDBOX_CONTROL_TOKEN = `${controlSecret}.${this.ctx.id.toString()}`;
+ 		this.containerTimeouts = this.getDefaultTimeouts(envObj);
+ 		this.logger = createLogger({
+ 			component: "sandbox-do",

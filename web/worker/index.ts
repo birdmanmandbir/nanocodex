@@ -11,8 +11,11 @@ import {
   warmChatGptEgress,
 } from "./chatGptEgressClient.ts";
 import { CredentialVault, type CredentialVaultEnv, type EncryptedEnvelope } from "./credentialVault.ts";
+import { CiMacJobs } from "./ciMacJobs.ts";
+import { CiReleases } from "./ciReleases.ts";
 import { CiRepository } from "./ciRepository.ts";
 import { routeCiRequest, type CiStorageEnv } from "./ciRoutes.ts";
+import { dispatchNightlyDistribution } from "./ciDistributionController.ts";
 import { EvalCoordinator, routeEvalMutation, type EvalStorageEnv } from "./evalCoordinator.ts";
 import { routeEvalRead } from "./evalReadApi.ts";
 import { handleGitRequest, type GitStorageEnv } from "./gitRoutes.ts";
@@ -33,7 +36,15 @@ import {
 import { CHATGPT_REALTIME_INSTRUCTIONS } from "nanocodex/browser/realtime";
 import { routeLinkPreview } from "./linkPreview.ts";
 
-export { ChatGptSession, CiRepository, EvalCoordinator, GitRepository, ThreadGitRepository };
+export {
+  ChatGptSession,
+  CiMacJobs,
+  CiReleases,
+  CiRepository,
+  EvalCoordinator,
+  GitRepository,
+  ThreadGitRepository,
+};
 
 const json = (body: unknown, init?: ResponseInit) =>
   Response.json(body, {
@@ -189,7 +200,39 @@ export default {
 
     return json({ error: "not_found" }, { status: 404 });
   },
+  async scheduled(
+    _controller: ScheduledController,
+    env: WorkerEnv,
+    _context: ExecutionContext,
+  ): Promise<void> {
+    const [nightly, sourceGc] = await Promise.allSettled([
+      dispatchNightlyDistribution(env),
+      collectCiSourceGarbage(env),
+    ]);
+    if (nightly.status === "fulfilled") {
+      console.log("Nightly distribution dispatch", nightly.value);
+    }
+    if (sourceGc.status === "fulfilled") {
+      console.log("CI source garbage collection", sourceGc.value);
+    }
+    const failures = [nightly, sourceGc]
+      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+      .map(({ reason }) => reason);
+    if (failures.length > 0) throw new AggregateError(failures, "scheduled CI maintenance failed");
+  },
 };
+
+async function collectCiSourceGarbage(env: WorkerEnv): Promise<unknown> {
+  if (!env.CI_REPOSITORY) throw new Error("CI repository is not configured");
+  const stub = env.CI_REPOSITORY.get(env.CI_REPOSITORY.idFromName("nanocodex"));
+  const response = await stub.fetch("https://ci-repository/maintenance/source-gc", {
+    method: "POST",
+  });
+  if (!response.ok) {
+    throw new Error(`CI source garbage collection returned HTTP ${response.status}`);
+  }
+  return response.json();
+}
 
 function enforceHttps(request: Request, env: WorkerEnv, url: URL): Response | null {
   if (

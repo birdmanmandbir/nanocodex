@@ -5,6 +5,7 @@ import {
   assertDeploymentDocument,
   assertDeploymentEntry,
   assertDeploymentHealth,
+  deploymentRevision,
   parseWorkerVersionId,
   rolloutArguments,
   uploadArguments,
@@ -25,6 +26,14 @@ test("deployment arguments bind the exact tagged commit to Worker health", () =>
   assert.ok(arguments_.includes(revision));
   assert.ok(arguments_.includes(`gakonst/nanocodex@${revision}`));
   assert.ok(arguments_.includes(`DEPLOYMENT_SHA:${revision}`));
+});
+
+test("CI deployment accepts only an explicit immutable source revision", () => {
+  assert.equal(deploymentRevision(revision), revision);
+  for (const invalid of ["", "abc", "A".repeat(40), `${revision}\n`]) {
+    if (invalid === "") continue;
+    assert.throws(() => deploymentRevision(invalid), /full commit SHA/);
+  }
 });
 
 test("deployment rolls only the uploaded Worker version to production", () => {

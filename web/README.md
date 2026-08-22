@@ -104,10 +104,23 @@ cannot overwrite a valid generation or bypass its compare-and-swap head.
 ### Cloudflare-native CI
 
 The repository also contains an application-owned CI control plane built from
-Workers, Workflows, Containers, Durable Objects, and R2. It does not use
-GitHub Actions, GitHub webhooks, GitHub status APIs, or Cloudflare Artifacts.
+Workers, Workflows, Containers, Durable Objects, R2, and one authenticated
+Apple Silicon runner. It replaces GitHub Actions and Cloudflare Artifacts;
+GitHub remains the authoritative Git, pull-request, and commit-status service.
 The existing browser-thread Git receiver remains unchanged and the public Git
 mirror stays read-only.
+
+Two trusted polling controllers replace repository webhooks. The master
+controller fast-forwards a clean attached checkout to authoritative
+`origin/master`, refreshes the official RustSec checkout, publishes the exact
+source and full `Cargo.lock` vendor bundle, waits for Cloudflare CI, posts the
+single GitHub status context `ci success`, deploys only the checksum-verified
+green `web-dist.tar`, publishes the Cloudflare Git mirror, and verifies the live
+Worker and mirror at the same commit. A separate, credential-minimal PR
+controller reads open pull requests from GitHub, constructs each exact tested
+merge commit in a disposable checkout, publishes that lane, and posts status on
+the PR head. PR-derived work receives no deploy, mirror, registry, release, or
+Cloudflare account authority.
 
 A trusted publisher creates a deterministic compressed archive of exactly the
 committed `master` tree plus a Git-blob manifest used for dependency-cache
@@ -196,6 +209,15 @@ records.
 Immutable source archives live in the separately credentialed
 `nanocodex-ci-source` bucket.
 
+Normal CI also emits raw native CLIs at
+`runs/<commit>/artifacts/nanocodex-<target>`. Linux builds inside the pinned
+Container; macOS runs the stable workspace suite and arm64 release build in one
+offline, network-denied claim on the authenticated external runner. The runner
+downloads the same source and complete Cargo vendor bundle, validates a thin
+arm64 Mach-O, and uploads only bounded logs and the binary. Its long-lived host
+is defense in depth rather than VM isolation, so it must run under a dedicated,
+credential-empty macOS account.
+
 Every Sandbox registers its exact runner ID under the run before container work
 starts. An authenticated termination first writes a run tombstone, terminates the
 Workflow, then reconciles every registered Sandbox across three teardown sweeps;
@@ -217,15 +239,22 @@ tombstones every 30 seconds and bounds transient connection retries. Timeout
 cleanup terminates the command process group, drains the capture FIFOs, and
 retains the early diagnostic before recording a typed timeout failure. Snapshot
 creation and log finalization have a separate five-minute Workflow margin beyond
-each command timeout. The pinned
-`@cloudflare/ci` 0.1.0 package is patched by `postinstall` to provide this
-behavior until the runner exposes the same R2 log sink upstream. Runner images
-also pin Node 22.15.0, both Python interpreters, the Rust and MSRV toolchains,
-and every installed Cargo utility; a floating package-manager runtime cannot
-silently change the gate.
+each command timeout. The pinned `@cloudflare/ci` 0.1.0 package is patched by
+`postinstall` to provide this behavior until the runner exposes the same R2 log
+sink upstream. The pinned `@cloudflare/sandbox` 0.12.1 client is patched at the
+same trusted install boundary: it derives a distinct control token for each
+Sandbox Durable Object, passes it only to the root container server, and
+authenticates every control request. The image pins and patches the exact
+upstream server bytes so all process, file, backup, RPC, and WebSocket routes
+except static health/version reads require that token. Repository commands run
+as a dedicated unprivileged UID through an empty, explicit environment, cannot
+read the root server environment, and are reaped UID-wide before log or
+snapshot credentials can be used. Runner images also pin Node 22.15.0, both
+Python interpreters, the Rust and MSRV toolchains, and every installed Cargo
+utility; a floating package-manager runtime cannot silently change the gate.
 
 For a local run, start OrbStack or another Docker-compatible engine, put the
-four development-only CI values in the repository `.env`, and run
+development-only CI capabilities in the repository `.env`, and run
 `npm run dev:ci` from this directory. The command rebuilds the development
 Worker, explicitly enables both container-backed Durable Objects, and serves
 the dashboard plus source API at `http://127.0.0.1:8787/ci`. The explicit
@@ -233,8 +262,12 @@ container opt-in is required because the normal visual-development loop keeps
 containers disabled for startup speed.
 
 Create both buckets, configure S3 API credentials scoped only to the backup
-bucket, and set separate source-publication and Workflow-control tokens before
-the first deployment:
+bucket, and set distinct master-source, PR-source, control, macOS-runner,
+release, Git-mirror, and Sandbox-control tokens before the first deployment.
+The values are capabilities and must not be reused across roles. The Sandbox
+control secret must be exactly 32 random bytes encoded as 64 lowercase hex
+characters; the client derives the per-Sandbox value without exposing this
+root secret to repository code.
 
 ```bash
 cd web
@@ -244,8 +277,14 @@ npx wrangler r2 bucket lifecycle add nanocodex-ci ci-backups backups/ --expire-d
 npx wrangler r2 bucket lifecycle add nanocodex-ci ci-cache cache/ --expire-days 31 --force
 npx wrangler r2 bucket lifecycle add nanocodex-ci ci-artifacts artifacts/ --expire-days 90 --force
 npx wrangler r2 bucket lifecycle add nanocodex-ci ci-runs runs/ --expire-days 90 --force
-npx wrangler secret put CI_SOURCE_WRITE_TOKEN
+npx wrangler r2 bucket lifecycle list nanocodex-ci
+npx wrangler secret put CI_MASTER_SOURCE_WRITE_TOKEN
+npx wrangler secret put CI_PR_SOURCE_WRITE_TOKEN
 npx wrangler secret put CI_CONTROL_TOKEN
+npx wrangler secret put CI_MACOS_RUNNER_TOKEN
+npx wrangler secret put CI_RELEASE_TOKEN
+npx wrangler secret put NANOCODEX_SANDBOX_CONTROL_TOKEN
+npx wrangler secret put GIT_MIRROR_TOKEN
 npx wrangler secret put R2_ACCESS_KEY_ID
 npx wrangler secret put R2_SECRET_ACCESS_KEY
 npm run deploy
@@ -253,68 +292,229 @@ npm run deploy
 
 Sandbox TTLs are restore-time checks, not physical deletion. The four
 lifecycle rules above are therefore required to bound backup, cache-pointer,
-content-addressed artifact, and run-evidence storage. The Durable Object separately removes source objects
-when their terminal run ages out of the retained 100-run index. Development
+content-addressed artifact, and run-evidence storage. The CI repository keeps
+100 run records and separately retires unreferenced source archives; the macOS
+broker pages through attempt/job cleanup seven days after terminal completion.
+Keep R2's default automatic abort of incomplete multipart uploads after seven
+days (or configure a shorter bound). Durable multipart-create recovery waits
+for that bound before replacing a create whose acknowledgement was lost.
+Stable release objects intentionally have no expiration. Development
 uses `nanocodex-ci-development` and `nanocodex-ci-source-development`; create
 those buckets and configure separate `--env development` secrets rather than
-reusing production credentials or cache state.
+reusing production credentials or cache state. Generate each Sandbox-control
+value with `openssl rand -hex 32`; never reuse the production value in
+development.
 
-Publish the RustSec snapshot and lockfile-addressed Git dependency bundle, then
-publish a clean committed `master` checkout from the trusted machine. Neither
-dependency publisher contacts a remote: the RustSec publisher rematerializes
-the selected commit through a local shallow fetch into a fresh sanitized Git
-repository, while the Cargo publisher verifies that every required cached Git
-checkout is the exact clean lockfile revision before packing it in offline
-mode. Publisher subprocesses receive no CI publication token. Existing immutable
-objects are reused without rebuilding or uploading bytes.
+Distribution Workflow writes first use the separate `distribution-staging/`
+namespace. The release ledger registers the exact bounded key set before a
+runner writes, creates the complete draft before promoting any immutable final
+key, and durably collects abandoned staging after seven days. Do not add an R2
+lifecycle rule over `distribution/` or the public release namespaces; finalized
+assets are intentionally permanent.
+
+Retain the production `lifecycle list` output with the deployment evidence and
+verify that no rule covers `distribution/`, `release-import/`, or public
+release assets. A configuration file is not proof that the account accepted the
+rules.
+
+Install the trusted controllers as LaunchAgents from two distinct, dedicated
+macOS login accounts. Exactly four local identities form the service boundary:
+the master-controller login, the PR-controller login, the non-login
+credential-empty PR preparation account, and the macOS-runner login. No two may
+resolve to the same passwd identity. Each controller installer rejects the
+other controller's loaded service, LaunchAgent, state directory, or role
+Keychain metadata and also rejects the macOS runner's loaded service,
+LaunchAgent, state directory, or runner Keychain metadata. The runner installer
+performs the inverse checks against both controllers. These probes request only
+existence/metadata, never token values, and fail closed on unreadable or
+ambiguous `launchctl`, filesystem, or Keychain results. Remove stale artifacts
+from the wrong account before installing; their presence is co-location, not a
+migration request.
+
+The PR controller additionally requires the separately provisioned non-login
+preparation identity and rejects a `--prep-user` whose username or UID is the
+current controller role. Its only entrypoint is the root-owned
+`/Library/PrivilegedHelperTools/dev.nanocodex.ci-pr-cargo-builder` byte-for-byte
+matching the trusted checkout, through the installer's exact
+`NOPASSWD:NOSETENV` sudo rule. That helper invokes only the separately reviewed
+Cargo 1.98.0 binary at
+`/Library/PrivilegedHelperTools/dev.nanocodex.ci-cargo`; the PR controller pins
+its exact SHA-256 on every install and update. The installer validates these
+boundaries but never creates the account, Cargo binary, or sudoers entry. Its
+generated root payload embeds the already-opened, reviewed builder bytes, so
+root never follows a controller-owned checkout path. Run each controller
+command as its target login user, with a fixed clean checkout and a canonical
+Node binary outside that checkout. For PR, the selected Node executable is also
+part of the sudo boundary: root provisions it as a singly linked,
+root-owned/root-group global executable under a complete root-owned/root-group
+ancestor chain. The file and every ancestor are real (no symlink component),
+have no ACL, and are non-group/world-writable. A controller-owned Node or a
+Homebrew convenience symlink is rejected. Install, update, startup, and status
+pin and recheck its exact path, device/inode, size, SHA-256, owner, mode, link
+count, and `node/darwin/<arch>` identity before and after the exact sudo probes,
+so the preparation account cannot replace the authorized pathname:
 
 ```bash
-NANOCODEX_CI_ORIGIN=https://nanocodex.me-7fb.workers.dev \
-NANOCODEX_CI_TOKEN=... \
-NANOCODEX_RUSTSEC_REPO=/path/to/advisory-db \
-npm run publish:ci-rustsec
+# Dedicated master-controller account.
+npm run ci:install-controller-service -- install \
+  --role master \
+  --origin https://nanocodex.me-7fb.workers.dev \
+  --node /absolute/path/to/node \
+  --repo /absolute/path/to/nanocodex \
+  --rustsec-repo /absolute/path/to/advisory-db \
+  --cloudflare-account-id 7fb82fc3b80331b2cd45f097acbd9ffc
 
-NANOCODEX_CI_ORIGIN=https://nanocodex.me-7fb.workers.dev \
-NANOCODEX_CI_TOKEN=... \
-npm run publish:ci-cargo-vendor
-
-NANOCODEX_CI_ORIGIN=https://nanocodex.me-7fb.workers.dev \
-NANOCODEX_CI_TOKEN=... \
-NANOCODEX_RUSTSEC_REVISION=<full-published-advisory-db-commit> \
-npm run publish:ci-source
+# Different dedicated PR-controller account.
+npm run ci:install-controller-service -- install \
+  --role pr \
+  --origin https://nanocodex.me-7fb.workers.dev \
+  --node /root-provisioned/no-symlink/path/to/node \
+  --repo /absolute/path/to/nanocodex \
+  --prep-user nanocodex-ci-pr-prep \
+  --cargo-sha256 <reviewed-cargo-1.98.0-sha256>
 ```
+
+The installer prompts directly into per-role Keychain items; no token enters a
+plist, argv, or file. Each controller plist names `/usr/bin/env` as its first
+executable and passes `-i` before the wrapper path, so no shell instruction can
+observe launchd's ambient environment; the wrapper repeats that empty boundary
+before constructing its exact role allowlist. Master loads exactly the
+source-publication, GitHub status, Cloudflare deploy, and Git-mirror
+capabilities. PR loads only source publication and GitHub status. The
+preparation account has no Keychain, login session, agent, runner token, shared
+writable group, controller role, or access to either controller's state. Never
+reuse either controller identity or the authenticated macOS runner account, and
+never `chown` a PR checkout across this boundary. `status`, `update`, and
+`uninstall` use the same command with `--role`;
+PR install/update also supplies
+`--prep-user` and `--cargo-sha256`; `update --replace-secrets` rotates the exact
+allowlist. The prep account must be a local locked non-login account with a
+unique same-name primary group, no shared or nested membership, a root-owned
+`/var/empty` home boundary, and no authentication, admin, Keychain, or service
+role. Its complete `LC_ALL=C sudo -n -l` output must contain only the builder's
+`--probe` and `--build` commands plus `timestamp_timeout=0`; inherited or group
+grants fail closed.
+Process status is not proof of a successful reconciliation, so production
+health also requires a recent retained master run and matching live deployment.
+Before a credentialed child starts, the master controller runs the trusted
+Node distribution's npm CLI with lifecycle scripts disabled, explicitly applies
+the committed `@cloudflare/ci` patch, and fingerprints the complete installed
+toolchain. It rechecks that fingerprint and authoritative `master` before every
+publication or promotion boundary. If `master` advances during a long fetch,
+CI wait, deploy, or verification, the old head receives no terminal status and
+the controller immediately reconciles the replacement.
+
+Install the Apple Silicon executor from a third dedicated arm64 macOS login
+account (the fourth identity overall, because the PR preparation account is
+non-login):
+
+```bash
+rustup toolchain install 1.98.0 --profile minimal
+npm run ci:install-macos-service -- install \
+  --origin https://nanocodex.me-7fb.workers.dev \
+  --runner-id macos-arm64-1 \
+  --node /absolute/path/to/node
+```
+
+Its Keychain contains only the value configured in the Worker as
+`CI_MACOS_RUNNER_TOKEN`. Do not expose GitHub, SSH-agent, cloud, deploy, or
+registry credentials to that account. Its plist names `/usr/bin/env` as the
+first executable and passes `-i` plus only fixed `HOME`, `USER`, `LOGNAME`,
+system `PATH`, private service `TMPDIR`, locale, and UID-derived macOS text
+encoding values before the wrapper's shebang interpreter can start. The wrapper
+rejects malformed or directly contaminated invocation, starts its
+credential-free log monitor before reading Keychain, and validates the final
+token-bearing Node environment as an exact allowlist. `NODE_OPTIONS`,
+`NODE_PATH`, shell startup hooks, `DYLD_*`/`LD_*`, SSH, GitHub, cloud, release,
+R2, and controller authority therefore never reach the monitor or runner Node.
+The token remains in Keychain and the inherited environment only; it is never
+placed in a plist, argv, or file. The runner resolves the exact
+`1.98.0-aarch64-apple-darwin` toolchain by canonical path; a floating `stable`
+alias cannot change macOS CI or release bytes. All three LaunchAgents require
+their dedicated Aqua users to remain logged in.
+
+The individual source publishers remain available as focused recovery tools.
+The master controller builds a deterministic vendor bundle in a token-free
+phase. The PR controller sends only the exact public PR/base/merge identity to
+the fixed helper, which fetches and vendors under the preparation UID and
+returns a bounded checksum-framed bundle. The controller rechecks GitHub, then
+an upload-only process receives the opened frame plus source authority; that
+process cannot invoke Git or Cargo. Objects are keyed by both the `Cargo.lock`
+blob and reproduced bundle SHA-256, so a PR first-write can never become a
+master cache choice.
+To repair only an obsolete Cloudflare repository-publication shape after the
+current Worker is already live at the exact authoritative head, stop the master
+LaunchAgent and run `npm run ci:controller -- repair-repository <full-sha>` from
+that service account. The same process lock proves local `HEAD`, GitHub master,
+live Worker health, and the requested SHA before exposing only mirror authority;
+it cannot deploy, run CI, or post a status.
+
+### Authority cutover
+
+Keep every GitHub Actions workflow active until one deployed commit has retained
+proof of a green master wave, an exact two-parent PR merge wave, PR
+supersession/close cancellation, the real macOS gate, immutable artifacts, and
+the deploy-plus-repository attestation. Then make the single GitHub status
+context `ci success` required on `master` and prove that a failing native gate
+blocks a merge before retiring `ci.yml`.
+
+Do not push a stable tag while the broad tag-triggered `release.yml` is active;
+it can irreversibly race the reviewed Cloudflare registry publication. Disable
+that trigger first and retain only the exact-byte compatibility bridge described
+in `docs/RELEASING.md`. Keep the old nightly surface until an old nightly client
+has crossed to the Cloudflare updater. The current CodeQL job scans only Actions
+YAML, so keep it while any Actions workflow remains and remove it with the final
+workflow rather than claiming that RustSec or `cargo deny` is an equivalent
+Actions-language scan.
+
+The former master/manual pkg-pr-new publication and automatic SHA comment are
+intentionally retired. Pull requests resolve their immutable npm and native
+artifacts through `/api/ci/pull-requests/<number>`; normal master artifacts stay
+on their checksum-bound run endpoint.
 
 `GET /api/ci/runs` and `GET /api/ci/runs/<40-hex-commit>` expose the retained
 Workflow/result state. `GET /api/ci/badge.svg` renders the current head's status
-directly from that ledger for the repository badge. Successful bindings and website gates export their
-tested archives directly to immutable, checksum-verified R2 and serve them at
-`GET /api/ci/runs/<40-hex-commit>/artifacts/{web-wasm,web-dist}.tar`; this is the
-owned replacement for a hosted artifact service. Step records and logs are available
+directly from that ledger for the repository badge. Successful bindings,
+website, npm, and native gates export tested artifacts directly to immutable,
+checksum-verified R2. They are served below the run's `/artifacts/` path; this
+is the owned replacement for a hosted artifact service. Step records and logs are available
 under `GET /api/ci/runs/<commit>/steps/<step>/{result.json,stdout.log,stderr.log}`.
 An authenticated `POST` request to
 the latter path's `/terminate` action uses `CI_CONTROL_TOKEN`. Runs are not
 restarted in place because commit-addressed evidence is immutable; publish a
-new commit for a new run. The publisher's
-`NANOCODEX_CI_TOKEN` must contain the value configured as
-`CI_SOURCE_WRITE_TOKEN`. The archive URL is
+new commit for a new run. The master publisher's `NANOCODEX_CI_TOKEN` must
+contain the value configured as `CI_MASTER_SOURCE_WRITE_TOKEN`; the PR
+publisher receives only `CI_PR_SOURCE_WRITE_TOKEN`. The two values are
+deliberately non-compatible. Both roles may upload immutable public source and
+Cargo-vendor objects, but only the master role can publish master or RustSec
+state and only the PR role can mutate pull-request state. Archive URLs are
 public and commit-addressed because this is a public source repository; write
 authority and R2 backup credentials never enter a runner or checkout URL.
 
-This Worker pipeline covers every current Linux test, quality, policy,
-VM-guest, browser/WASM, Python, and website gate. Cloudflare Containers are
-Linux-only, so the existing macOS matrix entry cannot run on this substrate;
-the CodeQL workflow scan, production promotion, release, and nightly workflows
-are outside this first CI slice. Every run pins the exact RustSec
-revision and owned archive checksum, verifies the extracted Git checkout, and
-runs `cargo deny --frozen check`; neither the policy gate nor cold Cargo setup
-contacts GitHub.
+`GET /api/ci/pull-requests/<number>` resolves the current open PR's exact tested
+merge, SHA-256-bound two-platform native manifest, and a separate npm preview
+whose version is `0.0.0-preview-<tested-merge-sha>`. The normal tested
+`npm-package.tgz` remains unchanged and is the only npm input accepted by stable
+or nightly release staging. Stable and nightly release manifests and assets are
+served under `/api/releases`; see `docs/RELEASING.md` for the staged
+registry/publication boundary.
+
+The pipeline covers the complete stable/MSRV Rust suites, rustfmt, warnings-
+denied Clippy and rustdoc, dependency and crate-boundary policy, spelling,
+static VM guest, Node/browser/WASM, Python 3.11/3.14, website, Linux native CLI,
+and authenticated macOS workspace/native CLI gates. Every run pins the exact
+RustSec revision and owned archive checksum, verifies the extracted Git
+checkout, and runs `cargo deny --frozen check`. The scheduled nightly and
+reviewed stable release paths consume only green master evidence. Production
+promotion consumes the exact tested web artifact rather than rebuilding it.
 
 Production serves the website indexes, immutable file and patch objects, and a
 read-only Git protocol-v2 endpoint from that publication. Clone the mirror with
-`git clone https://nanocodex.me-7fb.workers.dev/git`. This CI slice deliberately
-stops at the checksum-addressed tested deployment tar; it does not deploy or
-publish production state. Promotion can consume that exact artifact later
-without adding GitHub to the CI runtime.
+`git clone https://nanocodex.me-7fb.workers.dev/git`. After a green current
+master run, the trusted controller checks authoritative master before and after
+deployment and mirror publication, then proves `/api/health`, the public
+repository snapshot, and protocol-v2 Git refs all attest the same commit before
+posting success to GitHub.
 
 Each browser thread owns an OPFS working tree and an `origin` Cloudflare Git
 remote on branch `nanocodex`. The Files and Commits surfaces read that thread's
@@ -438,9 +638,8 @@ event accumulator bounded under a 20,000-delta burst and covers assistant,
 reasoning, and tool lifecycle updates.
 
 The homepage also exposes the release contract: the checksum-verifying install
-command, in-place `nanocodex update`, the crates.io SDK entry point, and links
-to the latest GitHub Release and grouped conventional-commit changelog. GitHub
-release notes also credit each pull request contributor.
+command, in-place `nanocodex update`, the crates.io SDK entry point, the
+Worker-owned `latest` manifest, and the conventional-commit changelog.
 
 Navigation stays available whenever an input is not active: `H`, `T`, `C`, `R`,
 and `E` switch between Home, Code, Commits, Requests, and Evals. The repository
@@ -450,17 +649,19 @@ scrolling are left to Pierre CodeView and the browser's native input behavior.
 
 ## Production
 
-Production promotion is intentionally separate from the Cloudflare-native CI
-slice above. CI validates and retains the complete tested deployment graph but
-does not mutate the hosted Worker. Local commands build and preview it:
+The trusted master controller owns normal production promotion. It installs the
+exact checksum-verified `web-dist.tar` from the green run, deploys that already-
+built graph, publishes the repository mirror, and marks `ci success` only after
+all live attestations match. Local commands remain useful for development:
 
 ```bash
 npm run build
 npm run preview
 ```
 
-For a break-glass production deployment, start from a clean commit and preserve
-the same attestation contract before running `publish:repository`:
+For a break-glass deployment, stop or disable the master LaunchAgent first,
+start from a clean authoritative `master` commit, and preserve the same
+deployment-before-mirror ordering:
 
 ```bash
 npm run deploy

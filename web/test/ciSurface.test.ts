@@ -7,6 +7,7 @@ const main = source("../src/main.tsx");
 const routeLoaders = source("../src/routeLoaders.ts");
 const ci = source("../src/Ci.tsx");
 const css = source("../src/ci.css");
+const readme = source("../README.md");
 
 test("CI is a direct, themed application surface", () => {
   assert.match(main, /preloadDirectSurface\(directUrl\)/);
@@ -21,7 +22,9 @@ test("CI is a direct, themed application surface", () => {
 
 test("CI presents the complete Worker pipeline without transient loading UI", () => {
   assert.match(ci, /Cloudflare-native CI/);
-  assert.equal([...ci.matchAll(/\[\s*"[a-z0-9-]+",/g)].length, 15);
+  assert.equal([...ci.matchAll(/\[\s*"[a-z0-9-]+",/g)].length, 17);
+  assert.match(ci, /authenticated Apple Silicon tests and verified arm64 binary/);
+  assert.match(ci, /without GitHub Actions/);
   assert.match(ci, /\{gates\.length\} gates\. One source\./);
   assert.doesNotMatch(ci, /Loading|spinner|aria-busy|connecting|waiting/);
 });
@@ -40,6 +43,27 @@ test("CI preserves complete state while polling and exposes truthful gate progre
   assert.match(ci, /status === "running"/);
   assert.match(ci, /status === "terminated"/);
   assert.match(ci, /not started/);
+});
+
+test("CI operations document four isolated macOS identities", () => {
+  assert.match(readme, /fourth identity/);
+  assert.match(
+    readme,
+    /\/Library\/PrivilegedHelperTools\/dev\.nanocodex\.ci-pr-cargo-builder/,
+  );
+  assert.match(readme, /NOPASSWD:NOSETENV/);
+  assert.match(readme, /--prep-user nanocodex-ci-pr-prep/);
+  assert.match(readme, /upload-only process/);
+  assert.doesNotMatch(readme, /controllers first run a credential-free\s+`cargo fetch/);
+});
+
+test("CI cutover keeps authority and retention fail-closed until live proof", () => {
+  assert.match(readme, /r2 bucket lifecycle list nanocodex-ci/);
+  assert.match(readme, /no rule covers `distribution\/`, `release-import\/`/);
+  assert.match(readme, /Keep every GitHub Actions workflow active until/);
+  assert.match(readme, /make the single GitHub status\s+context `ci success` required/);
+  assert.match(readme, /Do not push a stable tag while the broad tag-triggered `release\.yml` is active/);
+  assert.match(readme, /old nightly client\s+has crossed to the Cloudflare updater/);
 });
 
 function source(path: string) {

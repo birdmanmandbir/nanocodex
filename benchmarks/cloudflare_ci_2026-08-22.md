@@ -1,11 +1,15 @@
 # Cloudflare CI baseline — 2026-08-22
 
-This baseline covers the GitHub-free CI implementation in `web/`: immutable
-source publication to R2, a Cloudflare Workflow, Sandbox Containers, the
-Worker-owned run ledger and logs, content-addressed snapshots, and deployable
-artifacts served by the Worker. The local runner was Wrangler on OrbStack with
-12 host CPUs and 16 GiB of memory; Cloudflare's amd64 Sandbox image ran under
-local emulation.
+This historical baseline covers the original Cloudflare Linux executor in
+`web/`: immutable source publication to R2, a Cloudflare Workflow, Sandbox
+Containers, the Worker-owned run ledger and logs, content-addressed snapshots,
+and deployable artifacts served by the Worker. GitHub remained the source host,
+and this measurement predates the trusted master/PR controllers, GitHub status
+bridge, authenticated macOS runner, native PR artifacts, production promotion,
+and stable/nightly R2 release ledger. The local runner was Wrangler on OrbStack
+with 12 host CPUs and 16 GiB of memory; Cloudflare's amd64 Sandbox image ran
+under local emulation. Do not treat these numbers as a cold-production parity
+measurement of the completed replacement.
 
 ## End-to-end evidence
 

@@ -88,18 +88,30 @@ export function assertDeploymentEntry(response) {
   );
 }
 
-export async function deployWorker({
-  fetchImpl = globalThis.fetch,
-  origin = process.env.NANOCODEX_WEB_ORIGIN ?? "https://nanocodex.me-7fb.workers.dev",
-  run = runWrangler,
-} = {}) {
+export function deploymentRevision(explicitRevision) {
+  if (explicitRevision != null && explicitRevision !== "") {
+    assert.match(
+      explicitRevision,
+      /^[0-9a-f]{40}$/,
+      "NANOCODEX_DEPLOYMENT_SHA must be a full commit SHA",
+    );
+    return explicitRevision;
+  }
   const revision = git("rev-parse", "HEAD");
   assert.equal(
     git("rev-parse", "origin/master"),
     revision,
     "refusing to deploy a revision that is not the fetched origin/master",
   );
+  return revision;
+}
 
+export async function deployWorker({
+  fetchImpl = globalThis.fetch,
+  origin = process.env.NANOCODEX_WEB_ORIGIN ?? "https://nanocodex.me-7fb.workers.dev",
+  revision = deploymentRevision(process.env.NANOCODEX_DEPLOYMENT_SHA),
+  run = runWrangler,
+} = {}) {
   const uploaded = await run(uploadArguments(revision));
   const workerVersionId = parseWorkerVersionId(uploaded);
   await run(rolloutArguments(workerVersionId));

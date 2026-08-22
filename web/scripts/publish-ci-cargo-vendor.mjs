@@ -1,608 +1,723 @@
-import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
-import {
-  lstat,
-  mkdtemp,
-  readFile,
-  readdir,
-  readlink,
-  realpath,
-  rm,
-  stat,
-  writeFile,
-} from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { createReadStream, fstatSync, readSync } from "node:fs";
 import { Readable } from "node:stream";
-import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
-import { deflateRawSync } from "node:zlib";
+import { dirname, resolve } from "node:path";
 
-const execFileAsync = promisify(execFile);
 const scriptPath = fileURLToPath(import.meta.url);
-const projectRoot = resolve(dirname(scriptPath), "..");
-const maximumBundleBytes = 16 * 1024 * 1024;
-const maximumTarBytes = 128 * 1024 * 1024;
-const maximumCommandOutputBytes = 16 * 1024 * 1024;
-const maximumErrorBytes = 1_000;
-const cargoHomeVendor = "/workspace/.cargo-home/vendor";
 const sha1Pattern = /^[a-f0-9]{40}$/;
 const sha256Pattern = /^[a-f0-9]{64}$/;
+const maximumBundleBytes = 256 * 1024 * 1024;
+const maximumDescriptorBytes = 16 * 1024;
+const multipartPartBytes = 32 * 1024 * 1024;
+const maximumErrorBytes = 1_000;
+const frameMagic = Buffer.from("NANOCODEX-CI-CARGO-VENDOR\0", "ascii");
+const frameVersion = 1;
+const artifactFd = 3;
+const uuidV4Pattern = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
+const defaultRequestTimeoutMs = 60_000;
+const maximumRequestTimeoutMs = 120_000;
+const defaultCleanupTimeoutMs = 750;
+const maximumCleanupTimeoutMs = 5_000;
+const defaultRetryDelayCapMs = 1_000;
+const maximumRetryDelayCapMs = 5_000;
+const multipartCreateAttempts = 3;
+const completionSignalRecoveryMs = 350;
 
-export async function main({ env = process.env, log = console.log } = {}) {
-  const repository = resolve(env.NANOCODEX_REPO ?? resolve(projectRoot, ".."));
+export const cargoVendorFrame = Object.freeze({
+  magic: Buffer.from(frameMagic),
+  version: frameVersion,
+  maximumDescriptorBytes,
+  maximumBundleBytes,
+  maximumTotalBytes:
+    frameMagic.length + 8 + maximumDescriptorBytes + maximumBundleBytes,
+});
+
+export function canonicalJson(value) {
+  return JSON.stringify(canonicalValue(value));
+}
+
+export function deterministicMultipartRequestId(descriptor) {
+  const immutable = canonicalJson(validateDescriptor(descriptor));
+  const bytes = createHash("sha256")
+    .update("nanocodex-ci-cargo-vendor-multipart-v1\0", "utf8")
+    .update(immutable, "utf8")
+    .digest()
+    .subarray(0, 16);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-` +
+    `${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function canonicalValue(value) {
+  if (Array.isArray(value)) return value.map(canonicalValue);
+  if (value && typeof value === "object") {
+    const result = {};
+    for (const key of Object.keys(value).sort()) result[key] = canonicalValue(value[key]);
+    return result;
+  }
+  return value;
+}
+
+export function validateDescriptor(value) {
+  if (!record(value) || value.version !== 1) throw new Error("invalid Cargo vendor descriptor");
+  const common =
+    sha1Pattern.test(value.cargoLockBlob) && sha256Pattern.test(value.sha256) &&
+    Number.isSafeInteger(value.size) && value.size > 0 && value.size <= maximumBundleBytes &&
+    value.key === `cargo-vendor/${value.cargoLockBlob}/${value.sha256}/bundle.tar.gz`;
+  if (!common) throw new Error("invalid Cargo vendor descriptor");
+  const keys = Object.keys(value).sort();
+  if (sameKeys(keys, [
+    "baseHead", "cargoLockBlob", "key", "mergeHead", "number",
+    "pullRequestHead", "sha256", "size", "version",
+  ])) {
+    if (
+      !Number.isSafeInteger(value.number) || value.number <= 0 ||
+      !sha1Pattern.test(value.baseHead) || !sha1Pattern.test(value.pullRequestHead) ||
+      !sha1Pattern.test(value.mergeHead)
+    ) throw new Error("invalid PR Cargo vendor descriptor");
+    return value;
+  }
+  if (sameKeys(keys, ["cargoLockBlob", "head", "key", "sha256", "size", "version"])) {
+    if (!sha1Pattern.test(value.head)) throw new Error("invalid master Cargo vendor descriptor");
+    return value;
+  }
+  throw new Error("invalid Cargo vendor descriptor fields");
+}
+
+export async function readFramedArtifact(fd = artifactFd, {
+  expectedUid = process.getuid?.(),
+  expectedGid = process.getgid?.(),
+  signal,
+} = {}) {
+  if (!Number.isSafeInteger(fd) || fd < 0) throw new Error("invalid Cargo vendor artifact fd");
+  throwIfAborted(signal);
+  const before = validateArtifactIdentity(fstatSync(fd), expectedUid, expectedGid);
+  const fixed = readExactly(fd, 0, frameMagic.length + 8);
+  if (!fixed.subarray(0, frameMagic.length).equals(frameMagic)) {
+    throw new Error("invalid Cargo vendor frame magic");
+  }
+  if (fixed.readUInt32BE(frameMagic.length) !== frameVersion) {
+    throw new Error("unsupported Cargo vendor frame version");
+  }
+  const descriptorLength = fixed.readUInt32BE(frameMagic.length + 4);
+  if (descriptorLength <= 0 || descriptorLength > maximumDescriptorBytes) {
+    throw new Error("invalid Cargo vendor descriptor length");
+  }
+  const descriptorOffset = fixed.length;
+  const descriptorBytes = readExactly(fd, descriptorOffset, descriptorLength);
+  let descriptor;
+  try {
+    descriptor = JSON.parse(descriptorBytes.toString("utf8"));
+  } catch {
+    throw new Error("Cargo vendor descriptor is not JSON");
+  }
+  validateDescriptor(descriptor);
+  if (canonicalJson(descriptor) !== descriptorBytes.toString("utf8")) {
+    throw new Error("Cargo vendor descriptor is not canonical JSON");
+  }
+  const payloadOffset = descriptorOffset + descriptorLength;
+  const exactSize = payloadOffset + descriptor.size;
+  if (before.size !== exactSize) {
+    throw new Error(
+      before.size > exactSize
+        ? "Cargo vendor frame has trailing bytes"
+        : "Cargo vendor frame payload is truncated",
+    );
+  }
+  const hash = createHash("sha256");
+  let size = 0;
+  for await (const chunk of createReadStream("", {
+    fd,
+    autoClose: false,
+    start: payloadOffset,
+    end: exactSize - 1,
+    ...(signal ? { signal } : {}),
+  })) {
+    size += chunk.length;
+    if (size > descriptor.size) throw new Error("Cargo vendor payload exceeds descriptor size");
+    hash.update(chunk);
+  }
+  if (size !== descriptor.size || hash.digest("hex") !== descriptor.sha256) {
+    throw new Error("Cargo vendor payload does not match its descriptor");
+  }
+  const after = validateArtifactIdentity(fstatSync(fd), expectedUid, expectedGid);
+  if (!sameIdentity(before, after)) throw new Error("Cargo vendor artifact changed while parsing");
+  return { descriptor, fd, payloadOffset, identity: after };
+}
+
+export async function main({
+  args = process.argv.slice(2),
+  env = process.env,
+  fd = artifactFd,
+  log = console.log,
+  signal,
+  requestTimeoutMs = defaultRequestTimeoutMs,
+  cleanupTimeoutMs = defaultCleanupTimeoutMs,
+  retryDelayCapMs = defaultRetryDelayCapMs,
+} = {}) {
+  if (args.length !== 0) throw new Error("Cargo vendor uploader accepts no arguments");
+  for (const name of [
+    "NANOCODEX_REPO",
+    "NANOCODEX_CI_CARGO_VENDOR_PATH",
+    "NANOCODEX_CI_CARGO_VENDOR_FD",
+  ]) {
+    if (typeof env[name] === "string" && env[name] !== "") {
+      throw new Error(`Cargo vendor uploader rejects ${name}`);
+    }
+  }
+  const ambientAuthorities = Object.keys(env).filter((name) => {
+    if (["NANOCODEX_CI_ORIGIN", "NANOCODEX_CI_TOKEN"].includes(name)) return false;
+    return name.startsWith("NANOCODEX_") ||
+      /^(?:AWS|CF|CLOUDFLARE|GH|GITHUB|NPM|R2)_/.test(name) ||
+      /(?:^|_)(?:AUTH|CREDENTIAL|PASSWORD|SECRET|SESSION|TOKEN)(?:_|$)/.test(name);
+  });
+  if (ambientAuthorities.length > 0) {
+    throw new Error(
+      "Cargo vendor uploader rejects ambient authorities: " +
+      ambientAuthorities.sort().join(", "),
+    );
+  }
   const origin = parseOrigin(requiredEnvironment(env, "NANOCODEX_CI_ORIGIN"));
   const token = requiredEnvironment(env, "NANOCODEX_CI_TOKEN");
-  const snapshot = await readCargoSnapshot(repository);
-  const existing = await readPublishedBundle(origin, token, snapshot.cargoLockBlob);
-  if (existing) {
-    log(`CI Cargo vendor is current (${snapshot.cargoLockBlob.slice(0, 7)})`);
-    return existing;
-  }
-
-  const temporaryDirectory = await mkdtemp(resolve(tmpdir(), "nanocodex-ci-cargo-vendor-"));
+  validateBoundedInteger(requestTimeoutMs, 1, maximumRequestTimeoutMs, "request timeout");
+  validateBoundedInteger(cleanupTimeoutMs, 1, maximumCleanupTimeoutMs, "cleanup timeout");
+  validateBoundedInteger(retryDelayCapMs, 0, maximumRetryDelayCapMs, "retry delay cap");
+  const shutdown = new AbortController();
+  const operationSignal = signal
+    ? AbortSignal.any([signal, shutdown.signal])
+    : shutdown.signal;
+  const stop = () => shutdown.abort(new DOMException("Cargo vendor uploader stopped", "AbortError"));
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
   try {
-    const gitCheckouts = await readCleanCargoGitCheckouts(snapshot.cargoLock, env);
-    const vendorDirectory = resolve(temporaryDirectory, "vendor");
-    const { stdout } = await runCargo(repository, [
-      "vendor",
-      "--offline",
-      "--locked",
-      "--versioned-dirs",
-      vendorDirectory,
-    ]);
-    const config = cargoGitSourceConfig(stdout, snapshot.cargoLock);
-    const directories = await selectGitVendorDirectories(
-      vendorDirectory,
-      snapshot.cargoLock,
-    );
-    const extraDirectories = await cargoVendorExtraDirectories(
-      snapshot.cargoLock,
-      env,
-      gitCheckouts,
-    );
-    const bundlePath = resolve(temporaryDirectory, "bundle.tar.gz");
-    await buildCargoVendorBundle({
-      bundlePath,
-      config,
-      directories,
-      extraDirectories,
-      vendorDirectory,
-    });
-    const bundle = await describeArtifact(bundlePath);
-    if (bundle.size > maximumBundleBytes) {
-      throw new Error(
-        `CI Cargo vendor bundle is ${bundle.size} bytes; maximum is ${maximumBundleBytes}`,
-      );
-    }
-    await assertCargoSnapshot(repository, snapshot);
-    await assertCleanCargoGitCheckouts(gitCheckouts);
-    const key = cargoVendorKey(snapshot.cargoLockBlob);
-    const response = await authenticatedFetch(
-      `${origin}/api/ci/cargo-vendor/${snapshot.cargoLockBlob}/bundle.tar.gz`,
+    const artifact = await readFramedArtifact(fd, { signal: operationSignal });
+    const { descriptor } = artifact;
+    const requestOptions = { signal: operationSignal, timeoutMs: requestTimeoutMs };
+    const existing = await readPublishedBundle(
+      origin,
       token,
-      {
-        method: "PUT",
-        headers: {
-          "content-length": String(bundle.size),
-          "content-type": "application/gzip",
-          "x-nanocodex-sha256": bundle.sha256,
-        },
-        body: Readable.toWeb(createReadStream(bundle.path)),
-        duplex: "half",
-      },
+      descriptor.cargoLockBlob,
+      descriptor.sha256,
+      requestOptions,
     );
-    if (!response.ok) {
-      throw new Error(await responseError("publish CI Cargo vendor", response));
-    }
-    const published = await response.json().catch(() => undefined);
-    if (
-      published?.key !== key || published?.cargoLockBlob !== snapshot.cargoLockBlob ||
-      published?.size !== bundle.size || published?.sha256 !== bundle.sha256
-    ) throw new Error("publish CI Cargo vendor returned invalid metadata");
-    log(
-      `Published CI Cargo vendor ${snapshot.cargoLockBlob.slice(0, 7)} ` +
-      `(${directories.length} packages, ${bundle.size} bytes)`,
-    );
-    return published;
-  } finally {
-    await rm(temporaryDirectory, { recursive: true, force: true });
-  }
-}
-
-export async function readCargoSnapshot(repository) {
-  const [head, cargoLockBlob, cargoLock, status] = await Promise.all([
-    git(repository, ["rev-parse", "--verify", "HEAD^{commit}"]),
-    git(repository, ["rev-parse", "--verify", "HEAD:Cargo.lock"]),
-    git(repository, ["show", "HEAD:Cargo.lock"]),
-    git(repository, ["status", "--porcelain=v1", "--untracked-files=no"]),
-  ]);
-  if (!sha1Pattern.test(head) || !sha1Pattern.test(cargoLockBlob)) {
-    throw new Error("Git resolved an invalid commit or Cargo.lock blob ID");
-  }
-  if (status !== "") {
-    throw new Error(
-      `CI Cargo vendor publication requires a clean index and tracked worktree:\n` +
-      status.slice(0, 1_000),
-    );
-  }
-  return { head, cargoLockBlob, cargoLock };
-}
-
-export function cargoGitSourceConfig(cargoVendorOutput, cargoLock) {
-  const expected = new Set(gitPackagesFromCargoLock(cargoLock).map(({ source }) =>
-    source.slice(0, source.lastIndexOf("#"))
-  ));
-  if (expected.size === 0) throw new Error("Cargo.lock contains no git source packages");
-  const blocks = parseSourceBlocks(cargoVendorOutput);
-  const gitBlocks = blocks.filter(({ header }) => header.startsWith("[source.\"git+"));
-  const observed = new Set(gitBlocks.map(({ header }) => header.slice(9, -2)));
-  if (observed.size !== expected.size || [...expected].some((source) => !observed.has(source))) {
-    throw new Error("cargo vendor source config does not match Cargo.lock git sources");
-  }
-  for (const block of gitBlocks) {
-    if (!block.lines.includes('replace-with = "vendored-sources"')) {
-      throw new Error(`cargo vendor omitted source replacement in ${block.header}`);
-    }
-  }
-  gitBlocks.sort((left, right) => left.header.localeCompare(right.header));
-  return `${gitBlocks.map(({ header, lines }) => `${header}\n${lines.join("\n")}`)
-    .join("\n\n")}\n\n[source.vendored-sources]\n` +
-    `directory = "${cargoHomeVendor}"\n`;
-}
-
-export async function selectGitVendorDirectories(vendorDirectory, cargoLock) {
-  const expected = new Set(gitPackagesFromCargoLock(cargoLock).map(
-    ({ name, version }) => `${name}-${version}`,
-  ));
-  const entries = await readdir(vendorDirectory, { withFileTypes: true });
-  const selected = [];
-  for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
-    if (!entry.isDirectory() || !isSafeArchivePart(entry.name)) {
-      throw new Error(`cargo vendor produced unsupported entry: ${entry.name}`);
-    }
-    const checksumPath = resolve(vendorDirectory, entry.name, ".cargo-checksum.json");
-    let checksum;
-    try {
-      checksum = JSON.parse(await readFile(checksumPath, "utf8"));
-    } catch (cause) {
-      throw new Error(`cargo vendor produced an invalid checksum for ${entry.name}`, { cause });
-    }
-    if (checksum?.package === null) selected.push(entry.name);
-    else if (typeof checksum?.package !== "string" || !sha256Pattern.test(checksum.package)) {
-      throw new Error(`cargo vendor produced an invalid package checksum for ${entry.name}`);
-    }
-  }
-  const observed = new Set(selected);
-  if (observed.size !== expected.size || [...expected].some((name) => !observed.has(name))) {
-    throw new Error("vendored git package directories do not match Cargo.lock");
-  }
-  return selected;
-}
-
-export async function buildCargoVendorBundle({
-  bundlePath,
-  config,
-  directories,
-  extraDirectories = [],
-  vendorDirectory,
-}) {
-  const entries = [{ path: "config.toml", type: "file", mode: 0o644, body: Buffer.from(config) }];
-  entries.push({ path: "vendor/", type: "directory", mode: 0o755 });
-  for (const directory of [...directories].sort()) {
-    await collectArchiveEntries(
-      resolve(vendorDirectory, directory),
-      `vendor/${directory}`,
-      entries,
-    );
-  }
-  for (const { sourcePath, archivePath } of extraDirectories) {
-    if (!isSafeArchivePart(archivePath)) {
-      throw new Error(`unsafe Cargo vendor extra path: ${archivePath}`);
-    }
-    await collectArchiveEntries(sourcePath, archivePath, entries);
-  }
-  entries.sort((left, right) => left.path.localeCompare(right.path));
-  const tar = createTar(entries);
-  if (tar.byteLength > maximumTarBytes) {
-    throw new Error(`CI Cargo vendor tar exceeds ${maximumTarBytes} bytes`);
-  }
-  await writeFile(bundlePath, deterministicGzip(tar));
-}
-
-export async function cargoVendorExtraDirectories(
-  cargoLock,
-  env = process.env,
-  cleanCheckouts,
-) {
-  const dependency = gitPackagesFromCargoLock(cargoLock).find(
-    ({ name }) => name === "krun-init-blob",
-  );
-  if (!dependency) return [];
-  const commit = dependency.source.slice(dependency.source.lastIndexOf("#") + 1);
-  if (!sha1Pattern.test(commit)) {
-    throw new Error("krun-init-blob has an invalid Git commit in Cargo.lock");
-  }
-  const checkouts = cleanCheckouts ?? await readCleanCargoGitCheckouts(cargoLock, env);
-  const checkout = checkouts.find((candidate) => candidate.revision === commit)?.path;
-  if (!checkout) throw new Error(`missing verified krun-init checkout for ${commit}`);
-  const init = resolve(checkout, "init");
-  if (!(await stat(resolve(init, "Cargo.toml"))).isFile()) {
-    throw new Error(`verified krun-init checkout ${commit} has no init/Cargo.toml`);
-  }
-  return [{ sourcePath: init, archivePath: "init" }];
-}
-
-export async function readCleanCargoGitCheckouts(cargoLock, env = process.env) {
-  const cargoHome = env.CARGO_HOME?.trim() ||
-    (env.HOME?.trim() ? resolve(env.HOME, ".cargo") : "");
-  if (!cargoHome) throw new Error("CARGO_HOME or HOME is required to verify Cargo Git sources");
-  const root = resolve(cargoHome, "git/checkouts");
-  const repositories = await readdir(root, { withFileTypes: true }).catch(() => []);
-  const revisions = [...new Set(gitPackagesFromCargoLock(cargoLock).map(({ source }) =>
-    source.slice(source.lastIndexOf("#") + 1)
-  ))].sort();
-  const checkouts = [];
-  for (const revision of revisions) {
-    if (!sha1Pattern.test(revision)) {
-      throw new Error(`Cargo.lock contains an invalid Git revision: ${revision}`);
-    }
-    const matches = [];
-    for (const repository of repositories) {
-      if (!repository.isDirectory()) continue;
-      const candidate = resolve(root, repository.name, revision.slice(0, 7));
-      try {
-        if (!(await lstat(candidate)).isDirectory()) continue;
-        if (await git(candidate, ["rev-parse", "--verify", "HEAD^{commit}"]) === revision) {
-          matches.push(await realpath(candidate));
-        }
-      } catch {
-        continue;
+    let published;
+    if (existing) {
+      if (!matchesPublishedDescriptor(existing, descriptor)) {
+        throw new Error("published Cargo vendor differs from framed artifact");
       }
+      published = existing;
+    } else {
+      published = await publishMultipartBundle(origin, token, artifact, {
+        signal: operationSignal,
+        requestTimeoutMs,
+        cleanupTimeoutMs,
+        retryDelayCapMs,
+      });
     }
-    if (matches.length !== 1) {
-      throw new Error(`expected one cached Cargo Git checkout for ${revision}, found ${matches.length}`);
+    if (!matchesPublishedDescriptor(published, descriptor)) {
+      throw new Error("Cargo vendor upload returned mismatched metadata");
     }
-    checkouts.push(await cleanCargoGitCheckout(matches[0], revision));
-  }
-  return checkouts;
-}
-
-async function cleanCargoGitCheckout(path, revision) {
-  const gitDirectory = await lstat(resolve(path, ".git")).catch(() => undefined);
-  if (!gitDirectory?.isDirectory() || gitDirectory.isSymbolicLink()) {
-    throw new Error(`Cargo Git checkout ${revision} must own its .git directory`);
-  }
-  await assertSafeLocalGitConfig(path, revision);
-  const [head, tree, topLevel, status] = await Promise.all([
-    git(path, ["rev-parse", "--verify", "HEAD^{commit}"]),
-    git(path, ["rev-parse", "--verify", "HEAD^{tree}"]),
-    git(path, ["rev-parse", "--show-toplevel"]),
-    git(path, [
-      "status",
-      "--porcelain=v1",
-      "--untracked-files=all",
-      "--ignored=matching",
-      "--ignore-submodules=none",
-    ]),
-  ]);
-  const unexpected = status.split("\n").filter((line) => line !== "" && line !== "?? .cargo-ok");
-  if (
-    head !== revision || !sha1Pattern.test(tree) ||
-    await realpath(topLevel) !== path || unexpected.length > 0
-  ) {
-    throw new Error(
-      `Cargo Git checkout ${revision} is dirty or mismatched:\n` +
-      unexpected.join("\n").slice(0, maximumErrorBytes),
+    const after = validateArtifactIdentity(
+      fstatSync(fd),
+      process.getuid?.(),
+      process.getgid?.(),
     );
-  }
-  return { path, revision, tree };
-}
-
-async function assertCleanCargoGitCheckouts(expected) {
-  for (const checkout of expected) {
-    const observed = await cleanCargoGitCheckout(checkout.path, checkout.revision);
-    if (observed.tree !== checkout.tree) {
-      throw new Error(`Cargo Git checkout ${checkout.revision} changed during publication`);
+    if (!sameIdentity(artifact.identity, after)) {
+      throw new Error("Cargo vendor artifact changed during upload");
     }
+    log(canonicalJson(descriptor));
+    return descriptor;
+  } finally {
+    process.removeListener("SIGINT", stop);
+    process.removeListener("SIGTERM", stop);
   }
 }
 
-export async function readPublishedBundle(origin, token, cargoLockBlob) {
+export async function readPublishedBundle(
+  origin,
+  token,
+  cargoLockBlob,
+  bundleSha256,
+  { signal, timeoutMs = defaultRequestTimeoutMs } = {},
+) {
+  if (!sha1Pattern.test(cargoLockBlob) || !sha256Pattern.test(bundleSha256)) {
+    throw new Error("invalid Cargo vendor identity");
+  }
   const response = await authenticatedFetch(
-    `${origin}/api/ci/cargo-vendor/${cargoLockBlob}/bundle.tar.gz`,
+    `${origin}/api/ci/cargo-vendor/${cargoLockBlob}/${bundleSha256}/bundle.tar.gz`,
     token,
-    { method: "HEAD" },
+    { method: "HEAD", redirect: "error", signal },
+    { timeoutMs },
   );
-  if (response.status === 404) return null;
-  if (!response.ok) throw new Error(await responseError("read CI Cargo vendor", response));
+  if (response.status === 404) {
+    await response.body?.cancel();
+    return null;
+  }
+  if (!response.ok) {
+    throw new Error(await responseError("inspect CI Cargo vendor", response, token));
+  }
+  const size = parseCanonicalInteger(response.headers.get("content-length"));
+  const observedLock = response.headers.get("x-nanocodex-cargo-lock");
   const key = response.headers.get("x-nanocodex-key");
   const sha256 = response.headers.get("x-nanocodex-sha256");
-  const size = Number(response.headers.get("content-length"));
+  await response.body?.cancel();
   if (
-    key !== cargoVendorKey(cargoLockBlob) ||
-    response.headers.get("x-nanocodex-cargo-lock") !== cargoLockBlob ||
-    !sha256Pattern.test(sha256 ?? "") ||
-    !Number.isSafeInteger(size) || size <= 0 || size > maximumBundleBytes
-  ) throw new Error("read CI Cargo vendor returned invalid metadata");
-  return { key, cargoLockBlob, sha256, size };
+    size == null || size <= 0 || size > maximumBundleBytes || observedLock !== cargoLockBlob ||
+    sha256 !== bundleSha256 || key !== cargoVendorKey(cargoLockBlob, bundleSha256)
+  ) throw new Error("published CI Cargo vendor returned invalid exact-object metadata");
+  return { key, cargoLockBlob, size, sha256, uploaded: false };
 }
 
-function parseSourceBlocks(output) {
-  const lines = output.replaceAll("\r\n", "\n").split("\n");
-  const blocks = [];
-  let current;
-  for (const line of lines) {
-    if (/^\[source\.[^\]]+\]$/.test(line)) {
-      if (current) blocks.push(current);
-      current = { header: line, lines: [] };
-    } else if (current && line.startsWith("[")) {
-      blocks.push(current);
-      current = undefined;
-    } else if (current && line.trim() !== "") {
-      current.lines.push(line.trimEnd());
-    }
+export async function publishMultipartBundle(origin, token, artifact, {
+  signal,
+  requestTimeoutMs = defaultRequestTimeoutMs,
+  cleanupTimeoutMs = defaultCleanupTimeoutMs,
+  retryDelayCapMs = defaultRetryDelayCapMs,
+} = {}) {
+  validateBoundedInteger(
+    requestTimeoutMs,
+    1,
+    maximumRequestTimeoutMs,
+    "request timeout",
+  );
+  validateBoundedInteger(cleanupTimeoutMs, 1, maximumCleanupTimeoutMs, "cleanup timeout");
+  validateBoundedInteger(retryDelayCapMs, 0, maximumRetryDelayCapMs, "retry delay cap");
+  const descriptor = validateDescriptor(artifact?.descriptor);
+  const identity = validateArtifactIdentity(
+    fstatSync(artifact.fd),
+    process.getuid?.(),
+    process.getgid?.(),
+  );
+  if (!sameIdentity(identity, artifact.identity)) {
+    throw new Error("Cargo vendor artifact changed before upload");
   }
-  if (current) blocks.push(current);
-  return blocks;
-}
+  const partCount = Math.ceil(descriptor.size / multipartPartBytes);
+  if (partCount <= 0 || partCount > 10_000) throw new Error("invalid multipart part count");
+  const endpoint = `${origin}/api/ci/cargo-vendor/${descriptor.cargoLockBlob}/${descriptor.sha256}/multipart`;
+  const requestId = deterministicMultipartRequestId(descriptor);
+  const createBody = canonicalJson({
+    partCount,
+    partSize: multipartPartBytes,
+    requestId,
+    sha256: descriptor.sha256,
+    size: descriptor.size,
+    version: 1,
+  });
+  const created = await createMultipartUpload(endpoint, token, descriptor, {
+    createBody,
+    partCount,
+    requestId,
+    retryDelayCapMs,
+    signal,
+    timeoutMs: requestTimeoutMs,
+  });
+  if (created.type === "published") return created.value;
+  const upload = created.value;
 
-function gitPackagesFromCargoLock(cargoLock) {
-  const packages = [];
-  for (const block of cargoLock.replaceAll("\r\n", "\n").split("\n\n")) {
-    const name = block.match(/^name = "([^"]+)"$/m)?.[1];
-    const version = block.match(/^version = "([^"]+)"$/m)?.[1];
-    const source = block.match(/^source = "(git\+[^"]+)"$/m)?.[1];
-    if (name && version && source && source.includes("#")) packages.push({ name, version, source });
-  }
-  return packages;
-}
-
-async function collectArchiveEntries(sourcePath, archivePath, entries) {
-  const metadata = await lstat(sourcePath);
-  if (metadata.isDirectory()) {
-    entries.push({ path: `${archivePath}/`, type: "directory", mode: 0o755 });
-    for (const name of (await readdir(sourcePath)).sort()) {
-      if (!isSafeArchivePart(name)) throw new Error(`unsafe vendored path component: ${name}`);
-      await collectArchiveEntries(resolve(sourcePath, name), `${archivePath}/${name}`, entries);
-    }
-    return;
-  }
-  if (metadata.isFile()) {
-    entries.push({
-      path: archivePath,
-      type: "file",
-      mode: metadata.mode & 0o111 ? 0o755 : 0o644,
-      body: await readFile(sourcePath),
-    });
-    return;
-  }
-  if (metadata.isSymbolicLink()) {
-    const link = await readlink(sourcePath);
-    if (isAbsolute(link) || link.split(/[\\/]/).includes("..") || link.includes("\0")) {
-      throw new Error(`unsafe vendored symlink: ${archivePath}`);
-    }
-    entries.push({ path: archivePath, type: "symlink", mode: 0o777, link });
-    return;
-  }
-  throw new Error(`unsupported vendored file type: ${archivePath}`);
-}
-
-function createTar(entries) {
-  const chunks = [];
-  let paxIndex = 0;
-  for (const entry of entries) {
-    const pathParts = ustarPath(entry.path);
-    const pax = [];
-    if (!pathParts) pax.push(paxRecord("path", entry.path));
-    if (entry.type === "symlink" && Buffer.byteLength(entry.link) > 100) {
-      pax.push(paxRecord("linkpath", entry.link));
-    }
-    if (pax.length > 0) {
-      const body = Buffer.from(pax.join(""));
-      chunks.push(tarHeader({
-        path: `PaxHeaders/${String(paxIndex++).padStart(8, "0")}`,
-        type: "pax",
-        mode: 0o644,
-        size: body.byteLength,
-      }), body, padding(body.byteLength));
-    }
-    const body = entry.type === "file" ? entry.body : Buffer.alloc(0);
-    chunks.push(tarHeader({
-      ...entry,
-      path: pathParts ? entry.path : `PaxEntry/${String(paxIndex).padStart(8, "0")}`,
-      link: entry.type === "symlink" && Buffer.byteLength(entry.link) <= 100 ? entry.link : "",
-      size: body.byteLength,
-    }), body, padding(body.byteLength));
-  }
-  chunks.push(Buffer.alloc(1024));
-  return Buffer.concat(chunks);
-}
-
-function tarHeader(entry) {
-  const header = Buffer.alloc(512);
-  const pathParts = ustarPath(entry.path);
-  if (!pathParts) throw new Error(`tar path cannot be represented: ${entry.path}`);
-  writeText(header, pathParts.name, 0, 100);
-  writeOctal(header, entry.mode, 100, 8);
-  writeOctal(header, 0, 108, 8);
-  writeOctal(header, 0, 116, 8);
-  writeOctal(header, entry.size, 124, 12);
-  writeOctal(header, 0, 136, 12);
-  header.fill(0x20, 148, 156);
-  header[156] = { file: 0x30, symlink: 0x32, directory: 0x35, pax: 0x78 }[entry.type];
-  writeText(header, entry.link ?? "", 157, 100);
-  writeText(header, "ustar\0", 257, 6);
-  writeText(header, "00", 263, 2);
-  writeText(header, "root", 265, 32);
-  writeText(header, "root", 297, 32);
-  writeText(header, pathParts.prefix, 345, 155);
-  const checksum = header.reduce((sum, byte) => sum + byte, 0);
-  const encoded = checksum.toString(8).padStart(6, "0");
-  header.write(encoded, 148, 6, "ascii");
-  header[154] = 0;
-  header[155] = 0x20;
-  return header;
-}
-
-function ustarPath(path) {
-  if (Buffer.byteLength(path) <= 100) return { name: path, prefix: "" };
-  const parts = path.split("/");
-  for (let index = parts.length - 1; index > 0; index--) {
-    const prefix = parts.slice(0, index).join("/");
-    const name = parts.slice(index).join("/");
-    if (Buffer.byteLength(prefix) <= 155 && Buffer.byteLength(name) <= 100) {
-      return { name, prefix };
-    }
-  }
-  return null;
-}
-
-function paxRecord(key, value) {
-  const content = `${key}=${value}\n`;
-  let length = Buffer.byteLength(content) + 2;
-  while (true) {
-    const record = `${length} ${content}`;
-    const actual = Buffer.byteLength(record);
-    if (actual === length) return record;
-    length = actual;
-  }
-}
-
-function writeText(header, value, offset, length) {
-  const bytes = Buffer.from(value);
-  if (bytes.byteLength > length) throw new Error(`tar field exceeds ${length} bytes`);
-  bytes.copy(header, offset);
-}
-
-function writeOctal(header, value, offset, length) {
-  if (!Number.isSafeInteger(value) || value < 0) throw new Error("invalid tar integer");
-  const encoded = value.toString(8).padStart(length - 1, "0");
-  if (encoded.length >= length) throw new Error("tar integer overflow");
-  header.write(encoded, offset, length - 1, "ascii");
-}
-
-function padding(length) {
-  return Buffer.alloc((512 - (length % 512)) % 512);
-}
-
-function deterministicGzip(body) {
-  const header = Buffer.from([0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x02, 0xff]);
-  const trailer = Buffer.alloc(8);
-  trailer.writeUInt32LE(crc32(body), 0);
-  trailer.writeUInt32LE(body.byteLength >>> 0, 4);
-  return Buffer.concat([header, deflateRawSync(body, { level: 9 }), trailer]);
-}
-
-function crc32(body) {
-  let crc = 0xffffffff;
-  for (const byte of body) {
-    crc ^= byte;
-    for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
-  }
-  return (crc ^ 0xffffffff) >>> 0;
-}
-
-async function assertCargoSnapshot(repository, expected) {
-  const observed = await readCargoSnapshot(repository);
-  if (observed.head !== expected.head || observed.cargoLockBlob !== expected.cargoLockBlob) {
-    throw new Error("repository changed while its CI Cargo vendor bundle was being built");
-  }
-}
-
-async function runCargo(repository, args) {
+  const parts = [];
+  let canonicalProven = false;
   try {
-    return await execFileAsync("cargo", args, {
-      cwd: repository,
-      env: publisherEnvironment(repository, false),
-      encoding: "utf8",
-      maxBuffer: maximumCommandOutputBytes,
-    });
-  } catch (cause) {
-    const detail = String(cause?.stderr ?? cause?.message ?? cause).trim().slice(0, 2_000);
-    throw new Error(`cargo vendor failed: ${detail}`, { cause });
+    for (let index = 0; index < partCount; index += 1) {
+      const payloadStart = index * multipartPartBytes;
+      const payloadEnd = Math.min(payloadStart + multipartPartBytes, descriptor.size);
+      const size = payloadEnd - payloadStart;
+      const fileStart = artifact.payloadOffset + payloadStart;
+      const fileEnd = artifact.payloadOffset + payloadEnd;
+      const sha256 = await hashFileRange(artifact.fd, fileStart, fileEnd);
+      const response = await authenticatedFetch(
+        `${endpoint}/parts/${index + 1}`,
+        token,
+        {
+          method: "PUT",
+          redirect: "error",
+          headers: {
+            "content-length": String(size),
+            "content-type": "application/octet-stream",
+            "x-nanocodex-sha256": sha256,
+            "x-nanocodex-staging-id": upload.stagingId,
+            "x-nanocodex-upload-id": upload.uploadId,
+          },
+          body: Readable.toWeb(createReadStream("", {
+            fd: artifact.fd,
+            autoClose: false,
+            start: fileStart,
+            end: fileEnd - 1,
+          })),
+          duplex: "half",
+          signal,
+        },
+        { timeoutMs: requestTimeoutMs },
+      );
+      if (!response.ok) {
+        throw new Error(await responseError(
+          `upload CI Cargo vendor part ${index + 1}`,
+          response,
+          token,
+        ));
+      }
+      const value = await boundedJson(response, 64 * 1024, "multipart part");
+      if (
+        !hasExactKeys(value, ["etag", "partNumber", "sha256", "size"]) ||
+        value?.partNumber !== index + 1 || value.size !== size || value.sha256 !== sha256 ||
+        typeof value.etag !== "string" || !/^[a-f0-9]{32}$/.test(value.etag)
+      ) throw new Error(`multipart part ${index + 1} returned invalid metadata`);
+      parts.push({ partNumber: value.partNumber, etag: value.etag });
+    }
+    let completionFailure;
+    try {
+      const response = await authenticatedFetch(
+        `${endpoint}/complete`,
+        token,
+        {
+          method: "POST",
+          redirect: "error",
+          headers: { "content-type": "application/json" },
+          body: canonicalJson({
+            parts,
+            sha256: descriptor.sha256,
+            size: descriptor.size,
+            stagingId: upload.stagingId,
+            uploadId: upload.uploadId,
+            version: 1,
+          }),
+          signal,
+        },
+        { timeoutMs: requestTimeoutMs },
+      );
+      if (!response.ok) {
+        completionFailure = new Error(await responseError(
+          "complete CI Cargo vendor multipart upload",
+          response,
+          token,
+        ));
+      } else {
+        try {
+          const published = validateCompletionResponse(
+            await boundedJson(response, 64 * 1024, "multipart completion"),
+            descriptor,
+          );
+          canonicalProven = true;
+          return published;
+        } catch (cause) {
+          completionFailure = cause;
+        }
+      }
+    } catch (cause) {
+      completionFailure = cause;
+    }
+    const recoverySignal = signal?.aborted
+      ? AbortSignal.timeout(Math.min(cleanupTimeoutMs, completionSignalRecoveryMs))
+      : signal;
+    let existing;
+    try {
+      existing = await readPublishedBundle(
+        origin,
+        token,
+        descriptor.cargoLockBlob,
+        descriptor.sha256,
+        { signal: recoverySignal, timeoutMs: requestTimeoutMs },
+      );
+    } catch (recoveryCause) {
+      throw new AggregateError(
+        [completionFailure, recoveryCause],
+        "multipart completion outcome and exact-object recovery both failed",
+      );
+    }
+    if (existing && matchesPublishedDescriptor(existing, descriptor)) {
+      canonicalProven = true;
+      return existing;
+    }
+    throw completionFailure ?? new Error("multipart completion outcome was not canonical");
+  } finally {
+    if (!canonicalProven) {
+      await abortMultipart(endpoint, token, upload.uploadId, upload.stagingId, {
+        signal: AbortSignal.timeout(cleanupTimeoutMs),
+        timeoutMs: cleanupTimeoutMs,
+      });
+    }
   }
 }
 
-async function git(repository, args) {
-  try {
-    const { stdout } = await execFileAsync("git", [
-      "-c", "core.fsmonitor=false",
-      "-c", "core.hooksPath=/dev/null",
-      "-c", "core.attributesFile=/dev/null",
-      "-c", "core.autocrlf=false",
-      ...args,
-    ], {
-      cwd: repository,
-      env: publisherEnvironment(repository),
-      encoding: "utf8",
-      maxBuffer: maximumCommandOutputBytes,
-    });
-    return stdout.trimEnd();
-  } catch (cause) {
-    const detail = String(cause?.stderr ?? cause?.message ?? cause).trim().slice(0, 1_000);
-    throw new Error(`git ${args[0]} failed: ${detail}`, { cause });
+async function createMultipartUpload(endpoint, token, descriptor, {
+  createBody,
+  partCount,
+  requestId,
+  retryDelayCapMs,
+  signal,
+  timeoutMs,
+}) {
+  let failure;
+  for (let attempt = 0; attempt < multipartCreateAttempts; attempt += 1) {
+    throwIfAborted(signal);
+    let response;
+    try {
+      response = await authenticatedFetch(
+        endpoint,
+        token,
+        {
+          method: "POST",
+          redirect: "error",
+          headers: { "content-type": "application/json" },
+          body: createBody,
+          signal,
+        },
+        { timeoutMs },
+      );
+    } catch (cause) {
+      throwIfAborted(signal);
+      failure = new Error("create CI Cargo vendor multipart upload transport failed", {
+        cause,
+      });
+      if (attempt + 1 === multipartCreateAttempts) throw failure;
+      await waitForRetry(fallbackRetryDelay(attempt, retryDelayCapMs), signal);
+      continue;
+    }
+
+    const retryDelay = boundedRetryAfter(response, attempt, retryDelayCapMs);
+    if (!response.ok) {
+      try {
+        failure = new Error(await responseError(
+          "create CI Cargo vendor multipart upload",
+          response,
+          token,
+        ));
+      } catch (cause) {
+        failure = new Error("create CI Cargo vendor multipart upload returned an unreadable error", {
+          cause,
+        });
+      }
+      if (!retryableStatus(response.status) || attempt + 1 === multipartCreateAttempts) {
+        throw failure;
+      }
+      await waitForRetry(retryDelay, signal);
+      continue;
+    }
+
+    try {
+      return validateCreateResponse(
+        await boundedJson(response, 64 * 1024, "multipart creation"),
+        descriptor,
+        { partCount, requestId },
+      );
+    } catch (cause) {
+      failure = cause;
+      if (attempt + 1 === multipartCreateAttempts) throw failure;
+      await waitForRetry(retryDelay, signal);
+    }
+  }
+  throw failure ?? new Error("multipart creation failed");
+}
+
+function validateCreateResponse(value, descriptor, { partCount, requestId }) {
+  if (
+    hasExactKeys(value, [
+      "cargoLockBlob", "key", "requestId", "sha256", "size", "uploaded",
+    ]) && value.requestId === requestId && value.uploaded === false &&
+    matchesPublishedDescriptor(value, descriptor)
+  ) return { type: "published", value };
+  if (
+    !hasExactKeys(value, [
+      "cargoLockBlob", "key", "partCount", "partSize", "requestId", "sha256", "size",
+      "stagingId", "uploadId",
+    ]) || !matchesPublishedDescriptor(value, descriptor) || value.requestId !== requestId ||
+    value.stagingId !== requestId || !uuidV4Pattern.test(value.stagingId) ||
+    typeof value.uploadId !== "string" || value.uploadId.length === 0 ||
+    value.uploadId.length > 1_024 || value.partSize !== multipartPartBytes ||
+    value.partCount !== partCount
+  ) throw new Error("multipart creation returned invalid metadata");
+  return { type: "upload", value };
+}
+
+function validateCompletionResponse(value, descriptor) {
+  if (
+    !hasExactKeys(value, ["cargoLockBlob", "key", "sha256", "size", "uploaded"]) ||
+    typeof value.uploaded !== "boolean" || !matchesPublishedDescriptor(value, descriptor)
+  ) throw new Error("multipart completion returned invalid metadata");
+  return value;
+}
+
+function matchesPublishedDescriptor(value, descriptor) {
+  return record(value) && value.key === descriptor.key &&
+    value.cargoLockBlob === descriptor.cargoLockBlob && value.size === descriptor.size &&
+    value.sha256 === descriptor.sha256;
+}
+
+function retryableStatus(status) {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+function boundedRetryAfter(response, attempt, capMs) {
+  const value = response.headers.get("retry-after");
+  let delay;
+  if (value != null && /^[0-9]+$/.test(value)) {
+    const seconds = Number(value);
+    if (Number.isSafeInteger(seconds)) delay = seconds * 1_000;
+  } else if (value != null) {
+    const at = Date.parse(value);
+    if (Number.isFinite(at)) delay = Math.max(0, at - Date.now());
+  }
+  if (!Number.isSafeInteger(delay) || delay < 0) {
+    return fallbackRetryDelay(attempt, capMs);
+  }
+  return Math.min(delay, capMs);
+}
+
+function fallbackRetryDelay(attempt, capMs) {
+  return Math.min(100 * (2 ** attempt), capMs);
+}
+
+async function waitForRetry(milliseconds, signal) {
+  if (milliseconds <= 0) return;
+  throwIfAborted(signal);
+  await new Promise((resolvePromise, rejectPromise) => {
+    const timer = setTimeout(done, milliseconds);
+    const onAbort = () => done(signal.reason ?? new DOMException("Aborted", "AbortError"));
+    function done(cause) {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      if (cause) rejectPromise(cause);
+      else resolvePromise();
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+  });
+}
+
+async function abortMultipart(endpoint, token, uploadId, stagingId, {
+  signal,
+  timeoutMs = defaultCleanupTimeoutMs,
+} = {}) {
+  for (let attempt = 0; attempt < multipartCreateAttempts; attempt += 1) {
+    try {
+      const response = await authenticatedFetch(
+        endpoint,
+        token,
+        {
+          method: "DELETE",
+          redirect: "error",
+          headers: { "content-type": "application/json" },
+          body: canonicalJson({ stagingId, uploadId, version: 1 }),
+          signal,
+        },
+        { timeoutMs },
+      );
+      await response.body?.cancel();
+      if (response.ok || response.status === 404) return;
+    } catch {}
   }
 }
 
-async function assertSafeLocalGitConfig(repository, revision) {
-  const names = (await Promise.all(["--local", "--worktree"].map(async (scope) =>
-    (await git(repository, [
-      "config",
-      scope,
-      "--no-includes",
-      "--name-only",
-      "--list",
-    ])).split("\n").filter(Boolean)
-  ))).flat();
-  const safe = /^(?:core\.(?:repositoryformatversion|filemode|bare|logallrefupdates|ignorecase|precomposeunicode|autocrlf)|remote\.[^.]+\.(?:url|fetch)|branch\.[^.]+\.(?:remote|merge)|submodule\..+\.url)$/i;
-  const unsafe = names.filter((name) => !safe.test(name));
-  if (unsafe.length > 0) {
-    throw new Error(
-      `Cargo Git checkout ${revision} rejects local Git configuration: ${unsafe.join(", ")}`,
-    );
+async function hashFileRange(fd, start, endExclusive) {
+  const hash = createHash("sha256");
+  let size = 0;
+  for await (const chunk of createReadStream("", {
+    fd,
+    autoClose: false,
+    start,
+    end: endExclusive - 1,
+  })) {
+    size += chunk.length;
+    hash.update(chunk);
   }
+  if (size !== endExclusive - start) throw new Error("Cargo vendor part was truncated");
+  return hash.digest("hex");
 }
 
-function publisherEnvironment(repository, fixedWorktree = true) {
+function readExactly(fd, position, length) {
+  const buffer = Buffer.alloc(length);
+  let offset = 0;
+  while (offset < length) {
+    const read = readSync(fd, buffer, offset, length - offset, position + offset);
+    if (read === 0) throw new Error("Cargo vendor frame is truncated");
+    offset += read;
+  }
+  return buffer;
+}
+
+function validateArtifactIdentity(identity, expectedUid, expectedGid) {
+  if (
+    !identity.isFile() || identity.isSymbolicLink?.() || identity.nlink !== 1 ||
+    (identity.mode & 0o777) !== 0o600 ||
+    (Number.isSafeInteger(expectedUid) && identity.uid !== expectedUid) ||
+    (Number.isSafeInteger(expectedGid) && identity.gid !== expectedGid) ||
+    !Number.isSafeInteger(identity.size) || identity.size <= frameMagic.length + 8 ||
+    identity.size > cargoVendorFrame.maximumTotalBytes
+  ) throw new Error("Cargo vendor artifact fd must be one private controller-owned regular file");
   return {
-    PATH: process.env.PATH ?? "",
-    HOME: process.env.HOME ?? "",
-    TMPDIR: process.env.TMPDIR ?? tmpdir(),
-    LANG: process.env.LANG ?? "C.UTF-8",
-    CARGO_HOME: process.env.CARGO_HOME ?? resolve(process.env.HOME ?? "", ".cargo"),
-    RUSTUP_HOME: process.env.RUSTUP_HOME ?? resolve(process.env.HOME ?? "", ".rustup"),
-    GIT_CONFIG_NOSYSTEM: "1",
-    GIT_CONFIG_GLOBAL: "/dev/null",
-    GIT_NO_REPLACE_OBJECTS: "1",
-    GIT_OPTIONAL_LOCKS: "0",
-    GIT_TERMINAL_PROMPT: "0",
-    CARGO_NET_OFFLINE: "true",
-    ...(fixedWorktree ? { GIT_WORK_TREE: repository } : {}),
+    dev: identity.dev,
+    ino: identity.ino,
+    uid: identity.uid,
+    gid: identity.gid,
+    mode: identity.mode,
+    nlink: identity.nlink,
+    size: identity.size,
+    mtimeMs: identity.mtimeMs,
+    ctimeMs: identity.ctimeMs,
   };
 }
 
-async function describeArtifact(path) {
-  const size = (await stat(path)).size;
-  const hash = createHash("sha256");
-  for await (const chunk of createReadStream(path)) hash.update(chunk);
-  return { path, size, sha256: hash.digest("hex") };
+function sameIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino && left.uid === right.uid &&
+    left.gid === right.gid && left.mode === right.mode && left.nlink === right.nlink &&
+    left.size === right.size && left.mtimeMs === right.mtimeMs &&
+    left.ctimeMs === right.ctimeMs;
 }
 
-function cargoVendorKey(cargoLockBlob) {
-  return `cargo-vendor/${cargoLockBlob}/bundle.tar.gz`;
-}
-
-function authenticatedFetch(url, token, init = {}) {
+function authenticatedFetch(url, token, init = {}, { timeoutMs = defaultRequestTimeoutMs } = {}) {
+  validateBoundedInteger(timeoutMs, 1, maximumRequestTimeoutMs, "request timeout");
   const headers = new Headers(init.headers);
   headers.set("authorization", `Bearer ${token}`);
-  return fetch(url, { ...init, headers });
+  const timeout = AbortSignal.timeout(timeoutMs);
+  const signal = init.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
+  return fetch(url, { ...init, headers, signal });
 }
 
-async function responseError(operation, response) {
-  const detail = (await response.text()).slice(0, maximumErrorBytes);
-  return `${operation} failed with HTTP ${response.status}${detail ? `: ${detail}` : ""}`;
+async function boundedJson(response, maximum, description) {
+  const body = await readResponseBounded(response, maximum, description);
+  try {
+    return JSON.parse(body.toString("utf8"));
+  } catch (cause) {
+    throw new Error(`${description} response is not JSON`, { cause });
+  }
+}
+
+async function responseError(operation, response, token) {
+  const detail = (await readResponseBounded(response, maximumErrorBytes, operation, true))
+    .toString("utf8");
+  const safe = redactCredential(detail, token);
+  return `${operation} failed with HTTP ${response.status}${safe ? `: ${safe}` : ""}`;
+}
+
+async function readResponseBounded(response, maximum, description, truncate = false) {
+  if (!response.body) return Buffer.alloc(0);
+  const reader = response.body.getReader();
+  const chunks = [];
+  let bytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (bytes + value.byteLength > maximum) {
+        if (truncate) {
+          const remaining = maximum - bytes;
+          if (remaining > 0) chunks.push(Buffer.from(value).subarray(0, remaining));
+          bytes = maximum;
+          await reader.cancel();
+          break;
+        }
+        await reader.cancel();
+        throw new Error(`${description} response exceeds ${maximum} bytes`);
+      }
+      chunks.push(Buffer.from(value));
+      bytes += value.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks, bytes);
 }
 
 export function parseOrigin(value) {
@@ -626,9 +741,14 @@ export function parseOrigin(value) {
   }
 }
 
-function isSafeArchivePart(value) {
-  return value.length > 0 && value !== "." && value !== ".." &&
-    !value.includes("/") && !value.includes("\\") && !value.includes("\0");
+function cargoVendorKey(cargoLockBlob, bundleSha256) {
+  return `cargo-vendor/${cargoLockBlob}/${bundleSha256}/bundle.tar.gz`;
+}
+
+function parseCanonicalInteger(value) {
+  if (typeof value !== "string" || !/^(?:0|[1-9][0-9]*)$/.test(value)) return undefined;
+  const number = Number(value);
+  return Number.isSafeInteger(number) ? number : undefined;
 }
 
 function requiredEnvironment(env, name) {
@@ -637,4 +757,46 @@ function requiredEnvironment(env, name) {
   return value;
 }
 
-if (resolve(process.argv[1] ?? "") === scriptPath) await main();
+function validateBoundedInteger(value, minimum, maximum, description) {
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`${description} must be an integer from ${minimum} through ${maximum}`);
+  }
+  return value;
+}
+
+function redactCredential(value, token) {
+  let result = value.replace(/Bearer\s+[^\s"']+/gi, "Bearer [redacted]");
+  if (typeof token === "string" && token.length > 0) {
+    result = result.split(token).join("[redacted]");
+  }
+  return result;
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) {
+    throw signal.reason ?? new DOMException("Aborted", "AbortError");
+  }
+}
+
+function hasExactKeys(value, expected) {
+  return record(value) && sameKeys(Object.keys(value).sort(), [...expected].sort());
+}
+
+function sameKeys(left, right) {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function record(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+if (resolve(process.argv[1] ?? "") === scriptPath) {
+  try {
+    await main();
+  } catch (cause) {
+    process.stderr.write(
+      `Publish CI Cargo vendor failed: ${cause instanceof Error ? cause.message : String(cause)}\n`,
+    );
+    process.exitCode = 1;
+  }
+}

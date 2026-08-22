@@ -16,8 +16,11 @@
       "persist": true
     }
   },
+  "triggers": {
+    "crons": ["0 5 * * *"]
+  },
   "secrets": {
-    "required": ["CI_SOURCE_WRITE_TOKEN", "CI_CONTROL_TOKEN", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"]
+    "required": ["GIT_MIRROR_TOKEN", "CI_MASTER_SOURCE_WRITE_TOKEN", "CI_PR_SOURCE_WRITE_TOKEN", "CI_CONTROL_TOKEN", "CI_MACOS_RUNNER_TOKEN", "CI_RELEASE_TOKEN", "NANOCODEX_SANDBOX_CONTROL_TOKEN", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"]
   },
   "assets": {
     "binding": "ASSETS",
@@ -73,6 +76,14 @@
         "class_name": "CiRepository"
       },
       {
+        "name": "CI_MACOS_JOBS",
+        "class_name": "CiMacJobs"
+      },
+      {
+        "name": "CI_RELEASES",
+        "class_name": "CiReleases"
+      },
+      {
         "name": "SANDBOX",
         "class_name": "CiSandbox"
       }
@@ -114,6 +125,10 @@
     {
       "tag": "v9",
       "new_sqlite_classes": ["CiRepository", "CiSandbox"]
+    },
+    {
+      "tag": "v10",
+      "new_sqlite_classes": ["CiMacJobs", "CiReleases"]
     }
   ],
   "workflows": [
@@ -133,7 +148,7 @@
     {
       "class_name": "CiSandbox",
       "image": "./ci/Dockerfile",
-      "max_instances": 10,
+      "max_instances": 32,
       "instance_type": "standard-4"
     }
   ],
@@ -204,8 +219,9 @@
   "env": {
     "development": {
       "name": "nanocodex-development",
+      "triggers": { "crons": [] },
       "secrets": {
-        "required": ["CI_SOURCE_WRITE_TOKEN", "CI_CONTROL_TOKEN", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"]
+        "required": ["GIT_MIRROR_TOKEN", "CI_MASTER_SOURCE_WRITE_TOKEN", "CI_PR_SOURCE_WRITE_TOKEN", "CI_CONTROL_TOKEN", "CI_MACOS_RUNNER_TOKEN", "CI_RELEASE_TOKEN", "NANOCODEX_SANDBOX_CONTROL_TOKEN", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"]
       },
       "durable_objects": {
         "bindings": [
@@ -216,6 +232,8 @@
           { "name": "EVAL_COORDINATOR", "class_name": "EvalCoordinator" },
           { "name": "CHATGPT_EGRESS", "class_name": "ChatGptEgress" },
           { "name": "CI_REPOSITORY", "class_name": "CiRepository" },
+          { "name": "CI_MACOS_JOBS", "class_name": "CiMacJobs" },
+          { "name": "CI_RELEASES", "class_name": "CiReleases" },
           { "name": "SANDBOX", "class_name": "CiSandbox" }
         ]
       },

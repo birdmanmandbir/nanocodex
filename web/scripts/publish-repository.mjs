@@ -2,6 +2,7 @@ import { execFile, spawn } from "node:child_process";
 import { createReadStream, createWriteStream } from "node:fs";
 import {
   mkdtemp,
+  lstat,
   open,
   readFile,
   readdir,
@@ -25,14 +26,19 @@ const repositoryPath = resolve(
 const uploadConcurrency = 12;
 const repositoryUploadPartBytes = 4 * 1024 * 1024;
 const publicationBranch = "master";
+const publicationRef = `refs/heads/${publicationBranch}`;
+const authoritativeRepositoryUrl = "https://github.com/gakonst/nanocodex.git";
+const canonicalOriginFetch = "+refs/heads/*:refs/remotes/origin/*";
+const sha1Pattern = /^[a-f0-9]{40}$/;
+const maximumGitOutputBytes = 16 * 1024 * 1024;
 const uploadAttemptTimeoutMs = positiveIntegerEnvironment(
   "NANOCODEX_GIT_UPLOAD_TIMEOUT_MS",
   60_000,
 );
 
-async function main() {
+export async function main() {
   const origin = requiredEnvironment("NANOCODEX_GIT_ORIGIN").replace(/\/$/, "");
-  const head = await git(["rev-parse", "HEAD"]);
+  const { head } = await prepareMasterPublication(repositoryPath);
   await requireDeploymentSha(origin, head);
   const token = requiredEnvironment("NANOCODEX_GIT_TOKEN");
   const previous = await readRemoteState(
@@ -51,7 +57,10 @@ async function main() {
     await run(process.execPath, [resolve(projectRoot, "scripts", "sync-nanocodex.mjs")], {
       cwd: projectRoot,
       env: {
-        ...process.env,
+        ...publisherEnvironment(repositoryPath),
+        ...(process.env.NANOCODEX_COMMIT_LIMIT == null
+          ? {}
+          : { NANOCODEX_COMMIT_LIMIT: process.env.NANOCODEX_COMMIT_LIMIT }),
         NANOCODEX_DATA_DIR: dataDirectory,
         NANOCODEX_EMIT_OBJECTS: "1",
         NANOCODEX_FORCE_SYNC: "1",
@@ -133,20 +142,6 @@ async function main() {
     console.log(
       `Uploading ${plan.blobs.length} new blobs and ${plan.patches.length} new patches`,
     );
-    await mapConcurrent(
-      [
-        ...plan.blobs.map((id) => ({
-          remote: `blobs/${id}`,
-          local: resolve(dataDirectory, "blobs", `${id}.txt`),
-        })),
-        ...plan.patches.map((id) => ({
-          remote: `patches/${id}`,
-          local: resolve(dataDirectory, "patches", `${id}.patch`),
-        })),
-      ],
-      uploadConcurrency,
-      ({ remote, local }) => uploadFile(origin, token, remote, local),
-    );
 
     const generationPrefix = `generations/${head}`;
     const inventoryPath = resolve(temporaryDirectory, "inventory.json");
@@ -161,7 +156,22 @@ async function main() {
       writeFile(inventoryPath, `${JSON.stringify(inventory)}\n`),
       writeFile(commitPatchManifestPath, `${JSON.stringify(commitPatchManifest)}\n`),
     ]);
+    await assertMasterPublicationAuthority(repositoryPath, head);
     await Promise.all([
+      mapConcurrent(
+        [
+          ...plan.blobs.map((id) => ({
+            remote: `blobs/${id}`,
+            local: resolve(dataDirectory, "blobs", `${id}.txt`),
+          })),
+          ...plan.patches.map((id) => ({
+            remote: `patches/${id}`,
+            local: resolve(dataDirectory, "patches", `${id}.patch`),
+          })),
+        ],
+        uploadConcurrency,
+        ({ remote, local }) => uploadFile(origin, token, remote, local),
+      ),
       uploadFile(origin, token, `${generationPrefix}/repository.json`, resolve(dataDirectory, "repository.json")),
       uploadFile(origin, token, `${generationPrefix}/commits.json`, resolve(dataDirectory, "commits.json")),
       uploadFile(origin, token, `${generationPrefix}/commit-index.json`, resolve(dataDirectory, "commit-index.json")),
@@ -200,14 +210,16 @@ async function main() {
       packHash: gitArtifacts.packHash,
       publishedAt: new Date().toISOString(),
     };
+    const body = JSON.stringify({
+      expectedHead: previous?.publication?.head ?? null,
+      publication,
+      ...(previous?.replaceInvalid === true ? { replaceInvalid: true } : {}),
+    });
+    await assertMasterPublicationAuthority(repositoryPath, head);
     const response = await authenticatedFetch(`${origin}/api/git/publish`, token, {
       method: "PUT",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        expectedHead: previous?.publication?.head ?? null,
-        publication,
-        ...(previous?.replaceInvalid === true ? { replaceInvalid: true } : {}),
-      }),
+      body,
     });
     if (!response.ok) throw new Error(await responseError("publish", response));
     console.log(
@@ -216,6 +228,227 @@ async function main() {
   } finally {
     await rm(temporaryDirectory, { recursive: true, force: true });
   }
+}
+
+export async function prepareMasterPublication(repository) {
+  await assertMasterRepositoryShape(repository);
+  await git(repository, [
+    "fetch",
+    "--no-tags",
+    "--no-write-fetch-head",
+    "--recurse-submodules=no",
+    "origin",
+    `+${publicationRef}:refs/remotes/origin/${publicationBranch}`,
+  ]);
+  return assertMasterPublicationAuthority(repository);
+}
+
+export async function assertMasterPublicationAuthority(repository, expectedHead) {
+  await assertMasterRepositoryShape(repository);
+  const [
+    head,
+    localMaster,
+    trackingHead,
+    upstream,
+    remoteHead,
+    masterRefs,
+  ] = await Promise.all([
+    git(repository, ["rev-parse", "--verify", "HEAD^{commit}"]),
+    git(repository, ["rev-parse", "--verify", `${publicationRef}^{commit}`]),
+    git(repository, [
+      "rev-parse",
+      "--verify",
+      `refs/remotes/origin/${publicationBranch}^{commit}`,
+    ]),
+    git(repository, ["rev-parse", "--symbolic-full-name", "@{upstream}"]),
+    readAuthoritativeMaster(repository),
+    readRemoteMasterRefs(repository),
+  ]);
+  assertRemoteMasterTopology(masterRefs, true);
+  if (
+    !sha1Pattern.test(head) ||
+    localMaster !== head ||
+    trackingHead !== head ||
+    upstream !== `refs/remotes/origin/${publicationBranch}` ||
+    remoteHead !== head ||
+    (expectedHead != null && head !== expectedHead)
+  ) {
+    throw new Error(
+      "repository publication requires local HEAD, fetched origin/master, and fresh GitHub master to be identical",
+    );
+  }
+  return { head, ref: publicationRef };
+}
+
+async function readAuthoritativeMaster(repository) {
+  const output = await git(repository, [
+    "ls-remote",
+    "--exit-code",
+    "--refs",
+    authoritativeRepositoryUrl,
+    publicationRef,
+  ]);
+  const match = /^([a-f0-9]{40})\trefs\/heads\/master$/.exec(output);
+  if (match == null) {
+    throw new Error("git ls-remote returned an invalid authoritative master ref");
+  }
+  return match[1];
+}
+
+async function assertMasterRepositoryShape(repository) {
+  await assertSafeLocalGitConfig(repository);
+  await rejectObjectSubstitution(repository);
+  const [ref, status, bare, shallow, masterRefs] = await Promise.all([
+    git(repository, ["symbolic-ref", "--quiet", "HEAD"]),
+    git(repository, [
+      "status",
+      "--porcelain=v1",
+      "-z",
+      "--untracked-files=all",
+      "--ignore-submodules=none",
+    ]),
+    git(repository, ["rev-parse", "--is-bare-repository"]),
+    git(repository, ["rev-parse", "--is-shallow-repository"]),
+    readRemoteMasterRefs(repository),
+  ]);
+  if (ref !== publicationRef) {
+    throw new Error(
+      `repository publication requires an attached ${publicationRef} checkout; observed ${ref}`,
+    );
+  }
+  if (status !== "") {
+    throw new Error("repository publication requires a clean tracked and untracked checkout");
+  }
+  if (bare !== "false" || shallow !== "false") {
+    throw new Error("repository publication requires a complete non-bare repository");
+  }
+  assertRemoteMasterTopology(masterRefs, false);
+  await assertCanonicalOrigin(repository);
+}
+
+async function readRemoteMasterRefs(repository) {
+  const output = await git(repository, [
+    "for-each-ref",
+    "--format=%(refname)%00%(symref)",
+    "refs/remotes",
+  ]);
+  return output.split("\n").filter(Boolean).map((entry) => {
+    const fields = entry.split("\0");
+    if (fields.length !== 2) throw new Error("git returned invalid remote-tracking refs");
+    return { ref: fields[0], symref: fields[1] };
+  }).filter(({ ref }) => /^refs\/remotes\/.+\/master$/.test(ref));
+}
+
+function assertRemoteMasterTopology(masterRefs, requireOrigin) {
+  if (
+    masterRefs.length > 1 ||
+    (masterRefs.length === 1 && (
+      masterRefs[0].ref !== `refs/remotes/origin/${publicationBranch}` ||
+      masterRefs[0].symref !== ""
+    )) ||
+    (requireOrigin && masterRefs.length !== 1)
+  ) {
+    throw new Error("repository publication rejects extra remote-tracking master refs");
+  }
+}
+
+async function assertCanonicalOrigin(repository) {
+  const [remotes, urls, fetches, pushUrls, branchRemotes, branchMerges] = await Promise.all([
+    git(repository, ["remote"]),
+    readScopedConfigValues(repository, "remote.origin.url"),
+    readScopedConfigValues(repository, "remote.origin.fetch"),
+    readScopedConfigValues(repository, "remote.origin.pushurl"),
+    readScopedConfigValues(repository, `branch.${publicationBranch}.remote`),
+    readScopedConfigValues(repository, `branch.${publicationBranch}.merge`),
+  ]);
+  if (
+    JSON.stringify(remotes.split("\n").filter(Boolean)) !== JSON.stringify(["origin"]) ||
+    JSON.stringify(urls) !== JSON.stringify([authoritativeRepositoryUrl]) ||
+    JSON.stringify(fetches) !== JSON.stringify([canonicalOriginFetch]) ||
+    pushUrls.length !== 0 ||
+    JSON.stringify(branchRemotes) !== JSON.stringify(["origin"]) ||
+    JSON.stringify(branchMerges) !== JSON.stringify([publicationRef])
+  ) {
+    throw new Error(
+      `repository publication requires one canonical HTTPS origin at ${authoritativeRepositoryUrl}`,
+    );
+  }
+}
+
+async function rejectObjectSubstitution(repository) {
+  const replacements = await git(repository, [
+    "for-each-ref",
+    "--format=%(refname)",
+    "refs/replace/",
+  ]);
+  if (replacements !== "") {
+    throw new Error("repository publication rejects Git replacement objects");
+  }
+  const graftPath = await git(repository, ["rev-parse", "--git-path", "info/grafts"]);
+  const graft = await lstat(resolve(repository, graftPath)).catch((error) => {
+    if (error?.code === "ENOENT") return undefined;
+    throw error;
+  });
+  if (graft != null) throw new Error("repository publication rejects Git grafts");
+}
+
+async function assertSafeLocalGitConfig(repository) {
+  const names = [
+    ...(await readConfigScope(repository, "--local")),
+    ...(await hasWorktreeConfig(repository)
+      ? readConfigScope(repository, "--worktree")
+      : []),
+  ];
+  const safe = /^(?:core\.(?:repositoryformatversion|filemode|bare|logallrefupdates|ignorecase|precomposeunicode|autocrlf)|user\.(?:name|email)|extensions\.worktreeconfig|remote\.[^.]+\.(?:url|fetch)|branch\.[^.]+\.(?:remote|merge)|worktrunk\..+)$/i;
+  const unsafe = names.filter((name) => !safe.test(name));
+  if (unsafe.length > 0) {
+    throw new Error(`repository publication rejects local Git configuration: ${unsafe.join(", ")}`);
+  }
+}
+
+async function readConfigScope(repository, scope) {
+  return (await git(repository, [
+    "config",
+    scope,
+    "--no-includes",
+    "--name-only",
+    "--list",
+  ])).split("\n").filter(Boolean);
+}
+
+async function hasWorktreeConfig(repository) {
+  try {
+    return await git(repository, [
+      "config",
+      "--local",
+      "--no-includes",
+      "--bool",
+      "--get",
+      "extensions.worktreeConfig",
+    ]) === "true";
+  } catch (error) {
+    if (error?.exitCode === 1) return false;
+    throw error;
+  }
+}
+
+async function readScopedConfigValues(repository, name) {
+  const scopes = ["--local", ...(await hasWorktreeConfig(repository) ? ["--worktree"] : [])];
+  const values = [];
+  for (const scope of scopes) {
+    try {
+      values.push(...(await git(repository, [
+        "config",
+        scope,
+        "--no-includes",
+        "--get-all",
+        name,
+      ])).split("\n"));
+    } catch (error) {
+      if (error?.exitCode !== 1) throw error;
+    }
+  }
+  return values.filter((value) => value !== "");
 }
 
 async function requireDeploymentSha(origin, expected) {
@@ -415,8 +648,9 @@ async function writePack(path, objectIds, repository, traverseRevisions) {
   const args = ["pack-objects", "--stdout"];
   if (traverseRevisions) args.push("--revs");
   else args.push("--window=0", "--depth=0", "--no-reuse-delta", "--no-reuse-object");
-  const child = spawn("git", args, {
+  const child = spawn("git", gitArguments(args), {
     cwd: repository,
+    env: publisherEnvironment(repository),
     stdio: ["pipe", "pipe", "pipe"],
   });
   let stderr = "";
@@ -438,15 +672,16 @@ async function writePack(path, objectIds, repository, traverseRevisions) {
 async function indexAndVerifyPack(packPath, indexPath, repository) {
   const { stdout } = await execFileAsync(
     "git",
-    ["index-pack", "--index-version=2", "-o", indexPath, packPath],
-    { cwd: repository, encoding: "utf8" },
+    gitArguments(["index-pack", "--index-version=2", "-o", indexPath, packPath]),
+    { cwd: repository, env: publisherEnvironment(repository), encoding: "utf8" },
   );
   const hash = stdout.trim();
   if (!/^[a-f0-9]{40}$/.test(hash)) {
     throw new Error(`git index-pack returned an invalid hash: ${hash}`);
   }
-  await execFileAsync("git", ["verify-pack", "-s", indexPath], {
+  await execFileAsync("git", gitArguments(["verify-pack", "-s", indexPath]), {
     cwd: repository,
+    env: publisherEnvironment(repository),
     encoding: "utf8",
   });
   return hash;
@@ -528,8 +763,9 @@ async function buildObjectShards({
 }
 
 async function readPackEntries(indexPath, repository) {
-  const { stdout } = await execFileAsync("git", ["verify-pack", "-v", indexPath], {
+  const { stdout } = await execFileAsync("git", gitArguments(["verify-pack", "-v", indexPath]), {
     cwd: repository,
+    env: publisherEnvironment(repository),
     encoding: "utf8",
     maxBuffer: 64 * 1024 * 1024,
   });
@@ -651,7 +887,11 @@ function isReusableObjectRecord(value, shards) {
 }
 
 async function gitWithInput(args, input, repository, maximumBytes = 64 * 1024 * 1024) {
-  const child = spawn("git", args, { cwd: repository, stdio: ["pipe", "pipe", "pipe"] });
+  const child = spawn("git", gitArguments(args), {
+    cwd: repository,
+    env: publisherEnvironment(repository),
+    stdio: ["pipe", "pipe", "pipe"],
+  });
   const chunks = [];
   let bytes = 0;
   let stderr = "";
@@ -789,13 +1029,48 @@ async function run(command, args, options) {
   });
 }
 
-async function git(args) {
-  const { stdout } = await execFileAsync("git", args, {
-    cwd: repositoryPath,
-    encoding: "utf8",
-    maxBuffer: 16 * 1024 * 1024,
-  });
-  return stdout.trimEnd();
+async function git(repository, args) {
+  try {
+    const { stdout } = await execFileAsync("git", gitArguments(args), {
+      cwd: repository,
+      env: publisherEnvironment(repository),
+      encoding: "utf8",
+      maxBuffer: maximumGitOutputBytes,
+    });
+    return stdout.trimEnd();
+  } catch (error) {
+    const wrapped = new Error(
+      `git ${args[0]} failed: ${String(error?.stderr ?? error?.message ?? error).trim().slice(0, 1_000)}`,
+      { cause: error },
+    );
+    wrapped.exitCode = error?.code;
+    throw wrapped;
+  }
+}
+
+function gitArguments(args) {
+  return [
+    "-c", "core.fsmonitor=false",
+    "-c", "core.hooksPath=/dev/null",
+    "-c", "core.attributesFile=/dev/null",
+    "-c", "core.autocrlf=false",
+    "-c", "credential.helper=",
+    ...args,
+  ];
+}
+
+function publisherEnvironment(repository) {
+  return {
+    PATH: process.env.PATH ?? "",
+    TMPDIR: process.env.TMPDIR ?? tmpdir(),
+    LANG: process.env.LANG ?? "C.UTF-8",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_NO_REPLACE_OBJECTS: "1",
+    GIT_OPTIONAL_LOCKS: "0",
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_WORK_TREE: repository,
+  };
 }
 
 function requiredEnvironment(name) {

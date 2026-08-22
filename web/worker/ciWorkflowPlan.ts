@@ -164,15 +164,30 @@ export function cargoDependencyCommand(
   bundleSize: number,
   bundleSha256: string,
 ): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(bundleUrl);
+  } catch {
+    throw new TypeError("Cargo vendor bundle URL is invalid");
+  }
+  const identity = parsed.pathname.match(
+    /^\/api\/ci\/cargo-vendor\/[a-f0-9]{40}\/([a-f0-9]{64})\/bundle\.tar\.gz$/,
+  );
+  if (
+    !identity || identity[1] !== bundleSha256 ||
+    (parsed.protocol !== "https:" && parsed.protocol !== "http:") ||
+    parsed.username !== "" || parsed.password !== "" || parsed.search !== "" ||
+    parsed.hash !== "" || !Number.isSafeInteger(bundleSize) || bundleSize <= 0
+  ) throw new TypeError("Cargo vendor bundle descriptor is inconsistent");
   const bundle = "/tmp/nanocodex-ci-cargo-vendor.tar.gz";
   return [
     "mkdir -p /workspace/.cargo-home",
-    `curl --fail --location --silent --show-error --output ${bundle} ${shellQuote(bundleUrl)}`,
+    `curl --fail --silent --show-error --output ${bundle} ${shellQuote(bundleUrl)}`,
     `test "$(wc -c < ${bundle} | tr -d ' ')" -eq ${bundleSize}`,
     `printf '%s  %s\\n' ${shellQuote(bundleSha256)} ${bundle} | sha256sum --check --status`,
     `tar --extract --gzip --file ${bundle} --directory /workspace/.cargo-home --no-same-owner --no-same-permissions`,
     `rm ${bundle}`,
-    "cargo fetch --locked",
+    "CARGO_NET_OFFLINE=true cargo fetch --locked --offline",
     "find /workspace -mindepth 1 -maxdepth 1 ! -name .cargo-home -exec rm -rf -- {} +",
   ].join(" && ");
 }
@@ -421,7 +436,21 @@ function sourceCacheCommand(operation: "snapshot" | "refresh"): string {
   return `python3 /workspace/${RUST_SOURCE_CACHE_SCRIPT} ${operation} /workspace /workspace/.rust-source-manifest.json`;
 }
 
-export function bindingsCommand(): string {
+export function npmPreviewVersion(testedMergeHead: string): string {
+  if (!/^[a-f0-9]{40}$/.test(testedMergeHead)) {
+    throw new Error("npm preview identity must be a full lowercase tested merge SHA");
+  }
+  // Pull-request CI executes the synthetic merge commit, just as the existing
+  // pkg-pr-new workflow versions the checked-out commit. Keep that exact tested
+  // identity in the package version rather than labeling merge-tested bytes as
+  // the unmerged pull-request head.
+  return `0.0.0-preview-${testedMergeHead}`;
+}
+
+export function bindingsCommand(testedPullRequestMergeHead?: string): string {
+  const previewVersion = testedPullRequestMergeHead === undefined
+    ? undefined
+    : npmPreviewVersion(testedPullRequestMergeHead);
   return [
     "npm run build --prefix js/artifacts",
     parallelCommandGroups([
@@ -462,19 +491,45 @@ export function bindingsCommand(): string {
     "mkdir -p /workspace/.ci-output",
     "tar -C /workspace/js/bindings/pkg-web -cf /workspace/.ci-output/web-wasm.tar .",
     "sha256sum /workspace/.ci-output/web-wasm.tar > /workspace/.ci-output/web-wasm.tar.sha256",
+    "package_name=$(cd /workspace/js/bindings && npm pack --pack-destination /workspace/.ci-output --silent)",
+    "test -n \"$package_name\" && test \"$package_name\" = \"$(basename \"$package_name\")\"",
+    "mv \"/workspace/.ci-output/$package_name\" /workspace/.ci-output/npm-package.tgz",
+    "sha256sum /workspace/.ci-output/npm-package.tgz > /workspace/.ci-output/npm-package.tgz.sha256",
+    ...(previewVersion === undefined ? [] : [
+      `(cd /workspace/js/bindings && npm version ${shellQuote(previewVersion)} --no-git-tag-version --allow-same-version)`,
+      "npm run check:package --prefix /workspace/js/bindings",
+      "preview_name=$(cd /workspace/js/bindings && npm pack --pack-destination /workspace/.ci-output --silent)",
+      "test -n \"$preview_name\" && test \"$preview_name\" = \"$(basename \"$preview_name\")\"",
+      "mv \"/workspace/.ci-output/$preview_name\" /workspace/.ci-output/npm-preview.tgz",
+      `test "$(tar -xOf /workspace/.ci-output/npm-preview.tgz package/package.json | node -p ${shellQuote("JSON.parse(require('fs').readFileSync(0, 'utf8')).version")})" = ${shellQuote(previewVersion)}`,
+      "sha256sum /workspace/.ci-output/npm-preview.tgz > /workspace/.ci-output/npm-preview.tgz.sha256",
+    ]),
     "rm -rf /workspace/.cargo-home /workspace/.cargo-target",
   ].join(" && ");
 }
 
-export function bindingsResultCacheCommand(): string {
+export function bindingsResultCacheCommand(testedPullRequestMergeHead?: string): string {
   return [
-    bindingsCommand(),
+    bindingsCommand(testedPullRequestMergeHead),
     retainWorkspacePathsCommand([".ci-output"]),
   ].join(" && ");
 }
 
-export function bindingsArtifactCommand(): string {
-  return "test -s /workspace/.ci-output/web-wasm.tar && sha256sum --check /workspace/.ci-output/web-wasm.tar.sha256";
+export function bindingsArtifactCommand(testedPullRequestMergeHead?: string): string {
+  const previewVersion = testedPullRequestMergeHead === undefined
+    ? undefined
+    : npmPreviewVersion(testedPullRequestMergeHead);
+  return [
+    "test -s /workspace/.ci-output/web-wasm.tar",
+    "sha256sum --check /workspace/.ci-output/web-wasm.tar.sha256",
+    "test -s /workspace/.ci-output/npm-package.tgz",
+    "sha256sum --check /workspace/.ci-output/npm-package.tgz.sha256",
+    ...(previewVersion === undefined ? [] : [
+      "test -s /workspace/.ci-output/npm-preview.tgz",
+      "sha256sum --check /workspace/.ci-output/npm-preview.tgz.sha256",
+      `test "$(tar -xOf /workspace/.ci-output/npm-preview.tgz package/package.json | node -p ${shellQuote("JSON.parse(require('fs').readFileSync(0, 'utf8')).version")})" = ${shellQuote(previewVersion)}`,
+    ]),
+  ].join(" && ");
 }
 
 export function parallelCommandGroups(

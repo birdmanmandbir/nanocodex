@@ -11,9 +11,13 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 
 import {
+  assertMasterPublicationAuthority,
   buildSourceArtifacts,
+  main,
   parseGitTree,
   parseOrigin,
+  parsePublicationTarget,
+  prepareMasterPublication,
   readRepositorySnapshot,
 } from "./publish-ci-source.mjs";
 
@@ -25,6 +29,18 @@ test("requires HTTPS except for loopback development", () => {
   assert.equal(parseOrigin("http://127.0.0.1:8787/"), "http://127.0.0.1:8787");
   assert.equal(parseOrigin("http://ci.localhost:8787/"), "http://ci.localhost:8787");
   assert.throws(() => parseOrigin("http://ci.example.test"), /must use HTTPS/);
+});
+
+test("requires an explicit trusted Cargo vendor bundle SHA", async () => {
+  await assert.rejects(
+    main({
+      env: {
+        NANOCODEX_CI_ORIGIN: "http://127.0.0.1:8787",
+        NANOCODEX_CI_TOKEN: "source-token",
+      },
+    }),
+    /NANOCODEX_CI_CARGO_VENDOR_SHA256 is required/,
+  );
 });
 
 test("rejects Git replacement objects before naming an immutable source", async () => {
@@ -52,6 +68,232 @@ test("rejects Git replacement objects before naming an immutable source", async 
   }
 });
 
+test("pull-request targets are canonical and all-or-none", () => {
+  assert.deepEqual(parsePublicationTarget({}), {
+    type: "master",
+    branch: "master",
+    ref: "refs/heads/master",
+  });
+  assert.throws(
+    () => parsePublicationTarget({ NANOCODEX_CI_PULL_REQUEST_NUMBER: "7" }),
+    /requires NANOCODEX_CI_PULL_REQUEST_NUMBER, NANOCODEX_CI_PULL_REQUEST_HEAD/,
+  );
+  assert.throws(
+    () => parsePublicationTarget({
+      NANOCODEX_CI_PULL_REQUEST_NUMBER: "07",
+      NANOCODEX_CI_PULL_REQUEST_HEAD: "a".repeat(40),
+    }),
+    /positive canonical integer/,
+  );
+  assert.deepEqual(parsePublicationTarget({
+    NANOCODEX_CI_PULL_REQUEST_NUMBER: "7",
+    NANOCODEX_CI_PULL_REQUEST_HEAD: "a".repeat(40),
+  }), {
+    type: "pull_request",
+    number: 7,
+    pullRequestHead: "a".repeat(40),
+    branch: "pull/7/merge",
+    ref: "refs/pull/7/merge",
+    lane: { type: "pull_request", number: 7, pullRequestHead: "a".repeat(40) },
+  });
+});
+
+test("publishes an exact detached PR merge with CAS and exact reopen proof", async () => {
+  const directory = await mkdtemp(resolve(tmpdir(), "nanocodex-ci-pr-source-test-"));
+  const repository = resolve(directory, "repo");
+  const requests = [];
+  const number = 7;
+  const cargoVendorSha = "4".repeat(64);
+  const rustSecRevision = "5".repeat(40);
+  const rustSecSha = "6".repeat(64);
+  const closeRecord = {
+    error: "pull_request_closed",
+    number,
+    closeId: "123e4567-e89b-42d3-a456-426614174000",
+    mergeHead: "7".repeat(40),
+    pullRequestHead: "8".repeat(40),
+    closedAt: "2026-08-20T00:00:00.000Z",
+  };
+  let state = closeRecord;
+  let cargoLockBlob;
+  const server = createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const body = Buffer.concat(chunks);
+    requests.push({
+      authorization: request.headers.authorization,
+      body,
+      method: request.method,
+      url: request.url,
+    });
+    if (
+      request.method === "GET" &&
+      request.url === `/api/ci/source/pull-requests/${number}/state`
+    ) {
+      response.writeHead(state.error ? 404 : 200, { "content-type": "application/json" });
+      response.end(JSON.stringify(state));
+      return;
+    }
+    if (
+      request.method === "HEAD" &&
+      request.url === `/api/ci/cargo-vendor/${cargoLockBlob}/${cargoVendorSha}/bundle.tar.gz`
+    ) {
+      response.writeHead(200, {
+        "content-length": "1234",
+        "x-nanocodex-cargo-lock": cargoLockBlob,
+        "x-nanocodex-key": `cargo-vendor/${cargoLockBlob}/${cargoVendorSha}/bundle.tar.gz`,
+        "x-nanocodex-sha256": cargoVendorSha,
+      }).end();
+      return;
+    }
+    if (
+      request.method === "HEAD" &&
+      request.url === `/api/ci/rustsec-advisory-db/${rustSecRevision}/bundle.tar.gz`
+    ) {
+      response.writeHead(200, {
+        "content-length": "2345",
+        "x-nanocodex-key": `rustsec-advisory-db/${rustSecRevision}/bundle.tar.gz`,
+        "x-nanocodex-revision": rustSecRevision,
+        "x-nanocodex-sha256": rustSecSha,
+      }).end();
+      return;
+    }
+    if (request.method === "PUT" && request.url?.startsWith("/api/ci/source/objects/")) {
+      response.writeHead(201).end();
+      return;
+    }
+    if (request.method === "PUT" && request.url === "/api/ci/source/publish") {
+      response.writeHead(202).end();
+      return;
+    }
+    response.writeHead(418).end("unexpected endpoint");
+  });
+
+  try {
+    await git(["init", "-q", "-b", "master", repository], directory);
+    await git(["config", "user.name", "Nanocodex Test"], repository);
+    await git(["config", "user.email", "test@nanocodex.invalid"], repository);
+    await git(["remote", "add", "origin", "https://github.com/gakonst/nanocodex.git"], repository);
+    await writeFile(resolve(repository, "Cargo.lock"), "# lock\n");
+    await writeFile(resolve(repository, "README.md"), "base\n");
+    await git(["add", "."], repository);
+    await git(["commit", "-qm", "base"], repository, {
+      GIT_AUTHOR_DATE: "2026-08-20T01:00:00Z",
+      GIT_COMMITTER_DATE: "2026-08-20T01:00:00Z",
+    });
+    const baseHead = await git(["rev-parse", "HEAD"], repository);
+    await git(["checkout", "-qb", "pull-head"], repository);
+    await writeFile(resolve(repository, "README.md"), "pull request\n");
+    await git(["commit", "-qam", "pull request"], repository, {
+      GIT_AUTHOR_DATE: "2026-08-20T02:00:00Z",
+      GIT_COMMITTER_DATE: "2026-08-20T02:00:00Z",
+    });
+    const pullRequestHead = await git(["rev-parse", "HEAD"], repository);
+    await git(["checkout", "-q", "master"], repository);
+    await git(["merge", "--no-ff", "--no-edit", "pull-head"], repository, {
+      GIT_AUTHOR_DATE: "2026-08-20T03:00:00Z",
+      GIT_COMMITTER_DATE: "2026-08-20T03:00:00Z",
+    });
+    const mergeHead = await git(["rev-parse", "HEAD"], repository);
+    cargoLockBlob = await git(["rev-parse", "HEAD:Cargo.lock"], repository);
+    await git(["update-ref", "refs/remotes/origin/master", baseHead], repository);
+    await git(["update-ref", `refs/pull/${number}/head`, pullRequestHead], repository);
+    await git(["update-ref", `refs/pull/${number}/merge`, mergeHead], repository);
+
+    const target = parsePublicationTarget({
+      NANOCODEX_CI_PULL_REQUEST_NUMBER: String(number),
+      NANOCODEX_CI_PULL_REQUEST_HEAD: pullRequestHead,
+    });
+    await assert.rejects(
+      readRepositorySnapshot(repository, target),
+      /requires a detached checkout/,
+    );
+    await git(["checkout", "-q", "--detach", mergeHead], repository);
+    assert.deepEqual(await readRepositorySnapshot(repository, target), {
+      head: mergeHead,
+      ref: `refs/pull/${number}/merge`,
+    });
+
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    const env = {
+      ...process.env,
+      NANOCODEX_CI_ORIGIN: `http://127.0.0.1:${address.port}`,
+      NANOCODEX_CI_TOKEN: "source-token",
+      NANOCODEX_CI_CARGO_VENDOR_SHA256: cargoVendorSha,
+      NANOCODEX_REPO: repository,
+      NANOCODEX_RUSTSEC_REVISION: rustSecRevision,
+      NANOCODEX_CI_PULL_REQUEST_NUMBER: String(number),
+      NANOCODEX_CI_PULL_REQUEST_HEAD: pullRequestHead,
+    };
+    await main({ env, log() {} });
+    const firstPublication = JSON.parse(
+      requests.findLast(({ method, url }) =>
+        method === "PUT" && url === "/api/ci/source/publish"
+      ).body.toString("utf8"),
+    );
+    assert.equal(firstPublication.expectedHead, null);
+    assert.deepEqual(firstPublication.reopen, {
+      closeId: closeRecord.closeId,
+      mergeHead: closeRecord.mergeHead,
+      pullRequestHead: closeRecord.pullRequestHead,
+    });
+    assert.equal(firstPublication.publication.head, mergeHead);
+    assert.equal(firstPublication.publication.branch, `pull/${number}/merge`);
+    assert.equal(firstPublication.publication.ref, `refs/pull/${number}/merge`);
+    assert.deepEqual(firstPublication.publication.lane, {
+      type: "pull_request",
+      number,
+      pullRequestHead,
+    });
+    assert.ok(requests.every(({ authorization }) => authorization === "Bearer source-token"));
+
+    const priorMerge = "9".repeat(40);
+    state = {
+      publication: {
+        ...firstPublication.publication,
+        head: priorMerge,
+        lane: {
+          type: "pull_request",
+          number,
+          pullRequestHead: "8".repeat(40),
+        },
+        archive: { ...firstPublication.publication.archive, key: `sources/${priorMerge}/source.tar.gz` },
+        tree: { ...firstPublication.publication.tree, key: `sources/${priorMerge}/tree.json` },
+      },
+      run: {
+        version: 1,
+        head: priorMerge,
+        workflowId: `ci-${priorMerge}`,
+        state: "dispatched",
+        publishedAt: "2026-08-20T04:00:00.000Z",
+      },
+    };
+    const beforeReplay = requests.length;
+    await main({ env, log() {} });
+    const secondPublication = JSON.parse(
+      requests.slice(beforeReplay).findLast(({ method, url }) =>
+        method === "PUT" && url === "/api/ci/source/publish"
+      ).body.toString("utf8"),
+    );
+    assert.equal(secondPublication.expectedHead, priorMerge);
+    assert.equal(secondPublication.reopen, undefined);
+
+    await writeFile(resolve(repository, "UNTRACKED"), "dirty\n");
+    await assert.rejects(
+      readRepositorySnapshot(repository, target),
+      /requires a clean index and worktree/,
+    );
+  } finally {
+    if (server.listening) {
+      await new Promise((resolveClose) => server.close(resolveClose));
+    }
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("publishes the exact committed master source with authenticated CAS", async () => {
   const directory = await mkdtemp(resolve(tmpdir(), "nanocodex-ci-source-test-"));
   const repository = resolve(directory, "repo");
@@ -59,6 +301,10 @@ test("publishes the exact committed master source with authenticated CAS", async
   const artifactDirectoryTwo = resolve(directory, "artifacts-two");
   const requests = [];
   let remoteHead = null;
+  let advanceAuthorityOnState = false;
+  let advanceAuthorityOnObjectUpload = false;
+  let authoritativeRemote;
+  let movedAuthorityHead;
   let cargoLockBlob;
   const cargoVendorSha = "9".repeat(64);
   const cargoVendorSize = 4_000_000;
@@ -79,22 +325,33 @@ test("publishes the exact committed master source with authenticated CAS", async
       url: request.url,
     });
     if (request.method === "GET" && request.url === "/api/ci/source/state") {
+      if (advanceAuthorityOnState) {
+        advanceAuthorityOnState = false;
+        await git(["update-ref", "refs/heads/master", movedAuthorityHead], authoritativeRemote);
+        await git(["reset", "--hard", movedAuthorityHead], repository);
+        await git(
+          ["update-ref", "refs/remotes/origin/master", movedAuthorityHead],
+          repository,
+        );
+      }
       if (remoteHead == null) {
         response.writeHead(404).end("missing");
       } else {
         response.writeHead(200, { "content-type": "application/json" });
-        response.end(JSON.stringify({ publication: { head: remoteHead } }));
+        response.end(JSON.stringify({
+          publication: { head: remoteHead, cargoVendor: { sha256: cargoVendorSha } },
+        }));
       }
       return;
     }
     if (
       request.method === "HEAD" &&
-      request.url === `/api/ci/cargo-vendor/${cargoLockBlob}/bundle.tar.gz`
+      request.url === `/api/ci/cargo-vendor/${cargoLockBlob}/${cargoVendorSha}/bundle.tar.gz`
     ) {
       response.writeHead(200, {
         "content-length": String(cargoVendorSize),
         "x-nanocodex-cargo-lock": cargoLockBlob,
-        "x-nanocodex-key": `cargo-vendor/${cargoLockBlob}/bundle.tar.gz`,
+        "x-nanocodex-key": `cargo-vendor/${cargoLockBlob}/${cargoVendorSha}/bundle.tar.gz`,
         "x-nanocodex-sha256": cargoVendorSha,
       }).end();
       return;
@@ -115,6 +372,15 @@ test("publishes the exact committed master source with authenticated CAS", async
       request.method === "PUT" &&
       request.url?.startsWith("/api/ci/source/objects/")
     ) {
+      if (advanceAuthorityOnObjectUpload) {
+        advanceAuthorityOnObjectUpload = false;
+        await git(["update-ref", "refs/heads/master", movedAuthorityHead], authoritativeRemote);
+        await git(["reset", "--hard", movedAuthorityHead], repository);
+        await git(
+          ["update-ref", "refs/remotes/origin/master", movedAuthorityHead],
+          repository,
+        );
+      }
       response.writeHead(201).end();
       return;
     }
@@ -187,6 +453,24 @@ test("publishes the exact committed master source with authenticated CAS", async
       ],
     });
     await git(["config", "--unset", "tar.tar.gz.command"], repository);
+    await assert.rejects(
+      readRepositorySnapshot(repository),
+      /requires a clean tracked and untracked checkout/,
+    );
+    await rm(resolve(repository, "UNTRACKED-SECRET"));
+
+    await git(["switch", "-qc", "future-authority"], repository);
+    await writeFile(resolve(repository, "README.md"), "# future authoritative source\n");
+    await git(["commit", "-qam", "future authority fixture"], repository);
+    movedAuthorityHead = await git(["rev-parse", "HEAD"], repository);
+    await git(["switch", "-q", "master"], repository);
+    const authority = await installAuthoritativeGitShim({
+      directory,
+      repository,
+      masterHead: head,
+      retainedHeads: [movedAuthorityHead],
+    });
+    authoritativeRemote = authority.remote;
 
     server.listen(0, "127.0.0.1");
     await once(server, "listening");
@@ -197,8 +481,16 @@ test("publishes the exact committed master source with authenticated CAS", async
       ...process.env,
       NANOCODEX_CI_ORIGIN: origin,
       NANOCODEX_CI_TOKEN: "ci-source-token",
+      NANOCODEX_CI_CARGO_VENDOR_SHA256: cargoVendorSha,
       NANOCODEX_REPO: repository,
       NANOCODEX_RUSTSEC_REVISION: rustSecRevision,
+      PATH: `${authority.bin}:${process.env.PATH ?? ""}`,
+      GIT_REPLACE_REF_BASE: "refs/replace-attacker/",
+      GIT_OBJECT_DIRECTORY: resolve(directory, "attacker-objects"),
+      GIT_ALTERNATE_OBJECT_DIRECTORIES: resolve(directory, "attacker-alternates"),
+      GIT_INDEX_FILE: resolve(directory, "attacker-index"),
+      GIT_SHALLOW_FILE: resolve(directory, "attacker-shallow"),
+      GIT_CONFIG_GLOBAL: resolve(directory, "attacker-gitconfig"),
     };
 
     const firstStart = requests.length;
@@ -206,6 +498,26 @@ test("publishes the exact committed master source with authenticated CAS", async
       env,
       encoding: "utf8",
     });
+    const firstGitCalls = await readGitShimCalls(authority.log);
+    assert.equal(
+      firstGitCalls.filter(([command]) => command === "ls-remote").length,
+      3,
+      "a mutating publication must prove fresh GitHub authority initially, before upload, and before publish",
+    );
+    assert.deepEqual(firstGitCalls.filter(([command]) => command === "fetch"), [[
+      "fetch",
+      "--no-tags",
+      "--no-write-fetch-head",
+      "--recurse-submodules=no",
+      "origin",
+      "+refs/heads/master:refs/remotes/origin/master",
+    ]]);
+    assert.ok(firstGitCalls.filter(([command]) => command === "ls-remote").every((call) =>
+      call.includes("--exit-code") &&
+      call.includes("--refs") &&
+      call.includes("https://github.com/gakonst/nanocodex.git") &&
+      call.includes("refs/heads/master")
+    ));
     assert.match(first.stdout, new RegExp(`Published CI source ${head.slice(0, 7)}`));
     const firstRequests = requests.slice(firstStart);
     assert.deepEqual(
@@ -245,7 +557,7 @@ test("publishes the exact committed master source with authenticated CAS", async
     assert.equal(publication.publication.ref, "refs/heads/master");
     assert.equal(publication.publication.cargoLockBlob, cargoLockBlob);
     assert.deepEqual(publication.publication.cargoVendor, {
-      key: `cargo-vendor/${cargoLockBlob}/bundle.tar.gz`,
+      key: `cargo-vendor/${cargoLockBlob}/${cargoVendorSha}/bundle.tar.gz`,
       size: cargoVendorSize,
       sha256: cargoVendorSha,
     });
@@ -343,29 +655,143 @@ test("publishes the exact committed master source with authenticated CAS", async
     const rollbackStart = requests.length;
     await assert.rejects(
       execFileAsync(process.execPath, [publisherPath], { env, encoding: "utf8" }),
-      /must advance published head/,
+      /local HEAD, fetched origin\/master, and fresh GitHub master to be identical/,
     );
-    assert.deepEqual(
-      requests.slice(rollbackStart).map(({ method, url }) => ({ method, url })),
-      [{ method: "GET", url: "/api/ci/source/state" }],
-    );
+    assert.equal(requests.length, rollbackStart);
     await git(["reset", "--hard", head], repository);
 
     await writeFile(resolve(repository, "README.md"), "dirty tracked source\n");
     const dirtyStart = requests.length;
     await assert.rejects(
       execFileAsync(process.execPath, [publisherPath], { env, encoding: "utf8" }),
-      /requires a clean index and tracked worktree/,
+      /requires a clean tracked and untracked checkout/,
     );
     assert.equal(requests.length, dirtyStart);
     assert.equal(
       requests.some(({ url }) => url === "/api/health" || url?.includes("github")),
       false,
     );
+    await git(["checkout", "--", "README.md"], repository);
+
+    remoteHead = oldHead;
+    advanceAuthorityOnState = true;
+    const staleStart = requests.length;
+    await assert.rejects(
+      execFileAsync(process.execPath, [publisherPath], { env, encoding: "utf8" }),
+      /local HEAD, fetched origin\/master, and fresh GitHub master to be identical/,
+    );
+    assert.equal(
+      requests.slice(staleStart).some(({ method }) => method === "PUT"),
+      false,
+      "an authoritative ref move before upload must prevent every remote mutation",
+    );
+    await git(["reset", "--hard", head], repository);
+    await git(["update-ref", "refs/remotes/origin/master", head], repository);
+    await git(["update-ref", "refs/heads/master", head], authoritativeRemote);
+
+    advanceAuthorityOnObjectUpload = true;
+    const publishRaceStart = requests.length;
+    await assert.rejects(
+      execFileAsync(process.execPath, [publisherPath], { env, encoding: "utf8" }),
+      /local HEAD, fetched origin\/master, and fresh GitHub master to be identical/,
+    );
+    const publishRaceRequests = requests.slice(publishRaceStart);
+    assert.ok(publishRaceRequests.some(({ method, url }) =>
+      method === "PUT" && url?.startsWith("/api/ci/source/objects/")
+    ));
+    assert.equal(publishRaceRequests.some(({ method, url }) =>
+      method === "PUT" && url === "/api/ci/source/publish"
+    ), false, "a coherent local and remote ref move after upload must block publication");
   } finally {
     if (server.listening) {
       await new Promise((resolveClose) => server.close(resolveClose));
     }
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("master source authority rejects isolated, alternate, detached, shallow, grafted, and extra-master repositories", async () => {
+  const directory = await mkdtemp(resolve(tmpdir(), "nanocodex-ci-source-authority-test-"));
+  const repository = resolve(directory, "repo");
+  const baseEnv = {
+    ...process.env,
+    NANOCODEX_CI_ORIGIN: "http://127.0.0.1:9",
+    NANOCODEX_CI_TOKEN: "unused-source-token",
+    NANOCODEX_CI_CARGO_VENDOR_SHA256: "a".repeat(64),
+    NANOCODEX_REPO: repository,
+    NANOCODEX_RUSTSEC_REVISION: "b".repeat(40),
+  };
+  try {
+    await git(["init", "-q", "-b", "master", repository], directory);
+    await git(["config", "user.name", "Nanocodex Test"], repository);
+    await git(["config", "user.email", "test@nanocodex.invalid"], repository);
+    await writeFile(resolve(repository, "Cargo.lock"), "# authority fixture\n");
+    await git(["add", "Cargo.lock"], repository);
+    await git(["commit", "-qm", "authority fixture"], repository);
+    const head = await git(["rev-parse", "HEAD"], repository);
+
+    await assert.rejects(
+      execFileAsync(process.execPath, [publisherPath], { env: baseEnv, encoding: "utf8" }),
+      /one canonical HTTPS origin/,
+      "an isolated local repository must not acquire publication authority",
+    );
+
+    await git(["remote", "add", "origin", "git@github.com:gakonst/nanocodex.git"], repository);
+    await assert.rejects(
+      execFileAsync(process.execPath, [publisherPath], { env: baseEnv, encoding: "utf8" }),
+      /one canonical HTTPS origin/,
+    );
+    await git(["remote", "set-url", "origin", "https://github.com/gakonst/nanocodex.git"], repository);
+    const authority = await installAuthoritativeGitShim({ directory, repository, masterHead: head });
+    const env = { ...baseEnv, PATH: `${authority.bin}:${process.env.PATH ?? ""}` };
+
+    await git(["checkout", "-q", "--detach", head], repository);
+    await assert.rejects(
+      execFileAsync(process.execPath, [publisherPath], { env, encoding: "utf8" }),
+      /attached refs\/heads\/master checkout|git symbolic-ref failed/,
+    );
+    await git(["checkout", "-q", "master"], repository);
+
+    const shallowPath = resolve(repository, ".git", "shallow");
+    await writeFile(shallowPath, `${head}\n`);
+    await assert.rejects(
+      execFileAsync(process.execPath, [publisherPath], { env, encoding: "utf8" }),
+      /complete non-bare repository/,
+    );
+    await rm(shallowPath);
+
+    const graftPath = await git(["rev-parse", "--git-path", "info/grafts"], repository);
+    await writeFile(resolve(repository, graftPath), `${head} ${head}\n`);
+    await assert.rejects(
+      execFileAsync(process.execPath, [publisherPath], { env, encoding: "utf8" }),
+      /rejects Git grafts/,
+    );
+    await rm(resolve(repository, graftPath));
+
+    await git(["update-ref", "refs/remotes/backup/nested/master", head], repository);
+    await assert.rejects(
+      execFileAsync(process.execPath, [publisherPath], { env, encoding: "utf8" }),
+      /rejects extra remote-tracking master refs/,
+    );
+    await git(["update-ref", "-d", "refs/remotes/backup/nested/master"], repository);
+
+    await git(["symbolic-ref", "refs/remotes/origin/master", "refs/heads/master"], repository);
+    await assert.rejects(
+      assertMasterPublicationAuthorityWithPath(repository, head, authority.bin),
+      /rejects extra remote-tracking master refs/,
+    );
+    await git(["symbolic-ref", "--delete", "refs/remotes/origin/master"], repository);
+    await git(["update-ref", "refs/remotes/origin/master", head], repository);
+
+    assert.deepEqual(await prepareMasterPublicationWithPath(repository, authority.bin), {
+      head,
+      ref: "refs/heads/master",
+    });
+    assert.deepEqual(await assertMasterPublicationAuthorityWithPath(repository, head, authority.bin), {
+      head,
+      ref: "refs/heads/master",
+    });
+  } finally {
     await rm(directory, { recursive: true, force: true });
   }
 });
@@ -391,4 +817,87 @@ async function git(args, cwd, extraEnv = {}) {
     encoding: "utf8",
   });
   return stdout.trimEnd();
+}
+
+async function installAuthoritativeGitShim({
+  directory,
+  repository,
+  masterHead,
+  retainedHeads = [],
+}) {
+  const remote = resolve(directory, "authoritative.git");
+  const bin = resolve(directory, "authority-bin");
+  const log = resolve(directory, "authority-git.jsonl");
+  const realGit = (await execFileAsync("which", ["git"], { encoding: "utf8" })).stdout.trim();
+  await git(["init", "-q", "--bare", remote], directory);
+  await git([
+    "push",
+    "-q",
+    remote,
+    `${masterHead}:refs/heads/master`,
+    ...retainedHeads.map((head, index) => `${head}:refs/authority/${index}`),
+  ], repository);
+  const configured = await git(["remote"], repository);
+  if (!configured.split("\n").includes("origin")) {
+    await git([
+      "remote",
+      "add",
+      "origin",
+      "https://github.com/gakonst/nanocodex.git",
+    ], repository);
+  }
+  await git(["config", "branch.master.remote", "origin"], repository);
+  await git(["config", "branch.master.merge", "refs/heads/master"], repository);
+  await mkdir(bin);
+  await writeFile(log, "");
+  const shim = resolve(bin, "git");
+  await writeFile(shim, `#!/usr/bin/env node
+const { spawnSync } = require("node:child_process");
+const { appendFileSync } = require("node:fs");
+const args = process.argv.slice(2);
+let command = 0;
+while (args[command] === "-c") command += 2;
+appendFileSync(${JSON.stringify(log)}, JSON.stringify(args.slice(command)) + "\\n");
+if (args[command] === "fetch") {
+  const index = args.indexOf("origin", command + 1);
+  if (index >= 0) args[index] = ${JSON.stringify(remote)};
+}
+if (args[command] === "ls-remote") {
+  const index = args.indexOf("https://github.com/gakonst/nanocodex.git", command + 1);
+  if (index >= 0) args[index] = ${JSON.stringify(remote)};
+}
+const result = spawnSync(${JSON.stringify(realGit)}, args, {
+  cwd: process.cwd(),
+  env: process.env,
+  stdio: "inherit",
+});
+if (result.error) throw result.error;
+process.exit(result.status ?? 1);
+`);
+  await chmod(shim, 0o755);
+  return { bin, log, remote };
+}
+
+async function readGitShimCalls(path) {
+  const contents = await readFile(path, "utf8");
+  return contents.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+}
+
+async function withAuthorityPath(bin, operation) {
+  const prior = process.env.PATH;
+  process.env.PATH = `${bin}:${prior ?? ""}`;
+  try {
+    return await operation();
+  } finally {
+    if (prior == null) delete process.env.PATH;
+    else process.env.PATH = prior;
+  }
+}
+
+function prepareMasterPublicationWithPath(repository, bin) {
+  return withAuthorityPath(bin, () => prepareMasterPublication(repository));
+}
+
+function assertMasterPublicationAuthorityWithPath(repository, head, bin) {
+  return withAuthorityPath(bin, () => assertMasterPublicationAuthority(repository, head));
 }

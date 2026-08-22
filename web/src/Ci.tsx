@@ -18,6 +18,16 @@ const gates = [
     "isolated Rust 1.97 compilation root",
   ],
   ["stable-workspace-tests", "Stable workspace", "complete Rust test suite"],
+  [
+    "linux-native-cli",
+    "Linux native CLI",
+    "verified x86_64 GNU release binary",
+  ],
+  [
+    "macos-stable-workspace-tests-and-native-cli",
+    "macOS workspace and native CLI",
+    "authenticated Apple Silicon tests and verified arm64 binary",
+  ],
   ["msrv-workspace-tests", "MSRV 1.97", "minimum supported Rust"],
   ["quality", "Quality", "rustfmt and warnings-denied Clippy"],
   ["dependency-policy", "Dependency policy", "crate boundaries and Cargo deny"],
@@ -120,10 +130,11 @@ export function Ci() {
     <div className="ci-dashboard">
       <header className="ci-page-head" aria-labelledby="ci-title">
         <p className="eyebrow">Cloudflare-native CI</p>
-        <h1 id="ci-title">Continuous integration without GitHub.</h1>
+        <h1 id="ci-title">Continuous integration without GitHub Actions.</h1>
         <p>
-          One immutable source publication enters Workers and Workflows. Cloudflare
-          Containers execute the gates; R2 retains caches, logs, and deployable artifacts.
+          GitHub remains the source and pull-request authority. One immutable publication
+          enters Workers and Workflows; Cloudflare Containers and an authenticated Apple
+          Silicon runner execute the gates, while R2 retains evidence and artifacts.
         </p>
         <p className="ci-architecture">
           workers / workflows / containers / durable objects / r2

@@ -5,6 +5,8 @@ export { CiSandbox, NanocodexCI } from "./ciWorkflow.ts";
 export {
   ByokSession,
   ChatGptSession,
+  CiMacJobs,
+  CiReleases,
   CiRepository,
   EvalCoordinator,
   GitRepository,
