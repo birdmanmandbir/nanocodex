@@ -244,7 +244,7 @@ index aa6068d..9a43284 100644
  
  export type RunStepResult<S> = RunOutput & {
 diff --git a/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts b/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
-index a7f6c05..8b76660 100644
+index a7f6c05..26150fc 100644
 --- a/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
 +++ b/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
 @@ -1,7 +1,12 @@
@@ -285,23 +285,28 @@ index a7f6c05..8b76660 100644
  const COMMAND_TIMEOUT_MS = 11 * 60 * 1000;
  const SOURCE_TIMEOUT_MS = 5 * 60 * 1000;
  const PORT_READY_TIMEOUT_MS = 60_000;
-@@ -25,6 +39,15 @@ const TAIL_BYTES = 28_000;
+@@ -24,6 +38,20 @@ const PORT_READY_TIMEOUT_MS = 60_000;
+ const TAIL_BYTES = 28_000;
  // Two inline logs plus result metadata must remain below Workflows' 1 MiB limit.
  const INLINE_LOG_BYTES = 300_000;
- 
-+// Miniflare proxies local R2 streams through one process. Serializing only the
-+// large restore transfer prevents parallel cache hits from collapsing that
-+// proxy while still allowing the restored containers to compile in parallel.
++// One unbounded local R2 -> Sandbox RPC stream can stop making progress after
++// roughly 128 MiB. Range each archive into independently acknowledged writes
++// so multi-gigabyte Rust snapshots remain restorable under Wrangler/OrbStack.
++const LOCAL_RESTORE_CHUNK_BYTES = 32 * 1024 * 1024;
++const LARGE_LOCAL_RESTORE_BYTES = 64 * 1024 * 1024;
++
++// Miniflare proxies local R2 streams through one process. Serialize large
++// restore transfers, but let compact result/artifact snapshots pass without
++// waiting behind a multi-gigabyte Rust cache.
 +let localRestoreTail = Promise.resolve();
 +// Wrangler can drop its local proxy connection when several new Containers all
 +// perform their first RPC simultaneously. Serialize only that initialization
 +// boundary; commands run concurrently as soon as their workspace is ready.
 +let localSandboxStartTail = Promise.resolve();
-+
+ 
  export class SandboxRunner implements Runner<DirectoryBackup> {
    readonly name = 'sandbox';
- 
-@@ -38,40 +61,55 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -38,23 +66,43 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
    async run(
      input: RunStepInput & { restore?: DirectoryBackup }
    ): Promise<RunStepResult<DirectoryBackup>> {
@@ -323,16 +328,6 @@ index a7f6c05..8b76660 100644
  
 -    let cleanupTransferredToStreams = false;
      try {
--      if (input.restore) {
--        await sandbox.restoreBackup(input.restore);
--        // Overlay (no rm) so cached node_modules survive while tracked source
--        // files are refreshed to this commit. The restored archive may carry a
--        // different commit's source (e.g. a reused install cache), so this is
--        // what keeps it correct. Files deleted since then linger; the next
--        // install/build regenerates derived output.
--        await sandbox.exec(
--          checkoutSourceScript(input.source, WORKSPACE_DIR, true),
--          {
 +      await assertRunActive(this.env.BACKUP_BUCKET, input.sourceSha);
 +      const runnerSandbox = getSandbox(this.env.SANDBOX, runnerId, {
 +        // Local R2 restores must stream large squashfs archives into the
@@ -343,39 +338,38 @@ index a7f6c05..8b76660 100644
 +        containerTimeouts: { portReadyTimeoutMS: PORT_READY_TIMEOUT_MS },
 +      });
 +      sandbox = runnerSandbox;
-+      await serializeLocalSandboxStart(this.env, async () => {
-+        if (input.restore) {
-+          await restoreSnapshot(runnerSandbox, input.restore, this.env);
-+          // Overlay (no rm) so cached node_modules survive while tracked source
-+          // files are refreshed to this commit. The restored archive may carry a
-+          // different commit's source (e.g. a reused install cache), so this is
-+          // what keeps it correct. Files deleted since then linger; the next
-+          // install/build regenerates derived output.
-+          await runnerSandbox.exec(
-+            checkoutSourceScript(input.source, WORKSPACE_DIR, true),
-+            {
-+              cwd: '/',
-+              timeout: SOURCE_TIMEOUT_MS,
-+              env: checkoutSourceEnv(input.source),
-+            }
-+          );
-+        } else {
-+          await runnerSandbox.exec(checkoutSourceScript(input.source, WORKSPACE_DIR), {
++      await serializeLocalSandboxStart(this.env, () =>
++        runnerSandbox.exec('true', { cwd: '/', timeout: PORT_READY_TIMEOUT_MS })
++      );
+       if (input.restore) {
+-        await sandbox.restoreBackup(input.restore);
++        await restoreSnapshot(
++          runnerSandbox,
++          input.restore,
++          this.env,
++          input.sourceSha
++        );
+         // Overlay (no rm) so cached node_modules survive while tracked source
+         // files are refreshed to this commit. The restored archive may carry a
+         // different commit's source (e.g. a reused install cache), so this is
+         // what keeps it correct. Files deleted since then linger; the next
+         // install/build regenerates derived output.
+-        await sandbox.exec(
++        await runnerSandbox.exec(
+           checkoutSourceScript(input.source, WORKSPACE_DIR, true),
+           {
              cwd: '/',
-             timeout: SOURCE_TIMEOUT_MS,
-             env: checkoutSourceEnv(input.source),
--          }
--        );
--      } else {
+@@ -63,15 +111,16 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+           }
+         );
+       } else {
 -        await sandbox.exec(checkoutSourceScript(input.source, WORKSPACE_DIR), {
--          cwd: '/',
--          timeout: SOURCE_TIMEOUT_MS,
--          env: checkoutSourceEnv(input.source),
--        });
--      }
-+          });
-+        }
-+      });
++        await runnerSandbox.exec(checkoutSourceScript(input.source, WORKSPACE_DIR), {
+           cwd: '/',
+           timeout: SOURCE_TIMEOUT_MS,
+           env: checkoutSourceEnv(input.source),
+         });
+       }
  
 +      await assertRunActive(this.env.BACKUP_BUCKET, input.sourceSha);
        const proc = await sandbox.startProcess(
@@ -384,7 +378,7 @@ index a7f6c05..8b76660 100644
          {
            cwd: resolveCwd(input.cwd),
            env: {
-@@ -81,59 +119,465 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -81,61 +130,547 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
            autoCleanup: false,
          }
        );
@@ -498,7 +492,6 @@ index a7f6c05..8b76660 100644
      } finally {
 -      if (!cleanupTransferredToStreams) {
 -        await destroySandbox(sandbox);
--      }
 +      // Keep the registry marker when teardown fails so the authenticated
 +      // control route can retry the exact Sandbox rather than leaking it.
 +      if (sandbox) await destroySandbox(sandbox);
@@ -532,7 +525,7 @@ index a7f6c05..8b76660 100644
 +        runnerId,
 +        registeredAt,
 +      },
-     }
++    }
 +  );
 +}
 +
@@ -564,10 +557,17 @@ index a7f6c05..8b76660 100644
 +async function restoreSnapshot(
 +  sandbox: ReturnType<typeof getSandbox>,
 +  snapshot: DirectoryBackup,
-+  env: Bindings
++  env: Bindings,
++  sourceSha: string
 +) {
-+  if (env.ENVIRONMENT !== 'development') {
++  if (env.ENVIRONMENT !== 'development' || !snapshot.localBucket) {
 +    await sandbox.restoreBackup(snapshot);
++    return;
++  }
++  validateLocalSnapshot(snapshot);
++  const size = await localSnapshotSize(env.BACKUP_BUCKET, snapshot);
++  if (size <= LARGE_LOCAL_RESTORE_BYTES) {
++    await restoreLocalSnapshotInChunks(sandbox, snapshot, env, sourceSha, size);
 +    return;
 +  }
 +  const previous = localRestoreTail;
@@ -577,12 +577,85 @@ index a7f6c05..8b76660 100644
 +  });
 +  await previous;
 +  try {
-+    await sandbox.restoreBackup(snapshot);
++    await restoreLocalSnapshotInChunks(sandbox, snapshot, env, sourceSha, size);
 +  } finally {
 +    release();
 +  }
 +}
 +
++async function localSnapshotSize(bucket: R2Bucket, snapshot: DirectoryBackup) {
++  const archive = await bucket.head(`backups/${snapshot.id}/data.sqsh`);
++  if (!archive || archive.size <= 0 || !Number.isSafeInteger(archive.size)) {
++    throw new Error(`Local CI snapshot archive is missing: ${snapshot.id}`);
++  }
++  return archive.size;
++}
++
++function validateLocalSnapshot(snapshot: DirectoryBackup) {
++  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(snapshot.id)) {
++    throw new Error(`Invalid local CI snapshot id: ${snapshot.id}`);
++  }
++  if (!posix.isAbsolute(snapshot.dir) || posix.normalize(snapshot.dir) !== snapshot.dir) {
++    throw new Error(`Invalid local CI snapshot directory: ${snapshot.dir}`);
++  }
++}
++
++async function restoreLocalSnapshotInChunks(
++  sandbox: ReturnType<typeof getSandbox>,
++  snapshot: DirectoryBackup,
++  env: Bindings,
++  sourceSha: string,
++  size: number
++) {
++  const key = `backups/${snapshot.id}/data.sqsh`;
++  const archivePath = `/var/backups/${snapshot.id}.sqsh`;
++  const partPath = `${archivePath}.part`;
++  const initialize = await sandbox.exec(
++    `mkdir -p /var/backups && rm -f ${shellQuote(archivePath)} ${shellQuote(partPath)} && : > ${shellQuote(archivePath)}`,
++    { cwd: '/', timeout: 30_000 }
++  );
++  if (initialize.exitCode !== 0) {
++    throw new Error(`Failed to initialize local CI snapshot restore: ${snapshot.id}`);
++  }
++  try {
++    for (let offset = 0; offset < size; offset += LOCAL_RESTORE_CHUNK_BYTES) {
++      await assertRunActive(env.BACKUP_BUCKET, sourceSha);
++      const length = Math.min(LOCAL_RESTORE_CHUNK_BYTES, size - offset);
++      const chunk = await env.BACKUP_BUCKET.get(key, {
++        range: { offset, length },
++      });
++      if (!chunk) {
++        throw new Error(`Local CI snapshot range is missing at ${offset}: ${snapshot.id}`);
++      }
++      const written = await sandbox.writeFile(partPath, chunk.body);
++      if (!written.success) {
++        throw new Error(`Local CI snapshot range write failed at ${offset}: ${snapshot.id}`);
++      }
++      const appended = await sandbox.exec(
++        `test "$(stat -c %s ${shellQuote(partPath)})" -eq ${length} && cat ${shellQuote(partPath)} >> ${shellQuote(archivePath)} && rm -f ${shellQuote(partPath)}`,
++        { cwd: '/', timeout: 60_000 }
++      );
++      if (appended.exitCode !== 0) {
++        throw new Error(`Local CI snapshot range append failed at ${offset}: ${snapshot.id}`);
+       }
+     }
++    const restored = await sandbox.exec(
++      `test "$(stat -c %s ${shellQuote(archivePath)})" -eq ${size} && /usr/bin/unsquashfs -f -d ${shellQuote(snapshot.dir)} ${shellQuote(archivePath)}`,
++      { cwd: '/', timeout: SOURCE_TIMEOUT_MS }
++    );
++    if (restored.exitCode !== 0) {
++      throw new Error(
++        `Local CI snapshot extraction failed: ${snapshot.id}: ${restored.stderr.slice(-2_000)}`
++      );
++    }
++  } finally {
++    await sandbox.exec(
++      `rm -f ${shellQuote(archivePath)} ${shellQuote(partPath)}`,
++      { cwd: '/', timeout: 30_000 }
++    ).catch(() => undefined);
+   }
+ }
+ 
 +async function serializeLocalSandboxStart<T>(
 +  env: Bindings,
 +  start: () => Promise<T>
@@ -604,7 +677,7 @@ index a7f6c05..8b76660 100644
 +function fulfilled<T>(result: PromiseSettledResult<T>): T {
 +  if (result.status === 'rejected') {
 +    throw result.reason;
-   }
++  }
 +  return result.value;
 +}
 +
@@ -887,10 +960,12 @@ index a7f6c05..8b76660 100644
 +    throw new Error(`Invalid CI log metadata for ${path}`);
 +  }
 +  return value as LogCaptureMetadata;
- }
- 
++}
++
  async function readLogs(sandbox: ReturnType<typeof getSandbox>) {
-@@ -153,7 +597,7 @@ async function readLog(
+   const listing = await sandbox.listFiles('/tmp');
+   const sizes = new Map(
+@@ -153,7 +688,7 @@ async function readLog(
    size: number
  ): Promise<string | ReadableStream<Uint8Array>> {
    if (size > INLINE_LOG_BYTES) {
@@ -899,7 +974,7 @@ index a7f6c05..8b76660 100644
    }
    return (await sandbox.readFile(file, { encoding: 'utf-8' })).content;
  }
-@@ -192,51 +636,22 @@ function resolveCwd(cwd: string | undefined) {
+@@ -192,51 +727,22 @@ function resolveCwd(cwd: string | undefined) {
    return posix.join(WORKSPACE_DIR, normalized);
  }
  

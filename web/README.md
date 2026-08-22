@@ -179,6 +179,12 @@ Deterministic Rust, MSRV, quality, policy, static-VM, Python, bindings, and
 website verification gates reuse successful results whenever their exact
 declared inputs are unchanged. No correctness runner is retried; only
 network-backed dependency preparation gets one retry.
+Wrangler's local R2 fallback restores large Rust snapshots as independently
+acknowledged 32 MiB ranges, verifies every range and the assembled squashfs,
+then extracts it in the Sandbox. This avoids the unbounded local RPC stream
+that can stall after roughly 128 MiB. Only large restores serialize; compact
+result and artifact snapshots can pass while production keeps the native
+mounted R2 restore path.
 Success and failure logs, step records, final results, required parent/cache
 snapshots, and cache pointers are retained in the
 `nanocodex-ci` R2 bucket; no separate hosted artifact product is required.

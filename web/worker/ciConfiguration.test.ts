@@ -178,9 +178,27 @@ test("artifact and deterministic gates use bounded reusable cache entries", asyn
   assert.match(sandboxRunner, /let localRestoreTail = Promise\.resolve\(\)/);
   assert.match(
     sandboxRunner,
-    /await restoreSnapshot\(runnerSandbox, input\.restore, this\.env\)/,
+    /await restoreSnapshot\([\s\S]*?runnerSandbox,[\s\S]*?input\.restore,[\s\S]*?this\.env,[\s\S]*?input\.sourceSha/,
   );
   assert.match(sandboxRunner, /env\.ENVIRONMENT !== 'development'/);
+  assert.match(sandboxRunner, /LOCAL_RESTORE_CHUNK_BYTES = 32 \* 1024 \* 1024/);
+  assert.match(
+    sandboxRunner,
+    /BACKUP_BUCKET\.get\(key, \{[\s\S]*?range: \{ offset, length \}[\s\S]*?sandbox\.writeFile\(partPath, chunk\.body\)/,
+  );
+  assert.match(
+    sandboxRunner,
+    /stat -c %s[\s\S]*?\$\{size\}[\s\S]*?\/usr\/bin\/unsquashfs/,
+  );
+  assert.match(sandboxRunner, /LARGE_LOCAL_RESTORE_BYTES = 64 \* 1024 \* 1024/);
+  assert.match(
+    sandboxRunner,
+    /serializeLocalSandboxStart\([\s\S]*?runnerSandbox\.exec\('true'[\s\S]*?\);[\s\S]*?if \(input\.restore\)/,
+  );
+  assert.match(
+    sandboxRunner,
+    /if \(size <= LARGE_LOCAL_RESTORE_BYTES\)[\s\S]*?restoreLocalSnapshotInChunks[\s\S]*?return/,
+  );
   assert.match(sandboxRunner, /await registerActiveSandbox\(/);
   assert.match(sandboxRunner, /await assertRunActive\(this\.env\.BACKUP_BUCKET, input\.sourceSha\)/);
   assert.match(sandboxRunner, /runs\/\$\{head\}\/sandboxes\/\$\{runnerId\}\.json/);
