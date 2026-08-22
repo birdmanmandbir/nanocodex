@@ -62,6 +62,8 @@ const BINDINGS_WASM_INPUTS = [
   "crates/experimental/nanocodex-voice-protocol/src/**/*",
 ];
 
+const RUST_SOURCE_CACHE_SCRIPT = "web/ci/rust-source-cache.py";
+
 export type RustSecAdvisoryBundle = {
   url: string;
   revision: string;
@@ -196,12 +198,11 @@ export function websiteDependencyCacheInputs(): string[] {
 }
 
 export function rustBuildCacheInputs(): string[] {
-  // The snapshot retains only Cargo homes, target output, and a fingerprint of
-  // the source that produced it. A restored runner overlays the exact current
-  // tree and touches every Rust input when that fingerprint changes, so Cargo
-  // safely reuses dependency artifacts while rebuilding affected workspace
-  // crates. Source content therefore must not fragment this reusable layer.
-  return cargoCacheInputs();
+  // The snapshot retains Cargo homes, target output, and a content manifest.
+  // After source overlay, unchanged inputs are backdated ahead of the compiled
+  // graph while only changed inputs are invalidated. Source content therefore
+  // must not fragment this reusable layer.
+  return [...cargoCacheInputs(), RUST_SOURCE_CACHE_SCRIPT];
 }
 
 export function rustQualityCacheInputs(): string[] {
@@ -211,6 +212,7 @@ export function rustQualityCacheInputs(): string[] {
   // website-only publication to reuse the attested result.
   return [
     ...cargoCacheInputs(),
+    RUST_SOURCE_CACHE_SCRIPT,
     "bin/**/*",
     "crates/**/*",
     "examples/**/*.rs",
@@ -228,7 +230,7 @@ export function pythonCacheInputs(): string[] {
 }
 
 export function msrvBuildCacheInputs(): string[] {
-  return cargoCacheInputs();
+  return [...cargoCacheInputs(), RUST_SOURCE_CACHE_SCRIPT];
 }
 
 export function bindingsBuildCacheCommand(): string {
@@ -333,24 +335,21 @@ function rustCompilationCacheCommand(
   targetDirectory: string,
 ): string {
   return [
-    `${sourceFingerprintCommand()} > /workspace/.rust-source-fingerprint`,
+    sourceCacheCommand("snapshot"),
     command,
-    `find /workspace -mindepth 1 -maxdepth 1 ! -name .cargo-home ! -name ${targetDirectory} ! -name .rust-source-fingerprint -exec rm -rf -- {} +`,
+    `find /workspace -mindepth 1 -maxdepth 1 ! -name .cargo-home ! -name ${targetDirectory} ! -name .rust-source-manifest.json -exec rm -rf -- {} +`,
   ].join(" && ");
 }
 
 export function refreshSourceCommand(command: string): string {
   return [
-    `current_source_fingerprint=$(${sourceFingerprintCommand()})`,
-    "cached_source_fingerprint=$(cat /workspace/.rust-source-fingerprint 2>/dev/null || true)",
-    "if [ \"$current_source_fingerprint\" != \"$cached_source_fingerprint\" ]; then find /workspace -path '*/node_modules' -prune -o -path /workspace/.cargo-home -prune -o -path /workspace/.cargo-target -prune -o -path /workspace/.cargo-target-msrv -prune -o -path /workspace/.rust-source-fingerprint -prune -o -type f -exec touch -- {} +; fi",
-    "rm -f /workspace/.rust-source-fingerprint",
+    sourceCacheCommand("refresh"),
     command,
   ].join(" && ");
 }
 
-function sourceFingerprintCommand(): string {
-  return "{ find /workspace/Cargo.toml /workspace/Cargo.lock /workspace/.cargo /workspace/bin /workspace/crates /workspace/js/bindings/Cargo.toml /workspace/js/bindings/src /workspace/py/bindings/Cargo.toml /workspace/py/bindings/src -type f -print0; find /workspace/examples -type f \\( -name '*.rs' -o -name Cargo.toml \\) -print0; } | sort -z | xargs -0 sha256sum | sha256sum";
+function sourceCacheCommand(operation: "snapshot" | "refresh"): string {
+  return `python3 /workspace/${RUST_SOURCE_CACHE_SCRIPT} ${operation} /workspace /workspace/.rust-source-manifest.json`;
 }
 
 export function bindingsCommand(): string {

@@ -164,10 +164,17 @@ test("dependency and Rust compilation snapshots are content addressed", async ()
     stat(new URL(`../../${project}/package.json`, import.meta.url)),
     stat(new URL(`../../${project}/package-lock.json`, import.meta.url)),
   ]));
-  assert.deepEqual(rustBuildCacheInputs(), cargoCacheInputs());
-  assert.deepEqual(msrvBuildCacheInputs(), cargoCacheInputs());
+  assert.deepEqual(rustBuildCacheInputs(), [
+    ...cargoCacheInputs(),
+    "web/ci/rust-source-cache.py",
+  ]);
+  assert.deepEqual(msrvBuildCacheInputs(), [
+    ...cargoCacheInputs(),
+    "web/ci/rust-source-cache.py",
+  ]);
   assert.deepEqual(rustQualityCacheInputs(), [
     ...cargoCacheInputs(),
+    "web/ci/rust-source-cache.py",
     "bin/**/*",
     "crates/**/*",
     "examples/**/*.rs",
@@ -203,11 +210,13 @@ test("dependency and Rust compilation snapshots are content addressed", async ()
   assert.match(rustBuildCacheCommand(), /--bench tui_render/);
   assert.doesNotMatch(rustBuildCacheCommand(), /cargo clean/);
   assert.doesNotMatch(msrvBuildCacheCommand(), /cargo .*clean/);
-  assert.match(refreshSourceCommand("cargo test"), /-exec touch/);
-  assert.match(refreshSourceCommand("cargo test"), /\.cargo-target-msrv -prune/);
+  assert.match(
+    refreshSourceCommand("cargo test"),
+    /rust-source-cache\.py refresh \/workspace \/workspace\/\.rust-source-manifest\.json/,
+  );
   const qualityCache = rustQualityCacheCommand("cargo clippy --workspace");
   assert.match(qualityCache, /cargo clippy --workspace/);
-  assert.match(qualityCache, /-exec touch/);
+  assert.match(qualityCache, /rust-source-cache\.py refresh/);
   assert.match(
     qualityCache,
     /find \/workspace -mindepth 1 -maxdepth 1 -exec rm -rf -- \{\} \+/,
@@ -497,10 +506,12 @@ test("the website snapshot drops Cargo and unrelated package roots", async () =>
   }
 });
 
-test("the Rust cache preserves exact reruns and refreshes changed source", async () => {
+test("the Rust cache preserves unchanged crate mtimes and invalidates only changed source", async () => {
   const directory = await mkdtemp(resolve(tmpdir(), "nanocodex-ci-rust-cache-"));
   try {
     const source = resolve(directory, "crates/example/src/lib.rs");
+    const unchangedSource = resolve(directory, "crates/example/src/unchanged.rs");
+    const manifest = resolve(directory, ".rust-source-manifest.json");
     await Promise.all([
       mkdir(resolve(directory, ".cargo"), { recursive: true }),
       mkdir(resolve(directory, "bin"), { recursive: true }),
@@ -508,7 +519,7 @@ test("the Rust cache preserves exact reruns and refreshes changed source", async
       mkdir(resolve(directory, "examples"), { recursive: true }),
       mkdir(resolve(directory, "js/bindings/src"), { recursive: true }),
       mkdir(resolve(directory, "py/bindings/src"), { recursive: true }),
-      mkdir(resolve(directory, "web"), { recursive: true }),
+      mkdir(resolve(directory, "web/ci"), { recursive: true }),
     ]);
     await Promise.all([
       writeFile(resolve(directory, "Cargo.toml"), "[workspace]\n"),
@@ -518,8 +529,15 @@ test("the Rust cache preserves exact reruns and refreshes changed source", async
       writeFile(resolve(directory, "py/bindings/Cargo.toml"), "[package]\nname = \"py\"\n"),
       writeFile(resolve(directory, "examples/Cargo.toml"), "[package]\nname = \"examples\"\n"),
       writeFile(resolve(directory, "web/style.css"), "body { color: black; }\n"),
+      writeFile(
+        resolve(directory, "web/ci/rust-source-cache.py"),
+        await readFile(new URL("../ci/rust-source-cache.py", import.meta.url), "utf8"),
+      ),
     ]);
-    await writeFile(source, "pub fn value() -> u8 { 1 }\n");
+    await Promise.all([
+      writeFile(source, "pub fn value() -> u8 { 1 }\n"),
+      writeFile(unchangedSource, "pub fn unchanged() -> u8 { 1 }\n"),
+    ]);
     const marker = rustBuildCacheCommand().split(" && ")[0]!;
     const adapt = (command: string) => command.replaceAll(
       "/workspace",
@@ -532,24 +550,36 @@ test("the Rust cache preserves exact reruns and refreshes changed source", async
     });
 
     assert.equal(run(marker).status, 0);
-    await utimes(source, new Date(1_000), new Date(1_000));
+    const exactReference = (await stat(manifest)).mtimeMs;
+    const freshArchiveTime = new Date(Date.now() + 30_000);
+    await Promise.all([
+      utimes(source, freshArchiveTime, freshArchiveTime),
+      utimes(unchangedSource, freshArchiveTime, freshArchiveTime),
+    ]);
     const exact = run(refreshSourceCommand("true"));
     assert.equal(exact.status, 0, exact.stderr);
-    assert.equal((await stat(source)).mtimeMs, 1_000);
+    assert.ok(Math.abs((await stat(source)).mtimeMs - exactReference) < 2);
+    assert.ok(Math.abs((await stat(unchangedSource)).mtimeMs - exactReference) < 2);
 
     assert.equal(run(marker).status, 0);
+    const webOnlyReference = (await stat(manifest)).mtimeMs;
     await writeFile(resolve(directory, "web/style.css"), "body { color: white; }\n");
-    await utimes(source, new Date(1_000), new Date(1_000));
+    await utimes(source, freshArchiveTime, freshArchiveTime);
     const webOnly = run(refreshSourceCommand("true"));
     assert.equal(webOnly.status, 0, webOnly.stderr);
-    assert.equal((await stat(source)).mtimeMs, 1_000);
+    assert.ok(Math.abs((await stat(source)).mtimeMs - webOnlyReference) < 2);
 
     assert.equal(run(marker).status, 0);
+    const changedReference = (await stat(manifest)).mtimeMs;
     await writeFile(source, "pub fn value() -> u8 { 2 }\n");
-    await utimes(source, new Date(1_000), new Date(1_000));
+    await Promise.all([
+      utimes(source, new Date(1_000), new Date(1_000)),
+      utimes(unchangedSource, freshArchiveTime, freshArchiveTime),
+    ]);
     const changed = run(refreshSourceCommand("true"));
     assert.equal(changed.status, 0, changed.stderr);
-    assert.ok((await stat(source)).mtimeMs > 1_000);
+    assert.ok((await stat(source)).mtimeMs > changedReference);
+    assert.ok(Math.abs((await stat(unchangedSource)).mtimeMs - changedReference) < 2);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
