@@ -138,7 +138,9 @@ dependency output while rebuilding every affected crate, build script, and proc
 macro. Stable tests and quality branch from that reusable target while the other
 heavy gates continue, reaching up to five-way `standard-4` fanout. Cargo and
 libtest are explicitly capped at those four CPUs, so a local Containers emulator
-cannot oversubscribe each runner to every host core. The two Python versions then
+cannot oversubscribe each runner to every host core. The cold MSRV gate uses one
+libtest thread so its deadline-sensitive VM lifecycle tests do not contend with
+sibling tests while cache snapshots drain. The two Python versions then
 run together after those compile-heavy branches release the host, keeping their
 wall-clock performance gates meaningful. Ten container slots leave room for
 parent runners that are still draining logs. The bindings gate streams only its

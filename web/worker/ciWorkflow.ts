@@ -169,6 +169,11 @@ export class NanocodexCI extends CIWorkflow<
               ? {
                   ...COMMON_ENV,
                   CARGO_TARGET_DIR: "/tmp/nanocodex-msrv-target",
+                  // MSRV runs the complete workspace from a cold target. Keep
+                  // its deadline-sensitive VM lifecycle tests isolated from
+                  // sibling libtest work while the host is still draining
+                  // cache snapshots.
+                  RUST_TEST_THREADS: "1",
                 }
               : COMMON_ENV,
           config: runnerConfig(job.timeoutMs, 24 * 60 * 60, 0, false),

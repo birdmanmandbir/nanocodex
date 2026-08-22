@@ -154,6 +154,10 @@ test("terminal gates skip snapshots and publish the website artifact in-place", 
   assert.match(cache, /env\.ENVIRONMENT === 'development'/);
   assert.match(workflow, /CARGO_BUILD_JOBS: "4"/);
   assert.match(workflow, /RUST_TEST_THREADS: "4"/);
+  assert.match(
+    workflow,
+    /CARGO_TARGET_DIR: "\/tmp\/nanocodex-msrv-target",[\s\S]*?RUST_TEST_THREADS: "1"/,
+  );
   assert.doesNotMatch(runnerGroup, /await Promise\.allSettled/);
   const saturationBarrier = workflow.indexOf(
     "await Promise.all([\n        cargoPersistence,",
