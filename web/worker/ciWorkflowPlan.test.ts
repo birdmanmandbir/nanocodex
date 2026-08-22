@@ -16,9 +16,12 @@ import { resolve } from "node:path";
 import { test } from "node:test";
 
 import {
+  bindingsArtifactCommand,
   bindingsCommand,
   bindingsBuildCacheCommand,
   bindingsBuildCacheInputs,
+  bindingsResultCacheCommand,
+  bindingsResultCacheInputs,
   cargoCacheInputs,
   cargoDependencyCommand,
   msrvBuildCacheCommand,
@@ -138,6 +141,18 @@ test("dependency and Rust compilation snapshots are content addressed", async ()
     ...BINDINGS_PROJECTS.map((project) => `${project}/package-lock.json`),
     ...BINDINGS_WASM_INPUTS,
   ]);
+  assert.deepEqual(bindingsResultCacheInputs(), [
+    ...bindingsBuildCacheInputs(),
+    "js/bindings/**/*",
+    "js/artifacts/**/*",
+    "js/react/**/*",
+    "examples/browser-cdn/**/*",
+    "examples/node/**/*",
+    "examples/rivet-actors/**/*",
+    "examples/cloudflare-workers/**/*",
+    "examples/vercel-workflows/**/*",
+    "examples/react-vite/**/*",
+  ]);
   assert.deepEqual(websiteDependencyCacheInputs(), [
     "web/ci/Dockerfile",
     ...WEBSITE_PROJECTS.map((project) => `${project}/package.json`),
@@ -196,6 +211,9 @@ test("dependency and Rust compilation snapshots are content addressed", async ()
   assert.match(qualityCache, /> \/workspace\/\.rust-source-fingerprint/);
   assert.match(qualityCache, /! -name \.cargo-target/);
   assert.doesNotMatch(qualityCache, /! -name \.cargo-target-msrv/);
+  assert.match(bindingsResultCacheCommand(), /\.ci-output/);
+  assert.match(bindingsResultCacheCommand(), /\.ci-cache-staging/);
+  assert.match(bindingsArtifactCommand(), /sha256sum --check/);
 });
 
 test("Cargo dependencies restore the exact owned Git bundle before fetching", () => {
@@ -548,6 +566,8 @@ test("every generated container command is valid Bash", () => {
     msrvBuildCacheCommand(),
     refreshSourceCommand("cargo test"),
     bindingsCommand(),
+    bindingsResultCacheCommand(),
+    bindingsArtifactCommand(),
     websiteCommand(
       "https://ci.example/api/ci/runs/0123456789012345678901234567890123456789/artifacts/web-wasm.tar",
       3_500_000,

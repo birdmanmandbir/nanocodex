@@ -21,9 +21,11 @@ import {
   type NanocodexCiProviderData,
 } from "./ciSource.ts";
 import {
-  bindingsCommand,
+  bindingsArtifactCommand,
   bindingsBuildCacheCommand,
   bindingsBuildCacheInputs,
+  bindingsResultCacheCommand,
+  bindingsResultCacheInputs,
   cargoCacheInputs,
   cargoDependencyCommand,
   msrvBuildCacheCommand,
@@ -406,9 +408,23 @@ export class NanocodexCI extends CIWorkflow<
           await webPreparation;
         const bindingsStartedAt = progress.start("Node and browser bindings");
         const wasmArtifactKey = `runs/${head}/artifacts/web-wasm.tar`;
-        const bindings = await bindingsBuildState.result.runner({
+        const bindingsVerification = await bindingsBuildState.result.runner({
           name: "Node and browser bindings",
-          command: cleanupAfter(bindingsCommand(), [".ci-output"]),
+          command: bindingsResultCacheCommand(),
+          env: COMMON_ENV,
+          cache: { inputs: bindingsResultCacheInputs() },
+          config: runnerConfig(60 * 60 * 1_000, 30 * 24 * 60 * 60),
+        });
+        const bindingsVerificationPersistence = persistRunner(
+          this.env.BACKUP_BUCKET,
+          head,
+          bindingsVerification,
+          "node-and-browser-bindings",
+        );
+        void bindingsVerificationPersistence.catch(() => undefined);
+        const bindingsArtifact = await bindingsVerification.runner({
+          name: "Publish browser artifact",
+          command: bindingsArtifactCommand(),
           env: COMMON_ENV,
           outputs: [
             {
@@ -423,22 +439,26 @@ export class NanocodexCI extends CIWorkflow<
           config: runnerConfig(60 * 60 * 1_000, 24 * 60 * 60, 0, false),
         });
         const wasmArtifact = artifactRecord(
-          bindings.outputs?.[0],
+          bindingsArtifact.outputs?.[0],
           head,
           wasmArtifactKey,
           "web-wasm",
         );
         artifacts.push(wasmArtifact);
-        const bindingsPersistence = persistRunner(
+        const bindingsArtifactPersistence = persistRunner(
           this.env.BACKUP_BUCKET,
           head,
-          bindings,
-          "node-and-browser-bindings",
-        ).then(async () => {
+          bindingsArtifact,
+          "publish-browser-artifact",
+        );
+        const bindingsPersistence = Promise.all([
+          bindingsVerificationPersistence,
+          bindingsArtifactPersistence,
+        ]).then(async ([metadata]) => {
           const summary = {
             name: "Node and browser bindings",
-            exitCode: bindings.exitCode,
-            cacheHit: false,
+            exitCode: bindingsArtifact.exitCode,
+            cacheHit: metadata.cacheHit,
             durationMs: Date.now() - bindingsStartedAt,
           };
           completed.push(summary);

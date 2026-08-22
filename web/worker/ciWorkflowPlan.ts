@@ -170,6 +170,21 @@ export function bindingsBuildCacheInputs(): string[] {
   ];
 }
 
+export function bindingsResultCacheInputs(): string[] {
+  return [
+    ...bindingsBuildCacheInputs(),
+    "js/bindings/**/*",
+    "js/artifacts/**/*",
+    "js/react/**/*",
+    "examples/browser-cdn/**/*",
+    "examples/node/**/*",
+    "examples/rivet-actors/**/*",
+    "examples/cloudflare-workers/**/*",
+    "examples/vercel-workflows/**/*",
+    "examples/react-vite/**/*",
+  ];
+}
+
 export function websiteDependencyCacheInputs(): string[] {
   return [
     "web/ci/Dockerfile",
@@ -382,6 +397,17 @@ export function bindingsCommand(): string {
     "sha256sum /workspace/.ci-output/web-wasm.tar > /workspace/.ci-output/web-wasm.tar.sha256",
     "rm -rf /workspace/.cargo-home /workspace/.cargo-target",
   ].join(" && ");
+}
+
+export function bindingsResultCacheCommand(): string {
+  return [
+    bindingsCommand(),
+    retainWorkspacePathsCommand([".ci-output"]),
+  ].join(" && ");
+}
+
+export function bindingsArtifactCommand(): string {
+  return "test -s /workspace/.ci-output/web-wasm.tar && sha256sum --check /workspace/.ci-output/web-wasm.tar.sha256";
 }
 
 export function parallelCommandGroups(

@@ -158,13 +158,15 @@ to every host core. Ten container slots leave room for parent runners that are
 still draining logs. The two JavaScript dependency
 layers seed concurrently on a cold head and avoid restoring the former
 multi-gigabyte combined workspace into either consumer. The bindings gate
-streams only its
-small tested WASM package to R2 and skips its otherwise multi-gigabyte workspace
-snapshot. The website starts from its site-only dependency snapshot, restores
+keys its complete four-way verification fanout to all Rust, package, test, and
+consumer inputs. A miss retains only the tested WASM tar; an exact hit restores
+that small result instead of rerunning unchanged JavaScript suites. A tiny
+terminal child streams the checksum-verified package to R2 without snapshotting
+a multi-gigabyte workspace. The website starts from its site-only dependency snapshot, restores
 that checksum-verified WASM package, and streams its tested deployment tar
-straight back to R2. Deterministic quality, static-VM, and Python gates can reuse
-an exact successful result; source-sensitive Rust, MSRV, JavaScript, and website
-suites still execute. No correctness runner is retried; only network-backed
+straight back to R2. Deterministic quality, static-VM, Python, and JavaScript
+verification gates can reuse an exact successful result; source-sensitive Rust,
+MSRV, and website suites still execute. No correctness runner is retried; only network-backed
 dependency preparation gets one retry.
 Success and failure logs, step records, final results, required parent/cache
 snapshots, and cache pointers are retained in the

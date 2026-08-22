@@ -138,7 +138,11 @@ test("artifact gates stream outputs while quality and Python retain reusable sna
   );
   assert.match(
     workflow,
-    /const bindings = await bindingsBuildState\.result\.runner/,
+    /const bindingsVerification = await bindingsBuildState\.result\.runner[\s\S]*?cache: \{ inputs: bindingsResultCacheInputs\(\) \}/,
+  );
+  assert.match(
+    workflow,
+    /const bindingsArtifact = await bindingsVerification\.runner[\s\S]*?command: bindingsArtifactCommand\(\)[\s\S]*?outputs:/,
   );
   assert.match(workflow, /const website = await websiteDependencyState\.result\.runner/);
   assert.doesNotMatch(workflow, /const website = await bindings\.runner/);
