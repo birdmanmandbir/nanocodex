@@ -1531,15 +1531,15 @@ async fn write_requests(
                 write_request_frame(&mut input, &cancellation.frame).await
             }
             Outbound::Request(request) => {
+                // A cancellation that reached this writer first means the
+                // request never entered the guest. Drop both frames and let
+                // the cancellation release its admission permit.
+                if deferred_cancellations.remove(&request.id).is_some() {
+                    continue;
+                }
                 let result = write_request_frame(&mut input, &request.frame).await;
                 if result.is_ok() {
                     request.written.store(true, Ordering::Release);
-                    if let Some(cancellation) = deferred_cancellations.remove(&request.id)
-                        && let Err(error) =
-                            write_request_frame(&mut input, &cancellation.frame).await
-                    {
-                        break close_writer_after_error(&inner, error).await;
-                    }
                 }
                 result
             }
