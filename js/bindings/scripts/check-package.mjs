@@ -85,6 +85,7 @@ export async function checkPackage(packageRoot = root) {
   assert.equal(packageJson.type, "module");
   assert.equal(packageJson.engines?.node, ">=22.13.0");
   assert.equal(packageJson.publishConfig?.access, "public");
+  assert.equal(packageJson.publishConfig?.provenance, false);
   assert.equal(packageJson.exports?.["./browser"]?.import, "./browser/index.mjs");
   assert.equal(packageJson.exports?.["./browser/client"], undefined);
   assert.equal(packageJson.exports?.["./browser/workspace"]?.import, "./browser/workspace.mjs");

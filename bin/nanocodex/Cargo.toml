@@ -58,6 +58,7 @@ rand = { workspace = true, optional = true }
 ratatui.workspace = true
 ratatex.workspace = true
 reqwest = { workspace = true, features = ["blocking", "stream"] }
+rustix = { workspace = true, features = ["fs"] }
 self-replace.workspace = true
 semver.workspace = true
 serde.workspace = true

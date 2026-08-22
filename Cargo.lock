@@ -5289,6 +5289,7 @@ dependencies = [
  "ratatui",
  "regex",
  "reqwest",
+ "rustix 1.1.4",
  "self-replace",
  "semver 1.0.28",
  "serde",

@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repository="gakonst/nanocodex"
+release_origin="https://nanocodex.me-7fb.workers.dev"
+release_api_path="/api/releases"
+release_api="$release_origin$release_api_path"
+max_archive_bytes=268435456
+max_binary_bytes=268435456
 install_root="${NANOCODEX_DIR:-$HOME/.nanocodex}"
 bin_dir="$install_root/bin"
 versions_dir="$install_root/versions"
@@ -12,7 +16,7 @@ case "$(uname -s)" in
   Darwin) platform="apple-darwin" ;;
   *)
     echo "nanocodex: unsupported operating system $(uname -s)" >&2
-    echo "Download a binary from https://github.com/$repository/releases/latest" >&2
+    echo "See available binaries at $release_api/channels/latest" >&2
     exit 1
     ;;
 esac
@@ -35,72 +39,387 @@ case "${architecture}-${platform}" in
 esac
 
 binary="nanocodex-${architecture}-${platform}"
-asset="$binary.gz"
+guest_asset_binary="nanocodex-vm-guest-x86_64-unknown-linux-musl"
+guest_store_binary="nanocodex-vm-guest"
+temporary_dir=""
+version_stage=""
+activation_stage=""
+
+cleanup() {
+  if [[ -n "$activation_stage" && -d "$activation_stage" ]]; then
+    rm -rf -- "$activation_stage"
+  fi
+  if [[ -n "$version_stage" && -d "$version_stage" ]]; then
+    rm -rf -- "$version_stage"
+  fi
+  if [[ -n "$temporary_dir" && -d "$temporary_dir" ]]; then
+    rm -rf -- "$temporary_dir"
+  fi
+}
+trap cleanup EXIT
+
 temporary_dir="$(mktemp -d 2>/dev/null)" || {
   echo "nanocodex: failed to create a temporary directory" >&2
   exit 1
 }
-trap 'rm -rf -- "$temporary_dir"' EXIT
 
-echo "Installing the latest Nanocodex release..."
-release_redirect="$(
-  curl --fail --silent --show-error --head \
-    --output /dev/null --write-out '%{redirect_url}' \
-    "https://github.com/$repository/releases/latest"
-)"
-release_tag="${release_redirect##*/}"
-version="${release_tag#v}"
-if [[ -z "$release_tag" || -z "$version" || "$version" == "$release_tag" ]]; then
-  echo "nanocodex: could not resolve the latest release version" >&2
-  exit 1
-fi
-release_url="https://github.com/$repository/releases/download/$release_tag"
-echo "Downloading $asset..."
-curl --fail --show-error --location --progress-bar "$release_url/$asset" --output "$temporary_dir/$asset"
-curl --fail --silent --show-error --location "$release_url/SHA256SUMS" --output "$temporary_dir/SHA256SUMS"
+parse_header_value() {
+  awk -v expected="$1" -v required="$3" '
+    BEGIN { count = 0 }
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      separator = index(line, ":")
+      if (separator > 0 && tolower(substr(line, 1, separator - 1)) == expected) {
+        count += 1
+        value = substr(line, separator + 1)
+        sub(/^[[:space:]]*/, "", value)
+        sub(/[[:space:]]*$/, "", value)
+      }
+    }
+    END {
+      if (count > 1 || (count == 1 && value == "") || (required == "yes" && count != 1)) exit 1
+      if (count == 1) print value
+    }
+  ' "$2"
+}
 
-expected="$(awk -v asset="$asset" '$2 == asset || $2 == "*" asset { print $1; exit }' "$temporary_dir/SHA256SUMS")"
-if [[ -z "$expected" ]]; then
-  echo "nanocodex: SHA256SUMS does not contain $asset" >&2
-  exit 1
-fi
+header_value() {
+  parse_header_value "$1" "$2" yes
+}
 
-if ! command -v gzip >/dev/null 2>&1; then
-  echo "nanocodex: gzip is required to unpack the download" >&2
-  exit 1
-fi
+optional_header_value() {
+  parse_header_value "$1" "$2" no
+}
+
+file_size() {
+  local size
+  size="$(wc -c < "$1")"
+  size="${size//[[:space:]]/}"
+  if [[ ! "$size" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    echo "nanocodex: failed to determine the size of $1" >&2
+    return 1
+  fi
+  printf '%s\n' "$size"
+}
+
 if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
   echo "nanocodex: sha256sum or shasum is required to verify the download" >&2
   exit 1
 fi
 
 sha256_file() {
+  local digest
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | awk '{ print $1 }'
+    digest="$(sha256sum "$1" | awk 'NR == 1 { print tolower($1); exit }')"
   else
-    shasum -a 256 "$1" | awk '{ print $1 }'
+    digest="$(shasum -a 256 "$1" | awk 'NR == 1 { print tolower($1); exit }')"
+  fi
+  if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "nanocodex: the local checksum tool returned an invalid SHA-256 digest" >&2
+    return 1
+  fi
+  printf '%s\n' "$digest"
+}
+
+response_status=""
+request_asset() {
+  local url="$1"
+  local headers="$2"
+  local output="$3"
+  local result effective_url file_limit file_limit_blocks
+
+  file_limit_blocks="$((max_archive_bytes / 1024))"
+
+  if ! result="$(
+    file_limit="$(ulimit -f)"
+    if [[ "$file_limit" == "unlimited" ]] ||
+      { [[ "$file_limit" =~ ^[0-9]+$ ]] && (( file_limit > file_limit_blocks )); }; then
+      ulimit -f "$file_limit_blocks"
+    fi
+    curl --silent --show-error \
+      --proto '=https' \
+      --max-redirs 0 \
+      --max-filesize "$max_archive_bytes" \
+      --connect-timeout 15 \
+      --max-time 300 \
+      --dump-header "$headers" \
+      --output "$output" \
+      --write-out '%{http_code}:%{url_effective}' \
+      "$url"
+  )"; then
+    echo "nanocodex: failed to download $url" >&2
+    return 1
+  fi
+
+  response_status="${result%%:*}"
+  effective_url="${result#*:}"
+  if [[ ! "$response_status" =~ ^[0-9]{3}$ || "$effective_url" != "$url" ]]; then
+    echo "nanocodex: the release request did not remain on its exact canonical URL" >&2
+    return 1
   fi
 }
 
-actual="$(sha256_file "$temporary_dir/$asset")"
-if [[ "$actual" != "$expected" ]]; then
-  echo "nanocodex: checksum mismatch for $asset" >&2
-  exit 1
-fi
-if ! gzip -dc "$temporary_dir/$asset" > "$temporary_dir/$binary"; then
-  echo "nanocodex: failed to unpack $asset" >&2
-  exit 1
-fi
-binary_checksum="$(sha256_file "$temporary_dir/$binary")"
+validated_release_tag=""
+validate_asset() {
+  local asset="$1"
+  local headers="$2"
+  local output="$3"
+  local expected_release="$4"
+  local require_location="$5"
+  local expected_content_type="$6"
+  local release_tag checksum content_location content_length content_type
+  local content_encoding content_range expected_location actual_size actual_checksum
 
+  if ! release_tag="$(header_value x-nanocodex-release "$headers")"; then
+    echo "nanocodex: the release service returned an invalid release identity for $asset" >&2
+    return 1
+  fi
+  if [[ ! "$release_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+    echo "nanocodex: the release service returned an invalid stable release version" >&2
+    return 1
+  fi
+  if [[ -n "$expected_release" && "$release_tag" != "$expected_release" ]]; then
+    echo "nanocodex: $asset did not belong to the resolved stable release" >&2
+    return 1
+  fi
+
+  if ! checksum="$(header_value x-nanocodex-sha256 "$headers")" ||
+    [[ ! "$checksum" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "nanocodex: the release service returned an invalid checksum for $asset" >&2
+    return 1
+  fi
+  if ! content_length="$(header_value content-length "$headers")" ||
+    [[ ! "$content_length" =~ ^[1-9][0-9]*$ ]] ||
+    (( ${#content_length} > 9 )) ||
+    (( content_length > max_archive_bytes )); then
+    echo "nanocodex: the release service returned an invalid or oversized Content-Length for $asset" >&2
+    return 1
+  fi
+  if ! content_type="$(header_value content-type "$headers")" ||
+    [[ "$content_type" != "$expected_content_type" ]]; then
+    echo "nanocodex: the release service returned an invalid Content-Type for $asset" >&2
+    return 1
+  fi
+
+  expected_location="$release_api_path/releases/stable/$release_tag/assets/$asset"
+  if [[ "$require_location" == "yes" ]]; then
+    if ! content_location="$(header_value content-location "$headers")" ||
+      [[ "$content_location" != "$expected_location" ]]; then
+      echo "nanocodex: the release service returned an invalid Content-Location for $asset" >&2
+      return 1
+    fi
+  else
+    if ! content_location="$(optional_header_value content-location "$headers")" ||
+      [[ -n "$content_location" && "$content_location" != "$expected_location" ]]; then
+      echo "nanocodex: the release service returned an invalid Content-Location for $asset" >&2
+      return 1
+    fi
+  fi
+  if ! content_encoding="$(optional_header_value content-encoding "$headers")" ||
+    ! content_range="$(optional_header_value content-range "$headers")" ||
+    [[ -n "$content_encoding" || -n "$content_range" ]]; then
+    echo "nanocodex: the release service returned an encoded or partial response for $asset" >&2
+    return 1
+  fi
+
+  actual_size="$(file_size "$output")"
+  if (( actual_size > max_archive_bytes )) || [[ "$actual_size" != "$content_length" ]]; then
+    echo "nanocodex: downloaded byte count did not match Content-Length for $asset" >&2
+    return 1
+  fi
+  actual_checksum="$(sha256_file "$output")"
+  if [[ "$actual_checksum" != "$checksum" ]]; then
+    echo "nanocodex: checksum mismatch for $asset" >&2
+    return 1
+  fi
+
+  validated_release_tag="$release_tag"
+}
+
+download_headers="$temporary_dir/asset.headers"
+download_archive="$temporary_dir/cli.archive"
+asset="$binary.gz"
+compressed="yes"
+rolling_url="$release_api/channels/latest/assets/$asset"
+
+echo "Installing the latest Nanocodex release..."
+echo "Downloading $asset..."
+if ! request_asset "$rolling_url" "$download_headers" "$download_archive"; then
+  exit 1
+fi
+if [[ "$response_status" == "404" ]]; then
+  rm -f -- "$download_headers" "$download_archive"
+  asset="$binary"
+  compressed="no"
+  rolling_url="$release_api/channels/latest/assets/$asset"
+  echo "$binary.gz is not present in the stable release; downloading $asset..."
+  if ! request_asset "$rolling_url" "$download_headers" "$download_archive"; then
+    exit 1
+  fi
+fi
+if [[ "$response_status" != "200" ]]; then
+  echo "nanocodex: the release service returned HTTP $response_status for $asset" >&2
+  exit 1
+fi
+
+if [[ "$compressed" == "yes" ]]; then
+  content_type="application/gzip"
+else
+  content_type="application/octet-stream"
+fi
+if ! validate_asset \
+  "$asset" "$download_headers" "$download_archive" "" yes "$content_type"; then
+  exit 1
+fi
+release_tag="$validated_release_tag"
+version="${release_tag#v}"
+
+guest_required="no"
+if [[ "${architecture}-${platform}" == "x86_64-unknown-linux-gnu" &&
+  "$release_tag" != "v0.5.0" ]]; then
+  guest_required="yes"
+fi
+if [[ "$compressed" == "yes" || "$guest_required" == "yes" ]] &&
+  ! command -v gzip >/dev/null 2>&1; then
+  echo "nanocodex: gzip is required to unpack the stable release" >&2
+  exit 1
+fi
+
+decompress_bounded() {
+  local archive="$1"
+  local output="$2"
+  local name="$3"
+  local overflow="$output.overflow"
+  local pipeline_ok="yes"
+  local size
+
+  rm -f -- "$overflow"
+  if ! gzip -dc "$archive" | {
+    head -c "$max_binary_bytes" > "$output" &&
+      dd bs=1 count=1 of="$overflow" 2>/dev/null
+  }; then
+    pipeline_ok="no"
+  fi
+  size="$(file_size "$output")"
+  if [[ -s "$overflow" ]]; then
+    echo "nanocodex: decompressed $name exceeds the 256 MiB limit" >&2
+    return 1
+  fi
+  rm -f -- "$overflow"
+  if [[ "$pipeline_ok" != "yes" || "$size" == "0" ]]; then
+    echo "nanocodex: failed to unpack $name" >&2
+    return 1
+  fi
+}
+
+if [[ "$compressed" == "yes" ]]; then
+  binary_path="$temporary_dir/nanocodex"
+  if ! decompress_bounded "$download_archive" "$binary_path" "$asset"; then
+    exit 1
+  fi
+else
+  binary_path="$download_archive"
+fi
+binary_checksum="$(sha256_file "$binary_path")"
+
+guest_path=""
+guest_checksum=""
+if [[ "$guest_required" == "yes" ]]; then
+  guest_asset="$guest_asset_binary.gz"
+  guest_headers="$temporary_dir/guest.headers"
+  guest_archive="$temporary_dir/guest.archive"
+  guest_url="$release_api/releases/stable/$release_tag/assets/$guest_asset"
+  echo "Downloading $guest_asset..."
+  if ! request_asset "$guest_url" "$guest_headers" "$guest_archive"; then
+    exit 1
+  fi
+  if [[ "$response_status" != "200" ]]; then
+    echo "nanocodex: the release service returned HTTP $response_status for $guest_asset" >&2
+    exit 1
+  fi
+  if ! validate_asset \
+    "$guest_asset" "$guest_headers" "$guest_archive" "$release_tag" no "application/gzip"; then
+    exit 1
+  fi
+  guest_path="$temporary_dir/$guest_store_binary"
+  if ! decompress_bounded "$guest_archive" "$guest_path" "$guest_asset"; then
+    exit 1
+  fi
+  guest_checksum="$(sha256_file "$guest_path")"
+fi
+
+component_matches() {
+  local path="$1"
+  local checksum_path="$2"
+  local expected="$3"
+  local stored actual
+  [[ -f "$path" && -f "$checksum_path" ]] || return 1
+  stored="$(<"$checksum_path")"
+  [[ "$stored" == "$expected" ]] || return 1
+  actual="$(sha256_file "$path")"
+  [[ "$actual" == "$expected" ]]
+}
+
+existing_version_matches() {
+  component_matches \
+    "$version_dir/nanocodex" "$version_dir/nanocodex.sha256" "$binary_checksum" || return 1
+  if [[ "$guest_required" == "yes" ]]; then
+    component_matches \
+      "$version_dir/$guest_store_binary" \
+      "$version_dir/$guest_store_binary.sha256" \
+      "$guest_checksum" ||
+      return 1
+  fi
+}
+
+mkdir -p "$bin_dir" "$versions_dir" "$updater_dir"
 version_dir="$versions_dir/$version"
-mkdir -p "$bin_dir" "$version_dir" "$updater_dir"
-install -m 755 "$temporary_dir/$binary" "$version_dir/nanocodex"
-printf '%s\n' "$binary_checksum" > "$version_dir/nanocodex.sha256"
-install -m 755 "$temporary_dir/$binary" "$updater_dir/nanocodex"
-printf '%s\n' "$binary_checksum" > "$updater_dir/nanocodex.sha256"
+version_stage="$(mktemp -d "$versions_dir/.install-$version.XXXXXX" 2>/dev/null)" || {
+  echo "nanocodex: failed to stage Nanocodex $version" >&2
+  exit 1
+}
+install -m 755 "$binary_path" "$version_stage/nanocodex"
+printf '%s\n' "$binary_checksum" > "$version_stage/nanocodex.sha256"
+if [[ "$guest_required" == "yes" ]]; then
+  install -m 755 "$guest_path" "$version_stage/$guest_store_binary"
+  printf '%s\n' "$guest_checksum" > "$version_stage/$guest_store_binary.sha256"
+fi
 
-ln -sfn "versions/$version" "$install_root/current"
+if [[ -e "$version_dir" || -L "$version_dir" ]]; then
+  if [[ ! -d "$version_dir" ]] || ! existing_version_matches; then
+    echo "nanocodex: cannot coherently replace incomplete Nanocodex version $version" >&2
+    exit 1
+  fi
+  rm -rf -- "$version_stage"
+  version_stage=""
+else
+  if ! mv "$version_stage" "$version_dir"; then
+    echo "nanocodex: failed to install the staged Nanocodex version" >&2
+    exit 1
+  fi
+  version_stage=""
+fi
+
+atomic_install() {
+  local source="$1"
+  local destination="$2"
+  local mode="$3"
+  local parent temporary
+  parent="$(dirname -- "$destination")"
+  temporary="$(mktemp "$parent/.nanocodex-install.XXXXXX" 2>/dev/null)" || return 1
+  if ! install -m "$mode" "$source" "$temporary" || ! mv -f "$temporary" "$destination"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+}
+
+printf '%s\n' "$binary_checksum" > "$temporary_dir/nanocodex.sha256"
+if ! atomic_install "$binary_path" "$updater_dir/nanocodex" 755 ||
+  ! atomic_install "$temporary_dir/nanocodex.sha256" "$updater_dir/nanocodex.sha256" 644; then
+  echo "nanocodex: failed to install the updater" >&2
+  exit 1
+fi
 
 cat > "$temporary_dir/nanocodex-launcher" <<'EOF'
 #!/bin/sh
@@ -119,7 +438,28 @@ if [ "${1-}" = "update" ] && [ -f "$install_root/updater/nanocodex.sha256" ]; th
 fi
 exec "$install_root/current/nanocodex" "$@"
 EOF
-install -m 755 "$temporary_dir/nanocodex-launcher" "$bin_dir/nanocodex"
+if ! atomic_install "$temporary_dir/nanocodex-launcher" "$bin_dir/nanocodex" 755; then
+  echo "nanocodex: failed to install the Nanocodex launcher" >&2
+  exit 1
+fi
+
+if [[ -e "$install_root/current" && ! -L "$install_root/current" ]]; then
+  echo "nanocodex: $install_root/current exists and is not an activatable symlink" >&2
+  exit 1
+fi
+activation_stage="$(mktemp -d "$install_root/.activate.XXXXXX" 2>/dev/null)" || {
+  echo "nanocodex: failed to stage the active-version link" >&2
+  exit 1
+}
+ln -s "versions/$version" "$activation_stage/current"
+if mv -fT "$activation_stage/current" "$install_root/current" 2>/dev/null ||
+  mv -fh "$activation_stage/current" "$install_root/current" 2>/dev/null; then
+  rmdir "$activation_stage"
+  activation_stage=""
+else
+  echo "nanocodex: failed to activate Nanocodex $version" >&2
+  exit 1
+fi
 
 path_line="export PATH=\"\$PATH:$bin_dir\""
 profile=""

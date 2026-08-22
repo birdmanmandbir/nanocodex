@@ -127,11 +127,6 @@ build-eval-host: build-vm-guest
         target/debug/nanocodex
     fi
 
-# Ask the CLI artifact workflow to build from the exact head of one open PR.
-# Nothing is built for ordinary pull_request events.
-build-pr-artifacts pr:
-    ./scripts/dispatch-pr-artifacts.sh "{{pr}}"
-
 build-vm-example:
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="{{justfile_directory()}}/scripts/aarch64-unknown-linux-musl-linker" \
     CC_aarch64_unknown_linux_musl="{{justfile_directory()}}/scripts/aarch64-unknown-linux-musl-linker" \

@@ -115,7 +115,7 @@
   ],
   "publishConfig": {
     "access": "public",
-    "provenance": true
+    "provenance": false
   },
   "scripts": {
     "check:package": "node scripts/check-package.mjs",
