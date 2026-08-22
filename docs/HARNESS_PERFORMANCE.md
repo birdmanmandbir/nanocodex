@@ -1,10 +1,12 @@
 # Agent harness performance
 
-`harness_performance` measures the part of latency and memory that Nanocodex
-owns: runtime construction, agent startup, prompt admission, typed event
-delivery, retained history, historical forks, and prompt-cache-preserving
-request construction. It deliberately removes provider, network, sandbox, VM,
-and tool-process variance.
+`harness_performance` measures diagnostic costs that Nanocodex owns: runtime
+construction, agent startup, prompt admission, typed event delivery, retained
+history, historical forks, and prompt-cache-preserving request construction. It
+deliberately removes provider, network, sandbox, VM, and tool-process variance.
+These measurements locate regressions; they are not the product score. The
+latency score and controlled comparison protocol are defined in
+[`MODEL_LATENCY.md`](MODEL_LATENCY.md).
 
 This is the baseline beneath host adapters. A Cloudflare Worker, Vercel
 Workflow, native CLI, or VM-backed consumer may add its own cold-start and
@@ -24,6 +26,19 @@ The default release-profile workload runs in one process on one Tokio worker:
   startup samples; and
 - typed JSON output containing distributions and every audited request shape.
 
+After all timing and RSS sampling, a separate untimed probe builds the real
+default `Tools` registry. It records exact serialized byte counts and stable
+fingerprints for the warmup prefix, default tool declarations, default system
+prompt, first-turn delta, and incremental follow-on delta. Keeping this probe
+outside the timed workload makes the small client-tax measurement useful while
+ensuring that a faster result cannot silently come from removing production
+prompt or tool functionality.
+
+The normalized SHA-256 fingerprints, item counts, tool counts, and deterministic
+byte counts are executable gates, not descriptive snapshots. An intentional
+prompt or default-tool contract change must update those expected values in the
+benchmark together with its review; a stub schema or shortened prompt fails.
+
 Compilation is outside the timed process. RSS is process resident memory from
 the host, so comparisons require the same OS, architecture, allocator, build
 profile, and workload.
@@ -40,6 +55,7 @@ profile, and workload.
 | Fork construction | before `fork_from(checkpoint)` | fork handle and stream returned | checkpoint/history sharing plus child-driver construction |
 | Retained-fork memory | RSS after history | RSS with all forks retained | amortized resident footprint of live forks |
 | Cache eligibility | every scripted request | audited request ledger | stable key/prefix, warmup reuse, incremental chaining, and request bytes |
+| Prompt footprint | default-agent request construction | audited typed request shapes | complete default tools/system prompt and exact first/follow-on wire footprint |
 
 TTFT here is not model TTFT: the scripted service has no inference. It is the
 minimum client-side tax that live provider TTFT sits on top of.
@@ -63,9 +79,14 @@ The benchmark also accepts `--history-turns`, `--prompt-bytes`,
 `--startup-samples`. Keep the default workload for comparisons; change one
 dimension at a time for diagnosis.
 
+`source_commit` is a caller-declared local diagnostic. It does not attest that
+the tree was clean or that an executable came from that tree. The paid paired
+runner performs its own clean-checkout, location, and executable-digest checks.
+
 The process exits unsuccessfully if the cache key changes, a fork unexpectedly
-warms a replacement service, or a generation stops using the expected
-incremental request path.
+warms a replacement service, a generation stops using the expected incremental
+request path, the default `exec`/`wait` tool contract disappears, or the first
+and follow-on prompts stop using their expected typed request shapes.
 
 ## Reference baseline
 
@@ -93,11 +114,12 @@ requests, and no full-history generation replay. The 32-turn history plus 128
 retained forks ended at a median 22.25 MiB process RSS.
 
 The startup clock begins inside process `main`; executable loading before
-`main` is a host/package measurement. Warm page-cache results should not be
-presented as cold package launch time. At this scale, scheduler placement still
-moves agent-build and fork distributions even without provider noise. Compare
-repeated idle-host runs and inspect p50, p95, and maxima rather than treating
-one sample as a product claim.
+`main` is a host/package measurement. Startup, binary size, and RSS remain
+diagnostics rather than model-latency score inputs. Warm page-cache results
+should not be presented as cold package launch time. At this scale, scheduler
+placement still moves agent-build and fork distributions even without provider
+noise. Compare repeated idle-host runs and inspect p50, p95, and maxima rather
+than treating one sample as a product claim.
 
 ## Prompt-cache interpretation
 
@@ -111,10 +133,12 @@ Use the live [`RESPONSE_TRANSPORT_BENCH.md`](RESPONSE_TRANSPORT_BENCH.md) suite
 for cached-input tokens, network TTFT, WebSocket/HTTPS setup, and server-side
 checkpoint behavior. Keep the two result sets separate:
 
-1. this harness attributes SDK startup, scheduling, memory, and fork costs;
-2. a host-adapter benchmark adds Worker/Workflow/WASM/native startup and memory;
-3. a live provider benchmark adds network, queueing, inference, and actual
-   prompt-cache usage.
+1. this harness attributes SDK scheduling and event-path tax while auditing the
+   complete production prompt footprint;
+2. a browser loopback benchmark measures inline-WASM and Worker prompt-to-typed
+   delta tax in real Chromium; and
+3. the live model-latency benchmark adds transport, queueing, inference, and
+   actual prompt-cache usage.
 
 That layering makes regressions actionable and avoids solving provider or
 sandbox variance with adapters in the core agent contract.

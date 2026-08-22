@@ -19,20 +19,50 @@ use nanocodex_agent::{
     AgentEvents, ExecutionEnvironment, Nanocodex, OpenAi, ResponseError, Thinking, Tools,
     TurnResult,
     events::{AgentEventKind, monotonic_now_ns},
+    session::SessionId,
 };
 use nanocodex_oai_api::{
     ResponseEvent,
-    responses::{ContentItem, MessageRole, ResponseItem, Usage, WarmupResponse},
+    responses::{
+        ContentItem, MessageRole, ResponseItem, ResponseItemId, ToolDefinition, Usage,
+        WarmupResponse,
+    },
     tower::{
         GenerationOutput, ResponsePipelineStats, ResponsesAttempt, ResponsesAttemptKind,
         ResponsesOutput, ResponsesServiceResponse,
     },
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, get_current_pid};
 use tower::Service;
 
 const PROMPT_CACHE_KEY: &str = "nanocodex-harness-performance-v1";
+const PROMPT_FOOTPRINT_CACHE_KEY: &str = "nanocodex-prompt-footprint-v1";
+const PROMPT_FOOTPRINT_SESSION_ID: &str = "019c0d31-c308-7d91-bff4-5dca82d15ac6";
+const PROMPT_FOOTPRINT_WORKSPACE_MARKER: &str = "<isolated-temporary-workspace>";
+const PROMPT_FOOTPRINT_DATE: &str = "2026-08-22";
+const PROMPT_FOOTPRINT_TIMEZONE: &str = "Etc/UTC";
+const PROMPT_FOOTPRINT_FIRST_PROMPT: &str =
+    "Measure the default Nanocodex prompt footprint, turn one.";
+const PROMPT_FOOTPRINT_FOLLOW_ON_PROMPT: &str =
+    "Measure the default Nanocodex prompt footprint, turn two.";
+const PROMPT_FOOTPRINT_WARMUP_RESPONSE_ID: &str = "resp_prompt_footprint_warmup";
+const PROMPT_FOOTPRINT_FIRST_RESPONSE_ID: &str = "resp_prompt_footprint_first";
+const PROMPT_FOOTPRINT_FOLLOW_ON_RESPONSE_ID: &str = "resp_prompt_footprint_follow_on";
+const CANONICAL_ITEM_UUID: &str = "00000000-0000-7000-8000-000000000000";
+const EXPECTED_STABLE_PREFIX_SHA256: &str =
+    "70877209285cfc80ed44568265e0ff31621fedf2b29677a8553c2218721b0cb3";
+const EXPECTED_ADDITIONAL_TOOLS_ITEM_SHA256: &str =
+    "8d5728ace7e30c0e097392fc72082918a6cb6b3ad48a679c507ad22eaa0d6bf8";
+const EXPECTED_TOOL_DECLARATIONS_SHA256: &str =
+    "8c3a181cb39dbc6b94b5c568b209ca28d916e3cd1e1d33a163cb438d98c2fbb7";
+const EXPECTED_SYSTEM_PROMPT_SHA256: &str =
+    "cfa73b0509e3e5fa1cf15dacb7be0edbfa428ac9a16ecb80d46f09f8d8c5542e";
+const EXPECTED_FIRST_DELTA_SHA256: &str =
+    "e34620a335f1fa711113ab5308fca26619f5dde5beddbfe18881a26c7ebded3c";
+const EXPECTED_FOLLOW_ON_DELTA_SHA256: &str =
+    "daf84b7b02df04c29dd4b4ad68b7063279665121a94bfcb5e173f34b76f00399";
 
 #[derive(Clone)]
 struct ScriptedResponses {
@@ -176,6 +206,119 @@ impl Service<ResponsesAttempt> for ScriptedResponses {
     }
 }
 
+#[derive(Clone)]
+struct PromptFootprintResponses {
+    state: Arc<PromptFootprintState>,
+}
+
+#[derive(Default)]
+struct PromptFootprintState {
+    calls: AtomicU64,
+    attempts: Mutex<Vec<PromptFootprintAttempt>>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PromptFootprintAttemptKind {
+    Warmup,
+    Generation,
+}
+
+#[derive(Clone)]
+struct PromptFootprintAttempt {
+    kind: PromptFootprintAttemptKind,
+    previous_response_id: Option<String>,
+    full_replay: bool,
+    input: Vec<ResponseItem>,
+}
+
+impl PromptFootprintState {
+    fn record(&self, attempt: PromptFootprintAttempt) {
+        self.attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(attempt);
+    }
+
+    fn attempts(&self) -> Vec<PromptFootprintAttempt> {
+        self.attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl Service<ResponsesAttempt> for PromptFootprintResponses {
+    type Response = ResponsesServiceResponse;
+    type Error = ResponseError;
+    type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: ResponsesAttempt) -> Self::Future {
+        let call = self.state.calls.fetch_add(1, Ordering::Relaxed) + 1;
+        let kind = match request.kind() {
+            ResponsesAttemptKind::Warmup => PromptFootprintAttemptKind::Warmup,
+            ResponsesAttemptKind::Generation => PromptFootprintAttemptKind::Generation,
+            ResponsesAttemptKind::Compaction => {
+                return std::future::ready(Err(ResponseError::service(std::io::Error::other(
+                    "the prompt-footprint probe unexpectedly requested compaction",
+                ))));
+            }
+            _ => {
+                return std::future::ready(Err(ResponseError::service(std::io::Error::other(
+                    "the prompt-footprint probe received an unknown Responses attempt kind",
+                ))));
+            }
+        };
+        self.state.record(PromptFootprintAttempt {
+            kind,
+            previous_response_id: request.previous_response_id().map(str::to_owned),
+            full_replay: request.is_full_replay(),
+            input: request.input_items().cloned().collect(),
+        });
+
+        let output = match (call, kind) {
+            (1, PromptFootprintAttemptKind::Warmup) => ResponsesOutput::Warmup(WarmupResponse {
+                id: PROMPT_FOOTPRINT_WARMUP_RESPONSE_ID.to_owned(),
+                usage: None,
+            }),
+            (2, PromptFootprintAttemptKind::Generation) => prompt_footprint_generation(
+                PROMPT_FOOTPRINT_FIRST_RESPONSE_ID,
+                "prompt-footprint-first-complete",
+            ),
+            (3, PromptFootprintAttemptKind::Generation) => prompt_footprint_generation(
+                PROMPT_FOOTPRINT_FOLLOW_ON_RESPONSE_ID,
+                "prompt-footprint-follow-on-complete",
+            ),
+            _ => {
+                return std::future::ready(Err(ResponseError::service(std::io::Error::other(
+                    "the prompt-footprint probe received an unexpected request sequence",
+                ))));
+            }
+        };
+        std::future::ready(Ok(ResponsesServiceResponse::new(output)))
+    }
+}
+
+fn prompt_footprint_generation(response_id: &str, message: &str) -> ResponsesOutput {
+    let message_item =
+        ResponseItem::message(MessageRole::Assistant, [ContentItem::output_text(message)]);
+    ResponsesOutput::Generation(GenerationOutput {
+        id: response_id.to_owned(),
+        status: "completed".to_owned(),
+        end_turn: Some(true),
+        final_message: Some(message.to_owned()),
+        output_items: vec![message_item],
+        code_calls: Vec::new(),
+        usage: None,
+        time_to_first_event_ns: 0,
+        time_to_first_output_ns: None,
+        pipeline_stats: ResponsePipelineStats::default(),
+    })
+}
+
 const fn attempt_kind(kind: ResponsesAttemptKind) -> &'static str {
     match kind {
         ResponsesAttemptKind::Warmup => "warmup",
@@ -269,6 +412,7 @@ struct BenchmarkReport {
     memory: MemoryReport,
     fork: ForkReport,
     prompt_cache: PromptCacheReport,
+    prompt_footprint: PromptFootprintReport,
 }
 
 #[derive(Serialize)]
@@ -355,6 +499,44 @@ struct PromptCacheReport {
     generation_input_items: usize,
     generation_input_bytes: usize,
     requests: Vec<AttemptRecord>,
+}
+
+#[derive(Serialize)]
+struct PromptFootprintReport {
+    boundary: &'static str,
+    prompt_cache_key: &'static str,
+    session_id: &'static str,
+    workspace: String,
+    execution_environment: PromptFootprintEnvironment,
+    prompts: PromptFootprintPrompts,
+    stable_hash_normalization: &'static str,
+    stable_prefix: PromptFootprintComponent,
+    additional_tools_item: PromptFootprintComponent,
+    additional_tool_declarations: PromptFootprintComponent,
+    default_system_prompt_item: PromptFootprintComponent,
+    first_generation_delta: PromptFootprintComponent,
+    follow_on_delta: PromptFootprintComponent,
+    follow_on_uses_previous_response_id_without_full_replay: bool,
+}
+
+#[derive(Serialize)]
+struct PromptFootprintEnvironment {
+    current_date: &'static str,
+    timezone: &'static str,
+}
+
+#[derive(Serialize)]
+struct PromptFootprintPrompts {
+    first: &'static str,
+    follow_on: &'static str,
+}
+
+#[derive(Serialize)]
+struct PromptFootprintComponent {
+    serialized_bytes: usize,
+    stable_sha256: String,
+    item_count: usize,
+    tool_count: usize,
 }
 
 #[derive(Serialize)]
@@ -603,6 +785,9 @@ async fn run_benchmark(args: &Args, rss: &mut RssSampler) -> Result<BenchmarkRep
         );
     }
 
+    // This probe must remain after every timed sample, RSS sample, and measured-agent shutdown.
+    let prompt_footprint = measure_prompt_footprint().await?;
+
     Ok(BenchmarkReport {
         schema_version: 1,
         implementation: "nanocodex",
@@ -659,7 +844,421 @@ async fn run_benchmark(args: &Args, rss: &mut RssSampler) -> Result<BenchmarkRep
             construction_ns: Distribution::new(&fork_samples),
         },
         prompt_cache,
+        prompt_footprint,
     })
+}
+
+async fn measure_prompt_footprint() -> Result<PromptFootprintReport> {
+    let workspace_dir = tempfile::Builder::new()
+        .prefix("nanocodex-prompt-footprint-")
+        .tempdir()
+        .wrap_err("failed to create isolated prompt-footprint workspace")?;
+    let workspace = fs::canonicalize(workspace_dir.path())
+        .wrap_err("failed to resolve isolated prompt-footprint workspace")?;
+    let workspace_text = workspace
+        .to_str()
+        .ok_or_else(|| eyre!("the fixed prompt-footprint workspace is not valid UTF-8"))?
+        .to_owned();
+    let session_id = PROMPT_FOOTPRINT_SESSION_ID
+        .parse::<SessionId>()
+        .wrap_err("the fixed prompt-footprint session ID is invalid")?;
+    let state = Arc::new(PromptFootprintState::default());
+    let service_state = Arc::clone(&state);
+    let openai = OpenAi::builder("harness-only")
+        .service(move || PromptFootprintResponses {
+            state: Arc::clone(&service_state),
+        })
+        .build()?;
+    let tools = Tools::builder().build()?;
+    let (agent, events) = Nanocodex::builder(openai)
+        .workspace(&workspace)
+        .execution_environment(ExecutionEnvironment::new(
+            PROMPT_FOOTPRINT_DATE,
+            PROMPT_FOOTPRINT_TIMEZONE,
+        ))
+        .session_id(session_id)
+        .prompt_cache_key(PROMPT_FOOTPRINT_CACHE_KEY)
+        .tools(tools)
+        .build()?;
+    drop(events);
+
+    let turns = async {
+        complete_prompt_footprint_turn(
+            &agent,
+            PROMPT_FOOTPRINT_FIRST_PROMPT,
+            "prompt-footprint-first-complete",
+        )
+        .await?;
+        complete_prompt_footprint_turn(
+            &agent,
+            PROMPT_FOOTPRINT_FOLLOW_ON_PROMPT,
+            "prompt-footprint-follow-on-complete",
+        )
+        .await
+    }
+    .await;
+    let shutdown = agent.shutdown().await;
+    shutdown.wrap_err("failed to shut down the prompt-footprint agent")?;
+    turns?;
+
+    let attempts = state.attempts();
+    let [warmup, first, follow_on] = attempts.as_slice() else {
+        bail!(
+            "expected one warmup and two generations in the prompt-footprint probe, got {} requests",
+            attempts.len()
+        );
+    };
+    if warmup.kind != PromptFootprintAttemptKind::Warmup
+        || warmup.previous_response_id.is_some()
+        || warmup.full_replay
+    {
+        bail!("the prompt-footprint warmup request had an unexpected transport shape");
+    }
+    if first.kind != PromptFootprintAttemptKind::Generation
+        || first.previous_response_id.as_deref() != Some(PROMPT_FOOTPRINT_WARMUP_RESPONSE_ID)
+        || first.full_replay
+    {
+        bail!("the first prompt-footprint generation was not incremental from warmup");
+    }
+    let follow_on_uses_previous_response_id_without_full_replay = follow_on.kind
+        == PromptFootprintAttemptKind::Generation
+        && follow_on.previous_response_id.as_deref() == Some(PROMPT_FOOTPRINT_FIRST_RESPONSE_ID)
+        && !follow_on.full_replay;
+    if !follow_on_uses_previous_response_id_without_full_replay {
+        bail!(
+            "the follow-on prompt-footprint generation did not use previous_response_id without full replay"
+        );
+    }
+
+    let [additional_tools_item, default_system_prompt_item] = warmup.input.as_slice() else {
+        bail!(
+            "the default stable prefix must contain exactly additional_tools and system-prompt items"
+        );
+    };
+    let additional_tool_declarations = match additional_tools_item {
+        ResponseItem::AdditionalTools {
+            id: None,
+            role: MessageRole::Developer,
+            tools,
+        } if !tools.is_empty() => tools,
+        _ => bail!("the default stable prefix is missing its typed additional_tools item"),
+    };
+    validate_default_tool_contract(additional_tool_declarations)?;
+    let system_prompt = prefix_system_prompt(default_system_prompt_item)?;
+    if system_prompt.trim().is_empty() {
+        bail!("the default system-prompt item is empty");
+    }
+
+    validate_first_generation_delta(&first.input, &workspace_text)?;
+    validate_follow_on_delta(&follow_on.input)?;
+
+    let report = PromptFootprintReport {
+        boundary: "isolated_default_agent_probe_after_timing_and_rss",
+        prompt_cache_key: PROMPT_FOOTPRINT_CACHE_KEY,
+        session_id: PROMPT_FOOTPRINT_SESSION_ID,
+        workspace: PROMPT_FOOTPRINT_WORKSPACE_MARKER.to_owned(),
+        execution_environment: PromptFootprintEnvironment {
+            current_date: PROMPT_FOOTPRINT_DATE,
+            timezone: PROMPT_FOOTPRINT_TIMEZONE,
+        },
+        prompts: PromptFootprintPrompts {
+            first: PROMPT_FOOTPRINT_FIRST_PROMPT,
+            follow_on: PROMPT_FOOTPRINT_FOLLOW_ON_PROMPT,
+        },
+        stable_hash_normalization: "client UUIDv7 suffixes and the isolated workspace path are replaced before hashing; serialized_bytes always describe the exact wire value",
+        stable_prefix: response_items_footprint(&warmup.input, None)?,
+        additional_tools_item: response_item_footprint(additional_tools_item)?,
+        additional_tool_declarations: serialized_footprint(
+            additional_tool_declarations,
+            additional_tool_declarations,
+            0,
+            additional_tool_declarations.len(),
+        )?,
+        default_system_prompt_item: response_item_footprint(default_system_prompt_item)?,
+        first_generation_delta: response_items_footprint(&first.input, Some(&workspace_text))?,
+        follow_on_delta: response_items_footprint(&follow_on.input, None)?,
+        follow_on_uses_previous_response_id_without_full_replay,
+    };
+    validate_prompt_footprint_contract(&report)?;
+    Ok(report)
+}
+
+fn validate_prompt_footprint_contract(report: &PromptFootprintReport) -> Result<()> {
+    require_prompt_component(
+        "stable prefix",
+        &report.stable_prefix,
+        EXPECTED_STABLE_PREFIX_SHA256,
+        Some(40_265),
+        2,
+        2,
+    )?;
+    require_prompt_component(
+        "additional_tools item",
+        &report.additional_tools_item,
+        EXPECTED_ADDITIONAL_TOOLS_ITEM_SHA256,
+        Some(22_236),
+        1,
+        2,
+    )?;
+    require_prompt_component(
+        "default tool declarations",
+        &report.additional_tool_declarations,
+        EXPECTED_TOOL_DECLARATIONS_SHA256,
+        Some(22_181),
+        0,
+        2,
+    )?;
+    require_prompt_component(
+        "default system prompt",
+        &report.default_system_prompt_item,
+        EXPECTED_SYSTEM_PROMPT_SHA256,
+        Some(18_026),
+        1,
+        0,
+    )?;
+    require_prompt_component(
+        "first generation delta",
+        &report.first_generation_delta,
+        EXPECTED_FIRST_DELTA_SHA256,
+        None,
+        3,
+        0,
+    )?;
+    require_prompt_component(
+        "follow-on delta",
+        &report.follow_on_delta,
+        EXPECTED_FOLLOW_ON_DELTA_SHA256,
+        Some(183),
+        1,
+        0,
+    )?;
+    Ok(())
+}
+
+fn require_prompt_component(
+    label: &str,
+    actual: &PromptFootprintComponent,
+    expected_sha256: &str,
+    expected_bytes: Option<usize>,
+    expected_items: usize,
+    expected_tools: usize,
+) -> Result<()> {
+    if actual.stable_sha256 != expected_sha256
+        || expected_bytes.is_some_and(|bytes| actual.serialized_bytes != bytes)
+        || actual.item_count != expected_items
+        || actual.tool_count != expected_tools
+    {
+        bail!(
+            "the {label} changed: bytes={}, sha256={}, items={}, tools={}",
+            actual.serialized_bytes,
+            actual.stable_sha256,
+            actual.item_count,
+            actual.tool_count
+        );
+    }
+    Ok(())
+}
+
+async fn complete_prompt_footprint_turn(
+    agent: &Nanocodex,
+    prompt: &'static str,
+    expected_message: &str,
+) -> Result<()> {
+    let result = agent.prompt(prompt).await?.result().await?;
+    if result.final_message() != expected_message {
+        bail!(
+            "prompt-footprint turn returned an unexpected final message: {:?}",
+            result.final_message()
+        );
+    }
+    Ok(())
+}
+
+fn prefix_system_prompt(item: &ResponseItem) -> Result<&str> {
+    let ResponseItem::Message {
+        id: None,
+        role: MessageRole::Developer,
+        content,
+        ..
+    } = item
+    else {
+        bail!("the default stable prefix is missing its typed system-prompt item");
+    };
+    let [ContentItem::InputText { text }] = content.as_slice() else {
+        bail!("the default system-prompt item must contain exactly one input_text part");
+    };
+    Ok(text)
+}
+
+fn validate_default_tool_contract(tools: &[ToolDefinition]) -> Result<()> {
+    if !tools.iter().any(|tool| tool.name() == "exec")
+        || !tools.iter().any(|tool| tool.name() == "wait")
+    {
+        bail!("the default tool contract must expose both exec and wait");
+    }
+    Ok(())
+}
+
+fn validate_first_generation_delta(items: &[ResponseItem], workspace: &str) -> Result<()> {
+    let [permissions, environment, prompt] = items else {
+        bail!("the first generation delta must contain permissions, environment, and prompt items");
+    };
+    let permissions = single_input_text(permissions, MessageRole::Developer, "permissions")?;
+    if !permissions.starts_with("<permissions instructions>") {
+        bail!("the first generation delta is missing permissions instructions");
+    }
+    let environment = single_input_text(environment, MessageRole::User, "environment")?;
+    for expected in [
+        format!("<cwd>{workspace}</cwd>"),
+        format!("<current_date>{PROMPT_FOOTPRINT_DATE}</current_date>"),
+        format!("<timezone>{PROMPT_FOOTPRINT_TIMEZONE}</timezone>"),
+    ] {
+        if !environment.contains(&expected) {
+            bail!("the first generation environment item is missing {expected}");
+        }
+    }
+    let prompt = single_input_text(prompt, MessageRole::User, "first prompt")?;
+    if prompt != PROMPT_FOOTPRINT_FIRST_PROMPT {
+        bail!("the first generation delta did not retain the fixed prompt exactly");
+    }
+    Ok(())
+}
+
+fn validate_follow_on_delta(items: &[ResponseItem]) -> Result<()> {
+    let [prompt] = items else {
+        bail!("the follow-on generation delta must contain only its new prompt item");
+    };
+    let prompt = single_input_text(prompt, MessageRole::User, "follow-on prompt")?;
+    if prompt != PROMPT_FOOTPRINT_FOLLOW_ON_PROMPT {
+        bail!("the follow-on generation delta did not retain the fixed prompt exactly");
+    }
+    Ok(())
+}
+
+fn single_input_text<'a>(
+    item: &'a ResponseItem,
+    expected_role: MessageRole,
+    label: &str,
+) -> Result<&'a str> {
+    let ResponseItem::Message { role, content, .. } = item else {
+        bail!("the {label} item is not a typed message");
+    };
+    if *role != expected_role {
+        bail!("the {label} item has an unexpected role");
+    }
+    let [ContentItem::InputText { text }] = content.as_slice() else {
+        bail!("the {label} item must contain exactly one input_text part");
+    };
+    Ok(text)
+}
+
+fn response_items_footprint(
+    items: &[ResponseItem],
+    workspace: Option<&str>,
+) -> Result<PromptFootprintComponent> {
+    let canonical = canonicalize_response_items(items, workspace)?;
+    serialized_footprint(
+        items,
+        &canonical,
+        items.len(),
+        response_item_tool_count(items),
+    )
+}
+
+fn response_item_footprint(item: &ResponseItem) -> Result<PromptFootprintComponent> {
+    let canonical = canonicalize_response_item(item.clone(), None)?;
+    serialized_footprint(
+        item,
+        &canonical,
+        1,
+        response_item_tool_count(std::slice::from_ref(item)),
+    )
+}
+
+fn serialized_footprint<W, S>(
+    wire_value: &W,
+    stable_value: &S,
+    item_count: usize,
+    tool_count: usize,
+) -> Result<PromptFootprintComponent>
+where
+    W: Serialize + ?Sized,
+    S: Serialize + ?Sized,
+{
+    let wire = serde_json::to_vec(wire_value)?;
+    let stable = serde_json::to_vec(stable_value)?;
+    Ok(PromptFootprintComponent {
+        serialized_bytes: wire.len(),
+        stable_sha256: sha256_hex(&stable),
+        item_count,
+        tool_count,
+    })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn canonicalize_response_items(
+    items: &[ResponseItem],
+    workspace: Option<&str>,
+) -> Result<Vec<ResponseItem>> {
+    items
+        .iter()
+        .cloned()
+        .map(|item| canonicalize_response_item(item, workspace))
+        .collect()
+}
+
+fn canonicalize_response_item(
+    mut item: ResponseItem,
+    workspace: Option<&str>,
+) -> Result<ResponseItem> {
+    if let Some(id) = item.id() {
+        let prefix = item
+            .id_prefix()
+            .ok_or_else(|| eyre!("a prompt-footprint item has an ID but no typed ID prefix"))?;
+        let marker = format!("{prefix}_");
+        let suffix = id.as_str().strip_prefix(&marker).ok_or_else(|| {
+            eyre!("prompt-footprint item ID {id} does not use its typed {prefix} prefix")
+        })?;
+        if suffix.len() != CANONICAL_ITEM_UUID.len() {
+            bail!("prompt-footprint item ID {id} does not have a fixed-width UUID suffix");
+        }
+        item.set_id(Some(ResponseItemId::with_suffix(
+            prefix,
+            CANONICAL_ITEM_UUID,
+        )));
+    }
+    if let (Some(workspace), ResponseItem::Message { content, .. }) = (workspace, &mut item) {
+        for part in content {
+            if let ContentItem::InputText { text } = part
+                && text.contains(workspace)
+            {
+                *text = text
+                    .replace(workspace, PROMPT_FOOTPRINT_WORKSPACE_MARKER)
+                    .into_boxed_str();
+            }
+        }
+    }
+    Ok(item)
+}
+
+fn response_item_tool_count(items: &[ResponseItem]) -> usize {
+    items
+        .iter()
+        .map(|item| match item {
+            ResponseItem::AdditionalTools { tools, .. } => tools.len(),
+            _ => 0,
+        })
+        .sum()
 }
 
 async fn measured_turn(
