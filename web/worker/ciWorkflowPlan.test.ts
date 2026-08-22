@@ -28,6 +28,8 @@ import {
   refreshSourceCommand,
   rustBuildCacheInputs,
   rustBuildCacheCommand,
+  rustQualityCacheCommand,
+  rustQualityCacheInputs,
   rustPipeline,
   rustSecPolicyCommand,
   websiteCommand,
@@ -148,6 +150,14 @@ test("dependency and Rust compilation snapshots are content addressed", async ()
   ]));
   assert.deepEqual(rustBuildCacheInputs(), cargoCacheInputs());
   assert.deepEqual(msrvBuildCacheInputs(), cargoCacheInputs());
+  assert.deepEqual(rustQualityCacheInputs(), [
+    ...cargoCacheInputs(),
+    "bin/**/*",
+    "crates/**/*",
+    "examples/**/*.rs",
+    "js/bindings/src/**/*",
+    "py/bindings/src/**/*",
+  ]);
   assert.ok(
     rustBuildCacheInputs().every((path) => !path.includes("src") && !path.endsWith("**/*")),
     "workspace source changes reuse the compatible Cargo target layer",
@@ -174,6 +184,12 @@ test("dependency and Rust compilation snapshots are content addressed", async ()
   assert.doesNotMatch(msrvBuildCacheCommand(), /cargo .*clean/);
   assert.match(refreshSourceCommand("cargo test"), /-exec touch/);
   assert.match(refreshSourceCommand("cargo test"), /\.cargo-target-msrv -prune/);
+  const qualityCache = rustQualityCacheCommand("cargo clippy --workspace");
+  assert.match(qualityCache, /cargo clippy --workspace/);
+  assert.match(qualityCache, /-exec touch/);
+  assert.match(qualityCache, /> \/workspace\/\.rust-source-fingerprint/);
+  assert.match(qualityCache, /! -name \.cargo-target/);
+  assert.doesNotMatch(qualityCache, /! -name \.cargo-target-msrv/);
 });
 
 test("Cargo dependencies restore the exact owned Git bundle before fetching", () => {

@@ -189,6 +189,21 @@ export function rustBuildCacheInputs(): string[] {
   return cargoCacheInputs();
 }
 
+export function rustQualityCacheInputs(): string[] {
+  // Quality is a deterministic function of the Rust workspace rather than the
+  // whole publication. Key its completed graph to every input Cargo can read,
+  // including crate documentation and embedded prompts, while allowing a
+  // website-only publication to reuse the attested result.
+  return [
+    ...cargoCacheInputs(),
+    "bin/**/*",
+    "crates/**/*",
+    "examples/**/*.rs",
+    "js/bindings/src/**/*",
+    "py/bindings/src/**/*",
+  ];
+}
+
 export function msrvBuildCacheInputs(): string[] {
   return cargoCacheInputs();
 }
@@ -281,6 +296,14 @@ export function msrvBuildCacheCommand(): string {
     "cargo +1.97 test --workspace --locked --no-run",
     ".cargo-target-msrv",
   );
+}
+
+export function rustQualityCacheCommand(command: string): string {
+  return [
+    refreshSourceCommand(command),
+    `${sourceFingerprintCommand()} > /workspace/.rust-source-fingerprint`,
+    "find /workspace -mindepth 1 -maxdepth 1 ! -name .cargo-home ! -name .cargo-target ! -name .rust-source-fingerprint -exec rm -rf -- {} +",
+  ].join(" && ");
 }
 
 function rustCompilationCacheCommand(

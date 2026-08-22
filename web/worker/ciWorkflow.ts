@@ -32,6 +32,8 @@ import {
   refreshSourceCommand,
   rustBuildCacheInputs,
   rustBuildCacheCommand,
+  rustQualityCacheCommand,
+  rustQualityCacheInputs,
   rustPipeline,
   websiteCommand,
   websiteDependencyCacheInputs,
@@ -178,21 +180,30 @@ export class NanocodexCI extends CIWorkflow<
         parent: CiRunnerResult,
         job: ReturnType<typeof rustPipeline>[number],
         refreshSource: boolean,
-      ) => {
+        cacheInputs?: string[],
+      ): Promise<CiRunnerResult> => {
         const startedAt = progress.start(job.name);
         const result = await parent.runner({
           name: job.name,
-          command: cleanupAfter(
-            refreshSource ? refreshSourceCommand(job.command) : job.command,
-          ),
+          command: cacheInputs
+            ? job.command
+            : cleanupAfter(
+              refreshSource ? refreshSourceCommand(job.command) : job.command,
+            ),
           env: job.name === "MSRV workspace tests"
             ? MSRV_ENV
             : job.name === "stable workspace tests" || job.name === "quality"
               ? RUST_TEST_ENV
               : COMMON_ENV,
-          config: runnerConfig(job.timeoutMs, 24 * 60 * 60, 0, false),
+          ...(cacheInputs ? { cache: { inputs: cacheInputs } } : {}),
+          config: runnerConfig(
+            job.timeoutMs,
+            cacheInputs ? 30 * 24 * 60 * 60 : 24 * 60 * 60,
+            0,
+            cacheInputs != null,
+          ),
         });
-        await persistRunner(
+        const metadata = await persistRunner(
           this.env.BACKUP_BUCKET,
           head,
           result,
@@ -201,11 +212,12 @@ export class NanocodexCI extends CIWorkflow<
         const summary = {
           name: job.name,
           exitCode: result.exitCode,
-          cacheHit: false,
+          cacheHit: metadata.cacheHit,
           durationMs: Date.now() - startedAt,
         };
         completed.push(summary);
         await progress.complete(job.name, summary);
+        return result;
       };
       const rustJobs = rustPipeline({
         url: `${this.env.CI_PUBLIC_ORIGIN.replace(/\/$/, "")}/api/ci/rustsec-advisory-db/${source.rustSecRevision}/bundle.tar.gz`,
@@ -248,7 +260,15 @@ export class NanocodexCI extends CIWorkflow<
       })();
       const qualityBranch = (async () => {
         const buildCache = await buildCacheBranch;
-        await runRustJob(buildCache, qualityJob, true);
+        return runRustJob(
+          buildCache,
+          {
+            ...qualityJob,
+            command: rustQualityCacheCommand(qualityJob.command),
+          },
+          false,
+          rustQualityCacheInputs(),
+        );
       })();
       const msrvJob = rustJobs.find(
         ({ name }) => name === "MSRV workspace tests",
@@ -458,19 +478,18 @@ export class NanocodexCI extends CIWorkflow<
       };
       const saturationBarrier = Promise.all([
         cargoPersistence,
-        qualityBranch,
         ...directRustJobs,
         webPreparation,
       ]);
-      const [buildCache, msrvBuildCache] = await Promise.all([
-        buildCacheBranch,
+      const [qualityCache, msrvBuildCache] = await Promise.all([
+        qualityBranch,
         msrvBuildCacheBranch,
         saturationBarrier,
       ]);
       // Compilation can saturate the shared host. Finish every reusable target
       // and the compile-heavy quality gate first, then give the stable suite's
       // wall-clock assertions the host without a competing Rust compiler.
-      await runRustJob(buildCache, stableJob, true);
+      await runRustJob(qualityCache, stableJob, true);
       // The remaining MSRV and JavaScript suites are bounded to separate cache
       // trees and together fit the host after the stable suite releases it.
       await Promise.all([

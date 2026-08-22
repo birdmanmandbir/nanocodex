@@ -90,7 +90,7 @@ test("the local CI command enables container execution on the public runner orig
   assert.match(command, /--port 8787 --ip 127\.0\.0\.1/);
 });
 
-test("terminal gates skip snapshots and publish the website artifact in-place", async () => {
+test("terminal gates skip snapshots while cached quality feeds stable tests", async () => {
   const [workflow, sandboxRunner, runnerGroup, cache] = await Promise.all([
     readFile(new URL("./ciWorkflow.ts", import.meta.url), "utf8"),
     readFile(
@@ -106,7 +106,14 @@ test("terminal gates skip snapshots and publish the website artifact in-place", 
       "utf8",
     ),
   ]);
-  assert.match(workflow, /runnerConfig\(job\.timeoutMs, 24 \* 60 \* 60, 0, false\)/);
+  assert.match(
+    workflow,
+    /cacheInputs \? 30 \* 24 \* 60 \* 60 : 24 \* 60 \* 60[\s\S]*?cacheInputs != null/,
+  );
+  assert.match(
+    workflow,
+    /command: rustQualityCacheCommand\(qualityJob\.command\)[\s\S]*?rustQualityCacheInputs\(\)/,
+  );
   assert.match(workflow, /runnerConfig\(40 \* 60 \* 1_000, 24 \* 60 \* 60, 0, false\)/);
   assert.match(workflow, /path: "\/workspace\/\.ci-output\/web-wasm\.tar"/);
   assert.match(workflow, /path: "\/workspace\/\.ci-output\/web-dist\.tar"/);
@@ -188,10 +195,10 @@ test("terminal gates skip snapshots and publish the website artifact in-place", 
     "const saturationBarrier = Promise.all([",
   );
   const saturationAwait = workflow.indexOf(
-    "const [buildCache, msrvBuildCache] = await Promise.all([",
+    "const [qualityCache, msrvBuildCache] = await Promise.all([",
   );
   const stableExecution = workflow.indexOf(
-    "await runRustJob(buildCache, stableJob, true);",
+    "await runRustJob(qualityCache, stableJob, true);",
   );
   const msrvExecution = workflow.indexOf(
     "runRustJob(msrvBuildCache, msrvJob, true),",
@@ -204,7 +211,7 @@ test("terminal gates skip snapshots and publish the website artifact in-place", 
   );
   assert.match(
     workflow,
-    /const qualityBranch = \(async \(\) => \{[\s\S]*?await runRustJob\(buildCache, qualityJob, true\);[\s\S]*?const saturationBarrier = Promise\.all\(\[[\s\S]*?qualityBranch,/,
+    /const qualityBranch = \(async \(\) => \{[\s\S]*?rustQualityCacheCommand\(qualityJob\.command\)[\s\S]*?rustQualityCacheInputs\(\)[\s\S]*?const saturationBarrier = Promise\.all\(\[/,
   );
   assert.ok(
     saturationAwait > saturationBarrier && stableExecution > saturationAwait,

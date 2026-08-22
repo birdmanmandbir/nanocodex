@@ -138,9 +138,13 @@ graph used by Clippy, and the fingerprint of the source that produced them.
 Every consumer overlays the immutable current source and
 touches all Rust inputs when that fingerprint changes, so Cargo reuses compatible
 dependency output while rebuilding every affected crate, build script, and proc
-macro. Quality branches from that reusable target and joins the compile-heavy
-saturation phase. Stable tests start only after that phase releases the host, so
-their wall-clock lifecycle assertions never compete with a Rust compiler. The
+macro. Quality branches from that reusable target and is content-addressed by
+every Rust workspace input, including crate documentation and embedded prompts.
+A matching publication restores the completed Clippy, independent-crate, and
+rustdoc graph; changed Rust input reruns the full gate and publishes a new
+30-day snapshot. Stable tests branch from that exact quality snapshot and start
+only after the compile-heavy saturation phase releases the host, so their
+wall-clock lifecycle assertions never compete with a Rust compiler. The
 MSRV and JavaScript consumers follow, then both Python versions run together.
 Cargo and libtest are explicitly capped at four CPUs, and the MSRV gate uses one
 libtest thread, so a local Containers emulator cannot oversubscribe each runner
@@ -152,13 +156,14 @@ streams only its
 small tested WASM package to R2 and skips its otherwise multi-gigabyte workspace
 snapshot. The website starts from its site-only dependency snapshot, restores
 that checksum-verified WASM package, and streams its tested deployment tar
-straight back to R2. Correctness runners are not skipped by cache or retried;
-only network-backed dependency preparation gets one retry.
+straight back to R2. Runtime correctness suites are never skipped, while the
+deterministic quality gate can reuse an exact successful result. No correctness
+runner is retried; only network-backed dependency preparation gets one retry.
 Success and failure logs, step records, final results, required parent/cache
 snapshots, and cache pointers are retained in the
 `nanocodex-ci` R2 bucket; no separate hosted artifact product is required.
-All nine terminal Rust, Python, bindings, and website runners explicitly skip
-workspace snapshots.
+All eight terminal Rust, Python, bindings, and website runners explicitly skip
+workspace snapshots; quality retains the parent snapshot consumed by stable.
 Immutable source archives live in the separately credentialed
 `nanocodex-ci-source` bucket.
 
