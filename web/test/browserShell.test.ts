@@ -148,7 +148,10 @@ test("the prepared browser harness observes workspace writes before its first la
   };
   try {
     const preparingShell = prepareBrowserShell(thread.id, "https://example.test");
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitFor(
+      () => storageOpens === 2,
+      "workspace preparation did not start while Git storage was blocked",
+    );
     assert.equal(storageOpens, 2);
     releaseGitStorage();
     const shell = await preparingShell;
@@ -179,6 +182,14 @@ test("the prepared browser harness observes workspace writes before its first la
     else Reflect.deleteProperty(globalThis.navigator, "storage");
   }
 });
+
+async function waitFor(condition: () => boolean, message: string) {
+  const deadline = Date.now() + 10_000;
+  while (!condition()) {
+    if (Date.now() >= deadline) assert.fail(message);
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
 
 test("browser shell indexes the worktree once and notifies only for mutations", async () => {
   const root = new MemoryDirectory();
