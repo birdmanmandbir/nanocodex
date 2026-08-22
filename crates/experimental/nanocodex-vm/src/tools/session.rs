@@ -2472,7 +2472,12 @@ mod tracing_tests {
     fn cancellation_storm_releases_bounded_admission_slots() {
         let _test_guard = TRACE_TEST_LOCK.lock().unwrap();
         let mut command = tokio::process::Command::new("/bin/sh");
-        command.arg("-c").arg("sleep 30");
+        // Drain every frame without replying. A sleeping child eventually
+        // fills the platform pipe and tests writer backpressure instead of
+        // cancellation admission, with the exact threshold varying by host.
+        command
+            .arg("-c")
+            .arg("while IFS= read -r request; do :; done");
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
