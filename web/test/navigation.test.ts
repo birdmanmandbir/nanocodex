@@ -117,6 +117,8 @@ test("global product shortcuts are visible and browser Find remains native", () 
     productNavigation.map(({ label, shortcut }) => [label, shortcut]),
     [["Agent", "A"], ["Changelog", "H"], ["CI", "I"], ["Commits", "C"], ["Docs", "D"], ["Evals", "E"], ["Source", "S"]],
   );
+  assert.match(application, /data-mobile-label=\{item\.shortcut\}/);
+  assert.doesNotMatch(application, /data-mobile-label=\{item\.label\.slice/);
   assert.match(application, /title=\{`\$\{item\.label\} \(\$\{item\.shortcut\}\)`\}/);
   assert.match(application, /key === "h"[\s\S]*?\? "changelog"/);
   assert.match(application, /key === "i"[\s\S]*?\? "ci"/);

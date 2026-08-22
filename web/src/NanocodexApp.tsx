@@ -1031,7 +1031,7 @@ function NanocodexShell({ preparedRoute }: Required<NanocodexAppProps>) {
                     : threadSurfacePath(item.surface)}
                   aria-current={surface === item.surface ? "page" : undefined}
                   aria-keyshortcuts={item.shortcut}
-                  data-mobile-label={item.label.slice(0, 1)}
+                  data-mobile-label={item.shortcut}
                   key={item.surface}
                   title={`${item.label} (${item.shortcut})`}
                   onFocus={() => preloadSurface(item.surface)}
