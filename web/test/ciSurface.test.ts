@@ -4,11 +4,14 @@ import test from "node:test";
 
 const app = source("../src/NanocodexApp.tsx");
 const main = source("../src/main.tsx");
+const routeLoaders = source("../src/routeLoaders.ts");
 const ci = source("../src/Ci.tsx");
 const css = source("../src/ci.css");
 
 test("CI is a direct, themed application surface", () => {
-  assert.match(main, /surface === "ci"[^;]+import\("\.\/Ci"\)/);
+  assert.match(main, /preloadDirectSurface\(directUrl\)/);
+  assert.match(routeLoaders, /export const loadCi = \(\) =>\s*import\("\.\/Ci"\)/);
+  assert.match(routeLoaders, /surface === "ci"\) await loadCi\(\)/);
   assert.doesNotMatch(main, /CiStandalone/);
   assert.match(app, /nextSurface === "ci"/);
   assert.match(app, /<Ci \/>/);
