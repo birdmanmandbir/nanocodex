@@ -244,24 +244,23 @@ index aa6068d..9a43284 100644
  
  export type RunStepResult<S> = RunOutput & {
 diff --git a/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts b/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
-index a7f6c05..d9d517b 100644
+index a7f6c05..9f0001c 100644
 --- a/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
 +++ b/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
-@@ -1,7 +1,12 @@
+@@ -1,7 +1,11 @@
  // Copyright (c) 2026 Cloudflare, Inc.
  // SPDX-License-Identifier: Apache-2.0
  
 -import { getSandbox, type DirectoryBackup } from '@cloudflare/sandbox';
 +import {
 +  getSandbox,
-+  ProcessReadyTimeoutError,
 +  streamFile,
 +  type DirectoryBackup,
 +} from '@cloudflare/sandbox';
  import { posix } from 'node:path';
  import type { Bindings } from '../../env';
  import {
-@@ -9,13 +14,22 @@ import {
+@@ -9,21 +13,52 @@ import {
    checkoutSourceScript,
  } from '../../shared/source-checkout';
  import { slugify } from '../../shared/slugify';
@@ -285,7 +284,16 @@ index a7f6c05..d9d517b 100644
  const COMMAND_TIMEOUT_MS = 11 * 60 * 1000;
  const SOURCE_TIMEOUT_MS = 5 * 60 * 1000;
  const PORT_READY_TIMEOUT_MS = 60_000;
-@@ -24,6 +38,20 @@ const PORT_READY_TIMEOUT_MS = 60_000;
++// waitForExit holds one SSE request open for the complete command. Local
++// Container proxies retire that stream after roughly five minutes even while
++// the process remains healthy. Short status requests also make cancellation
++// observable without coupling process lifetime to one network connection.
++const PROCESS_POLL_INTERVAL_MS = 5_000;
++const PROCESS_RUN_CHECK_INTERVAL_MS = 30_000;
++const PROCESS_NETWORK_RETRY_MS = 250;
++const PROCESS_NETWORK_RETRIES = 3;
+ // Keep notification and failure previews bounded by slicing each stream to its
+ // tail in the sandbox, where command failures usually surface.
  const TAIL_BYTES = 28_000;
  // Two inline logs plus result metadata must remain below Workflows' 1 MiB limit.
  const INLINE_LOG_BYTES = 300_000;
@@ -306,7 +314,7 @@ index a7f6c05..d9d517b 100644
  
  export class SandboxRunner implements Runner<DirectoryBackup> {
    readonly name = 'sandbox';
-@@ -38,23 +66,40 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -38,23 +73,40 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
    async run(
      input: RunStepInput & { restore?: DirectoryBackup }
    ): Promise<RunStepResult<DirectoryBackup>> {
@@ -356,7 +364,7 @@ index a7f6c05..d9d517b 100644
            checkoutSourceScript(input.source, WORKSPACE_DIR, true),
            {
              cwd: '/',
-@@ -63,15 +108,16 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -63,15 +115,16 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
            }
          );
        } else {
@@ -375,24 +383,26 @@ index a7f6c05..d9d517b 100644
          {
            cwd: resolveCwd(input.cwd),
            env: {
-@@ -81,61 +127,550 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -81,61 +134,625 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
            autoCleanup: false,
          }
        );
 -      const { exitCode } = await proc.waitForExit(
 -        input.timeoutMs ?? COMMAND_TIMEOUT_MS
--      );
 +      let exitCode: number;
 +      let timedOut = false;
-+      try {
-+        ({ exitCode } = await proc.waitForExit(
-+          input.timeoutMs ?? COMMAND_TIMEOUT_MS
-+        ));
-+      } catch (error) {
-+        if (!(error instanceof ProcessReadyTimeoutError)) throw error;
++      const completed = await waitForRunnerProcess(
++        sandbox,
++        proc,
++        input.timeoutMs ?? COMMAND_TIMEOUT_MS,
++        () => assertRunActive(this.env.BACKUP_BUCKET, input.sourceSha)
+       );
++      if (completed === undefined) {
 +        timedOut = true;
 +        await terminateTimedOutProcess(sandbox, proc);
 +        exitCode = 124;
++      } else {
++        exitCode = completed;
 +      }
 +      await assertRunActive(this.env.BACKUP_BUCKET, input.sourceSha);
        const preview = await readPreviews(sandbox);
@@ -489,7 +499,6 @@ index a7f6c05..d9d517b 100644
      } finally {
 -      if (!cleanupTransferredToStreams) {
 -        await destroySandbox(sandbox);
--      }
 +      // Keep the registry marker when teardown fails so the authenticated
 +      // control route can retry the exact Sandbox rather than leaking it.
 +      if (sandbox) await destroySandbox(sandbox);
@@ -648,7 +657,7 @@ index a7f6c05..d9d517b 100644
 +      throw new Error(
 +        `Local CI snapshot extraction failed: ${snapshot.id}: ${restored.stderr.slice(-2_000)}`
 +      );
-     }
++    }
 +  } finally {
 +    await sandbox.exec(
 +      `rm -f ${shellQuote(archivePath)} ${shellQuote(partPath)}`,
@@ -672,9 +681,9 @@ index a7f6c05..d9d517b 100644
 +    return await start();
 +  } finally {
 +    release();
-   }
- }
- 
++  }
++}
++
 +function fulfilled<T>(result: PromiseSettledResult<T>): T {
 +  if (result.status === 'rejected') {
 +    throw result.reason;
@@ -692,7 +701,7 @@ index a7f6c05..d9d517b 100644
 +      assertWorkspacePath(output.path, 'output');
 +      if (!output.key || output.key.startsWith('/')) {
 +        throw new Error(`Invalid CI output key: ${output.key}`);
-+      }
+       }
 +      if (!Number.isSafeInteger(output.maxBytes) || output.maxBytes <= 0) {
 +        throw new Error(`Invalid CI output byte limit: ${output.key}`);
 +      }
@@ -788,6 +797,75 @@ index a7f6c05..d9d517b 100644
 +    .join('');
 +}
 +
++async function waitForRunnerProcess(
++  sandbox: ReturnType<typeof getSandbox>,
++  proc: Awaited<ReturnType<ReturnType<typeof getSandbox>['startProcess']>>,
++  timeoutMs: number,
++  assertActive: () => Promise<void> = () => Promise.resolve()
++): Promise<number | undefined> {
++  const deadline = Date.now() + timeoutMs;
++  let nextRunCheckAt = Date.now() + PROCESS_RUN_CHECK_INTERVAL_MS;
++  let networkFailures = 0;
++
++  for (;;) {
++    const now = Date.now();
++    if (now >= nextRunCheckAt) {
++      await assertActive();
++      nextRunCheckAt = now + PROCESS_RUN_CHECK_INTERVAL_MS;
+     }
++
++    let current: Awaited<ReturnType<typeof sandbox.getProcess>>;
++    try {
++      current = await sandbox.getProcess(proc.id);
++      networkFailures = 0;
++    } catch (error) {
++      if (
++        !isNetworkConnectionLost(error) ||
++        networkFailures >= PROCESS_NETWORK_RETRIES
++      ) {
++        throw error;
++      }
++      networkFailures += 1;
++      await wait(
++        Math.min(
++          PROCESS_NETWORK_RETRY_MS * networkFailures,
++          Math.max(0, deadline - Date.now())
++        )
++      );
++      continue;
++    }
++
++    if (!current) {
++      throw new Error(`CI process disappeared before completion: ${proc.id}`);
++    }
++    if (
++      current.status === 'completed' ||
++      current.status === 'failed' ||
++      current.status === 'killed' ||
++      current.status === 'error'
++    ) {
++      if (current.exitCode == null) {
++        throw new Error(
++          `CI process reached ${current.status} without an exit code: ${proc.id}`
++        );
++      }
++      return current.exitCode;
++    }
++
++    const remaining = deadline - Date.now();
++    if (remaining <= 0) return undefined;
++    await wait(Math.min(PROCESS_POLL_INTERVAL_MS, remaining));
++  }
++}
++
++function isNetworkConnectionLost(error: unknown) {
++  return error instanceof Error && error.message.includes('Network connection lost.');
++}
++
++function wait(milliseconds: number) {
++  return new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
++}
++
 +async function terminateTimedOutProcess(
 +  sandbox: ReturnType<typeof getSandbox>,
 +  proc: Awaited<ReturnType<ReturnType<typeof getSandbox>['startProcess']>>
@@ -800,10 +878,13 @@ index a7f6c05..d9d517b 100644
 +    { cwd: '/', timeout: 10_000 }
 +  );
 +  await proc.kill('SIGTERM').catch(() => undefined);
-+  await proc.waitForExit(30_000).catch(async () => {
++  const exited = await waitForRunnerProcess(sandbox, proc, 30_000).catch(
++    () => undefined
++  );
++  if (exited === undefined) {
 +    await proc.kill('SIGKILL').catch(() => undefined);
-+    await proc.waitForExit(5_000).catch(() => undefined);
-+  });
++    await waitForRunnerProcess(sandbox, proc, 5_000).catch(() => undefined);
++  }
 +  await sandbox.exec(
 +    `for attempt in $(seq 1 100); do if test -f ${STDOUT_FILE}.meta.json -a -f ${STDERR_FILE}.meta.json; then exit 0; fi; sleep 0.1; done; exit 1`,
 +    { cwd: '/', timeout: 15_000 }
@@ -908,9 +989,9 @@ index a7f6c05..d9d517b 100644
 +  } catch (error) {
 +    await piping.catch(() => undefined);
 +    throw error;
-+  }
-+}
-+
+   }
+ }
+ 
 +function decodeFileStream(
 +  stream: ReadableStream<Uint8Array>
 +): ReadableStream<Uint8Array> {
@@ -966,7 +1047,7 @@ index a7f6c05..d9d517b 100644
  async function readLogs(sandbox: ReturnType<typeof getSandbox>) {
    const listing = await sandbox.listFiles('/tmp');
    const sizes = new Map(
-@@ -153,7 +688,7 @@ async function readLog(
+@@ -153,7 +770,7 @@ async function readLog(
    size: number
  ): Promise<string | ReadableStream<Uint8Array>> {
    if (size > INLINE_LOG_BYTES) {
@@ -975,7 +1056,7 @@ index a7f6c05..d9d517b 100644
    }
    return (await sandbox.readFile(file, { encoding: 'utf-8' })).content;
  }
-@@ -192,51 +727,22 @@ function resolveCwd(cwd: string | undefined) {
+@@ -192,51 +809,22 @@ function resolveCwd(cwd: string | undefined) {
    return posix.join(WORKSPACE_DIR, normalized);
  }
  

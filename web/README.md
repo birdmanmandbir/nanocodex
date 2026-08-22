@@ -210,10 +210,14 @@ Runner output is captured through a bounded 32 MiB head plus 32 MiB tail per
 stream. The step record includes observed/stored byte counts and a truncation
 flag. Every command uploads those bounded logs directly to R2 before its
 Sandbox is destroyed, while Workflow state carries only the small preview and
-R2 references. Timeout cleanup terminates the command process group, drains the
-capture FIFOs, and retains the early diagnostic before recording a typed
-timeout failure. Snapshot creation and log finalization have a separate
-five-minute Workflow margin beyond each command timeout. The pinned
+R2 references. Long-running commands are observed through five-second process
+status requests instead of one lifetime SSE connection, so a local proxy stream
+cannot erase healthy work at its five-minute boundary. The same loop checks run
+tombstones every 30 seconds and bounds transient connection retries. Timeout
+cleanup terminates the command process group, drains the capture FIFOs, and
+retains the early diagnostic before recording a typed timeout failure. Snapshot
+creation and log finalization have a separate five-minute Workflow margin beyond
+each command timeout. The pinned
 `@cloudflare/ci` 0.1.0 package is patched by `postinstall` to provide this
 behavior until the runner exposes the same R2 log sink upstream. Runner images
 also pin Node 22.15.0, both Python interpreters, the Rust and MSRV toolchains,

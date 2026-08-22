@@ -222,6 +222,20 @@ test("artifact and deterministic gates use bounded reusable cache entries", asyn
     sandboxRunner,
     /if \(env\.ENVIRONMENT !== 'development'\) return start\(\)/,
   );
+  assert.match(sandboxRunner, /PROCESS_POLL_INTERVAL_MS = 5_000/);
+  assert.match(
+    sandboxRunner,
+    /waitForRunnerProcess\([\s\S]*?await sandbox\.getProcess\(proc\.id\)/,
+  );
+  assert.match(
+    sandboxRunner,
+    /PROCESS_RUN_CHECK_INTERVAL_MS[\s\S]*?await assertActive\(\)/,
+  );
+  assert.doesNotMatch(
+    sandboxRunner,
+    /\.waitForExit\(/,
+    "long CI commands must not depend on one Sandbox SSE connection",
+  );
   assert.match(workflow, /CARGO_BUILD_JOBS: "4"/);
   assert.match(workflow, /CARGO_PROFILE_DEV_DEBUG: "0"/);
   assert.match(workflow, /CARGO_PROFILE_TEST_DEBUG: "0"/);
