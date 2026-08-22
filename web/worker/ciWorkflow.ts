@@ -59,16 +59,20 @@ const COMMON_ENV = {
   CARGO_TARGET_DIR: "/workspace/.cargo-target",
   CARGO_BUILD_JOBS: "4",
   CARGO_INCREMENTAL: "0",
-  // Test DWARF dominates the reusable workspace snapshot but is not consumed
-  // by any CI gate. Keep test codegen and assertions identical while avoiding
-  // multi-gigabyte cache writes and restores.
-  CARGO_PROFILE_TEST_DEBUG: "0",
   CARGO_TERM_COLOR: "always",
   RUST_TEST_THREADS: "4",
 };
 
-const MSRV_ENV = {
+const RUST_TEST_ENV = {
   ...COMMON_ENV,
+  // Test DWARF dominates the reusable workspace snapshot but is not consumed
+  // by any CI gate. Keep test codegen and assertions identical while avoiding
+  // multi-gigabyte cache writes and restores.
+  CARGO_PROFILE_TEST_DEBUG: "0",
+};
+
+const MSRV_ENV = {
+  ...RUST_TEST_ENV,
   CARGO_TARGET_DIR: "/workspace/.cargo-target-msrv",
   RUST_TEST_THREADS: "1",
 };
@@ -180,7 +184,11 @@ export class NanocodexCI extends CIWorkflow<
           command: cleanupAfter(
             refreshSource ? refreshSourceCommand(job.command) : job.command,
           ),
-          env: job.name === "MSRV workspace tests" ? MSRV_ENV : COMMON_ENV,
+          env: job.name === "MSRV workspace tests"
+            ? MSRV_ENV
+            : job.name === "stable workspace tests" || job.name === "quality"
+              ? RUST_TEST_ENV
+              : COMMON_ENV,
           config: runnerConfig(job.timeoutMs, 24 * 60 * 60, 0, false),
         });
         await persistRunner(
@@ -209,7 +217,7 @@ export class NanocodexCI extends CIWorkflow<
         const buildCache = await dependencies.runner({
           name: "Rust build cache",
           command: rustBuildCacheCommand(),
-          env: COMMON_ENV,
+          env: RUST_TEST_ENV,
           cache: { inputs: rustBuildCacheInputs() },
           config: runnerConfig(45 * 60 * 1_000, 30 * 24 * 60 * 60),
         });

@@ -159,6 +159,10 @@ test("terminal gates skip snapshots and publish the website artifact in-place", 
   assert.match(workflow, /RUST_TEST_THREADS: "4"/);
   assert.match(
     workflow,
+    /name: "cargo dependencies"[\s\S]*?env: COMMON_ENV,[\s\S]*?name: "Rust build cache"[\s\S]*?env: RUST_TEST_ENV,/,
+  );
+  assert.match(
+    workflow,
     /const MSRV_ENV = \{[\s\S]*?CARGO_TARGET_DIR: "\/workspace\/\.cargo-target-msrv",[\s\S]*?RUST_TEST_THREADS: "1"/,
   );
   assert.doesNotMatch(runnerGroup, /await Promise\.allSettled/);
