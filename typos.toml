@@ -18,6 +18,10 @@ udid = "udid"
 Udid = "Udid"
 # `CMO` abbreviates the differential evaluator's code-mode-only profile.
 CMO = "CMO"
+# Rustix and Linux spell these machine-defined capability/open flags exactly.
+WRONLY = "WRONLY"
+Inh = "Inh"
+inh = "inh"
 # `caf` is the hexadecimal middle of the reviewed Codex commit
 # `312caf176a8f`, not prose.
 caf = "caf"
