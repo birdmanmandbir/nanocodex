@@ -772,7 +772,7 @@ type CiArtifact = {
 type CiProgressStep = {
   name: string;
   slug: string;
-  status: "pending" | "running" | "success" | "failure";
+  status: "pending" | "running" | "success" | "failure" | "terminated";
   startedAt?: string;
   completedAt?: string;
   durationMs?: number;
@@ -837,15 +837,24 @@ class CiProgress {
 
   async failRunning(cause: unknown): Promise<void> {
     const failure = failureRecord(cause);
+    const failedGates = isCiRunnerFailure(cause)
+      ? new Set([
+        cause.runner.name,
+        ...cause.diagnostics.failures.map(({ runner }) => runner.name),
+      ].map(slug))
+      : null;
     const completedAt = Date.now();
     for (const gate of this.#steps.values()) {
       if (gate.status !== "running") continue;
-      gate.status = "failure";
+      const failed = failedGates == null || failedGates.has(gate.slug);
+      gate.status = failed ? "failure" : "terminated";
       gate.completedAt = new Date(completedAt).toISOString();
       gate.durationMs = gate.startedAt
         ? Math.max(0, completedAt - Date.parse(gate.startedAt))
         : undefined;
-      gate.message = failure.message;
+      gate.message = failed
+        ? failure.message
+        : `stopped after ${failure.name} failed`;
     }
     this.#queueSnapshot();
     await this.#flush();
@@ -953,7 +962,7 @@ async function persistLog(
 function failureRecord(value: unknown) {
   if (isCiRunnerFailure(value)) {
     return {
-      name: value.name,
+      name: value.runner.name,
       message: value.message,
       diagnostics: value.diagnostics,
     };

@@ -182,7 +182,9 @@ Workflow, then reconciles every registered Sandbox across three teardown sweeps;
 a runner rechecks the tombstone between long phases, and a failed teardown retains
 its marker for a safe operator retry. A deterministic gate failure writes its own
 stop marker and immediately tears down active siblings instead of waiting for a
-known-doomed fanout to finish.
+known-doomed fanout to finish. Progress records attribute the actual runner as
+failed and mark interrupted siblings as terminated, so the dashboard never
+misreports collateral teardown as a second test failure.
 
 Runner output is captured through a bounded 32 MiB head plus 32 MiB tail per
 stream. The step record includes observed/stored byte counts and a truncation

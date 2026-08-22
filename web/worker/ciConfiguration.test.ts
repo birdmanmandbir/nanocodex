@@ -198,6 +198,11 @@ test("artifact gates stream outputs while quality and Python retain reusable sna
     /const MSRV_ENV = \{[\s\S]*?CARGO_TARGET_DIR: "\/workspace\/\.cargo-target-msrv",[\s\S]*?RUST_TEST_THREADS: "1"/,
   );
   assert.doesNotMatch(runnerGroup, /await Promise\.allSettled/);
+  assert.match(workflow, /name: value\.runner\.name/);
+  assert.match(
+    workflow,
+    /const failedGates = isCiRunnerFailure\(cause\)[\s\S]*?gate\.status = failed \? "failure" : "terminated"/,
+  );
   const saturationBarrier = workflow.indexOf(
     "const saturationBarrier = Promise.all([",
   );
