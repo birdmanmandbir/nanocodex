@@ -3,6 +3,7 @@ const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 const SOURCE_PREFIX_PATTERN = /^sources\/([a-f0-9]{40})\/(source\.tar\.gz|tree\.json)$/;
 const SOURCE_REF = "refs/heads/master";
 const SOURCE_BRANCH = "master";
+export const EXACT_SOURCE_TREE_PATH = "/.nanocodex-ci/source-tree";
 
 export type CiSourceObject = {
   key: string;
@@ -153,6 +154,19 @@ export function isSha256(value: unknown): value is string {
 
 export function isCanonicalSourceKey(value: string): boolean {
   return SOURCE_PREFIX_PATTERN.test(value);
+}
+
+export async function sourceTreeFingerprint(tree: CiSourceTree): Promise<string> {
+  const canonical = JSON.stringify(
+    tree.files.map(({ path, sha, mode }) => [path, sha, mode]),
+  );
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(canonical),
+  );
+  return [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 function isSourceObject(value: unknown, key: string, maxSize: number): value is CiSourceObject {

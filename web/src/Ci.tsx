@@ -21,6 +21,7 @@ const gates = [
   ["msrv-workspace-tests", "MSRV 1.97", "minimum supported Rust"],
   ["quality", "Quality", "rustfmt and warnings-denied Clippy"],
   ["dependency-policy", "Dependency policy", "crate boundaries and Cargo deny"],
+  ["typos", "Typos", "whole-tree spelling policy"],
   ["static-vm-guest", "Static VM guest", "cross-target guest build"],
   ["python-3-11", "Python 3.11", "bindings and consumer tests"],
   ["python-3-14", "Python 3.14", "forward-runtime coverage"],

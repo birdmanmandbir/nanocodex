@@ -120,7 +120,11 @@ test("artifact and deterministic gates use bounded reusable cache entries", asyn
   );
   assert.match(
     workflow,
-    /job\.name === "dependency policy"[\s\S]*?command: cleanupAfter\(job\.command\)[\s\S]*?fullSourceCacheInputs\(\)/,
+    /job\.name === "dependency policy"[\s\S]*?command: cleanupAfter\(job\.command\)[\s\S]*?dependencyPolicyCacheInputs\(\)/,
+  );
+  assert.match(
+    workflow,
+    /name: "typos"[\s\S]*?command: cleanupAfter\(typosCommand\(\)\)[\s\S]*?cacheInputs: exactSourceCacheInputs\(\)/,
   );
   assert.match(
     workflow,
@@ -150,7 +154,7 @@ test("artifact and deterministic gates use bounded reusable cache entries", asyn
   );
   assert.match(
     workflow,
-    /const websiteVerification = await websiteDependencyState\.result\.runner[\s\S]*?websiteResultCacheCommand[\s\S]*?cache: \{ inputs: fullSourceCacheInputs\(\) \}/,
+    /retainContentAddressedArtifact[\s\S]*?const websiteVerification = await websiteDependencyState\.result\.runner[\s\S]*?\/api\/ci\/artifacts\/\$\{wasmContentKey\}[\s\S]*?cache: \{ inputs: websiteResultCacheInputs\(\) \}/,
   );
   assert.match(
     workflow,
@@ -267,11 +271,11 @@ test("artifact and deterministic gates use bounded reusable cache entries", asyn
   );
   assert.match(
     workflow,
-    /command: rustResultCacheCommand\(stableJob\.command\)[\s\S]*?fullSourceCacheInputs\(\)/,
+    /command: rustResultCacheCommand\(stableJob\.command\)[\s\S]*?rustResultCacheInputs\(\)/,
   );
   assert.match(
     workflow,
-    /command: rustResultCacheCommand\(msrvJob\.command\)[\s\S]*?fullSourceCacheInputs\(\)/,
+    /command: rustResultCacheCommand\(msrvJob\.command\)[\s\S]*?rustResultCacheInputs\(\)/,
   );
   assert.match(workflow, /\(\["3\.11", "3\.14"\] as const\)\.map/);
   assert.ok(

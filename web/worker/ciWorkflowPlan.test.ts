@@ -24,7 +24,8 @@ import {
   bindingsResultCacheInputs,
   cargoCacheInputs,
   cargoDependencyCommand,
-  fullSourceCacheInputs,
+  dependencyPolicyCacheInputs,
+  exactSourceCacheInputs,
   msrvBuildCacheCommand,
   msrvBuildCacheInputs,
   parallelCommandGroups,
@@ -34,14 +35,17 @@ import {
   rustBuildCacheInputs,
   rustBuildCacheCommand,
   rustResultCacheCommand,
+  rustResultCacheInputs,
   rustQualityCacheInputs,
   rustPipeline,
   rustSecPolicyCommand,
+  typosCommand,
   websiteCommand,
   websiteArtifactCommand,
   websiteDependencyCacheInputs,
   websiteDependencyCommand,
   websiteResultCacheCommand,
+  websiteResultCacheInputs,
 } from "./ciWorkflowPlan.ts";
 
 const RUSTSEC = {
@@ -104,8 +108,10 @@ test("dependency policy verifies and uses only the pinned owned RustSec database
   assert.match(command, /rev-parse --verify 'HEAD\^\{commit\}'/);
   assert.match(command, /status --porcelain --untracked-files=all/);
   assert.match(command, /cargo deny --frozen check/);
+  assert.doesNotMatch(command, /typos/);
   assert.ok(command.indexOf("sha256sum") < command.indexOf("tar --extract"));
   assert.ok(command.indexOf("rev-parse") < command.indexOf("cargo deny --frozen"));
+  assert.equal(typosCommand(), "typos");
 });
 
 test("dependency and Rust compilation snapshots are content addressed", async () => {
@@ -163,7 +169,14 @@ test("dependency and Rust compilation snapshots are content addressed", async ()
     ...WEBSITE_PROJECTS.map((project) => `${project}/package-lock.json`),
     "web/patches/**/*.patch",
   ]);
-  assert.deepEqual(fullSourceCacheInputs(), ["**/*"]);
+  assert.deepEqual(exactSourceCacheInputs(), ["/.nanocodex-ci/source-tree"]);
+  assert.deepEqual(dependencyPolicyCacheInputs(), [
+    ...cargoCacheInputs(),
+    "deny.toml",
+    "scripts/check-experimental-boundary.sh",
+    "scripts/check-crate-boundaries.sh",
+    "scripts/check-rustls-provider.sh",
+  ]);
   await Promise.all([...new Set([...BINDINGS_PROJECTS, ...WEBSITE_PROJECTS])].flatMap((project) => [
     stat(new URL(`../../${project}/package.json`, import.meta.url)),
     stat(new URL(`../../${project}/package-lock.json`, import.meta.url)),
@@ -184,6 +197,19 @@ test("dependency and Rust compilation snapshots are content addressed", async ()
     "examples/**/*.rs",
     "js/bindings/src/**/*",
     "py/bindings/src/**/*",
+  ]);
+  assert.deepEqual(rustResultCacheInputs(), [
+    ...rustQualityCacheInputs(),
+    "tasks/**/*",
+    "benchmarks/codex_parity_workload.json",
+    "nanocodex.toml",
+  ]);
+  assert.deepEqual(websiteResultCacheInputs(), [
+    ...websiteDependencyCacheInputs(),
+    "web/**/*",
+    "js/bindings/**/*",
+    "js/artifacts/**/*",
+    "js/react/**/*",
   ]);
   assert.deepEqual(pythonCacheInputs(), [
     ...rustQualityCacheInputs(),

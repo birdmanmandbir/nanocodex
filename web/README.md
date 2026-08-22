@@ -135,19 +135,26 @@ stable-build-snapshot branches start concurrently. The native target snapshot
 is keyed by the exact Cargo graph and runner image rather than workspace source.
 It retains Cargo homes, the completed stable test graph, the all-feature check
 graph used by Clippy, and the fingerprint of the source that produced them.
-Every consumer overlays the immutable current source and
-touches all Rust inputs when that fingerprint changes, so Cargo reuses compatible
-dependency output while rebuilding every affected crate, build script, and proc
-macro. Quality branches from that reusable target and is content-addressed by
+Every consumer overlays the immutable current source and compares a retained
+per-file content manifest. Unchanged Rust inputs are backdated to preserve Cargo
+fingerprints while only changed files receive a fresh timestamp, so compatible
+crate, build-script, and proc-macro output survives an unrelated source edit.
+Quality branches from that reusable target and is content-addressed by
 every Rust workspace input, including crate documentation and embedded prompts.
 A matching publication restores the completed Clippy, independent-crate, and
 rustdoc graph; changed Rust input reruns the full gate and publishes a new
-30-day snapshot. Stable tests branch from that exact quality snapshot and start
+30-day snapshot. Stable tests branch from the reusable native target and start
 only after the compile-heavy saturation phase releases the host, so their
 wall-clock lifecycle assertions never compete with a Rust compiler. The
 static VM build uses the same exact Rust-input key for its compact successful
 result, avoiding an identical cross-target rebuild on website-only changes. The
-MSRV and JavaScript consumers follow, then both Python versions run together.
+stable and MSRV result records use that Rust input surface too, so site-only
+publications restore their completed suites. Cargo deny and architecture policy
+are keyed only by the manifest graph, policy files, and their executable checks.
+The independent spelling gate keys the whole repository through one canonical
+synthetic tree blob instead of expanding thousands of paths, so a documentation
+edit reruns only the cheap whole-tree check. JavaScript consumers follow, then
+both Python versions run together.
 Each Python gate is content-addressed by its complete Rust and Python consumer
 inputs plus the pinned runner image. A successful miss tests the installed
 release wheel before retaining only a minimal result snapshot; an exact hit
@@ -162,12 +169,14 @@ keys its complete four-way verification fanout to all Rust, package, test, and
 consumer inputs. A miss retains only the tested WASM tar; an exact hit restores
 that small result instead of rerunning unchanged JavaScript suites. A tiny
 terminal child streams the checksum-verified package to R2 without snapshotting
-a multi-gigabyte workspace. The website starts from its site-only dependency snapshot, restores
-that checksum-verified WASM package, and streams its tested deployment tar
-straight back to R2. Deterministic quality, static-VM, Python, and JavaScript
-verification gates can reuse an exact successful result; source-sensitive Rust,
-MSRV, and website suites still execute. No correctness runner is retried; only network-backed
-dependency preparation gets one retry.
+a multi-gigabyte workspace. Its immutable digest also addresses a small R2 copy,
+so the website cache command is independent of the producing commit. The website
+starts from its site-only dependency snapshot, restores that checksum-verified
+WASM package, and streams its tested deployment tar straight back to R2.
+Deterministic Rust, MSRV, quality, policy, static-VM, Python, bindings, and
+website verification gates reuse successful results whenever their exact
+declared inputs are unchanged. No correctness runner is retried; only
+network-backed dependency preparation gets one retry.
 Success and failure logs, step records, final results, required parent/cache
 snapshots, and cache pointers are retained in the
 `nanocodex-ci` R2 bucket; no separate hosted artifact product is required.
@@ -220,6 +229,7 @@ npx wrangler r2 bucket create nanocodex-ci
 npx wrangler r2 bucket create nanocodex-ci-source
 npx wrangler r2 bucket lifecycle add nanocodex-ci ci-backups backups/ --expire-days 31 --force
 npx wrangler r2 bucket lifecycle add nanocodex-ci ci-cache cache/ --expire-days 31 --force
+npx wrangler r2 bucket lifecycle add nanocodex-ci ci-artifacts artifacts/ --expire-days 90 --force
 npx wrangler r2 bucket lifecycle add nanocodex-ci ci-runs runs/ --expire-days 90 --force
 npx wrangler secret put CI_SOURCE_WRITE_TOKEN
 npx wrangler secret put CI_CONTROL_TOKEN
@@ -228,9 +238,9 @@ npx wrangler secret put R2_SECRET_ACCESS_KEY
 npm run deploy
 ```
 
-Sandbox TTLs are restore-time checks, not physical deletion. The three
+Sandbox TTLs are restore-time checks, not physical deletion. The four
 lifecycle rules above are therefore required to bound backup, cache-pointer,
-and run-evidence storage. The Durable Object separately removes source objects
+content-addressed artifact, and run-evidence storage. The Durable Object separately removes source objects
 when their terminal run ages out of the retained 100-run index. Development
 uses `nanocodex-ci-development` and `nanocodex-ci-source-development`; create
 those buckets and configure separate `--env development` secrets rather than

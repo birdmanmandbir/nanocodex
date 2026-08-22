@@ -21,7 +21,7 @@ test("CI is a direct, themed application surface", () => {
 
 test("CI presents the complete Worker pipeline without transient loading UI", () => {
   assert.match(ci, /Cloudflare-native CI/);
-  assert.equal([...ci.matchAll(/\[\s*"[a-z0-9-]+",/g)].length, 14);
+  assert.equal([...ci.matchAll(/\[\s*"[a-z0-9-]+",/g)].length, 15);
   assert.match(ci, /\{gates\.length\} gates\. One source\./);
   assert.doesNotMatch(ci, /Loading|spinner|aria-busy|connecting|waiting/);
 });

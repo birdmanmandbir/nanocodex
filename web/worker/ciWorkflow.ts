@@ -11,13 +11,16 @@ import type { SourceControlAdapter } from "@cloudflare/ci/worker/source-control"
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
 
 import {
+  EXACT_SOURCE_TREE_PATH,
   cargoVendorBundleKey,
   isCiSourceTree,
   isSha1,
   isSha256,
   rustSecAdvisoryBundleKey,
   sourceArchiveKey,
+  sourceTreeFingerprint,
   sourceTreeKey,
+  type CiSourceTree,
   type NanocodexCiProviderData,
 } from "./ciSource.ts";
 import {
@@ -28,21 +31,24 @@ import {
   bindingsResultCacheInputs,
   cargoCacheInputs,
   cargoDependencyCommand,
-  fullSourceCacheInputs,
+  dependencyPolicyCacheInputs,
+  exactSourceCacheInputs,
   msrvBuildCacheCommand,
   msrvBuildCacheInputs,
   pythonCacheInputs,
   pythonCommand,
-  refreshSourceCommand,
   rustBuildCacheInputs,
   rustBuildCacheCommand,
   rustResultCacheCommand,
+  rustResultCacheInputs,
   rustQualityCacheInputs,
   rustPipeline,
+  typosCommand,
   websiteArtifactCommand,
   websiteDependencyCacheInputs,
   websiteDependencyCommand,
   websiteResultCacheCommand,
+  websiteResultCacheInputs,
 } from "./ciWorkflowPlan.ts";
 import {
   failureMarkerKey,
@@ -93,6 +99,7 @@ const CI_GATE_NAMES = [
   "MSRV workspace tests",
   "quality",
   "dependency policy",
+  "typos",
   "static VM guest",
   "Python 3.11",
   "Python 3.14",
@@ -182,24 +189,25 @@ export class NanocodexCI extends CIWorkflow<
       });
 
       const runRustJob = async (
-        parent: CiRunnerResult,
+        parent: CiContext | CiRunnerResult,
         job: ReturnType<typeof rustPipeline>[number],
-        refreshSource: boolean,
-        cacheInputs?: string[],
+        options: {
+          cacheInputs?: string[];
+        } = {},
       ): Promise<CiRunnerResult> => {
+        const { cacheInputs } = options;
         const startedAt = progress.start(job.name);
+        const jobEnv = job.name === "MSRV workspace tests"
+          ? MSRV_ENV
+          : job.name === "stable workspace tests" || job.name === "quality"
+            ? RUST_TEST_ENV
+            : COMMON_ENV;
         const result = await parent.runner({
           name: job.name,
           command: cacheInputs
             ? job.command
-            : cleanupAfter(
-              refreshSource ? refreshSourceCommand(job.command) : job.command,
-            ),
-          env: job.name === "MSRV workspace tests"
-            ? MSRV_ENV
-            : job.name === "stable workspace tests" || job.name === "quality"
-              ? RUST_TEST_ENV
-              : COMMON_ENV,
+            : cleanupAfter(job.command),
+          env: jobEnv,
           ...(cacheInputs ? { cache: { inputs: cacheInputs } } : {}),
           config: runnerConfig(
             job.timeoutMs,
@@ -271,8 +279,7 @@ export class NanocodexCI extends CIWorkflow<
             ...qualityJob,
             command: rustResultCacheCommand(qualityJob.command),
           },
-          false,
-          rustQualityCacheInputs(),
+          { cacheInputs: rustQualityCacheInputs() },
         );
       })();
       const msrvJob = rustJobs.find(
@@ -304,32 +311,41 @@ export class NanocodexCI extends CIWorkflow<
         await progress.complete("MSRV build cache", summary);
         return result;
       })();
-      const directRustJobs = rustJobs
-        .filter(
-          ({ name }) =>
-            name !== "stable workspace tests" &&
-            name !== "MSRV workspace tests" &&
-            name !== "quality",
-        )
-        .map((job) => {
-          if (job.name === "static VM guest") {
-            return runRustJob(
-              dependencies,
-              { ...job, command: cleanupAfter(job.command) },
-              false,
-              rustQualityCacheInputs(),
-            );
-          }
-          if (job.name === "dependency policy") {
-            return runRustJob(
-              dependencies,
-              { ...job, command: cleanupAfter(job.command) },
-              false,
-              fullSourceCacheInputs(),
-            );
-          }
-          return runRustJob(dependencies, job, false);
-        });
+      const directRustJobs = [
+        runRustJob(
+          ci,
+          {
+            name: "typos",
+            command: cleanupAfter(typosCommand()),
+            timeoutMs: 10 * 60 * 1_000,
+          },
+          { cacheInputs: exactSourceCacheInputs() },
+        ),
+        ...rustJobs
+          .filter(
+            ({ name }) =>
+              name !== "stable workspace tests" &&
+              name !== "MSRV workspace tests" &&
+              name !== "quality",
+          )
+          .map((job) => {
+            if (job.name === "static VM guest") {
+              return runRustJob(
+                dependencies,
+                { ...job, command: cleanupAfter(job.command) },
+                { cacheInputs: rustQualityCacheInputs() },
+              );
+            }
+            if (job.name === "dependency policy") {
+              return runRustJob(
+                dependencies,
+                { ...job, command: cleanupAfter(job.command) },
+                { cacheInputs: dependencyPolicyCacheInputs() },
+              );
+            }
+            return runRustJob(dependencies, job);
+          }),
+      ];
       const runPythonJobs = () =>
         (["3.11", "3.14"] as const).map(async (version) => {
           const name = `Python ${version}`;
@@ -462,6 +478,12 @@ export class NanocodexCI extends CIWorkflow<
           bindingsArtifact,
           "publish-browser-artifact",
         );
+        void bindingsArtifactPersistence.catch(() => undefined);
+        const wasmContentKey = await retainContentAddressedArtifact(
+          this.env.BACKUP_BUCKET,
+          wasmArtifact,
+          "web-wasm",
+        );
         const bindingsPersistence = Promise.all([
           bindingsVerificationPersistence,
           bindingsArtifactPersistence,
@@ -480,12 +502,12 @@ export class NanocodexCI extends CIWorkflow<
         const websiteVerification = await websiteDependencyState.result.runner({
           name: "website",
           command: websiteResultCacheCommand(
-            `${this.env.CI_PUBLIC_ORIGIN.replace(/\/$/, "")}/api/ci/runs/${head}/artifacts/web-wasm.tar`,
+            `${this.env.CI_PUBLIC_ORIGIN.replace(/\/$/, "")}/api/ci/artifacts/${wasmContentKey}`,
             wasmArtifact.size,
             wasmArtifact.sha256,
           ),
           env: COMMON_ENV,
-          cache: { inputs: fullSourceCacheInputs() },
+          cache: { inputs: websiteResultCacheInputs() },
           config: runnerConfig(45 * 60 * 1_000, 30 * 24 * 60 * 60),
         });
         const websiteVerificationPersistence = persistRunner(
@@ -561,8 +583,9 @@ export class NanocodexCI extends CIWorkflow<
           ...stableJob,
           command: rustResultCacheCommand(stableJob.command),
         },
-        false,
-        fullSourceCacheInputs(),
+        {
+          cacheInputs: rustResultCacheInputs(),
+        },
       );
       // The remaining MSRV and JavaScript suites are bounded to separate cache
       // trees and together fit the host after the stable suite releases it.
@@ -573,8 +596,9 @@ export class NanocodexCI extends CIWorkflow<
             ...msrvJob,
             command: rustResultCacheCommand(msrvJob.command),
           },
-          false,
-          fullSourceCacheInputs(),
+          {
+            cacheInputs: rustResultCacheInputs(),
+          },
         ),
         runWebJob(),
       ]);
@@ -688,6 +712,7 @@ export function nanocodexSource(): SourceControlAdapter<NanocodexSourceProvider>
 
 class NanocodexSourceControl {
   readonly #env: NanocodexCiBindings;
+  readonly #trees = new Map<string, Promise<CiSourceTree | null>>();
 
   constructor(env: NanocodexCiBindings) {
     this.#env = env;
@@ -720,20 +745,40 @@ class NanocodexSourceControl {
 
   async listTreeBlobs(source: SourceIdentity, paths: string[]) {
     const data = providerData(source.providerData, source.sha);
-    const object = await this.#env.CI_SOURCE.get(data.treeKey);
-    if (
-      !object ||
-      object.customMetadata?.sha256 !== data.treeSha256 ||
-      object.checksums.sha256 == null ||
-      checksumHex(object.checksums.sha256) !== data.treeSha256
-    )
-      return null;
-    const tree: unknown = await object.json().catch(() => undefined);
-    if (!isCiSourceTree(tree, source.sha)) return null;
+    const tree = await this.#sourceTree(source.sha, data);
+    if (!tree) return null;
     const patterns = paths.map(globToRegExp);
-    return tree.files
+    const blobs = tree.files
       .filter((file) => patterns.some((pattern) => pattern.test(file.path)))
       .map(({ path, sha }) => ({ path, sha }));
+    if (paths.includes(EXACT_SOURCE_TREE_PATH)) {
+      blobs.push({
+        path: EXACT_SOURCE_TREE_PATH,
+        sha: await sourceTreeFingerprint(tree),
+      });
+    }
+    return blobs;
+  }
+
+  #sourceTree(
+    head: string,
+    data: NanocodexCiProviderData,
+  ): Promise<CiSourceTree | null> {
+    const retained = this.#trees.get(head);
+    if (retained) return retained;
+    const pending = (async () => {
+      const object = await this.#env.CI_SOURCE.get(data.treeKey);
+      if (
+        !object ||
+        object.customMetadata?.sha256 !== data.treeSha256 ||
+        object.checksums.sha256 == null ||
+        checksumHex(object.checksums.sha256) !== data.treeSha256
+      ) return null;
+      const tree: unknown = await object.json().catch(() => undefined);
+      return isCiSourceTree(tree, head) ? tree : null;
+    })();
+    this.#trees.set(head, pending);
+    return pending;
   }
 
   getStepCredentialEnv(): Promise<Record<string, string>> {
@@ -977,6 +1022,58 @@ function artifactRecord(
   )
     throw new Error(`${kind} artifact is invalid for ${head}`);
   return { key, size: output.size, sha256, contentType: output.contentType };
+}
+
+async function retainContentAddressedArtifact(
+  bucket: R2Bucket,
+  artifact: CiArtifact,
+  kind: "web-wasm",
+): Promise<string> {
+  const relativeKey = `${kind}/${artifact.sha256}.tar`;
+  const key = `artifacts/${relativeKey}`;
+  const existing = await bucket.head(key);
+  if (existing) {
+    if (matchesContentAddressedArtifact(existing, key, artifact, kind)) return relativeKey;
+    throw new Error(`Content-addressed ${kind} artifact conflicts at ${key}`);
+  }
+
+  const source = await bucket.get(artifact.key);
+  if (
+    !source || source.key !== artifact.key || source.size !== artifact.size ||
+    source.checksums.sha256 == null ||
+    checksumHex(source.checksums.sha256) !== artifact.sha256
+  ) {
+    await source?.body.cancel();
+    throw new Error(`Published ${kind} artifact is invalid at ${artifact.key}`);
+  }
+  const body = await source.arrayBuffer();
+  if (body.byteLength !== artifact.size) {
+    throw new Error(`Published ${kind} artifact body is truncated at ${artifact.key}`);
+  }
+  const created = await bucket.put(key, body, {
+    onlyIf: { etagDoesNotMatch: "*" },
+    httpMetadata: { contentType: artifact.contentType },
+    customMetadata: { kind, sha256: artifact.sha256 },
+    sha256: artifact.sha256,
+  });
+  const retained = created ?? await bucket.head(key);
+  if (!matchesContentAddressedArtifact(retained, key, artifact, kind)) {
+    throw new Error(`Failed to retain content-addressed ${kind} artifact at ${key}`);
+  }
+  return relativeKey;
+}
+
+function matchesContentAddressedArtifact(
+  object: R2Object | null,
+  key: string,
+  artifact: CiArtifact,
+  kind: "web-wasm",
+): boolean {
+  return object != null && object.key === key && object.size === artifact.size &&
+    object.customMetadata?.kind === kind &&
+    object.customMetadata?.sha256 === artifact.sha256 &&
+    object.checksums.sha256 != null &&
+    checksumHex(object.checksums.sha256) === artifact.sha256;
 }
 
 async function persistRunner(

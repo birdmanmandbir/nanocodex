@@ -110,14 +110,27 @@ export async function routeCiRequest(
     return Response.json(body, noStore());
   }
 
+  const contentArtifact = url.pathname.match(
+    /^\/api\/ci\/artifacts\/(web-wasm)\/([a-f0-9]{64})\.tar$/,
+  );
+  if (contentArtifact && (request.method === "GET" || request.method === "HEAD")) {
+    return serveContentAddressedCiArtifact(
+      configured.BACKUP_BUCKET,
+      contentArtifact[1]! as "web-wasm",
+      contentArtifact[2]!,
+      request.method === "HEAD",
+    );
+  }
+
   const artifact = url.pathname.match(
     /^\/api\/ci\/runs\/([a-f0-9]{40})\/artifacts\/(web-dist|web-wasm)\.tar$/,
   );
-  if (artifact && request.method === "GET") {
+  if (artifact && (request.method === "GET" || request.method === "HEAD")) {
     return serveCiArtifact(
       configured,
       artifact[1]!,
       artifact[2]! as "web-dist" | "web-wasm",
+      request.method === "HEAD",
     );
   }
 
@@ -503,11 +516,14 @@ async function serveCiArtifact(
   env: RequiredCiEnv,
   head: string,
   kind: "web-dist" | "web-wasm",
+  headOnly: boolean,
 ): Promise<Response> {
   const run = await repository(env).fetch(`https://ci-repository/runs/${head}`);
   if (!run.ok) return run;
   const key = `runs/${head}/artifacts/${kind}.tar`;
-  const object = await env.BACKUP_BUCKET.get(key);
+  const object = headOnly
+    ? await env.BACKUP_BUCKET.head(key)
+    : await env.BACKUP_BUCKET.get(key);
   const sha256 = object?.customMetadata?.sha256;
   if (
     !object || object.key !== key || object.size <= 0 ||
@@ -515,13 +531,44 @@ async function serveCiArtifact(
     !isSha256(sha256) || object.checksums.sha256 == null ||
     hex(object.checksums.sha256) !== sha256
   ) {
-    await object?.body.cancel();
+    if (object && "body" in object) await (object as R2ObjectBody).body.cancel();
     return error("ci_artifact_missing", 404);
   }
-  return new Response(object.body, {
+  return new Response(headOnly ? null : (object as R2ObjectBody).body, {
     headers: {
       "cache-control": IMMUTABLE_CACHE,
       "content-disposition": `attachment; filename="nanocodex-${head}-${kind}.tar"`,
+      "content-length": String(object.size),
+      "content-type": "application/x-tar",
+      "etag": object.httpEtag,
+      "x-content-type-options": "nosniff",
+      "x-nanocodex-sha256": sha256,
+    },
+  });
+}
+
+async function serveContentAddressedCiArtifact(
+  bucket: R2Bucket,
+  kind: "web-wasm",
+  sha256: string,
+  headOnly: boolean,
+): Promise<Response> {
+  const key = `artifacts/${kind}/${sha256}.tar`;
+  const object = headOnly ? await bucket.head(key) : await bucket.get(key);
+  if (
+    !object || object.key !== key || object.size <= 0 ||
+    object.size > 16 * 1024 * 1024 ||
+    object.customMetadata?.kind !== kind ||
+    object.customMetadata?.sha256 !== sha256 ||
+    object.checksums.sha256 == null || hex(object.checksums.sha256) !== sha256
+  ) {
+    if (object && "body" in object) await (object as R2ObjectBody).body.cancel();
+    return error("ci_artifact_missing", 404);
+  }
+  return new Response(headOnly ? null : (object as R2ObjectBody).body, {
+    headers: {
+      "cache-control": IMMUTABLE_CACHE,
+      "content-disposition": `attachment; filename="nanocodex-${kind}-${sha256}.tar"`,
       "content-length": String(object.size),
       "content-type": "application/x-tar",
       "etag": object.httpEtag,

@@ -1,3 +1,5 @@
+import { EXACT_SOURCE_TREE_PATH } from "./ciSource.ts";
+
 export type CiPipelineStep = {
   name: string;
   command: string;
@@ -131,8 +133,21 @@ export function rustSecPolicyCommand(bundle: RustSecAdvisoryBundle): string {
     "cargo deny --frozen check",
     "./scripts/check-crate-boundaries.sh",
     "./scripts/check-rustls-provider.sh",
-    "typos",
   ].join(" && ");
+}
+
+export function dependencyPolicyCacheInputs(): string[] {
+  return [
+    ...cargoCacheInputs(),
+    "deny.toml",
+    "scripts/check-experimental-boundary.sh",
+    "scripts/check-crate-boundaries.sh",
+    "scripts/check-rustls-provider.sh",
+  ];
+}
+
+export function typosCommand(): string {
+  return "typos";
 }
 
 export function cargoCacheInputs(): string[] {
@@ -197,11 +212,12 @@ export function websiteDependencyCacheInputs(): string[] {
   ];
 }
 
-export function fullSourceCacheInputs(): string[] {
-  // Runtime tests, repository policy, and final publication can intentionally
-  // read files outside their compiler/build graph. Their compact attestations
-  // are reusable only for a byte-identical published source tree.
-  return ["**/*"];
+export function exactSourceCacheInputs(): string[] {
+  // The Nanocodex source adapter resolves this impossible repository path to
+  // one synthetic blob containing the complete committed tree fingerprint.
+  // That keeps exact-source gates correct without expanding and logging every
+  // file in the repository for each runner.
+  return [EXACT_SOURCE_TREE_PATH];
 }
 
 export function rustBuildCacheInputs(): string[] {
@@ -225,6 +241,32 @@ export function rustQualityCacheInputs(): string[] {
     "examples/**/*.rs",
     "js/bindings/src/**/*",
     "py/bindings/src/**/*",
+  ];
+}
+
+export function rustResultCacheInputs(): string[] {
+  // Workspace tests consume the complete Rust package surface plus the
+  // repository-owned task and benchmark fixtures loaded at runtime. Keeping
+  // this narrower than the repository lets website-only publications reuse
+  // already-attested native and MSRV results without omitting test data.
+  return [
+    ...rustQualityCacheInputs(),
+    "tasks/**/*",
+    "benchmarks/codex_parity_workload.json",
+    "nanocodex.toml",
+  ];
+}
+
+export function websiteResultCacheInputs(): string[] {
+  // The downloaded WASM artifact is content-addressed in the command itself.
+  // These are the remaining source inputs consumed by the website tests and
+  // production build.
+  return [
+    ...websiteDependencyCacheInputs(),
+    "web/**/*",
+    "js/bindings/**/*",
+    "js/artifacts/**/*",
+    "js/react/**/*",
   ];
 }
 

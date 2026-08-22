@@ -190,6 +190,9 @@ test("published historical archives and Workflow status do not resolve through c
   await env.backup.put(`runs/${head}/artifacts/web-wasm.tar`, artifactBody, {
     customMetadata: { head, kind: "web-wasm", sha256: artifactSha },
   });
+  await env.backup.put(`artifacts/web-wasm/${artifactSha}.tar`, artifactBody, {
+    customMetadata: { kind: "web-wasm", sha256: artifactSha },
+  });
   const qualityLogKey = `runs/${head}/steps/quality/attempts/1/stdout.log`;
   await env.backup.put(qualityLogKey, "quality passed\n");
   await env.backup.put(
@@ -225,6 +228,24 @@ test("published historical archives and Workflow status do not resolve through c
   ), env);
   assert.equal(wasmArtifact.status, 200);
   assert.equal(wasmArtifact.headers.get("x-nanocodex-sha256"), artifactSha);
+  const wasmArtifactHead = await route(new Request(
+    `https://ci.test/api/ci/runs/${head}/artifacts/web-wasm.tar`,
+    { method: "HEAD" },
+  ), env);
+  assert.equal(wasmArtifactHead.status, 200);
+  assert.equal(wasmArtifactHead.headers.get("content-length"), String(artifactBody.length));
+  const contentArtifact = await route(new Request(
+    `https://ci.test/api/ci/artifacts/web-wasm/${artifactSha}.tar`,
+  ), env);
+  assert.equal(contentArtifact.status, 200);
+  assert.equal(contentArtifact.headers.get("x-nanocodex-sha256"), artifactSha);
+  assert.deepEqual(new Uint8Array(await contentArtifact.arrayBuffer()), artifactBody);
+  const contentArtifactHead = await route(new Request(
+    `https://ci.test/api/ci/artifacts/web-wasm/${artifactSha}.tar`,
+    { method: "HEAD" },
+  ), env);
+  assert.equal(contentArtifactHead.status, 200);
+  assert.equal(contentArtifactHead.headers.get("content-length"), String(artifactBody.length));
   const log = await route(new Request(
     `https://ci.test/api/ci/runs/${head}/steps/quality/stdout.log`,
   ), env);
