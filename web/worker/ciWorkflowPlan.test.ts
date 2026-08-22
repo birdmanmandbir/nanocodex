@@ -208,9 +208,11 @@ test("dependency and Rust compilation snapshots are content addressed", async ()
   const qualityCache = rustQualityCacheCommand("cargo clippy --workspace");
   assert.match(qualityCache, /cargo clippy --workspace/);
   assert.match(qualityCache, /-exec touch/);
-  assert.match(qualityCache, /> \/workspace\/\.rust-source-fingerprint/);
-  assert.match(qualityCache, /! -name \.cargo-target/);
-  assert.doesNotMatch(qualityCache, /! -name \.cargo-target-msrv/);
+  assert.match(
+    qualityCache,
+    /find \/workspace -mindepth 1 -maxdepth 1 -exec rm -rf -- \{\} \+/,
+  );
+  assert.doesNotMatch(qualityCache, /! -name \.cargo-target/);
   assert.match(bindingsResultCacheCommand(), /\.ci-output/);
   assert.match(bindingsResultCacheCommand(), /\.ci-cache-staging/);
   assert.match(bindingsArtifactCommand(), /sha256sum --check/);

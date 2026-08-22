@@ -324,8 +324,7 @@ export function msrvBuildCacheCommand(): string {
 export function rustQualityCacheCommand(command: string): string {
   return [
     refreshSourceCommand(command),
-    `${sourceFingerprintCommand()} > /workspace/.rust-source-fingerprint`,
-    "find /workspace -mindepth 1 -maxdepth 1 ! -name .cargo-home ! -name .cargo-target ! -name .rust-source-fingerprint -exec rm -rf -- {} +",
+    "find /workspace -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +",
   ].join(" && ");
 }
 

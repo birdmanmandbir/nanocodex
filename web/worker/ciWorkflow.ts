@@ -517,7 +517,7 @@ export class NanocodexCI extends CIWorkflow<
         ...directRustJobs,
         webPreparation,
       ]);
-      const [qualityCache, msrvBuildCache] = await Promise.all([
+      const [, msrvBuildCache] = await Promise.all([
         qualityBranch,
         msrvBuildCacheBranch,
         saturationBarrier,
@@ -525,7 +525,8 @@ export class NanocodexCI extends CIWorkflow<
       // Compilation can saturate the shared host. Finish every reusable target
       // and the compile-heavy quality gate first, then give the stable suite's
       // wall-clock assertions the host without a competing Rust compiler.
-      await runRustJob(qualityCache, stableJob, true);
+      const stableBuildCache = await buildCacheBranch;
+      await runRustJob(stableBuildCache, stableJob, true);
       // The remaining MSRV and JavaScript suites are bounded to separate cache
       // trees and together fit the host after the stable suite releases it.
       await Promise.all([

@@ -90,7 +90,7 @@ test("the local CI command enables container execution on the public runner orig
   assert.match(command, /--port 8787 --ip 127\.0\.0\.1/);
 });
 
-test("artifact gates stream outputs while quality and Python retain reusable snapshots", async () => {
+test("artifact and deterministic gates use bounded reusable cache entries", async () => {
   const [workflow, sandboxRunner, runnerGroup, cache] = await Promise.all([
     readFile(new URL("./ciWorkflow.ts", import.meta.url), "utf8"),
     readFile(
@@ -211,10 +211,13 @@ test("artifact gates stream outputs while quality and Python retain reusable sna
     "const saturationBarrier = Promise.all([",
   );
   const saturationAwait = workflow.indexOf(
-    "const [qualityCache, msrvBuildCache] = await Promise.all([",
+    "const [, msrvBuildCache] = await Promise.all([",
+  );
+  const buildCacheReuse = workflow.indexOf(
+    "const stableBuildCache = await buildCacheBranch;",
   );
   const stableExecution = workflow.indexOf(
-    "await runRustJob(qualityCache, stableJob, true);",
+    "await runRustJob(stableBuildCache, stableJob, true);",
   );
   const msrvExecution = workflow.indexOf(
     "runRustJob(msrvBuildCache, msrvJob, true),",
@@ -230,7 +233,9 @@ test("artifact gates stream outputs while quality and Python retain reusable sna
     /const qualityBranch = \(async \(\) => \{[\s\S]*?rustQualityCacheCommand\(qualityJob\.command\)[\s\S]*?rustQualityCacheInputs\(\)[\s\S]*?const saturationBarrier = Promise\.all\(\[/,
   );
   assert.ok(
-    saturationAwait > saturationBarrier && stableExecution > saturationAwait,
+    saturationAwait > saturationBarrier &&
+      buildCacheReuse > saturationAwait &&
+      stableExecution > buildCacheReuse,
     "stable tests start only after the compile-heavy quality phase releases the host",
   );
   assert.ok(
