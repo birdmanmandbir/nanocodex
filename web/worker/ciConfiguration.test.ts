@@ -229,6 +229,16 @@ test("artifact and deterministic gates use bounded reusable cache entries", asyn
   );
   assert.match(
     sandboxRunner,
+    /finally \{\s+disposeRpcStub\(current\);\s+\}/,
+    "every polled process capability is released",
+  );
+  assert.match(
+    sandboxRunner,
+    /finally \{[\s\S]*?disposeRpcStub\(proc\);[\s\S]*?destroySandbox\(sandbox\)/,
+    "the original process capability is released before Sandbox teardown",
+  );
+  assert.match(
+    sandboxRunner,
     /PROCESS_RUN_CHECK_INTERVAL_MS[\s\S]*?await assertActive\(\)/,
   );
   assert.doesNotMatch(

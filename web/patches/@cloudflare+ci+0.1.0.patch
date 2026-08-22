@@ -244,7 +244,7 @@ index aa6068d..9a43284 100644
  
  export type RunStepResult<S> = RunOutput & {
 diff --git a/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts b/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
-index a7f6c05..9f0001c 100644
+index a7f6c05..3299a96 100644
 --- a/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
 +++ b/node_modules/@cloudflare/ci/src/ci/runners/sandbox.ts
 @@ -1,7 +1,11 @@
@@ -260,7 +260,7 @@ index a7f6c05..9f0001c 100644
  import { posix } from 'node:path';
  import type { Bindings } from '../../env';
  import {
-@@ -9,21 +13,52 @@ import {
+@@ -9,21 +13,56 @@ import {
    checkoutSourceScript,
  } from '../../shared/source-checkout';
  import { slugify } from '../../shared/slugify';
@@ -311,10 +311,14 @@ index a7f6c05..9f0001c 100644
 +// perform their first RPC simultaneously. Serialize only that initialization
 +// boundary; commands run concurrently as soon as their workspace is ready.
 +let localSandboxStartTail = Promise.resolve();
++
++type SandboxProcess = Awaited<
++  ReturnType<ReturnType<typeof getSandbox>['startProcess']>
++>;
  
  export class SandboxRunner implements Runner<DirectoryBackup> {
    readonly name = 'sandbox';
-@@ -38,23 +73,40 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -38,23 +77,41 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
    async run(
      input: RunStepInput & { restore?: DirectoryBackup }
    ): Promise<RunStepResult<DirectoryBackup>> {
@@ -333,6 +337,7 @@ index a7f6c05..9f0001c 100644
 +      input
 +    );
 +    let sandbox: ReturnType<typeof getSandbox> | undefined;
++    let proc: SandboxProcess | undefined;
  
 -    let cleanupTransferredToStreams = false;
      try {
@@ -364,7 +369,7 @@ index a7f6c05..9f0001c 100644
            checkoutSourceScript(input.source, WORKSPACE_DIR, true),
            {
              cwd: '/',
-@@ -63,15 +115,16 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -63,15 +120,16 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
            }
          );
        } else {
@@ -376,14 +381,15 @@ index a7f6c05..9f0001c 100644
          });
        }
  
-+      await assertRunActive(this.env.BACKUP_BUCKET, input.sourceSha);
-       const proc = await sandbox.startProcess(
+-      const proc = await sandbox.startProcess(
 -        `(${input.command}) > ${STDOUT_FILE} 2> ${STDERR_FILE}`,
++      await assertRunActive(this.env.BACKUP_BUCKET, input.sourceSha);
++      proc = await sandbox.startProcess(
 +        captureCommand(input.command),
          {
            cwd: resolveCwd(input.cwd),
            env: {
-@@ -81,61 +134,625 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -81,61 +139,640 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
            autoCleanup: false,
          }
        );
@@ -501,7 +507,11 @@ index a7f6c05..9f0001c 100644
 -        await destroySandbox(sandbox);
 +      // Keep the registry marker when teardown fails so the authenticated
 +      // control route can retry the exact Sandbox rather than leaking it.
-+      if (sandbox) await destroySandbox(sandbox);
++      try {
++        disposeRpcStub(proc);
++      } finally {
++        if (sandbox) await destroySandbox(sandbox);
+       }
 +      await this.env.BACKUP_BUCKET.delete(registryKey);
 +    }
 +  }
@@ -657,7 +667,7 @@ index a7f6c05..9f0001c 100644
 +      throw new Error(
 +        `Local CI snapshot extraction failed: ${snapshot.id}: ${restored.stderr.slice(-2_000)}`
 +      );
-+    }
+     }
 +  } finally {
 +    await sandbox.exec(
 +      `rm -f ${shellQuote(archivePath)} ${shellQuote(partPath)}`,
@@ -701,7 +711,7 @@ index a7f6c05..9f0001c 100644
 +      assertWorkspacePath(output.path, 'output');
 +      if (!output.key || output.key.startsWith('/')) {
 +        throw new Error(`Invalid CI output key: ${output.key}`);
-       }
++      }
 +      if (!Number.isSafeInteger(output.maxBytes) || output.maxBytes <= 0) {
 +        throw new Error(`Invalid CI output byte limit: ${output.key}`);
 +      }
@@ -788,9 +798,9 @@ index a7f6c05..9f0001c 100644
 +    posix.normalize(path) !== path
 +  ) {
 +    throw new Error(`Invalid CI ${kind} path: ${path}`);
-+  }
-+}
-+
+   }
+ }
+ 
 +function checksumHex(buffer: ArrayBuffer) {
 +  return [...new Uint8Array(buffer)]
 +    .map((byte) => byte.toString(16).padStart(2, '0'))
@@ -799,7 +809,7 @@ index a7f6c05..9f0001c 100644
 +
 +async function waitForRunnerProcess(
 +  sandbox: ReturnType<typeof getSandbox>,
-+  proc: Awaited<ReturnType<ReturnType<typeof getSandbox>['startProcess']>>,
++  proc: SandboxProcess,
 +  timeoutMs: number,
 +  assertActive: () => Promise<void> = () => Promise.resolve()
 +): Promise<number | undefined> {
@@ -812,7 +822,7 @@ index a7f6c05..9f0001c 100644
 +    if (now >= nextRunCheckAt) {
 +      await assertActive();
 +      nextRunCheckAt = now + PROCESS_RUN_CHECK_INTERVAL_MS;
-     }
++    }
 +
 +    let current: Awaited<ReturnType<typeof sandbox.getProcess>>;
 +    try {
@@ -835,27 +845,38 @@ index a7f6c05..9f0001c 100644
 +      continue;
 +    }
 +
-+    if (!current) {
-+      throw new Error(`CI process disappeared before completion: ${proc.id}`);
-+    }
-+    if (
-+      current.status === 'completed' ||
-+      current.status === 'failed' ||
-+      current.status === 'killed' ||
-+      current.status === 'error'
-+    ) {
-+      if (current.exitCode == null) {
-+        throw new Error(
-+          `CI process reached ${current.status} without an exit code: ${proc.id}`
-+        );
++    try {
++      if (!current) {
++        throw new Error(`CI process disappeared before completion: ${proc.id}`);
 +      }
-+      return current.exitCode;
++      if (
++        current.status === 'completed' ||
++        current.status === 'failed' ||
++        current.status === 'killed' ||
++        current.status === 'error'
++      ) {
++        if (current.exitCode == null) {
++          throw new Error(
++            `CI process reached ${current.status} without an exit code: ${proc.id}`
++          );
++        }
++        return current.exitCode;
++      }
++    } finally {
++      disposeRpcStub(current);
 +    }
 +
 +    const remaining = deadline - Date.now();
 +    if (remaining <= 0) return undefined;
 +    await wait(Math.min(PROCESS_POLL_INTERVAL_MS, remaining));
 +  }
++}
++
++function disposeRpcStub(value: unknown) {
++  if (typeof value !== 'object' || value === null || !(Symbol.dispose in value)) {
++    return;
++  }
++  (value as { [Symbol.dispose](): void })[Symbol.dispose]();
 +}
 +
 +function isNetworkConnectionLost(error: unknown) {
@@ -868,7 +889,7 @@ index a7f6c05..9f0001c 100644
 +
 +async function terminateTimedOutProcess(
 +  sandbox: ReturnType<typeof getSandbox>,
-+  proc: Awaited<ReturnType<ReturnType<typeof getSandbox>['startProcess']>>
++  proc: SandboxProcess
 +) {
 +  const pidFile = await sandbox.readFile(COMMAND_PID_FILE, { encoding: 'utf-8' });
 +  const pid = pidFile.content.trim();
@@ -989,9 +1010,9 @@ index a7f6c05..9f0001c 100644
 +  } catch (error) {
 +    await piping.catch(() => undefined);
 +    throw error;
-   }
- }
- 
++  }
++}
++
 +function decodeFileStream(
 +  stream: ReadableStream<Uint8Array>
 +): ReadableStream<Uint8Array> {
@@ -1047,7 +1068,7 @@ index a7f6c05..9f0001c 100644
  async function readLogs(sandbox: ReturnType<typeof getSandbox>) {
    const listing = await sandbox.listFiles('/tmp');
    const sizes = new Map(
-@@ -153,7 +770,7 @@ async function readLog(
+@@ -153,7 +790,7 @@ async function readLog(
    size: number
  ): Promise<string | ReadableStream<Uint8Array>> {
    if (size > INLINE_LOG_BYTES) {
@@ -1056,7 +1077,7 @@ index a7f6c05..9f0001c 100644
    }
    return (await sandbox.readFile(file, { encoding: 'utf-8' })).content;
  }
-@@ -192,51 +809,22 @@ function resolveCwd(cwd: string | undefined) {
+@@ -192,51 +829,22 @@ function resolveCwd(cwd: string | undefined) {
    return posix.join(WORKSPACE_DIR, normalized);
  }
  
