@@ -24,6 +24,7 @@ import {
   bindingsResultCacheInputs,
   cargoCacheInputs,
   cargoDependencyCommand,
+  fullSourceCacheInputs,
   msrvBuildCacheCommand,
   msrvBuildCacheInputs,
   parallelCommandGroups,
@@ -32,13 +33,15 @@ import {
   refreshSourceCommand,
   rustBuildCacheInputs,
   rustBuildCacheCommand,
-  rustQualityCacheCommand,
+  rustResultCacheCommand,
   rustQualityCacheInputs,
   rustPipeline,
   rustSecPolicyCommand,
   websiteCommand,
+  websiteArtifactCommand,
   websiteDependencyCacheInputs,
   websiteDependencyCommand,
+  websiteResultCacheCommand,
 } from "./ciWorkflowPlan.ts";
 
 const RUSTSEC = {
@@ -160,6 +163,7 @@ test("dependency and Rust compilation snapshots are content addressed", async ()
     ...WEBSITE_PROJECTS.map((project) => `${project}/package-lock.json`),
     "web/patches/**/*.patch",
   ]);
+  assert.deepEqual(fullSourceCacheInputs(), ["**/*"]);
   await Promise.all([...new Set([...BINDINGS_PROJECTS, ...WEBSITE_PROJECTS])].flatMap((project) => [
     stat(new URL(`../../${project}/package.json`, import.meta.url)),
     stat(new URL(`../../${project}/package-lock.json`, import.meta.url)),
@@ -214,7 +218,7 @@ test("dependency and Rust compilation snapshots are content addressed", async ()
     refreshSourceCommand("cargo test"),
     /rust-source-cache\.py refresh \/workspace \/workspace\/\.rust-source-manifest\.json/,
   );
-  const qualityCache = rustQualityCacheCommand("cargo clippy --workspace");
+  const qualityCache = rustResultCacheCommand("cargo clippy --workspace");
   assert.match(qualityCache, /cargo clippy --workspace/);
   assert.match(qualityCache, /rust-source-cache\.py refresh/);
   assert.match(
@@ -376,6 +380,14 @@ test("bindings, website, and both Python versions preserve the GitHub CI gates",
   assert.doesNotMatch(website, /js\/(?:tui|tui-react|terminal)|test:terminal/);
   assert.match(website, /build:from-wasm/);
   assert.match(website, /web-dist\.tar/);
+  const websiteResult = websiteResultCacheCommand(
+    "https://ci.example/api/ci/runs/0123456789012345678901234567890123456789/artifacts/web-wasm.tar",
+    3_500_000,
+    "a".repeat(64),
+  );
+  assert.match(websiteResult, /web-dist\.tar/);
+  assert.match(websiteResult, /\.ci-cache-staging/);
+  assert.match(websiteArtifactCommand(), /sha256sum --check/);
   for (const version of ["3.11", "3.14"] as const) {
     const python = pythonCommand(version);
     assert.match(python, new RegExp(`/opt/python/${version.replace(".", "\\.")}/bin/python`));
@@ -605,6 +617,12 @@ test("every generated container command is valid Bash", () => {
       3_500_000,
       "a".repeat(64),
     ),
+    websiteResultCacheCommand(
+      "https://ci.example/api/ci/runs/0123456789012345678901234567890123456789/artifacts/web-wasm.tar",
+      3_500_000,
+      "a".repeat(64),
+    ),
+    websiteArtifactCommand(),
     pythonCommand("3.11"),
     pythonCommand("3.14"),
     ...rustPipeline(RUSTSEC).map(({ command }) => command),

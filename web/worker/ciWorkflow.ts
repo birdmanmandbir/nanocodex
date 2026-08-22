@@ -28,6 +28,7 @@ import {
   bindingsResultCacheInputs,
   cargoCacheInputs,
   cargoDependencyCommand,
+  fullSourceCacheInputs,
   msrvBuildCacheCommand,
   msrvBuildCacheInputs,
   pythonCacheInputs,
@@ -35,12 +36,13 @@ import {
   refreshSourceCommand,
   rustBuildCacheInputs,
   rustBuildCacheCommand,
-  rustQualityCacheCommand,
+  rustResultCacheCommand,
   rustQualityCacheInputs,
   rustPipeline,
-  websiteCommand,
+  websiteArtifactCommand,
   websiteDependencyCacheInputs,
   websiteDependencyCommand,
+  websiteResultCacheCommand,
 } from "./ciWorkflowPlan.ts";
 import {
   failureMarkerKey,
@@ -267,7 +269,7 @@ export class NanocodexCI extends CIWorkflow<
           buildCache,
           {
             ...qualityJob,
-            command: rustQualityCacheCommand(qualityJob.command),
+            command: rustResultCacheCommand(qualityJob.command),
           },
           false,
           rustQualityCacheInputs(),
@@ -309,16 +311,25 @@ export class NanocodexCI extends CIWorkflow<
             name !== "MSRV workspace tests" &&
             name !== "quality",
         )
-        .map((job) =>
-          job.name === "static VM guest"
-            ? runRustJob(
+        .map((job) => {
+          if (job.name === "static VM guest") {
+            return runRustJob(
               dependencies,
               { ...job, command: cleanupAfter(job.command) },
               false,
               rustQualityCacheInputs(),
-            )
-            : runRustJob(dependencies, job, false)
-        );
+            );
+          }
+          if (job.name === "dependency policy") {
+            return runRustJob(
+              dependencies,
+              { ...job, command: cleanupAfter(job.command) },
+              false,
+              fullSourceCacheInputs(),
+            );
+          }
+          return runRustJob(dependencies, job, false);
+        });
       const runPythonJobs = () =>
         (["3.11", "3.14"] as const).map(async (version) => {
           const name = `Python ${version}`;
@@ -466,16 +477,27 @@ export class NanocodexCI extends CIWorkflow<
         });
         const websiteStartedAt = progress.start("website");
         const artifactKey = `runs/${head}/artifacts/web-dist.tar`;
-        const website = await websiteDependencyState.result.runner({
+        const websiteVerification = await websiteDependencyState.result.runner({
           name: "website",
-          command: cleanupAfter(
-            websiteCommand(
-              `${this.env.CI_PUBLIC_ORIGIN.replace(/\/$/, "")}/api/ci/runs/${head}/artifacts/web-wasm.tar`,
-              wasmArtifact.size,
-              wasmArtifact.sha256,
-            ),
-            [".ci-output"],
+          command: websiteResultCacheCommand(
+            `${this.env.CI_PUBLIC_ORIGIN.replace(/\/$/, "")}/api/ci/runs/${head}/artifacts/web-wasm.tar`,
+            wasmArtifact.size,
+            wasmArtifact.sha256,
           ),
+          env: COMMON_ENV,
+          cache: { inputs: fullSourceCacheInputs() },
+          config: runnerConfig(45 * 60 * 1_000, 30 * 24 * 60 * 60),
+        });
+        const websiteVerificationPersistence = persistRunner(
+          this.env.BACKUP_BUCKET,
+          head,
+          websiteVerification,
+          "website",
+        );
+        void websiteVerificationPersistence.catch(() => undefined);
+        const websiteArtifact = await websiteVerification.runner({
+          name: "Publish website artifact",
+          command: websiteArtifactCommand(),
           env: COMMON_ENV,
           outputs: [
             {
@@ -489,24 +511,31 @@ export class NanocodexCI extends CIWorkflow<
           ],
           config: runnerConfig(45 * 60 * 1_000, 24 * 60 * 60, 0, false),
         });
-        await persistRunner(this.env.BACKUP_BUCKET, head, website, "website");
+        const websiteArtifactPersistence = persistRunner(
+          this.env.BACKUP_BUCKET,
+          head,
+          websiteArtifact,
+          "publish-website-artifact",
+        );
         artifacts.push(
           artifactRecord(
-            website.outputs?.[0],
+            websiteArtifact.outputs?.[0],
             head,
             artifactKey,
             "web-dist",
           ),
         );
-        await Promise.all([
+        const [websiteMetadata] = await Promise.all([
+          websiteVerificationPersistence,
+          websiteArtifactPersistence,
           bindingsBuildState.persistence,
           websiteDependencyState.persistence,
           bindingsPersistence,
         ]);
         const summary = {
           name: "website",
-          exitCode: website.exitCode,
-          cacheHit: false,
+          exitCode: websiteArtifact.exitCode,
+          cacheHit: websiteMetadata.cacheHit,
           durationMs: Date.now() - websiteStartedAt,
         };
         completed.push(summary);
@@ -526,11 +555,27 @@ export class NanocodexCI extends CIWorkflow<
       // and the compile-heavy quality gate first, then give the stable suite's
       // wall-clock assertions the host without a competing Rust compiler.
       const stableBuildCache = await buildCacheBranch;
-      await runRustJob(stableBuildCache, stableJob, true);
+      await runRustJob(
+        stableBuildCache,
+        {
+          ...stableJob,
+          command: rustResultCacheCommand(stableJob.command),
+        },
+        false,
+        fullSourceCacheInputs(),
+      );
       // The remaining MSRV and JavaScript suites are bounded to separate cache
       // trees and together fit the host after the stable suite releases it.
       await Promise.all([
-        runRustJob(msrvBuildCache, msrvJob, true),
+        runRustJob(
+          msrvBuildCache,
+          {
+            ...msrvJob,
+            command: rustResultCacheCommand(msrvJob.command),
+          },
+          false,
+          fullSourceCacheInputs(),
+        ),
         runWebJob(),
       ]);
       // The binding gates contain wall-clock SLAs. Run both versions together,

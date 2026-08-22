@@ -197,6 +197,13 @@ export function websiteDependencyCacheInputs(): string[] {
   ];
 }
 
+export function fullSourceCacheInputs(): string[] {
+  // Runtime tests, repository policy, and final publication can intentionally
+  // read files outside their compiler/build graph. Their compact attestations
+  // are reusable only for a byte-identical published source tree.
+  return ["**/*"];
+}
+
 export function rustBuildCacheInputs(): string[] {
   // The snapshot retains Cargo homes, target output, and a content manifest.
   // After source overlay, unchanged inputs are backdated ahead of the compiled
@@ -323,7 +330,7 @@ export function msrvBuildCacheCommand(): string {
   );
 }
 
-export function rustQualityCacheCommand(command: string): string {
+export function rustResultCacheCommand(command: string): string {
   return [
     refreshSourceCommand(command),
     "find /workspace -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +",
@@ -454,6 +461,21 @@ export function websiteCommand(
     "tar -C /workspace/web/dist -cf /workspace/.ci-output/web-dist.tar .",
     "sha256sum /workspace/.ci-output/web-dist.tar > /workspace/.ci-output/web-dist.tar.sha256",
   ].join(" && ");
+}
+
+export function websiteResultCacheCommand(
+  wasmUrl: string,
+  wasmSize: number,
+  wasmSha256: string,
+): string {
+  return [
+    websiteCommand(wasmUrl, wasmSize, wasmSha256),
+    retainWorkspacePathsCommand([".ci-output"]),
+  ].join(" && ");
+}
+
+export function websiteArtifactCommand(): string {
+  return "test -s /workspace/.ci-output/web-dist.tar && sha256sum --check /workspace/.ci-output/web-dist.tar.sha256";
 }
 
 export function pythonCommand(version: "3.11" | "3.14"): string {
