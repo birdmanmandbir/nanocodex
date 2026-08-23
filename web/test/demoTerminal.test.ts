@@ -29,6 +29,7 @@ function fakeTerminal() {
   let onData = (_data: string, _receivedAt: number) => {};
   let onResize = (_size: { cols: number; rows: number }) => {};
   let onVisibilityChange = () => {};
+  let onScroll = (_position: { baseY: number; viewportY: number }) => {};
   let visible = true;
   const writes: string[] = [];
   return {
@@ -51,6 +52,10 @@ function fakeTerminal() {
       onVisibilityChange = listener;
       return () => { onVisibilityChange = () => {}; };
     },
+    onScroll(listener: (position: { baseY: number; viewportY: number }) => void) {
+      onScroll = listener;
+      return () => { onScroll = () => {}; };
+    },
     data(value: string, receivedAt = performance.now()) { onData(value, receivedAt); },
     resize(cols: number, rows: number) {
       this.cols = cols;
@@ -61,6 +66,7 @@ function fakeTerminal() {
       visible = next;
       onVisibilityChange();
     },
+    scroll(baseY: number, viewportY: number) { onScroll({ baseY, viewportY }); },
   };
 }
 
@@ -466,6 +472,54 @@ test("streaming bursts coalesce into one animation-frame projection", async () =
     terminal.dispose();
     frames.restore();
   }
+});
+
+test("managed history loads once per transition into the top threshold", async () => {
+  const host = fakeTerminal();
+  let loadCalls = 0;
+  const agent = fakeAgent();
+  agent.events.watch = () => ({
+    onEvent() { return () => {}; },
+    onHistory(listener: (events: readonly AgentEvent[]) => void) {
+      listener([event(1, "assistant.message", { text: "recent" })]);
+      return () => {};
+    },
+    async loadOlder() { loadCalls += 1; return true; },
+    off() {},
+  });
+  const terminal = createAgentTerminal({ agent: agent as never, terminal: host });
+  await terminal.ready;
+
+  host.scroll(100, 50);
+  host.scroll(100, 20);
+  host.scroll(100, 10);
+  await settle();
+  assert.equal(loadCalls, 1);
+  host.scroll(100, 40);
+  host.scroll(100, 0);
+  await settle();
+  assert.equal(loadCalls, 2);
+  terminal.dispose();
+});
+
+test("xterm history redraw restores the previous distance from the buffer bottom", async () => {
+  let restored: number | undefined;
+  const active = { baseY: 100, viewportY: 60 };
+  const adapter = xtermAdapter({
+    cols: 80,
+    rows: 24,
+    buffer: { active },
+    write(_data: string, callback?: () => void) {
+      active.baseY = 140;
+      active.viewportY = 140;
+      callback?.();
+    },
+    scrollToLine(line: number) { restored = line; },
+    onData() { return { dispose() {} }; },
+    onResize() { return { dispose() {} }; },
+  });
+  await adapter.write("older frame", { preserveScroll: true });
+  assert.equal(restored, 100);
 });
 
 test("hidden streaming reduces state without TerminalHost writes", async () => {

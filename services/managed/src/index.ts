@@ -23,6 +23,7 @@ import { createComputerFilesystem } from "./computer-workspace";
 import {
   DurableEventLog,
   EventLogCapacityError,
+  MAX_HISTORY_PAGE_SIZE,
   parseCursor,
   type DurableEvent,
 } from "./durable-events";
@@ -357,11 +358,11 @@ export default {
         new Request(request, { headers: sessionHeaders }),
       );
     }
-    if (resource === "events") {
+    if (resource === "events" || resource === "events/history") {
       if (request.method !== "GET") return json({ error: "method_not_allowed" }, { status: 405 });
       const query = new URLSearchParams(url.searchParams);
       query.set("public_origin", url.origin);
-      return stub.fetch(`https://session.internal/events?${query}`, {
+      return stub.fetch(`https://session.internal/${resource}?${query}`, {
         headers: sessionHeaders,
         signal: request.signal,
       });
@@ -620,6 +621,32 @@ export class NanocodexSession extends DurableComputerSession {
       if (cursor === undefined) return json({ error: "invalid_cursor" }, { status: 400 });
       return this.#eventLog.stream(cursor, request.signal);
     }
+    if (request.method === "GET" && url.pathname === "/events/history") {
+      if (this.#deleting) return json({ error: "agent_deleting" }, { status: 409 });
+      if (!this.#sessionId()) return json({ error: "not_found" }, { status: 404 });
+      const requestedBefore = url.searchParams.get("before");
+      const before = requestedBefore === null ? undefined : parseCursor(requestedBefore);
+      const requestedLimit = url.searchParams.get("limit") ?? "128";
+      if ((requestedBefore !== null && (before === undefined || before === "0"))
+        || !/^[1-9][0-9]*$/.test(requestedLimit)) {
+        return json({ error: "invalid_history_page" }, { status: 400 });
+      }
+      const limit = Number(requestedLimit);
+      if (!Number.isSafeInteger(limit) || limit > MAX_HISTORY_PAGE_SIZE) {
+        return json({ error: "invalid_history_page" }, { status: 400 });
+      }
+      const page = this.#eventLog.history(before, limit);
+      return json({
+        data: page.data.map((event) => ({
+          cursor: event.cursor,
+          created_at: event.created_at,
+          turn_id: event.turn_id,
+          ...event.message,
+        })),
+        has_more: page.has_more,
+        latest_cursor: page.latest_cursor,
+      }, { headers: { "cache-control": "no-store" } });
+    }
     if (request.method === "POST" && url.pathname === "/turns") {
       return this.#submitHttpTurn(request);
     }
@@ -648,6 +675,7 @@ export class NanocodexSession extends DurableComputerSession {
         session_id: session.session_id,
         has_snapshot: session.has_snapshot !== 0,
         completed_turns: session.completed_turns,
+        first_prompt: this.#firstPrompt(),
         last_active: session.last_active,
         active_turns: this.#activeTurnIds(),
         active_turn_details: this.#activeTurnDetails(),
@@ -1536,6 +1564,15 @@ export class NanocodexSession extends DurableComputerSession {
     return this.#managedTurns("WHERE id = ?", id)[0];
   }
 
+  #firstPrompt(): string {
+    const row = this.ctx.storage.sql.exec<{ input_json: string }>(
+      "SELECT input_json FROM managed_turns ORDER BY created_at, id LIMIT 1",
+    ).toArray()[0];
+    if (!row) return "";
+    try { return promptInputText(JSON.parse(row.input_json) as PromptInput); }
+    catch { return ""; }
+  }
+
   #managedTurnByRequestKey(requestKey: string): ManagedTurnRow | undefined {
     return this.#managedTurns("WHERE request_key = ?", requestKey)[0];
   }
@@ -1655,6 +1692,18 @@ function managedTurnView(row: ManagedTurnRow) {
       ? {}
       : { terminal: JSON.parse(row.terminal_json) as TurnTerminal }),
   };
+}
+
+function promptInputText(input: PromptInput): string {
+  if (typeof input === "string") return input;
+  return input.flatMap((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+    const value = item as unknown as Record<string, unknown>;
+    if (value.type === "text" && typeof value.text === "string") return [value.text];
+    if (value.type === "image") return ["[image]"];
+    if (value.type === "audio") return ["[audio]"];
+    return [];
+  }).join("\n");
 }
 
 function messageForManagedTurn(row: ManagedTurnRow): ServerMessage {
