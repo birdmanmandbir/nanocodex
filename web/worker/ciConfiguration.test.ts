@@ -101,6 +101,37 @@ test("development repeats every non-inherited CI binding", async () => {
   assert.deepEqual(development.secrets.required, config.secrets.required);
 });
 
+test("preview isolates every stateful binding from production and local development", async () => {
+  const config = JSON.parse(await readFile(new URL("../wrangler.jsonc", import.meta.url), "utf8"));
+  const preview = config.env.preview;
+  assert.equal(preview.name, "nanocodex-preview");
+  assert.deepEqual(preview.workflows, [{
+    binding: "CI_WORKFLOW",
+    name: "nanocodex-ci-preview",
+    class_name: "NanocodexCI",
+  }]);
+  assert.deepEqual(preview.r2_buckets, [
+    { binding: "GIT_OBJECTS", bucket_name: "nanocodex-git-preview" },
+    { binding: "EVALS_ARTIFACTS", bucket_name: "nanocodex-evals-preview" },
+    { binding: "CI_SOURCE", bucket_name: "nanocodex-ci-source-preview" },
+    { binding: "BACKUP_BUCKET", bucket_name: "nanocodex-ci-preview" },
+  ]);
+  assert.deepEqual(preview.d1_databases, [{
+    binding: "EVALS_DB",
+    database_name: "nanocodex-evals-preview",
+    database_id: "d201368e-d5ad-4246-bb43-1d88522fbf63",
+    migrations_dir: "migrations",
+  }]);
+  assert.equal(preview.vars.ENVIRONMENT, "preview");
+  assert.equal(preview.vars.BACKUP_BUCKET_NAME, "nanocodex-ci-preview");
+  assert.equal(preview.vars.CI_PUBLIC_ORIGIN, "https://nanocodex-preview.gakonst.workers.dev");
+  assert.equal(preview.vars.CLOUDFLARE_ACCOUNT_ID, "16ce0442a940f01beefdb15a196a43ea");
+  assert.deepEqual(preview.triggers.crons, []);
+  assert.deepEqual(preview.secrets.required, config.secrets.required);
+  assert.equal(preview.r2_buckets.some(({ remote }: { remote?: boolean }) => remote), false);
+  assert.equal(preview.d1_databases.some(({ remote }: { remote?: boolean }) => remote), false);
+});
+
 test("the local CI command enables container execution on the public runner origin", async () => {
   const packageDocument = JSON.parse(
     await readFile(new URL("../package.json", import.meta.url), "utf8"),
