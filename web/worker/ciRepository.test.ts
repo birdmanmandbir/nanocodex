@@ -1110,6 +1110,85 @@ test("multipart create replays one durable request identity after acknowledgemen
   assert.equal(memory.multipartCreates, 1);
 });
 
+test("multipart finalize and reset require the exact ready upload identity", async () => {
+  const requestId = "00000000-0000-4000-8000-000000000005";
+  const input = {
+    version: 1 as const,
+    requestId,
+    cargoLockBlob: "c".repeat(40),
+    bundleSha256: "3".repeat(64),
+    size: 4_000_000,
+    partSize: 32 * 1024 * 1024,
+    partCount: 1,
+  };
+  const memory = repository();
+  const created = await createCargoVendorMultipart(memory.durable, input);
+  const upload = await created.json() as { uploadId: string; stagingId: string };
+  const identity = {
+    version: 1 as const,
+    requestId,
+    stagingId: upload.stagingId,
+    uploadId: upload.uploadId,
+    cargoLockBlob: input.cargoLockBlob,
+    bundleSha256: input.bundleSha256,
+  };
+  for (const operation of ["finalize", "reset"] as const) {
+    const spoofed = await transitionCargoVendorMultipart(memory.durable, operation, {
+      ...identity,
+      uploadId: "spoofed-upload",
+    });
+    assert.equal(spoofed.status, 409);
+    assert.equal(
+      (memory.stateValue(`cargo-vendor-multipart:${requestId}`) as { state: string }).state,
+      "ready",
+    );
+  }
+
+  assert.equal(
+    (await transitionCargoVendorMultipart(memory.durable, "finalize", identity)).status,
+    204,
+  );
+  assert.equal(
+    (await transitionCargoVendorMultipart(memory.durable, "finalize", identity)).status,
+    204,
+  );
+  assert.equal(
+    (memory.stateValue(`cargo-vendor-multipart:${requestId}`) as {
+      state: string;
+      uploadId: string;
+    }).state,
+    "complete",
+  );
+  assert.equal(
+    (await transitionCargoVendorMultipart(memory.durable, "reset", identity)).status,
+    409,
+  );
+
+  const resetRequestId = "00000000-0000-4000-8000-000000000006";
+  const resetInput = { ...input, requestId: resetRequestId };
+  const resetCreated = await createCargoVendorMultipart(memory.durable, resetInput);
+  const resetUpload = await resetCreated.json() as { uploadId: string; stagingId: string };
+  const resetIdentity = {
+    ...identity,
+    requestId: resetRequestId,
+    stagingId: resetUpload.stagingId,
+    uploadId: resetUpload.uploadId,
+  };
+  assert.equal(
+    (await transitionCargoVendorMultipart(memory.durable, "reset", resetIdentity)).status,
+    204,
+  );
+  assert.equal(
+    (await transitionCargoVendorMultipart(memory.durable, "reset", resetIdentity)).status,
+    204,
+  );
+  const recreated = await createCargoVendorMultipart(memory.durable, resetInput);
+  assert.notEqual(
+    (await recreated.json() as { uploadId: string }).uploadId,
+    resetUpload.uploadId,
+  );
+});
+
 test("an uncertain multipart create waits for R2 incomplete-upload expiry", async () => {
   const originalNow = Date.now;
   let now = Date.UTC(2026, 7, 22, 15, 0, 0);
@@ -1744,6 +1823,28 @@ function createCargoVendorMultipart(
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(input),
+    },
+  ));
+}
+
+function transitionCargoVendorMultipart(
+  durable: CiRepository,
+  operation: "finalize" | "reset",
+  identity: {
+    version: 1;
+    requestId: string;
+    stagingId: string;
+    uploadId: string;
+    cargoLockBlob: string;
+    bundleSha256: string;
+  },
+) {
+  return durable.fetch(new Request(
+    `https://ci.test/cargo-vendor/multipart/${identity.requestId}/${operation}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(identity),
     },
   ));
 }

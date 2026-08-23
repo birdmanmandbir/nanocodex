@@ -1108,6 +1108,8 @@ test("the PR capability uses authenticated checksum-bound Cargo multipart upload
     stagingId: upload.stagingId,
     parts: [{ partNumber: descriptor.partNumber, etag: descriptor.etag }],
   };
+  bucket.returnIncompleteMultipartCompletionOnce();
+  bucket.useCompositeMultipartChecksumOnce();
   const completed = await route(new Request(`${endpoint}/complete`, {
     method: "POST",
     headers: prAuth({ "content-type": "application/json" }),
@@ -1115,6 +1117,7 @@ test("the PR capability uses authenticated checksum-bound Cargo multipart upload
   }), env);
   assert.equal(completed.status, 200);
   assert.equal((await completed.json() as { uploaded: boolean }).uploaded, true);
+  assert.equal(repository.multipartState(createBody.requestId), "complete");
   const completedReplay = await route(new Request(`${endpoint}/complete`, {
     method: "POST",
     headers: prAuth({ "content-type": "application/json" }),
@@ -1149,6 +1152,83 @@ test("the PR capability uses authenticated checksum-bound Cargo multipart upload
       body: abortBody,
     }), env)).status, 204);
   }
+  const recreatedAfterAbort = await route(new Request(abortedEndpoint, {
+    method: "POST",
+    headers: prAuth({ "content-type": "application/json" }),
+    body: JSON.stringify({
+      ...createBody,
+      requestId: "123e4567-e89b-42d3-a456-426614174002",
+      sha256: abortedSha,
+    }),
+  }), env);
+  assert.equal(recreatedAfterAbort.status, 200);
+  const freshAbortUpload = await recreatedAfterAbort.json() as {
+    uploadId: string;
+    stagingId: string;
+  };
+  assert.notEqual(freshAbortUpload.uploadId, aborted.uploadId);
+  const freshPart = await route(new Request(`${abortedEndpoint}/parts/1`, {
+    method: "PUT",
+    headers: prAuth({
+      "content-length": String(cargoVendorBody.byteLength),
+      "content-type": "application/octet-stream",
+      "x-nanocodex-staging-id": freshAbortUpload.stagingId,
+      "x-nanocodex-upload-id": freshAbortUpload.uploadId,
+      "x-nanocodex-sha256": sha256,
+    }),
+    body: byteBuffer(cargoVendorBody),
+  }), env);
+  const freshPartDescriptor = await freshPart.json() as { partNumber: number; etag: string };
+  bucket.mismatchMultipartMetadataOnce();
+  const stagedMismatch = await route(new Request(`${abortedEndpoint}/complete`, {
+    method: "POST",
+    headers: prAuth({ "content-type": "application/json" }),
+    body: JSON.stringify({
+      version: 1,
+      uploadId: freshAbortUpload.uploadId,
+      stagingId: freshAbortUpload.stagingId,
+      size: cargoVendorBody.byteLength,
+      sha256: abortedSha,
+      parts: [{
+        partNumber: freshPartDescriptor.partNumber,
+        etag: freshPartDescriptor.etag,
+      }],
+    }),
+  }), env);
+  assert.equal(stagedMismatch.status, 409);
+  assert.deepEqual(await stagedMismatch.json(), {
+    error: "immutable_object_conflict",
+    mismatch: {
+      headPresent: true,
+      keyMatches: true,
+      sizeMatches: true,
+      metadataPresent: true,
+      metadataKeysMatch: true,
+      kindMatches: false,
+      canonicalKeyMatches: true,
+      cargoLockBlobMatches: true,
+      sha256MetadataMatches: true,
+      sizeMetadataMatches: true,
+      partSizeMatches: true,
+      partCountMatches: true,
+      requestIdMatches: true,
+      checksumPresent: false,
+    },
+  });
+  const recreatedAfterFailure = await route(new Request(abortedEndpoint, {
+    method: "POST",
+    headers: prAuth({ "content-type": "application/json" }),
+    body: JSON.stringify({
+      ...createBody,
+      requestId: "123e4567-e89b-42d3-a456-426614174002",
+      sha256: abortedSha,
+    }),
+  }), env);
+  assert.equal(recreatedAfterFailure.status, 200);
+  assert.notEqual(
+    (await recreatedAfterFailure.json() as { uploadId: string }).uploadId,
+    freshAbortUpload.uploadId,
+  );
   const replay = await route(new Request(endpoint, {
     method: "POST",
     headers: prAuth({ "content-type": "application/json" }),
@@ -1207,6 +1287,20 @@ test("the PR capability uses authenticated checksum-bound Cargo multipart upload
     `https://ci.test/api/ci/cargo-vendor/${cargoLockBlob}/${wrongBundleSha}/bundle.tar.gz`,
   ), env)).status, 404);
   assert.equal((await bucket.list({ prefix: "cargo-vendor-staging/" })).objects.length, 0);
+  const wrongRetry = await route(new Request(wrongEndpoint, {
+    method: "POST",
+    headers: prAuth({ "content-type": "application/json" }),
+    body: JSON.stringify({
+      ...createBody,
+      requestId: "123e4567-e89b-42d3-a456-426614174003",
+      sha256: wrongBundleSha,
+    }),
+  }), env);
+  assert.equal(wrongRetry.status, 200);
+  assert.notEqual(
+    (await wrongRetry.json() as { uploadId: string }).uploadId,
+    wrongUpload.uploadId,
+  );
 });
 
 test("source publication rejects a missing or mismatched Cargo.lock bundle", async () => {
@@ -1787,6 +1881,9 @@ function memoryBucket() {
     parts: Map<number, Uint8Array>;
   }>();
   let uploadSequence = 0;
+  let incompleteMultipartCompletion = false;
+  let compositeMultipartChecksum = false;
+  let mismatchedMultipartMetadata = false;
   let cargoVendorPutFault:
     | "commit_then_throw"
     | "mismatch_then_throw"
@@ -1817,6 +1914,15 @@ function memoryBucket() {
     };
   };
   return {
+    returnIncompleteMultipartCompletionOnce() {
+      incompleteMultipartCompletion = true;
+    },
+    useCompositeMultipartChecksumOnce() {
+      compositeMultipartChecksum = true;
+    },
+    mismatchMultipartMetadataOnce() {
+      mismatchedMultipartMetadata = true;
+    },
     failNextCargoVendorPut(
       fault: "commit_then_throw" | "mismatch_then_throw" | "transient",
     ) {
@@ -1897,18 +2003,28 @@ function memoryBucket() {
             if (!part) throw new Error("missing multipart part");
             return part;
           }));
+          const metadata = mismatchedMultipartMetadata
+            ? { ...upload.options.customMetadata, kind: "unexpected" }
+            : upload.options.customMetadata;
           const value = {
             body,
-            customMetadata: upload.options.customMetadata,
+            customMetadata: metadata,
             httpMetadata: upload.options.httpMetadata as R2HTTPMetadata | undefined,
-            nativeSha256: undefined,
+            nativeSha256: compositeMultipartChecksum ? "f".repeat(64) : undefined,
           };
+          mismatchedMultipartMetadata = false;
+          compositeMultipartChecksum = false;
           objects.set(key, value);
           multipart.delete(uploadId);
-          return object(key, value);
+          const completed = object(key, value);
+          if (!incompleteMultipartCompletion) return completed;
+          incompleteMultipartCompletion = false;
+          return { ...completed, customMetadata: undefined };
         },
         async abort() {
-          if (!multipart.delete(uploadId)) throw new Error("missing multipart upload");
+          if (!multipart.delete(uploadId)) {
+            throw r2Error(10024, "NoSuchUpload", "abortMultipartUpload");
+          }
         },
       };
     },
@@ -1958,8 +2074,12 @@ function concatBytes(parts: Uint8Array[]): Uint8Array {
   return combined;
 }
 
-function r2Error(code: number, message: string): Error & { code: number; action: string } {
-  return Object.assign(new Error(message), { name: "R2Error", code, action: "put" });
+function r2Error(
+  code: number,
+  message: string,
+  action = "put",
+): Error & { code: number; action: string } {
+  return Object.assign(new Error(message), { name: "R2Error", code, action });
 }
 
 function memoryNamespace() {
@@ -1979,7 +2099,11 @@ function memoryNamespace() {
     lastLeaseId?: string;
     leaseSequence: number;
     leases: Map<string, string>;
-    multipart: Map<string, { input: MultipartRequest; response: Record<string, unknown> }>;
+    multipart: Map<string, {
+      input: MultipartRequest;
+      response: Record<string, unknown>;
+      status: "ready" | "complete";
+    }>;
     multipartCreates: number;
     loseMultipartResponse: boolean;
   } = {
@@ -2046,12 +2170,58 @@ function memoryNamespace() {
           partSize: value.partSize,
           partCount: value.partCount,
         };
-        state.multipart.set(value.requestId, { input: structuredClone(value), response });
+        state.multipart.set(value.requestId, {
+          input: structuredClone(value),
+          response,
+          status: "ready",
+        });
         if (state.loseMultipartResponse) {
           state.loseMultipartResponse = false;
           throw new Error("injected multipart response acknowledgement loss");
         }
         return Response.json(response);
+      }
+      const multipartTransition = path.match(
+        /^\/cargo-vendor\/multipart\/([a-f0-9-]+)\/(finalize|reset)$/,
+      );
+      if (multipartTransition && request.method === "POST") {
+        const requestId = multipartTransition[1]!;
+        const operation = multipartTransition[2]!;
+        const identity = await request.json() as {
+          version: number;
+          requestId: string;
+          stagingId: string;
+          uploadId: string;
+          cargoLockBlob: string;
+          bundleSha256: string;
+        };
+        const current = state.multipart.get(requestId);
+        if (!current && operation === "reset") return new Response(null, { status: 204 });
+        if (!current) return Response.json({ error: "cargo_vendor_multipart_not_found" }, {
+          status: 404,
+        });
+        if (
+          identity.version !== 1 || identity.requestId !== requestId ||
+          identity.stagingId !== requestId ||
+          identity.uploadId !== current.response.uploadId ||
+          identity.cargoLockBlob !== current.input.cargoLockBlob ||
+          identity.bundleSha256 !== current.input.bundleSha256
+        ) {
+          return Response.json({ error: "cargo_vendor_multipart_identity_conflict" }, {
+            status: 409,
+          });
+        }
+        if (operation === "reset") {
+          if (current.status !== "ready") {
+            return Response.json({ error: "cargo_vendor_multipart_identity_conflict" }, {
+              status: 409,
+            });
+          }
+          state.multipart.delete(requestId);
+        } else {
+          current.status = "complete";
+        }
+        return new Response(null, { status: 204 });
       }
       const publicationLease = path.match(/^\/leases\/publication\/([a-f0-9]{40})$/);
       if (publicationLease && request.method === "POST") {
@@ -2121,6 +2291,7 @@ function memoryNamespace() {
     get published() { return state.published; },
     get lastLeaseId() { return state.lastLeaseId; },
     get multipartCreates() { return state.multipartCreates; },
+    multipartState(requestId: string) { return state.multipart.get(requestId)?.status; },
     bindBucket(bucket: ReturnType<typeof memoryBucket>) { sourceBucket = bucket; },
     loseNextMultipartResponse() { state.loseMultipartResponse = true; },
   };

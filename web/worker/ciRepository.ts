@@ -199,8 +199,18 @@ type CiCargoVendorMultipartRecord = CiCargoVendorMultipartInput & {
   | {
     state: "complete";
     completedAt: string;
+    uploadId?: string;
   }
 );
+
+type CiCargoVendorMultipartIdentity = {
+  version: 1;
+  requestId: string;
+  stagingId: string;
+  uploadId: string;
+  cargoLockBlob: string;
+  bundleSha256: string;
+};
 
 type CiCancellationRecord = {
   version: 1;
@@ -400,10 +410,22 @@ export class CiRepository {
       return this.#requestOperatorCancellation(request, cancellation[1]!);
     }
     const cargoVendorMultipart = url.pathname.match(
-      /^\/cargo-vendor\/multipart\/([a-f0-9-]+)$/,
+      /^\/cargo-vendor\/multipart\/([a-f0-9-]+)(?:\/(finalize|reset))?$/,
     );
-    if (cargoVendorMultipart && request.method === "POST") {
+    if (cargoVendorMultipart && request.method === "POST" && !cargoVendorMultipart[2]) {
       return this.#createCargoVendorMultipart(request, cargoVendorMultipart[1]!);
+    }
+    if (
+      cargoVendorMultipart && request.method === "POST" &&
+      cargoVendorMultipart[2] === "finalize"
+    ) {
+      return this.#finalizeCargoVendorMultipart(request, cargoVendorMultipart[1]!);
+    }
+    if (
+      cargoVendorMultipart && request.method === "POST" &&
+      cargoVendorMultipart[2] === "reset"
+    ) {
+      return this.#resetCargoVendorMultipart(request, cargoVendorMultipart[1]!);
     }
     if (url.pathname === "/maintenance/source-gc" && request.method === "POST") {
       try {
@@ -1130,6 +1152,61 @@ export class CiRepository {
     return Response.json(cargoVendorMultipartResponse(ready), {
       headers: { "cache-control": "no-store" },
     });
+  }
+
+  async #finalizeCargoVendorMultipart(
+    request: Request,
+    requestId: string,
+  ): Promise<Response> {
+    const identity = await request.json().catch(() => undefined);
+    if (!isCargoVendorMultipartIdentity(identity) || identity.requestId !== requestId) {
+      return Response.json({ error: "invalid_cargo_vendor_multipart_identity" }, {
+        status: 400,
+        headers: { "cache-control": "no-store" },
+      });
+    }
+    const storageKey = `${CARGO_VENDOR_MULTIPART_PREFIX}${requestId}`;
+    const outcome = await this.#state.storage.transaction(async (transaction) => {
+      const current = await transaction.get<CiCargoVendorMultipartRecord>(storageKey);
+      if (!current) return "missing" as const;
+      if (!validCargoVendorMultipartRecord(current, requestId)) return "invalid" as const;
+      if (!sameCargoVendorMultipartIdentity(current, identity)) return "conflict" as const;
+      if (current.state === "complete") return "complete" as const;
+      if (current.state !== "ready") return "conflict" as const;
+      const complete = {
+        ...current,
+        state: "complete",
+        completedAt: new Date().toISOString(),
+      } satisfies CiCargoVendorMultipartRecord;
+      await transaction.put(storageKey, complete);
+      return "complete" as const;
+    });
+    return cargoVendorMultipartTransitionResponse(outcome);
+  }
+
+  async #resetCargoVendorMultipart(
+    request: Request,
+    requestId: string,
+  ): Promise<Response> {
+    const identity = await request.json().catch(() => undefined);
+    if (!isCargoVendorMultipartIdentity(identity) || identity.requestId !== requestId) {
+      return Response.json({ error: "invalid_cargo_vendor_multipart_identity" }, {
+        status: 400,
+        headers: { "cache-control": "no-store" },
+      });
+    }
+    const storageKey = `${CARGO_VENDOR_MULTIPART_PREFIX}${requestId}`;
+    const outcome = await this.#state.storage.transaction(async (transaction) => {
+      const current = await transaction.get<CiCargoVendorMultipartRecord>(storageKey);
+      if (!current) return "complete" as const;
+      if (!validCargoVendorMultipartRecord(current, requestId)) return "invalid" as const;
+      if (current.state !== "ready" || !sameCargoVendorMultipartIdentity(current, identity)) {
+        return "conflict" as const;
+      }
+      await transaction.delete(storageKey);
+      return "complete" as const;
+    });
+    return cargoVendorMultipartTransitionResponse(outcome);
   }
 
   async #requestOperatorCancellation(request: Request, head: string): Promise<Response> {
@@ -2757,6 +2834,25 @@ function isCargoVendorMultipartInput(
     input.partCount > 0 && input.partCount <= MAX_CARGO_VENDOR_PARTS;
 }
 
+function isCargoVendorMultipartIdentity(
+  value: unknown,
+): value is CiCargoVendorMultipartIdentity {
+  if (value == null || typeof value !== "object" || Array.isArray(value)) return false;
+  const identity = value as Partial<CiCargoVendorMultipartIdentity>;
+  return hasExactKeys(value, [
+    "bundleSha256",
+    "cargoLockBlob",
+    "requestId",
+    "stagingId",
+    "uploadId",
+    "version",
+  ]) && identity.version === 1 && typeof identity.requestId === "string" &&
+    CLOSE_ID_PATTERN.test(identity.requestId) && identity.stagingId === identity.requestId &&
+    typeof identity.uploadId === "string" && identity.uploadId.length > 0 &&
+    identity.uploadId.length <= 1_024 && isSha1(identity.cargoLockBlob) &&
+    isSha256(identity.bundleSha256);
+}
+
 function validCargoVendorMultipartRecord(
   record: CiCargoVendorMultipartRecord,
   requestId: string,
@@ -2782,7 +2878,10 @@ function validCargoVendorMultipartRecord(
       typeof record.uploadId === "string" && record.uploadId.length > 0 &&
       record.uploadId.length <= 1_024;
   }
-  return record.state === "complete" && Number.isFinite(Date.parse(record.completedAt));
+  return record.state === "complete" && Number.isFinite(Date.parse(record.completedAt)) &&
+    (record.uploadId == null ||
+      (typeof record.uploadId === "string" && record.uploadId.length > 0 &&
+        record.uploadId.length <= 1_024));
 }
 
 function sameCargoVendorMultipartRequest(
@@ -2793,6 +2892,43 @@ function sameCargoVendorMultipartRequest(
     record.cargoLockBlob === input.cargoLockBlob &&
     record.bundleSha256 === input.bundleSha256 && record.size === input.size &&
     record.partSize === input.partSize && record.partCount === input.partCount;
+}
+
+function sameCargoVendorMultipartIdentity(
+  record: CiCargoVendorMultipartRecord,
+  identity: CiCargoVendorMultipartIdentity,
+): boolean {
+  return record.requestId === identity.requestId && record.stagingId === identity.stagingId &&
+    record.cargoLockBlob === identity.cargoLockBlob &&
+    record.bundleSha256 === identity.bundleSha256 && record.state !== "creating" &&
+    record.uploadId === identity.uploadId;
+}
+
+function cargoVendorMultipartTransitionResponse(
+  outcome: "complete" | "missing" | "invalid" | "conflict",
+): Response {
+  if (outcome === "complete") {
+    return new Response(null, {
+      status: 204,
+      headers: { "cache-control": "no-store" },
+    });
+  }
+  if (outcome === "missing") {
+    return Response.json({ error: "cargo_vendor_multipart_not_found" }, {
+      status: 404,
+      headers: { "cache-control": "no-store" },
+    });
+  }
+  if (outcome === "invalid") {
+    return Response.json({ error: "repository_state_invalid" }, {
+      status: 503,
+      headers: { "cache-control": "no-store" },
+    });
+  }
+  return Response.json({ error: "cargo_vendor_multipart_identity_conflict" }, {
+    status: 409,
+    headers: { "cache-control": "no-store" },
+  });
 }
 
 function cargoVendorMultipartStagingKey(input: CiCargoVendorMultipartInput): string {

@@ -331,6 +331,7 @@ export async function routeCiRequest(
       return abortCargoVendorMultipart(
         request,
         configured.CI_SOURCE,
+        repository(configured),
         cargoLockBlob,
         bundleSha256,
       );
@@ -348,6 +349,7 @@ export async function routeCiRequest(
       return completeCargoVendorMultipart(
         request,
         configured.CI_SOURCE,
+        repository(configured),
         cargoLockBlob,
         bundleSha256,
       );
@@ -708,6 +710,7 @@ async function uploadCargoVendorPart(
 async function completeCargoVendorMultipart(
   request: Request,
   bucket: R2Bucket,
+  coordinator: DurableObjectStub,
   cargoLockBlob: string,
   bundleSha256: string,
 ): Promise<Response> {
@@ -741,65 +744,106 @@ async function completeCargoVendorMultipart(
     bundleSha256,
     input.stagingId,
   );
+  const identity = cargoVendorMultipartIdentity(
+    cargoLockBlob,
+    bundleSha256,
+    input.stagingId,
+    input.uploadId,
+  );
+  const stagingInput = {
+    stagingId: input.stagingId,
+    size: input.size,
+    sha256: input.sha256,
+    parts: input.parts,
+  };
   const expectedParts = input.parts as Array<{ partNumber: number; etag: string }>;
   const existing = await bucket.head(key);
   if (existing && !matchesCargoVendor(existing, cargoLockBlob, input.size, bundleSha256)) {
-    await cleanupCargoVendorMultipart(bucket, stagingKey, input.uploadId);
-    return error("immutable_object_conflict", 409);
+    return cleanupFailedCargoVendorMultipart(
+      bucket,
+      coordinator,
+      identity,
+      stagingKey,
+      key,
+      error("immutable_object_conflict", 409),
+    );
   }
   if (existing) {
     await cleanupCargoVendorMultipart(bucket, stagingKey, input.uploadId);
-    return Response.json({
+    return finalizedCargoVendorMultipartResponse(coordinator, identity, {
       key,
       cargoLockBlob,
       size: input.size,
       sha256: bundleSha256,
       uploaded: false,
-    }, noStore());
+    });
   }
-  let staged: R2Object | null = null;
+  let completionFailure: unknown;
   try {
-    staged = await bucket.resumeMultipartUpload(stagingKey, input.uploadId).complete(expectedParts);
+    await bucket.resumeMultipartUpload(stagingKey, input.uploadId).complete(expectedParts);
   } catch (cause) {
+    completionFailure = cause;
+  }
+  let staged: R2Object | null;
+  try {
+    // R2's MultipartUpload.complete() return is not authoritative: production
+    // can omit metadata present on the stored object. Always validate a fresh HEAD.
     staged = await bucket.head(stagingKey);
-    if (!staged) {
-      const resolved = await bucket.head(key);
-      if (resolved && matchesCargoVendor(resolved, cargoLockBlob, input.size, bundleSha256)) {
-        return Response.json({
-          key,
-          cargoLockBlob,
-          size: input.size,
-          sha256: bundleSha256,
-          uploaded: false,
-        }, noStore());
-      }
-      return Response.json({
-        error: "cargo_vendor_multipart_failed",
-        detail: boundedError(cause),
-      }, { status: 409, ...noStore() });
+  } catch (cause) {
+    return Response.json({
+      error: "cargo_vendor_multipart_unavailable",
+      detail: boundedError(cause),
+    }, { status: 503, ...noStore() });
+  }
+  if (!staged) {
+    const resolved = await bucket.head(key);
+    if (resolved && matchesCargoVendor(resolved, cargoLockBlob, input.size, bundleSha256)) {
+      return finalizedCargoVendorMultipartResponse(coordinator, identity, {
+        key,
+        cargoLockBlob,
+        size: input.size,
+        sha256: bundleSha256,
+        uploaded: false,
+      });
     }
+    const response = completionFailure == null
+      ? cargoVendorStagingMismatchResponse(null, stagingKey, key, cargoLockBlob, stagingInput)
+      : Response.json({
+        error: "cargo_vendor_multipart_failed",
+        detail: boundedError(completionFailure),
+      }, { status: 409, ...noStore() });
+    return cleanupFailedCargoVendorMultipart(
+      bucket,
+      coordinator,
+      identity,
+      stagingKey,
+      key,
+      response,
+    );
+  }
+  if (!matchesCargoVendorStaging(staged, stagingKey, key, cargoLockBlob, stagingInput)) {
+    return cleanupFailedCargoVendorMultipart(
+      bucket,
+      coordinator,
+      identity,
+      stagingKey,
+      key,
+      cargoVendorStagingMismatchResponse(staged, stagingKey, key, cargoLockBlob, stagingInput),
+    );
+  }
+  const body = await bucket.get(stagingKey);
+  if (!body || !matchesCargoVendorStaging(body, stagingKey, key, cargoLockBlob, stagingInput)) {
+    await body?.body.cancel();
+    return cleanupFailedCargoVendorMultipart(
+      bucket,
+      coordinator,
+      identity,
+      stagingKey,
+      key,
+      cargoVendorStagingMismatchResponse(body, stagingKey, key, cargoLockBlob, stagingInput),
+    );
   }
   try {
-    if (!matchesCargoVendorStaging(
-      staged,
-      stagingKey,
-      key,
-      cargoLockBlob,
-      input.size,
-      bundleSha256,
-    )) return error("immutable_object_conflict", 409);
-    const body = await bucket.get(stagingKey);
-    if (!body || !matchesCargoVendorStaging(
-      body,
-      stagingKey,
-      key,
-      cargoLockBlob,
-      input.size,
-      bundleSha256,
-    )) {
-      await body?.body.cancel();
-      return error("immutable_object_conflict", 409);
-    }
     const published = await bucket.put(key, body.body, {
       onlyIf: { etagDoesNotMatch: "*" },
       sha256: bundleSha256,
@@ -817,37 +861,54 @@ async function completeCargoVendorMultipart(
       cargoLockBlob,
       input.size,
       bundleSha256,
-    )) return error("immutable_object_conflict", 409);
-    return Response.json({
+    )) {
+      return cleanupFailedCargoVendorMultipart(
+        bucket,
+        coordinator,
+        identity,
+        stagingKey,
+        key,
+        error("immutable_object_conflict", 409),
+      );
+    }
+    await bucket.delete(stagingKey).catch(() => undefined);
+    return finalizedCargoVendorMultipartResponse(coordinator, identity, {
       key,
       cargoLockBlob,
       size: input.size,
       sha256: bundleSha256,
       uploaded: published != null,
-    }, noStore());
+    });
   } catch (cause) {
     const resolved = await bucket.head(key);
     if (resolved && matchesCargoVendor(resolved, cargoLockBlob, input.size, bundleSha256)) {
-      return Response.json({
+      await bucket.delete(stagingKey).catch(() => undefined);
+      return finalizedCargoVendorMultipartResponse(coordinator, identity, {
         key,
         cargoLockBlob,
         size: input.size,
         sha256: bundleSha256,
         uploaded: false,
-      }, noStore());
+      });
     }
-    return Response.json({
+    return cleanupFailedCargoVendorMultipart(
+      bucket,
+      coordinator,
+      identity,
+      stagingKey,
+      key,
+      Response.json({
       error: "cargo_vendor_multipart_failed",
       detail: boundedError(cause),
-    }, { status: 409, ...noStore() });
-  } finally {
-    await bucket.delete(stagingKey).catch(() => undefined);
+      }, { status: 409, ...noStore() }),
+    );
   }
 }
 
 async function abortCargoVendorMultipart(
   request: Request,
   bucket: R2Bucket,
+  coordinator: DurableObjectStub,
   cargoLockBlob: string,
   bundleSha256: string,
 ): Promise<Response> {
@@ -863,21 +924,50 @@ async function abortCargoVendorMultipart(
     bundleSha256,
     input.stagingId,
   );
+  const key = cargoVendorBundleKey(cargoLockBlob, bundleSha256);
+  const identity = cargoVendorMultipartIdentity(
+    cargoLockBlob,
+    bundleSha256,
+    input.stagingId,
+    input.uploadId,
+  );
+  let abortKnown = false;
   try {
     await bucket.resumeMultipartUpload(
       stagingKey,
       input.uploadId,
     ).abort();
+    abortKnown = true;
   } catch (cause) {
-    if (!await bucket.head(stagingKey)) {
-      return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
+    abortKnown = isR2MissingMultipartUpload(cause);
+    if (!abortKnown) {
+      return Response.json({
+        error: "cargo_vendor_multipart_abort_failed",
+        detail: boundedError(cause),
+      }, { status: 409, ...noStore() });
     }
+  }
+  try {
+    await bucket.delete(stagingKey);
+    const [staged, canonical] = await Promise.all([
+      bucket.head(stagingKey),
+      bucket.head(key),
+    ]);
+    if (staged) return error("cargo_vendor_multipart_abort_failed", 409);
+    if (!canonical) {
+      const transition = await cargoVendorMultipartTransition(
+        coordinator,
+        identity,
+        "reset",
+      );
+      if (transition) return transition;
+    }
+  } catch (cause) {
     return Response.json({
       error: "cargo_vendor_multipart_abort_failed",
       detail: boundedError(cause),
     }, { status: 409, ...noStore() });
   }
-  await bucket.delete(stagingKey).catch(() => undefined);
   return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
 }
 
@@ -2284,16 +2374,162 @@ function matchesCargoVendorStaging(
   stagingKey: string,
   canonicalKey: string,
   cargoLockBlob: string,
-  size: number,
-  sha256: string,
+  input: {
+    stagingId: string;
+    size: number;
+    sha256: string;
+    parts: unknown[];
+  },
 ): boolean {
-  return object.key === stagingKey && object.size === size &&
-    object.customMetadata?.kind === "cargo-vendor-staging" &&
-    object.customMetadata?.canonicalKey === canonicalKey &&
-    object.customMetadata?.cargoLockBlob === cargoLockBlob &&
-    object.customMetadata?.sha256 === sha256 &&
-    object.customMetadata?.size === String(size) &&
-    (object.checksums.sha256 == null || hex(object.checksums.sha256) === sha256);
+  const metadata = object.customMetadata;
+  return object.key === stagingKey && object.size === input.size && metadata != null &&
+    hasExactKeys(metadata, [
+      "canonicalKey",
+      "cargoLockBlob",
+      "kind",
+      "partCount",
+      "partSize",
+      "requestId",
+      "sha256",
+      "size",
+    ]) && metadata.kind === "cargo-vendor-staging" &&
+    metadata.canonicalKey === canonicalKey && metadata.cargoLockBlob === cargoLockBlob &&
+    metadata.sha256 === input.sha256 && metadata.size === String(input.size) &&
+    metadata.partSize === String(CARGO_VENDOR_PART_BYTES) &&
+    metadata.partCount === String(input.parts.length) && metadata.requestId === input.stagingId;
+}
+
+function cargoVendorStagingMismatchResponse(
+  object: R2Object | null,
+  stagingKey: string,
+  canonicalKey: string,
+  cargoLockBlob: string,
+  input: {
+    stagingId: string;
+    size: number;
+    sha256: string;
+    parts: unknown[];
+  },
+): Response {
+  const metadata = object?.customMetadata;
+  const metadataKeys = [
+    "canonicalKey",
+    "cargoLockBlob",
+    "kind",
+    "partCount",
+    "partSize",
+    "requestId",
+    "sha256",
+    "size",
+  ];
+  return Response.json({
+    error: "immutable_object_conflict",
+    mismatch: {
+      headPresent: object != null,
+      keyMatches: object?.key === stagingKey,
+      sizeMatches: object?.size === input.size,
+      metadataPresent: metadata != null,
+      metadataKeysMatch: metadata != null && hasExactKeys(metadata, metadataKeys),
+      kindMatches: metadata?.kind === "cargo-vendor-staging",
+      canonicalKeyMatches: metadata?.canonicalKey === canonicalKey,
+      cargoLockBlobMatches: metadata?.cargoLockBlob === cargoLockBlob,
+      sha256MetadataMatches: metadata?.sha256 === input.sha256,
+      sizeMetadataMatches: metadata?.size === String(input.size),
+      partSizeMatches: metadata?.partSize === String(CARGO_VENDOR_PART_BYTES),
+      partCountMatches: metadata?.partCount === String(input.parts.length),
+      requestIdMatches: metadata?.requestId === input.stagingId,
+      checksumPresent: object?.checksums.sha256 != null,
+    },
+  }, { status: 409, ...noStore() });
+}
+
+type CargoVendorMultipartIdentity = {
+  version: 1;
+  requestId: string;
+  stagingId: string;
+  uploadId: string;
+  cargoLockBlob: string;
+  bundleSha256: string;
+};
+
+function cargoVendorMultipartIdentity(
+  cargoLockBlob: string,
+  bundleSha256: string,
+  stagingId: string,
+  uploadId: string,
+): CargoVendorMultipartIdentity {
+  return {
+    version: 1,
+    requestId: stagingId,
+    stagingId,
+    uploadId,
+    cargoLockBlob,
+    bundleSha256,
+  };
+}
+
+async function finalizedCargoVendorMultipartResponse(
+  coordinator: DurableObjectStub,
+  identity: CargoVendorMultipartIdentity,
+  body: Record<string, unknown>,
+): Promise<Response> {
+  const transition = await cargoVendorMultipartTransition(coordinator, identity, "finalize");
+  return transition ?? Response.json(body, noStore());
+}
+
+async function cleanupFailedCargoVendorMultipart(
+  bucket: R2Bucket,
+  coordinator: DurableObjectStub,
+  identity: CargoVendorMultipartIdentity,
+  stagingKey: string,
+  canonicalKey: string,
+  failure: Response,
+): Promise<Response> {
+  let abortKnown = false;
+  try {
+    await bucket.resumeMultipartUpload(stagingKey, identity.uploadId).abort();
+    abortKnown = true;
+  } catch (cause) {
+    abortKnown = isR2MissingMultipartUpload(cause);
+  }
+  if (!abortKnown) return failure;
+  try {
+    await bucket.delete(stagingKey);
+    const [staged, canonical] = await Promise.all([
+      bucket.head(stagingKey),
+      bucket.head(canonicalKey),
+    ]);
+    if (staged || canonical) return failure;
+  } catch {
+    return failure;
+  }
+  const transition = await cargoVendorMultipartTransition(coordinator, identity, "reset");
+  return transition ?? failure;
+}
+
+async function cargoVendorMultipartTransition(
+  coordinator: DurableObjectStub,
+  identity: CargoVendorMultipartIdentity,
+  operation: "finalize" | "reset",
+): Promise<Response | undefined> {
+  try {
+    const response = await coordinator.fetch(new Request(
+      `https://ci-repository/cargo-vendor/multipart/${identity.requestId}/${operation}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(identity),
+      },
+    ));
+    if (!response.ok) return response;
+    await response.body?.cancel();
+    return undefined;
+  } catch (cause) {
+    return Response.json({
+      error: "cargo_vendor_multipart_state_unavailable",
+      detail: boundedError(cause),
+    }, { status: 503, ...noStore() });
+  }
 }
 
 async function cleanupCargoVendorMultipart(
@@ -2303,6 +2539,11 @@ async function cleanupCargoVendorMultipart(
 ): Promise<void> {
   await bucket.resumeMultipartUpload(stagingKey, uploadId).abort().catch(() => undefined);
   await bucket.delete(stagingKey).catch(() => undefined);
+}
+
+function isR2MissingMultipartUpload(value: unknown): value is R2Error {
+  return value instanceof Error && "code" in value &&
+    (value as Partial<R2Error>).code === 10024;
 }
 
 function matchesRustSecAdvisory(
