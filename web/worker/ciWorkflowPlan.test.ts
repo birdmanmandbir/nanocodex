@@ -185,15 +185,12 @@ test("dependency and Rust compilation snapshots are content addressed", async ()
   ]));
   assert.deepEqual(rustBuildCacheInputs(), [
     ...cargoCacheInputs(),
-    "web/ci/rust-source-cache.py",
   ]);
   assert.deepEqual(msrvBuildCacheInputs(), [
     ...cargoCacheInputs(),
-    "web/ci/rust-source-cache.py",
   ]);
   assert.deepEqual(rustQualityCacheInputs(), [
     ...cargoCacheInputs(),
-    "web/ci/rust-source-cache.py",
     "bin/**/*",
     "crates/**/*",
     "examples/**/*.rs",
@@ -255,11 +252,11 @@ test("dependency and Rust compilation snapshots are content addressed", async ()
   assert.doesNotMatch(msrvBuildCacheCommand(), /cargo .*clean/);
   assert.match(
     refreshSourceCommand("cargo test"),
-    /rust-source-cache\.py refresh \/workspace \/workspace\/\.rust-source-manifest\.json/,
+    /python3 -c .* refresh \/workspace \/workspace\/\.rust-source-manifest\.json/s,
   );
   const qualityCache = rustResultCacheCommand("cargo clippy --workspace");
   assert.match(qualityCache, /cargo clippy --workspace/);
-  assert.match(qualityCache, /rust-source-cache\.py refresh/);
+  assert.match(qualityCache, /python3 -c .* refresh/s);
   assert.match(
     qualityCache,
     /find \/workspace -mindepth 1 -maxdepth 1 -exec rm -rf -- \{\} \+/,
@@ -600,7 +597,7 @@ test("the website snapshot drops Cargo and unrelated package roots", async () =>
   }
 });
 
-test("the Rust cache preserves unchanged crate mtimes and invalidates only changed source", async () => {
+test("the deployed Rust cache helper runs without web/ci and invalidates only changed source", async () => {
   const directory = await mkdtemp(resolve(tmpdir(), "nanocodex-ci-rust-cache-"));
   try {
     const source = resolve(directory, "crates/example/src/lib.rs");
@@ -613,7 +610,7 @@ test("the Rust cache preserves unchanged crate mtimes and invalidates only chang
       mkdir(resolve(directory, "examples"), { recursive: true }),
       mkdir(resolve(directory, "js/bindings/src"), { recursive: true }),
       mkdir(resolve(directory, "py/bindings/src"), { recursive: true }),
-      mkdir(resolve(directory, "web/ci"), { recursive: true }),
+      mkdir(resolve(directory, "web"), { recursive: true }),
     ]);
     await Promise.all([
       writeFile(resolve(directory, "Cargo.toml"), "[workspace]\n"),
@@ -623,16 +620,16 @@ test("the Rust cache preserves unchanged crate mtimes and invalidates only chang
       writeFile(resolve(directory, "py/bindings/Cargo.toml"), "[package]\nname = \"py\"\n"),
       writeFile(resolve(directory, "examples/Cargo.toml"), "[package]\nname = \"examples\"\n"),
       writeFile(resolve(directory, "web/style.css"), "body { color: black; }\n"),
-      writeFile(
-        resolve(directory, "web/ci/rust-source-cache.py"),
-        await readFile(new URL("../ci/rust-source-cache.py", import.meta.url), "utf8"),
-      ),
     ]);
     await Promise.all([
       writeFile(source, "pub fn value() -> u8 { 1 }\n"),
       writeFile(unchangedSource, "pub fn unchanged() -> u8 { 1 }\n"),
     ]);
     const marker = rustBuildCacheCommand().split(" && ")[0]!;
+    assert.match(marker, /^python3 -c /);
+    assert.match(marker, /rust source cache: recorded/);
+    assert.doesNotMatch(marker, /\/workspace\/web\/ci|rust-source-cache\.py/);
+    await assert.rejects(stat(resolve(directory, "web/ci")));
     const adapt = (command: string) => command.replaceAll(
       "/workspace",
       "$CI_TEST_WORKSPACE",
@@ -674,6 +671,7 @@ test("the Rust cache preserves unchanged crate mtimes and invalidates only chang
     assert.equal(changed.status, 0, changed.stderr);
     assert.ok((await stat(source)).mtimeMs > changedReference);
     assert.ok(Math.abs((await stat(unchangedSource)).mtimeMs - changedReference) < 2);
+    await assert.rejects(stat(resolve(directory, "web/ci")));
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -711,9 +709,16 @@ test("every generated container command is valid Bash", () => {
     pythonCommand("3.11"),
     pythonCommand("3.14"),
     ...rustPipeline(RUSTSEC).map(({ command }) => command),
+    rustResultCacheCommand("cargo test --workspace --locked"),
+    typosCommand(),
   ];
   for (const command of commands) {
     const result = spawnSync("bash", ["-n", "-c", command], { encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(
+      command,
+      /\/workspace\/web\/ci(?:\/|\b)/,
+      "runner commands must not load CI implementation from tested source",
+    );
   }
 });
