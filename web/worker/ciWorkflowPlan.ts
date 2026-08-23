@@ -498,7 +498,9 @@ function retainWorkspacePathsCommand(paths: readonly string[]): string {
     "staging=/workspace/.ci-cache-staging",
     "rm -rf \"$staging\"",
     `for retained in ${retained}; do test -e "/workspace/$retained"; mkdir -p "$staging/$(dirname "$retained")"; mv "/workspace/$retained" "$staging/$retained"; done`,
-    "find /workspace -mindepth 1 -maxdepth 1 ! -name .ci-cache-staging -exec rm -rf -- {} +",
+    "cleanup_complete=",
+    "for cleanup_attempt in 1 2 3; do find /workspace -mindepth 1 -maxdepth 1 ! -name .ci-cache-staging -exec rm -rf -- {} + || :; remaining=$(find /workspace -mindepth 1 -maxdepth 1 ! -name .ci-cache-staging -print -quit) || break; if test -z \"$remaining\"; then cleanup_complete=1; break; fi; done",
+    "test \"$cleanup_complete\" = 1",
     `for retained in ${retained}; do mkdir -p "/workspace/$(dirname "$retained")"; mv "$staging/$retained" "/workspace/$retained"; done`,
     "rm -rf \"$staging\"",
   ].join("; ");

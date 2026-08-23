@@ -551,6 +551,120 @@ test("the bindings build snapshot retains generated WASM and node_modules only",
   }
 });
 
+test("the bindings snapshot cleanup bounds repopulation retries and fails closed", async () => {
+  const executableDirectory = await mkdtemp(resolve(tmpdir(), "nanocodex-ci-rm-shim-"));
+  const workspaces: string[] = [];
+  try {
+    const realRm = spawnSync("sh", ["-c", "command -v rm"], { encoding: "utf8" });
+    assert.equal(realRm.status, 0, realRm.stderr);
+    assert.ok(realRm.stdout.trim());
+    const rmShim = resolve(executableDirectory, "rm");
+    await writeFile(
+      rmShim,
+      [
+        "#!/bin/sh",
+        "set -eu",
+        "cleanup_target=",
+        "for argument do",
+        "  if test \"$argument\" = \"$CI_TEST_WORKSPACE/.cargo-home\"; then cleanup_target=1; fi",
+        "done",
+        "if test -z \"$cleanup_target\"; then",
+        "  exec \"$CI_TEST_REAL_RM\" \"$@\"",
+        "fi",
+        "attempt=0",
+        "if test -f \"$CI_TEST_RM_ATTEMPTS\"; then attempt=$(cat \"$CI_TEST_RM_ATTEMPTS\"); fi",
+        "attempt=$((attempt + 1))",
+        "printf '%s\\n' \"$attempt\" > \"$CI_TEST_RM_ATTEMPTS\"",
+        "\"$CI_TEST_REAL_RM\" \"$@\"",
+        "if test \"$attempt\" -le \"$CI_TEST_RM_REPOPULATIONS\"; then",
+        "  mkdir -p \"$CI_TEST_WORKSPACE/.cargo-home/vendor/bitcoin_hashes-0.14.101\"",
+        "  printf 'repopulated\\n' > \"$CI_TEST_WORKSPACE/.cargo-home/vendor/bitcoin_hashes-0.14.101/race\"",
+        "  printf \"rm: cannot remove '%s': Directory not empty\\n\" \"$CI_TEST_WORKSPACE/.cargo-home/vendor/bitcoin_hashes-0.14.101\" >&2",
+        "  exit 1",
+        "fi",
+      ].join("\n"),
+    );
+    await chmod(rmShim, 0o755);
+
+    const cleanup = bindingsBuildCacheCommand().split(" && ").at(-1);
+    assert.ok(cleanup);
+    const command = cleanup.replaceAll("/workspace", "$CI_TEST_WORKSPACE");
+    const runCleanup = async (repopulations: number) => {
+      const workspace = await mkdtemp(resolve(tmpdir(), "nanocodex-ci-cleanup-race-"));
+      workspaces.push(workspace);
+      const retainedPaths = [
+        ...BINDINGS_PROJECTS.map((project) => `${project}/node_modules`),
+        "js/bindings/pkg-node",
+        "js/bindings/pkg-web",
+      ];
+      await Promise.all([
+        ...retainedPaths.map((path) => mkdir(resolve(workspace, path), { recursive: true })),
+        mkdir(
+          resolve(workspace, ".cargo-home/vendor/bitcoin_hashes-0.14.101"),
+          { recursive: true },
+        ),
+      ]);
+      await Promise.all([
+        ...retainedPaths.map((path) =>
+          writeFile(resolve(workspace, path, "retained.txt"), `${path}\n`)
+        ),
+        writeFile(
+          resolve(workspace, ".cargo-home/vendor/bitcoin_hashes-0.14.101/source"),
+          "remove me\n",
+        ),
+      ]);
+      const attempts = resolve(executableDirectory, `attempts-${repopulations}`);
+      const result = spawnSync("bash", ["-c", command], {
+        cwd: workspace,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          CI_TEST_REAL_RM: realRm.stdout.trim(),
+          CI_TEST_RM_ATTEMPTS: attempts,
+          CI_TEST_RM_REPOPULATIONS: String(repopulations),
+          CI_TEST_WORKSPACE: workspace,
+          PATH: `${executableDirectory}:${process.env.PATH}`,
+        },
+      });
+      return { attempts, result, retainedPaths, workspace };
+    };
+
+    const transient = await runCleanup(1);
+    assert.equal(transient.result.status, 0, transient.result.stderr);
+    assert.equal(await readFile(transient.attempts, "utf8"), "2\n");
+    for (const path of transient.retainedPaths) {
+      assert.equal(
+        await readFile(resolve(transient.workspace, path, "retained.txt"), "utf8"),
+        `${path}\n`,
+      );
+    }
+    await assert.rejects(stat(resolve(transient.workspace, ".cargo-home")));
+    await assert.rejects(stat(resolve(transient.workspace, ".ci-cache-staging")));
+
+    const persistent = await runCleanup(10);
+    assert.equal(persistent.result.status, 1, persistent.result.stderr);
+    assert.match(persistent.result.stderr, /bitcoin_hashes-0\.14\.101.*Directory not empty/);
+    assert.equal(await readFile(persistent.attempts, "utf8"), "3\n");
+    for (const path of persistent.retainedPaths) {
+      assert.equal(
+        await readFile(
+          resolve(persistent.workspace, ".ci-cache-staging", path, "retained.txt"),
+          "utf8",
+        ),
+        `${path}\n`,
+      );
+    }
+    await assert.rejects(
+      stat(resolve(persistent.workspace, "js/bindings/node_modules/retained.txt")),
+    );
+  } finally {
+    await Promise.all([
+      ...workspaces.map((workspace) => rm(workspace, { recursive: true, force: true })),
+      rm(executableDirectory, { recursive: true, force: true }),
+    ]);
+  }
+});
+
 test("the website snapshot drops Cargo and unrelated package roots", async () => {
   const directory = await mkdtemp(resolve(tmpdir(), "nanocodex-ci-web-cache-"));
   try {
