@@ -500,9 +500,25 @@ test("release asset validation accepts only a complete thin 64-bit arm64 Mach-O"
   }
 });
 
+test("sandbox permits writes only to the literal null device outside the job", () => {
+  const profile = createSandboxProfile({
+    jobDirectory: "/private/tmp/nanocodex-ci-job",
+    runtime: {
+      realHome: "/Users/nanocodex-ci",
+      toolchainDirectory: "/Users/nanocodex-ci/.rustup/toolchains/pinned",
+    },
+    networkAccess: false,
+  });
+  assert.deepEqual(
+    profile.split("\n").filter((line) => line.startsWith("(allow file-write") && line.includes("/dev")),
+    ['(allow file-write-data (literal "/dev/null"))'],
+  );
+  assert.doesNotMatch(profile, /\(allow file-write\* \(subpath "\/dev"\)\)/);
+});
+
 test("darwin sandbox hides operator state and runs only the pinned temporary Cargo environment", {
   skip: platform() !== "darwin" || arch() !== "arm64",
-  timeout: 30_000,
+  timeout: 60_000,
 }, async () => {
   const ambientHome = process.env.HOME;
   process.env.HOME = "/tmp/untrusted-runner-home";
@@ -538,6 +554,7 @@ test("darwin sandbox hides operator state and runs only the pinned temporary Car
         '[package]\nname = "sandbox-probe"\nversion = "0.1.0"\nedition = "2024"\n',
       ),
       writeFile(join(workspace, "src/main.rs"), "fn main() {}\n"),
+      writeFile(join(workspace, "clang-probe.c"), "int main(void) { return 0; }\n"),
     ]);
     const profile = createSandboxProfile({ jobDirectory: directory, runtime });
     const nativeProfile = createSandboxProfile({
@@ -552,6 +569,8 @@ test("darwin sandbox hides operator state and runs only the pinned temporary Car
     for (const policy of [profile, nativeProfile]) {
       assert.match(policy, /\(deny process-info\*\)/);
       assert.match(policy, /\(deny process-info-setcontrol\)/);
+      assert.match(policy, /^\(allow file-write-data \(literal "\/dev\/null"\)\)$/m);
+      assert.doesNotMatch(policy, /\(allow file-write\* \(subpath "\/dev"\)\)/);
       assert.match(policy, /SecurityServer/);
       assert.doesNotMatch(policy, /\(allow default\)/);
     }
@@ -629,6 +648,24 @@ test("darwin sandbox hides operator state and runs only the pinned temporary Car
 
     const profileMutation = await run("/usr/bin/touch", [nativeProfilePath]);
     assert.notEqual(profileMutation.exitCode, 0);
+
+    const nullWrite = await run("/bin/sh", ["-c", "printf discarded > /dev/null"]);
+    assert.equal(nullWrite.exitCode, 0, nullWrite.stderr.body.toString("utf8"));
+
+    const otherDeviceWrite = await run("/bin/sh", ["-c", "printf denied > /dev/zero"]);
+    assert.notEqual(otherDeviceWrite.exitCode, 0);
+    assert.match(otherDeviceWrite.stderr.body.toString("utf8"), /Operation not permitted/);
+
+    const clangOutput = join(workspace, "clang-probe");
+    const clang = await run("/usr/bin/clang", [
+      "-Werror",
+      join(workspace, "clang-probe.c"),
+      "-o",
+      clangOutput,
+    ]);
+    assert.equal(clang.exitCode, 0, clang.stderr.body.toString("utf8"));
+    const linkedProbe = await run(clangOutput, []);
+    assert.equal(linkedProbe.exitCode, 0, linkedProbe.stderr.body.toString("utf8"));
 
     const environment = await run("/usr/bin/env", []);
     assert.equal(environment.exitCode, 0);

@@ -361,6 +361,8 @@ export function createSandboxProfile({ jobDirectory, runtime, networkAccess = tr
     `(deny file-read* (subpath ${home}))`,
     `(allow file-read* (subpath ${toolchain}))`,
     `(allow file-write* (subpath ${job}))`,
+    "; Apple's clang driver probes Xcode with stderr redirected to this one discard device.",
+    '(allow file-write-data (literal "/dev/null"))',
     "",
     ...(networkAccess
       ? [
