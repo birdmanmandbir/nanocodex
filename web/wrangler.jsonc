@@ -323,13 +323,7 @@
       "secrets": {
         "required": ["GIT_MIRROR_TOKEN", "CI_MASTER_SOURCE_WRITE_TOKEN", "CI_PR_SOURCE_WRITE_TOKEN", "CI_CONTROL_TOKEN", "CI_MACOS_RUNNER_TOKEN", "CI_RELEASE_TOKEN", "NANOCODEX_SANDBOX_CONTROL_TOKEN", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"]
       },
-      "services": [
-        {
-          "binding": "MULTIPLAYER_BACKEND",
-          "service": "nanocodex-durable-agent",
-          "remote": true
-        }
-      ],
+      "services": [],
       "durable_objects": {
         "bindings": [
           { "name": "BYOK_SESSIONS", "class_name": "ByokSession" },

@@ -128,6 +128,11 @@ test("preview isolates every stateful binding from production and local developm
   assert.equal(preview.vars.CLOUDFLARE_ACCOUNT_ID, "16ce0442a940f01beefdb15a196a43ea");
   assert.deepEqual(preview.triggers.crons, []);
   assert.deepEqual(preview.secrets.required, config.secrets.required);
+  assert.deepEqual(
+    preview.services,
+    [],
+    "the isolated CI preview must not depend on the production multiplayer backend",
+  );
   assert.equal(preview.r2_buckets.some(({ remote }: { remote?: boolean }) => remote), false);
   assert.equal(preview.d1_databases.some(({ remote }: { remote?: boolean }) => remote), false);
 });
