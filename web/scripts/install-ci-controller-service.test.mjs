@@ -28,6 +28,10 @@ import {
   PR_PREP_HELPER_SHA256,
   PR_PREP_HELPER_VERSION,
   PR_PREP_NODE_MAX_BYTES,
+  PR_PREP_RUSTC_MANIFEST_PATH,
+  PR_PREP_RUSTC_PATH,
+  PR_PREP_RUSTC_RELEASE,
+  PR_PREP_RUSTC_ROOT,
   PR_FORBIDDEN_SECRET_KEYS,
   RETAINED_LOG_BYTES,
   ROLE_KEYCHAIN_ACCOUNTS,
@@ -56,6 +60,7 @@ import {
   parseLocalGroupIdentityList,
   parseMacOsPasswdRecord,
   parseNumericGroupList,
+  parsePrPrepRustcManifest,
   parsePrPrepDirectoryGroupRecord,
   parsePrPrepDirectoryUserRecord,
   parseUnavoidableMacOsGroupRecord,
@@ -65,6 +70,7 @@ import {
   renderLaunchAgentPlist,
   renderLiveEnvironmentProbeProgram,
   renderPrPrepProvisioning,
+  renderPrPrepRustcProvisioningValidationProgram,
   renderPrPrepRuntimeValidationProgram,
   renderPrPrepSudoersRule,
   runGeneratedWrapperProbe,
@@ -86,10 +92,12 @@ import {
   validatePrPrepHelperSnapshot,
   validatePrPrepNodeSnapshot,
   validatePrPrepProbe,
+  validatePrPrepRustcBundleSnapshot,
   validatePrPrepSudoEvidence,
   validatePrPrepSudoPolicy,
   validatePrPrepUsername,
   validateRecordedPrPrepIdentity,
+  validateRustcVersionOutput,
   validateRole,
   validateServicePaths,
   prPrepSudoArguments,
@@ -108,6 +116,29 @@ const ACCOUNT_ID = "0123456789abcdef0123456789abcdef";
 const PREP_GENERATED_UID = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE";
 const PREP_GROUP_GENERATED_UID = "BBBBBBBB-CCCC-DDDD-EEEE-FFFFFFFFFFFF";
 const CARGO_SHA256 = "c".repeat(64);
+const RUSTC_DRIVER = "librustc_driver-4031c0ff8e88f5d1.dylib";
+const RUSTC_MANIFEST_VALUE = {
+  version: 1,
+  release: PR_PREP_RUSTC_RELEASE,
+  host: "aarch64-apple-darwin",
+  files: [
+    { path: "bin/rustc", size: 400_000, sha256: "1".repeat(64) },
+    { path: "lib/libLLVM.dylib", size: 140_000_000, sha256: "2".repeat(64) },
+    { path: `lib/${RUSTC_DRIVER}`, size: 83_000_000, sha256: "3".repeat(64) },
+  ],
+};
+const RUSTC_MANIFEST_TEXT = JSON.stringify(RUSTC_MANIFEST_VALUE) + "\n";
+const RUSTC_MANIFEST_SHA256 = createHash("sha256")
+  .update(RUSTC_MANIFEST_TEXT)
+  .digest("hex");
+const RUSTC_VERSION_OUTPUT = `rustc ${PR_PREP_RUSTC_RELEASE} (88d9e12ae 2026-08-18)
+binary: rustc
+commit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea
+commit-date: 2026-08-18
+host: aarch64-apple-darwin
+release: ${PR_PREP_RUSTC_RELEASE}
+LLVM version: 22.1.8
+`;
 const CARGO_VERSION_OUTPUT = `cargo ${PR_PREP_CARGO_RELEASE} (012345678 2026-08-01)
 release: ${PR_PREP_CARGO_RELEASE}
 commit-hash: 0123456789abcdef0123456789abcdef01234567
@@ -215,6 +246,8 @@ test("role, host, origin, account, path, and lifecycle arguments are strict", ()
     PREP_USERNAME,
     "--cargo-sha256",
     CARGO_SHA256,
+    "--rustc-manifest-sha256",
+    RUSTC_MANIFEST_SHA256,
   ]), {
     command: "update",
     role: "pr",
@@ -226,6 +259,7 @@ test("role, host, origin, account, path, and lifecycle arguments are strict", ()
     cloudflareAccountId: undefined,
     prepUsername: PREP_USERNAME,
     cargoSha256: CARGO_SHA256,
+    rustcManifestSha256: RUSTC_MANIFEST_SHA256,
     replaceSecrets: true,
   });
   assert.deepEqual(parseCliArguments(["status", "--role", "pr"]), {
@@ -278,7 +312,7 @@ test("role, host, origin, account, path, and lifecycle arguments are strict", ()
     "/opt/node/bin/node",
     "--repo",
     "/Users/ci/nanocodex",
-  ]), /requires --prep-user and --cargo-sha256/);
+  ]), /requires --prep-user, --cargo-sha256, and --rustc-manifest-sha256/);
   assert.throws(() => parseCliArguments([
     "install",
     "--role",
@@ -306,7 +340,24 @@ test("role, host, origin, account, path, and lifecycle arguments are strict", ()
     "/opt/node/bin/node",
     "--repo",
     "/Users/ci/nanocodex",
-  ]), /update pr requires --prep-user and --cargo-sha256/);
+  ]), /update pr requires --prep-user, --cargo-sha256, and --rustc-manifest-sha256/);
+  assert.throws(() => parseCliArguments([
+    "install",
+    "--role",
+    "master",
+    "--origin",
+    "https://ci.example.test",
+    "--node",
+    "/opt/node/bin/node",
+    "--repo",
+    "/Users/ci/nanocodex",
+    "--rustsec-repo",
+    "/Users/ci/advisory-db",
+    "--cloudflare-account-id",
+    ACCOUNT_ID,
+    "--rustc-manifest-sha256",
+    RUSTC_MANIFEST_SHA256,
+  ]), /rustc-manifest-sha256.*forbidden for the master role/);
   assert.throws(
     () => parseCliArguments(["status", "--role", "pr", "--prep-user", PREP_USERNAME]),
     /status requires --role/,
@@ -1000,10 +1051,16 @@ test("generated wrappers preserve the empty boundary, load only role Keychain it
   assert.match(prWrapper, /--version.*--verbose/);
   assert.match(prWrapper, new RegExp(PR_PREP_CARGO_PATH.replaceAll(".", "\\.")));
   assert.match(prWrapper, new RegExp(CARGO_SHA256));
+  assert.match(prWrapper, new RegExp(PR_PREP_RUSTC_PATH.replaceAll(".", "\\.")));
+  assert.match(prWrapper, new RegExp(RUSTC_MANIFEST_SHA256));
+  assert.match(prWrapper, /O_NOFOLLOW/);
+  assert.match(prWrapper, /\["-vV"\]/);
+  assert.match(prWrapper, /libLLVM\.dylib/);
+  assert.match(prWrapper, /librustc_driver-/);
   assert.ok(
     prWrapper.indexOf("Matching Defaults entries for") <
       prWrapper.indexOf("find-generic-password"),
-    "the complete sudo/account/helper/Cargo validation must succeed before Keychain",
+    "the complete sudo/account/helper/Cargo/rustc validation must succeed before Keychain",
   );
   assert.match(prWrapper, /credentialEnvironmentNames/);
   assert.match(prWrapper, new RegExp(PR_PREP_HELPER_VERSION.replaceAll(".", "\\.")));
@@ -1016,7 +1073,7 @@ test("generated wrappers preserve the empty boundary, load only role Keychain it
 test("failed empty-environment preparation probe exits before a credential reader can run", async () => {
   const wrapper = renderControllerWrapper(fixtureConfiguration("pr"));
   const probeIndex = wrapper.indexOf("Matching Defaults entries for");
-  const failureIndex = wrapper.indexOf("account or helper identity drifted");
+  const failureIndex = wrapper.indexOf("account, helper, or rustc bundle identity drifted");
   const keychainIndex = wrapper.indexOf("find-generic-password");
   assert.ok(probeIndex >= 0 && probeIndex < failureIndex && failureIndex < keychainIndex);
 
@@ -1048,6 +1105,43 @@ test("failed empty-environment preparation probe exits before a credential reade
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }
+});
+
+test("PR lifecycle defers co-location Keychain probes until prep and rustc validation", async () => {
+  const source = await readFile(
+    resolve(TEST_DIRECTORY, "install-ci-controller-service.mjs"),
+    "utf8",
+  );
+  const install = source.slice(
+    source.indexOf("async function installOrUpdate("),
+    source.indexOf("async function serviceStatus("),
+  );
+  const installRuntime = install.indexOf("const runtime = await validateTrustedRuntime(");
+  const installKeychainAudit = install.lastIndexOf(
+    "await assertNoColocatedRole(options.role, context);",
+  );
+  const installSecretRead = install.indexOf("await keychainItemExists(");
+  assert.ok(
+    installRuntime >= 0 && installRuntime < installKeychainAudit &&
+      installKeychainAudit < installSecretRead,
+  );
+
+  const status = source.slice(
+    source.indexOf("async function serviceStatus("),
+    source.indexOf("async function validateInstallerRepository("),
+  );
+  const statusRuntime = status.indexOf("prPrep = await validatePrPrepRuntime(");
+  const missingBoundary = status.indexOf(
+    "PR status refuses Keychain inspection without an installed, validated prep boundary",
+  );
+  const statusKeychainAudit = status.lastIndexOf(
+    "await assertNoColocatedRole(role, context);",
+  );
+  const statusSecretRead = status.indexOf("const keychainEntries = await Promise.all(");
+  assert.ok(
+    statusRuntime >= 0 && statusRuntime < missingBoundary &&
+      missingBoundary < statusKeychainAudit && statusKeychainAudit < statusSecretRead,
+  );
 });
 
 test("Keychain and launchctl helpers carry names but never values or controller locks", () => {
@@ -1274,13 +1368,20 @@ test("sudo provisioning embeds pinned bytes and audits the complete effective po
     controllerUsername: USERNAME,
     prepUsername: PREP_USERNAME,
     nodeBinary: node,
+    trustedNode: {
+      ...fixturePrPrepIdentity().node,
+      path: node,
+    },
     helperPayload,
     cargoSha256: CARGO_SHA256,
+    rustcManifestSha256: RUSTC_MANIFEST_SHA256,
+    hostArchitecture: "arm64",
   });
   assert.match(provisioning, /Four identities stay distinct/);
   assert.match(provisioning, /Never reuse a controller, runner, root, admin, guest, or shared account/);
   assert.match(provisioning, /Never chown\/chmod the PR checkout/);
   assert.match(provisioning, new RegExp(PR_PREP_CARGO_PATH.replaceAll(".", "\\.")));
+  assert.match(provisioning, new RegExp(PR_PREP_RUSTC_ROOT.replaceAll(".", "\\.")));
   assert.match(provisioning, /Defaults:ci-controller env_reset/);
   assert.match(provisioning, /Defaults:ci-controller !setenv/);
   assert.match(provisioning, /Defaults:ci-controller timestamp_timeout=0/);
@@ -1288,8 +1389,10 @@ test("sudo provisioning embeds pinned bytes and audits the complete effective po
   assert.match(provisioning, /\/usr\/bin\/shasum -a 256 <&3/);
   assert.match(provisioning, /\/usr\/bin\/shasum -a 256 <&5/);
   assert.match(provisioning, /\/usr\/bin\/shasum -a 256 <&6/);
+  assert.match(provisioning, /\/usr\/bin\/shasum -a 256 <&7/);
   assert.match(provisioning, new RegExp(PR_PREP_HELPER_SHA256));
   assert.match(provisioning, new RegExp(CARGO_SHA256));
+  assert.match(provisioning, new RegExp(RUSTC_MANIFEST_SHA256));
   assert.doesNotMatch(provisioning, new RegExp(helperPath.replaceAll("/", "\\/")));
   assert.equal(provisioning.includes(helperPath), false);
   assert.doesNotMatch(provisioning, /trustedHelperPath|\/Users\/ci-controller\/trusted/);
@@ -1298,12 +1401,19 @@ test("sudo provisioning embeds pinned bytes and audits the complete effective po
   assert.match(provisioning, /visudo -cf "\$NANOCODEX_SUDOERS_TMP"/);
   assert.match(provisioning, /\/bin\/mv -f "\$NANOCODEX_SUDOERS_TMP" '\/private\/etc\/sudoers\.d\//);
   assert.doesNotMatch(provisioning, /\/bin\/cat > '\/private\/etc\/sudoers\.d/);
-  assert.match(provisioning, /Uninstall deliberately leaves the account, helper, and sudoers file/);
+  assert.match(
+    provisioning,
+    /Uninstall deliberately leaves the account, helper, Cargo, rustc bundle, and sudoers file/,
+  );
   assert.deepEqual(prPrepOperatorCleanup(), {
     prepAccountPreserved: true,
     helperPreserved: PR_PREP_HELPER_PATH,
+    cargoPreserved: PR_PREP_CARGO_PATH,
+    rustcBundlePreserved: PR_PREP_RUSTC_ROOT,
     sudoersPreserved: true,
-    instruction: "root must separately remove the dedicated account, helper, and sudoers rule",
+    instruction:
+      "root must separately remove the dedicated account, helper, Cargo, rustc bundle, " +
+        "and sudoers rule",
   });
   const syntax = spawnSync("/bin/sh", ["-n"], { input: provisioning, encoding: "utf8" });
   assert.equal(syntax.status, 0, syntax.stderr);
@@ -1314,6 +1424,45 @@ test("sudo provisioning embeds pinned bytes and audits the complete effective po
   const embedded = Buffer.from(encoded[1].replaceAll("\n", ""), "base64");
   assert.equal(createHash("sha256").update(embedded).digest("hex"), PR_PREP_HELPER_SHA256);
   assert.deepEqual(embedded, helperPayload.bytes);
+  const rustcProvisioningProgram = renderPrPrepRustcProvisioningValidationProgram({
+    trustedManifestSha256: RUSTC_MANIFEST_SHA256,
+    hostArchitecture: "arm64",
+  });
+  const rustcProgramSyntax = spawnSync(process.execPath, ["--check"], {
+    input: rustcProvisioningProgram,
+    encoding: "utf8",
+  });
+  assert.equal(rustcProgramSyntax.status, 0, rustcProgramSyntax.stderr);
+  assert.match(rustcProvisioningProgram, /O_NOFOLLOW/);
+  assert.match(rustcProvisioningProgram, /-vV/);
+  assert.equal(
+    [...rustcProvisioningProgram.matchAll(/opened\(root\+"\/"\+files\[i\]\.path/g)].length,
+    2,
+    "root provisioning must re-open every compiler file after rustc executes",
+  );
+  const nodeAttestation = "assert_nanocodex_root_node '/opt/trusted/node'";
+  const firstNodeAttestation = provisioning.indexOf(nodeAttestation);
+  const rustcProbe = provisioning.indexOf("--eval");
+  const secondNodeAttestation = provisioning.indexOf(
+    nodeAttestation,
+    firstNodeAttestation + 1,
+  );
+  assert.ok(firstNodeAttestation >= 0 && firstNodeAttestation < rustcProbe);
+  assert.ok(secondNodeAttestation > rustcProbe);
+  assert.throws(
+    () => renderPrPrepProvisioning({
+      controllerUsername: USERNAME,
+      prepUsername: PREP_USERNAME,
+      nodeBinary: node,
+      trustedNode: { ...fixturePrPrepIdentity().node, path: node, uid: 501 },
+      helperPayload,
+      cargoSha256: CARGO_SHA256,
+      rustcManifestSha256: RUSTC_MANIFEST_SHA256,
+      hostArchitecture: "arm64",
+    }),
+    /captured root-owned Node file identity/,
+  );
+  assert.match(rustcProvisioningProgram, new RegExp(RUSTC_MANIFEST_SHA256));
 
   const probeValue = {
     credentialEnvironmentNames: [],
@@ -1704,7 +1853,114 @@ test("fixed Cargo attestation pins root chain, executable bytes, release, and ho
   );
 });
 
-test("recorded PR preparation identity detects status/update drift in account, helper, Node, and sudo policy", () => {
+test("fixed rustc bundle pins canonical manifest, exact entries, every file, and -vV identity", () => {
+  assert.deepEqual(
+    parsePrPrepRustcManifest(RUSTC_MANIFEST_TEXT, RUSTC_MANIFEST_SHA256, "arm64"),
+    {
+      ...RUSTC_MANIFEST_VALUE,
+      files: RUSTC_MANIFEST_VALUE.files,
+      sha256: RUSTC_MANIFEST_SHA256,
+      text: RUSTC_MANIFEST_TEXT,
+    },
+  );
+  assert.deepEqual(validateRustcVersionOutput(RUSTC_VERSION_OUTPUT, "arm64"), {
+    release: PR_PREP_RUSTC_RELEASE,
+    host: "aarch64-apple-darwin",
+    llvmVersion: "22.1.8",
+    output: RUSTC_VERSION_OUTPUT,
+  });
+  const x64ManifestValue = {
+    ...RUSTC_MANIFEST_VALUE,
+    host: "x86_64-apple-darwin",
+  };
+  const x64ManifestText = JSON.stringify(x64ManifestValue) + "\n";
+  assert.equal(
+    parsePrPrepRustcManifest(
+      x64ManifestText,
+      createHash("sha256").update(x64ManifestText).digest("hex"),
+      "x64",
+    ).host,
+    "x86_64-apple-darwin",
+  );
+  assert.equal(
+    validateRustcVersionOutput(
+      RUSTC_VERSION_OUTPUT.replace("aarch64-apple-darwin", "x86_64-apple-darwin"),
+      "x64",
+    ).host,
+    "x86_64-apple-darwin",
+  );
+  const safe = fixtureRustcBundleSnapshot();
+  assert.deepEqual(
+    validatePrPrepRustcBundleSnapshot(
+      safe,
+      RUSTC_MANIFEST_SHA256,
+      RUSTC_VERSION_OUTPUT,
+      "arm64",
+    ),
+    fixtureRustcBundleIdentity(),
+  );
+  for (const [name, mutate] of [
+    ["extra root entry", (value) => { value.entries.root.push("mutable"); }],
+    ["second driver", (value) => { value.entries.lib.push("librustc_driver-deadbeef.dylib"); }],
+    ["writable root", (value) => { value.directories.root.mode = 0o755; }],
+    ["wrong non-writable root mode", (value) => { value.directories.root.mode = 0o545; }],
+    ["directory ACL", (value) => { value.directories.lib.accessControlList = true; }],
+    ["manifest symlink", (value) => { value.manifest.symbolicLink = true; }],
+    ["manifest hard link", (value) => { value.manifest.nlink = 2; }],
+    ["manifest owner", (value) => { value.manifest.uid = 501; }],
+    ["manifest writable", (value) => { value.manifest.mode = 0o644; }],
+    ["wrong non-writable manifest mode", (value) => { value.manifest.mode = 0o404; }],
+    ["compiler not executable", (value) => { value.files[0].mode = 0o444; }],
+    ["wrong non-writable compiler mode", (value) => { value.files[0].mode = 0o515; }],
+    ["library writable", (value) => { value.files[1].mode = 0o644; }],
+    ["driver hash", (value) => { value.files[2].sha256 = "4".repeat(64); }],
+    ["parent ACL", (value) => { value.parents[1].accessControlList = true; }],
+  ]) {
+    const changed = structuredClone(safe);
+    mutate(changed);
+    assert.throws(
+      () => validatePrPrepRustcBundleSnapshot(
+        changed,
+        RUSTC_MANIFEST_SHA256,
+        RUSTC_VERSION_OUTPUT,
+        "arm64",
+      ),
+      /rustc|manifest|compiler file set|root-owned/i,
+      name,
+    );
+  }
+  const reordered = JSON.stringify({
+    release: PR_PREP_RUSTC_RELEASE,
+    version: 1,
+    host: "aarch64-apple-darwin",
+    files: RUSTC_MANIFEST_VALUE.files,
+  }) + "\n";
+  assert.throws(
+    () => parsePrPrepRustcManifest(
+      reordered,
+      createHash("sha256").update(reordered).digest("hex"),
+      "arm64",
+    ),
+    /canonical release, host, or shape/,
+  );
+  assert.throws(
+    () => parsePrPrepRustcManifest(
+      RUSTC_MANIFEST_TEXT,
+      "f".repeat(64),
+      "arm64",
+    ),
+    /reviewed SHA-256/,
+  );
+  assert.throws(
+    () => validateRustcVersionOutput(
+      RUSTC_VERSION_OUTPUT.replace("aarch64-apple-darwin", "x86_64-apple-darwin"),
+      "arm64",
+    ),
+    /canonical release/,
+  );
+});
+
+test("recorded PR preparation identity detects status/update rustc and existing boundary drift", () => {
   const installed = fixturePrPrepIdentity();
   assert.deepEqual(validateRecordedPrPrepIdentity(installed), installed);
   assert.deepEqual(assertPrPrepIdentityUnchanged(installed, installed), installed);
@@ -1722,6 +1978,12 @@ test("recorded PR preparation identity detects status/update drift in account, h
     ["Cargo hash", (value) => { value.cargo.sha256 = "d".repeat(64); }],
     ["Cargo owner", (value) => { value.cargo.gid = 20; }],
     ["Cargo version", (value) => { value.cargo.release = "1.97.0"; }],
+    ["rustc root inode", (value) => { value.rustc.root.inode += 1; }],
+    ["rustc manifest hash", (value) => { value.rustc.manifest.sha256 = "4".repeat(64); }],
+    ["rustc compiler inode", (value) => { value.rustc.files[0].inode += 1; }],
+    ["rustc LLVM writable", (value) => { value.rustc.files[1].mode = 0o644; }],
+    ["rustc driver hash", (value) => { value.rustc.files[2].sha256 = "5".repeat(64); }],
+    ["rustc host", (value) => { value.rustc.host = "x86_64-apple-darwin"; }],
     ["Node inode", (value) => { value.node.inode += 1; }],
     ["Node hash", (value) => { value.node.sha256 = "f".repeat(64); }],
     ["Node owner", (value) => { value.node.uid = 501; }],
@@ -1739,7 +2001,7 @@ test("recorded PR preparation identity detects status/update drift in account, h
     mutate(changed);
     assert.throws(
       () => assertPrPrepIdentityUnchanged(changed, installed),
-      /drifted|invalid|incomplete|root or the controller UID|dedicated-group boundary|same-name|Cargo|Node/,
+      /drifted|invalid|incomplete|root or the controller UID|dedicated-group boundary|same-name|Cargo|rustc|Node/,
       name,
     );
   }
@@ -2085,7 +2347,10 @@ test("probe result validation and runbooks fail closed without exposing secret v
   assert.match(prRunbook, new RegExp(PR_PREP_HELPER_PATH.replaceAll(".", "\\.")));
   assert.match(prRunbook, new RegExp(PR_PREP_CARGO_PATH.replaceAll(".", "\\.")));
   assert.match(prRunbook, /before its first Keychain read/);
-  assert.match(prRunbook, /Uninstall never removes the prep account, helper, or sudoers rule/);
+  assert.match(
+    prRunbook,
+    /Uninstall never removes the prep account, helper, Cargo, rustc bundle, or sudoers rule/,
+  );
   assert.match(prRunbook, /controller owns no persistent Cargo state/);
   assert.doesNotMatch(
     prRunbook,
@@ -2174,6 +2439,7 @@ function fixturePrPrepIdentity() {
       host: "aarch64-apple-darwin",
       versionOutput: CARGO_VERSION_OUTPUT,
     },
+    rustc: fixtureRustcBundleIdentity(),
     node: {
       path: "/opt/trusted/node",
       device: 1,
@@ -2196,6 +2462,50 @@ function fixturePrPrepIdentity() {
       nopasswd: true,
       timestampTimeoutZero: true,
     },
+  };
+}
+
+function fixtureRustcBundleIdentity() {
+  const directory = (path, inode) => ({
+    path,
+    device: 1,
+    inode,
+    uid: 0,
+    gid: 0,
+    mode: 0o555,
+    nlink: 2,
+  });
+  return {
+    root: directory(PR_PREP_RUSTC_ROOT, 10),
+    bin: directory(resolve(PR_PREP_RUSTC_ROOT, "bin"), 11),
+    lib: directory(resolve(PR_PREP_RUSTC_ROOT, "lib"), 12),
+    manifest: {
+      path: PR_PREP_RUSTC_MANIFEST_PATH,
+      device: 1,
+      inode: 13,
+      size: Buffer.byteLength(RUSTC_MANIFEST_TEXT),
+      sha256: RUSTC_MANIFEST_SHA256,
+      uid: 0,
+      gid: 0,
+      mode: 0o444,
+      nlink: 1,
+    },
+    files: RUSTC_MANIFEST_VALUE.files.map((entry, index) => ({
+      path: entry.path,
+      absolutePath: resolve(PR_PREP_RUSTC_ROOT, entry.path),
+      device: 1,
+      inode: 14 + index,
+      size: entry.size,
+      sha256: entry.sha256,
+      uid: 0,
+      gid: 0,
+      mode: index === 0 ? 0o555 : 0o444,
+      nlink: 1,
+    })),
+    release: PR_PREP_RUSTC_RELEASE,
+    host: "aarch64-apple-darwin",
+    llvmVersion: "22.1.8",
+    versionOutput: RUSTC_VERSION_OUTPUT,
   };
 }
 
@@ -2253,6 +2563,72 @@ function fixtureCargoSnapshot(sha256) {
       size: 16 * 1024 * 1024,
       sha256,
     },
+  };
+}
+
+function fixtureRustcBundleSnapshot() {
+  const directory = (path, inode, mode) => ({
+    path,
+    canonicalPath: path,
+    kind: "directory",
+    symbolicLink: false,
+    uid: 0,
+    gid: 0,
+    specialMode: 0,
+    mode,
+    nlink: 2,
+    inode,
+    device: 1,
+    size: 0,
+    accessControlList: false,
+  });
+  const file = (path, inode, size, sha256, mode) => ({
+    path,
+    canonicalPath: path,
+    kind: "file",
+    symbolicLink: false,
+    uid: 0,
+    gid: 0,
+    specialMode: 0,
+    mode,
+    nlink: 1,
+    inode,
+    device: 1,
+    size,
+    sha256,
+    accessControlList: false,
+  });
+  return {
+    parents: [
+      directory("/", 1, 0o755),
+      directory("/Library", 2, 0o755),
+      directory("/Library/PrivilegedHelperTools", 3, 0o755),
+    ],
+    directories: {
+      root: directory(PR_PREP_RUSTC_ROOT, 10, 0o555),
+      bin: directory(resolve(PR_PREP_RUSTC_ROOT, "bin"), 11, 0o555),
+      lib: directory(resolve(PR_PREP_RUSTC_ROOT, "lib"), 12, 0o555),
+    },
+    entries: {
+      root: ["bin", "lib", "manifest.json"],
+      bin: ["rustc"],
+      lib: ["libLLVM.dylib", RUSTC_DRIVER],
+    },
+    manifest: file(
+      PR_PREP_RUSTC_MANIFEST_PATH,
+      13,
+      Buffer.byteLength(RUSTC_MANIFEST_TEXT),
+      RUSTC_MANIFEST_SHA256,
+      0o444,
+    ),
+    manifestText: RUSTC_MANIFEST_TEXT,
+    files: RUSTC_MANIFEST_VALUE.files.map((entry, index) => file(
+      resolve(PR_PREP_RUSTC_ROOT, entry.path),
+      14 + index,
+      entry.size,
+      entry.sha256,
+      index === 0 ? 0o555 : 0o444,
+    )),
   };
 }
 

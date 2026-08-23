@@ -55,13 +55,20 @@ export const PR_PREP_HELPER_PATH =
   "/Library/PrivilegedHelperTools/dev.nanocodex.ci-pr-cargo-builder";
 export const PR_PREP_CARGO_PATH =
   "/Library/PrivilegedHelperTools/dev.nanocodex.ci-cargo";
-export const PR_PREP_HELPER_VERSION = "2026-08-22.1";
+export const PR_PREP_RUSTC_ROOT =
+  "/Library/PrivilegedHelperTools/dev.nanocodex.ci-rustc-1.98.0";
+export const PR_PREP_RUSTC_MANIFEST_PATH = join(PR_PREP_RUSTC_ROOT, "manifest.json");
+export const PR_PREP_RUSTC_PATH = join(PR_PREP_RUSTC_ROOT, "bin", "rustc");
+export const PR_PREP_HELPER_VERSION = "2026-08-23.1";
 export const PR_PREP_HELPER_SHA256 =
-  "247a453952f53a03aa9189ced4fac97ef98ce6f8c6564d9472ece3127bf41a93";
+  "3ae5886e583db72b6cbe84a27484c7f74798cef9bde17fd6a5288887455a1b72";
 export const PR_PREP_HELPER_MAX_BYTES = 1024 * 1024;
 export const PR_PREP_CARGO_MAX_BYTES = 128 * 1024 * 1024;
+export const PR_PREP_RUSTC_MANIFEST_MAX_BYTES = 16 * 1024;
+export const PR_PREP_RUSTC_FILE_MAX_BYTES = 256 * 1024 * 1024;
 export const PR_PREP_NODE_MAX_BYTES = 256 * 1024 * 1024;
 export const PR_PREP_CARGO_RELEASE = "1.98.0";
+export const PR_PREP_RUSTC_RELEASE = "1.98.0";
 export const PR_PREP_HOME_DIRECTORIES = Object.freeze([
   "/var/empty",
   "/private/var/empty",
@@ -1123,6 +1130,302 @@ export function validatePrPrepCargoSnapshot(
   });
 }
 
+export function parsePrPrepRustcManifest(
+  text,
+  trustedSha256,
+  hostArchitecture,
+) {
+  const trustedHash = validateSha256(
+    trustedSha256,
+    "trusted rustc bundle manifest SHA-256",
+  );
+  const expectedHost = rustcHostForArchitecture(hostArchitecture);
+  if (
+    typeof text !== "string" || text === "" || text.includes("\u0000") ||
+    text.includes("\r") || !text.endsWith("\n") ||
+    Buffer.byteLength(text) > PR_PREP_RUSTC_MANIFEST_MAX_BYTES ||
+    /[^\x20-\x7e\n]/.test(text)
+  ) {
+    throw new ControllerServiceConfigurationError(
+      "rustc bundle manifest must be bounded canonical ASCII JSON",
+    );
+  }
+  if (createHash("sha256").update(text).digest("hex") !== trustedHash) {
+    throw new ControllerServiceConfigurationError(
+      "rustc bundle manifest does not match its reviewed SHA-256",
+    );
+  }
+  let value;
+  try {
+    value = JSON.parse(text.slice(0, -1));
+  } catch (cause) {
+    throw new ControllerServiceConfigurationError(
+      "rustc bundle manifest is not JSON",
+      { cause },
+    );
+  }
+  if (
+    value == null || typeof value !== "object" || Array.isArray(value) ||
+    Object.keys(value).join("\0") !== "version\0release\0host\0files" ||
+    JSON.stringify(value) + "\n" !== text || value.version !== 1 ||
+    value.release !== PR_PREP_RUSTC_RELEASE || value.host !== expectedHost ||
+    !Array.isArray(value.files) || value.files.length !== 3
+  ) {
+    throw new ControllerServiceConfigurationError(
+      "rustc bundle manifest has the wrong canonical release, host, or shape",
+    );
+  }
+  const files = value.files.map((entry) => {
+    if (
+      entry == null || typeof entry !== "object" || Array.isArray(entry) ||
+      Object.keys(entry).join("\0") !== "path\0size\0sha256" ||
+      typeof entry.path !== "string" ||
+      !Number.isSafeInteger(entry.size) || entry.size <= 0 ||
+      entry.size > PR_PREP_RUSTC_FILE_MAX_BYTES ||
+      typeof entry.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(entry.sha256)
+    ) {
+      throw new ControllerServiceConfigurationError(
+        "rustc bundle manifest contains an invalid file identity",
+      );
+    }
+    return Object.freeze({
+      path: entry.path,
+      size: entry.size,
+      sha256: entry.sha256,
+    });
+  });
+  if (
+    files[0].path !== "bin/rustc" ||
+    files[1].path !== "lib/libLLVM.dylib" ||
+    !/^lib\/librustc_driver-[0-9a-f]+\.dylib$/.test(files[2].path) ||
+    files.some((entry, index) => index > 0 && entry.path <= files[index - 1].path)
+  ) {
+    throw new ControllerServiceConfigurationError(
+      "rustc bundle manifest must contain the exact sorted compiler file set",
+    );
+  }
+  return Object.freeze({
+    version: 1,
+    release: PR_PREP_RUSTC_RELEASE,
+    host: expectedHost,
+    files: Object.freeze(files),
+    sha256: trustedHash,
+    text,
+  });
+}
+
+export function validateRustcVersionOutput(output, hostArchitecture) {
+  const expectedHost = rustcHostForArchitecture(hostArchitecture);
+  if (
+    typeof output !== "string" || output === "" || output.includes("\u0000") ||
+    output.includes("\r") || !output.endsWith("\n") || output.length > 16 * 1024 ||
+    /[^\x20-\x7e\n]/.test(output)
+  ) {
+    throw new ControllerServiceConfigurationError("rustc version output is noncanonical");
+  }
+  const lines = output.slice(0, -1).split("\n");
+  if (lines.length !== 7) {
+    throw new ControllerServiceConfigurationError("rustc version identity is incomplete");
+  }
+  const first = new RegExp(
+    `^rustc ${PR_PREP_RUSTC_RELEASE.replaceAll(".", "\\.")} ` +
+      "\\(([a-f0-9]{9}) ([0-9]{4}-[0-9]{2}-[0-9]{2})\\)$",
+  ).exec(lines[0]);
+  const commitHash = /^commit-hash: ([a-f0-9]{40})$/.exec(lines[2])?.[1];
+  const commitDate = /^commit-date: ([0-9]{4}-[0-9]{2}-[0-9]{2})$/.exec(lines[3])?.[1];
+  const host = /^host: (\S+)$/.exec(lines[4])?.[1];
+  const release = /^release: (\S+)$/.exec(lines[5])?.[1];
+  const llvmVersion = /^LLVM version: ([0-9]+(?:\.[0-9]+){1,3}(?:[-+][A-Za-z0-9.-]+)?)$/
+    .exec(lines[6])?.[1];
+  if (
+    !first || lines[1] !== "binary: rustc" || commitHash == null ||
+    commitDate == null || host !== expectedHost || release !== PR_PREP_RUSTC_RELEASE ||
+    llvmVersion == null || !commitHash.startsWith(first[1]) || commitDate !== first[2]
+  ) {
+    throw new ControllerServiceConfigurationError(
+      `rustc must report canonical release ${PR_PREP_RUSTC_RELEASE} for ${expectedHost}`,
+    );
+  }
+  return Object.freeze({
+    release: PR_PREP_RUSTC_RELEASE,
+    host: expectedHost,
+    llvmVersion,
+    output,
+  });
+}
+
+export function validatePrPrepRustcBundleSnapshot(
+  snapshot,
+  trustedManifestSha256,
+  versionOutput,
+  hostArchitecture,
+) {
+  if (snapshot == null || typeof snapshot !== "object" || Array.isArray(snapshot)) {
+    throw new ControllerServiceConfigurationError("fixed rustc bundle snapshot is invalid");
+  }
+  const expectedParents = ["/", "/Library", "/Library/PrivilegedHelperTools"];
+  if (!Array.isArray(snapshot.parents) || snapshot.parents.length !== expectedParents.length) {
+    throw new ControllerServiceConfigurationError("fixed rustc parent chain is incomplete");
+  }
+  for (let index = 0; index < expectedParents.length; index += 1) {
+    validateRustcDirectorySnapshot(
+      snapshot.parents[index],
+      expectedParents[index],
+      "rustc parent",
+      { allowRootWrite: true },
+    );
+  }
+  const root = validateRustcDirectorySnapshot(
+    snapshot.directories?.root,
+    PR_PREP_RUSTC_ROOT,
+    "rustc bundle root",
+  );
+  const bin = validateRustcDirectorySnapshot(
+    snapshot.directories?.bin,
+    join(PR_PREP_RUSTC_ROOT, "bin"),
+    "rustc bundle bin directory",
+  );
+  const lib = validateRustcDirectorySnapshot(
+    snapshot.directories?.lib,
+    join(PR_PREP_RUSTC_ROOT, "lib"),
+    "rustc bundle lib directory",
+  );
+  const manifest = parsePrPrepRustcManifest(
+    snapshot.manifestText,
+    trustedManifestSha256,
+    hostArchitecture,
+  );
+  const expectedDriver = manifest.files[2].path.slice("lib/".length);
+  if (
+    !sameStringArray(snapshot.entries?.root, ["bin", "lib", "manifest.json"]) ||
+    !sameStringArray(snapshot.entries?.bin, ["rustc"]) ||
+    !sameStringArray(snapshot.entries?.lib, ["libLLVM.dylib", expectedDriver])
+  ) {
+    throw new ControllerServiceConfigurationError(
+      "rustc bundle contains an entry outside its exact manifest contract",
+    );
+  }
+  const manifestIdentity = validateRustcFileSnapshot(
+    snapshot.manifest,
+    PR_PREP_RUSTC_MANIFEST_PATH,
+    {
+      size: Buffer.byteLength(snapshot.manifestText),
+      sha256: manifest.sha256,
+      executable: false,
+    },
+    "rustc bundle manifest",
+  );
+  if (!Array.isArray(snapshot.files) || snapshot.files.length !== manifest.files.length) {
+    throw new ControllerServiceConfigurationError("rustc bundle file snapshots are incomplete");
+  }
+  const files = manifest.files.map((expected, index) => {
+    const actual = validateRustcFileSnapshot(
+      snapshot.files[index],
+      join(PR_PREP_RUSTC_ROOT, expected.path),
+      {
+        size: expected.size,
+        sha256: expected.sha256,
+        executable: expected.path === "bin/rustc",
+      },
+      `rustc bundle file ${expected.path}`,
+    );
+    return Object.freeze({
+      path: expected.path,
+      absolutePath: actual.path,
+      device: actual.device,
+      inode: actual.inode,
+      size: actual.size,
+      sha256: actual.sha256,
+      uid: actual.uid,
+      gid: actual.gid,
+      mode: actual.mode,
+      nlink: actual.nlink,
+    });
+  });
+  const version = validateRustcVersionOutput(versionOutput, hostArchitecture);
+  return Object.freeze({
+    root,
+    bin,
+    lib,
+    manifest: manifestIdentity,
+    files: Object.freeze(files),
+    release: version.release,
+    host: version.host,
+    llvmVersion: version.llvmVersion,
+    versionOutput: version.output,
+  });
+}
+
+function validateRustcDirectorySnapshot(entry, expectedPath, description, {
+  allowRootWrite = false,
+} = {}) {
+  if (
+    entry?.path !== expectedPath || entry.canonicalPath !== expectedPath ||
+    entry.kind !== "directory" || entry.symbolicLink !== false ||
+    entry.uid !== 0 || entry.gid !== 0 || entry.specialMode !== 0 ||
+    entry.accessControlList !== false || !validUnixMode(entry.mode) ||
+    (allowRootWrite
+      ? (entry.mode & 0o022) !== 0 || (entry.mode & 0o005) !== 0o005
+      : entry.mode !== 0o555) ||
+    !Number.isSafeInteger(entry.inode) || entry.inode <= 0 ||
+    !Number.isSafeInteger(entry.device) || entry.device < 0 ||
+    !Number.isSafeInteger(entry.nlink) || entry.nlink <= 0
+  ) {
+    throw new ControllerServiceConfigurationError(
+      `${description} must be a root-owned, root-group, no-ACL, real non-writable directory`,
+    );
+  }
+  return Object.freeze({
+    path: entry.path,
+    device: entry.device,
+    inode: entry.inode,
+    uid: entry.uid,
+    gid: entry.gid,
+    mode: entry.mode,
+    nlink: entry.nlink,
+  });
+}
+
+function validateRustcFileSnapshot(entry, expectedPath, expected, description) {
+  const expectedMode = expected.executable ? 0o555 : 0o444;
+  if (
+    entry?.path !== expectedPath || entry.canonicalPath !== expectedPath ||
+    entry.kind !== "file" || entry.symbolicLink !== false ||
+    entry.uid !== 0 || entry.gid !== 0 || entry.specialMode !== 0 ||
+    entry.accessControlList !== false || entry.nlink !== 1 ||
+    !validUnixMode(entry.mode) || entry.mode !== expectedMode ||
+    !Number.isSafeInteger(entry.inode) || entry.inode <= 0 ||
+    !Number.isSafeInteger(entry.device) || entry.device < 0 ||
+    entry.size !== expected.size || entry.sha256 !== expected.sha256
+  ) {
+    throw new ControllerServiceConfigurationError(
+      `${description} must match its singly linked root-owned manifest identity`,
+    );
+  }
+  return Object.freeze({
+    path: entry.path,
+    device: entry.device,
+    inode: entry.inode,
+    size: entry.size,
+    sha256: entry.sha256,
+    uid: entry.uid,
+    gid: entry.gid,
+    mode: entry.mode,
+    nlink: entry.nlink,
+  });
+}
+
+function rustcHostForArchitecture(hostArchitecture) {
+  if (hostArchitecture === "arm64") return "aarch64-apple-darwin";
+  if (hostArchitecture === "x64") return "x86_64-apple-darwin";
+  throw new ControllerServiceConfigurationError("unsupported rustc host architecture");
+}
+
+function sameStringArray(value, expected) {
+  return Array.isArray(value) && value.length === expected.length &&
+    value.every((entry, index) => entry === expected[index]);
+}
+
 export function validatePrPrepNodeSnapshot(snapshot, nodeBinary) {
   const nodePath = validateAbsolutePath(nodeBinary, "PR preparation Node binary");
   if (snapshot == null || typeof snapshot !== "object" || Array.isArray(snapshot)) {
@@ -1179,6 +1482,35 @@ export function validatePrPrepNodeSnapshot(snapshot, nodeBinary) {
   });
 }
 
+function validatePrPrepNodeFileIdentity(value, nodeBinary) {
+  const nodePath = validateAbsolutePath(nodeBinary, "PR preparation Node binary");
+  if (
+    value == null || typeof value !== "object" || Array.isArray(value) ||
+    value.path !== nodePath || value.uid !== 0 || value.gid !== 0 ||
+    !Number.isSafeInteger(value.device) || value.device < 0 ||
+    !Number.isSafeInteger(value.inode) || value.inode <= 0 ||
+    !Number.isSafeInteger(value.size) || value.size <= 0 ||
+    value.size > PR_PREP_NODE_MAX_BYTES || !/^[a-f0-9]{64}$/.test(value.sha256) ||
+    !validUnixMode(value.mode) || (value.mode & 0o001) === 0 ||
+    (value.mode & 0o022) !== 0 || value.nlink !== 1
+  ) {
+    throw new ControllerServiceConfigurationError(
+      "root provisioning requires the captured root-owned Node file identity",
+    );
+  }
+  return Object.freeze({
+    path: nodePath,
+    device: value.device,
+    inode: value.inode,
+    size: value.size,
+    sha256: value.sha256,
+    uid: 0,
+    gid: 0,
+    mode: value.mode,
+    nlink: 1,
+  });
+}
+
 export function validatePrPrepProbe(value, { uid, gid } = {}) {
   const expectedKeys = [
     "credentialEnvironmentNames",
@@ -1228,6 +1560,7 @@ export function validateRecordedPrPrepIdentity(value) {
     "nodeIdentity",
     "primaryGroupGeneratedUid",
     "primaryGroupName",
+    "rustc",
     "shell",
     "sudoProbe",
     "supplementaryGids",
@@ -1389,6 +1722,7 @@ export function validateRecordedPrPrepIdentity(value) {
   if (cargo.release !== cargoVersion.release || cargo.host !== cargoVersion.host) {
     throw new ControllerServiceConfigurationError("recorded fixed Cargo version identity is invalid");
   }
+  const rustc = validateRecordedRustcBundle(value.rustc, cargoArchitecture);
   if (
     value.sudoProbe == null ||
     typeof value.sudoProbe !== "object" ||
@@ -1421,6 +1755,7 @@ export function validateRecordedPrPrepIdentity(value) {
     helperVersion: value.helperVersion,
     helper: Object.freeze({ ...helper }),
     cargo: Object.freeze({ ...cargo }),
+    rustc,
     node: Object.freeze({ ...node }),
     nodeBinary,
     nodeIdentity: value.nodeIdentity,
@@ -1434,6 +1769,115 @@ export function validateRecordedPrPrepIdentity(value) {
       timestampTimeoutZero: true,
     }),
   });
+}
+
+function validateRecordedRustcBundle(value, hostArchitecture) {
+  const expectedKeys = [
+    "bin", "files", "host", "lib", "llvmVersion", "manifest", "release", "root",
+    "versionOutput",
+  ];
+  if (
+    value == null || typeof value !== "object" || Array.isArray(value) ||
+    Object.keys(value).sort().join("\0") !== expectedKeys.sort().join("\0")
+  ) {
+    throw new ControllerServiceConfigurationError(
+      "recorded rustc bundle identity has the wrong shape",
+    );
+  }
+  const directoryKeys = ["device", "gid", "inode", "mode", "nlink", "path", "uid"];
+  const directoryPaths = [
+    [value.root, PR_PREP_RUSTC_ROOT, "root"],
+    [value.bin, join(PR_PREP_RUSTC_ROOT, "bin"), "bin"],
+    [value.lib, join(PR_PREP_RUSTC_ROOT, "lib"), "lib"],
+  ];
+  const directories = {};
+  for (const [entry, expectedPath, name] of directoryPaths) {
+    if (
+      entry == null || typeof entry !== "object" || Array.isArray(entry) ||
+      Object.keys(entry).sort().join("\0") !== directoryKeys.join("\0") ||
+      entry.path !== expectedPath || entry.uid !== 0 || entry.gid !== 0 ||
+      !Number.isSafeInteger(entry.device) || entry.device < 0 ||
+      !Number.isSafeInteger(entry.inode) || entry.inode <= 0 ||
+      !Number.isSafeInteger(entry.nlink) || entry.nlink <= 0 ||
+      entry.mode !== 0o555
+    ) {
+      throw new ControllerServiceConfigurationError(
+        `recorded rustc bundle ${name} directory identity is invalid`,
+      );
+    }
+    directories[name] = Object.freeze({ ...entry });
+  }
+  const fileKeys = [
+    "device", "gid", "inode", "mode", "nlink", "path", "sha256", "size", "uid",
+  ];
+  const manifest = value.manifest;
+  if (
+    manifest == null || typeof manifest !== "object" || Array.isArray(manifest) ||
+    Object.keys(manifest).sort().join("\0") !== fileKeys.join("\0") ||
+    manifest.path !== PR_PREP_RUSTC_MANIFEST_PATH ||
+    !validRecordedRustcFileMetadata(manifest, { executable: false }) ||
+    manifest.size > PR_PREP_RUSTC_MANIFEST_MAX_BYTES
+  ) {
+    throw new ControllerServiceConfigurationError(
+      "recorded rustc bundle manifest identity is invalid",
+    );
+  }
+  const entryKeys = [
+    "absolutePath", "device", "gid", "inode", "mode", "nlink", "path", "sha256",
+    "size", "uid",
+  ];
+  if (!Array.isArray(value.files) || value.files.length !== 3) {
+    throw new ControllerServiceConfigurationError("recorded rustc bundle files are incomplete");
+  }
+  const expectedPaths = ["bin/rustc", "lib/libLLVM.dylib"];
+  const files = value.files.map((entry, index) => {
+    const relativePath = entry?.path;
+    if (
+      entry == null || typeof entry !== "object" || Array.isArray(entry) ||
+      Object.keys(entry).sort().join("\0") !== entryKeys.join("\0") ||
+      (index < 2
+        ? relativePath !== expectedPaths[index]
+        : !/^lib\/librustc_driver-[0-9a-f]+\.dylib$/.test(relativePath ?? "")) ||
+      entry.absolutePath !== join(PR_PREP_RUSTC_ROOT, relativePath ?? "") ||
+      !validRecordedRustcFileMetadata(entry, { executable: index === 0 }) ||
+      entry.size > PR_PREP_RUSTC_FILE_MAX_BYTES
+    ) {
+      throw new ControllerServiceConfigurationError(
+        "recorded rustc bundle file identity is invalid",
+      );
+    }
+    return Object.freeze({ ...entry });
+  });
+  const version = validateRustcVersionOutput(value.versionOutput, hostArchitecture);
+  if (
+    value.release !== version.release || value.host !== version.host ||
+    value.llvmVersion !== version.llvmVersion
+  ) {
+    throw new ControllerServiceConfigurationError(
+      "recorded rustc bundle version identity is invalid",
+    );
+  }
+  return Object.freeze({
+    root: directories.root,
+    bin: directories.bin,
+    lib: directories.lib,
+    manifest: Object.freeze({ ...manifest }),
+    files: Object.freeze(files),
+    release: version.release,
+    host: version.host,
+    llvmVersion: version.llvmVersion,
+    versionOutput: version.output,
+  });
+}
+
+function validRecordedRustcFileMetadata(entry, { executable }) {
+  const expectedMode = executable ? 0o555 : 0o444;
+  return entry.uid === 0 && entry.gid === 0 && entry.nlink === 1 &&
+    Number.isSafeInteger(entry.device) && entry.device >= 0 &&
+    Number.isSafeInteger(entry.inode) && entry.inode > 0 &&
+    Number.isSafeInteger(entry.size) && entry.size > 0 &&
+    typeof entry.sha256 === "string" && /^[a-f0-9]{64}$/.test(entry.sha256) &&
+    entry.mode === expectedMode;
 }
 
 export function prPrepSudoArguments(mode, prepUsername, nodeBinary) {
@@ -1613,7 +2057,7 @@ export function assertPrPrepIdentityUnchanged(current, installed) {
   const previous = validateRecordedPrPrepIdentity(installed);
   if (JSON.stringify(next) !== JSON.stringify(previous)) {
     throw new ControllerServiceConfigurationError(
-      "installed PR preparation account, helper, Node, or sudo identity drifted",
+      "installed PR preparation account, helper, Cargo, rustc bundle, Node, or sudo identity drifted",
     );
   }
   return next;
@@ -1636,12 +2080,17 @@ export function renderPrPrepProvisioning({
   controllerUsername,
   prepUsername,
   nodeBinary,
+  trustedNode,
   helperPayload,
   cargoSha256,
+  rustcManifestSha256,
+  hostArchitecture,
 }) {
   const controller = validatePrPrepUsername(controllerUsername, "controller username");
   const prep = validatePrPrepUsername(prepUsername);
   const node = validateAbsolutePath(nodeBinary, "PR helper Node binary");
+  const capturedNode = validatePrPrepNodeFileIdentity(trustedNode, node);
+  const nodeParents = ancestorPaths(node);
   if (
     helperPayload == null || typeof helperPayload !== "object" ||
     !Buffer.isBuffer(helperPayload.bytes) || helperPayload.bytes.length <= 0 ||
@@ -1655,6 +2104,14 @@ export function renderPrPrepProvisioning({
     );
   }
   const cargoHash = validateSha256(cargoSha256, "pinned Cargo SHA-256");
+  const rustcManifestHash = validateSha256(
+    rustcManifestSha256,
+    "pinned rustc bundle manifest SHA-256",
+  );
+  const rustcValidationProgram = renderPrPrepRustcProvisioningValidationProgram({
+    trustedManifestSha256: rustcManifestHash,
+    hostArchitecture,
+  });
   const payload = helperPayload.bytes.toString("base64").match(/.{1,76}/g).join("\n");
   const sudoersPath = `/private/etc/sudoers.d/dev.nanocodex.ci-pr-cargo-builder-${controller}`;
   const rule = renderPrPrepSudoersRule({
@@ -1674,6 +2131,10 @@ export function renderPrPrepProvisioning({
 # Separately provision Cargo ${PR_PREP_CARGO_RELEASE} at ${PR_PREP_CARGO_PATH} with
 # exact SHA-256 ${cargoHash}. It and every parent must be real, root:wheel,
 # executable where applicable, singly linked, and non-group/world-writable.
+# Separately provision the reviewed Rust ${PR_PREP_RUSTC_RELEASE} bundle at
+# ${PR_PREP_RUSTC_ROOT}. Its canonical manifest SHA-256 must be
+# ${rustcManifestHash}; root/bin/lib and the exact manifest, rustc, LLVM, and
+# rustc-driver entries must be root:wheel, no-ACL, real, and non-writable.
 # Separately provision ${node} as one singly linked root:wheel global Node file.
 # It and every ancestor must be real, no-ACL, and non-group/world-writable; a
 # controller-owned executable or a symlinked Homebrew convenience path is rejected.
@@ -1692,6 +2153,19 @@ cleanup_nanocodex_provisioning() {
 trap cleanup_nanocodex_provisioning 0 1 2 15
 NANOCODEX_ROOT_STAGE="$(/usr/bin/mktemp -d '/private/var/root/.dev.nanocodex.ci-pr-provision.XXXXXX')"
 NANOCODEX_SUDOERS_TMP="$(/usr/bin/mktemp '/private/etc/sudoers.d/.dev.nanocodex.ci-pr-cargo-builder.XXXXXX')"
+assert_nanocodex_no_acl() {
+  checked_acl=$(/bin/ls -lde "$1")
+  case "$checked_acl" in
+    *'
+'*) return 1 ;;
+  esac
+  checked_acl_mode=${"${checked_acl%%[[:space:]]*}"}
+  case "$checked_acl_mode" in
+    *+) return 1 ;;
+    ??????????|??????????@) ;;
+    *) return 1 ;;
+  esac
+}
 assert_nanocodex_root_directory() {
   checked_path=$1
   [ ! -L "$checked_path" ] && [ -d "$checked_path" ]
@@ -1700,10 +2174,29 @@ assert_nanocodex_root_directory() {
   [ "$(/usr/bin/stat -f '%Mp' "$checked_path")" = 0 ]
   checked_mode=$(/usr/bin/stat -f '%Lp' "$checked_path")
   [ $((0$checked_mode & 022)) -eq 0 ]
+  [ $((0$checked_mode & 001)) -ne 0 ]
+  assert_nanocodex_no_acl "$checked_path"
+}
+assert_nanocodex_root_node() {
+  checked_node=$1
+  [ ! -L "$checked_node" ] && [ -f "$checked_node" ]
+  [ "$(/bin/realpath "$checked_node")" = "$checked_node" ]
+  assert_nanocodex_no_acl "$checked_node"
+  exec 7< "$checked_node"
+  checked_node_identity='${capturedNode.device}:${capturedNode.inode}:0:0:1:0:${capturedNode.mode.toString(8)}:${capturedNode.size}'
+  [ "$(/usr/bin/stat -f '%d:%i:%u:%g:%l:%Mp:%Lp:%z' /dev/fd/7)" = "$checked_node_identity" ]
+  [ "$(/usr/bin/stat -f '%d:%i:%u:%g:%l:%Mp:%Lp:%z' "$checked_node")" = "$checked_node_identity" ]
+  NANOCODEX_NODE_SHA=$(/usr/bin/shasum -a 256 <&7)
+  [ "${"${NANOCODEX_NODE_SHA%% *}"}" = '${capturedNode.sha256}' ]
+  exec 7<&-
 }
 assert_nanocodex_root_directory /
 assert_nanocodex_root_directory /Library
 assert_nanocodex_root_directory /Library/PrivilegedHelperTools
+for NANOCODEX_NODE_PARENT in ${nodeParents.map(shellQuote).join(" ")}; do
+  assert_nanocodex_root_directory "$NANOCODEX_NODE_PARENT"
+done
+assert_nanocodex_root_node ${shellQuote(node)}
 /usr/sbin/chown root:wheel "$NANOCODEX_ROOT_STAGE"
 /bin/chmod 0700 "$NANOCODEX_ROOT_STAGE"
 /usr/bin/base64 -D > "$NANOCODEX_ROOT_STAGE/helper" <<'NANOCODEX_HELPER_PAYLOAD'
@@ -1735,6 +2228,12 @@ NANOCODEX_CARGO_SIZE=$6
 NANOCODEX_CARGO_SHA=$(/usr/bin/shasum -a 256 <&4)
 [ "${"${NANOCODEX_CARGO_SHA%% *}"}" = '${cargoHash}' ]
 exec 4<&-
+if ! ${ENV} -i HOME=/var/empty PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  ${shellQuote(node)} --eval ${shellQuote(rustcValidationProgram)}; then
+  printf '%s\n' 'nanocodex fixed rustc bundle failed its manifest probe' >&2
+  exit 78
+fi
+assert_nanocodex_root_node ${shellQuote(node)}
 if [ -e ${shellQuote(PR_PREP_HELPER_PATH)} ] || [ -L ${shellQuote(PR_PREP_HELPER_PATH)} ]; then
   [ ! -L ${shellQuote(PR_PREP_HELPER_PATH)} ] && [ -f ${shellQuote(PR_PREP_HELPER_PATH)} ]
   [ "$(/usr/bin/stat -f '%u:%g:%l' ${shellQuote(PR_PREP_HELPER_PATH)})" = '0:0:1' ]
@@ -1778,15 +2277,46 @@ NANOCODEX_SUDOERS_TMP=
 /bin/rm -rf "$NANOCODEX_ROOT_STAGE"
 NANOCODEX_ROOT_STAGE=
 trap - 0 1 2 15
-# Uninstall deliberately leaves the account, helper, and sudoers file for explicit root cleanup.`;
+# Uninstall deliberately leaves the account, helper, Cargo, rustc bundle, and sudoers file for explicit root cleanup.`;
+}
+
+export function renderPrPrepRustcProvisioningValidationProgram({
+  trustedManifestSha256,
+  hostArchitecture,
+}) {
+  const manifestHash = validateSha256(
+    trustedManifestSha256,
+    "pinned rustc bundle manifest SHA-256",
+  );
+  const expectedHost = rustcHostForArchitecture(hostArchitecture);
+  return `const fs=require("node:fs"),crypto=require("node:crypto"),cp=require("node:child_process");
+const root=${JSON.stringify(PR_PREP_RUSTC_ROOT)},manifestPath=${JSON.stringify(PR_PREP_RUSTC_MANIFEST_PATH)},rustcPath=${JSON.stringify(PR_PREP_RUSTC_PATH)},expectedHash=${JSON.stringify(manifestHash)},expectedHost=${JSON.stringify(expectedHost)},release=${JSON.stringify(PR_PREP_RUSTC_RELEASE)};
+const clean={HOME:"/var/empty",CARGO_HOME:"/var/empty",RUSTUP_HOME:"/var/empty",PATH:"/usr/bin:/bin",LANG:"C",LC_ALL:"C"},fail=()=>process.exit(78);
+const same=(a,b)=>["dev","ino","uid","gid","mode","nlink","size","mtimeMs","ctimeMs"].every((k)=>a[k]===b[k]);
+const acl=(path)=>{const r=cp.spawnSync("/bin/ls",["-lde",path],{cwd:"/",env:clean,encoding:"utf8",timeout:${PR_PREP_PROBE_TIMEOUT_MS},maxBuffer:${MAX_PROBE_OUTPUT_BYTES}});if(r.status!==0||r.signal||r.stderr!==""||typeof r.stdout!=="string"||!r.stdout.endsWith("\\n")||r.stdout.slice(0,-1).includes("\\n")){fail()}const mode=r.stdout.split(/\\s/,1)[0];if(mode.endsWith("+")||!/^[bcdlps-][rwxStTs-]{9}@?$/.test(mode))fail()};
+const dir=(path,allowRootWrite)=>{const s=fs.lstatSync(path),mode=s.mode&511;if(s.isSymbolicLink()||!s.isDirectory()||s.uid!==0||s.gid!==0||(s.mode&0o7000)!==0||(allowRootWrite?((mode&0o022)!==0||(mode&0o005)!==0o005):mode!==0o555)||fs.realpathSync(path)!==path)fail();acl(path)};
+const opened=(path,maximum,expected,executable)=>{if(typeof fs.constants.O_NOFOLLOW!=="number")fail();const fd=fs.openSync(path,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);try{const before=fs.fstatSync(fd),mode=before.mode&511,expectedMode=executable?0o555:0o444;if(!before.isFile()||before.uid!==0||before.gid!==0||before.nlink!==1||(before.mode&0o7000)!==0||mode!==expectedMode||before.size<=0||before.size>maximum)fail();const bytes=Buffer.alloc(before.size);let at=0;while(at<bytes.length){const n=fs.readSync(fd,bytes,at,bytes.length-at,at);if(!n)break;at+=n}const extra=Buffer.alloc(1);if(at!==bytes.length||fs.readSync(fd,extra,0,1,before.size)!==0)fail();const after=fs.fstatSync(fd),pathStat=fs.lstatSync(path);if(!same(before,after)||!same(after,pathStat)||pathStat.isSymbolicLink()||fs.realpathSync(path)!==path)fail();const hash=crypto.createHash("sha256").update(bytes).digest("hex");if(expected&&(after.size!==expected.size||hash!==expected.sha256))fail();acl(path);return{bytes,hash}}finally{fs.closeSync(fd)}};
+try{
+for(const path of ["/","/Library","/Library/PrivilegedHelperTools"])dir(path,true);for(const path of [root,root+"/bin",root+"/lib"])dir(path,false);
+if(JSON.stringify(fs.readdirSync(root).sort())!==JSON.stringify(["bin","lib","manifest.json"])||JSON.stringify(fs.readdirSync(root+"/bin").sort())!==JSON.stringify(["rustc"]))fail();
+const manifestFile=opened(manifestPath,${PR_PREP_RUSTC_MANIFEST_MAX_BYTES},null,false),text=manifestFile.bytes.toString("utf8");if(manifestFile.hash!==expectedHash||!text.endsWith("\\n")||text.includes("\\r")||text.includes("\\0")||/[^\\x20-\\x7e\\n]/.test(text))fail();const manifest=JSON.parse(text.slice(0,-1));if(JSON.stringify(manifest)+"\\n"!==text||Object.keys(manifest).join("\\0")!=="version\\0release\\0host\\0files"||manifest.version!==1||manifest.release!==release||manifest.host!==expectedHost||!Array.isArray(manifest.files)||manifest.files.length!==3)fail();
+const files=manifest.files;for(const f of files)if(!f||Object.keys(f).join("\\0")!=="path\\0size\\0sha256"||!Number.isSafeInteger(f.size)||f.size<=0||f.size>${PR_PREP_RUSTC_FILE_MAX_BYTES}||!/^[a-f0-9]{64}$/.test(f.sha256))fail();if(files[0].path!=="bin/rustc"||files[1].path!=="lib/libLLVM.dylib"||!/^lib\\/librustc_driver-[0-9a-f]+\\.dylib$/.test(files[2].path)||files.some((f,i)=>i>0&&f.path<=files[i-1].path))fail();
+const driver=files[2].path.slice(4);if(JSON.stringify(fs.readdirSync(root+"/lib").sort())!==JSON.stringify(["libLLVM.dylib",driver]))fail();for(let i=0;i<files.length;i++)opened(root+"/"+files[i].path,${PR_PREP_RUSTC_FILE_MAX_BYTES},files[i],i===0);
+const v=cp.spawnSync(rustcPath,["-vV"],{cwd:"/",env:clean,encoding:"utf8",timeout:${PR_PREP_PROBE_TIMEOUT_MS},maxBuffer:16384});if(v.status!==0||v.signal||v.stderr!==""||typeof v.stdout!=="string"||!v.stdout.endsWith("\\n")||v.stdout.includes("\\r")||v.stdout.includes("\\0"))fail();const l=v.stdout.slice(0,-1).split("\\n"),first=new RegExp("^rustc "+release.replaceAll(".","\\\\.")+" \\\\(([a-f0-9]{9}) ([0-9]{4}-[0-9]{2}-[0-9]{2})\\\\)$").exec(l[0]||""),hash=/^commit-hash: ([a-f0-9]{40})$/.exec(l[2]||"")?.[1],date=/^commit-date: ([0-9]{4}-[0-9]{2}-[0-9]{2})$/.exec(l[3]||"")?.[1];if(l.length!==7||!first||l[1]!=="binary: rustc"||!hash||!hash.startsWith(first[1])||date!==first[2]||l[4]!=="host: "+expectedHost||l[5]!=="release: "+release||!/^LLVM version: [0-9]+(?:\\.[0-9]+){1,3}(?:[-+][A-Za-z0-9.-]+)?$/.test(l[6]||""))fail();
+if(JSON.stringify(fs.readdirSync(root).sort())!==JSON.stringify(["bin","lib","manifest.json"])||JSON.stringify(fs.readdirSync(root+"/bin").sort())!==JSON.stringify(["rustc"])||JSON.stringify(fs.readdirSync(root+"/lib").sort())!==JSON.stringify(["libLLVM.dylib",driver]))fail();opened(manifestPath,${PR_PREP_RUSTC_MANIFEST_MAX_BYTES},{size:manifestFile.bytes.length,sha256:expectedHash},false);for(let i=0;i<files.length;i++)opened(root+"/"+files[i].path,${PR_PREP_RUSTC_FILE_MAX_BYTES},files[i],i===0);
+}catch{fail()}`;
 }
 
 export function prPrepOperatorCleanup() {
   return Object.freeze({
     prepAccountPreserved: true,
     helperPreserved: PR_PREP_HELPER_PATH,
+    cargoPreserved: PR_PREP_CARGO_PATH,
+    rustcBundlePreserved: PR_PREP_RUSTC_ROOT,
     sudoersPreserved: true,
-    instruction: "root must separately remove the dedicated account, helper, and sudoers rule",
+    instruction:
+      "root must separately remove the dedicated account, helper, Cargo, rustc bundle, " +
+        "and sudoers rule",
   });
 }
 
@@ -2184,7 +2714,7 @@ if ! assert_runtime_directory "$TMPDIR" "$EXPECTED_UID" 700; then
   exit 78
 fi
 ${role === "pr" ? `if ! "$NODE_BINARY" --eval ${shellQuote(renderPrPrepRuntimeValidationProgram(prPrep))}; then
-  printf '%s\\n' 'nanocodex PR preparation account or helper identity drifted' >&2
+  printf '%s\\n' 'nanocodex PR preparation account, helper, or rustc bundle identity drifted' >&2
   exit 78
 fi
 ` : ""}
@@ -2626,6 +3156,7 @@ export function parseCliArguments(argv) {
       "--cloudflare-account-id",
       "--prep-user",
       "--cargo-sha256",
+      "--rustc-manifest-sha256",
     ]);
     for (let index = 0; index < arguments_.length; index += 1) {
       const flag = arguments_[index];
@@ -2664,9 +3195,13 @@ export function parseCliArguments(argv) {
           throw new ControllerServiceConfigurationError(`${command} master requires ${flag}`);
         }
       }
-      if (values.has("--prep-user") || values.has("--cargo-sha256")) {
+      if (
+        values.has("--prep-user") || values.has("--cargo-sha256") ||
+        values.has("--rustc-manifest-sha256")
+      ) {
         throw new ControllerServiceConfigurationError(
-          "--prep-user and --cargo-sha256 are forbidden for the master role",
+          "--prep-user, --cargo-sha256, and --rustc-manifest-sha256 are forbidden " +
+            "for the master role",
         );
       }
     } else {
@@ -2675,9 +3210,13 @@ export function parseCliArguments(argv) {
           throw new ControllerServiceConfigurationError(`${flag} is forbidden for the pr role`);
         }
       }
-      if (!values.has("--prep-user") || !values.has("--cargo-sha256")) {
+      if (
+        !values.has("--prep-user") || !values.has("--cargo-sha256") ||
+        !values.has("--rustc-manifest-sha256")
+      ) {
         throw new ControllerServiceConfigurationError(
-          `${command} pr requires --prep-user and --cargo-sha256`,
+          `${command} pr requires --prep-user, --cargo-sha256, and ` +
+            "--rustc-manifest-sha256",
         );
       }
     }
@@ -2701,6 +3240,10 @@ export function parseCliArguments(argv) {
         ? {
             prepUsername: validatePrPrepUsername(values.get("--prep-user")),
             cargoSha256: validateSha256(values.get("--cargo-sha256"), "Cargo SHA-256"),
+            rustcManifestSha256: validateSha256(
+              values.get("--rustc-manifest-sha256"),
+              "rustc bundle manifest SHA-256",
+            ),
           }
         : {}),
       replaceSecrets,
@@ -2755,9 +3298,11 @@ ${role === "pr" ? `  - PR install/update requires an existing local non-login --
   - Root must separately install the byte-exact helper at ${PR_PREP_HELPER_PATH} mode 0555 and a visudo-checked root-owned 0440 exact-command NOSETENV sudoers rule.
   - Root must separately provision the selected global Node executable as a singly linked root:wheel file under an entirely root:wheel, no-ACL, non-group/world-writable real parent chain; controller-owned and symlink paths fail closed.
   - Root must provision pinned Cargo ${PR_PREP_CARGO_RELEASE} only at ${PR_PREP_CARGO_PATH}; install/update requires its exact SHA-256 and startup/status revalidate its bytes, version, ownership, link count, and real root-only parent chain.
+  - Root must separately provision the exact Rust ${PR_PREP_RUSTC_RELEASE} bundle at ${PR_PREP_RUSTC_ROOT}. Its canonical manifest must name only bin/rustc, lib/libLLVM.dylib, and one hashed librustc_driver dylib; install/update pins the manifest SHA-256 and every lifecycle probe reopens and hashes all four files.
+  - The rustc bundle root/bin/lib directories and compiler are exact mode 0555; its manifest and libraries are exact mode 0444. Every entry is root:wheel, no-ACL, real, and singly linked where a file. The compiler must report the exact release and host through canonical rustc -vV output.
   - LC_ALL=C sudo -n -l must expose one complete Defaults/grant inventory with timestamp_timeout=0 and only the two NOPASSWD:NOSETENV helper commands. Unsupported listing formats or inherited/group grants fail closed and must be removed by the operator.
-  - The wrapper validates account/group/helper/Cargo/Node and complete sudo identity before its first Keychain read; --build accepts canonical stdin only.
-  - Uninstall never removes the prep account, helper, or sudoers rule; root performs that explicit operator cleanup.
+  - The wrapper validates account/group/helper/Cargo/rustc-bundle/Node and complete sudo identity before its first Keychain read; --build accepts canonical stdin only.
+  - Uninstall never removes the prep account, helper, Cargo, rustc bundle, or sudoers rule; root performs that explicit operator cleanup.
 ` : ""}  - The PR preparation helper owns fresh private temporary home and Cargo state per build; the controller owns no persistent Cargo state.
   - The controllers retain their own kernel-held lock; this service adds no PID file or wrapper lock.
   - launchd restarts the controller after every exit; update and uninstall stop it with an explicit bootout.
@@ -2908,7 +3453,9 @@ export async function main(argv = process.argv.slice(2)) {
 
 async function installOrUpdate(options, context, paths) {
   await validateExistingPathChain(paths, options.role, context.uid);
-  await assertNoColocatedRole(options.role, context);
+  if (options.role === "master") {
+    await assertNoColocatedRole(options.role, context);
+  }
   let trustedHelperPayload;
   let trustedPrPrepNode;
   if (options.role === "pr") {
@@ -2930,8 +3477,11 @@ async function installOrUpdate(options, context, paths) {
       controllerUsername: context.username,
       prepUsername: options.prepUsername,
       nodeBinary: options.nodeBinary,
+      trustedNode: trustedPrPrepNode,
       helperPayload: trustedHelperPayload,
       cargoSha256: options.cargoSha256,
+      rustcManifestSha256: options.rustcManifestSha256,
+      hostArchitecture: context.architecture,
     })}\n`);
   }
   const [initialLaunchStatus, artifacts] = await Promise.all([
@@ -2949,6 +3499,11 @@ async function installOrUpdate(options, context, paths) {
     trustedHelperPayload,
     trustedPrPrepNode,
   });
+  if (options.role === "pr") {
+    // The co-location audit reads opposite-role Keychain metadata. Keep every
+    // such read behind the complete credential-free prep/rustc attestation.
+    await assertNoColocatedRole(options.role, context);
+  }
   await ensureServiceDirectories(paths, options.role, context.uid);
   await assertSafeLogAndStateFiles(paths, options.role, context.uid, false);
   const wrapper = renderControllerWrapper({
@@ -3053,7 +3608,9 @@ async function installOrUpdate(options, context, paths) {
 async function serviceStatus(role, context, paths) {
   validateServicePaths(paths, role);
   await validateExistingPathChain(paths, role, context.uid);
-  await assertNoColocatedRole(role, context);
+  if (role === "master") {
+    await assertNoColocatedRole(role, context);
+  }
   await assertSafeLogAndStateFiles(paths, role, context.uid, false);
   const [initialLaunchStatus, artifacts] = await Promise.all([
     serviceLaunchStatus(context.uid, role, paths),
@@ -3110,6 +3667,11 @@ async function serviceStatus(role, context, paths) {
     throw new ControllerServiceConfigurationError(
       "PR status refuses Keychain inspection without an installed, validated prep boundary",
     );
+  }
+  if (role === "pr") {
+    // This includes opposite-controller and runner Keychain existence probes,
+    // so it must remain after the installed wrapper and prep/rustc validation.
+    await assertNoColocatedRole(role, context);
   }
   const keychainEntries = await Promise.all(
     ROLE_SECRET_ALLOWLISTS[role].map(async (name) => [
@@ -3245,6 +3807,7 @@ async function validateTrustedRuntime(options, context, paths, {
       context,
       trustedHelperSha256: trustedHelperPayload?.sha256,
       cargoSha256: options.cargoSha256,
+      rustcManifestSha256: options.rustcManifestSha256,
       trustedNode: prPrepNode,
     });
   }
@@ -3309,6 +3872,7 @@ async function validatePrPrepRuntime({
   context,
   trustedHelperSha256,
   cargoSha256,
+  rustcManifestSha256,
   trustedNode,
   expected,
 }) {
@@ -3321,11 +3885,21 @@ async function validatePrPrepRuntime({
     cargoSha256 ?? expectedIdentity?.cargo.sha256,
     "trusted Cargo SHA-256",
   );
+  const rustcManifestHash = validateSha256(
+    rustcManifestSha256 ?? expectedIdentity?.rustc.manifest.sha256,
+    "trusted rustc bundle manifest SHA-256",
+  );
   const expectedNode = trustedNode ?? expectedIdentity?.node;
-  const [account, helper, cargo, node] = await Promise.all([
+  const [account, helper, cargo, rustc, node] = await Promise.all([
     inspectPrPrepAccount(prepUsername, context),
     inspectPrPrepHelper(helperHash),
     inspectPrPrepCargo(cargoHash, context.architecture),
+    inspectPrPrepRustcBundle(
+      rustcManifestHash,
+      context.architecture,
+      context,
+      { expected: expectedIdentity?.rustc },
+    ),
     inspectPrPrepNode(nodeBinary, context, { expected: expectedNode }),
   ]);
   const sudoProbe = await probePrPrepSudoBoundary({
@@ -3336,6 +3910,21 @@ async function validatePrPrepRuntime({
     nodeBinary,
   });
   const nodeAfterSudo = await inspectPrPrepNode(nodeBinary, context, { expected: node });
+  const rustcAfterSudo = validatePrPrepRustcBundleSnapshot(
+    await snapshotPrPrepRustcBundle(
+      rustcManifestHash,
+      context.architecture,
+      context,
+    ),
+    rustcManifestHash,
+    rustc.versionOutput,
+    context.architecture,
+  );
+  if (JSON.stringify(rustcAfterSudo) !== JSON.stringify(rustc)) {
+    throw new ControllerServiceConfigurationError(
+      "fixed rustc bundle changed across the PR preparation sudo probe",
+    );
+  }
   const recorded = validateRecordedPrPrepIdentity({
     ...account,
     controllerUsername: context.username,
@@ -3343,6 +3932,7 @@ async function validatePrPrepRuntime({
     helperVersion: PR_PREP_HELPER_VERSION,
     helper,
     cargo,
+    rustc: rustcAfterSudo,
     node: nodeAfterSudo,
     nodeBinary,
     nodeIdentity: `node/darwin/${context.architecture}`,
@@ -3573,6 +4163,140 @@ async function inspectPrPrepCargo(trustedSha256, architecture) {
     architecture);
 }
 
+async function inspectPrPrepRustcBundle(
+  trustedManifestSha256,
+  architecture,
+  context,
+  { expected } = {},
+) {
+  const trustedHash = validateSha256(
+    trustedManifestSha256,
+    "trusted rustc bundle manifest SHA-256",
+  );
+  const expectedIdentity = expected == null
+    ? null
+    : validateRecordedRustcBundle(expected, architecture);
+  const beforeSnapshot = await snapshotPrPrepRustcBundle(
+    trustedHash,
+    architecture,
+    context,
+  );
+  const version = await runOutputProbe(
+    PR_PREP_RUSTC_PATH,
+    ["-vV"],
+    {
+      cwd: "/",
+      env: {
+        HOME: "/var/empty",
+        CARGO_HOME: "/var/empty",
+        RUSTUP_HOME: "/var/empty",
+        PATH: "/usr/bin:/bin",
+        LANG: "C",
+        LC_ALL: "C",
+      },
+      timeoutMs: PR_PREP_PROBE_TIMEOUT_MS,
+    },
+  );
+  if (
+    version.timedOut || version.signal != null || version.code !== 0 || version.stderr !== ""
+  ) {
+    throw new ControllerServiceConfigurationError(
+      "fixed rustc -vV probe must succeed quietly from the manifest executable",
+    );
+  }
+  const before = validatePrPrepRustcBundleSnapshot(
+    beforeSnapshot,
+    trustedHash,
+    version.stdout,
+    architecture,
+  );
+  const after = validatePrPrepRustcBundleSnapshot(
+    await snapshotPrPrepRustcBundle(trustedHash, architecture, context),
+    trustedHash,
+    version.stdout,
+    architecture,
+  );
+  if (JSON.stringify(after) !== JSON.stringify(before)) {
+    throw new ControllerServiceConfigurationError(
+      "fixed rustc bundle changed across its executable identity probe",
+    );
+  }
+  if (expectedIdentity != null && JSON.stringify(after) !== JSON.stringify(expectedIdentity)) {
+    throw new ControllerServiceConfigurationError(
+      "fixed rustc bundle manifest, files, or filesystem identity drifted",
+    );
+  }
+  return after;
+}
+
+async function snapshotPrPrepRustcBundle(trustedManifestSha256, architecture, context) {
+  const parentPaths = ["/", "/Library", "/Library/PrivilegedHelperTools"];
+  const directoryPaths = {
+    root: PR_PREP_RUSTC_ROOT,
+    bin: join(PR_PREP_RUSTC_ROOT, "bin"),
+    lib: join(PR_PREP_RUSTC_ROOT, "lib"),
+  };
+  const parents = [];
+  for (const path of parentPaths) {
+    await assertNoAccessControlList(path, context);
+    parents.push(Object.freeze({
+      ...(await filesystemSnapshot(path)),
+      accessControlList: false,
+    }));
+  }
+  const directories = {};
+  for (const [name, path] of Object.entries(directoryPaths)) {
+    await assertNoAccessControlList(path, context);
+    directories[name] = Object.freeze({
+      ...(await filesystemSnapshot(path)),
+      accessControlList: false,
+    });
+  }
+  const entries = Object.freeze({
+    root: Object.freeze((await readdir(directoryPaths.root)).sort()),
+    bin: Object.freeze((await readdir(directoryPaths.bin)).sort()),
+    lib: Object.freeze((await readdir(directoryPaths.lib)).sort()),
+  });
+  await assertNoAccessControlList(PR_PREP_RUSTC_MANIFEST_PATH, context);
+  const openedManifest = await readBoundedBinarySnapshot(
+    PR_PREP_RUSTC_MANIFEST_PATH,
+    PR_PREP_RUSTC_MANIFEST_MAX_BYTES,
+    { expectedUid: 0, expectedGid: 0, requireSafeMode: true },
+  );
+  const manifestText = openedManifest.bytes.toString("utf8");
+  const manifest = parsePrPrepRustcManifest(
+    manifestText,
+    trustedManifestSha256,
+    architecture,
+  );
+  const manifestEntry = Object.freeze({
+    ...(await filesystemSnapshot(PR_PREP_RUSTC_MANIFEST_PATH, openedManifest)),
+    accessControlList: false,
+  });
+  const files = [];
+  for (const expected of manifest.files) {
+    const path = join(PR_PREP_RUSTC_ROOT, expected.path);
+    await assertNoAccessControlList(path, context);
+    const opened = await readBoundedBinarySnapshot(path, expected.size, {
+      expectedUid: 0,
+      expectedGid: 0,
+      requireSafeMode: true,
+    });
+    files.push(Object.freeze({
+      ...(await filesystemSnapshot(path, opened)),
+      accessControlList: false,
+    }));
+  }
+  return Object.freeze({
+    parents: Object.freeze(parents),
+    directories: Object.freeze(directories),
+    entries,
+    manifest: manifestEntry,
+    manifestText,
+    files: Object.freeze(files),
+  });
+}
+
 async function probePrPrepSudoBoundary({
   controllerUsername,
   prepUsername,
@@ -3745,12 +4469,15 @@ const uids=listing(quiet(await run(${JSON.stringify(DSCL)},["/Local/Default","-l
 const ur=attrs(quiet(await run(${JSON.stringify(DSCL)},["/Local/Default","-read","/Users/"+e.username,"RecordName","UniqueID","PrimaryGroupID","NFSHomeDirectory","UserShell","GeneratedUID","AuthenticationAuthority"])));if(ur.has("AuthenticationAuthority"))fail();one(ur,"RecordName",e.username);one(ur,"UniqueID",e.uid);one(ur,"PrimaryGroupID",e.gid);one(ur,"NFSHomeDirectory",e.homeDirectory);one(ur,"UserShell",e.shell);one(ur,"GeneratedUID",e.generatedUid);
 const gr=attrs(quiet(await run(${JSON.stringify(DSCL)},["/Local/Default","-read","/Groups/"+e.primaryGroupName,"RecordName","PrimaryGroupID","GeneratedUID","GroupMembership","GroupMembers","NestedGroups"])));one(gr,"RecordName",e.primaryGroupName);one(gr,"PrimaryGroupID",e.gid);one(gr,"GeneratedUID",e.primaryGroupGeneratedUid);if((gr.get("GroupMembership")||[]).some((v)=>v!==e.username)||(gr.get("GroupMembers")||[]).some((v)=>v!==e.generatedUid)||(gr.get("NestedGroups")||[]).length)fail();
 for(const path of homeParents){const s=fs.lstatSync(path),mode=s.mode&511;if(s.isSymbolicLink()||!s.isDirectory()||s.uid!==0||(s.mode&0o7000)!==0||(mode&0o022)!==0||fs.realpathSync(path)!==path)fail()}const hs=fs.lstatSync(e.homeDirectory),hm=hs.mode&511;if(hs.isSymbolicLink()||!hs.isDirectory()||hs.uid!==0||(hs.mode&0o7000)!==0||(hm&0o022)!==0||fs.realpathSync(e.homeDirectory)!==${JSON.stringify(PR_PREP_CANONICAL_HOME_DIRECTORY)})fail();
-for(const path of parents){const s=fs.lstatSync(path),mode=s.mode&511;if(s.isSymbolicLink()||!s.isDirectory()||s.uid!==0||s.gid!==0||(s.mode&0o7000)!==0||(mode&0o022)!==0||fs.realpathSync(path)!==path)fail()}
+for(const path of parents){const s=fs.lstatSync(path),mode=s.mode&511;if(s.isSymbolicLink()||!s.isDirectory()||s.uid!==0||s.gid!==0||(s.mode&0o7000)!==0||(mode&0o022)!==0||fs.realpathSync(path)!==path)fail();aclFree(quiet(await run("/bin/ls",["-lde",path])))}
 for(const path of nodeParents){const s=fs.lstatSync(path),mode=s.mode&511;if(s.isSymbolicLink()||!s.isDirectory()||s.uid!==0||s.gid!==0||(s.mode&0o7000)!==0||(mode&0o022)!==0||(mode&1)===0||fs.realpathSync(path)!==path)fail();aclFree(quiet(await run("/bin/ls",["-lde",path])))}
 const nodeExpected={device:e.node.device,inode:e.node.inode,size:e.node.size,sha256:e.node.sha256,uid:0,gid:0,mode:e.node.mode,nlink:1};aclFree(quiet(await run("/bin/ls",["-lde",e.nodeBinary])));opened(e.nodeBinary,${PR_PREP_NODE_MAX_BYTES},nodeExpected);
+const rustcDir=(path,x)=>{const s=fs.lstatSync(path),mode=s.mode&511;if(s.isSymbolicLink()||!s.isDirectory()||s.uid!==0||s.gid!==0||(s.mode&0o7000)!==0||(mode&0o222)!==0||(mode&5)!==5||fs.realpathSync(path)!==path||s.dev!==x.device||s.ino!==x.inode||mode!==x.mode||s.nlink!==x.nlink)fail()};for(const [path,x] of [[${JSON.stringify(PR_PREP_RUSTC_ROOT)},e.rustc.root],[${JSON.stringify(join(PR_PREP_RUSTC_ROOT, "bin"))},e.rustc.bin],[${JSON.stringify(join(PR_PREP_RUSTC_ROOT, "lib"))},e.rustc.lib]]){rustcDir(path,x);aclFree(quiet(await run("/bin/ls",["-lde",path])))}const driver=e.rustc.files[2].path.slice(4),rustcEntries=()=>{if(JSON.stringify(fs.readdirSync(${JSON.stringify(PR_PREP_RUSTC_ROOT)}).sort())!==JSON.stringify(["bin","lib","manifest.json"])||JSON.stringify(fs.readdirSync(${JSON.stringify(join(PR_PREP_RUSTC_ROOT, "bin"))}).sort())!==JSON.stringify(["rustc"])||JSON.stringify(fs.readdirSync(${JSON.stringify(join(PR_PREP_RUSTC_ROOT, "lib"))}).sort())!==JSON.stringify(["libLLVM.dylib",driver]))fail()};rustcEntries();
+const rustcOpened=async()=>{aclFree(quiet(await run("/bin/ls",["-lde",e.rustc.manifest.path])));opened(e.rustc.manifest.path,${PR_PREP_RUSTC_MANIFEST_MAX_BYTES},{device:e.rustc.manifest.device,inode:e.rustc.manifest.inode,size:e.rustc.manifest.size,sha256:e.rustc.manifest.sha256,uid:0,gid:0,mode:e.rustc.manifest.mode,nlink:1});for(const f of e.rustc.files){aclFree(quiet(await run("/bin/ls",["-lde",f.absolutePath])));opened(f.absolutePath,${PR_PREP_RUSTC_FILE_MAX_BYTES},{device:f.device,inode:f.inode,size:f.size,sha256:f.sha256,uid:0,gid:0,mode:f.mode,nlink:1})}};await rustcOpened();
 opened(${JSON.stringify(PR_PREP_HELPER_PATH)},${PR_PREP_HELPER_MAX_BYTES},{device:e.helper.device,inode:e.helper.inode,size:e.helper.size,sha256:e.helper.sha256,uid:0,gid:0,mode:e.helper.mode,nlink:1});opened(${JSON.stringify(PR_PREP_CARGO_PATH)},${PR_PREP_CARGO_MAX_BYTES},{device:e.cargo.device,inode:e.cargo.inode,size:e.cargo.size,sha256:e.cargo.sha256,uid:0,gid:0,mode:e.cargo.mode,nlink:1});
-const cv=await run(${JSON.stringify(PR_PREP_CARGO_PATH)},["--version","--verbose"],{HOME:"/var/empty",CARGO_HOME:"/var/empty",RUSTUP_HOME:"/var/empty",PATH:"/usr/bin:/bin",LANG:"C",LC_ALL:"C"});if(quiet(cv)!==e.cargo.versionOutput)fail();sudoPolicy(quiet(await run(${JSON.stringify(SUDO)},["-n","-l"])));
+const toolEnv={HOME:"/var/empty",CARGO_HOME:"/var/empty",RUSTUP_HOME:"/var/empty",PATH:"/usr/bin:/bin",LANG:"C",LC_ALL:"C"},cv=await run(${JSON.stringify(PR_PREP_CARGO_PATH)},["--version","--verbose"],toolEnv);if(quiet(cv)!==e.cargo.versionOutput)fail();const rv=await run(${JSON.stringify(PR_PREP_RUSTC_PATH)},["-vV"],toolEnv);if(quiet(rv)!==e.rustc.versionOutput)fail();rustcEntries();await rustcOpened();sudoPolicy(quiet(await run(${JSON.stringify(SUDO)},["-n","-l"])));
 const hp=await run(${JSON.stringify(SUDO)},["-n","-u",e.username,"--",e.nodeBinary,${JSON.stringify(PR_PREP_HELPER_PATH)},"--probe"],{});if(quiet(hp)!==${JSON.stringify(helperProbe)})fail();
+rustcEntries();await rustcOpened();
 aclFree(quiet(await run("/bin/ls",["-lde",e.nodeBinary])));opened(e.nodeBinary,${PR_PREP_NODE_MAX_BYTES},nodeExpected);
 const node=[process.release.name,process.platform,process.arch].join("/");if(process.execPath!==e.nodeBinary||node!==e.nodeIdentity)fail();
 }catch{fail()}})()`;
@@ -4939,7 +5666,7 @@ async function exists(path) {
 function usage() {
   return `Usage:
   install-ci-controller-service.mjs install --role master --origin <https-origin> --node <absolute-node> --repo <absolute-checkout> --rustsec-repo <absolute-checkout> --cloudflare-account-id <32-hex> [--web-origin <https-origin>]
-  install-ci-controller-service.mjs install --role pr --origin <https-origin> --node <absolute-node> --repo <absolute-checkout> --prep-user <dedicated-non-login-user> --cargo-sha256 <64-lowercase-hex>
+  install-ci-controller-service.mjs install --role pr --origin <https-origin> --node <absolute-node> --repo <absolute-checkout> --prep-user <dedicated-non-login-user> --cargo-sha256 <64-lowercase-hex> --rustc-manifest-sha256 <64-lowercase-hex>
   install-ci-controller-service.mjs update <same role options> [--replace-secrets]
   install-ci-controller-service.mjs status --role <master|pr>
   install-ci-controller-service.mjs uninstall --role <master|pr> [--remove-data]

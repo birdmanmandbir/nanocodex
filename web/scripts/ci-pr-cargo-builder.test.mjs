@@ -8,6 +8,8 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
+  realpath,
   rm,
   symlink,
   writeFile,
@@ -19,19 +21,25 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 
 import {
+  assertCleanCargoGitCheckouts,
   buildCargoVendorBundle,
   buildEnvironment,
   canonicalJson,
   cargoConfigurationDifference,
   cargoSourceConfig,
+  cleanCargoGitCheckout,
   dangerousCredentialEnvironment,
   encodeFrameHeader,
   openGeneratedBundle,
   parseBuildRequest,
+  probeToolchain,
   probeDescriptor,
   resolveFixedCargoExecutable,
   runTool,
+  rustcBundleContract,
+  rustcHostForArchitecture,
   selectVendorDirectories,
+  verifyFixedRustcBundle,
   writeCargoVendorFrame,
 } from "./ci-pr-cargo-builder.mjs";
 
@@ -102,7 +110,7 @@ test("probe and fresh child environment fail closed on credential authority", as
     credentialEnvironmentNames: [],
     freshHomePolicy: "per-build-private-temporary",
     gid: 20,
-    helperVersion: "2026-08-22.1",
+    helperVersion: "2026-08-23.1",
     uid: 502,
     version: 1,
   });
@@ -112,8 +120,16 @@ test("probe and fresh child environment fail closed on credential authority", as
       NANOCODEX_CI_TOKEN: "sentinel-authority",
       SSH_AUTH_SOCK: "/private/agent",
       NODE_OPTIONS: "--trace-warnings",
+      RUSTC: "/tmp/hostile-rustc",
+      DYLD_FRAMEWORK_PATH: "/tmp/hostile-frameworks",
     }),
-    ["NANOCODEX_CI_TOKEN", "NODE_OPTIONS", "SSH_AUTH_SOCK"],
+    [
+      "DYLD_FRAMEWORK_PATH",
+      "NANOCODEX_CI_TOKEN",
+      "NODE_OPTIONS",
+      "RUSTC",
+      "SSH_AUTH_SOCK",
+    ],
   );
   assert.throws(
     () => probeDescriptor({ env: {}, uid: 502, gid: 0 }),
@@ -134,11 +150,16 @@ test("probe and fresh child environment fail closed on credential authority", as
       root: directory,
       home: resolve(directory, "home"),
       cargoHome: resolve(directory, "cargo-home"),
+      rustupHome: resolve(directory, "rustup-home"),
     };
     const env = buildEnvironment(state);
     assert.equal(env.NANOCODEX_CI_TOKEN, undefined);
+    assert.equal(env.DYLD_FRAMEWORK_PATH, undefined);
     assert.equal(env.HOME, state.home);
     assert.equal(env.CARGO_HOME, state.cargoHome);
+    assert.equal(env.RUSTUP_HOME, state.rustupHome);
+    assert.equal(env.RUSTC, rustcBundleContract.rustcPath);
+    assert.equal(env.PATH, "/usr/bin:/bin");
     assert.equal(env.GIT_CONFIG_GLOBAL, "/dev/null");
     assert.equal(env.GIT_CONFIG_NOSYSTEM, "1");
     const hostile = await execFileAsync(process.execPath, [
@@ -154,6 +175,190 @@ test("probe and fresh child environment fail closed on credential authority", as
     const observed = JSON.parse(hostile.stdout);
     assert.equal(observed.token, null);
     assert.equal(observed.canary, "");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("direct toolchain probe verifies the fixed rustc manifest, files, ACLs, and -vV", async () => {
+  const fixture = fixedRustcFixture("arm64");
+  const verified = await probeToolchain(502, undefined, {
+    resolveCargoPath: async () => "/trusted/cargo",
+    resolveGitPath: async (uid) => {
+      assert.equal(uid, 502);
+      return "/trusted/git";
+    },
+    runToolPath: fixture.runToolPath,
+    rustcBundleOptions: fixture.options,
+  });
+  assert.equal(verified.rustcPath, rustcBundleContract.rustcPath);
+  assert.equal(verified.release, "1.98.0");
+  assert.equal(verified.host, "aarch64-apple-darwin");
+  assert.match(verified.manifestSha256, /^[a-f0-9]{64}$/);
+  assert.deepEqual(
+    fixture.toolCalls.map(({ command, args }) => [command, args]),
+    [
+      [rustcBundleContract.rustcPath, ["-vV"]],
+      ["/trusted/git", ["--version"]],
+      ["/trusted/cargo", ["--version", "--verbose"]],
+    ],
+  );
+  for (const { env } of fixture.toolCalls) {
+    assert.equal(env.RUSTC, rustcBundleContract.rustcPath);
+    assert.equal(env.PATH, "/usr/bin:/bin");
+    assert.equal(env.HOME, "/var/empty");
+    assert.equal(env.CARGO_HOME, "/var/empty");
+    assert.equal(env.RUSTUP_HOME, "/var/empty");
+    assert.equal(Object.keys(env).some((name) => name.startsWith("DYLD_")), false);
+  }
+  assert.deepEqual(
+    fixture.hashedPaths,
+    [
+      resolve(rustcBundleContract.root, "bin/rustc"),
+      resolve(rustcBundleContract.root, "lib/libLLVM.dylib"),
+      resolve(rustcBundleContract.root, fixture.driverRelativePath),
+    ],
+  );
+  assert.deepEqual(
+    [...fixture.inspectedAclPaths].sort(),
+    [
+      "/",
+      "/Library",
+      "/Library/PrivilegedHelperTools",
+      rustcBundleContract.root,
+      resolve(rustcBundleContract.root, "bin"),
+      resolve(rustcBundleContract.root, "bin/rustc"),
+      resolve(rustcBundleContract.root, "lib"),
+      resolve(rustcBundleContract.root, "lib/libLLVM.dylib"),
+      resolve(rustcBundleContract.root, fixture.driverRelativePath),
+      resolve(rustcBundleContract.root, "manifest.json"),
+    ].sort(),
+  );
+});
+
+test("fixed rustc host mapping preserves both supported Darwin architectures", async () => {
+  assert.equal(rustcHostForArchitecture("arm64"), "aarch64-apple-darwin");
+  assert.equal(rustcHostForArchitecture("x64"), "x86_64-apple-darwin");
+  assert.throws(() => rustcHostForArchitecture("ia32"), /does not support architecture/);
+
+  const fixture = fixedRustcFixture("x64");
+  const verified = await verifyFixedRustcBundle(fixture.options);
+  assert.equal(verified.host, "x86_64-apple-darwin");
+  assert.match(fixture.versionOutput, /host: x86_64-apple-darwin/);
+});
+
+test("fixed rustc verification rejects content drift and unsafe bundle entries", async () => {
+  {
+    const fixture = fixedRustcFixture();
+    fixture.fileBodies.set(
+      rustcBundleContract.rustcPath,
+      Buffer.from("rustc-v2"),
+    );
+    await assert.rejects(
+      verifyFixedRustcBundle(fixture.options),
+      /manifest hash does not match bin\/rustc/,
+    );
+  }
+  {
+    const fixture = fixedRustcFixture();
+    const originalHash = fixture.options.hashFilePath;
+    fixture.options.hashFilePath = async (path, identity) => {
+      const observed = await originalHash(path, identity);
+      if (path.endsWith("libLLVM.dylib")) {
+        fixture.identities.set(path, {
+          ...fixture.identities.get(path),
+          mtimeMs: fixture.identities.get(path).mtimeMs + 1,
+        });
+      }
+      return observed;
+    };
+    await assert.rejects(
+      verifyFixedRustcBundle(fixture.options),
+      /lib\/libLLVM\.dylib changed while it was hashed/,
+    );
+  }
+
+  for (const [name, mutate, pattern] of [
+    ["extra root entry", (fixture) => {
+      fixture.entries.get(rustcBundleContract.root).push("unexpected");
+    }, /unsafe entries/],
+    ["ACL", (fixture) => {
+      fixture.unsafeAclPaths.add(rustcBundleContract.rustcPath);
+    }, /no access-control list/],
+    ["hard link", (fixture) => {
+      fixture.identities.get(rustcBundleContract.rustcPath).nlink = 2;
+    }, /singly-linked|non-writable.*read-only executable/],
+    ["writable directory", (fixture) => {
+      fixture.identities.get(rustcBundleContract.root).mode = 0o040755;
+    }, /bundle root.*non-writable/],
+    ["symbolic library", (fixture) => {
+      const path = resolve(rustcBundleContract.root, "lib/libLLVM.dylib");
+      fixture.identities.get(path).isSymbolicLink = () => true;
+    }, /non-writable.*read-only data file/],
+    ["wrong host output", (fixture) => {
+      fixture.versionOutput = fixture.versionOutput.replace(
+        "host: aarch64-apple-darwin",
+        "host: x86_64-apple-darwin",
+      );
+    }, /required release and host/],
+  ]) {
+    const fixture = fixedRustcFixture();
+    mutate(fixture);
+    await assert.rejects(
+      verifyFixedRustcBundle(fixture.options),
+      pattern,
+      name,
+    );
+  }
+});
+
+test("fake Cargo executes only the sanitized exact RUSTC selection", async () => {
+  const directory = await mkdtemp(resolve(tmpdir(), "nanocodex-helper-fake-cargo-"));
+  const rustcPath = resolve(directory, "rustc.mjs");
+  const cargoPath = resolve(directory, "cargo.mjs");
+  const invocationPath = resolve(directory, "rustc-invocation.json");
+  const state = {
+    root: directory,
+    home: resolve(directory, "home"),
+    cargoHome: resolve(directory, "cargo-home"),
+    rustupHome: resolve(directory, "rustup-home"),
+  };
+  try {
+    await Promise.all([
+      mkdir(state.home),
+      mkdir(state.cargoHome),
+      mkdir(state.rustupHome),
+    ]);
+    await writeFile(rustcPath, [
+      `#!${process.execPath}`,
+      'import {writeFileSync} from "node:fs";',
+      `writeFileSync(${JSON.stringify(invocationPath)},JSON.stringify({`,
+      "args:process.argv.slice(2),path:process.env.PATH,rustc:process.env.RUSTC,",
+      "rustupHome:process.env.RUSTUP_HOME}));",
+      'process.stdout.write("fake rustc 1.98.0\\n");',
+    ].join("\n"), { mode: 0o555 });
+    await writeFile(cargoPath, [
+      `#!${process.execPath}`,
+      'import {spawnSync} from "node:child_process";',
+      'const result=spawnSync(process.env.RUSTC,["-vV"],{env:process.env,encoding:"utf8"});',
+      "if(result.status!==0){process.stderr.write(result.stderr??\"\");process.exit(97);}",
+      "process.stdout.write(result.stdout);",
+    ].join("\n"), { mode: 0o555 });
+    await Promise.all([chmod(rustcPath, 0o555), chmod(cargoPath, 0o555)]);
+    const env = buildEnvironment(state, { rustcPath });
+    const result = await runTool(cargoPath, ["fetch", "--locked"], {
+      cwd: directory,
+      env,
+      operation: "fake Cargo RUSTC selection",
+    });
+    assert.equal(result.stdout.toString("utf8"), "fake rustc 1.98.0\n");
+    assert.deepEqual(JSON.parse(await readFile(invocationPath, "utf8")), {
+      args: ["-vV"],
+      path: "/usr/bin:/bin",
+      rustc: rustcPath,
+      rustupHome: state.rustupHome,
+    });
+    assert.deepEqual(await readdir(state.rustupHome), []);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -228,6 +433,171 @@ test("Cargo config boundary rejects content, mode, add/remove, and symlink chang
     ),
     ".cargo/config",
   );
+});
+
+test("Cargo Git checkout recursively verifies exact submodules and only Cargo markers", {
+  timeout: 20_000,
+}, async () => {
+  const directory = await realpath(
+    await mkdtemp(resolve(tmpdir(), "nanocodex-helper-git-checkout-")),
+  );
+  const fixtureHome = resolve(directory, "fixture-home");
+  const cargoHome = resolve(directory, "cargo-home");
+  const checkoutRoot = resolve(cargoHome, "git/checkouts/fixture");
+  const root = resolve(checkoutRoot, "root");
+  const middleSource = resolve(directory, "middle-source");
+  const leafSource = resolve(directory, "leaf-source");
+  const fixtureEnv = {
+    PATH: process.env.PATH ?? "/usr/bin:/bin",
+    HOME: fixtureHome,
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_TERMINAL_PROMPT: "0",
+    LANG: "C.UTF-8",
+    LC_ALL: "C.UTF-8",
+  };
+  try {
+    await Promise.all([
+      mkdir(fixtureHome, { recursive: true }),
+      mkdir(checkoutRoot, { recursive: true }),
+    ]);
+    await initializeGitFixture(leafSource, fixtureEnv, {
+      "leaf.txt": "recorded leaf content\n",
+    });
+    const leafHead = await fixtureGit(leafSource, ["rev-parse", "HEAD"], fixtureEnv);
+    await initializeGitFixture(middleSource, fixtureEnv, {
+      "middle.txt": "recorded middle content\n",
+    });
+    await fixtureGit(middleSource, [
+      "-c", "protocol.file.allow=always", "submodule", "add", "--quiet",
+      leafSource, "nested/leaf",
+    ], fixtureEnv);
+    await fixtureGit(middleSource, ["commit", "--quiet", "-am", "add leaf"], fixtureEnv);
+    const middleHead = await fixtureGit(middleSource, ["rev-parse", "HEAD"], fixtureEnv);
+    await initializeGitFixture(root, fixtureEnv, {
+      "root.txt": "recorded root content\n",
+    });
+    await fixtureGit(root, [
+      "-c", "protocol.file.allow=always", "submodule", "add", "--quiet",
+      middleSource, "deps/middle",
+    ], fixtureEnv);
+    await fixtureGit(root, ["commit", "--quiet", "-am", "add middle"], fixtureEnv);
+    await fixtureGit(root, [
+      "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive",
+    ], fixtureEnv);
+    const rootHead = await fixtureGit(root, ["rev-parse", "HEAD"], fixtureEnv);
+    const middle = resolve(root, "deps/middle");
+    const leaf = resolve(middle, "nested/leaf");
+    for (const repository of [root, middle, leaf]) {
+      await writeFile(resolve(repository, ".cargo-ok"), Buffer.alloc(0), { mode: 0o644 });
+    }
+    const rawStatus = await fixtureGit(root, [
+      "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none",
+    ], fixtureEnv);
+    assert.match(rawStatus, /(?:^|\n) M deps\/middle(?:\n|$)/);
+    assert.match(rawStatus, /(?:^|\n)\?\? \.cargo-ok(?:\n|$)/);
+
+    const context = {
+      cargoHome,
+      env: { ...fixtureEnv, GIT_NO_REPLACE_OBJECTS: "1", GIT_OPTIONAL_LOCKS: "0" },
+      git: "git",
+    };
+    const snapshot = await cleanCargoGitCheckout(context, root, rootHead);
+    assert.equal(snapshot.revision, rootHead);
+    assert.equal(snapshot.submodules[0].revision, middleHead);
+    assert.equal(snapshot.submodules[0].submodules[0].revision, leafHead);
+    await assertCleanCargoGitCheckouts(context, [snapshot]);
+
+    await writeFile(resolve(leaf, "leaf.txt"), "changed leaf content\n");
+    await assert.rejects(
+      cleanCargoGitCheckout(context, root, rootHead),
+      /dirty or mismatched:  M leaf\.txt/,
+    );
+    await writeFile(resolve(leaf, "leaf.txt"), "recorded leaf content\n");
+
+    const extra = resolve(leaf, "extra.txt");
+    await writeFile(extra, "untracked\n");
+    await assert.rejects(
+      cleanCargoGitCheckout(context, root, rootHead),
+      /dirty or mismatched: \?\? extra\.txt/,
+    );
+    await rm(extra);
+
+    await writeFile(resolve(leaf, ".cargo-ok"), "not Cargo's marker\n");
+    await assert.rejects(
+      cleanCargoGitCheckout(context, root, rootHead),
+      /unsafe \.cargo-ok marker/,
+    );
+    await writeFile(resolve(leaf, ".cargo-ok"), Buffer.alloc(0));
+
+    await rm(resolve(leaf, ".cargo-ok"));
+    await symlink("leaf.txt", resolve(leaf, ".cargo-ok"));
+    await assert.rejects(
+      cleanCargoGitCheckout(context, root, rootHead),
+      /unsafe \.cargo-ok marker/,
+    );
+    await rm(resolve(leaf, ".cargo-ok"));
+    await writeFile(resolve(leaf, ".cargo-ok"), Buffer.alloc(0));
+
+    await fixtureGit(leaf, ["commit", "--quiet", "--allow-empty", "-m", "changed head"], fixtureEnv);
+    await assert.rejects(
+      cleanCargoGitCheckout(context, root, rootHead),
+      /dirty or mismatched/,
+    );
+    await fixtureGit(middle, ["add", "nested/leaf"], fixtureEnv);
+    await assert.rejects(
+      cleanCargoGitCheckout(context, root, rootHead),
+      /dirty or mismatched: M[ M] nested\/leaf/,
+    );
+    await fixtureGit(middle, ["reset", "--quiet", "HEAD", "--", "nested/leaf"], fixtureEnv);
+    await fixtureGit(leaf, ["switch", "--quiet", "--detach", leafHead], fixtureEnv);
+
+    const heldLeaf = resolve(directory, "held-leaf");
+    renameSync(leaf, heldLeaf);
+    await assert.rejects(
+      cleanCargoGitCheckout(context, root, rootHead),
+      /dirty or mismatched:  D nested\/leaf|contained real directory/,
+    );
+    await assert.rejects(
+      cleanCargoGitCheckout(context, leaf, leafHead),
+      /contained real directory/,
+    );
+    renameSync(heldLeaf, leaf);
+
+    renameSync(leaf, heldLeaf);
+    await symlink(leafSource, leaf);
+    await assert.rejects(
+      cleanCargoGitCheckout(context, root, rootHead),
+      /expected submodule path .* not to be a symbolic link|contained real directory/,
+    );
+    await assert.rejects(
+      cleanCargoGitCheckout(context, leaf, leafHead),
+      /contained real directory/,
+    );
+    await rm(leaf);
+    renameSync(heldLeaf, leaf);
+
+    renameSync(leaf, heldLeaf);
+    await mkdir(leaf);
+    await writeFile(resolve(leaf, ".git"), `gitdir: ${resolve(leafSource, ".git")}\n`);
+    await assert.rejects(
+      cleanCargoGitCheckout(context, root, rootHead),
+      /dirty or mismatched/,
+    );
+    await rm(leaf, { recursive: true, force: true });
+    renameSync(heldLeaf, leaf);
+
+    const wrongTree = structuredClone(snapshot);
+    wrongTree.submodules[0].submodules[0].tree = "f".repeat(40);
+    await assert.rejects(
+      assertCleanCargoGitCheckouts(context, [wrongTree]),
+      /changed during build/,
+    );
+    await assertCleanCargoGitCheckouts(context, [snapshot]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("moved deterministic vendor builder binds every locked package and one exact frame", async () => {
@@ -528,6 +898,26 @@ async function writePackage(vendor, name, packageHash, files) {
   }
 }
 
+async function initializeGitFixture(path, env, files) {
+  await mkdir(path, { recursive: true });
+  await fixtureGit(path, ["init", "--quiet"], env);
+  for (const [name, body] of Object.entries(files)) {
+    await writeFile(resolve(path, name), body);
+  }
+  await fixtureGit(path, ["add", "."], env);
+  await fixtureGit(path, ["commit", "--quiet", "-m", "fixture"], env);
+}
+
+async function fixtureGit(cwd, args, env) {
+  const result = await execFileAsync("git", [
+    "-c", "user.name=Nanocodex CI",
+    "-c", "user.email=ci@nanocodex.invalid",
+    "-c", "commit.gpgSign=false",
+    ...args,
+  ], { cwd, env, encoding: "utf8", maxBuffer: 1024 * 1024 });
+  return result.stdout.trimEnd();
+}
+
 async function run(command, args, env, input) {
   const child = spawn(command, args, {
     env,
@@ -546,12 +936,149 @@ function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-function fakeIdentity({ file = false, uid = 0, gid = 0, mode, nlink = 2 }) {
+function fixedRustcFixture(architecture = "arm64") {
+  const root = rustcBundleContract.root;
+  const host = rustcHostForArchitecture(architecture);
+  const driverRelativePath = "lib/librustc_driver-deadbeef.dylib";
+  const fileBodies = new Map([
+    [resolve(root, "bin/rustc"), Buffer.from("rustc-v1")],
+    [resolve(root, "lib/libLLVM.dylib"), Buffer.from("llvm-v1")],
+    [resolve(root, driverRelativePath), Buffer.from("driver-v1")],
+  ]);
+  const manifest = {
+    version: 1,
+    release: "1.98.0",
+    host,
+    files: [
+      {
+        path: "bin/rustc",
+        size: fileBodies.get(resolve(root, "bin/rustc")).length,
+        sha256: sha256(fileBodies.get(resolve(root, "bin/rustc"))),
+      },
+      {
+        path: "lib/libLLVM.dylib",
+        size: fileBodies.get(resolve(root, "lib/libLLVM.dylib")).length,
+        sha256: sha256(fileBodies.get(resolve(root, "lib/libLLVM.dylib"))),
+      },
+      {
+        path: driverRelativePath,
+        size: fileBodies.get(resolve(root, driverRelativePath)).length,
+        sha256: sha256(fileBodies.get(resolve(root, driverRelativePath))),
+      },
+    ],
+  };
+  const fixture = {
+    driverRelativePath,
+    entries: new Map([
+      [root, ["manifest.json", "lib", "bin"]],
+      [resolve(root, "bin"), ["rustc"]],
+      [resolve(root, "lib"), [driverRelativePath.slice("lib/".length), "libLLVM.dylib"]],
+    ]),
+    fileBodies,
+    hashedPaths: [],
+    identities: new Map(),
+    inspectedAclPaths: new Set(),
+    manifestBytes: Buffer.from(JSON.stringify(manifest) + "\n"),
+    toolCalls: [],
+    unsafeAclPaths: new Set(),
+    versionOutput: [
+      "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+      "binary: rustc",
+      "commit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea",
+      "commit-date: 2026-08-18",
+      `host: ${host}`,
+      "release: 1.98.0",
+      "LLVM version: 22.1.8",
+      "",
+    ].join("\n"),
+  };
+  let ino = 100;
+  const addIdentity = (path, options) => {
+    fixture.identities.set(path, fakeIdentity({ ...options, ino: ino++ }));
+  };
+  for (const path of ["/", "/Library", "/Library/PrivilegedHelperTools"]) {
+    addIdentity(path, { mode: 0o040755 });
+  }
+  for (const path of [root, resolve(root, "bin"), resolve(root, "lib")]) {
+    addIdentity(path, { mode: 0o040555 });
+  }
+  addIdentity(resolve(root, "manifest.json"), {
+    file: true,
+    mode: 0o100444,
+    nlink: 1,
+    size: fixture.manifestBytes.length,
+  });
+  addIdentity(resolve(root, "bin/rustc"), {
+    file: true,
+    mode: 0o100555,
+    nlink: 1,
+    size: fileBodies.get(resolve(root, "bin/rustc")).length,
+  });
+  for (const path of [
+    resolve(root, "lib/libLLVM.dylib"),
+    resolve(root, driverRelativePath),
+  ]) {
+    addIdentity(path, {
+      file: true,
+      mode: 0o100444,
+      nlink: 1,
+      size: fileBodies.get(path).length,
+    });
+  }
+  fixture.runToolPath = async (command, args, { env }) => {
+    fixture.toolCalls.push({ command, args: [...args], env: { ...env } });
+    return command === rustcBundleContract.rustcPath
+      ? { stdout: Buffer.from(fixture.versionOutput), stderr: Buffer.alloc(0) }
+      : { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+  };
+  fixture.options = {
+    architecture,
+    assertNoAclPath: async (path) => {
+      fixture.inspectedAclPaths.add(path);
+      if (fixture.unsafeAclPaths.has(path)) {
+        throw new Error(`fixed rustc path must have no access-control list: ${path}`);
+      }
+    },
+    hashFilePath: async (path) => {
+      fixture.hashedPaths.push(path);
+      const bytes = fixture.fileBodies.get(path);
+      return { sha256: sha256(bytes), size: bytes.length };
+    },
+    lstatPath: async (path) => {
+      const identity = fixture.identities.get(path);
+      if (identity == null) throw Object.assign(new Error(`missing ${path}`), { code: "ENOENT" });
+      return identity;
+    },
+    readManifestPath: async () => Buffer.from(fixture.manifestBytes),
+    readdirPath: async (path) => [...(fixture.entries.get(path) ?? [])],
+    realpathPath: async (path) => path,
+    runToolPath: fixture.runToolPath,
+  };
+  return fixture;
+}
+
+function fakeIdentity({
+  file = false,
+  uid = 0,
+  gid = 0,
+  mode,
+  nlink = 2,
+  size = 64,
+  dev = 1,
+  ino = 1,
+  mtimeMs = 1,
+  ctimeMs = 1,
+}) {
   return {
+    dev,
+    ino,
     uid,
     gid,
     mode,
     nlink,
+    size,
+    mtimeMs,
+    ctimeMs,
     isFile: () => file,
     isDirectory: () => !file,
     isSymbolicLink: () => false,

@@ -36,6 +36,7 @@ import {
   trustedPublisherPath,
   throwGitHubResponseFailure,
 } from "./ci-pr-controller.mjs";
+import { probeDescriptor } from "./ci-pr-cargo-builder.mjs";
 
 const headOne = "1".repeat(40);
 const headTwo = "2".repeat(40);
@@ -344,23 +345,17 @@ test("publisher children carry only source authority and fixed trusted code", ()
       cargoPrepHelperPath, "--build",
     ],
   );
+  const liveHelperProbe = probeDescriptor({ env: {}, uid: 502, gid: 20 });
   assert.deepEqual(parsePrepProbe(
-    JSON.stringify({
-      credentialEnvironmentNames: [],
-      freshHomePolicy: "per-build-private-temporary",
-      gid: 20,
-      helperVersion: "2026-08-22.1",
-      uid: 502,
-      version: 1,
-    }) + "\n",
+    JSON.stringify(liveHelperProbe) + "\n",
     501,
-  ).uid, 502);
+  ), liveHelperProbe);
   assert.throws(
     () => parsePrepProbe(JSON.stringify({
       credentialEnvironmentNames: ["NANOCODEX_CI_TOKEN"],
       freshHomePolicy: "per-build-private-temporary",
       gid: 20,
-      helperVersion: "2026-08-22.1",
+      helperVersion: "2026-08-23.1",
       uid: 502,
       version: 1,
     }) + "\n", 501),

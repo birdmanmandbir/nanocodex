@@ -39,7 +39,7 @@ const authoritativeRepositoryUrl =
 export const cargoPrepHelperPath =
   "/Library/PrivilegedHelperTools/dev.nanocodex.ci-pr-cargo-builder";
 const sudoPath = "/usr/bin/sudo";
-const cargoPrepHelperVersion = "2026-08-22.1";
+const cargoPrepHelperVersion = "2026-08-23.1";
 const githubApiOrigin = "https://api.github.com";
 const sha1Pattern = /^[a-f0-9]{40}$/;
 const sha256Pattern = /^[a-f0-9]{64}$/;

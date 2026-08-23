@@ -385,11 +385,33 @@ current controller role. Its only entrypoint is the root-owned
 matching the trusted checkout, through the installer's exact
 `NOPASSWD:NOSETENV` sudo rule. That helper invokes only the separately reviewed
 Cargo 1.98.0 binary at
-`/Library/PrivilegedHelperTools/dev.nanocodex.ci-cargo`; the PR controller pins
-its exact SHA-256 on every install and update. The installer validates these
-boundaries but never creates the account, Cargo binary, or sudoers entry. Its
-generated root payload embeds the already-opened, reviewed builder bytes, so
-root never follows a controller-owned checkout path. Run each controller
+`/Library/PrivilegedHelperTools/dev.nanocodex.ci-cargo` and the real compiler at
+`/Library/PrivilegedHelperTools/dev.nanocodex.ci-rustc-1.98.0/bin/rustc`; the PR
+controller pins Cargo's exact SHA-256 and the compiler bundle manifest's exact
+SHA-256 on every install and update. The compiler bundle contains exactly
+`manifest.json`, `bin/rustc`, `lib/libLLVM.dylib`, and one
+`lib/librustc_driver-[0-9a-f]+.dylib`. The manifest is one compact canonical
+JSON object plus one newline, with this field order and the files sorted by
+path:
+
+```json
+{"version":1,"release":"1.98.0","host":"aarch64-apple-darwin","files":[{"path":"bin/rustc","size":400000,"sha256":"<64-lowercase-hex>"},{"path":"lib/libLLVM.dylib","size":140000000,"sha256":"<64-lowercase-hex>"},{"path":"lib/librustc_driver-4031c0ff8e88f5d1.dylib","size":83000000,"sha256":"<64-lowercase-hex>"}]}
+```
+
+Use the reviewed files' actual names, sizes, hashes, and the current machine's
+exact `aarch64-apple-darwin` or `x86_64-apple-darwin` host; the numbers and
+driver suffix above illustrate the schema only. The bundle root plus its
+`bin`/`lib` directories must be real root:wheel, no-ACL mode-0555 directories.
+All four files are real, root:wheel, singly linked, and no-ACL: the manifest
+and libraries are mode 0444, while `bin/rustc` is mode 0555. No other directory
+entry is allowed. The installer validates these boundaries but never creates the
+account, Cargo binary, 223 MiB compiler bundle, or sudoers entry. Its generated
+root payload embeds the already-opened, reviewed builder bytes, so root never
+follows a controller-owned checkout path. Before executing Node as root, the
+payload re-attests the captured Node device/inode, bytes, owner, mode, link
+count, ACL state, and complete root-owned ancestor chain; it then separately
+re-opens and hashes the already provisioned bundle and runs its exact
+`rustc -vV` before installing the builder. Run each controller
 command as its target login user, with a fixed clean checkout and a canonical
 Node binary outside that checkout. For PR, the selected Node executable is also
 part of the sudo boundary: root provisions it as a singly linked,
@@ -418,7 +440,8 @@ npm run ci:install-controller-service -- install \
   --node /root-provisioned/no-symlink/path/to/node \
   --repo /absolute/path/to/nanocodex \
   --prep-user nanocodex-ci-pr-prep \
-  --cargo-sha256 <reviewed-cargo-1.98.0-sha256>
+  --cargo-sha256 <reviewed-cargo-1.98.0-sha256> \
+  --rustc-manifest-sha256 <reviewed-rustc-1.98.0-manifest-sha256>
 ```
 
 The installer prompts directly into per-role Keychain items; no token enters a
@@ -434,13 +457,17 @@ reuse either controller identity or the authenticated macOS runner account, and
 never `chown` a PR checkout across this boundary. `status`, `update`, and
 `uninstall` use the same command with `--role`;
 PR install/update also supplies
-`--prep-user` and `--cargo-sha256`; `update --replace-secrets` rotates the exact
+`--prep-user`, `--cargo-sha256`, and `--rustc-manifest-sha256`;
+`update --replace-secrets` rotates the exact
 allowlist. The prep account must be a local locked non-login account with a
 unique same-name primary group, no shared or nested membership, a root-owned
 `/var/empty` home boundary, and no authentication, admin, Keychain, or service
 role. Its complete `LC_ALL=C sudo -n -l` output must contain only the builder's
 `--probe` and `--build` commands plus `timestamp_timeout=0`; inherited or group
 grants fail closed.
+Uninstall removes only controller-owned service and Keychain state. It leaves
+the preparation account, fixed builder, Cargo, rustc bundle, and sudoers rule
+for a separately reviewed root cleanup.
 Process status is not proof of a successful reconciliation, so production
 health also requires a recent retained master run and matching live deployment.
 Before a credentialed child starts, the master controller runs the trusted
@@ -484,7 +511,11 @@ The individual source publishers remain available as focused recovery tools.
 The master controller builds a deterministic vendor bundle in a token-free
 phase. The PR controller sends only the exact public PR/base/merge identity to
 the fixed helper, which fetches and vendors under the preparation UID and
-returns a bounded checksum-framed bundle. The controller rechecks GitHub, then
+returns a bounded checksum-framed bundle. Its fresh private environment sets
+`RUSTC` to the exact bundle executable while retaining a system-only `PATH` and
+empty `RUSTUP_HOME`; startup, helper probe/build, update, and status re-open and
+hash the manifest and all three loaded compiler files and require canonical
+Rust 1.98.0 `rustc -vV` release/host output. The controller rechecks GitHub, then
 an upload-only process receives the opened frame plus source authority; that
 process cannot invoke Git or Cargo. Objects are keyed by both the `Cargo.lock`
 blob and reproduced bundle SHA-256, so a PR first-write can never become a

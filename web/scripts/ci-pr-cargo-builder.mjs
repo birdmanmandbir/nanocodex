@@ -14,7 +14,7 @@ import {
   rm,
   stat,
 } from "node:fs/promises";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
@@ -31,16 +31,24 @@ const maximumTarBytes = 2 * 1024 * 1024 * 1024;
 const maximumTarEntries = 100_000;
 const maximumCommandOutputBytes = 16 * 1024 * 1024;
 const maximumDiagnosticBytes = 2_000;
+const maximumRustcManifestBytes = 16 * 1024;
+const maximumRustcVersionBytes = 16 * 1024;
 const processTerminationGraceMs = 500;
 const processKillWaitMs = 5_000;
 const processGroupPollMs = 25;
 const cargoHomeVendor = "/workspace/.cargo-home/vendor";
 const frameMagic = Buffer.from("NANOCODEX-CI-CARGO-VENDOR\0", "ascii");
 const frameVersion = 1;
-const helperVersion = "2026-08-22.1";
+const helperVersion = "2026-08-23.1";
 const freshHomePolicy = "per-build-private-temporary";
 const buildRequestExitCode = 65;
 const fixedCargoPath = "/Library/PrivilegedHelperTools/dev.nanocodex.ci-cargo";
+const fixedRustcRoot =
+  "/Library/PrivilegedHelperTools/dev.nanocodex.ci-rustc-1.98.0";
+const fixedRustcManifestPath = resolve(fixedRustcRoot, "manifest.json");
+const fixedRustcPath = resolve(fixedRustcRoot, "bin/rustc");
+const fixedRustcRelease = "1.98.0";
+const rustcDriverNamePattern = /^librustc_driver-[0-9a-f]+\.dylib$/;
 const dangerousEnvironmentPattern =
   /(?:^|_)(?:AUTH|CREDENTIAL|COOKIE|KEYCHAIN|PASSWORD|PASSWD|SECRET|SESSION|TOKEN)(?:_|$)/i;
 const dangerousEnvironmentNames = new Set([
@@ -72,6 +80,7 @@ const dangerousEnvironmentNames = new Set([
   "PERL5OPT",
   "PYTHONPATH",
   "RUBYOPT",
+  "RUSTC",
   "RUSTC_WRAPPER",
   "RUSTC_WORKSPACE_WRAPPER",
   "RUSTUP_HOME",
@@ -95,6 +104,22 @@ export const cargoVendorFrame = Object.freeze({
   maximumTotalBytes:
     frameMagic.length + 8 + maximumDescriptorBytes + maximumBundleBytes,
 });
+
+export const rustcBundleContract = Object.freeze({
+  get host() {
+    return rustcHostForArchitecture();
+  },
+  manifestPath: fixedRustcManifestPath,
+  release: fixedRustcRelease,
+  root: fixedRustcRoot,
+  rustcPath: fixedRustcPath,
+});
+
+export function rustcHostForArchitecture(architecture = process.arch) {
+  if (architecture === "arm64") return "aarch64-apple-darwin";
+  if (architecture === "x64") return "x86_64-apple-darwin";
+  throw new Error(`fixed rustc bundle does not support architecture: ${architecture}`);
+}
 
 export function canonicalJson(value) {
   return JSON.stringify(canonicalValue(value));
@@ -154,6 +179,7 @@ export function parseBuildRequest(bytes) {
 export function dangerousCredentialEnvironment(env = process.env) {
   return Object.keys(env).filter((name) =>
     name.startsWith("NANOCODEX_") ||
+    name.startsWith("DYLD_") ||
     dangerousEnvironmentNames.has(name) ||
     dangerousEnvironmentPattern.test(name)
   ).sort();
@@ -243,6 +269,7 @@ export function validateDescriptor(value) {
 
 export async function buildCargoVendor(request, {
   gitPath,
+  rustcBundleOptions,
   signal,
 } = {}) {
   const identity = validateParsedRequest(request);
@@ -252,6 +279,10 @@ export async function buildCargoVendor(request, {
     !Number.isSafeInteger(uid) || uid <= 0 ||
     !Number.isSafeInteger(gid) || gid <= 0
   ) throw new Error("helper requires a non-root POSIX uid and nonzero gid");
+  const rustcBefore = await verifyFixedRustcBundle({
+    ...rustcBundleOptions,
+    signal,
+  });
   const tools = {
     git: gitPath ?? await resolveTrustedExecutable(
       process.platform === "win32" ? [] : ["/usr/bin/git", "/bin/git"],
@@ -274,7 +305,7 @@ export async function buildCargoVendor(request, {
       ...state,
       ...tools,
       signal: combinedSignal,
-      env: buildEnvironment(state),
+      env: buildEnvironment(state, { rustcPath: rustcBefore.rustcPath }),
     };
     await checkoutIdentity(context, identity);
     await assertCheckout(context, identity);
@@ -313,6 +344,11 @@ export async function buildCargoVendor(request, {
       signal: combinedSignal,
       operation: "cargo vendor",
     });
+    const rustcAfter = await verifyFixedRustcBundle({
+      ...rustcBundleOptions,
+      signal: combinedSignal,
+    });
+    assertSameRustcBundle(rustcBefore, rustcAfter);
     const config = cargoSourceConfig(vendorResult.stdout.toString("utf8"), cargoLock);
     const directories = await selectVendorDirectories(vendorDirectory, cargoLock);
     const checkouts = await readCleanCargoGitCheckouts(context, cargoLock);
@@ -472,12 +508,21 @@ async function checkoutIdentity(context, identity) {
 
 async function assertPrivateBuildDirectories(context) {
   const uid = process.getuid?.();
-  for (const path of [context.root, context.home, context.cargoHome, context.repository]) {
+  for (const path of [
+    context.root,
+    context.home,
+    context.cargoHome,
+    context.rustupHome,
+    context.repository,
+  ]) {
     const identity = await lstat(path);
     if (
       !identity.isDirectory() || identity.isSymbolicLink() || identity.uid !== uid ||
       (identity.mode & 0o077) !== 0 || await realpath(path) !== path
     ) throw new Error("Cargo preparation directories must remain private to the prep uid");
+  }
+  if ((await readdir(context.rustupHome)).length !== 0) {
+    throw new Error("Cargo preparation RUSTUP_HOME must remain empty");
   }
 }
 
@@ -573,22 +618,28 @@ async function createFreshState(uid) {
   }
   const home = resolve(root, "home");
   const cargoHome = resolve(root, "cargo-home");
+  const rustupHome = resolve(root, "rustup-home");
   const repository = resolve(root, "repository");
   await Promise.all([
     mkdir(home, { mode: 0o700 }),
     mkdir(cargoHome, { mode: 0o700 }),
+    mkdir(rustupHome, { mode: 0o700 }),
     mkdir(repository, { mode: 0o700 }),
   ]);
-  return { root, home, cargoHome, repository };
+  return { root, home, cargoHome, rustupHome, repository };
 }
 
-export function buildEnvironment(state) {
+export function buildEnvironment(state, { rustcPath = fixedRustcPath } = {}) {
+  if (!isAbsolute(rustcPath) || rustcPath.includes("\0")) {
+    throw new Error("RUSTC must be one exact absolute executable path");
+  }
   return {
     PATH: "/usr/bin:/bin",
     HOME: state.home,
     USERPROFILE: state.home,
     CARGO_HOME: state.cargoHome,
-    RUSTUP_HOME: resolve(state.root, "rustup-home"),
+    RUSTUP_HOME: state.rustupHome ?? resolve(state.root, "rustup-home"),
+    RUSTC: rustcPath,
     LANG: "C.UTF-8",
     LC_ALL: "C.UTF-8",
     TMPDIR: state.root,
@@ -686,35 +737,423 @@ export async function resolveFixedCargoExecutable({
   return fixedCargoPath;
 }
 
-async function probeToolchain(uid, signal) {
-  const git = await resolveTrustedExecutable(
-    process.platform === "win32" ? [] : ["/usr/bin/git", "/bin/git"],
-    "Git",
-    uid,
+export async function verifyFixedRustcBundle({
+  architecture = process.arch,
+  assertNoAclPath = assertNoAccessControlList,
+  hashFilePath = hashFixedRustcFile,
+  lstatPath = lstat,
+  readManifestPath = readFixedRustcManifest,
+  readdirPath = readdir,
+  realpathPath = realpath,
+  runToolPath = runTool,
+  signal,
+} = {}) {
+  const expectedHost = rustcHostForArchitecture(architecture);
+  const dependencies = { assertNoAclPath, lstatPath, realpathPath, signal };
+  const ancestorPaths = [];
+  let ancestor = dirname(fixedRustcRoot);
+  while (true) {
+    ancestorPaths.push(ancestor);
+    if (ancestor === "/") break;
+    ancestor = dirname(ancestor);
+  }
+  for (const path of ancestorPaths.reverse()) {
+    await trustedRustcNode(path, "ancestor directory", dependencies);
+  }
+
+  const directoryIdentities = new Map();
+  for (const [path, description] of [
+    [fixedRustcRoot, "bundle root"],
+    [resolve(fixedRustcRoot, "bin"), "bundle bin directory"],
+    [resolve(fixedRustcRoot, "lib"), "bundle lib directory"],
+  ]) {
+    directoryIdentities.set(
+      path,
+      await trustedRustcNode(path, "bundle directory", dependencies, description),
+    );
+  }
+
+  await assertExactRustcDirectory(
+    fixedRustcRoot,
+    ["bin", "lib", "manifest.json"],
+    readdirPath,
   );
-  const cargo = await resolveFixedCargoExecutable();
-  const environment = {
+  await assertExactRustcDirectory(resolve(fixedRustcRoot, "bin"), ["rustc"], readdirPath);
+  const libraryNames = await rustcDirectoryEntries(resolve(fixedRustcRoot, "lib"), readdirPath);
+  const driverNames = libraryNames.filter((name) => rustcDriverNamePattern.test(name));
+  if (
+    libraryNames.length !== 2 || libraryNames[0] !== "libLLVM.dylib" ||
+    driverNames.length !== 1 || libraryNames[1] !== driverNames[0]
+  ) {
+    throw new Error(
+      "fixed rustc lib directory must contain exactly libLLVM.dylib and one hashed rustc driver",
+    );
+  }
+  const driverName = driverNames[0];
+  const driverRelativePath = `lib/${driverName}`;
+
+  const fileModes = new Map([
+    [fixedRustcManifestPath, "read-only data file"],
+    [fixedRustcPath, "read-only executable"],
+    [resolve(fixedRustcRoot, "lib/libLLVM.dylib"), "read-only data file"],
+    [resolve(fixedRustcRoot, driverRelativePath), "read-only data file"],
+  ]);
+  const fileIdentities = new Map();
+  for (const [path, kind] of fileModes) {
+    fileIdentities.set(path, await trustedRustcNode(path, kind, dependencies));
+  }
+
+  const manifestIdentity = fileIdentities.get(fixedRustcManifestPath);
+  const manifestBytes = await readManifestPath(fixedRustcManifestPath, manifestIdentity);
+  if (!Buffer.isBuffer(manifestBytes)) {
+    throw new Error("fixed rustc manifest reader returned non-bytes");
+  }
+  if (
+    manifestBytes.length === 0 || manifestBytes.length > maximumRustcManifestBytes ||
+    manifestBytes.length !== manifestIdentity.size
+  ) throw new Error("fixed rustc manifest has an unsafe size");
+  await assertRustcPathIdentity(
+    fixedRustcManifestPath,
+    manifestIdentity,
+    lstatPath,
+    "manifest changed while it was read",
+  );
+  const manifest = parseFixedRustcManifest(manifestBytes, driverRelativePath, expectedHost);
+
+  const observedFiles = [];
+  for (const entry of manifest.files) {
+    const path = resolve(fixedRustcRoot, entry.path);
+    const identity = fileIdentities.get(path);
+    if (identity == null || identity.size !== entry.size) {
+      throw new Error(`fixed rustc manifest size does not match ${entry.path}`);
+    }
+    const observed = await hashFilePath(path, identity);
+    if (
+      !record(observed) || observed.size !== entry.size ||
+      observed.sha256 !== entry.sha256
+    ) throw new Error(`fixed rustc manifest hash does not match ${entry.path}`);
+    await assertRustcPathIdentity(
+      path,
+      identity,
+      lstatPath,
+      `${entry.path} changed while it was hashed`,
+    );
+    observedFiles.push({
+      identity: fileIdentity(identity),
+      path: entry.path,
+      sha256: observed.sha256,
+      size: observed.size,
+    });
+  }
+
+  await assertExactRustcDirectory(
+    fixedRustcRoot,
+    ["bin", "lib", "manifest.json"],
+    readdirPath,
+  );
+  await assertExactRustcDirectory(resolve(fixedRustcRoot, "bin"), ["rustc"], readdirPath);
+  await assertExactRustcDirectory(
+    resolve(fixedRustcRoot, "lib"),
+    ["libLLVM.dylib", driverName],
+    readdirPath,
+  );
+  for (const [path, identity] of directoryIdentities) {
+    await assertRustcPathIdentity(
+      path,
+      identity,
+      lstatPath,
+      "fixed rustc directory changed during validation",
+    );
+  }
+
+  const versionResult = await runToolPath(fixedRustcPath, ["-vV"], {
+    cwd: "/",
+    env: rustcProbeEnvironment(),
+    signal,
+    operation: "fixed rustc readiness probe",
+  });
+  const version = validateRustcVersionOutput(
+    versionResult.stdout,
+    versionResult.stderr,
+    { architecture },
+  );
+  const manifestSha256 = createHash("sha256").update(manifestBytes).digest("hex");
+  const snapshot = canonicalJson({
+    directories: [...directoryIdentities].map(([path, identity]) => ({
+      identity: fileIdentity(identity),
+      path,
+    })),
+    files: observedFiles,
+    manifestIdentity: fileIdentity(manifestIdentity),
+    manifestSha256,
+    versionSha256: createHash("sha256").update(version.output).digest("hex"),
+  });
+  return {
+    host: expectedHost,
+    manifestSha256,
+    release: fixedRustcRelease,
+    rustcPath: fixedRustcPath,
+    snapshot,
+  };
+}
+
+function parseFixedRustcManifest(bytes, driverRelativePath, expectedHost) {
+  const text = bytes.toString("utf8");
+  if (!Buffer.from(text).equals(bytes) || !text.endsWith("\n") || text.includes("\r")) {
+    throw new Error("fixed rustc manifest must be canonical UTF-8 JSON plus one newline");
+  }
+  let value;
+  try {
+    value = JSON.parse(text);
+  } catch (cause) {
+    throw new Error("fixed rustc manifest is not valid JSON", { cause });
+  }
+  const expectedPaths = ["bin/rustc", "lib/libLLVM.dylib", driverRelativePath];
+  if (
+    !record(value) ||
+    !sameKeys(Object.keys(value), ["version", "release", "host", "files"]) ||
+    value.version !== 1 || value.release !== fixedRustcRelease || value.host !== expectedHost ||
+    !Array.isArray(value.files) || value.files.length !== expectedPaths.length
+  ) throw new Error("fixed rustc manifest has an unsupported identity or schema");
+  for (let index = 0; index < expectedPaths.length; index += 1) {
+    const entry = value.files[index];
+    if (
+      !record(entry) || !sameKeys(Object.keys(entry), ["path", "size", "sha256"]) ||
+      entry.path !== expectedPaths[index] ||
+      !Number.isSafeInteger(entry.size) || entry.size <= 0 ||
+      !sha256Pattern.test(entry.sha256)
+    ) throw new Error("fixed rustc manifest has invalid or unsorted file entries");
+  }
+  const canonical = JSON.stringify({
+    version: value.version,
+    release: value.release,
+    host: value.host,
+    files: value.files.map(({ path, size, sha256 }) => ({ path, size, sha256 })),
+  }) + "\n";
+  if (canonical !== text) {
+    throw new Error("fixed rustc manifest must use its canonical JSON encoding");
+  }
+  return value;
+}
+
+async function trustedRustcNode(path, kind, {
+  assertNoAclPath,
+  lstatPath,
+  realpathPath,
+  signal,
+}, description = kind) {
+  let canonical;
+  let identity;
+  try {
+    [canonical, identity] = await Promise.all([realpathPath(path), lstatPath(path)]);
+  } catch (cause) {
+    throw new Error(`fixed rustc ${description} is unavailable: ${path}`, { cause });
+  }
+  const common =
+    canonical === path && !identity.isSymbolicLink() && identity.uid === 0 && identity.gid === 0;
+  let valid = false;
+  if (kind === "ancestor directory") {
+    valid = common && identity.isDirectory() &&
+      (identity.mode & 0o7022) === 0 && (identity.mode & 0o005) === 0o005;
+  } else if (kind === "bundle directory") {
+    valid = common && identity.isDirectory() && (identity.mode & 0o7777) === 0o555;
+  } else if (kind === "read-only executable") {
+    valid = common && identity.isFile() && identity.nlink === 1 &&
+      (identity.mode & 0o7777) === 0o555 &&
+      Number.isSafeInteger(identity.size) && identity.size > 0;
+  } else if (kind === "read-only data file") {
+    valid = common && identity.isFile() && identity.nlink === 1 &&
+      (identity.mode & 0o7777) === 0o444 &&
+      Number.isSafeInteger(identity.size) && identity.size > 0;
+  }
+  if (!valid) {
+    throw new Error(
+      `fixed rustc ${description} must be a real root:wheel non-writable no-special-bit ${kind}`,
+    );
+  }
+  await assertNoAclPath(path, { signal });
+  return identity;
+}
+
+async function assertExactRustcDirectory(path, expected, readdirPath) {
+  const observed = await rustcDirectoryEntries(path, readdirPath);
+  if (!sameKeys(observed, [...expected].sort())) {
+    throw new Error(`fixed rustc directory has unsafe entries: ${path}`);
+  }
+}
+
+async function rustcDirectoryEntries(path, readdirPath) {
+  let entries;
+  try {
+    entries = await readdirPath(path);
+  } catch (cause) {
+    throw new Error(`fixed rustc directory is unreadable: ${path}`, { cause });
+  }
+  if (!Array.isArray(entries) || entries.some((entry) => typeof entry !== "string")) {
+    throw new Error(`fixed rustc directory returned unsafe entries: ${path}`);
+  }
+  return [...entries].sort();
+}
+
+async function assertRustcPathIdentity(path, expected, lstatPath, message) {
+  const observed = fileIdentity(await lstatPath(path));
+  if (!sameFileIdentity(fileIdentity(expected), observed)) throw new Error(message);
+}
+
+async function readFixedRustcManifest(path, expectedIdentity) {
+  let handle;
+  try {
+    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const before = fileIdentity(await handle.stat());
+    if (!sameFileIdentity(fileIdentity(expectedIdentity), before)) {
+      throw new Error("fixed rustc manifest changed before it was read");
+    }
+    if (before.size <= 0 || before.size > maximumRustcManifestBytes) {
+      throw new Error("fixed rustc manifest exceeds its size bound");
+    }
+    const bytes = await handle.readFile();
+    const after = fileIdentity(await handle.stat());
+    if (!sameFileIdentity(before, after) || bytes.length !== before.size) {
+      throw new Error("fixed rustc manifest changed while it was read");
+    }
+    return bytes;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+async function hashFixedRustcFile(path, expectedIdentity) {
+  let handle;
+  try {
+    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const before = fileIdentity(await handle.stat());
+    if (!sameFileIdentity(fileIdentity(expectedIdentity), before)) {
+      throw new Error(`fixed rustc file changed before hashing: ${path}`);
+    }
+    const hash = createHash("sha256");
+    let size = 0;
+    for await (const chunk of createReadStream("", {
+      fd: handle.fd,
+      autoClose: false,
+      start: 0,
+      end: before.size - 1,
+    })) {
+      size += chunk.length;
+      if (size > before.size) throw new Error(`fixed rustc file grew while hashing: ${path}`);
+      hash.update(chunk);
+    }
+    const after = fileIdentity(await handle.stat());
+    if (size !== before.size || !sameFileIdentity(before, after)) {
+      throw new Error(`fixed rustc file changed while hashing: ${path}`);
+    }
+    return { sha256: hash.digest("hex"), size };
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+async function assertNoAccessControlList(path, { signal } = {}) {
+  const result = await runTool("/bin/ls", ["-lde", path], {
+    cwd: "/",
+    env: rustcProbeEnvironment(),
+    signal,
+    operation: "fixed rustc ACL inspection",
+  });
+  const text = result.stdout.toString("utf8");
+  const lines = text.endsWith("\n") ? text.slice(0, -1).split("\n") : [];
+  const mode = lines[0]?.trimStart().split(/\s+/, 1)[0] ?? "";
+  if (
+    result.stderr.length !== 0 || !Buffer.from(text).equals(result.stdout) ||
+    text.includes("\r") || lines.length !== 1 ||
+    !/^[bcdlps-][rwxStTs-]{9}@?$/.test(mode)
+  ) throw new Error(`fixed rustc path must have no access-control list: ${path}`);
+}
+
+function rustcProbeEnvironment() {
+  return {
     PATH: "/usr/bin:/bin",
     HOME: "/var/empty",
+    USERPROFILE: "/var/empty",
     CARGO_HOME: "/var/empty",
     RUSTUP_HOME: "/var/empty",
+    RUSTC: fixedRustcPath,
+    LANG: "C.UTF-8",
+    LC_ALL: "C.UTF-8",
     GIT_CONFIG_NOSYSTEM: "1",
     GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_SYSTEM: "/dev/null",
     GIT_TERMINAL_PROMPT: "0",
-    LANG: "C.UTF-8",
   };
-  await runTool(git, ["--version"], {
+}
+
+export function validateRustcVersionOutput(
+  stdout,
+  stderr = Buffer.alloc(0),
+  { architecture = process.arch } = {},
+) {
+  const expectedHost = rustcHostForArchitecture(architecture);
+  if (!Buffer.isBuffer(stdout)) stdout = Buffer.from(stdout ?? "");
+  if (!Buffer.isBuffer(stderr)) stderr = Buffer.from(stderr ?? "");
+  const output = stdout.toString("utf8");
+  if (
+    stdout.length === 0 || stdout.length > maximumRustcVersionBytes || stderr.length !== 0 ||
+    !Buffer.from(output).equals(stdout) || !output.endsWith("\n") ||
+    output.includes("\r") || output.includes("\0")
+  ) throw new Error("fixed rustc -vV emitted non-canonical output");
+  const lines = output.slice(0, -1).split("\n");
+  if (lines.length !== 7) throw new Error("fixed rustc -vV emitted unexpected fields");
+  const heading = lines[0].match(/^rustc 1\.98\.0 \(([0-9a-f]{9}) (\d{4}-\d{2}-\d{2})\)$/);
+  const commit = lines[2].match(/^commit-hash: ([0-9a-f]{40})$/);
+  const date = lines[3].match(/^commit-date: (\d{4}-\d{2}-\d{2})$/);
+  if (
+    heading == null || lines[1] !== "binary: rustc" || commit == null || date == null ||
+    lines[4] !== `host: ${expectedHost}` ||
+    lines[5] !== `release: ${fixedRustcRelease}` ||
+    !/^LLVM version: [0-9]+(?:\.[0-9]+)+$/.test(lines[6]) ||
+    !commit[1].startsWith(heading[1]) || date[1] !== heading[2]
+  ) throw new Error("fixed rustc -vV does not match the required release and host");
+  return { host: expectedHost, output, release: fixedRustcRelease };
+}
+
+function assertSameRustcBundle(before, after) {
+  if (before.snapshot !== after.snapshot) {
+    throw new Error("fixed rustc bundle changed during Cargo preparation");
+  }
+}
+
+export async function probeToolchain(uid, signal, {
+  resolveCargoPath = resolveFixedCargoExecutable,
+  resolveGitPath,
+  runToolPath = runTool,
+  rustcBundleOptions,
+} = {}) {
+  const git = resolveGitPath
+    ? await resolveGitPath(uid)
+    : await resolveTrustedExecutable(
+        process.platform === "win32" ? [] : ["/usr/bin/git", "/bin/git"],
+        "Git",
+        uid,
+      );
+  const cargo = await resolveCargoPath();
+  const rustc = await verifyFixedRustcBundle({
+    runToolPath,
+    ...rustcBundleOptions,
+    signal,
+  });
+  const environment = rustcProbeEnvironment();
+  await runToolPath(git, ["--version"], {
     cwd: "/",
     env: environment,
     signal,
     operation: "Git readiness probe",
   });
-  await runTool(cargo, ["--version", "--verbose"], {
+  await runToolPath(cargo, ["--version", "--verbose"], {
     cwd: "/",
     env: environment,
     signal,
     operation: "Cargo readiness probe",
   });
+  return rustc;
 }
 
 export async function runTool(command, args, { cwd, env, signal, operation }) {
@@ -1058,34 +1497,171 @@ async function readCleanCargoGitCheckouts(context, cargoLock) {
     if (matches.length !== 1) {
       throw new Error(`expected one fresh Cargo Git checkout for ${revision}, found ${matches.length}`);
     }
-    checkouts.push(await cleanCargoGitCheckout(context, matches[0], revision));
+    checkouts.push(await cleanCargoGitCheckout(context, matches[0], revision, root));
   }
   return checkouts;
 }
 
-async function cleanCargoGitCheckout(context, path, revision) {
-  const [head, tree, topLevel, status] = await Promise.all([
-    gitText(context, ["rev-parse", "--verify", "HEAD^{commit}"], path),
-    gitText(context, ["rev-parse", "--verify", "HEAD^{tree}"], path),
-    gitText(context, ["rev-parse", "--show-toplevel"], path),
-    gitText(context, [
-      "status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching",
-      "--ignore-submodules=none",
-    ], path),
-  ]);
-  const unexpected = status.split("\n").filter((line) => line && line !== "?? .cargo-ok");
-  if (
-    head !== revision || !sha1Pattern.test(tree) || await realpath(topLevel) !== path ||
-    unexpected.length > 0
-  ) throw new Error(`Cargo Git checkout ${revision} is dirty or mismatched`);
-  return { path, revision, tree };
+export async function cleanCargoGitCheckout(
+  context,
+  path,
+  revision,
+  checkoutRoot = resolve(context.cargoHome, "git/checkouts"),
+) {
+  const cargoHome = resolve(context.cargoHome);
+  const root = resolve(checkoutRoot);
+  const checkout = resolve(path);
+  await assertRealCargoDirectory(cargoHome, null, "Cargo home");
+  await assertRealCargoDirectory(root, cargoHome, "Cargo Git checkout root");
+  await assertRealCargoDirectory(checkout, root, "Cargo Git checkout");
+  return cleanCargoGitRepository(context, checkout, revision, {
+    cargoHome,
+    checkout,
+  });
 }
 
-async function assertCleanCargoGitCheckouts(context, expected) {
+async function cleanCargoGitRepository(context, path, revision, containment) {
+  if (!sha1Pattern.test(revision)) throw new Error("Cargo Git checkout has an invalid revision");
+  const dotGit = await lstat(resolve(path, ".git")).catch(() => null);
+  if (
+    dotGit == null || dotGit.isSymbolicLink() ||
+    (!dotGit.isDirectory() && !dotGit.isFile())
+  ) throw new Error(`Cargo Git repository ${revision} is uninitialized or unsafe`);
+  const [head, tree, topLevel, gitDirectory, commonDirectory, status, entries, replacements] =
+    await Promise.all([
+      gitText(context, ["rev-parse", "--verify", "HEAD^{commit}"], path),
+      gitText(context, ["rev-parse", "--verify", "HEAD^{tree}"], path),
+      gitText(context, ["rev-parse", "--show-toplevel"], path),
+      gitText(context, ["rev-parse", "--absolute-git-dir"], path),
+      gitText(context, ["rev-parse", "--git-common-dir"], path),
+      runGit(context, [
+        "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching",
+        "--ignore-submodules=none",
+      ], path),
+      runGit(context, ["ls-tree", "-r", "-z", "--full-tree", "HEAD"], path),
+      gitText(context, ["for-each-ref", "--format=%(refname)", "refs/replace/"], path),
+    ]);
+  const canonicalTopLevel = await realpath(topLevel);
+  const canonicalGitDirectory = await realpath(gitDirectory);
+  const commonPath = isAbsolute(commonDirectory)
+    ? resolve(commonDirectory)
+    : resolve(path, commonDirectory);
+  const canonicalCommonDirectory = await realpath(commonPath);
+  const gitlinks = cargoGitlinks(entries.stdout);
+  const unexpected = unexpectedCargoGitStatus(status.stdout, gitlinks);
+  if (
+    head !== revision || !sha1Pattern.test(tree) || canonicalTopLevel !== path ||
+    canonicalGitDirectory !== resolve(gitDirectory) ||
+    canonicalCommonDirectory !== commonPath ||
+    !containedPath(containment.cargoHome, canonicalGitDirectory) ||
+    !containedPath(containment.cargoHome, canonicalCommonDirectory) ||
+    replacements !== "" || unexpected.length > 0
+  ) {
+    const detail = unexpected.join("; ").slice(0, maximumDiagnosticBytes);
+    throw new Error(
+      `Cargo Git checkout ${revision} is dirty or mismatched${detail ? `: ${detail}` : ""}`,
+    );
+  }
+  if (status.stdout.includes(Buffer.from("?? .cargo-ok\0"))) {
+    const marker = await lstat(resolve(path, ".cargo-ok")).catch(() => null);
+    if (
+      marker == null || !marker.isFile() || marker.isSymbolicLink() ||
+      marker.nlink !== 1 || marker.size !== 0
+    ) throw new Error(`Cargo Git checkout ${revision} has an unsafe .cargo-ok marker`);
+  }
+  const submodules = [];
+  for (const gitlink of gitlinks) {
+    const submodule = resolve(path, gitlink.path);
+    if (!containedPath(path, submodule) || !containedPath(containment.checkout, submodule)) {
+      throw new Error(`Cargo Git checkout ${revision} has an unsafe submodule path`);
+    }
+    await assertRealCargoDirectory(submodule, containment.checkout, "Cargo Git submodule");
+    submodules.push(await cleanCargoGitRepository(
+      context,
+      submodule,
+      gitlink.revision,
+      containment,
+    ));
+  }
+  return { path, revision, tree, submodules };
+}
+
+function cargoGitlinks(bytes) {
+  const gitlinks = [];
+  for (const record of nulRecords(bytes)) {
+    const tab = record.indexOf(0x09);
+    if (tab < 0) throw new Error("Cargo Git checkout has a malformed tree entry");
+    const header = decodeGitBytes(record.subarray(0, tab));
+    if (!header.startsWith("160000 ")) continue;
+    const match = header.match(/^160000 commit ([a-f0-9]{40})$/);
+    const path = decodeGitBytes(record.subarray(tab + 1));
+    if (
+      !match || path.length === 0 || isAbsolute(path) ||
+      path.split("/").some((part) => part === "" || part === "." || part === "..")
+    ) throw new Error("Cargo Git checkout has an unsafe gitlink");
+    gitlinks.push({ path, revision: match[1] });
+  }
+  return gitlinks;
+}
+
+function unexpectedCargoGitStatus(bytes, gitlinks) {
+  const allowed = new Set([
+    "?? .cargo-ok",
+    ...gitlinks.map(({ path }) => ` M ${path}`),
+  ]);
+  return nulRecords(bytes).map(decodeGitBytes).filter((record) => !allowed.has(record));
+}
+
+function nulRecords(bytes) {
+  if (bytes.length === 0) return [];
+  if (bytes[bytes.length - 1] !== 0) throw new Error("Git emitted a malformed NUL-delimited record");
+  const records = [];
+  let start = 0;
+  for (let index = 0; index < bytes.length; index += 1) {
+    if (bytes[index] !== 0) continue;
+    if (index === start) throw new Error("Git emitted an empty NUL-delimited record");
+    records.push(bytes.subarray(start, index));
+    start = index + 1;
+  }
+  return records;
+}
+
+function decodeGitBytes(bytes) {
+  const decoded = bytes.toString("utf8");
+  if (!Buffer.from(decoded).equals(bytes)) throw new Error("Git emitted a non-UTF-8 path");
+  return decoded;
+}
+
+async function assertRealCargoDirectory(path, parent, description) {
+  const identity = await lstat(path).catch(() => null);
+  if (
+    identity == null || !identity.isDirectory() || identity.isSymbolicLink() ||
+    await realpath(path) !== path || (parent != null && !containedPath(parent, path))
+  ) throw new Error(`${description} must be a contained real directory`);
+}
+
+function containedPath(parent, path, allowEqual = false) {
+  const suffix = relative(parent, path);
+  return (allowEqual && suffix === "") ||
+    (suffix !== "" && suffix !== ".." && !suffix.startsWith(`..${sep}`) &&
+      !isAbsolute(suffix));
+}
+
+export async function assertCleanCargoGitCheckouts(context, expected) {
   for (const checkout of expected) {
     const observed = await cleanCargoGitCheckout(context, checkout.path, checkout.revision);
-    if (observed.tree !== checkout.tree) throw new Error("Cargo Git checkout changed during build");
+    if (!sameCargoGitCheckout(observed, checkout)) {
+      throw new Error("Cargo Git checkout changed during build");
+    }
   }
+}
+
+function sameCargoGitCheckout(left, right) {
+  return left.path === right.path && left.revision === right.revision && left.tree === right.tree &&
+    left.submodules.length === right.submodules.length &&
+    left.submodules.every((submodule, index) =>
+      sameCargoGitCheckout(submodule, right.submodules[index])
+    );
 }
 
 async function cargoVendorExtraDirectories(cargoLock, checkouts) {
