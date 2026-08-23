@@ -1,17 +1,34 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { realpathSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const webDirectory = fileURLToPath(new URL("../", import.meta.url));
 const repositoryDirectory = fileURLToPath(new URL("../../", import.meta.url));
+const deploymentConfigPath = "dist/nanocodex/wrangler.json";
+const deploymentConfigUrl = new URL(`../${deploymentConfigPath}`, import.meta.url);
+const deploymentTargets = new Map([
+  ["https://nanocodex.me-7fb.workers.dev", Object.freeze({
+    accountId: "7fb82fc3b80331b2cd45f097acbd9ffc",
+    environment: "production",
+    name: "nanocodex",
+    origin: "https://nanocodex.me-7fb.workers.dev",
+  })],
+  ["https://nanocodex-preview.gakonst.workers.dev", Object.freeze({
+    accountId: "16ce0442a940f01beefdb15a196a43ea",
+    environment: "preview",
+    name: "nanocodex-preview",
+    origin: "https://nanocodex-preview.gakonst.workers.dev",
+  })],
+]);
 
 export function deployArguments(revision) {
   assert.match(revision, /^[0-9a-f]{40}$/, "deployment revision must be a full commit SHA");
   return [
     "deploy",
     "--config",
-    "dist/nanocodex/wrangler.json",
+    deploymentConfigPath,
     "--strict",
     "--containers-rollout",
     "none",
@@ -41,6 +58,66 @@ export function wranglerEnvironment(environment) {
   const childEnvironment = { ...environment };
   delete childEnvironment.CLOUDFLARE_ENV;
   return childEnvironment;
+}
+
+function deploymentTarget(origin, accountId) {
+  const url = new URL(origin);
+  assert.equal(
+    url.href,
+    `${url.origin}/`,
+    "NANOCODEX_WEB_ORIGIN must contain only an origin",
+  );
+  const target = deploymentTargets.get(url.origin);
+  assert.ok(target, `NANOCODEX_WEB_ORIGIN is not a supported deployment target: ${url.origin}`);
+  assert.equal(
+    accountId,
+    target.accountId,
+    `CLOUDFLARE_ACCOUNT_ID must match the ${target.environment} deployment target`,
+  );
+  return target;
+}
+
+function assertDeploymentConfig(serializedConfig, target) {
+  assert.equal(typeof serializedConfig, "string", "generated deployment config must be text");
+  let config;
+  try {
+    config = JSON.parse(serializedConfig);
+  } catch (cause) {
+    throw new Error("generated deployment config must be valid JSON", { cause });
+  }
+  assert.ok(
+    config !== null && typeof config === "object" && !Array.isArray(config),
+    "generated deployment config must be an object",
+  );
+  assert.equal(
+    Object.hasOwn(config, "env"),
+    false,
+    "generated deployment config must be flattened and omit env",
+  );
+  assert.equal(
+    config.name,
+    target.name,
+    `generated deployment config Worker name must match the ${target.environment} target`,
+  );
+  assert.ok(
+    config.vars !== null && typeof config.vars === "object" && !Array.isArray(config.vars),
+    "generated deployment config vars must be an object",
+  );
+  assert.equal(
+    config.vars.ENVIRONMENT,
+    target.environment,
+    "generated deployment config ENVIRONMENT must match the requested target",
+  );
+  assert.equal(
+    config.vars.CI_PUBLIC_ORIGIN,
+    target.origin,
+    "generated deployment config CI_PUBLIC_ORIGIN must match the requested target",
+  );
+  assert.equal(
+    config.vars.CLOUDFLARE_ACCOUNT_ID,
+    target.accountId,
+    "generated deployment config CLOUDFLARE_ACCOUNT_ID must match the requested target",
+  );
 }
 
 export function assertDeploymentHealth(health, revision) {
@@ -104,12 +181,16 @@ export function deploymentRevision(explicitRevision) {
 }
 
 export async function deployWorker({
+  accountId = process.env.CLOUDFLARE_ACCOUNT_ID,
   fetchImpl = globalThis.fetch,
   origin = process.env.NANOCODEX_WEB_ORIGIN ?? "https://nanocodex.me-7fb.workers.dev",
+  readConfig = () => readFile(deploymentConfigUrl, "utf8"),
   revision = deploymentRevision(process.env.NANOCODEX_DEPLOYMENT_SHA),
   run = runWrangler,
   write = (output) => process.stdout.write(output),
 } = {}) {
+  const target = deploymentTarget(origin, accountId);
+  assertDeploymentConfig(await readConfig(), target);
   const deployed = await run(deployArguments(revision));
   const workerVersionId = parseWorkerVersionId(deployed);
   const health = await waitForDeployment(fetchImpl, origin, revision);
