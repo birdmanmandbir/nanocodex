@@ -6,14 +6,15 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const webDirectory = fileURLToPath(new URL("../", import.meta.url));
 const repositoryDirectory = fileURLToPath(new URL("../../", import.meta.url));
 
-export function uploadArguments(revision) {
+export function deployArguments(revision) {
   assert.match(revision, /^[0-9a-f]{40}$/, "deployment revision must be a full commit SHA");
   return [
-    "versions",
-    "upload",
+    "deploy",
     "--config",
     "dist/nanocodex/wrangler.json",
     "--strict",
+    "--containers-rollout",
+    "none",
     "--tag",
     revision,
     "--message",
@@ -23,27 +24,23 @@ export function uploadArguments(revision) {
   ];
 }
 
-export function rolloutArguments(workerVersionId) {
-  assert.match(
-    workerVersionId,
-    /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/,
-    "Worker version ID must be a UUID",
+export function parseWorkerVersionId(output) {
+  const plainOutput = output.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "");
+  const workerVersionIds = [...plainOutput.matchAll(
+    /^[ \t]*Current Version ID:[ \t]*([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})[ \t]*\r?$/gim,
+  )].map((match) => match[1].toLowerCase());
+  assert.equal(
+    workerVersionIds.length,
+    1,
+    "wrangler deploy must report exactly one Current Worker version ID",
   );
-  return [
-    "versions",
-    "deploy",
-    `${workerVersionId}@100%`,
-    "--config",
-    "dist/nanocodex/wrangler.json",
-    "--yes",
-  ];
+  return workerVersionIds[0];
 }
 
-export function parseWorkerVersionId(output) {
-  const workerVersionId = output.match(/Worker Version ID:\s+([0-9a-f-]{36})/)?.[1];
-  assert.ok(workerVersionId, "wrangler upload must report its Worker version ID");
-  rolloutArguments(workerVersionId);
-  return workerVersionId;
+export function wranglerEnvironment(environment) {
+  const childEnvironment = { ...environment };
+  delete childEnvironment.CLOUDFLARE_ENV;
+  return childEnvironment;
 }
 
 export function assertDeploymentHealth(health, revision) {
@@ -111,12 +108,12 @@ export async function deployWorker({
   origin = process.env.NANOCODEX_WEB_ORIGIN ?? "https://nanocodex.me-7fb.workers.dev",
   revision = deploymentRevision(process.env.NANOCODEX_DEPLOYMENT_SHA),
   run = runWrangler,
+  write = (output) => process.stdout.write(output),
 } = {}) {
-  const uploaded = await run(uploadArguments(revision));
-  const workerVersionId = parseWorkerVersionId(uploaded);
-  await run(rolloutArguments(workerVersionId));
+  const deployed = await run(deployArguments(revision));
+  const workerVersionId = parseWorkerVersionId(deployed);
   const health = await waitForDeployment(fetchImpl, origin, revision);
-  process.stdout.write(`${JSON.stringify({
+  write(`${JSON.stringify({
     deploymentSha: health.deployment_sha,
     origin: new URL(origin).origin,
     status: health.status,
@@ -188,6 +185,7 @@ function runWrangler(args) {
     let output = "";
     const child = spawn(executable, args, {
       cwd: webDirectory,
+      env: wranglerEnvironment(process.env),
       stdio: ["inherit", "pipe", "inherit"],
     });
     child.stdout.setEncoding("utf8");

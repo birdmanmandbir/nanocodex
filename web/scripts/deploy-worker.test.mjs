@@ -5,27 +5,34 @@ import {
   assertDeploymentDocument,
   assertDeploymentEntry,
   assertDeploymentHealth,
+  deployArguments,
+  deployWorker,
   deploymentRevision,
   parseWorkerVersionId,
-  rolloutArguments,
-  uploadArguments,
+  wranglerEnvironment,
 } from "./deploy-worker.mjs";
 
 const revision = "a".repeat(40);
 
 test("deployment arguments bind the exact tagged commit to Worker health", () => {
-  const arguments_ = uploadArguments(revision);
+  const arguments_ = deployArguments(revision);
 
-  assert.deepEqual(arguments_.slice(0, 5), [
-    "versions",
-    "upload",
+  assert.deepEqual(arguments_, [
+    "deploy",
     "--config",
     "dist/nanocodex/wrangler.json",
     "--strict",
+    "--containers-rollout",
+    "none",
+    "--tag",
+    revision,
+    "--message",
+    `gakonst/nanocodex@${revision}`,
+    "--var",
+    `DEPLOYMENT_SHA:${revision}`,
   ]);
-  assert.ok(arguments_.includes(revision));
-  assert.ok(arguments_.includes(`gakonst/nanocodex@${revision}`));
-  assert.ok(arguments_.includes(`DEPLOYMENT_SHA:${revision}`));
+  assert.equal(arguments_.includes("versions"), false);
+  assert.equal(arguments_.includes("--env"), false);
 });
 
 test("CI deployment accepts only an explicit immutable source revision", () => {
@@ -36,21 +43,96 @@ test("CI deployment accepts only an explicit immutable source revision", () => {
   }
 });
 
-test("deployment rolls only the uploaded Worker version to production", () => {
+test("deployment reads the current Worker version from full deploy output", () => {
   const workerVersionId = "12345678-1234-1234-1234-123456789abc";
   assert.equal(
-    parseWorkerVersionId(`Uploaded\nWorker Version ID: ${workerVersionId}\n`),
+    parseWorkerVersionId(`Uploaded\n\u001b[32mCurrent Version ID:\u001b[0m ${workerVersionId}\n`),
     workerVersionId,
   );
-  assert.deepEqual(rolloutArguments(workerVersionId), [
-    "versions",
-    "deploy",
-    `${workerVersionId}@100%`,
-    "--config",
-    "dist/nanocodex/wrangler.json",
-    "--yes",
-  ]);
   assert.throws(() => parseWorkerVersionId("Uploaded without an ID"));
+  assert.throws(() => parseWorkerVersionId([
+    `Current Version ID: ${workerVersionId}`,
+    "Current Version ID: abcdefab-abcd-abcd-abcd-abcdefabcdef",
+  ].join("\n")));
+});
+
+test("deployment ignores ambient Wrangler environment selection", () => {
+  const environment = Object.freeze({
+    CLOUDFLARE_API_TOKEN: "deployment-token",
+    CLOUDFLARE_ENV: "development",
+    PATH: "/usr/bin:/bin",
+  });
+
+  assert.deepEqual(wranglerEnvironment(environment), {
+    CLOUDFLARE_API_TOKEN: "deployment-token",
+    PATH: "/usr/bin:/bin",
+  });
+  assert.equal(environment.CLOUDFLARE_ENV, "development");
+});
+
+test("deployment runs one full command before injected delivery checks", async () => {
+  const workerVersionId = "12345678-1234-1234-1234-123456789abc";
+  const origin = "https://nanocodex.example.test";
+  const commands = [];
+  const requests = [];
+  let output = "";
+
+  const health = await deployWorker({
+    revision,
+    origin,
+    run: async (arguments_) => {
+      commands.push(arguments_);
+      return [
+        "Uploaded nanocodex",
+        "Deployed nanocodex triggers",
+        "  workflow: nanocodex-ci-preview",
+        `Current Version ID: ${workerVersionId}`,
+      ].join("\n");
+    },
+    fetchImpl: async (input, init) => {
+      const url = new URL(input);
+      requests.push({ init, url });
+      if (url.pathname === "/api/health") {
+        return Response.json({ deployment_sha: revision, status: "ok" });
+      }
+      if (url.pathname === "/") {
+        return new Response([
+          "<!doctype html>",
+          '<script type="module" src="/assets/index-Ab_9.js"></script>',
+          '<div id="root"></div>',
+        ].join("\n"), {
+          headers: { "content-type": "text/html; charset=utf-8" },
+        });
+      }
+      if (url.pathname === "/assets/index-Ab_9.js" && init.method === "HEAD") {
+        return new Response(null, {
+          headers: {
+            "cache-control": "public, max-age=31536000, immutable",
+            "content-type": "text/javascript",
+          },
+        });
+      }
+      throw new Error(`unexpected deployment request: ${url}`);
+    },
+    write: (chunk) => {
+      output += chunk;
+    },
+  });
+
+  assert.deepEqual(commands, [deployArguments(revision)]);
+  assert.deepEqual(requests.map(({ url }) => url.pathname), [
+    "/api/health",
+    "/",
+    "/assets/index-Ab_9.js",
+  ]);
+  assert.equal(requests[0].url.searchParams.get("revision"), revision);
+  assert.deepEqual(health, { deployment_sha: revision, status: "ok" });
+  assert.deepEqual(JSON.parse(output), {
+    deploymentSha: revision,
+    origin,
+    status: "ok",
+    workerVersionId,
+  });
 });
 
 test("deployment health accepts only the exact revision", () => {
