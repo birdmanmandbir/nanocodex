@@ -399,6 +399,104 @@ test("heartbeats renew live claims and report terminal Workflow cancellation", a
   }
 });
 
+test("terminal Workflow rejects log and asset mutations without writing to R2", async () => {
+  const clock = useClock();
+  try {
+    const logMemory = broker();
+    await queue(logMemory.durable, workspaceJob(headA, workflowA));
+    const logClaim = await claimBody(logMemory.durable);
+    logMemory.setWorkflow(workflowA, "terminated");
+    const logResponse = await uploadLog(
+      logMemory.durable,
+      logClaim.claim,
+      "stdout",
+      new TextEncoder().encode("late output\n"),
+    );
+    assert.equal(logResponse.status, 409);
+    assert.deepEqual(await logResponse.json(), {
+      action: "cancel",
+      reason: "workflow_terminal",
+      workflowStatus: "terminated",
+    });
+    const logJob = await readJob(logMemory.durable, logClaim.job.id);
+    assert.equal(logJob.state, "cancelled");
+    assert.deepEqual(logJob.cancellation, {
+      reason: "workflow_terminal",
+      workflowStatus: "terminated",
+    });
+    assert.deepEqual(logMemory.objectKeys(), []);
+
+    const assetMemory = broker();
+    await queue(assetMemory.durable, nativeJob(headB, workflowB));
+    const assetClaim = await claimBody(assetMemory.durable);
+    assetMemory.setWorkflow(workflowB, "errored");
+    const assetResponse = await uploadAsset(
+      assetMemory.durable,
+      assetClaim.claim,
+      new TextEncoder().encode("late asset"),
+    );
+    assert.equal(assetResponse.status, 409);
+    assert.deepEqual(await assetResponse.json(), {
+      action: "cancel",
+      reason: "workflow_terminal",
+      workflowStatus: "errored",
+    });
+    const assetJob = await readJob(assetMemory.durable, assetClaim.job.id);
+    assert.equal(assetJob.state, "cancelled");
+    assert.deepEqual(assetJob.cancellation, {
+      reason: "workflow_terminal",
+      workflowStatus: "errored",
+    });
+    assert.deepEqual(assetMemory.objectKeys(), []);
+  } finally {
+    clock.restore();
+  }
+});
+
+test("terminal Workflow rejects completion with a cancellation conflict", async () => {
+  const clock = useClock();
+  try {
+    const memory = broker();
+    await queue(memory.durable, workspaceJob(headC, workflowC));
+    const claimed = await claimBody(memory.durable);
+    const stdout = await uploadedLog(
+      memory.durable,
+      claimed.claim,
+      "stdout",
+      "complete too late\n",
+    );
+    const stderr = await uploadedLog(
+      memory.durable,
+      claimed.claim,
+      "stderr",
+      "",
+    );
+    const objectsBefore = memory.objectKeys();
+
+    memory.setWorkflow(workflowC, "complete");
+    const response = await complete(
+      memory.durable,
+      claimed.claim,
+      success(stdout, stderr),
+    );
+    assert.equal(response.status, 409);
+    assert.deepEqual(await response.json(), {
+      action: "cancel",
+      reason: "workflow_terminal",
+      workflowStatus: "complete",
+    });
+    const stored = await readJob(memory.durable, claimed.job.id);
+    assert.equal(stored.state, "cancelled");
+    assert.deepEqual(stored.cancellation, {
+      reason: "workflow_terminal",
+      workflowStatus: "complete",
+    });
+    assert.deepEqual(memory.objectKeys(), objectsBefore);
+  } finally {
+    clock.restore();
+  }
+});
+
 test("queue creation arms reconciliation and terminal ownership is removed after seven days", async () => {
   const clock = useClock();
   try {

@@ -473,7 +473,7 @@ export class CiMacJobs {
     if (!workflow.available) return error("workflow_status_unavailable", 503);
     if (TERMINAL_WORKFLOW_STATES.has(workflow.status)) {
       await this.#cancelClaim(active, workflow.status);
-      return cancellation(workflow.status);
+      return cancellation(workflow.status, 200);
     }
     const now = Date.now();
     const leaseExpiresAt = now + CI_MAC_CLAIM_LEASE_MS;
@@ -647,13 +647,16 @@ export class CiMacJobs {
         : error("result_conflict", 409);
     }
     if (job.state === "cancelled") {
-      return cancellation(job.cancellation?.workflowStatus ?? "terminated");
+      return cancellation(
+        job.cancellation?.workflowStatus ?? "terminated",
+        409,
+      );
     }
     const workflow = await this.#workflowStatus(job.workflowId);
     if (!workflow.available) return error("workflow_status_unavailable", 503);
     if (TERMINAL_WORKFLOW_STATES.has(workflow.status)) {
       await this.#cancelClaim(job, workflow.status);
-      return cancellation(workflow.status);
+      return cancellation(workflow.status, 409);
     }
     if (!isCurrentClaim(job, claimId, Date.now())) {
       await this.#releaseExpiredClaims(Date.now());
@@ -717,7 +720,7 @@ export class CiMacJobs {
     }
     if (completed.kind === "conflict") return error("result_conflict", 409);
     if (completed.kind === "cancelled") {
-      return cancellation(completed.workflowStatus);
+      return cancellation(completed.workflowStatus, 409);
     }
     await this.#state.storage.setAlarm(Date.now());
     return Response.json({ job: completed.job }, {
@@ -733,7 +736,7 @@ export class CiMacJobs {
     if (!workflow.available) return error("workflow_status_unavailable", 503);
     if (TERMINAL_WORKFLOW_STATES.has(workflow.status)) {
       await this.#cancelClaim(active, workflow.status);
-      return cancellation(workflow.status);
+      return cancellation(workflow.status, 409);
     }
     return active;
   }
@@ -1724,10 +1727,10 @@ function normalizePath(path: string): string {
     : path;
 }
 
-function cancellation(workflowStatus: string): Response {
+function cancellation(workflowStatus: string, status: 200 | 409): Response {
   return Response.json(
     { action: "cancel", reason: "workflow_terminal", workflowStatus },
-    { headers: JSON_HEADERS },
+    { status, headers: JSON_HEADERS },
   );
 }
 
