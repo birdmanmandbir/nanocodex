@@ -56,6 +56,8 @@ import {
   loadDocs,
   loadEvals,
   loadHomeFrame,
+  loadMonsterWorld,
+  loadMultiplayer,
   loadPierreWorkerProvider,
   loadVirtualCommitList,
   preloadEvalOverview,
@@ -71,6 +73,8 @@ const Changelog = lazy(() =>
 );
 const HomeFrame = lazy(loadHomeFrame);
 const AgentExperience = lazy(loadAgentExperience);
+const Multiplayer = lazy(loadMultiplayer);
+const MonsterWorld = lazy(loadMonsterWorld);
 const PierreWorkerProvider = lazy(loadPierreWorkerProvider);
 const CodeBrowser = lazy(loadCodeBrowser);
 const CommitCodeStream = lazy(loadCommitCodeStream);
@@ -635,6 +639,14 @@ function NanocodexShell({ preparedRoute }: Required<NanocodexAppProps>) {
       void Promise.all([loadHomeFrame(), loadAgentExperience()]).catch(() => undefined);
       return;
     }
+    if (nextSurface === "multiplayer") {
+      void loadMultiplayer().catch(() => undefined);
+      return;
+    }
+    if (nextSurface === "world") {
+      void loadMonsterWorld().catch(() => undefined);
+      return;
+    }
     if (nextSurface === "changelog") {
       void loadChangelog()
         .then((module) => module.preloadChangelog())
@@ -932,6 +944,13 @@ function NanocodexShell({ preparedRoute }: Required<NanocodexAppProps>) {
       }
       if (commitModalOpen) return;
       if (isTyping || primaryModifier || event.altKey) return;
+      if (surface === "world"
+        && target === document.activeElement
+        && target?.matches(".monster-world-stage canvas")
+        && ["w", "a", "s", "d"].includes(key)) {
+        // The World surface owns WASD only while its game canvas has focus.
+        return;
+      }
       if (key === "f") {
         if (surface !== "commits") return;
         event.preventDefault();
@@ -950,6 +969,10 @@ function NanocodexShell({ preparedRoute }: Required<NanocodexAppProps>) {
           ? "changelog"
           : key === "a"
           ? "agent"
+          : key === "p"
+          ? "multiplayer"
+          : key === "w"
+          ? "world"
           : key === "d"
           ? "docs"
           : key === "s"
@@ -1172,7 +1195,11 @@ function NanocodexShell({ preparedRoute }: Required<NanocodexAppProps>) {
             </HomeFrame>
           ) : null}
 
-          {surface === "home" || surface === "agent" ? null : surface === "changelog" ? (
+          {surface === "home" || surface === "agent" ? null : surface === "multiplayer" ? (
+            <Multiplayer />
+          ) : surface === "world" ? (
+            <MonsterWorld />
+          ) : surface === "changelog" ? (
             <Changelog onCommitClick={handleCommitClick} />
           ) : surface === "docs" ? (
             DocsComponent ? <DocsComponent /> : null

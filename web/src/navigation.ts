@@ -1,6 +1,8 @@
 export type Surface =
   | "home"
   | "agent"
+  | "multiplayer"
+  | "world"
   | "changelog"
   | "docs"
   | "code"
@@ -11,6 +13,8 @@ export type Surface =
 
 export const productNavigation = [
   { surface: "agent", label: "Agent", shortcut: "A" },
+  { surface: "multiplayer", label: "Multiplayer", shortcut: "P" },
+  { surface: "world", label: "World", shortcut: "W" },
   { surface: "changelog", label: "Changelog", shortcut: "H" },
   { surface: "ci", label: "CI", shortcut: "I" },
   { surface: "commits", label: "Commits", shortcut: "C" },
@@ -26,6 +30,8 @@ export const productNavigation = [
 const surfacePaths: Record<Surface, string> = {
   home: "/",
   agent: "/agent",
+  multiplayer: "/multiplayer",
+  world: "/world",
   changelog: "/changelog",
   docs: "/docs",
   code: "/code",
