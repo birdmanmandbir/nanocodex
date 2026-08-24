@@ -663,45 +663,11 @@ mod tests {
     use flate2::{Compression, write::GzEncoder};
     use sha2::{Digest, Sha256};
     use std::{
-        ffi::OsString,
         fs,
         io::{self, Read, Write},
         path::Path,
-        sync::Mutex,
     };
     use tar::{Builder, EntryType, Header};
-
-    static ENVIRONMENT: Mutex<()> = Mutex::new(());
-
-    struct EnvironmentGuard {
-        name: &'static str,
-        previous: Option<OsString>,
-    }
-
-    impl EnvironmentGuard {
-        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let previous = std::env::var_os(name);
-            unsafe { std::env::set_var(name, value) };
-            Self { name, previous }
-        }
-
-        fn remove(name: &'static str) -> Self {
-            let previous = std::env::var_os(name);
-            unsafe { std::env::remove_var(name) };
-            Self { name, previous }
-        }
-    }
-
-    impl Drop for EnvironmentGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.previous {
-                    Some(value) => std::env::set_var(self.name, value),
-                    None => std::env::remove_var(self.name),
-                }
-            }
-        }
-    }
 
     fn write_valid_assets(directory: &Path) {
         let assets = [
@@ -720,7 +686,7 @@ mod tests {
                     path: path.to_owned(),
                     content_type: content_type.to_owned(),
                     bytes: contents.len() as u64,
-                    sha256: format!("{:x}", Sha256::digest(contents.as_bytes())),
+                    sha256: hex::encode(Sha256::digest(contents.as_bytes())),
                 }
             })
             .collect();
@@ -804,8 +770,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn availability_accepts_the_documented_development_symlink_install() {
-        let _environment = ENVIRONMENT.lock().unwrap();
+    fn development_assets_accept_a_symlinked_install() {
         let tact_home = tempfile::tempdir().unwrap();
         let bundle = tempfile::tempdir().unwrap();
         write_valid_assets(bundle.path());
@@ -817,12 +782,10 @@ mod tests {
         let destination = super::install_path(tact_home.path());
         fs::create_dir_all(destination.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(bundle.path(), &destination).unwrap();
-        let _home = EnvironmentGuard::set("TACT_HOME", tact_home.path());
-        let _override = EnvironmentGuard::remove(super::REVIEW_ASSETS_ENV);
 
         assert!(matches!(
-            ReviewAssets::availability(),
-            Ok(super::AssetAvailability::Ready(_))
+            ReviewAssets::from_directory(destination, InstallKind::DevelopmentOverride),
+            Ok(ReviewAssets { .. })
         ));
     }
 

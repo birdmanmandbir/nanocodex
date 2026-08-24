@@ -1,7 +1,6 @@
 // Modified from clabby/tact@a2de8ae1e0b6ce8d8f0a251a9d681dc430b247aa for Nanocodex2.
 // SPDX-License-Identifier: Apache-2.0
 
-
 //! Demand-driven empty transcript animation.
 
 use crate::{app::config::ReasoningEffort, tui::theme::Theme};
@@ -230,7 +229,7 @@ mod tests {
                 ratatui_tact::style::Color::Rgb(0xD7, 0xD7, 0xD7),
             ]
             .into_iter()
-            .collect()
+            .collect::<std::collections::HashSet<_>>()
         );
         assert!(glyphs.len() >= 5);
     }
