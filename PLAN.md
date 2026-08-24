@@ -162,6 +162,21 @@ is clean; the neural controller maintains occupancy without a wave tail; and
 the terminal host has zero running/unclaimed rows, worker units, VMMs, proxies,
 or controller-owned recovery residue.
 
+## Application slice: Nanocodex2 managed TUI
+
+Outcome: add an Apache-2.0 `nanocodex2` Rust binary target whose terminal
+surface is 1:1 with Tact 0.6.6 at
+`clabby/tact@a2de8ae1e0b6ce8d8f0a251a9d681dc430b247aa`
+while every model turn, retained conversation, workspace, and tool lifecycle is
+owned by the authenticated managed-agent service. Nanocodex2 uses only an
+account-issued `NANOCODEX_API_KEY`; it never receives a provider API key or
+constructs a local agent engine.
+
+Follow the ordered vertical slices and stop conditions in
+[`docs/NANOCODEX2_PLAN.md`](docs/NANOCODEX2_PLAN.md). This is an
+application consumer of the managed-agent slice, not a new transport or app
+server in the stable Rust crates.
+
 ## Active milestones
 
 ### 1. Runtime and Code Mode parity
@@ -273,25 +288,27 @@ or controller-owned recovery residue.
    hosted transports, composable egress, Cloudflare, and Rivet consumers.
 3. [ ] Finish the authenticated managed-agent slice and its deployed browser
    exit gate.
-4. [ ] Continue durable-evaluation throughput as an isolated side track without
+4. [ ] Build Nanocodex2 through the ordered managed-client, 1:1 Tact TUI,
+   event-projection, lifecycle, capability-closure, and performance slices.
+5. [ ] Continue durable-evaluation throughput as an isolated side track without
    changing managed-product boundaries.
-5. [ ] Finish and merge the focused Code Mode parity slice in PR #95.
-6. [ ] Reconcile and advance the Codex parity checkpoint with a complete commit
+6. [ ] Finish and merge the focused Code Mode parity slice in PR #95.
+7. [ ] Reconcile and advance the Codex parity checkpoint with a complete commit
    classification and direct evidence for every adopted behavior.
-7. [ ] Fix, validate, and merge desktop profile import in PR #93.
-8. [ ] Build browser placement and presentation policy for private host and
+8. [ ] Fix, validate, and merge desktop profile import in PR #93.
+9. [ ] Build browser placement and presentation policy for private host and
    private VM sessions, then prove both through the CLI consumer.
-9. [ ] Prototype the user-Chrome extension/native-host path; prove exact tab
+10. [ ] Prototype the user-Chrome extension/native-host path; prove exact tab
    claiming, grouping, visible cursor feedback, interruption, leasing, and
    cleanup before exposing it as normal CLI policy.
-10. [ ] Rebase and decide PR #79, then review PR #89 against the stable-core and
+11. [ ] Rebase and decide PR #79, then review PR #89 against the stable-core and
    application-policy boundaries above.
-11. [ ] Rebase and merge PR #61, then complete the stacked StableBench work in
+12. [ ] Rebase and merge PR #61, then complete the stacked StableBench work in
    PR #72 and record retained differential evidence.
-12. [ ] Decide whether PR #32 still solves a demonstrated problem or should be
-    replaced by a smaller application-owned experiment.
-13. [ ] Cut the next release only after all selected milestones pass the full
-    release gate.
+13. [ ] Decide whether PR #32 still solves a demonstrated problem or should be
+   replaced by a smaller application-owned experiment.
+14. [ ] Cut the next release only after all selected milestones pass the full
+   release gate.
 
 ## Current non-goals
 

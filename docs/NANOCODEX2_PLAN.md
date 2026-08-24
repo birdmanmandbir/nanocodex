@@ -1,0 +1,198 @@
+# Nanocodex2 plan
+
+## Outcome
+
+Ship `nanocodex2` as an application-owned Rust terminal client for
+account-owned managed Nanocodex agents. Its terminal presentation and
+interaction model track Tact 0.6.6 at
+`clabby/tact@a2de8ae1e0b6ce8d8f0a251a9d681dc430b247aa`; its engine is the
+Nanocodex managed-agent API.
+
+Nanocodex2 never constructs a local `Nanocodex` agent, opens an OpenAI transport, or
+accepts `OPENAI_API_KEY`. It authenticates with an account-issued
+`NANOCODEX_API_KEY` (`ncx_live_...`) and sends it only to the configured
+`NANOCODEX_MANAGED_URL`. Provider credentials, conversation history, tools,
+model sockets, and turn execution remain owned by the managed service.
+
+“1:1 with Tact's TUI” means every user-visible Tact 0.6.6 terminal state and
+interaction: layout, composer, transcript, streaming, actions, selection,
+themes, keyboard and mouse controls, queues, session restore and search,
+forks, settings, subagent and memory panels, review and handoff flows, and
+responsive behavior. Golden PTY captures from the pinned Tact checkpoint are
+the presentation authority. Nanocodex2 does not ship a control that is absent,
+disabled, or behaviorally reduced merely because the current managed API lacks
+the operation; that gap is fixed at the managed boundary first.
+
+Tact-owned local model construction is replaced, not copied. Its updater and
+release pipeline are distribution concerns outside TUI parity. Memory,
+subagents, forks, auxiliary review/handoff inference, and any other visible
+agent-backed feature must run through managed agents without a hidden local
+model fallback.
+
+The Tact-derived binary is Apache-2.0 and carries source attribution to the
+pinned upstream checkpoint. Stable Nanocodex library crates remain unchanged
+unless Nanocodex2 demonstrates a reusable SDK defect independently of the hosted
+product contract.
+
+## Progress
+
+- [x] Create the isolated `feat/nanocodex2` worktree and pin the Tact parity
+  checkpoint.
+- [x] Add the second Rust binary target and the typed managed REST/SSE client.
+- [ ] Finish slice 1 with the shared replayable subscriber/cache layer and a
+  real managed-agent detach/resume smoke.
+- [ ] Port and adapt the complete pinned Tact TUI.
+- [ ] Close every missing managed capability required by a visible Tact flow.
+- [ ] Pass the PTY parity, representative replay, performance, and release
+  gates.
+
+## Ownership
+
+- `bin/nanocodex` owns a second `nanocodex2` binary target, its configuration,
+  secret wrapper, managed HTTP/SSE client, terminal state, event projection,
+  and local UI preferences.
+- `services/managed` continues to own account authorization, durable agents,
+  accepted turns, cursor replay, cancellation, deletion, workspace policy,
+  tools, and provider egress.
+- Nanocodex2 stores no transcript authority. A small mode-`0600` state file may
+  retain only non-provider routing state needed to reopen an owned agent and
+  resume after its last fully processed cursor.
+- The existing `nanocodex` binary and Ratatui consumer remain independent.
+  Nanocodex2 does not become a second stable SDK surface or force its hosted
+  policy into `nanocodex-agent`.
+
+## Backend mapping
+
+| Nanocodex2 behavior | Managed operation |
+| --- | --- |
+| New conversation | `POST /v1/agents` |
+| Conversation picker | `GET /v1/agents` summaries |
+| Restore transcript | backward pages from `GET /v1/agents/:id/events/history` |
+| Follow live output | resumable `GET /v1/agents/:id/events` SSE |
+| Submit | idempotent `POST /v1/agents/:id/turns` |
+| Await completion | terminal event from the shared replayable stream |
+| Steer | `POST /v1/agents/:id/turns/:turn/steer` |
+| Cancel | `POST /v1/agents/:id/turns/:turn/cancel` |
+| Delete | `DELETE /v1/agents/:id` |
+| Reconnect | reopen the retained agent and continue strictly after the saved cursor |
+
+The Rust client follows the existing JavaScript client contract in
+`js/bindings/managed/Agent.mjs`: strict IDs and cursors, three idempotent
+submission attempts for transport failures only, shared replayable event
+delivery, terminal-result caching, and typed server errors. It does not add a
+second server protocol.
+
+## Ordered implementation
+
+### 1. Rust managed-client vertical slice
+
+- Add the unpublished `nanocodex2` target in the existing `nanocodex-bin`
+  package with `run`, `new`,
+  `list`, `resume`, and interactive default entry points.
+- Read the managed origin and account API key from environment/config without
+  accepting the key in process arguments or persisting it.
+- Implement typed create/list/get/delete, turn submit/state/steer/cancel,
+  history pagination, and resumable SSE in Rust.
+- Prove strict bearer routing, response validation, idempotent transport retry,
+  monotonic cursor handling, reconnect, cancellation, and secret-safe errors
+  against a deterministic local HTTP server.
+- Exercise one real managed agent from a PTY with the provider credential
+  absent from Nanocodex2's environment and process state.
+
+Exit: `nanocodex2 run` can create or resume an account-owned agent, stream
+canonical events, await the typed terminal result, detach, and resume without
+duplicating a turn.
+
+### 2. Tact terminal shell and static parity
+
+- Port the Tact component tree, terminal lifecycle, scheduler, theme, composer,
+  transcript model, markdown/diff/image rendering, selection, clipboard,
+  editor, floating panels, and responsive layout from the pinned checkpoint.
+- Preserve upstream module boundaries where they still describe UI ownership;
+  replace every local-engine call with a typed managed operation. Keep the
+  complete visible TUI even when its owning managed operation must be added.
+- Add Apache attribution and a short parity ledger that classifies every
+  top-level Tact subsystem as ported, adapted to a managed capability, or a
+  non-TUI distribution concern.
+- Derive deterministic terminal fixtures from the pinned Tact checkpoint at
+  representative desktop and narrow sizes.
+
+Exit: without a network, Nanocodex2 renders the same empty, composing,
+streaming, tool, completed, error, picker, and overlay states with the same key
+and mouse behavior.
+
+### 3. Managed event projection
+
+- Project managed `AgentEvent` values into the Tact transcript model without
+  flattening known events to display strings.
+- Keep acceptance, model/tool/reasoning streams, plans, patches, shell output,
+  images, usage, terminal state, and errors ordered by durable cursor.
+- Batch bursty SSE delivery and redraws with Tact's scheduler so rendering cost
+  depends on the live tail rather than retained transcript size.
+- Rehydrate from history pages before attaching at the captured durable head;
+  deduplicate the replay-to-live handoff by cursor.
+
+Exit: a real managed coding turn is visually and interactively equivalent to
+the same retained event workload in Tact, and reload/reconnect produces no
+missing or duplicate transcript rows.
+
+### 4. Complete interactive lifecycle
+
+- Wire submit, queued follow-ups, live steering, queue editing, cancellation,
+  retryable/blocked failures, deletion, and clean terminal restoration through
+  the Rust managed client.
+- Map Tact's session picker to managed agent summaries and event-history search;
+  keep the managed agent ID private from normal transcript presentation.
+- Persist only the last owned agent and acknowledged cursor with restrictive
+  permissions. Recover unfinished accepted turns from durable state.
+- Preserve Tact's completion hook, external editor, clipboard, prompt history,
+  theme reload, and local-only presentation settings where they do not create
+  another agent engine.
+
+Exit: new, resume, disconnect during inference, reconnect, follow-on, steer,
+cancel, and delete all pass through visible controls in a real PTY.
+
+### 5. Managed-capability closure
+
+- Compare every Tact action with the capabilities returned by the managed
+  agent. Add the missing managed service operations for fork/branch, model and
+  effort changes, auxiliary review/handoff turns, skills, memory, subagents,
+  and any other agent-backed TUI behavior before wiring the corresponding
+  control.
+- Keep durable conversation and tool ownership in the managed service. Local
+  TUI persistence may cache presentation but may not emulate a missing server
+  lifecycle.
+- Run auxiliary inference through scoped managed agents and delete disposable
+  auxiliaries after their durable terminal result. Never issue a hidden local
+  model call.
+
+Exit: the parity ledger has no visible or behavioral gap. Every Tact TUI action
+works through a managed capability and has the same enabled/disabled state,
+feedback, cancellation, and recovery behavior at the pinned checkpoint.
+
+### 6. Representative performance and release gate
+
+- Replay retained Codex rollout traces and long Amp thread exports at multiple
+  terminal sizes, including streaming bursts and long-history tails.
+- Record state-update throughput, frame construction, rendered frame count,
+  changed cells/output volume, retained memory, input-to-frame latency, resize,
+  reconnect, and history-hydration behavior against both Tact and the current
+  Nanocodex Ratatui consumer.
+- Run focused rustfmt, warnings-denied Clippy, client/component tests, PTY
+  journeys, crate-boundary checks, and a live managed-agent smoke.
+- Document installation, API-key issuance, secret handling, managed origin,
+  recovery, capability gaps, attribution, and exact validated checkpoints.
+
+Exit: Nanocodex2 passes the Tact parity fixtures and real PTY journeys, remains
+responsive on representative long sessions, and all inference observed during
+validation belongs to managed agents.
+
+## Stop conditions
+
+- Stop if Nanocodex2 is about to receive an OpenAI or ChatGPT provider credential.
+- Stop if a UI workaround would become a second conversation history or turn
+  authority instead of fixing the managed boundary.
+- Stop if copying a Tact subsystem adds distribution policy unrelated to the
+  1:1 terminal experience.
+- Stop a parity or performance claim on the first authoritative PTY or replay
+  mismatch, fix the owning boundary, and rerun from that boundary.
