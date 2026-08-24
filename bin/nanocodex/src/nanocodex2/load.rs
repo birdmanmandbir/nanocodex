@@ -919,7 +919,8 @@ fn observe_agent_terminal(
 ) {
     let reply_to = decimal_cursor(record, "agent_terminal", reply_to);
     let Some(index) = tracked.iter().position(|message| {
-        message.target == RoomTarget::Agent
+        message.room == clients[client].room
+            && message.target == RoomTarget::Agent
             && message.accepted_cursor.is_some()
             && message.accepted_cursor == reply_to
     }) else {
