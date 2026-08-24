@@ -1,7 +1,6 @@
 // Modified from clabby/tact@a2de8ae1e0b6ce8d8f0a251a9d681dc430b247aa for Nanocodex2.
 // SPDX-License-Identifier: Apache-2.0
 
-
 //! Camera-centered subagent hierarchy and read-only transcript inspector.
 
 use super::{
@@ -17,7 +16,7 @@ use crate::{
     tui::{format::sanitize_terminal_text_inline, theme::Theme, transcript::TranscriptRecord},
 };
 use crossterm_tact::event::{Event, KeyCode, KeyEventKind};
-use nanocodex::Model;
+use nanocodex_subagents::{AgentDescriptor, AgentId, AgentStatus, AgentUpdate, MessageSender};
 use ratatui_tact::{
     Frame,
     layout::Rect,
@@ -30,7 +29,6 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tact_subagents::{AgentDescriptor, AgentId, AgentStatus, AgentUpdate, MessageSender};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -172,7 +170,7 @@ impl SubagentTree {
                     transcript.set_workspace(&self.workspace);
                     self.nodes.push(AgentNode {
                         descriptor,
-                        status: AgentStatus::Running,
+                        status: AgentStatus::Pending,
                         transcript: Node::new(transcript),
                     });
                     self.focused.get_or_insert(id);
@@ -455,19 +453,14 @@ impl SubagentTree {
         let Some(node) = self.node_mut(id) else {
             return;
         };
-        let title = format!(
-            "{} · {} · #{}",
-            node.descriptor.role,
-            model_name(node.descriptor.model),
-            node.descriptor.id
-        );
+        let title = format!("{} · #{}", node.descriptor.role, node.descriptor.id);
         let keys: &[(&str, &str)] = if node.transcript.component().expandables_focused() {
             &FOCUSED_ENTRY_KEYS
         } else {
             &TRANSCRIPT_KEYS
         };
         let layout = Floating::new(&title, area.width, area.height, keys)
-            .colors(theme.border(), theme.model(node.descriptor.model))
+            .colors(theme.border(), theme.text())
             .render(frame, area, theme);
         node.transcript.render(frame, layout.body, theme);
     }
@@ -710,13 +703,6 @@ impl SubagentTree {
                     self.nodes.len(),
                     self.filter.label()
                 )),
-                Span::styled("    Model  ", Style::default().fg(theme.muted())),
-                Span::styled(
-                    model_name(node.descriptor.model),
-                    Style::default()
-                        .fg(theme.model(node.descriptor.model))
-                        .add_modifier(Modifier::BOLD),
-                ),
             ]),
             Line::from(vec![
                 Span::styled("Session  ", Style::default().fg(theme.muted())),
@@ -1092,15 +1078,6 @@ fn unix_time_ms() -> u64 {
         })
 }
 
-fn model_name(model: Model) -> &'static str {
-    match model {
-        Model::Luna => "Luna",
-        Model::Terra => "Terra",
-        Model::Sol => "Sol",
-        _ => "Sol",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{SubagentEffect, SubagentTree};
@@ -1108,9 +1085,9 @@ mod tests {
     use crossterm_tact::event::{
         Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
-    use nanocodex::{
-        Model,
-        agent::events::{AgentEvent, AgentEventKind},
+    use nanocodex::agent::events::{AgentEvent, AgentEventKind};
+    use nanocodex_subagents::{
+        AgentDescriptor, AgentId, AgentMessageUpdate, AgentStatus, AgentUpdate,
     };
     use ratatui_tact::{Terminal, backend::TestBackend, style::Color};
     use serde_json::{json, value::to_raw_value};
@@ -1118,13 +1095,21 @@ mod tests {
         sync::Arc,
         time::{Duration, Instant},
     };
-    use tact_subagents::{AgentDescriptor, AgentId, AgentMessageUpdate, AgentStatus, AgentUpdate};
+
+    trait TestAgentId {
+        fn new(value: u64) -> Self;
+    }
+
+    impl TestAgentId for AgentId {
+        fn new(value: u64) -> Self {
+            serde_json::from_value(json!(value)).unwrap()
+        }
+    }
 
     fn descriptor() -> AgentDescriptor {
         AgentDescriptor {
             id: AgentId::new(1),
             session_id: "child-session".to_owned(),
-            model: Model::Luna,
             role: "researcher".to_owned(),
             task: "Trace the event lifecycle".to_owned(),
             parent: None,
@@ -1260,7 +1245,6 @@ mod tests {
         AgentDescriptor {
             id: AgentId::new(2),
             session_id: "second-session".to_owned(),
-            model: Model::Sol,
             role: "reviewer".to_owned(),
             task: "Verify the event ordering".to_owned(),
             parent: None,
@@ -1271,7 +1255,6 @@ mod tests {
         AgentDescriptor {
             id: AgentId::new(id),
             session_id: format!("agent-{id}"),
-            model: Model::Sol,
             role: role.to_owned(),
             task: format!("Task for {role}"),
             parent: parent.map(AgentId::new),
@@ -1491,21 +1474,10 @@ mod tests {
 
         assert!(rendered.contains("╭──────────────────────╮"));
         assert!(rendered.contains("researcher"));
-        assert!(rendered.contains("running · 0 children"));
+        assert!(rendered.contains("pending · 0 children"));
         assert!(rendered.contains("Trace the event lifecycle"));
-        assert!(rendered.contains("Model  Luna"));
+        assert!(rendered.contains("1 agents · all filter"));
         let buffer = terminal.backend().buffer();
-        let luna = buffer
-            .content
-            .windows(4)
-            .find(|cells| {
-                cells
-                    .iter()
-                    .map(|cell| cell.symbol())
-                    .eq(["L", "u", "n", "a"])
-            })
-            .unwrap();
-        assert_eq!(luna[0].fg, Color::White);
         assert_eq!(buffer[(0, 0)].symbol(), "╭");
         assert_eq!(buffer[(89, 39)].symbol(), "╯");
     }

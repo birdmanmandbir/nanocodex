@@ -1,11 +1,10 @@
 // Modified from clabby/tact@a2de8ae1e0b6ce8d8f0a251a9d681dc430b247aa for Nanocodex2.
 // SPDX-License-Identifier: Apache-2.0
 
-
 //! Deterministic world-space layout for the subagent hierarchy.
 
+use nanocodex_subagents::AgentId;
 use std::collections::{HashMap, HashSet};
-use tact_subagents::AgentId;
 
 pub(super) const NODE_WIDTH: i32 = 24;
 pub(super) const NODE_HEIGHT: i32 = 4;
@@ -229,7 +228,17 @@ fn place_subtree(
 #[cfg(test)]
 mod tests {
     use super::{HORIZONTAL_GAP, LayoutNode, NODE_WIDTH, TreeLayout};
-    use tact_subagents::AgentId;
+    use nanocodex_subagents::AgentId;
+
+    trait TestAgentId {
+        fn new(value: u64) -> Self;
+    }
+
+    impl TestAgentId for AgentId {
+        fn new(value: u64) -> Self {
+            serde_json::from_value(serde_json::json!(value)).unwrap()
+        }
+    }
 
     fn node(id: u64, parent: Option<u64>) -> LayoutNode {
         LayoutNode {

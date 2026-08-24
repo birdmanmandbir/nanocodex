@@ -1,18 +1,17 @@
 // Modified from clabby/tact@a2de8ae1e0b6ce8d8f0a251a9d681dc430b247aa for Nanocodex2.
 // SPDX-License-Identifier: Apache-2.0
 
-
 //! Collapsible presentation for one directed-message thread.
 
 use super::markdown::{sanitize, wrap_plain, wrap_spans};
 use crate::tui::{theme::Theme, transcript::DirectedMessageEntry};
+use nanocodex_subagents::{
+    AgentId, AgentMessage, MessageDeliveryState, MessageDisposition, MessagePriority,
+    MessagePurpose, MessageSender,
+};
 use ratatui_tact::{
     style::{Modifier, Style},
     text::{Line, Span},
-};
-use tact_subagents::{
-    AgentId, AgentMessage, MessageDeliveryState, MessageDisposition, MessagePriority,
-    MessagePurpose, MessageSender,
 };
 
 pub(super) fn render(
@@ -319,8 +318,8 @@ fn first_line(text: &str) -> String {
 mod tests {
     use super::render;
     use crate::tui::{theme::Theme, transcript::DirectedMessageEntry};
+    use nanocodex_subagents::{AgentMessageUpdate, MessageDeliveryState};
     use serde_json::json;
-    use tact_subagents::{AgentMessageUpdate, MessageDeliveryState};
 
     fn entry() -> DirectedMessageEntry {
         let update = serde_json::from_value::<AgentMessageUpdate>(json!({
