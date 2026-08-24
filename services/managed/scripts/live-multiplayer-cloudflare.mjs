@@ -42,6 +42,7 @@ const loadGuestsPerRoom = boundedInteger("NANOCODEX2_LOAD_GUESTS_PER_ROOM", 15, 
 const loadMessagesPerGuest = boundedInteger("NANOCODEX2_LOAD_MESSAGES_PER_GUEST", 8, 0, 8);
 const loadAgentPromptsPerRoom = boundedInteger("NANOCODEX2_LOAD_AGENT_PROMPTS_PER_ROOM", 0, 0, 4);
 const loadMaxSeconds = boundedInteger("NANOCODEX2_LOAD_MAX_SECONDS", 180, 30, 900);
+const loadWarmupMs = boundedInteger("NANOCODEX2_LOAD_WARMUP_MS", 10_000, 0, 60_000);
 const temporaryDirectory = await mkdtemp(join(tmpdir(), "nanocodex-multiplayer-cloudflare-"));
 const brokerConfigPath = join(temporaryDirectory, "wrangler.broker.json");
 const managedConfigPath = join(temporaryDirectory, "wrangler.managed.json");
@@ -169,6 +170,7 @@ try {
     if (!origin) throw new Error("Wrangler did not report the public managed Worker URL");
     credentialSafeHttpOrigin(origin, "deployed managed Worker origin");
     await waitUntilReady(`${origin}/health`);
+    await delay(loadWarmupMs, lifecycleAbort.signal);
     loadAccount = await createLoadAccount(origin);
     redactions.push(loadAccount.apiKey);
     const loadOutput = await runNanocodex2Load(origin, loadAccount.apiKey);
@@ -183,6 +185,7 @@ try {
       managed_origin: origin,
       load: loadResult,
       load_account_attempts: loadAccount.bootstrapAttempts,
+      load_warmup_ms: loadWarmupMs,
       credential_boundary: "account-key-client/private-provider-broker",
       cleanup: "disposable rooms, account key, managed Worker, and broker Worker deleted",
     };
