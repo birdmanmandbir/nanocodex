@@ -1,0 +1,25 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "nanocodex-dynamic-apps-runtime-poc",
+  "main": "src/runtime.ts",
+  "compatibility_date": "2026-08-24",
+  "compatibility_flags": ["enable_ctx_exports"],
+  "workers_dev": true,
+  "minify": true,
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "invocation_logs": true,
+      "persist": true
+    }
+  },
+  "services": [
+    {
+      "binding": "APP_PLATFORM",
+      "service": "nanocodex-dynamic-apps-poc",
+      "entrypoint": "RuntimePlatform",
+      "props": { "clientId": "nanocodex-app-runtime" }
+    }
+  ]
+}

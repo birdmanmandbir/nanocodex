@@ -1,5 +1,5 @@
 const SHA1_PATTERN = /^[a-f0-9]{40}$/;
-const PACK_KEY_PATTERN = /^thread-repositories\/[A-Za-z0-9._-]+\/[A-Za-z0-9-]+\.pack$/;
+const PACK_KEY_PATTERN = /^(?:thread|app)-repositories\/[A-Za-z0-9._-]+\/[A-Za-z0-9-]+\.pack$/;
 const THREAD_BRANCH = "nanocodex";
 const THREAD_REF = `refs/heads/${THREAD_BRANCH}` as const;
 const ZERO_OID = "0".repeat(40);

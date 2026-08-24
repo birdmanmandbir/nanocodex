@@ -8,6 +8,11 @@ test("managed browser callbacks bypass the local document fallback", () => {
   assert.equal(isManagedRoutePath("/v1/connectors/gmail/callback"), true);
   assert.equal(isManagedRoutePath("/v1/connectors/gdrive/callback"), true);
   assert.equal(isManagedRoutePath("/v1/connectors/x/callback"), true);
+  assert.equal(isManagedRoutePath("/apps"), true);
+  assert.equal(isManagedRoutePath("/apps/"), true);
+  assert.equal(isManagedRoutePath("/apps/tiny-app/settings"), true);
+  assert.equal(isManagedRoutePath("/applications"), false);
+  assert.equal(isManagedRoutePath("/apps-evil"), false);
   assert.equal(isManagedRoutePath("/definitely-not-a-route"), false);
 });
 
@@ -35,6 +40,8 @@ test("projects only the managed product surface through one private binding", as
     "/v1/connectors/x/callback?code=code&state=state",
     "/v1/agents/agent-id/events?cursor=7",
     "/v1/rooms/room-id/ws?cursor=9",
+    "/apps",
+    "/apps/tiny-app?view=settings",
   ]) {
     const request = new Request(`https://nanocodex.test${path}`, {
       headers: {
@@ -78,4 +85,35 @@ test("returns an actionable failure when the private service is unavailable", as
   } finally {
     console.error = originalError;
   }
+});
+
+test("preserves an apps mutation request for managed authentication and CSRF enforcement", async () => {
+  let forwarded: Request | undefined;
+  const env = {
+    NANOCODEX_BACKEND: {
+      async fetch(request: Request) {
+        forwarded = request;
+        return new Response(null, { status: 204 });
+      },
+    },
+  };
+  const request = new Request("https://nanocodex.test/apps/tiny/settings?tab=model", {
+    method: "POST",
+    headers: {
+      authorization: "Bearer ncx_live_example",
+      cookie: "nanocodex_account=session",
+      "content-type": "application/json",
+      origin: "https://nanocodex.test",
+    },
+    body: JSON.stringify({ model: "gpt-5" }),
+  });
+
+  const response = await routeManaged(request, env as never, new URL(request.url));
+  assert.equal(response?.status, 204);
+  assert.equal(forwarded, request);
+  assert.equal(forwarded?.method, "POST");
+  assert.equal(new URL(forwarded!.url).search, "?tab=model");
+  assert.equal(forwarded?.headers.get("origin"), "https://nanocodex.test");
+  assert.equal(forwarded?.headers.get("cookie"), "nanocodex_account=session");
+  assert.deepEqual(await forwarded?.json(), { model: "gpt-5" });
 });

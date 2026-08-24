@@ -22,6 +22,8 @@
     "run_worker_first": [
       "/",
       "/agent",
+      "/apps",
+      "/apps/*",
       "/multiplayer",
       "/world",
       "/artifact-runtime",

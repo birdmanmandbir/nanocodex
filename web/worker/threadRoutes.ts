@@ -27,6 +27,7 @@ import {
 
 const SHA1_PATTERN = /^[a-f0-9]{40}$/;
 const THREAD_REPOSITORY_PATTERN = /^thread-[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
+const APP_REPOSITORY_PATTERN = /^app-[a-f0-9]{8}-[a-f0-9]{4}-[47][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 const THREAD_BRANCH = "nanocodex";
 const THREAD_REF = `refs/heads/${THREAD_BRANCH}`;
 const ZERO_OID = "0".repeat(40);
@@ -37,6 +38,17 @@ export type ThreadGitStorageEnv = {
   THREAD_GIT_REPOSITORY?: DurableObjectNamespace;
 };
 
+export type AppGitServiceProps = Readonly<{
+  clientId: string;
+}>;
+
+type GitRoute = {
+  repository: string;
+  operation: "info/refs" | "git-upload-pack" | "git-receive-pack";
+};
+
+type RepositoryNamespace = "thread-repositories" | "app-repositories";
+
 export async function handleThreadGitRequest(
   request: Request,
   env: ThreadGitStorageEnv,
@@ -45,6 +57,36 @@ export async function handleThreadGitRequest(
 ): Promise<Response | undefined> {
   const route = parseGitRoute(url.pathname);
   if (!route) return undefined;
+  return handleRepositoryGitRequest(request, env, url, route, "thread-repositories", context);
+}
+
+export async function handleAppGitRequest(
+  repositoryName: string,
+  request: Request,
+  env: ThreadGitStorageEnv,
+  props: AppGitServiceProps,
+  context?: ExecutionContext,
+): Promise<Response> {
+  if (props.clientId !== "nanocodex-apps") return gitError("forbidden", 403);
+  if (!APP_REPOSITORY_PATTERN.test(repositoryName)) {
+    return gitError("invalid app repository name", 400);
+  }
+  const url = new URL(request.url);
+  const route = parseAppGitRoute(url.pathname);
+  if (!route || route.repository !== repositoryName) {
+    return gitError("app repository URL does not match repository name", 400);
+  }
+  return handleRepositoryGitRequest(request, env, url, route, "app-repositories", context);
+}
+
+async function handleRepositoryGitRequest(
+  request: Request,
+  env: ThreadGitStorageEnv,
+  url: URL,
+  route: GitRoute,
+  repositoryNamespace: RepositoryNamespace,
+  context?: ExecutionContext,
+): Promise<Response> {
   if (!env.GIT_OBJECTS || !env.THREAD_GIT_REPOSITORY) {
     return gitError("Git workspace storage is not configured", 503);
   }
@@ -77,7 +119,7 @@ export async function handleThreadGitRequest(
     return uploadPack(request, env, route.repository);
   }
   if (route.operation === "git-receive-pack" && request.method === "POST") {
-    return receivePack(request, env, route.repository, context);
+    return receivePack(request, env, route.repository, repositoryNamespace, context);
   }
   return new Response(null, { status: 405, headers: { allow: "GET, POST" } });
 }
@@ -160,6 +202,7 @@ async function receivePack(
   request: Request,
   env: ThreadGitStorageEnv,
   repositoryName: string,
+  repositoryNamespace: RepositoryNamespace,
   context?: ExecutionContext,
 ): Promise<Response> {
   const body = await readGitProtocolRequest(request, MAX_THREAD_PACK_BYTES + 512 * 1024);
@@ -211,7 +254,7 @@ async function receivePack(
   const token = typeof beginBody.lease?.token === "string" ? beginBody.lease.token : "";
   if (!token) return gitError("repository returned an invalid receive lease", 503);
 
-  const packKey = `thread-repositories/${repositoryName}/${crypto.randomUUID()}.pack`;
+  const packKey = `${repositoryNamespace}/${repositoryName}/${crypto.randomUUID()}.pack`;
   let uploaded = false;
   let finalizeAttempted = false;
   try {
@@ -362,15 +405,21 @@ export async function readGitProtocolRequest(
   return body;
 }
 
-function parseGitRoute(pathname: string): {
-  repository: string;
-  operation: "info/refs" | "git-upload-pack" | "git-receive-pack";
-} | undefined {
+function parseGitRoute(pathname: string): GitRoute | undefined {
   const match = pathname.match(/^\/git\/(thread-[a-f0-9-]+)\/(info\/refs|git-upload-pack|git-receive-pack)$/);
   if (!match || !THREAD_REPOSITORY_PATTERN.test(match[1]!)) return undefined;
   return {
     repository: match[1]!,
     operation: match[2] as "info/refs" | "git-upload-pack" | "git-receive-pack",
+  };
+}
+
+function parseAppGitRoute(pathname: string): GitRoute | undefined {
+  const match = pathname.match(/^\/git\/(app-[a-f0-9-]+)\/(info\/refs|git-upload-pack|git-receive-pack)$/);
+  if (!match || !APP_REPOSITORY_PATTERN.test(match[1]!)) return undefined;
+  return {
+    repository: match[1]!,
+    operation: match[2] as GitRoute["operation"],
   };
 }
 

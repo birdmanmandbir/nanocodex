@@ -18,6 +18,12 @@
     {
       "binding": "NANOCODEX",
       "service": "nanocodex-egress"
+    },
+    {
+      "binding": "NANOCODEX_APPS",
+      "service": "nanocodex-dynamic-apps-poc",
+      "entrypoint": "AppPlatform",
+      "props": { "clientId": "nanocodex-managed" }
     }
   ],
   "durable_objects": {

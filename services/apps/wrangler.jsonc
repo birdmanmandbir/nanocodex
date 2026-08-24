@@ -1,0 +1,91 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "nanocodex-dynamic-apps-poc",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-24",
+  "compatibility_flags": ["nodejs_compat", "enable_ctx_exports"],
+  "workers_dev": false,
+  "minify": true,
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "invocation_logs": true,
+      "persist": true
+    }
+  },
+  "assets": {
+    "binding": "ASSETS",
+    "directory": "./dist-ui",
+    "not_found_handling": "none",
+    "run_worker_first": ["/*"]
+  },
+  "ai": {
+    "binding": "AI"
+  },
+  "worker_loaders": [
+    {
+      "binding": "LOADER"
+    }
+  ],
+  "services": [
+    {
+      "binding": "APP_GIT",
+      "service": "nanocodex",
+      "entrypoint": "AppGitService",
+      "props": { "clientId": "nanocodex-apps" }
+    },
+    {
+      "binding": "NANOCODEX_AGENTS",
+      "service": "nanocodex-durable-agent",
+      "entrypoint": "ManagedAgentEntrypoint",
+      "props": { "clientId": "nanocodex-apps" }
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "APP_STATE",
+        "class_name": "AppState"
+      },
+      {
+        "name": "APP_REGISTRY",
+        "class_name": "AppRegistry"
+      },
+      {
+        "name": "APP_LAUNCH_TICKETS",
+        "class_name": "LaunchTicketStore"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["AppState"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["AppRegistry"]
+    },
+    {
+      "tag": "v3",
+      "new_sqlite_classes": ["LaunchTicketStore"]
+    }
+  ],
+  "workflows": [
+    {
+      "binding": "APP_BUILDS",
+      "class_name": "AppBuildWorkflow",
+      "name": "nanocodex-dynamic-app-builds-poc"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "APP_ARTIFACTS",
+      "bucket_name": "nanocodex-dynamic-apps-poc"
+    }
+  ],
+  "vars": {
+    "RUNTIME_ORIGIN": "https://nanocodex-dynamic-apps-runtime-poc.gakonst.workers.dev"
+  }
+}

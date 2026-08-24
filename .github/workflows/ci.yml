@@ -154,6 +154,7 @@ jobs:
             examples/rivet-actors/package-lock.json
             services/egress/package-lock.json
             services/managed/package-lock.json
+            services/apps/package-lock.json
             examples/vercel-workflows/package-lock.json
             examples/react-vite/package-lock.json
       - uses: taiki-e/install-action@3522286d40783523f9c7880e33f785905b4c20d0 # v2
@@ -177,6 +178,7 @@ jobs:
           npm ci --prefix examples/rivet-actors
           npm ci --prefix services/egress
           npm ci --prefix services/managed
+          npm ci --prefix services/apps
           npm ci --prefix examples/vercel-workflows
           npm ci --prefix examples/react-vite
       - name: Test JS runtime
@@ -195,6 +197,7 @@ jobs:
           npm run check --prefix examples/rivet-actors
           npm run check --prefix services/egress
           npm run check --prefix services/managed
+          npm run check --prefix services/apps
           npm run check --prefix examples/vercel-workflows
           npm test --prefix examples/react-vite
           npm run build --prefix examples/react-vite
@@ -330,6 +333,7 @@ jobs:
           cache-dependency-path: |
             services/egress/package-lock.json
             services/managed/package-lock.json
+            services/apps/package-lock.json
             web/package-lock.json
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -343,6 +347,7 @@ jobs:
         run: |
           npm ci --prefix services/egress --ignore-scripts
           npm ci --prefix services/managed --ignore-scripts
+          npm ci --prefix services/apps --ignore-scripts
           npm ci --prefix web --ignore-scripts
       - name: Select the current production revision
         id: production
@@ -406,6 +411,12 @@ jobs:
           NANOCODEX_ADMIN_TOKEN: ${{ secrets.NANOCODEX_ADMIN_TOKEN }}
           TARGET_SHA: ${{ github.sha }}
         run: npm run deploy:production:managed --prefix services/managed
+      - name: Deploy the private app platform and public app runtime
+        if: steps.production.outputs.current == 'true'
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: npm run deploy --prefix services/apps
       - name: Verify private broker readiness
         if: steps.production.outputs.current == 'true'
         env:

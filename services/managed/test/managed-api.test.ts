@@ -5,9 +5,16 @@ import {
   runDurableObjectAlarm,
   runInDurableObject,
 } from "cloudflare:test";
+import { exports as workerExports } from "cloudflare:workers";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
-import { NanocodexSession, UserAccount, type Env } from "../src/index";
+import {
+  default as managedWorker,
+  ManagedAgentEntrypoint,
+  NanocodexSession,
+  UserAccount,
+  type Env,
+} from "../src/index";
 
 const testEnv = env as unknown as Env;
 const USER_ID = "11111111-1111-4111-8111-111111111111";
@@ -27,6 +34,184 @@ afterEach(async () => {
     await SELF.fetch(`https://example.test/v1/agents/${id}`, { method: "DELETE" });
     createdAgents.delete(id);
   }));
+});
+
+describe("managed apps trust boundary", () => {
+  it("authenticates persistent accounts, ignores forged identity, and preserves the browser request", async () => {
+    const appsUserId = "77777777-7777-4777-8777-777777777777";
+    const token = "a".repeat(43);
+    await seedPasskeySession(appsUserId, token);
+    const account = await RAW_SELF.fetch("https://example.test/v1/me", {
+      headers: { cookie: `nanocodex_account=${token}` },
+    });
+    expect(await account.json()).toMatchObject({
+      authentication: "account_session",
+      user: { id: appsUserId, persistent: true },
+    });
+    const denied = await RAW_SELF.fetch("https://example.test/apps");
+    expect(denied.status).toBe(401);
+    const apiKeyDenied = await RAW_SELF.fetch("https://example.test/apps", {
+      headers: { authorization: `Bearer ${API_KEY}` },
+    });
+    expect(apiKeyDenied.status).toBe(401);
+
+    const response = await RAW_SELF.fetch("https://example.test/apps/tiny?view=settings", {
+      headers: {
+        authorization: `Bearer ${OTHER_API_KEY}`,
+        cookie: `nanocodex_account=${token}`,
+        origin: "https://example.test",
+        "x-nanocodex-owner-id": OTHER_USER_ID,
+        "x-nanocodex-user-id": OTHER_USER_ID,
+      },
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      authorization: null,
+      body: null,
+      cookie: `nanocodex_account=${token}`,
+      method: "GET",
+      origin: "https://example.test",
+      ownerId: null,
+      url: "https://example.test/apps/tiny?view=settings",
+      userId: appsUserId,
+    });
+  });
+
+  it("requires same-origin mutations and reports a missing apps binding", async () => {
+    const appsUserId = "88888888-8888-4888-8888-888888888888";
+    const token = "b".repeat(43);
+    await seedPasskeySession(appsUserId, token);
+    const crossOrigin = await RAW_SELF.fetch("https://example.test/apps/tiny", {
+        method: "POST",
+        headers: {
+          cookie: `nanocodex_account=${token}`,
+          origin: "https://attacker.test",
+        },
+      });
+    expect(crossOrigin.status).toBe(403);
+    expect(await crossOrigin.json()).toEqual({ error: "forbidden_origin" });
+
+    const delegated = await RAW_SELF.fetch("https://example.test/apps/tiny?tab=model", {
+        method: "POST",
+        headers: {
+          cookie: `nanocodex_account=${token}`,
+          "content-type": "application/json",
+          origin: "https://example.test",
+        },
+        body: JSON.stringify({ model: "gpt-5" }),
+      });
+    expect(delegated.status).toBe(200);
+    expect(await delegated.json()).toEqual({
+      authorization: null,
+      body: { model: "gpt-5" },
+      cookie: `nanocodex_account=${token}`,
+      method: "POST",
+      origin: "https://example.test",
+      ownerId: null,
+      url: "https://example.test/apps/tiny?tab=model",
+      userId: appsUserId,
+    });
+
+    const missing = await managedWorker.fetch(
+      new Request("https://example.test/apps", {
+        headers: { cookie: `nanocodex_account=${token}` },
+      }),
+      { ...testEnv, NANOCODEX_APPS: undefined } as Env,
+      { waitUntil: vi.fn(), passThroughOnException: vi.fn() } as unknown as ExecutionContext,
+    );
+    expect(missing.status).toBe(503);
+    expect(await missing.json()).toEqual({ error: "apps_service_unavailable" });
+  });
+
+  it("keeps agent creation, turn submission, status, and ownership inside managed RPC", async () => {
+    type ManagedAgentLoopback = {
+      ManagedAgentEntrypoint(options: {
+        props: { clientId: string };
+      }): Pick<ManagedAgentEntrypoint, "createAgent" | "getTurnStatus" | "submitTurn">;
+    };
+    const loopback = workerExports as unknown as ManagedAgentLoopback;
+    const service = loopback.ManagedAgentEntrypoint({ props: { clientId: "nanocodex-apps" } });
+    const denied = loopback.ManagedAgentEntrypoint({ props: { clientId: "attacker" } });
+
+    expect(await denied.createAgent(USER_ID, { publicOrigin: "https://example.test" })).toEqual({
+      status: 403,
+      body: { error: "forbidden" },
+    });
+    expect(await service.createAgent(USER_ID, { publicOrigin: "https://example.test/path" })).toEqual({
+      status: 400,
+      body: { error: "invalid_request", message: "publicOrigin must be an HTTP(S) URL origin" },
+    });
+    const created = await service.createAgent(USER_ID, { publicOrigin: "https://example.test" });
+    expect(created.status).toBe(201);
+    expect(structuredClone(created)).toEqual(created);
+    const agentId = created.body.agent_id;
+    expect(agentId).toEqual(expect.any(String));
+    createdAgents.add(agentId as string);
+
+    const originalFetch = NanocodexSession.prototype.fetch;
+    const forwarded: Array<{ authorization: string | null; cookie: string | null; owner: string | null }> = [];
+    const fetchSpy = vi.spyOn(NanocodexSession.prototype, "fetch").mockImplementation(
+      async function (this: NanocodexSession, request: Request): Promise<Response> {
+        if (new URL(request.url).pathname === "/turns") {
+          forwarded.push({
+            authorization: request.headers.get("authorization"),
+            cookie: request.headers.get("cookie"),
+            owner: request.headers.get("x-nanocodex-owner-id"),
+          });
+        }
+        return originalFetch.call(this, request);
+      },
+    );
+    try {
+      const other = await service.submitTurn(OTHER_USER_ID, agentId as string, {
+        id: "rpc-other",
+        input: "must not run",
+        publicOrigin: "https://example.test",
+      });
+      expect(other).toEqual({ status: 404, body: { error: "not_found" } });
+
+      const oversized = await service.submitTurn(USER_ID, agentId as string, {
+        id: "rpc-oversized",
+        input: "x".repeat(1024 * 1024),
+        publicOrigin: "https://example.test",
+      });
+      expect(oversized).toEqual({
+        status: 400,
+        body: { error: "invalid_request", message: "turn input exceeds 1 MiB" },
+      });
+
+      const accepted = await service.submitTurn(USER_ID, agentId as string, {
+        id: "rpc-turn",
+        idempotencyKey: "rpc-request",
+        input: "run through managed",
+        publicOrigin: "https://example.test",
+      });
+      expect(accepted.status).toBe(202);
+      expect(accepted.body).toMatchObject({ state: "accepted", turn_id: "rpc-turn" });
+      expect(forwarded).toEqual([
+        { authorization: null, cookie: null, owner: OTHER_USER_ID },
+        { authorization: null, cookie: null, owner: USER_ID },
+      ]);
+
+      const hidden = await service.getTurnStatus(
+        OTHER_USER_ID,
+        agentId as string,
+        "rpc-turn",
+        { publicOrigin: "https://example.test" },
+      );
+      expect(hidden).toEqual({ status: 404, body: { error: "not_found" } });
+      const status = await service.getTurnStatus(
+        USER_ID,
+        agentId as string,
+        "rpc-turn",
+        { publicOrigin: "https://example.test" },
+      );
+      expect(status.status).toBe(200);
+      expect(status.body).toMatchObject({ turn_id: "rpc-turn" });
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
 });
 
 describe("managed agents REST and resumable SSE", () => {

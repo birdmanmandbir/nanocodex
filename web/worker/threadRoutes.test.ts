@@ -4,11 +4,17 @@ import { test } from "node:test";
 
 import { encodePacketLine, parsePacketLines } from "./threadProtocol.ts";
 import { ThreadGitRepository, type ThreadRepository } from "./threadRepository.ts";
-import { handleThreadGitRequest, readGitProtocolRequest } from "./threadRoutes.ts";
+import {
+  handleAppGitRequest,
+  handleThreadGitRequest,
+  readGitProtocolRequest,
+} from "./threadRoutes.ts";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const repositoryName = "thread-12345678-1234-4123-8123-123456789abc";
+const appRepository = "app-12345678-1234-4123-8123-123456789abc";
+const appRepositoryV7 = "app-018f1f4e-7b2c-7abc-8def-0123456789ab";
 const remote = `https://repository.test/git/${repositoryName}`;
 const ref = "refs/heads/nanocodex";
 const zero = "0".repeat(40);
@@ -23,6 +29,144 @@ test("Git request bodies are rejected while reading once they exceed the limit",
   }), 4);
   assert.ok(result instanceof Response);
   assert.equal(result.status, 413);
+});
+
+test("app Git lane requires exact props, repository names, URL locators, and methods", async () => {
+  const repositories = repositoryNamespace();
+  const bucket = new MemoryBucket();
+  const env = {
+    GIT_OBJECTS: bucket as unknown as R2Bucket,
+    THREAD_GIT_REPOSITORY: repositories.namespace,
+  };
+  const validUrl = `https://repository.test/git/${appRepository}/info/refs?service=git-receive-pack`;
+
+  const wrongProps = await handleAppGitRequest(
+    appRepository,
+    new Request(validUrl),
+    env,
+    { clientId: "browser" },
+  );
+  assert.equal(wrongProps.status, 403);
+
+  for (const invalid of [
+    "thread-12345678-1234-4123-8123-123456789abc",
+    "app-12345678-1234-5123-8123-123456789abc",
+    "app-12345678-1234-4123-7123-123456789abc",
+    "app-12345678-1234-4123-8123-123456789ABC",
+  ]) {
+    const response = await handleAppGitRequest(
+      invalid,
+      new Request(validUrl),
+      env,
+      { clientId: "nanocodex-apps" },
+    );
+    assert.equal(response.status, 400);
+  }
+
+  const mismatch = await handleAppGitRequest(
+    appRepository,
+    new Request(`https://repository.test/git/${appRepositoryV7}/info/refs?service=git-receive-pack`, {
+      headers: { "x-nanocodex-repository": appRepository },
+    }),
+    env,
+    { clientId: "nanocodex-apps" },
+  );
+  assert.equal(mismatch.status, 400);
+
+  const unsupportedPath = await handleAppGitRequest(
+    appRepository,
+    new Request(`https://repository.test/git/${appRepository}/objects`),
+    env,
+    { clientId: "nanocodex-apps" },
+  );
+  assert.equal(unsupportedPath.status, 400);
+
+  const unsupportedMethod = await handleAppGitRequest(
+    appRepository,
+    new Request(validUrl, { method: "POST" }),
+    env,
+    { clientId: "nanocodex-apps" },
+  );
+  assert.equal(unsupportedMethod.status, 405);
+  assert.deepEqual(repositories.requestedNames, []);
+  assert.equal(bucket.objects.size, 0);
+
+  const ignoredHeader = await handleAppGitRequest(
+    appRepository,
+    new Request(validUrl, { headers: { "x-nanocodex-repository": appRepositoryV7 } }),
+    env,
+    { clientId: "nanocodex-apps" },
+  );
+  assert.equal(ignoredHeader.status, 200);
+  assert.deepEqual(new Set(repositories.requestedNames), new Set([appRepository]));
+});
+
+test("app Git lane creates, fetches, and CAS-updates an isolated repository", async () => {
+  const repositories = repositoryNamespace();
+  const bucket = new MemoryBucket();
+  const env = {
+    GIT_OBJECTS: bucket as unknown as R2Bucket,
+    THREAD_GIT_REPOSITORY: repositories.namespace,
+  };
+
+  assert.equal((await advertiseApp(env, appRepositoryV7)).status, 200);
+  const empty = await advertiseApp(env, appRepository);
+  assert.match((await responseLines(empty))[1]!, new RegExp(`^${zero} capabilities\\^\\{\\}`));
+  assert.equal((await pushApp(env, appRepository, zero, headA)).status, 200);
+  assert.equal((await pushApp(env, appRepository, headA, headB)).status, 200);
+
+  const repository = await currentRepository(repositories.repository(appRepository));
+  assert.equal(repository.head, headB);
+  assert.deepEqual(repository.packs.map(({ oldOid, newOid }) => ({ oldOid, newOid })), [
+    { oldOid: zero, newOid: headA },
+    { oldOid: headA, newOid: headB },
+  ]);
+  assert.ok(repository.packs.every(({ key }) => key.startsWith(
+    `app-repositories/${appRepository}/`,
+  )));
+
+  const fetched = await fetchAppV2(env, appRepository, headB, [headA]);
+  assert.equal(packObjectCount(await uploadPackBytes(fetched)), 1);
+
+  const stale = await pushApp(env, appRepository, headA, headC);
+  assert.equal(stale.status, 200);
+  assert.deepEqual((await responseLines(stale)).slice(0, 2), [
+    "unpack error stale ref; pull and retry\n",
+    `ng ${ref} stale ref; pull and retry\n`,
+  ]);
+  assert.equal((await currentRepository(repositories.repository(appRepository))).head, headB);
+  assert.equal(bucket.objects.size, 2);
+});
+
+test("app and public thread Git retain distinct DO and R2 namespaces", async () => {
+  const repositories = repositoryNamespace();
+  const bucket = new MemoryBucket();
+  const env = {
+    GIT_OBJECTS: bucket as unknown as R2Bucket,
+    THREAD_GIT_REPOSITORY: repositories.namespace,
+  };
+  const matchingThread = "thread-12345678-1234-4123-8123-123456789abc";
+
+  assert.equal((await pushApp(env, appRepository, zero, headA)).status, 200);
+  assert.equal((await pushThread(env, matchingThread, zero, headB)).status, 200);
+  assert.equal((await currentRepository(repositories.repository(appRepository))).head, headA);
+  assert.equal((await currentRepository(repositories.repository(matchingThread))).head, headB);
+  assert.deepEqual(new Set([...bucket.objects.keys()].map((key) => key.split("/", 1)[0])), new Set([
+    "app-repositories",
+    "thread-repositories",
+  ]));
+
+  const publicAppRequest = new Request(
+    `https://repository.test/git/${appRepository}/info/refs?service=git-upload-pack`,
+  );
+  assert.equal(
+    await handleThreadGitRequest(publicAppRequest, env, new URL(publicAppRequest.url)),
+    undefined,
+  );
+  const publicThreadRequest = new Request(
+    `https://repository.test/git/${matchingThread}/info/refs?service=git-upload-pack`,
+  );
+  assert.ok(await handleThreadGitRequest(publicThreadRequest, env, new URL(publicThreadRequest.url)));
 });
 
 test("thread routes persist refs, CAS updates, and retain every finalized pack", async () => {
@@ -134,6 +278,113 @@ function namespace(durable: ThreadGitRepository, loseFinalizeResponse = false) {
       return response;
     } }),
   };
+}
+
+function repositoryNamespace(): {
+  namespace: DurableObjectNamespace;
+  repository(name: string): ThreadGitRepository;
+  requestedNames: string[];
+} {
+  const repositories = new Map<string, ThreadGitRepository>();
+  const requestedNames: string[] = [];
+  const repository = (name: string) => {
+    let durable = repositories.get(name);
+    if (!durable) {
+      durable = memoryRepository();
+      repositories.set(name, durable);
+    }
+    return durable;
+  };
+  return {
+    namespace: {
+      idFromName: (name: string) => name,
+      get: (name: string) => ({
+        fetch: (request: Request | string, init?: RequestInit) => {
+          requestedNames.push(name);
+          return repository(name).fetch(request instanceof Request ? request : new Request(request, init));
+        },
+      }),
+    } as unknown as DurableObjectNamespace,
+    repository,
+    requestedNames,
+  };
+}
+
+async function currentRepository(durable: ThreadGitRepository): Promise<ThreadRepository> {
+  const response = await durable.fetch(new Request("https://repository.internal/thread"));
+  assert.equal(response.status, 200);
+  return response.json() as Promise<ThreadRepository>;
+}
+
+async function advertiseApp(env: {
+  GIT_OBJECTS: R2Bucket;
+  THREAD_GIT_REPOSITORY: DurableObjectNamespace;
+}, name: string): Promise<Response> {
+  return handleAppGitRequest(
+    name,
+    new Request(`https://repository.test/git/${name}/info/refs?service=git-receive-pack`),
+    env,
+    { clientId: "nanocodex-apps" },
+  );
+}
+
+async function pushApp(env: {
+  GIT_OBJECTS: R2Bucket;
+  THREAD_GIT_REPOSITORY: DurableObjectNamespace;
+}, name: string, oldOid: string, newOid: string): Promise<Response> {
+  return handleAppGitRequest(
+    name,
+    receiveRequest(`https://repository.test/git/${name}/git-receive-pack`, oldOid, newOid),
+    env,
+    { clientId: "nanocodex-apps" },
+  );
+}
+
+async function pushThread(env: {
+  GIT_OBJECTS: R2Bucket;
+  THREAD_GIT_REPOSITORY: DurableObjectNamespace;
+}, name: string, oldOid: string, newOid: string): Promise<Response> {
+  const request = receiveRequest(
+    `https://repository.test/git/${name}/git-receive-pack`,
+    oldOid,
+    newOid,
+  );
+  const response = await handleThreadGitRequest(request, env, new URL(request.url));
+  assert.ok(response);
+  return response;
+}
+
+function receiveRequest(url: string, oldOid: string, newOid: string): Request {
+  const body = concatenate([
+    encodePacketLine(`${oldOid} ${newOid} ${ref}\0 report-status\n`),
+    encoder.encode("0000"),
+    sourcePack(),
+  ]);
+  return new Request(url, { method: "POST", body: body.slice().buffer });
+}
+
+async function fetchAppV2(env: {
+  GIT_OBJECTS: R2Bucket;
+  THREAD_GIT_REPOSITORY: DurableObjectNamespace;
+}, name: string, want: string, haves: readonly string[]): Promise<Response> {
+  const body = concatenate([
+    encodePacketLine("command=fetch\n"),
+    encoder.encode("0001"),
+    encodePacketLine(`want ${want}\n`),
+    ...haves.map((oid) => encodePacketLine(`have ${oid}\n`)),
+    encodePacketLine("done\n"),
+    encoder.encode("0000"),
+  ]);
+  return handleAppGitRequest(
+    name,
+    new Request(`https://repository.test/git/${name}/git-upload-pack`, {
+      method: "POST",
+      headers: { "git-protocol": "version=2" },
+      body: body.slice().buffer,
+    }),
+    env,
+    { clientId: "nanocodex-apps" },
+  );
 }
 
 async function advertise(env: {

@@ -1,4 +1,4 @@
-import { DurableObject } from "cloudflare:workers";
+import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import {
   getWorkspace,
   withWorkspace,
@@ -71,6 +71,7 @@ import { routeConnectorRequest } from "./connectors";
 import {
   attachAgent,
   authenticate,
+  authenticatePersistentAccount,
   detachAgent,
   isUserId,
   listAgents,
@@ -120,11 +121,40 @@ export interface Env extends AccountAuthEnv {
   NANOCODEX_ROOMS: DurableObjectNamespace<MultiplayerRoom>;
   NANOCODEX_MULTIPLAYER_QUOTA: DurableObjectNamespace<MultiplayerQuota>;
   NANOCODEX: Fetcher;
+  NANOCODEX_APPS?: AppsServiceBinding;
   NANOCODEX_ADMIN_TOKEN: string;
   AGENT_IDLE_TIMEOUT_MS?: string;
   MANAGED_MULTIPLAYER_IO_TIMEOUT_MS?: string;
   MANAGED_OWNERSHIP_IO_TIMEOUT_MS?: string;
 }
+
+export interface AppsServiceBinding extends Fetcher {
+  request(userId: string, request: Request): Promise<Response>;
+}
+
+export type ManagedAgentClientProps = Readonly<{
+  clientId: "nanocodex-apps";
+}>;
+
+export type ManagedAgentCreateInput = Readonly<{
+  publicOrigin: string;
+}>;
+
+export type ManagedAgentTurnInput = Readonly<{
+  id: string;
+  input: PromptInput;
+  idempotencyKey?: string;
+  publicOrigin: string;
+}>;
+
+export type ManagedAgentTurnStatusInput = Readonly<{
+  publicOrigin: string;
+}>;
+
+export type ManagedAgentRpcResult = Readonly<{
+  status: number;
+  body: Record<string, unknown>;
+}>;
 
 type SessionRow = {
   session_id: string;
@@ -274,6 +304,289 @@ const json = (body: unknown, init: ResponseInit = {}) => Response.json(body, {
   headers: { "cache-control": "no-store", ...init.headers },
 });
 
+const MANAGED_APPS_CLIENT_ID = "nanocodex-apps";
+
+export class ManagedAgentEntrypoint extends WorkerEntrypoint<Env, ManagedAgentClientProps> {
+  async createAgent(userId: string, input: ManagedAgentCreateInput): Promise<ManagedAgentRpcResult> {
+    if (!this.#isAppsClient()) return rpcForbidden();
+    const error = validateRpcOwnerAndOrigin(userId, input);
+    if (error) return rpcFailure(error);
+    return rpcResult(await createManagedAgent(this.env, userId, input.publicOrigin));
+  }
+
+  async submitTurn(
+    userId: string,
+    agentId: string,
+    input: ManagedAgentTurnInput,
+  ): Promise<ManagedAgentRpcResult> {
+    if (!this.#isAppsClient()) return rpcForbidden();
+    const error = validateRpcTurnSubmission(userId, agentId, input);
+    if (error) return rpcFailure(error);
+    const headers = new Headers({ "content-type": "application/json" });
+    if (input.idempotencyKey !== undefined) headers.set("idempotency-key", input.idempotencyKey);
+    const request = new Request("https://session.internal/turns", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ id: input.id, input: input.input }),
+    });
+    return rpcResult(await submitManagedAgentTurn(
+      request,
+      this.env,
+      this.ctx,
+      userId,
+      agentId,
+      input.publicOrigin,
+    ));
+  }
+
+  async getTurnStatus(
+    userId: string,
+    agentId: string,
+    turnId: string,
+    input: ManagedAgentTurnStatusInput,
+  ): Promise<ManagedAgentRpcResult> {
+    if (!this.#isAppsClient()) return rpcForbidden();
+    const error = validateRpcTurnStatus(userId, agentId, turnId, input);
+    if (error) return rpcFailure(error);
+    return rpcResult(await getManagedAgentTurnStatus(
+      this.env,
+      userId,
+      agentId,
+      turnId,
+      input.publicOrigin,
+    ));
+  }
+
+  #isAppsClient(): boolean {
+    return this.ctx.props?.clientId === MANAGED_APPS_CLIENT_ID;
+  }
+}
+
+async function createManagedAgent(env: Env, userId: string, publicOrigin: string): Promise<Response> {
+  const agentId = uuidV7();
+  const subject = env.NANOCODEX_SESSIONS.idFromName(agentId).toString();
+  const stub = env.NANOCODEX_SESSIONS.getByName(agentId);
+  const ownershipTimeoutMs = managedOwnershipTimeoutMs(env);
+  let prepared: Response;
+  try {
+    prepared = await fetchWithDeadline(stub, "https://session.internal/credential-binding", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ owner_id: userId, session_id: agentId, subject }),
+    }, ownershipTimeoutMs, "agent cleanup preparation");
+  } catch {
+    return json({ error: "agent cleanup initialization failed" }, { status: 503 });
+  }
+  await prepared.body?.cancel();
+  if (!prepared.ok) {
+    return json({ error: "agent cleanup initialization failed" }, { status: 503 });
+  }
+  const [credentialBinding, initialization] = await Promise.allSettled([
+    fetchWithDeadline(
+      stub,
+      "https://session.internal/credential-binding/bind",
+      { method: "POST" },
+      ownershipTimeoutMs,
+      "agent credential binding",
+    ),
+    fetchWithDeadline(stub, "https://session.internal/initialize", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        session_id: agentId,
+        owner_id: userId,
+        public_origin: publicOrigin,
+      }),
+    }, ownershipTimeoutMs, "agent initialization"),
+  ]);
+  if (initialization.status === "fulfilled") {
+    await initialization.value.body?.cancel();
+  }
+  if (credentialBinding.status === "fulfilled") {
+    await credentialBinding.value.body?.cancel();
+  }
+  const credentialUnavailable = credentialBinding.status === "rejected"
+    || !credentialBinding.value.ok;
+  if (credentialUnavailable
+    || initialization.status === "rejected"
+    || !initialization.value.ok) {
+    await requestSessionCleanup(stub, ownershipTimeoutMs);
+    return credentialUnavailable
+      ? json({ error: "credential_broker_unavailable" }, { status: 503 })
+      : json({ error: "agent initialization failed" }, { status: 503 });
+  }
+  let committed: Response | undefined;
+  try {
+    committed = await fetchWithDeadline(
+      stub,
+      "https://session.internal/credential-binding/commit",
+      { method: "POST" },
+      ownershipTimeoutMs,
+      "agent cleanup commit",
+    );
+    await committed.body?.cancel();
+  } catch { /* The commit may have applied; cleanup is authoritative. */ }
+  if (!committed?.ok) {
+    await requestSessionCleanup(stub, ownershipTimeoutMs);
+    return json({ error: "agent cleanup commit failed" }, { status: 503 });
+  }
+  const routeBase = "/v1/agents";
+  const baseUrl = new URL(publicOrigin);
+  const websocketUrl = new URL(`${routeBase}/${agentId}/ws`, baseUrl);
+  websocketUrl.protocol = websocketUrl.protocol === "https:" ? "wss:" : "ws:";
+  return json({
+    agent_id: agentId,
+    session_id: agentId,
+    events_url: new URL(`${routeBase}/${agentId}/events`, baseUrl).href,
+    websocket_url: websocketUrl.href,
+  }, { status: 201 });
+}
+
+async function submitManagedAgentTurn(
+  request: Request,
+  env: Env,
+  ctx: Pick<ExecutionContext, "waitUntil">,
+  userId: string,
+  agentId: string,
+  publicOrigin: string,
+): Promise<Response> {
+  const stub = env.NANOCODEX_SESSIONS.getByName(agentId);
+  const sessionHeaders = new Headers(request.headers);
+  sessionHeaders.set(SESSION_OWNER_ASSERTION, userId);
+  const response = await stub.fetch(
+    `https://session.internal/turns?public_origin=${encodeURIComponent(publicOrigin)}`,
+    {
+      method: "POST",
+      headers: sessionHeaders,
+      body: request.body,
+    },
+  );
+  const created = response.headers.get("x-nanocodex-turn-created") === "1";
+  const encodedSummary = response.headers.get("x-nanocodex-turn-summary");
+  if (created && encodedSummary !== null) {
+    let title = "";
+    let turnCount = 0;
+    try {
+      const summary = JSON.parse(encodedSummary) as { title?: unknown; turnCount?: unknown };
+      if (typeof summary.title === "string") title = summary.title;
+      if (Number.isSafeInteger(summary.turnCount) && Number(summary.turnCount) >= 0) {
+        turnCount = Number(summary.turnCount);
+      }
+    } catch { /* Session-generated value is best effort. */ }
+    if (turnCount > 0) {
+      ctx.waitUntil(recordAgentActivity(env, userId, agentId, { title, turnCount }).catch((error) => {
+        console.error("managed agent summary update failed", errorMessage(error));
+      }));
+    }
+  }
+  const headers = new Headers(response.headers);
+  headers.delete("x-nanocodex-turn-created");
+  headers.delete("x-nanocodex-turn-summary");
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
+function getManagedAgentTurnStatus(
+  env: Env,
+  userId: string,
+  agentId: string,
+  turnId: string,
+  publicOrigin: string,
+): Promise<Response> {
+  const headers = new Headers({ [SESSION_OWNER_ASSERTION]: userId });
+  return env.NANOCODEX_SESSIONS.getByName(agentId).fetch(
+    `https://session.internal/turns/${turnId}?public_origin=${encodeURIComponent(publicOrigin)}`,
+    { headers },
+  );
+}
+
+function validateRpcOwnerAndOrigin(userId: unknown, input: unknown): string | undefined {
+  if (!isUserId(userId)) return "userId must be a canonical account UUID";
+  if (!exactObject(input, ["publicOrigin"])) return "create input must contain only publicOrigin";
+  return validatePublicOrigin(input.publicOrigin);
+}
+
+function validateRpcTurnSubmission(userId: unknown, agentId: unknown, input: unknown): string | undefined {
+  if (!isUserId(userId)) return "userId must be a canonical account UUID";
+  if (typeof agentId !== "string" || !SESSION_ID.test(agentId)) return "agentId must be a UUIDv7";
+  if (!exactObject(input, ["id", "idempotencyKey", "input", "publicOrigin"])) {
+    return "turn input contains unsupported fields";
+  }
+  if (typeof input.id !== "string" || !TURN_ID.test(input.id)) {
+    return "turn id must be 1-128 safe ASCII characters";
+  }
+  if (input.idempotencyKey !== undefined
+    && (typeof input.idempotencyKey !== "string" || !IDEMPOTENCY_KEY.test(input.idempotencyKey))) {
+    return "idempotencyKey must contain 1-256 visible ASCII characters";
+  }
+  try {
+    validatePromptInput(input.input);
+  } catch (error) {
+    return error instanceof Error ? error.message : "invalid prompt input";
+  }
+  let encoded: string;
+  try {
+    encoded = JSON.stringify({ id: input.id, input: input.input });
+  } catch {
+    return "turn input must be serializable";
+  }
+  if (encoder.encode(encoded).byteLength > MAX_REQUEST_BODY_BYTES) return "turn input exceeds 1 MiB";
+  return validatePublicOrigin(input.publicOrigin);
+}
+
+function validateRpcTurnStatus(
+  userId: unknown,
+  agentId: unknown,
+  turnId: unknown,
+  input: unknown,
+): string | undefined {
+  if (!isUserId(userId)) return "userId must be a canonical account UUID";
+  if (typeof agentId !== "string" || !SESSION_ID.test(agentId)) return "agentId must be a UUIDv7";
+  if (typeof turnId !== "string" || !TURN_ID.test(turnId)) {
+    return "turn id must be 1-128 safe ASCII characters";
+  }
+  if (!exactObject(input, ["publicOrigin"])) return "status input must contain only publicOrigin";
+  return validatePublicOrigin(input.publicOrigin);
+}
+
+function validatePublicOrigin(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length > 2_048) return "publicOrigin must be a bounded URL origin";
+  try {
+    const url = new URL(value);
+    return (url.protocol === "https:" || url.protocol === "http:") && url.origin === value
+      ? undefined
+      : "publicOrigin must be an HTTP(S) URL origin";
+  } catch {
+    return "publicOrigin must be an HTTP(S) URL origin";
+  }
+}
+
+function exactObject(value: unknown, allowed: readonly string[]): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const keys = Object.keys(value);
+  return keys.every((key) => allowed.includes(key))
+    && allowed.filter((key) => key !== "idempotencyKey").every((key) => keys.includes(key));
+}
+
+function rpcFailure(message: string): ManagedAgentRpcResult {
+  return { status: 400, body: { error: "invalid_request", message } };
+}
+
+function rpcForbidden(): ManagedAgentRpcResult {
+  return { status: 403, body: { error: "forbidden" } };
+}
+
+async function rpcResult(response: Response): Promise<ManagedAgentRpcResult> {
+  try {
+    const body = await response.json<unknown>();
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      return { status: 502, body: { error: "invalid_managed_response" } };
+    }
+    return { status: response.status, body: body as Record<string, unknown> };
+  } catch {
+    return { status: 502, body: { error: "invalid_managed_response" } };
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -296,6 +609,25 @@ export default {
     if (connector) return connector;
     const browserEgress = await routeBrowserEgress(request, env, url);
     if (browserEgress) return browserEgress;
+    if (url.pathname === "/apps" || url.pathname.startsWith("/apps/")) {
+      const headers = new Headers(request.headers);
+      headers.delete("authorization");
+      headers.delete("proxy-authorization");
+      headers.delete("x-nanocodex-owner-id");
+      headers.delete("x-nanocodex-subject");
+      headers.delete("x-nanocodex-user-id");
+      const appsRequest = new Request(request, { headers });
+      const principal = await authenticatePersistentAccount(appsRequest, env, url);
+      if (!principal) return json({ error: "unauthorized" }, { status: 401 });
+      if (request.method !== "GET" && request.method !== "HEAD") {
+        const originFailure = requireSameOriginMutation(appsRequest, url, principal);
+        if (originFailure) return originFailure;
+      }
+      if (!env.NANOCODEX_APPS) {
+        return json({ error: "apps_service_unavailable" }, { status: 503 });
+      }
+      return env.NANOCODEX_APPS.request(principal.userId, appsRequest);
+    }
     if (request.method === "GET") {
       const asset = webAsset(url.pathname);
       if (asset) return asset;
@@ -394,88 +726,7 @@ export default {
       if (!principal) return json({ error: "unauthorized" }, { status: 401 });
       const originFailure = requireSameOriginMutation(request, url, principal);
       if (originFailure) return originFailure;
-      const agentId = uuidV7();
-      const subject = env.NANOCODEX_SESSIONS.idFromName(agentId).toString();
-      const stub = env.NANOCODEX_SESSIONS.getByName(agentId);
-      const ownershipTimeoutMs = managedOwnershipTimeoutMs(env);
-      let prepared: Response;
-      try {
-        prepared = await fetchWithDeadline(stub, "https://session.internal/credential-binding", {
-          method: "PUT",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            owner_id: principal.userId,
-            session_id: agentId,
-            subject,
-          }),
-        }, ownershipTimeoutMs, "agent cleanup preparation");
-      } catch {
-        return json({ error: "agent cleanup initialization failed" }, { status: 503 });
-      }
-      await prepared.body?.cancel();
-      if (!prepared.ok) {
-        return json({ error: "agent cleanup initialization failed" }, { status: 503 });
-      }
-      const [credentialBinding, initialization] = await Promise.allSettled([
-        fetchWithDeadline(
-          stub,
-          "https://session.internal/credential-binding/bind",
-          { method: "POST" },
-          ownershipTimeoutMs,
-          "agent credential binding",
-        ),
-        fetchWithDeadline(stub, "https://session.internal/initialize", {
-          method: "PUT",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            session_id: agentId,
-            owner_id: principal.userId,
-            public_origin: url.origin,
-          }),
-        }, ownershipTimeoutMs, "agent initialization"),
-      ]);
-      if (initialization.status === "fulfilled") {
-        await initialization.value.body?.cancel();
-      }
-      if (credentialBinding.status === "fulfilled") {
-        await credentialBinding.value.body?.cancel();
-      }
-      const credentialUnavailable = credentialBinding.status === "rejected"
-        || !credentialBinding.value.ok;
-      if (credentialUnavailable
-        || initialization.status === "rejected"
-        || !initialization.value.ok) {
-        await requestSessionCleanup(stub, ownershipTimeoutMs);
-        return credentialUnavailable
-          ? json({ error: "credential_broker_unavailable" }, { status: 503 })
-          : json({ error: "agent initialization failed" }, { status: 503 });
-      }
-      let committed: Response | undefined;
-      try {
-        committed = await fetchWithDeadline(
-          stub,
-          "https://session.internal/credential-binding/commit",
-          { method: "POST" },
-          ownershipTimeoutMs,
-          "agent cleanup commit",
-        );
-        await committed.body?.cancel();
-      } catch { /* The commit may have applied; cleanup is authoritative. */ }
-      if (!committed?.ok) {
-        await requestSessionCleanup(stub, ownershipTimeoutMs);
-        return json({ error: "agent cleanup commit failed" }, { status: 503 });
-      }
-      const routeBase = "/v1/agents";
-      const websocketUrl = new URL(`${routeBase}/${agentId}/ws`, url);
-      websocketUrl.protocol = websocketUrl.protocol === "https:" ? "wss:" : "ws:";
-      return json({
-        agent_id: agentId,
-        session_id: agentId,
-        events_url: new URL(`${routeBase}/${agentId}/events`, url).href,
-        websocket_url: websocketUrl.href,
-      }, {
-        status: 201,
-      });
+      return createManagedAgent(env, principal.userId, url.origin);
     }
     const match = url.pathname.match(/^\/v1\/agents\/([^/]+)(?:\/(.*))?$/);
     if (!match || !SESSION_ID.test(match[1] ?? "")) {
@@ -515,56 +766,7 @@ export default {
         return json({ error: "method_not_allowed" }, { status: 405 });
       const originFailure = requireSameOriginMutation(request, url, principal);
       if (originFailure) return originFailure;
-      const response = await stub.fetch(
-        `https://session.internal/turns?${publicOrigin}`,
-        {
-          method: "POST",
-          headers: sessionHeaders,
-          body: request.body,
-        },
-      );
-      const created = response.headers.get("x-nanocodex-turn-created") === "1";
-      const encodedSummary = response.headers.get("x-nanocodex-turn-summary");
-      if (created && encodedSummary !== null) {
-        let title = "";
-        let turnCount = 0;
-        try {
-          const summary = JSON.parse(encodedSummary) as {
-            title?: unknown;
-            turnCount?: unknown;
-          };
-          if (typeof summary.title === "string") title = summary.title;
-          if (
-            Number.isSafeInteger(summary.turnCount) &&
-            Number(summary.turnCount) >= 0
-          ) {
-            turnCount = Number(summary.turnCount);
-          }
-        } catch {
-          /* Session-generated value is best effort. */
-        }
-        if (turnCount > 0) {
-          ctx.waitUntil(
-            recordAgentActivity(env, principal.userId, agentId, {
-              title,
-              turnCount,
-            }).catch((error) => {
-              console.error(
-                "managed agent summary update failed",
-                errorMessage(error),
-              );
-            }),
-          );
-        }
-      }
-      const headers = new Headers(response.headers);
-      headers.delete("x-nanocodex-turn-created");
-      headers.delete("x-nanocodex-turn-summary");
-      return new Response(response.body, {
-        status: response.status,
-        statusText: response.statusText,
-        headers,
-      });
+      return submitManagedAgentTurn(request, env, ctx, principal.userId, agentId, url.origin);
     }
     const realtimeMatch = resource.match(/^realtime\/(start|delegate|stop)$/);
     if (realtimeMatch) {
@@ -595,6 +797,9 @@ export default {
       if (request.method === "POST") {
         const originFailure = requireSameOriginMutation(request, url, principal);
         if (originFailure) return originFailure;
+      }
+      if (action === undefined) {
+        return getManagedAgentTurnStatus(env, principal.userId, agentId, turnMatch[1]!, url.origin);
       }
       return stub.fetch(
         `https://session.internal/turns/${turnMatch[1]}${action ? `/${action}` : ""}?${publicOrigin}`,

@@ -349,6 +349,25 @@ export default {
 };
 `;
 
+const TEST_APP_PLATFORM = `
+import { WorkerEntrypoint } from "cloudflare:workers";
+export class AppPlatform extends WorkerEntrypoint {
+  async request(userId, request) {
+    return Response.json({
+      body: request.method === "GET" || request.method === "HEAD" ? null : await request.json(),
+      authorization: request.headers.get("authorization"),
+      cookie: request.headers.get("cookie"),
+      method: request.method,
+      origin: request.headers.get("origin"),
+      ownerId: request.headers.get("x-nanocodex-owner-id"),
+      url: request.url,
+      userId,
+    });
+  }
+}
+export default { async fetch() { return new Response("not found", { status: 404 }); } };
+`;
+
 export default defineConfig({
   plugins: [
     cloudflareTest({
@@ -363,6 +382,10 @@ export default defineConfig({
           name: "nanocodex-egress",
           modules: true,
           script: TEST_BROKER,
+        }, {
+          name: "nanocodex-dynamic-apps-poc",
+          modules: true,
+          script: TEST_APP_PLATFORM,
         }],
       },
     }),
