@@ -148,6 +148,7 @@ export type App = AppSummary & Readonly<{
 export type AppBase = Readonly<{
   app: AppRecord;
   revision: Revision;
+  sourceHeadCommitOid: string;
 }>;
 
 export type PublishTransition = Readonly<{
@@ -586,7 +587,22 @@ export class AppRegistry extends DurableObject<RegistryEnv> {
     if (revision === null) {
       throw new RegistryError("schema_mismatch", 500, "active revision is missing");
     }
-    return Object.freeze({ app, revision: revisionFromRow(revision) });
+    const sourceHead = oneOrNull(this.ctx.storage.sql.exec<RevisionRow>(
+      `SELECT revisions.* FROM activations
+       JOIN revisions ON revisions.app_id = activations.app_id
+         AND revisions.revision_id = activations.revision_id
+       WHERE activations.app_id = ? AND activations.reason = 'publish'
+       ORDER BY activations.sequence DESC LIMIT 1`,
+      app.appId,
+    ));
+    if (sourceHead === null) {
+      throw new RegistryError("schema_mismatch", 500, "app source head is missing");
+    }
+    return Object.freeze({
+      app,
+      revision: revisionFromRow(revision),
+      sourceHeadCommitOid: sourceHead.source_commit_oid,
+    });
   }
 
   getBase(rawTenantId: TenantId, appId: string): AppBase | null {

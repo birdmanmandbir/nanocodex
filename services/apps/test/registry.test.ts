@@ -61,8 +61,49 @@ class RegistryBindingSql {
   }
 }
 
+type BaseFixture = Readonly<{
+  app: Record<string, SqlStorageValue>;
+  activeRevision: Record<string, SqlStorageValue>;
+  sourceHeadRevision: Record<string, SqlStorageValue>;
+}>;
+
+class AppBaseSql extends RegistryBindingSql {
+  constructor(private readonly fixture: BaseFixture) {
+    super();
+  }
+
+  override exec<T extends Record<string, SqlStorageValue>>(
+    query: string,
+    ...bindings: unknown[]
+  ): SqlStorageCursor<T> {
+    const statement = query.trim();
+    if (statement === "SELECT * FROM apps WHERE app_id = ?") {
+      return cursor([this.fixture.app as T]);
+    }
+    if (statement === "SELECT * FROM revisions WHERE app_id = ? AND revision_id = ?") {
+      expect(bindings).toEqual([this.fixture.app.app_id, this.fixture.app.active_revision_id]);
+      return cursor([this.fixture.activeRevision as T]);
+    }
+    if (statement.startsWith("SELECT revisions.* FROM activations")) {
+      expect(bindings).toEqual([this.fixture.app.app_id]);
+      return cursor([this.fixture.sourceHeadRevision as T]);
+    }
+    return super.exec(query, ...bindings);
+  }
+}
+
 function durableRegistry(): InstanceType<RegistryModule["AppRegistry"]> {
   const sql = new RegistryBindingSql();
+  const state = {
+    storage: {
+      sql,
+      transactionSync: <T>(callback: () => T): T => callback(),
+    },
+  } as unknown as DurableObjectState;
+  return new registry.AppRegistry(state, {});
+}
+
+function durableRegistryWithSql(sql: RegistryBindingSql): InstanceType<RegistryModule["AppRegistry"]> {
   const state = {
     storage: {
       sql,
@@ -317,5 +358,51 @@ describe("app registry canonical transitions", () => {
       revisionId: "rev-1",
       expectedActiveRevisionId: "rev-2",
     })).toThrowError(expect.objectContaining({ code: "not_found", status: 404 }));
+  });
+});
+
+describe("app registry source base", () => {
+  it("keeps the active generation revision separate from the append-only source head after rollback", () => {
+    const owner = tenant("team:engineering");
+    const revision = (revisionId: string, jobId: string, sourceCommitOid: string, createdAt: string) => ({
+      revision_id: revisionId,
+      app_id: "app-live",
+      owner_id: owner,
+      job_id: jobId,
+      artifact_key: `apps/app-live/revisions/${revisionId}/worker.json`,
+      artifact_hash: revisionId,
+      artifact_bytes: 42,
+      source_commit_oid: sourceCommitOid,
+      source_summary: "{}",
+      prompt: jobId,
+      generation_model: "gpt-5",
+      main_module: "app.js",
+      policy_version: 1,
+      created_at: createdAt,
+    });
+    const revisionA = revision("a".repeat(64), "job-a", "1".repeat(40), "2026-08-25T10:00:00.000Z");
+    const revisionB = revision("b".repeat(64), "job-b", "2".repeat(40), "2026-08-25T10:01:00.000Z");
+    const object = durableRegistryWithSql(new AppBaseSql({
+      app: {
+        app_id: "app-live",
+        owner_id: owner,
+        display_name: "Live app",
+        slug: "live-app",
+        active_revision_id: revisionA.revision_id,
+        created_at: revisionA.created_at,
+        updated_at: "2026-08-25T10:02:00.000Z",
+      },
+      activeRevision: revisionA,
+      sourceHeadRevision: revisionB,
+    }));
+
+    expect(object.getAppBase(owner, "app-live")).toMatchObject({
+      app: { activeRevisionId: revisionA.revision_id },
+      revision: {
+        revisionId: revisionA.revision_id,
+        sourceCommitOid: revisionA.source_commit_oid,
+      },
+      sourceHeadCommitOid: revisionB.source_commit_oid,
+    });
   });
 });

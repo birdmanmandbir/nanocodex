@@ -27,7 +27,7 @@ export interface AppGitService {
 
 export type CommitProjectInput = Readonly<{
   appId: string;
-  expectedParentOid: string | null;
+  expectedAncestorOid: string | null;
   jobId: string;
   prompt: string;
   createdAt: string;
@@ -72,12 +72,10 @@ export async function commitProject(
   await prepareRepository(fs, http, remoteUrl);
   const head = await resolveHead(fs);
   if (head && await headBelongsToJob(fs, head, input.jobId)) {
-    await verifyCheckedOutProject(fs, head, input.expectedParentOid, desired);
+    await verifyRetryProject(fs, head, input.expectedAncestorOid, desired);
     return { oid: head, repository };
   }
-  if (head !== (input.expectedParentOid ?? undefined)) {
-    throw new Error("app repository head does not match the active source revision");
-  }
+  await verifySourceAncestor(fs, head, input.expectedAncestorOid);
 
   const tracked = new Set(await git.listFiles({ fs, dir: DIRECTORY }));
 
@@ -122,7 +120,7 @@ export async function commitProject(
   if (await remoteHead(http, remoteUrl) !== oid) {
     throw new Error("app repository did not publish the expected commit");
   }
-  await verifyPublishedProject(service, repository, oid, input.expectedParentOid, desired);
+  await verifyPublishedProject(service, repository, oid, head ?? null, desired);
   return { oid, repository };
 }
 
@@ -225,23 +223,14 @@ async function verifyPublishedProject(
   if (!previousOid && commit.parent.length !== 0) {
     throw new Error("initial app repository commit has an unexpected parent");
   }
-  await verifyCheckedOutProject(fs, expectedOid, previousOid, desired);
+  await verifyCheckedOutProject(fs, expectedOid, desired);
 }
 
 async function verifyCheckedOutProject(
   fs: ReturnType<typeof createMemoryGitFs>,
   oid: string,
-  expectedParentOid: string | null,
   desired: ReadonlyMap<string, string>,
 ): Promise<void> {
-  const { commit } = await git.readCommit({ fs, dir: DIRECTORY, oid });
-  if (expectedParentOid) {
-    if (commit.parent.length !== 1 || commit.parent[0] !== expectedParentOid) {
-      throw new Error("app repository retry is not the expected direct fast-forward");
-    }
-  } else if (commit.parent.length !== 0) {
-    throw new Error("initial app repository retry has an unexpected parent");
-  }
   const tracked = (await git.listFiles({ fs, dir: DIRECTORY })).sort();
   const expected = [...desired.keys()].sort();
   if (tracked.length !== expected.length || tracked.some((path, index) => path !== expected[index])) {
@@ -253,6 +242,46 @@ async function verifyCheckedOutProject(
     if (decoder.decode(blob) !== content) {
       throw new Error(`app repository readback changed ${path}`);
     }
+  }
+}
+
+async function verifyRetryProject(
+  fs: ReturnType<typeof createMemoryGitFs>,
+  oid: string,
+  expectedAncestorOid: string | null,
+  desired: ReadonlyMap<string, string>,
+): Promise<void> {
+  const { commit } = await git.readCommit({ fs, dir: DIRECTORY, oid });
+  if (expectedAncestorOid) {
+    if (commit.parent.length !== 1) {
+      throw new Error("app repository retry is not a direct fast-forward");
+    }
+    await verifySourceAncestor(fs, commit.parent[0], expectedAncestorOid);
+  } else if (commit.parent.length !== 0) {
+    throw new Error("initial app repository retry has an unexpected parent");
+  }
+  await verifyCheckedOutProject(fs, oid, desired);
+}
+
+async function verifySourceAncestor(
+  fs: ReturnType<typeof createMemoryGitFs>,
+  head: string | undefined,
+  expectedAncestorOid: string | null,
+): Promise<void> {
+  if (!expectedAncestorOid) {
+    if (head) throw new Error("initial app repository unexpectedly has source history");
+    return;
+  }
+  if (!head) throw new Error("app repository is missing its published source revision");
+  if (head === expectedAncestorOid) return;
+  if (!await git.isDescendent({
+    fs,
+    dir: DIRECTORY,
+    oid: head,
+    ancestor: expectedAncestorOid,
+    depth: -1,
+  })) {
+    throw new Error("app repository head does not descend from the published source revision");
   }
 }
 

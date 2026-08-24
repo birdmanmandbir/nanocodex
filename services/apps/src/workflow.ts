@@ -52,7 +52,7 @@ type StoredArtifact = Readonly<{
 }>;
 
 type BaseSource = Readonly<{
-  expectedParentOid: string;
+  expectedAncestorOid: string;
   project: GeneratedProject;
 }>;
 
@@ -91,7 +91,7 @@ export class AppBuildWorkflow extends WorkflowEntrypoint<BuildWorkflowEnv, Build
         async () => commitProject(this.env.APP_GIT, {
           appId: params.updateAppId ?? params.appId,
           createdAt: params.createdAt,
-          expectedParentOid: base?.expectedParentOid ?? null,
+          expectedAncestorOid: base?.expectedAncestorOid ?? null,
           jobId: params.jobId,
           project,
           prompt: params.prompt,
@@ -144,7 +144,7 @@ export class AppBuildWorkflow extends WorkflowEntrypoint<BuildWorkflowEnv, Build
     const object = await this.env.APP_ARTIFACTS.get(base.revision.artifactKey);
     if (!object) throw new Error("active app artifact is missing");
     return {
-      expectedParentOid: base.revision.sourceCommitOid,
+      expectedAncestorOid: base.sourceHeadCommitOid,
       project: (await parseArtifact(await object.text())).project,
     };
   }
