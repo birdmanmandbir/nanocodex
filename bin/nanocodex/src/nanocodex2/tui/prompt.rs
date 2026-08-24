@@ -1,9 +1,9 @@
 // Modified from clabby/tact@a2de8ae1e0b6ce8d8f0a251a9d681dc430b247aa for Nanocodex2.
 // SPDX-License-Identifier: Apache-2.0
 
-
 //! Displayable prompt text paired with model-only image content.
 
+use crate::client::{PromptContent as ManagedPromptContent, PromptInput as ManagedPromptInput};
 use nanocodex::agent::input::{Prompt, UserInput};
 use std::{fmt, ops::Range};
 
@@ -96,6 +96,32 @@ impl Submission {
         }
         Prompt::content(content)
     }
+
+    pub(crate) fn managed_prompt(&self) -> ManagedPromptInput {
+        if self.images.is_empty() {
+            return ManagedPromptInput::Text(self.text.clone());
+        }
+        let mut content = Vec::new();
+        let mut cursor = 0;
+        for image in &self.images {
+            if cursor < image.range.start {
+                content.push(ManagedPromptContent::Text {
+                    text: self.text[cursor..image.range.start].to_owned(),
+                });
+            }
+            content.push(ManagedPromptContent::Image {
+                image_url: image.data_url.clone(),
+                detail: None,
+            });
+            cursor = image.range.end;
+        }
+        if cursor < self.text.len() {
+            content.push(ManagedPromptContent::Text {
+                text: self.text[cursor..].to_owned(),
+            });
+        }
+        ManagedPromptInput::Content(content)
+    }
 }
 
 impl fmt::Debug for Submission {
@@ -117,6 +143,7 @@ impl From<String> for Submission {
 #[cfg(test)]
 mod tests {
     use super::Submission;
+    use crate::client::{PromptContent as ManagedPromptContent, PromptInput as ManagedPromptInput};
     use nanocodex::agent::input::{PromptInput, UserInput};
 
     #[test]
@@ -135,5 +162,26 @@ mod tests {
             matches!(&content[1], UserInput::Image { image_url, .. } if image_url.ends_with(",a"))
         );
         assert!(matches!(&content[2], UserInput::Text { text } if text == " after"));
+    }
+
+    #[test]
+    fn managed_prompt_preserves_multimodal_order() {
+        let submission = Submission::multimodal(
+            "before [Image #1] after".to_owned(),
+            [(7..17, "data:image/png;base64,a".to_owned())],
+        );
+        let ManagedPromptInput::Content(content) = submission.managed_prompt() else {
+            panic!("multimodal submissions should use managed content input");
+        };
+        assert!(matches!(
+            &content[..],
+            [
+                ManagedPromptContent::Text { text: before },
+                ManagedPromptContent::Image { image_url, .. },
+                ManagedPromptContent::Text { text: after }
+            ] if before == "before "
+                && image_url == "data:image/png;base64,a"
+                && after == " after"
+        ));
     }
 }

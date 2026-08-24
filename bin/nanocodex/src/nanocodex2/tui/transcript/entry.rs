@@ -1,10 +1,9 @@
 // Modified from clabby/tact@a2de8ae1e0b6ce8d8f0a251a9d681dc430b247aa for Nanocodex2.
 // SPDX-License-Identifier: Apache-2.0
 
-
 use crate::app::config::ReasoningEffort;
+use nanocodex_subagents::{AgentThread, MessageDeliveryState, MessageId, MessageSender};
 use serde_json::Value;
-use tact_subagents::{AgentThread, MessageDeliveryState, MessageId, MessageSender};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct EntryId(usize);

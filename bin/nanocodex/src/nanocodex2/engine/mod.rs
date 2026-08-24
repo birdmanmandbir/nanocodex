@@ -43,6 +43,8 @@ impl ManagedIdentity {
 pub(crate) enum UnsupportedCapability {
     /// Creating another managed agent from this agent's retained history.
     ForkRetainedHistory,
+    ThinkingUpdate,
+    FastModeUpdate,
 }
 
 impl std::fmt::Display for UnsupportedCapability {
@@ -51,6 +53,8 @@ impl std::fmt::Display for UnsupportedCapability {
             Self::ForkRetainedHistory => {
                 formatter.write_str("forking a managed agent from retained history")
             }
+            Self::ThinkingUpdate => formatter.write_str("updating managed reasoning effort"),
+            Self::FastModeUpdate => formatter.write_str("updating managed fast mode"),
         }
     }
 }
@@ -371,6 +375,21 @@ impl ManagedAgent {
     pub(crate) async fn fork(&self) -> Result<(ManagedAgent, ManagedAgentEvents), EngineError> {
         Err(EngineError::Unsupported(
             UnsupportedCapability::ForkRetainedHistory,
+        ))
+    }
+
+    pub(crate) async fn set_thinking(
+        &self,
+        _thinking: nanocodex::Thinking,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported(
+            UnsupportedCapability::ThinkingUpdate,
+        ))
+    }
+
+    pub(crate) async fn set_fast_mode(&self, _enabled: bool) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported(
+            UnsupportedCapability::FastModeUpdate,
         ))
     }
 

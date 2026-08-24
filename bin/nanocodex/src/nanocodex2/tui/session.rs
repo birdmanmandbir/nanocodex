@@ -1,7 +1,6 @@
 // Modified from clabby/tact@a2de8ae1e0b6ce8d8f0a251a9d681dc430b247aa for Nanocodex2.
 // SPDX-License-Identifier: Apache-2.0
 
-
 //! V2 resumable session storage and indexed session discovery.
 
 use crate::{
@@ -11,7 +10,7 @@ use crate::{
         transcript::{SessionStarted, TranscriptRecord},
     },
 };
-use nanocodex::{Model, agent::session::SessionSnapshot};
+use nanocodex::Model;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -21,7 +20,7 @@ use std::{
 };
 use thiserror::Error;
 
-const RESUME_STATE_FORMAT_VERSION: u32 = 2;
+const RESUME_STATE_FORMAT_VERSION: u32 = 1;
 pub(crate) const MAX_RECENT_PROMPTS: usize = 100;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -46,19 +45,23 @@ pub(crate) struct RecentPrompt {
 #[derive(Deserialize, Serialize)]
 struct StoredResumeState {
     format_version: u32,
-    snapshot: SessionSnapshot,
+    snapshot: ManagedSessionSnapshot,
     instructions: String,
     skills_catalog_present: bool,
 }
 
 pub(crate) struct ResumeState {
-    snapshot: SessionSnapshot,
+    snapshot: ManagedSessionSnapshot,
     instructions: String,
     skills_catalog_present: bool,
 }
 
 impl ResumeState {
-    fn new(snapshot: SessionSnapshot, instructions: String, skills_catalog_present: bool) -> Self {
+    fn new(
+        snapshot: ManagedSessionSnapshot,
+        instructions: String,
+        skills_catalog_present: bool,
+    ) -> Self {
         Self {
             snapshot,
             instructions,
@@ -66,12 +69,25 @@ impl ResumeState {
         }
     }
 
-    pub(crate) fn into_parts(self) -> (SessionSnapshot, String, Option<bool>) {
+    pub(crate) fn into_parts(self) -> (ManagedSessionSnapshot, String, Option<bool>) {
         (
             self.snapshot,
             self.instructions,
             Some(self.skills_catalog_present),
         )
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct ManagedSessionSnapshot {
+    pub(crate) agent_id: String,
+}
+
+impl ManagedSessionSnapshot {
+    pub(crate) fn new(agent_id: impl Into<String>) -> Self {
+        Self {
+            agent_id: agent_id.into(),
+        }
     }
 }
 
@@ -101,7 +117,7 @@ pub(crate) enum SessionError {
 pub(crate) fn save_checkpoint(
     config_path: &Path,
     session_id: &str,
-    snapshot: &SessionSnapshot,
+    snapshot: &ManagedSessionSnapshot,
     instructions: &str,
     skills_catalog_present: bool,
 ) -> Result<(), SessionError> {
@@ -112,7 +128,7 @@ pub(crate) fn save_checkpoint(
 }
 
 pub(crate) fn encode_checkpoint(
-    snapshot: &SessionSnapshot,
+    snapshot: &ManagedSessionSnapshot,
     instructions: &str,
     skills_catalog_present: bool,
 ) -> Result<Vec<u8>, SessionError> {
@@ -374,7 +390,10 @@ pub(crate) fn format_age(started_at_unix_ms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_checkpoint, load_checkpoint, load_transcript, model, save_checkpoint};
+    use super::{
+        ManagedSessionSnapshot, encode_checkpoint, load_checkpoint, load_transcript, model,
+        save_checkpoint,
+    };
     use crate::{
         app::config::{ReasoningEffort, ReasoningMode},
         tui::{
@@ -382,33 +401,14 @@ mod tests {
             transcript::{LocalEvent, SessionStarted, TranscriptJournal, TranscriptRecord, TurnId},
         },
     };
-    use nanocodex::{Model, agent::session::SessionSnapshot};
+    use nanocodex::Model;
     use rusqlite::Connection;
-    use serde_json::{Value, json};
+    use serde_json::Value;
     use std::sync::Arc;
     use tempfile::tempdir;
 
-    fn snapshot(lineage: &str) -> SessionSnapshot {
-        serde_json::from_value(json!({
-            "version": 1,
-            "model": nanocodex::oai::MODEL,
-            "lineage_id": lineage,
-            "prompt_cache_key": format!("cache-{lineage}"),
-            "workspace": "/work",
-            "request_prefix": [
-                {"type": "additional_tools", "role": "developer", "tools": []},
-                {"type": "message", "role": "developer", "content": []}
-            ],
-            "canonical_context": {
-                "type": "message", "role": "user",
-                "content": [{"type": "input_text", "text": "canonical"}]
-            },
-            "history": [
-                {"type": "message", "role": "user",
-                 "content": [{"type": "input_text", "text": "hello"}]}
-            ]
-        }))
-        .unwrap()
+    fn snapshot(lineage: &str) -> ManagedSessionSnapshot {
+        ManagedSessionSnapshot::new(format!("agent-{lineage}"))
     }
 
     fn started(

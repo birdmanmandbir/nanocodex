@@ -1,7 +1,6 @@
 // Modified from clabby/tact@a2de8ae1e0b6ce8d8f0a251a9d681dc430b247aa for Nanocodex2.
 // SPDX-License-Identifier: Apache-2.0
 
-
 use super::{
     DirectedMessageEntry, EntryId, EntryKind, MessageDelivery, MessagePhase, SessionStarted,
     ShellId, ToolEntry, ToolState, TranscriptEntry, TranscriptRecord, TransientStatus,
@@ -14,14 +13,14 @@ use nanocodex::{
     },
     oai::responses::MessagePhase as AgentMessagePhase,
 };
+use nanocodex_subagents::{
+    AgentMessageUpdate, MessageDeliveryState, MessageDisposition, MessageSender, ThreadId,
+};
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
-};
-use tact_subagents::{
-    AgentMessageUpdate, MessageDeliveryState, MessageDisposition, MessageSender, ThreadId,
 };
 
 const MAX_RETAINED_MESSAGE_THREADS: usize = 256;
@@ -1272,13 +1271,21 @@ mod tests {
         },
     };
     use nanocodex::agent::events::{AgentEvent, AgentEventKind};
+    use nanocodex_subagents::{AgentId, AgentMessageUpdate, MessageSender, ThreadId};
     use serde::Serialize;
     use serde_json::{json, value::to_raw_value};
     use std::sync::Arc;
-    use tact_subagents::{AgentId, AgentMessageUpdate, MessageSender, ThreadId};
 
     fn agent(kind: AgentEventKind, payload: impl Serialize) -> TranscriptRecord {
         agent_at(1, kind, payload)
+    }
+
+    fn agent_id(value: u64) -> AgentId {
+        serde_json::from_value(json!(value)).unwrap()
+    }
+
+    fn thread_id(value: u64) -> ThreadId {
+        serde_json::from_value(json!(value)).unwrap()
     }
 
     fn agent_at(
@@ -1334,7 +1341,7 @@ mod tests {
     fn message_delivery_updates_upsert_one_entry_per_thread() {
         let mut model = TranscriptModel::default();
         let perspective = MessageSender::Agent {
-            agent_id: AgentId::new(1),
+            agent_id: agent_id(1),
         };
         let admitted = message_update("admitted");
 
@@ -1358,7 +1365,7 @@ mod tests {
         assert_eq!(thread.deliveries.len(), 1);
         assert!(matches!(
             thread.deliveries[0].state,
-            tact_subagents::MessageDeliveryState::Delivered { .. }
+            nanocodex_subagents::MessageDeliveryState::Delivered { .. }
         ));
 
         let mut snapshot = model.fork_snapshot();
@@ -1452,7 +1459,7 @@ mod tests {
     fn completed_directed_message_history_is_bounded() {
         let mut model = TranscriptModel::default();
         let perspective = MessageSender::Agent {
-            agent_id: AgentId::new(1),
+            agent_id: agent_id(1),
         };
 
         for id in 1..=u64::try_from(MAX_RETAINED_MESSAGE_THREADS + 1).unwrap() {
@@ -1468,7 +1475,7 @@ mod tests {
         assert!(model.entries().iter().all(|entry| {
             matches!(
                 &entry.kind,
-                EntryKind::DirectedMessage(message) if message.thread.id != ThreadId::new(1)
+                EntryKind::DirectedMessage(message) if message.thread.id != thread_id(1)
             )
         }));
     }

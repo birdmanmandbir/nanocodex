@@ -1,11 +1,10 @@
 // Modified from clabby/tact@a2de8ae1e0b6ce8d8f0a251a9d681dc430b247aa for Nanocodex2.
 // SPDX-License-Identifier: Apache-2.0
 
-
 //! Lossless forwarding for active and retiring Nanocodex event streams.
 
-use crate::tui::pane::PaneId;
-use nanocodex::{AgentEvents, agent::events::AgentEvent};
+use crate::{engine::ManagedAgentEvents, tui::pane::PaneId};
+use nanocodex::agent::events::AgentEvent;
 use tokio::sync::mpsc;
 
 pub(crate) enum ForwardedAgentEvent {
@@ -25,10 +24,10 @@ pub(crate) enum ForwardedAgentEvent {
 pub(crate) fn forward(
     pane: PaneId,
     generation: u64,
-    mut events: AgentEvents,
+    mut events: ManagedAgentEvents,
     sender: mpsc::UnboundedSender<ForwardedAgentEvent>,
 ) {
-    let session_id = events.request_id().to_owned();
+    let session_id = events.identity().session_id().to_owned();
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
             if sender

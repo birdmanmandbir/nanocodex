@@ -12,7 +12,7 @@ pub(crate) type Result<T> = StdResult<T, Error>;
 #[derive(Debug, Error)]
 pub(crate) enum Error {
     #[error(transparent)]
-    Agent(#[from] nanocodex::NanocodexError),
+    Agent(#[from] crate::engine::EngineError),
     #[error(transparent)]
     Config(#[from] ConfigError),
     #[error(transparent)]
