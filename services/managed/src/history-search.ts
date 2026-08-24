@@ -4,7 +4,7 @@ const DEFAULT_LIMIT = 8;
 export const MAX_HISTORY_SEARCH_LIMIT = 20;
 export const HISTORY_VECTOR_MATCH_THRESHOLD = 0.5;
 const MAX_QUERY_BYTES = 4_096;
-const THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const TURN_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 const EXACT_IDENTIFIER = /^(?=.{2,128}$)(?=.*[_:])[\p{L}\p{N}][\p{L}\p{N}._:-]*$/u;
 const HISTORY_TERM = /[\p{L}\p{N}_-]+/gu;
@@ -15,19 +15,13 @@ const HISTORY_SEARCH_STOP_WORDS = new Set([
   "which", "who", "why", "with", "you", "your",
 ]);
 
-export type HistorySearchInput = Readonly<{
-  query: string;
-  limit: number;
-  agentic: boolean;
-}>;
-
-export type HistoryFindThreadsInput = Readonly<{
+export type HistoryFindSessionsInput = Readonly<{
   query: string;
   limit: number;
 }>;
 
-export type HistoryReadThreadInput = Readonly<{
-  thread_id: string;
+export type HistoryReadSessionInput = Readonly<{
+  session_id: string;
   turn_ids?: readonly string[];
 }>;
 
@@ -42,8 +36,8 @@ export type HistoryCitation = Readonly<{
   sources: readonly HistorySource[];
 }>;
 
-export type HistorySearchHit = Readonly<{
-  thread_id: string;
+export type SessionSearchHit = Readonly<{
+  session_id: string;
   title: string;
   turn_id: string;
   cursor: string;
@@ -51,16 +45,14 @@ export type HistorySearchHit = Readonly<{
   snippet: string;
 }>;
 
-export type HistorySearchResponse = Readonly<{
+export type HistoryFindSessionsResponse = Readonly<{
   query: string;
-  agentic: boolean;
-  answer: string | null;
-  results: readonly HistorySearchHit[];
+  results: readonly SessionSearchHit[];
   citations: readonly HistoryCitation[];
 }>;
 
-export type HistoryThreadTurn = Readonly<{
-  thread_id: string;
+export type HistorySessionTurn = Readonly<{
+  session_id: string;
   title: string;
   turn_id: string;
   cursor: string;
@@ -68,8 +60,8 @@ export type HistoryThreadTurn = Readonly<{
   assistant: string;
 }>;
 
-export type HistoryReadThreadResponse = Readonly<{
-  turns: readonly HistoryThreadTurn[];
+export type HistoryReadSessionResponse = Readonly<{
+  turns: readonly HistorySessionTurn[];
   citations: readonly HistoryCitation[];
 }>;
 
@@ -93,12 +85,12 @@ export class HistorySearchError extends Error {
   }
 }
 
-export function parseHistorySearchInput(value: unknown): HistorySearchInput {
+export function parseHistoryFindSessionsInput(value: unknown): HistoryFindSessionsInput {
   if (!isRecord(value)) {
-    throw new HistorySearchError(400, "invalid_request", "history search body must be a JSON object");
+    throw new HistorySearchError(400, "invalid_request", "session search body must be a JSON object");
   }
-  if (Object.keys(value).some((key) => !["query", "limit", "agentic"].includes(key))) {
-    throw new HistorySearchError(400, "invalid_request", "supported fields are query, limit, and agentic");
+  if (Object.keys(value).some((key) => !["query", "limit"].includes(key))) {
+    throw new HistorySearchError(400, "invalid_request", "supported fields are query and limit");
   }
   if (typeof value.query !== "string" || !value.query.trim()) {
     throw new HistorySearchError(400, "invalid_query", "query must be a non-empty string");
@@ -114,32 +106,19 @@ export function parseHistorySearchInput(value: unknown): HistorySearchInput {
       `limit must be an integer from 1 to ${MAX_HISTORY_SEARCH_LIMIT}`,
     );
   }
-  if (value.agentic !== undefined && typeof value.agentic !== "boolean") {
-    throw new HistorySearchError(400, "invalid_agentic", "agentic must be a boolean");
-  }
   return {
     query: value.query.trim(),
     limit: value.limit === undefined ? DEFAULT_LIMIT : Number(value.limit),
-    agentic: value.agentic ?? false,
   };
 }
 
-export function parseHistoryFindThreadsInput(value: unknown): HistoryFindThreadsInput {
+export function parseHistoryReadSessionInput(value: unknown): HistoryReadSessionInput {
   if (!isRecord(value)
-    || Object.keys(value).some((key) => !["query", "limit"].includes(key))) {
-    throw new HistorySearchError(400, "invalid_request", "supported fields are query and limit");
+    || Object.keys(value).some((key) => !["session_id", "turn_ids"].includes(key))) {
+    throw new HistorySearchError(400, "invalid_request", "supported fields are session_id and turn_ids");
   }
-  const parsed = parseHistorySearchInput({ ...value, agentic: false });
-  return { query: parsed.query, limit: parsed.limit };
-}
-
-export function parseHistoryReadThreadInput(value: unknown): HistoryReadThreadInput {
-  if (!isRecord(value)
-    || Object.keys(value).some((key) => !["thread_id", "turn_ids"].includes(key))) {
-    throw new HistorySearchError(400, "invalid_request", "supported fields are thread_id and turn_ids");
-  }
-  if (typeof value.thread_id !== "string" || !THREAD_ID.test(value.thread_id)) {
-    throw new HistorySearchError(400, "invalid_thread_id", "invalid thread id");
+  if (typeof value.session_id !== "string" || !SESSION_ID.test(value.session_id)) {
+    throw new HistorySearchError(400, "invalid_session_id", "invalid session id");
   }
   if (value.turn_ids !== undefined && (!Array.isArray(value.turn_ids)
     || value.turn_ids.length > MAX_HISTORY_SEARCH_LIMIT
@@ -151,7 +130,7 @@ export function parseHistoryReadThreadInput(value: unknown): HistoryReadThreadIn
     );
   }
   return {
-    thread_id: value.thread_id,
+    session_id: value.session_id,
     ...(value.turn_ids === undefined ? {} : { turn_ids: value.turn_ids as string[] }),
   };
 }
@@ -217,27 +196,15 @@ export function isAcceptedHistoryLexicalMatch(query: string, content: string): b
   return matched >= Math.max(2, Math.ceil(terms.length * 0.6));
 }
 
-export function seededAgenticSearchPrompt(
-  query: string,
-  results: readonly HistorySearchHit[],
-): string {
-  return [
-    `Question:\n${query}`,
-    "Initial find_threads result (already computed):",
-    JSON.stringify({ results }),
-    "Start by reading the relevant candidates. Call find_threads only if the initial result is empty or insufficient.",
-  ].join("\n\n");
-}
-
 export function groupHistoryCitations(
-  results: readonly Pick<HistorySearchHit, "thread_id" | "title" | "turn_id" | "cursor">[],
+  results: readonly Pick<SessionSearchHit, "session_id" | "title" | "turn_id" | "cursor">[],
 ): HistoryCitation[] {
   const grouped = new Map<string, { title: string; sources: HistorySource[] }>();
   for (const result of results) {
-    let citation = grouped.get(result.thread_id);
+    let citation = grouped.get(result.session_id);
     if (!citation) {
       citation = { title: result.title, sources: [] };
-      grouped.set(result.thread_id, citation);
+      grouped.set(result.session_id, citation);
     }
     if (!citation.sources.some((source) => source.turn_id === result.turn_id
       && source.cursor === result.cursor)) {
@@ -247,24 +214,13 @@ export function groupHistoryCitations(
   return [...grouped].map(([thread_id, citation]) => ({ thread_id, ...citation }));
 }
 
-/** Keep display results bounded without dropping provenance inspected by the search agent. */
-export function agenticHistoryEvidence(
-  used: readonly HistorySearchHit[],
-  resultLimit: number,
-): Pick<HistorySearchResponse, "results" | "citations"> {
-  return {
-    results: used.slice(0, resultLimit),
-    citations: groupHistoryCitations(used),
-  };
-}
-
 export function mergeHistoryCitations(
   current: readonly HistoryCitation[],
   added: readonly HistoryCitation[],
 ): HistoryCitation[] {
   return groupHistoryCitations([...current, ...added].flatMap((citation) => (
     citation.sources.map((source) => ({
-      thread_id: citation.thread_id,
+      session_id: citation.thread_id,
       title: citation.title,
       turn_id: source.turn_id,
       cursor: source.cursor,

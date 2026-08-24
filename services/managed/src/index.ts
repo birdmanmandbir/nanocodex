@@ -72,18 +72,24 @@ import {
 } from "./account-auth";
 import { routeBrowserModel } from "./browser-model";
 import {
+  DurableMemoryError,
+  parseMemoryKey,
+  parseMemoryOperation,
+  type MemoryOperation,
+  type MemoryRecord,
+  type MemoryResult,
+} from "./durable-memory";
+import {
   HistorySearchError,
   mergeHistoryCitations,
-  parseHistoryFindThreadsInput,
-  parseHistoryReadThreadInput,
-  parseHistorySearchInput,
+  parseHistoryFindSessionsInput,
+  parseHistoryReadSessionInput,
   type HistoryCitation,
-  type HistoryFindThreadsInput,
+  type HistoryFindSessionsInput,
+  type HistoryFindSessionsResponse,
   type HistoryProjection,
-  type HistoryReadThreadInput,
-  type HistoryReadThreadResponse,
-  type HistorySearchInput,
-  type HistorySearchResponse,
+  type HistoryReadSessionInput,
+  type HistoryReadSessionResponse,
 } from "./history-search";
 import { MemoryScope } from "./memory-scope";
 export { MemoryScope } from "./memory-scope";
@@ -244,6 +250,8 @@ export default {
     }
     const history = await routeHistoryRequest(request, env, url);
     if (history) return history;
+    const memory = await routeMemoryRequest(request, env, url);
+    if (memory) return memory;
     if (request.method === "POST" && url.pathname === "/v1/rooms") {
       const principal = await authenticate(request, env, url);
       if (!principal) return json({ error: "unauthorized" }, { status: 401 });
@@ -325,11 +333,9 @@ export default {
       const subject = env.NANOCODEX_SESSIONS.idFromName(agentId).toString();
       const stub = env.NANOCODEX_SESSIONS.getByName(agentId);
       const memory = env.NANOCODEX_MEMORY.getByName(principal.userId);
-      const memorySubject = env.NANOCODEX_MEMORY.idFromName(principal.userId).toString();
-      const [credentialBinding, memoryCredentialBinding, initialization, memoryInitialization]
+      const [credentialBinding, initialization, memoryInitialization]
         = await Promise.allSettled([
         bindAgentCredential(env.NANOCODEX, subject, principal.userId),
-        bindAgentCredential(env.NANOCODEX, memorySubject, principal.userId),
         stub.fetch("https://session.internal/initialize", {
           method: "PUT",
           headers: { "content-type": "application/json" },
@@ -348,7 +354,6 @@ export default {
         await memoryInitialization.value.body?.cancel();
       }
       if (credentialBinding.status === "rejected"
-        || memoryCredentialBinding.status === "rejected"
         || initialization.status === "rejected"
         || memoryInitialization.status === "rejected"
         || !initialization.value.ok
@@ -359,7 +364,7 @@ export default {
             .catch(() => {}),
           unbindAgentCredential(env.NANOCODEX, subject, principal.userId).catch(() => {}),
         ]);
-        return credentialBinding.status === "rejected" || memoryCredentialBinding.status === "rejected"
+        return credentialBinding.status === "rejected"
           ? json({ error: "credential_broker_unavailable" }, { status: 503 })
           : json({ error: "agent initialization failed" }, { status: 503 });
       }
@@ -1418,36 +1423,10 @@ export class NanocodexSession extends DurableComputerSession {
             }),
           },
           {
-            name: "search_history",
+            name: "find_sessions",
             description: [
-              "Search the authenticated user's completed Nanocodex threads.",
-              "Set agentic=false for direct retrieval or agentic=true for a bounded Luna search agent.",
-              "Returned citations identify the exact thread turns used by the result.",
-            ].join(" "),
-            parameters: {
-              type: "object",
-              properties: {
-                query: { type: "string" },
-                limit: { type: "integer", minimum: 1, maximum: 20 },
-                agentic: { type: "boolean" },
-              },
-              required: ["query", "limit", "agentic"],
-              additionalProperties: false,
-            },
-            handler: async (input: unknown) => {
-              const response = await this.#searchHistory(parseHistorySearchInput(input));
-              const turnId = this.#eventTurnId;
-              if (turnId !== undefined && response.citations.length > 0) {
-                this.#recordHistoryCitations(turnId, response.citations);
-              }
-              return response;
-            },
-          },
-          {
-            name: "find_threads",
-            description: [
-              "Find candidate completed threads in the authenticated user's Nanocodex history.",
-              "This is direct retrieval; use read_thread to verify relevant candidates before answering.",
+              "Find candidate completed sessions in the authenticated user's Nanocodex history.",
+              "Use read_session to verify relevant candidates before answering.",
             ].join(" "),
             parameters: {
               type: "object",
@@ -1459,7 +1438,7 @@ export class NanocodexSession extends DurableComputerSession {
               additionalProperties: false,
             },
             handler: async (input: unknown) => {
-              const found = await this.#findThreads(parseHistoryFindThreadsInput(input));
+              const found = await this.#findSessions(parseHistoryFindSessionsInput(input));
               const turnId = this.#eventTurnId;
               if (turnId !== undefined && found.citations.length > 0) {
                 this.#recordHistoryCitations(turnId, found.citations);
@@ -1468,32 +1447,83 @@ export class NanocodexSession extends DurableComputerSession {
             },
           },
           {
-            name: "read_thread",
+            name: "read_session",
             description: [
-              "Read exact completed turns from one candidate Nanocodex thread.",
-              "Pass turn_ids to select exact search hits, or omit them to read the newest bounded thread context.",
+              "Read exact completed turns from one candidate Nanocodex session.",
+              "Pass turn_ids to select exact search hits, or omit them to read the newest bounded session context.",
             ].join(" "),
             parameters: {
               type: "object",
               properties: {
-                thread_id: { type: "string" },
+                session_id: { type: "string" },
                 turn_ids: {
                   type: "array",
                   items: { type: "string" },
                   maxItems: 20,
                 },
               },
-              required: ["thread_id"],
+              required: ["session_id"],
               additionalProperties: false,
             },
             handler: async (input: unknown) => {
-              const read = await this.#readHistoryThread(parseHistoryReadThreadInput(input));
+              const read = await this.#readHistorySession(parseHistoryReadSessionInput(input));
               const turnId = this.#eventTurnId;
               if (turnId !== undefined && read.citations.length > 0) {
                 this.#recordHistoryCitations(turnId, read.citations);
               }
               return { turns: read.turns };
             },
+          },
+          {
+            name: "memory",
+            description: "Search, read, store, replace, or delete bounded account-owned hosted memory. Scan before storing a conclusion and pass returned optimistic-version keys unchanged. This is the managed hosted store, never local TUI storage.",
+            parameters: {
+              oneOf: [
+                {
+                  type: "object",
+                  properties: {
+                    operation: { type: "string", const: "scan" },
+                    query: { type: "string", minLength: 1, maxLength: 512 },
+                    limit: { type: "integer", minimum: 1, maximum: 5, default: 5 },
+                  },
+                  required: ["operation", "query"],
+                  additionalProperties: false,
+                },
+                {
+                  type: "object",
+                  properties: {
+                    operation: { type: "string", const: "read" },
+                    keys: {
+                      type: "array",
+                      minItems: 1,
+                      items: { type: "object", properties: { id: { type: "integer", minimum: 1 }, version: { type: "integer", minimum: 1 } }, required: ["id", "version"], additionalProperties: false },
+                    },
+                  },
+                  required: ["operation", "keys"],
+                  additionalProperties: false,
+                },
+                {
+                  type: "object",
+                  properties: {
+                    operation: { type: "string", const: "put" },
+                    content: { type: "string", minLength: 1, maxLength: 1024 },
+                    replace: { type: "object", properties: { id: { type: "integer", minimum: 1 }, version: { type: "integer", minimum: 1 } }, required: ["id", "version"], additionalProperties: false },
+                  },
+                  required: ["operation", "content"],
+                  additionalProperties: false,
+                },
+                {
+                  type: "object",
+                  properties: {
+                    operation: { type: "string", const: "delete" },
+                    key: { type: "object", properties: { id: { type: "integer", minimum: 1 }, version: { type: "integer", minimum: 1 } }, required: ["id", "version"], additionalProperties: false },
+                  },
+                  required: ["operation", "key"],
+                  additionalProperties: false,
+                },
+              ],
+            },
+            handler: async (input: unknown) => this.#memoryOperation(parseMemoryOperation(input)),
           },
         ],
       });
@@ -1506,18 +1536,11 @@ export class NanocodexSession extends DurableComputerSession {
     return agent;
   }
 
-  async #searchHistory(input: HistorySearchInput): Promise<HistorySearchResponse> {
+  async #findSessions(input: HistoryFindSessionsInput): Promise<HistoryFindSessionsResponse> {
     const session = this.#session();
     if (!session) throw new HistorySearchError(404, "not_found", "session is not initialized");
     const memory = this.env.NANOCODEX_MEMORY.getByName(session.owner_id);
-    const [initialized] = await Promise.all([
-      initializeMemoryScope(memory, session.owner_id),
-      bindAgentCredential(
-        this.env.NANOCODEX,
-        this.env.NANOCODEX_MEMORY.idFromName(session.owner_id).toString(),
-        session.owner_id,
-      ),
-    ]);
+    const initialized = await initializeMemoryScope(memory, session.owner_id);
     if (!initialized.ok) {
       throw new HistorySearchError(initialized.status, "memory_scope_unavailable", "memory scope is unavailable");
     }
@@ -1530,14 +1553,10 @@ export class NanocodexSession extends DurableComputerSession {
       body: JSON.stringify(input),
     });
     if (!response.ok) throw await historySearchResponseError(response);
-    return response.json<HistorySearchResponse>();
+    return response.json<HistoryFindSessionsResponse>();
   }
 
-  async #findThreads(input: HistoryFindThreadsInput): Promise<HistorySearchResponse> {
-    return this.#searchHistory({ ...input, agentic: false });
-  }
-
-  async #readHistoryThread(input: HistoryReadThreadInput): Promise<HistoryReadThreadResponse> {
+  async #readHistorySession(input: HistoryReadSessionInput): Promise<HistoryReadSessionResponse> {
     const session = this.#session();
     if (!session) throw new HistorySearchError(404, "not_found", "session is not initialized");
     const memory = this.env.NANOCODEX_MEMORY.getByName(session.owner_id);
@@ -1554,7 +1573,27 @@ export class NanocodexSession extends DurableComputerSession {
       body: JSON.stringify(input),
     });
     if (!response.ok) throw await historySearchResponseError(response);
-    return response.json<HistoryReadThreadResponse>();
+    return response.json<HistoryReadSessionResponse>();
+  }
+
+  async #memoryOperation(operation: MemoryOperation): Promise<MemoryResult> {
+    const session = this.#session();
+    if (!session) throw new DurableMemoryError("memory_not_found", "session is not initialized");
+    const memory = this.env.NANOCODEX_MEMORY.getByName(session.owner_id);
+    const initialized = await initializeMemoryScope(memory, session.owner_id);
+    if (!initialized.ok) {
+      throw new DurableMemoryError("memory_unavailable", "hosted memory is unavailable");
+    }
+    const response = await memory.fetch("https://memory.internal/memory", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        [SESSION_OWNER_ASSERTION]: session.owner_id,
+      },
+      body: JSON.stringify(operation),
+    });
+    if (!response.ok) throw await durableMemoryResponseError(response);
+    return response.json<MemoryResult>();
   }
 
   #historyCitations(turnId: string): HistoryCitation[] {
@@ -2170,10 +2209,6 @@ function managedErrorResponse(error: unknown, fallbackCode?: string): Response {
   return json({ error: failure.code, message: failure.message }, { status: failure.status });
 }
 
-async function parseHistorySearchRequest(request: Request): Promise<HistorySearchInput> {
-  return parseHistorySearchInput(await parseHistoryRequestBody(request));
-}
-
 async function parseHistoryRequestBody(request: Request): Promise<unknown> {
   let value: unknown;
   try {
@@ -2190,10 +2225,9 @@ async function routeHistoryRequest(
   env: Env,
   url: URL,
 ): Promise<Response | undefined> {
-  const search = url.pathname === "/v1/history/search";
-  const find = url.pathname === "/v1/history/threads/search";
-  const read = url.pathname.match(/^\/v1\/history\/threads\/([^/]+)\/read$/);
-  if (!search && !find && !read) return undefined;
+  const find = url.pathname === "/v1/history/sessions/search";
+  const read = url.pathname.match(/^\/v1\/history\/sessions\/([^/]+)\/read$/);
+  if (!find && !read) return undefined;
   if (request.method !== "POST") {
     return json({ error: "method_not_allowed" }, { status: 405 });
   }
@@ -2204,15 +2238,9 @@ async function routeHistoryRequest(
 
   try {
     let internalPath: "/search" | "/read";
-    let input: HistorySearchInput | HistoryReadThreadInput;
-    let modelAccess = false;
-    if (search) {
-      input = await parseHistorySearchRequest(request);
-      internalPath = "/search";
-      modelAccess = input.agentic;
-    } else if (find) {
-      const found = parseHistoryFindThreadsInput(await parseHistoryRequestBody(request));
-      input = { ...found, agentic: false };
+    let input: HistoryFindSessionsInput | HistoryReadSessionInput;
+    if (find) {
+      input = parseHistoryFindSessionsInput(await parseHistoryRequestBody(request));
       internalPath = "/search";
     } else {
       const value = await parseHistoryRequestBody(request);
@@ -2220,23 +2248,15 @@ async function routeHistoryRequest(
         || Object.keys(value).some((key) => key !== "turn_ids")) {
         throw new HistorySearchError(400, "invalid_request", "supported field is turn_ids");
       }
-      input = parseHistoryReadThreadInput({
+      input = parseHistoryReadSessionInput({
         ...value,
-        thread_id: read![1],
+        session_id: read![1],
       });
       internalPath = "/read";
     }
 
     const memory = env.NANOCODEX_MEMORY.getByName(principal.userId);
-    const initializedPromise = initializeMemoryScope(memory, principal.userId);
-    const bindingPromise = modelAccess
-      ? bindAgentCredential(
-        env.NANOCODEX,
-        env.NANOCODEX_MEMORY.idFromName(principal.userId).toString(),
-        principal.userId,
-      )
-      : Promise.resolve();
-    const [initialized] = await Promise.all([initializedPromise, bindingPromise]);
+    const initialized = await initializeMemoryScope(memory, principal.userId);
     if (!initialized.ok) return initialized;
     const response = await memory.fetch(`https://memory.internal${internalPath}`, {
       method: "POST",
@@ -2246,15 +2266,66 @@ async function routeHistoryRequest(
       },
       body: JSON.stringify(input),
     });
-    if (!find || !response.ok) return response;
-    const found = await response.json<HistorySearchResponse>();
-    return json({
-      query: found.query,
-      results: found.results,
-      citations: found.citations,
-    });
+    return response;
   } catch (error) {
     return historySearchErrorResponse(error);
+  }
+}
+
+async function routeMemoryRequest(
+  request: Request,
+  env: Env,
+  url: URL,
+): Promise<Response | undefined> {
+  const list = url.pathname === "/v1/memory";
+  const deletion = url.pathname.match(/^\/v1\/memory\/([^/]+)$/);
+  if (!list && !deletion) return undefined;
+  if ((list && request.method !== "GET") || (deletion && request.method !== "DELETE")) {
+    return json({ error: "method_not_allowed" }, { status: 405 });
+  }
+  const principal = await authenticate(request, env, url);
+  if (!principal) return json({ error: "unauthorized" }, { status: 401 });
+  if (deletion) {
+    const originFailure = requireSameOriginMutation(request, url, principal);
+    if (originFailure) return originFailure;
+  }
+  try {
+    const memory = env.NANOCODEX_MEMORY.getByName(principal.userId);
+    const initialized = await initializeMemoryScope(memory, principal.userId);
+    if (!initialized.ok) return initialized;
+    if (list) {
+      if (url.search !== "") {
+        throw new DurableMemoryError("invalid_request", "memory list accepts no query parameters");
+      }
+      return memory.fetch("https://memory.internal/memory", {
+        headers: { [SESSION_OWNER_ASSERTION]: principal.userId },
+      });
+    }
+    if ([...url.searchParams.keys()].some((key) => key !== "version")
+      || url.searchParams.getAll("version").length !== 1) {
+      throw new DurableMemoryError("invalid_key", "memory deletion requires one version query parameter");
+    }
+    const version = url.searchParams.get("version")!;
+    if (!/^[1-9][0-9]*$/.test(deletion![1]!) || !/^[1-9][0-9]*$/.test(version)) {
+      throw new DurableMemoryError("invalid_key", "memory id and version must be positive decimal integers");
+    }
+    const key = parseMemoryKey({
+      id: Number(deletion![1]),
+      version: Number(version),
+    });
+    const response = await memory.fetch("https://memory.internal/memory", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        [SESSION_OWNER_ASSERTION]: principal.userId,
+      },
+      body: JSON.stringify({ operation: "delete", key } satisfies MemoryOperation),
+    });
+    if (!response.ok) return response;
+    await response.body?.cancel();
+    return new Response(null, { status: 204 });
+  } catch (error) {
+    return durableMemoryErrorResponse(error);
   }
 }
 
@@ -2271,6 +2342,25 @@ async function historySearchResponseError(response: Response): Promise<HistorySe
   const code = typeof value?.error === "string" ? value.error : "history_search_failed";
   const message = typeof value?.message === "string" ? value.message : `history search failed with HTTP ${response.status}`;
   return new HistorySearchError(response.status, code, message);
+}
+
+function durableMemoryErrorResponse(error: unknown): Response {
+  if (error instanceof DurableMemoryError) {
+    const status = error.code === "memory_conflict" || error.code === "memory_duplicate" ? 409
+      : error.code === "memory_not_found" ? 404
+        : error.code === "memory_capacity" || error.code === "memory_secret_rejected" ? 422
+          : 400;
+    return json({ error: error.code, message: error.message }, { status });
+  }
+  if (error instanceof ManagedRequestError) return managedErrorResponse(error);
+  return json({ error: "memory_failed", message: errorMessage(error) }, { status: 500 });
+}
+
+async function durableMemoryResponseError(response: Response): Promise<DurableMemoryError> {
+  const value = await response.json<{ error?: unknown; message?: unknown }>().catch(() => undefined);
+  const code = typeof value?.error === "string" ? value.error : "memory_failed";
+  const message = typeof value?.message === "string" ? value.message : `memory failed with HTTP ${response.status}`;
+  return new DurableMemoryError(code, message);
 }
 
 function initializeMemoryScope(

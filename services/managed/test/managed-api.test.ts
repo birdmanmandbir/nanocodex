@@ -206,7 +206,7 @@ describe("managed agents REST and resumable SSE", () => {
     await events.cancel();
   });
 
-  it("projects completed turns into the account memory scope and tombstones deleted threads", async () => {
+  it("projects completed turns into account history and tombstones deleted sessions", async () => {
     const agent = await createAgent();
     const accepted = await submit(agent, "turn-memory", "COPPER_LIGHTHOUSE_MEMORY");
     const events = sseReader(await SELF.fetch(
@@ -223,15 +223,13 @@ describe("managed agents REST and resumable SSE", () => {
     });
     await events.cancel();
 
-    const found = await eventuallyHistorySearch("copper lighthouse", API_KEY, (body) => (
+    const found = await eventuallyFindSessions("copper lighthouse", API_KEY, (body) => (
       body.results.length === 1
     ));
     expect(found).toMatchObject({
       query: "copper lighthouse",
-      agentic: false,
-      answer: null,
       results: [{
-        thread_id: agent.agent_id,
+        session_id: agent.agent_id,
         turn_id: "turn-memory",
         cursor: expect.any(String),
         snippet: expect.stringContaining("COPPER_LIGHTHOUSE_MEMORY"),
@@ -242,11 +240,11 @@ describe("managed agents REST and resumable SSE", () => {
       }],
     });
 
-    const candidates = await historyFindThreads("copper lighthouse", API_KEY);
+    const candidates = await historyFindSessions("copper lighthouse", API_KEY);
     expect(candidates).toMatchObject({
       query: "copper lighthouse",
       results: [{
-        thread_id: agent.agent_id,
+        session_id: agent.agent_id,
         turn_id: "turn-memory",
       }],
       citations: [{
@@ -254,10 +252,10 @@ describe("managed agents REST and resumable SSE", () => {
         sources: [{ turn_id: "turn-memory", cursor: expect.any(String) }],
       }],
     });
-    const read = await historyReadThread(agent.agent_id, ["turn-memory"], API_KEY);
+    const read = await historyReadSession(agent.agent_id, ["turn-memory"], API_KEY);
     expect(read).toMatchObject({
       turns: [{
-        thread_id: agent.agent_id,
+        session_id: agent.agent_id,
         turn_id: "turn-memory",
         user: "COPPER_LIGHTHOUSE_MEMORY",
         assistant: expect.any(String),
@@ -268,36 +266,23 @@ describe("managed agents REST and resumable SSE", () => {
       }],
     });
 
-    const crowdedOut = await historySearch(
+    const crowdedOut = await historyFindSessions(
       "copper lighthouse nonexistent insurance policy",
       API_KEY,
     );
     expect(crowdedOut.results).toEqual([]);
     expect(crowdedOut.citations).toEqual([]);
 
-    const exact = await historySearch("COPPER_LIGHTHOUSE_MEMORY", API_KEY);
+    const exact = await historyFindSessions("COPPER_LIGHTHOUSE_MEMORY", API_KEY);
     expect(exact.results).toMatchObject([{
-      thread_id: agent.agent_id,
+      session_id: agent.agent_id,
       turn_id: "turn-memory",
     }]);
 
-    const isolated = await historySearch("copper lighthouse", OTHER_API_KEY);
+    const isolated = await historyFindSessions("copper lighthouse", OTHER_API_KEY);
     expect(isolated.results).toEqual([]);
     expect(isolated.citations).toEqual([]);
-    expect((await historyFindThreads("copper lighthouse", OTHER_API_KEY)).results).toEqual([]);
-    expect((await historyReadThread(agent.agent_id, ["turn-memory"], OTHER_API_KEY)).turns).toEqual([]);
-
-    const agentic = await historySearch("recall copper lighthouse", API_KEY, true);
-    expect(agentic).toMatchObject({
-      query: "recall copper lighthouse",
-      agentic: true,
-      answer: "MEMORY_AGENTIC_OK",
-      results: [{ thread_id: agent.agent_id, turn_id: "turn-memory" }],
-      citations: [{
-        thread_id: agent.agent_id,
-        sources: [{ turn_id: "turn-memory", cursor: expect.any(String) }],
-      }],
-    });
+    expect((await historyReadSession(agent.agent_id, ["turn-memory"], OTHER_API_KEY)).turns).toEqual([]);
 
     const consumer = await createAgent();
     const consumed = await submit(consumer, "turn-memory-consumer", "E2E_MEMORY_TOOL");
@@ -322,7 +307,7 @@ describe("managed agents REST and resumable SSE", () => {
     const deleted = await SELF.fetch(agent.events_url.replace(/\/events$/, ""), { method: "DELETE" });
     expect(deleted.status).toBe(204);
     createdAgents.delete(agent.agent_id);
-    const tombstoned = await eventuallyHistorySearch("copper lighthouse", API_KEY, (body) => (
+    const tombstoned = await eventuallyFindSessions("copper lighthouse", API_KEY, (body) => (
       body.results.length === 0
     ));
     expect(tombstoned.citations).toEqual([]);
@@ -330,17 +315,12 @@ describe("managed agents REST and resumable SSE", () => {
 
   it("requires account authentication for every public history operation", async () => {
     const requests = [
-      new Request("https://example.test/v1/history/search", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ query: "memory", limit: 8, agentic: false }),
-      }),
-      new Request("https://example.test/v1/history/threads/search", {
+      new Request("https://example.test/v1/history/sessions/search", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ query: "memory", limit: 8 }),
       }),
-      new Request("https://example.test/v1/history/threads/018f1f9a-7b3c-7a09-8000-000000000009/read", {
+      new Request("https://example.test/v1/history/sessions/018f1f9a-7b3c-7a09-8000-000000000009/read", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ turn_ids: ["turn-1"] }),
@@ -351,6 +331,64 @@ describe("managed agents REST and resumable SSE", () => {
       expect(response.status).toBe(401);
       expect(await response.json()).toEqual({ error: "unauthorized" });
     }
+  });
+
+  it("lists and optimistic-deletes account-owned hosted memory", async () => {
+    const memory = testEnv.NANOCODEX_MEMORY.getByName(USER_ID);
+    const ownerHeaders = {
+      "content-type": "application/json",
+      "x-nanocodex-owner-id": USER_ID,
+    };
+    const initialized = await memory.fetch("https://memory.internal/initialize", {
+      method: "PUT",
+      headers: { "x-nanocodex-owner-id": USER_ID },
+    });
+    expect(initialized.status).toBe(204);
+    const content = `managed panel memory ${crypto.randomUUID()}`;
+    const insertedResponse = await memory.fetch("https://memory.internal/memory", {
+      method: "POST",
+      headers: ownerHeaders,
+      body: JSON.stringify({ operation: "put", content }),
+    });
+    expect(insertedResponse.status).toBe(200);
+    const inserted = await insertedResponse.json<{
+      memory: { key: { id: number; version: number }; content: string };
+    }>();
+
+    const listed = await RAW_SELF.fetch("https://example.test/v1/memory", {
+      headers: { authorization: `Bearer ${API_KEY}` },
+    });
+    expect(listed.status).toBe(200);
+    expect(await listed.json()).toMatchObject({
+      memories: [expect.objectContaining({
+        key: inserted.memory.key,
+        content,
+      })],
+    });
+    const isolated = await RAW_SELF.fetch("https://example.test/v1/memory", {
+      headers: { authorization: `Bearer ${OTHER_API_KEY}` },
+    });
+    expect(await isolated.json()).toEqual({ memories: [] });
+
+    const stale = await RAW_SELF.fetch(
+      `https://example.test/v1/memory/${inserted.memory.key.id}?version=${inserted.memory.key.version + 1}`,
+      {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${API_KEY}` },
+      },
+    );
+    expect(stale.status).toBe(409);
+    expect(await stale.json()).toMatchObject({ error: "memory_conflict" });
+
+    const deletionUrl = `https://example.test/v1/memory/${inserted.memory.key.id}?version=${inserted.memory.key.version}`;
+    expect((await RAW_SELF.fetch(deletionUrl, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${API_KEY}` },
+    })).status).toBe(204);
+    expect((await RAW_SELF.fetch(deletionUrl, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${API_KEY}` },
+    })).status).toBe(204);
   });
 
   it("does not let an unrelated bearer mint managed agents", async () => {
@@ -911,10 +949,8 @@ type ManagedTurnView = {
   turn_id: string;
 };
 
-type HistorySearchBody = {
+type HistorySessionsBody = {
   query: string;
-  agentic: boolean;
-  answer: string | null;
   results: Array<Record<string, unknown>>;
   citations: Array<Record<string, unknown>>;
 };
@@ -1013,25 +1049,8 @@ async function submit(agent: AgentReceipt, id: string, input: string): Promise<M
   return response.json<ManagedTurnView>();
 }
 
-async function historySearch(
-  query: string,
-  apiKey: string,
-  agentic = false,
-): Promise<HistorySearchBody> {
-  const response = await RAW_SELF.fetch("https://example.test/v1/history/search", {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${apiKey}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({ query, limit: 8, agentic }),
-  });
-  expect(response.status).toBe(200);
-  return response.json<HistorySearchBody>();
-}
-
-async function historyFindThreads(query: string, apiKey: string): Promise<HistorySearchBody> {
-  const response = await RAW_SELF.fetch("https://example.test/v1/history/threads/search", {
+async function historyFindSessions(query: string, apiKey: string): Promise<HistorySessionsBody> {
+  const response = await RAW_SELF.fetch("https://example.test/v1/history/sessions/search", {
     method: "POST",
     headers: {
       authorization: `Bearer ${apiKey}`,
@@ -1040,12 +1059,12 @@ async function historyFindThreads(query: string, apiKey: string): Promise<Histor
     body: JSON.stringify({ query, limit: 8 }),
   });
   expect(response.status).toBe(200);
-  return response.json<HistorySearchBody>();
+  return response.json<HistorySessionsBody>();
 }
 
-async function historyReadThread(threadId: string, turnIds: string[], apiKey: string) {
+async function historyReadSession(sessionId: string, turnIds: string[], apiKey: string) {
   const response = await RAW_SELF.fetch(
-    `https://example.test/v1/history/threads/${threadId}/read`,
+    `https://example.test/v1/history/sessions/${sessionId}/read`,
     {
       method: "POST",
       headers: {
@@ -1062,14 +1081,14 @@ async function historyReadThread(threadId: string, turnIds: string[], apiKey: st
   }>();
 }
 
-async function eventuallyHistorySearch(
+async function eventuallyFindSessions(
   query: string,
   apiKey: string,
-  ready: (body: HistorySearchBody) => boolean,
-): Promise<HistorySearchBody> {
-  let latest: HistorySearchBody | undefined;
+  ready: (body: HistorySessionsBody) => boolean,
+): Promise<HistorySessionsBody> {
+  let latest: HistorySessionsBody | undefined;
   for (let attempt = 0; attempt < 40; attempt += 1) {
-    latest = await historySearch(query, apiKey);
+    latest = await historyFindSessions(query, apiKey);
     if (ready(latest)) return latest;
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
