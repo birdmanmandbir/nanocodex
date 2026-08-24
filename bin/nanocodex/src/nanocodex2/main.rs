@@ -169,6 +169,7 @@ fn main() -> ExitCode {
 }
 
 fn try_main() -> Result<(), ManagedError> {
+    install_tls_provider();
     let cli = Cli::parse();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
