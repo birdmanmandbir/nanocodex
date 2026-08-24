@@ -1,11 +1,11 @@
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 
 const MAX_KEY_CHARS = 128;
-const MAX_VALUE_CHARS = 32 * 1024;
+const MAX_VALUE_BYTES = 32 * 1024;
 const MAX_KEYS = 256;
 const MAX_AI_PROMPT_CHARS = 4 * 1024;
 const MAX_AI_OUTPUT_CHARS = 8 * 1024;
-const MAX_AGENT_REQUEST_CHARS = 64 * 1024;
+const MAX_AGENT_REQUEST_BYTES = 64 * 1024;
 const MAX_APP_AGENTS = 32;
 const KEY = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
 const USER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -47,16 +47,50 @@ export interface CapabilityEnv {
 }
 
 type StoredValue = Readonly<{ value: unknown }>;
-type StoredAgent = Readonly<{ actorUserId: string; managedAgentId: string }>;
+type StoredAgent = Readonly<{ actorUserId: string; managedAgentId: string | null }>;
 
 export class AppState extends DurableObject<CapabilityEnv> {
-  async registerAgent(actorUserId: string, managedAgentId: string): Promise<string> {
-    if (!USER_ID.test(actorUserId) || !USER_ID.test(managedAgentId)) throw new Error("invalid agent identity");
-    const existing = await this.ctx.storage.list({ prefix: "agent:", limit: MAX_APP_AGENTS });
-    if (existing.size >= MAX_APP_AGENTS) throw new Error("app agent limit reached");
+  async reserveAgent(actorUserId: string): Promise<string> {
+    if (!USER_ID.test(actorUserId)) throw new Error("invalid agent identity");
     const handle = crypto.randomUUID();
-    await this.ctx.storage.put(`agent:${handle}`, { actorUserId, managedAgentId } satisfies StoredAgent);
+    await this.ctx.storage.transaction(async (storage) => {
+      const existing = await storage.list({ prefix: "agent:", limit: MAX_APP_AGENTS });
+      if (existing.size >= MAX_APP_AGENTS) throw new Error("app agent limit reached");
+      await storage.put(
+        `agent:${handle}`,
+        { actorUserId, managedAgentId: null } satisfies StoredAgent,
+      );
+    });
     return handle;
+  }
+
+  async registerAgent(actorUserId: string, handle: string, managedAgentId: string): Promise<string> {
+    if (!USER_ID.test(actorUserId) || !AGENT_HANDLE.test(handle) || !USER_ID.test(managedAgentId)) {
+      throw new Error("invalid agent identity");
+    }
+    await this.ctx.storage.transaction(async (storage) => {
+      const key = `agent:${handle}`;
+      const reserved = await storage.get<StoredAgent>(key);
+      if (!reserved || reserved.actorUserId !== actorUserId) throw new Error("agent reservation not found");
+      if (reserved.managedAgentId !== null && reserved.managedAgentId !== managedAgentId) {
+        throw new Error("agent reservation already registered");
+      }
+      if (reserved.managedAgentId === null) {
+        await storage.put(key, { actorUserId, managedAgentId } satisfies StoredAgent);
+      }
+    });
+    return handle;
+  }
+
+  async releaseAgent(actorUserId: string, handle: string): Promise<void> {
+    if (!USER_ID.test(actorUserId) || !AGENT_HANDLE.test(handle)) return;
+    await this.ctx.storage.transaction(async (storage) => {
+      const key = `agent:${handle}`;
+      const reserved = await storage.get<StoredAgent>(key);
+      if (reserved?.actorUserId === actorUserId && reserved.managedAgentId === null) {
+        await storage.delete(key);
+      }
+    });
   }
 
   async resolveAgent(actorUserId: string, handle: string): Promise<string | null> {
@@ -120,13 +154,13 @@ export class AppState extends DurableObject<CapabilityEnv> {
       return Response.json({ deleted: await this.ctx.storage.delete(storageKey) });
     }
     if (request.method !== "PUT") return methodNotAllowed();
-    const text = await request.text();
-    if (text.length > MAX_VALUE_CHARS) {
+    const bytes = await readBoundedBody(request, MAX_VALUE_BYTES);
+    if (bytes === null) {
       return Response.json({ error: "value_too_large" }, { status: 413 });
     }
     let stored: StoredValue;
     try {
-      stored = JSON.parse(text) as StoredValue;
+      stored = JSON.parse(new TextDecoder().decode(bytes)) as StoredValue;
     } catch {
       return Response.json({ error: "invalid_json" }, { status: 400 });
     }
@@ -161,7 +195,7 @@ export class NanocodexCapability extends WorkerEntrypoint<CapabilityEnv, Capabil
   async put(key: string, value: unknown): Promise<void> {
     this.#require("state:write");
     const body = JSON.stringify({ value });
-    if (body.length > MAX_VALUE_CHARS) throw new Error("value too large");
+    if (new TextEncoder().encode(body).byteLength > MAX_VALUE_BYTES) throw new Error("value too large");
     await this.#state(`/kv/${encodeURIComponent(assertKey(key))}`, "PUT", body);
   }
 
@@ -223,16 +257,35 @@ export class NanocodexCapability extends WorkerEntrypoint<CapabilityEnv, Capabil
     }
     if (url.pathname === "/v1/agents") {
       if (request.method !== "POST") return capabilityJson({ error: "method_not_allowed" }, 405);
-      if (request.body && (await request.text()).length > 0) {
+      if (request.body) {
+        await request.body.cancel().catch(() => undefined);
         return capabilityJson({ error: "invalid_request" }, 400);
       }
-      const result = await this.env.NANOCODEX_AGENTS.createAgent(this.#actor(), {
-        publicOrigin: "https://apps.nanocodex.internal",
-      });
+      const actor = this.#actor();
+      const state = this.#stateStub();
+      let handle: string;
+      try {
+        handle = await state.reserveAgent(actor);
+      } catch (error) {
+        if (error instanceof Error && error.message === "app agent limit reached") {
+          return capabilityJson({ error: "app_agent_limit" }, 409);
+        }
+        throw error;
+      }
+      let result: ManagedAgentRpcResult;
+      try {
+        result = await this.env.NANOCODEX_AGENTS.createAgent(actor, {
+          publicOrigin: "https://apps.nanocodex.internal",
+        });
+      } catch (error) {
+        await state.releaseAgent(actor, handle);
+        throw error;
+      }
       if (result.status !== 201 || typeof result.body.agent_id !== "string") {
+        await state.releaseAgent(actor, handle);
         return capabilityJson(result.body, result.status);
       }
-      const handle = await this.#stateStub().registerAgent(this.#actor(), result.body.agent_id);
+      await state.registerAgent(actor, handle, result.body.agent_id);
       return capabilityJson({ agent_id: handle, session_id: handle }, 201);
     }
 
@@ -309,20 +362,54 @@ export class NanocodexCapability extends WorkerEntrypoint<CapabilityEnv, Capabil
 }
 
 async function readAgentBody(request: Request): Promise<Record<string, unknown> | Response> {
-  const declared = Number(request.headers.get("content-length") ?? "0");
-  if (!Number.isFinite(declared) || declared > MAX_AGENT_REQUEST_CHARS) {
-    return capabilityJson({ error: "request_too_large" }, 413);
-  }
-  const text = await request.text();
-  if (text.length > MAX_AGENT_REQUEST_CHARS) return capabilityJson({ error: "request_too_large" }, 413);
+  const bytes = await readBoundedBody(request, MAX_AGENT_REQUEST_BYTES);
+  if (bytes === null) return capabilityJson({ error: "request_too_large" }, 413);
   try {
-    const value = JSON.parse(text) as unknown;
+    const value = JSON.parse(new TextDecoder().decode(bytes)) as unknown;
     return value && typeof value === "object" && !Array.isArray(value)
       ? value as Record<string, unknown>
       : capabilityJson({ error: "invalid_json" }, 400);
   } catch {
     return capabilityJson({ error: "invalid_json" }, 400);
   }
+}
+
+async function readBoundedBody(request: Request, maxBytes: number): Promise<Uint8Array | null> {
+  const declaredHeader = request.headers.get("content-length");
+  if (declaredHeader !== null) {
+    const declared = Number(declaredHeader);
+    if (!Number.isSafeInteger(declared) || declared < 0 || declared > maxBytes) {
+      await request.body?.cancel().catch(() => undefined);
+      return null;
+    }
+  }
+  if (!request.body) return new Uint8Array();
+
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        return null;
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const body = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
 }
 
 function capabilityJson(body: unknown, status: number): Response {
