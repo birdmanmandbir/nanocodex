@@ -93,6 +93,10 @@ export function formatBytes(bytes: number): string {
   return `${value.toFixed(precision)} ${units[unit]}`;
 }
 
+export function hasCompletedBuild(responses: readonly JobResponse[]): boolean {
+  return responses.some(({ job }) => job.status === "completed");
+}
+
 export function AppsConsole() {
   const [apps, setApps] = useState<readonly GeneratedApp[]>([]);
   const [hasAppSnapshot, setHasAppSnapshot] = useState(false);
@@ -143,11 +147,10 @@ export function AppsConsole() {
           ids.map((id) => requestJson<JobResponse>(`/apps/api/builds/${encodeURIComponent(id)}`)),
         );
         if (cancelled) return;
-        let published = false;
+        const published = hasCompletedBuild(responses);
         setJobs((current) => current.map((tracked) => {
           const response = responses.find((candidate) => candidate.job.id === tracked.id);
           if (!response) return tracked;
-          if (tracked.status === "building" && response.job.status === "completed") published = true;
           return {
             ...response.job,
             requestedPrompt: tracked.requestedPrompt,
