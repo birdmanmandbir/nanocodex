@@ -1,12 +1,16 @@
 import { env, SELF, runInDurableObject } from "cloudflare:test";
 import { exports as workerExports } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   ManagedAgentEntrypoint,
   type Env,
 } from "../src/index";
-import type { TeamAuthorization } from "../src/organization";
+import {
+  authorizeTeam,
+  Organization,
+  type TeamAuthorization,
+} from "../src/organization";
 
 const testEnv = env as unknown as Env;
 const ORIGIN = "https://example.test";
@@ -41,6 +45,9 @@ describe("managed team authority", () => {
       team: { id: string; name: string; role: string; created_at: number };
     }>();
     expect(receipt.team).toMatchObject({ name: "Acme Agents", role: "owner" });
+    expect(receipt.team.id).toMatch(/^[0-9a-f]{64}$/);
+    expect(testEnv.NANOCODEX_ORGANIZATIONS.idFromString(receipt.team.id).toString())
+      .toBe(receipt.team.id);
 
     const list = await SELF.fetch(`${ORIGIN}/v1/teams`, { headers: accountHeaders(token) });
     expect(await list.json()).toEqual({ data: [receipt.team] });
@@ -55,7 +62,7 @@ describe("managed team authority", () => {
       data: [{ user_id: OWNER_ID, role: "owner", joined_at: receipt.team.created_at }],
     });
 
-    const immutable = await testEnv.NANOCODEX_ORGANIZATIONS.getByName(receipt.team.id).fetch(
+    const immutable = await organizationStub(receipt.team.id).fetch(
       "https://organization.internal/initialize",
       {
         method: "PUT",
@@ -95,7 +102,7 @@ describe("managed team authority", () => {
     expect(invitation.role).toBe("member");
 
     const storedInvitations = await runInDurableObject(
-      testEnv.NANOCODEX_ORGANIZATIONS.getByName(team.id),
+      organizationStub(team.id),
       (_instance, state) => state.storage.sql.exec<{ digest: string; expires_at: number }>(
         "SELECT digest, expires_at FROM organization_invitations",
       ).toArray(),
@@ -163,7 +170,7 @@ describe("managed team authority", () => {
       invitation: string;
     }>();
     await runInDurableObject(
-      testEnv.NANOCODEX_ORGANIZATIONS.getByName(team.id),
+      organizationStub(team.id),
       (_instance, state) => {
         state.storage.sql.exec(
           "UPDATE organization_invitations SET expires_at = ? WHERE accepted_at IS NULL",
@@ -190,29 +197,97 @@ describe("managed team authority", () => {
     expect(oversized.status).toBe(413);
   });
 
-  it("never turns forged or stale UserAccount discovery references into authority", async () => {
+  it("rejects forged selectors before organization lookup or construction", async () => {
     const token = "G".repeat(43);
     await seedPasskeySession(OTHER_ID, token);
-    const forgedTeamId = "afffffff-ffff-4fff-8fff-ffffffffffff";
-    const attached = await testEnv.NANOCODEX_USERS.getByName(OTHER_ID).fetch(
-      "https://user.internal/organizations",
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ organizationId: forgedTeamId }),
-      },
-    );
-    expect(attached.status).toBe(201);
+    const forgedTeamIds = [
+      "afffffff-ffff-4fff-8fff-ffffffffffff",
+      "f".repeat(64),
+      testEnv.NANOCODEX_USERS.newUniqueId().toString(),
+    ];
+    for (const teamId of forgedTeamIds) {
+      expect(() => testEnv.NANOCODEX_ORGANIZATIONS.idFromString(teamId)).toThrow();
+    }
 
-    expect(await (await SELF.fetch(`${ORIGIN}/v1/teams`, {
-      headers: accountHeaders(token),
-    })).json()).toEqual({ data: [] });
-    expect(await (await SELF.fetch(`${ORIGIN}/v1/me`, {
-      headers: accountHeaders(token),
-    })).json()).toMatchObject({ teams: [] });
-    expect(await managedAuthority("nanocodex-apps").authorizeTeam(OTHER_ID, forgedTeamId)).toEqual({
-      authorized: false,
-    });
+    const namespaceCalls = { fetch: 0, get: 0, getByName: 0, newUniqueId: 0 };
+    const actualNamespace = testEnv.NANOCODEX_ORGANIZATIONS;
+    const guardedNamespace = {
+      idFromString: actualNamespace.idFromString.bind(actualNamespace),
+      get() {
+        namespaceCalls.get += 1;
+        return { fetch: () => { namespaceCalls.fetch += 1; } };
+      },
+      getByName() {
+        namespaceCalls.getByName += 1;
+        return { fetch: () => { namespaceCalls.fetch += 1; } };
+      },
+      newUniqueId() {
+        namespaceCalls.newUniqueId += 1;
+        return actualNamespace.newUniqueId();
+      },
+    } as unknown as DurableObjectNamespace;
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      for (const teamId of forgedTeamIds) {
+        expect(await authorizeTeam(
+          { NANOCODEX_ORGANIZATIONS: guardedNamespace },
+          OTHER_ID,
+          teamId,
+        )).toEqual({ authorized: false });
+      }
+    }
+    expect(namespaceCalls).toEqual({ fetch: 0, get: 0, getByName: 0, newUniqueId: 0 });
+
+    const organizationFetch = vi.spyOn(Organization.prototype, "fetch");
+    try {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        for (const teamId of forgedTeamIds) {
+          const attached = await testEnv.NANOCODEX_USERS.getByName(OTHER_ID).fetch(
+            "https://user.internal/organizations",
+            {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ organizationId: teamId }),
+            },
+          );
+          expect(attached.status).toBe(400);
+          expect((await invite(token, teamId, "member")).status).toBe(404);
+          expect((await SELF.fetch(`${ORIGIN}/v1/teams/${teamId}/members`, {
+            headers: accountHeaders(token),
+          })).status).toBe(404);
+          expect((await remove(token, teamId, MEMBER_ID)).status).toBe(404);
+          expect((await accept(token, `${teamId}.${"s".repeat(43)}`)).status).toBe(400);
+          expect(await managedAuthority("nanocodex-apps").authorizeTeam(OTHER_ID, teamId))
+            .toEqual({ authorized: false });
+        }
+      }
+      expect(organizationFetch).not.toHaveBeenCalled();
+
+      await runInDurableObject(
+        testEnv.NANOCODEX_USERS.getByName(OTHER_ID),
+        async (_instance, state) => {
+          await state.storage.put("organizationIds", forgedTeamIds);
+        },
+      );
+      expect(await (await SELF.fetch(`${ORIGIN}/v1/teams`, {
+        headers: accountHeaders(token),
+      })).json()).toEqual({ data: [] });
+      expect(await (await SELF.fetch(`${ORIGIN}/v1/me`, {
+        headers: accountHeaders(token),
+      })).json()).toMatchObject({ teams: [] });
+      expect(organizationFetch).not.toHaveBeenCalled();
+
+      const team = await createdTeam(token, "Issued ID Team");
+      expect(team.id).toMatch(/^[0-9a-f]{64}$/);
+      expect(testEnv.NANOCODEX_ORGANIZATIONS.idFromString(team.id).toString()).toBe(team.id);
+      expect((await SELF.fetch(`${ORIGIN}/v1/teams/${team.id}/members`, {
+        headers: accountHeaders(token),
+      })).status).toBe(200);
+      expect(await managedAuthority("nanocodex-apps").authorizeTeam(OTHER_ID, team.id))
+        .toMatchObject({ authorized: true, team: { id: team.id } });
+      expect(organizationFetch).toHaveBeenCalled();
+    } finally {
+      organizationFetch.mockRestore();
+    }
   });
 });
 
@@ -289,6 +364,12 @@ function remove(token: string, teamId: string, userId: string): Promise<Response
 
 function accountHeaders(token: string): Record<string, string> {
   return { cookie: `nanocodex_account=${token}` };
+}
+
+function organizationStub(teamId: string): DurableObjectStub {
+  return testEnv.NANOCODEX_ORGANIZATIONS.get(
+    testEnv.NANOCODEX_ORGANIZATIONS.idFromString(teamId),
+  );
 }
 
 async function seedPasskeySession(userId: string, token: string): Promise<void> {

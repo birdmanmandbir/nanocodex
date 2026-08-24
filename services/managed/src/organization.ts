@@ -6,13 +6,13 @@ import {
   detachOrganization,
   isUserId,
   listRevalidatedTeamSummaries,
+  organizationIdFromString,
   requireSameOriginMutation,
   type AccountAuthEnv,
 } from "./account-auth";
 import { withHardDeadline } from "./deadline";
 
-const TEAM_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-const INVITATION = /^([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.([A-Za-z0-9_-]{43})$/;
+const INVITATION = /^([0-9a-f]{64})\.([A-Za-z0-9_-]{43})$/;
 const DIGEST = /^[A-Za-z0-9_-]{43}$/;
 const MAX_REQUEST_BYTES = 4 * 1024;
 const MAX_PENDING_INVITATIONS = 100;
@@ -88,7 +88,7 @@ export async function routeTeamRequest(
     const name = normalizeTeamName(value.name);
     if (!name) return json({ error: "invalid_team_name" }, 400);
 
-    const teamId = crypto.randomUUID();
+    const teamId = env.NANOCODEX_ORGANIZATIONS.newUniqueId().toString();
     let attachment: "attached" | "existing" | "limit";
     try {
       attachment = await attachOrganization(env, principal.userId, teamId);
@@ -136,6 +136,9 @@ export async function routeTeamRequest(
     const parsed = value.invitation.match(INVITATION);
     if (!parsed) return json({ error: "invalid_invitation" }, 400);
     const teamId = parsed[1]!;
+    if (!organizationIdFromString(env.NANOCODEX_ORGANIZATIONS, teamId)) {
+      return json({ error: "invalid_invitation" }, 400);
+    }
     const digest = await sha256(value.invitation);
     let attachment: "attached" | "existing" | "limit";
     try {
@@ -184,8 +187,10 @@ export async function routeTeamRequest(
   const invitationMatch = url.pathname.match(/^\/v1\/teams\/([^/]+)\/invitations$/);
   if (invitationMatch) {
     if (request.method !== "POST") return methodNotAllowed();
-    const teamId = invitationMatch[1]!.toLowerCase();
-    if (!TEAM_ID.test(teamId)) return json({ error: "not_found" }, 404);
+    const teamId = invitationMatch[1]!;
+    if (!organizationIdFromString(env.NANOCODEX_ORGANIZATIONS, teamId)) {
+      return json({ error: "not_found" }, 404);
+    }
     const value = await boundedJson(request);
     if (value instanceof Response) return value;
     if (!exactObject(value, ["role"])) return json({ error: "invalid_invitation" }, 400);
@@ -224,9 +229,11 @@ export async function routeTeamRequest(
   const memberMatch = url.pathname.match(/^\/v1\/teams\/([^/]+)\/members\/([^/]+)$/);
   if (memberMatch) {
     if (request.method !== "DELETE") return methodNotAllowed();
-    const teamId = memberMatch[1]!.toLowerCase();
+    const teamId = memberMatch[1]!;
     const memberId = memberMatch[2]!.toLowerCase();
-    if (!TEAM_ID.test(teamId) || !isUserId(memberId)) return json({ error: "not_found" }, 404);
+    if (!organizationIdFromString(env.NANOCODEX_ORGANIZATIONS, teamId) || !isUserId(memberId)) {
+      return json({ error: "not_found" }, 404);
+    }
     let removed: Response;
     try {
       removed = await organizationFetch(
@@ -251,8 +258,10 @@ export async function routeTeamRequest(
   const membersMatch = url.pathname.match(/^\/v1\/teams\/([^/]+)\/members$/);
   if (membersMatch) {
     if (request.method !== "GET") return methodNotAllowed();
-    const teamId = membersMatch[1]!.toLowerCase();
-    if (!TEAM_ID.test(teamId)) return json({ error: "not_found" }, 404);
+    const teamId = membersMatch[1]!;
+    if (!organizationIdFromString(env.NANOCODEX_ORGANIZATIONS, teamId)) {
+      return json({ error: "not_found" }, 404);
+    }
     try {
       const response = await organizationFetch(
         env,
@@ -273,7 +282,8 @@ export async function authorizeTeam(
   actorUserId: unknown,
   teamId: unknown,
 ): Promise<TeamAuthorization> {
-  if (!isUserId(actorUserId) || typeof teamId !== "string" || !TEAM_ID.test(teamId)) {
+  if (!isUserId(actorUserId) || typeof teamId !== "string"
+    || !organizationIdFromString(env.NANOCODEX_ORGANIZATIONS, teamId)) {
     return { authorized: false };
   }
   try {
@@ -333,7 +343,7 @@ export class Organization extends DurableObject<Record<string, never>> {
       const creatorId = typeof value.creator_id === "string" ? value.creator_id.toLowerCase() : "";
       const name = normalizeTeamName(value.name);
       if (!exactObject(value, ["id", "name", "creator_id"])
-        || !TEAM_ID.test(id) || !isUserId(creatorId) || !name) {
+        || id !== this.ctx.id.toString() || !isUserId(creatorId) || !name) {
         return json({ error: "invalid_team" }, 400);
       }
       const now = Date.now();
@@ -674,8 +684,10 @@ function organizationFetch(
   path: string,
   init: RequestInit = {},
 ): Promise<Response> {
+  const objectId = organizationIdFromString(env.NANOCODEX_ORGANIZATIONS, teamId);
+  if (!objectId) throw new Error("invalid organization identity");
   return withHardDeadline("organization authority", TEAM_IO_TIMEOUT_MS, (signal) => (
-    env.NANOCODEX_ORGANIZATIONS.getByName(teamId).fetch(
+    env.NANOCODEX_ORGANIZATIONS.get(objectId).fetch(
       `https://organization.internal${path}`,
       { ...init, signal },
     )

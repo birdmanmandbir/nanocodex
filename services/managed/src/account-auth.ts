@@ -19,6 +19,19 @@ export function isUserId(value: unknown): value is string {
   return typeof value === "string" && USER_ID.test(value);
 }
 
+export function organizationIdFromString(
+  namespace: DurableObjectNamespace,
+  value: unknown,
+): DurableObjectId | undefined {
+  if (typeof value !== "string") return undefined;
+  try {
+    const id = namespace.idFromString(value);
+    return id.toString() === value ? id : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export const NonceStorage = Kv.NonceStorage;
 
 export interface AccountAuthEnv {
@@ -209,6 +222,9 @@ export async function attachOrganization(
   userId: string,
   organizationId: string,
 ): Promise<"attached" | "existing" | "limit"> {
+  if (!organizationIdFromString(env.NANOCODEX_ORGANIZATIONS, organizationId)) {
+    throw new Error("invalid organization identity");
+  }
   const response = await env.NANOCODEX_USERS.getByName(userId).fetch(
     "https://user.internal/organizations",
     {
@@ -228,6 +244,9 @@ export async function detachOrganization(
   userId: string,
   organizationId: string,
 ): Promise<void> {
+  if (!organizationIdFromString(env.NANOCODEX_ORGANIZATIONS, organizationId)) {
+    throw new Error("invalid organization identity");
+  }
   const response = await env.NANOCODEX_USERS.getByName(userId).fetch(
     `https://user.internal/organizations/${organizationId}`,
     { method: "DELETE" },
@@ -268,8 +287,9 @@ async function listRevalidatedTeamSummariesWithinDeadline(
     }
     const value = await response.json<unknown>();
     ids = Array.isArray(value)
-      ? value.filter((id): id is string => typeof id === "string" && USER_ID.test(id))
-        .slice(0, MAX_ORGANIZATION_REFS)
+      ? value.filter((id): id is string => (
+        organizationIdFromString(env.NANOCODEX_ORGANIZATIONS, id) !== undefined
+      )).slice(0, MAX_ORGANIZATION_REFS)
       : [];
   } catch { return []; }
 
@@ -282,7 +302,9 @@ async function listRevalidatedTeamSummariesWithinDeadline(
         const index = cursor++;
         const id = ids[index]!;
         try {
-          const response = await env.NANOCODEX_ORGANIZATIONS.getByName(id).fetch(
+          const objectId = organizationIdFromString(env.NANOCODEX_ORGANIZATIONS, id);
+          if (!objectId) continue;
+          const response = await env.NANOCODEX_ORGANIZATIONS.get(objectId).fetch(
             `https://organization.internal/authority/${userId}`,
           );
           if (!response.ok) {
@@ -674,17 +696,21 @@ export class UserAccount extends DurableObject<AccountAuthEnv> {
       const organizationIds = await this.ctx.storage.get<string[]>("organizationIds") ?? [];
       if (request.method === "GET") {
         return json(organizationIds
-          .filter((id) => USER_ID.test(id))
+          .filter((id) => (
+            organizationIdFromString(this.env.NANOCODEX_ORGANIZATIONS, id) !== undefined
+          ))
           .slice(0, MAX_ORGANIZATION_REFS));
       }
       if (request.method === "POST") {
         const body = await request.json<{ organizationId?: unknown }>();
-        const organizationId = typeof body.organizationId === "string"
-          ? body.organizationId.toLowerCase()
-          : "";
-        if (!USER_ID.test(organizationId)) {
+        const objectId = organizationIdFromString(
+          this.env.NANOCODEX_ORGANIZATIONS,
+          body.organizationId,
+        );
+        if (!objectId) {
           return json({ error: "invalid_organization" }, { status: 400 });
         }
+        const organizationId = objectId.toString();
         if (organizationIds.includes(organizationId)) return new Response(null, { status: 200 });
         if (organizationIds.length >= MAX_ORGANIZATION_REFS) {
           return json({ error: "organization_limit_reached" }, { status: 409 });
@@ -694,12 +720,16 @@ export class UserAccount extends DurableObject<AccountAuthEnv> {
         return new Response(null, { status: 201 });
       }
     }
-    const organizationMatch = url.pathname.match(
-      /^\/organizations\/([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/,
-    );
+    const organizationMatch = url.pathname.match(/^\/organizations\/([^/]+)$/);
     if (organizationMatch && request.method === "DELETE") {
+      const objectId = organizationIdFromString(
+        this.env.NANOCODEX_ORGANIZATIONS,
+        organizationMatch[1],
+      );
+      if (!objectId) return json({ error: "not_found" }, { status: 404 });
+      const organizationId = objectId.toString();
       const organizationIds = await this.ctx.storage.get<string[]>("organizationIds") ?? [];
-      const next = organizationIds.filter((id) => id !== organizationMatch[1]);
+      const next = organizationIds.filter((id) => id !== organizationId);
       if (next.length === organizationIds.length) {
         return json({ error: "not_found" }, { status: 404 });
       }
