@@ -196,6 +196,29 @@ export function AppsConsole() {
     }
   }, []);
 
+  const handleWorkspaceAuthorityLoss = useCallback(async (error: unknown, workspace: Workspace) => {
+    if (workspace === "personal" || !(error instanceof ApiError)
+      || (error.status !== 401 && error.status !== 403 && error.status !== 404)) return false;
+    const teamId = workspace.slice("team:".length);
+    setAppSnapshots((current) => {
+      const next = { ...current };
+      delete next[workspace];
+      return next;
+    });
+    setMembersByTeam((current) => {
+      const next = { ...current };
+      delete next[teamId];
+      return next;
+    });
+    if (selectedWorkspaceRef.current === workspace) selectWorkspace("personal");
+    await refreshAccount();
+    setTeamNotice({
+      kind: "error",
+      message: "Your access to that team changed. Its cached app data was cleared and the workspace list was refreshed.",
+    });
+    return true;
+  }, [refreshAccount]);
+
   const refreshApps = useCallback(async (workspace: Workspace) => {
     try {
       const response = await requestJson<AppsResponse>(workspacePath("/apps/api/apps", workspace));
@@ -208,12 +231,13 @@ export function AppsConsole() {
       if (selectedWorkspaceRef.current === workspace) setAppsFailure(undefined);
       return true;
     } catch (error) {
+      if (await handleWorkspaceAuthorityLoss(error, workspace)) return false;
       if (selectedWorkspaceRef.current === workspace) {
         setAppsFailure(actionableError(error, "The app list could not be refreshed."));
       }
       return false;
     }
-  }, []);
+  }, [handleWorkspaceAuthorityLoss]);
 
   const refreshMembers = useCallback(async (teamId: string) => {
     try {
@@ -222,11 +246,12 @@ export function AppsConsole() {
       setMembersByTeam((current) => ({ ...current, [teamId]: response.data }));
       if (selectedWorkspaceRef.current === `team:${teamId}`) setMembersFailure(undefined);
     } catch (error) {
+      if (await handleWorkspaceAuthorityLoss(error, `team:${teamId}`)) return;
       if (selectedWorkspaceRef.current === `team:${teamId}`) {
         setMembersFailure(actionableError(error, "Team members could not be refreshed."));
       }
     }
-  }, []);
+  }, [handleWorkspaceAuthorityLoss]);
 
   useEffect(() => { void refreshAccount(); }, [refreshAccount]);
   useEffect(() => { void refreshApps(selectedWorkspace); }, [refreshApps, selectedWorkspace]);
@@ -265,7 +290,8 @@ export function AppsConsole() {
         setNotice((current) => current?.message === "Build status could not be checked. Retry the page to reconnect."
           ? undefined
           : current);
-      } catch {
+      } catch (error) {
+        if (await handleWorkspaceAuthorityLoss(error, workspace)) return;
         if (!cancelled && selectedWorkspaceRef.current === workspace) {
           setNotice({ kind: "error", message: "Build status could not be checked. Retry the page to reconnect." });
         }
@@ -277,7 +303,7 @@ export function AppsConsole() {
       cancelled = true;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [activeJobKey, refreshApps, selectedWorkspace]);
+  }, [activeJobKey, handleWorkspaceAuthorityLoss, refreshApps, selectedWorkspace]);
 
   function selectWorkspace(workspace: Workspace) {
     selectedWorkspaceRef.current = workspace;
@@ -313,6 +339,7 @@ export function AppsConsole() {
       setCreateApproved(false);
       setNotice({ kind: "success", message: "Build accepted. Its status will stay here while it runs." });
     } catch (error) {
+      if (await handleWorkspaceAuthorityLoss(error, workspace)) return;
       if (selectedWorkspaceRef.current === workspace) {
         setNotice({ kind: "error", message: actionableError(error, "The build could not be started.") });
       }
@@ -335,6 +362,7 @@ export function AppsConsole() {
       setUpdatePrompts((current) => ({ ...current, [appId]: "" }));
       setNotice({ kind: "success", message: "Update accepted. The current app remains live during the build." });
     } catch (error) {
+      if (await handleWorkspaceAuthorityLoss(error, workspace)) return;
       if (selectedWorkspaceRef.current === workspace) {
         setNotice({ kind: "error", message: actionableError(error, "The update could not be started.") });
       }
@@ -369,6 +397,7 @@ export function AppsConsole() {
       }));
       setNotice({ kind: "success", message: `${response.app.display_name} now serves the selected revision.` });
     } catch (error) {
+      if (await handleWorkspaceAuthorityLoss(error, workspace)) return;
       if (selectedWorkspaceRef.current !== workspace) return;
       if (error instanceof ApiError && error.code === "stale_active") {
         await refreshApps(workspace);
@@ -426,6 +455,7 @@ export function AppsConsole() {
       });
       setTeamNotice({ kind: "success", message: "Invitation created. It is shown only in this page session." });
     } catch (error) {
+      if (await handleWorkspaceAuthorityLoss(error, workspace)) return;
       if (selectedWorkspaceRef.current === workspace) {
         setTeamNotice({ kind: "error", message: actionableError(error, "The invitation could not be created.") });
       }
@@ -490,6 +520,7 @@ export function AppsConsole() {
         setTeamNotice({ kind: "success", message: "Team member removed." });
       }
     } catch (error) {
+      if (await handleWorkspaceAuthorityLoss(error, workspace)) return;
       if (selectedWorkspaceRef.current === workspace) {
         setTeamNotice({ kind: "error", message: actionableError(error, "The team member could not be removed.") });
       }
