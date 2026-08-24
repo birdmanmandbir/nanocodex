@@ -1,14 +1,13 @@
 // Modified from clabby/tact@a2de8ae1e0b6ce8d8f0a251a9d681dc430b247aa for Nanocodex2.
 // SPDX-License-Identifier: Apache-2.0
 
-
 use crate::tui::{format::sanitize_terminal_text, theme::Theme};
 use pulldown_cmark_tact::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use ratatui_image_tact::sliced::SlicedProtocol;
 use ratatui_tact::{
     style::{Modifier, Style},
     text::{Line, Span},
 };
-use ratatui_image_tact::sliced::SlicedProtocol;
 use std::{ops::Range, path::Path, sync::Arc};
 use syntect::easy::HighlightLines;
 use unicode_segmentation::UnicodeSegmentation;

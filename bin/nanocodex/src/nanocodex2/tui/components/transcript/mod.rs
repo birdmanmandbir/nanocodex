@@ -1,7 +1,6 @@
 // Modified from clabby/tact@a2de8ae1e0b6ce8d8f0a251a9d681dc430b247aa for Nanocodex2.
 // SPDX-License-Identifier: Apache-2.0
 
-
 //! Scrollable rendering of the persisted agent session.
 
 mod diff;
@@ -29,8 +28,12 @@ use crate::{
         },
     },
 };
-use crossterm_tact::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
+use crossterm_tact::event::{
+    Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+};
 use empty::EmptyLogo;
+use nanocodex_subagents::{AgentMessageUpdate, MessageSender};
+use ratatui_image_tact::sliced::{SignedPosition, SlicedImage};
 use ratatui_tact::{
     Frame,
     buffer::Buffer,
@@ -39,7 +42,6 @@ use ratatui_tact::{
     text::{Line, Span},
     widgets::{Clear, Widget},
 };
-use ratatui_image_tact::sliced::{SignedPosition, SlicedImage};
 use std::{
     collections::{HashMap, hash_map::Entry},
     ops::Range,
@@ -47,7 +49,6 @@ use std::{
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tact_subagents::{AgentMessageUpdate, MessageSender};
 
 const EXPANDABLE_FOCUS_HINTS: [&str; 2] =
     ["↑↓ item · Enter toggle · Esc back", "↑↓ item · Enter · Esc"];
@@ -2032,6 +2033,7 @@ mod tests {
         Model,
         agent::events::{AgentEvent, AgentEventKind},
     };
+    use nanocodex_subagents::{AgentMessageUpdate, MessageSender};
     use ratatui_tact::{Terminal, backend::TestBackend, layout::Position, style::Color};
     use serde_json::{json, value::to_raw_value};
     use std::{
@@ -2040,7 +2042,6 @@ mod tests {
         sync::Arc,
         time::{Duration, Instant},
     };
-    use tact_subagents::{AgentMessageUpdate, MessageSender};
 
     #[test]
     fn user_messages_normalize_carriage_returns() {

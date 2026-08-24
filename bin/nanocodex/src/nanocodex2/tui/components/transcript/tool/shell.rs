@@ -1,7 +1,6 @@
 // Modified from clabby/tact@a2de8ae1e0b6ce8d8f0a251a9d681dc430b247aa for Nanocodex2.
 // SPDX-License-Identifier: Apache-2.0
 
-
 use super::{Presentation, format_bytes};
 use crate::tui::{format::shorten_home, theme::Theme, transcript::ToolEntry};
 use ratatui_tact::{

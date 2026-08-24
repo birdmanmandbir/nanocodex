@@ -1,7 +1,6 @@
 // Modified from clabby/tact@a2de8ae1e0b6ce8d8f0a251a9d681dc430b247aa for Nanocodex2.
 // SPDX-License-Identifier: Apache-2.0
 
-
 //! Multiline prompt editing and Pi-style composer rendering.
 
 mod history;
@@ -1767,7 +1766,11 @@ mod tests {
 
         assert!(rendered.contains("medium ⚡"));
         assert_eq!(top[bolt].fg, Color::Yellow);
-        assert!(top[bolt].modifier.contains(ratatui_tact::style::Modifier::BOLD));
+        assert!(
+            top[bolt]
+                .modifier
+                .contains(ratatui_tact::style::Modifier::BOLD)
+        );
     }
 
     #[test]

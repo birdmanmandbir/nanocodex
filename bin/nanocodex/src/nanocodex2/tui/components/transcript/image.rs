@@ -1,14 +1,13 @@
 // Modified from clabby/tact@a2de8ae1e0b6ce8d8f0a251a9d681dc430b247aa for Nanocodex2.
 // SPDX-License-Identifier: Apache-2.0
 
-
 use image::{DynamicImage, ImageReader};
-use ratatui_tact::layout::Size;
 use ratatui_image_tact::{
     FontSize, Resize,
     picker::{Picker, ProtocolType},
     sliced::SlicedProtocol,
 };
+use ratatui_tact::layout::Size;
 use std::{
     collections::{HashSet, VecDeque},
     env, fs, mem,
@@ -579,8 +578,8 @@ mod tests {
         SOURCE_CACHE_CAPACITY, Target, picker_supports_tmux_passthrough, protocol_hint,
         protocol_override, queries_terminal_for_image_capabilities, supports_inline_images,
     };
-    use ratatui_tact::layout::Size;
     use ratatui_image_tact::picker::ProtocolType;
+    use ratatui_tact::layout::Size;
     use std::{
         fs::File,
         sync::Arc,
