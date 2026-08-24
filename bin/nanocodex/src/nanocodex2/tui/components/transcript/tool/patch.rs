@@ -4,7 +4,7 @@
 
 use super::Presentation;
 use crate::tui::{theme::Theme, transcript::ToolEntry};
-use ratatui::{
+use ratatui_tact::{
     style::{Color, Style},
     text::Span,
 };

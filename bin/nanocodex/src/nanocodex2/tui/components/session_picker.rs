@@ -12,8 +12,8 @@ use crate::tui::{
     session::{SessionSummary, format_age},
     theme::Theme,
 };
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::{
+use crossterm_tact::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui_tact::{
     Frame,
     layout::Rect,
     style::{Modifier, Style},
@@ -68,7 +68,7 @@ impl SessionPicker {
 
     fn update_key(
         &mut self,
-        key: crossterm::event::KeyEvent,
+        key: crossterm_tact::event::KeyEvent,
     ) -> ComponentUpdate<SessionPickerEffect> {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return ComponentUpdate::none();
@@ -281,7 +281,7 @@ mod tests {
         app::config::{ReasoningEffort, ReasoningMode},
         tui::session::SessionSummary,
     };
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use crossterm_tact::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use std::path::PathBuf;
 
     fn key(code: KeyCode) -> SessionPickerEvent {

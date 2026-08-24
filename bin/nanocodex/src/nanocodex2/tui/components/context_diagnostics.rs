@@ -13,8 +13,8 @@ use crate::tui::{
     theme::Theme,
 };
 use chrono::{DateTime, Utc};
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::{
+use crossterm_tact::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui_tact::{
     Frame,
     layout::Rect,
     style::{Modifier, Style},
@@ -314,7 +314,7 @@ mod tests {
         },
         theme::Theme,
     };
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui_tact::{Terminal, backend::TestBackend};
 
     #[test]
     fn panel_renders_counts_unavailable_metrics_and_cache_help() {

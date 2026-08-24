@@ -4,7 +4,7 @@
 
 use super::{Presentation, format_bytes};
 use crate::tui::{format::shorten_home, theme::Theme, transcript::ToolEntry};
-use ratatui::style::Style;
+use ratatui_tact::style::Style;
 use serde_json::Value;
 use std::path::Path;
 

@@ -29,9 +29,9 @@ use crate::{
         },
     },
 };
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
+use crossterm_tact::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use empty::EmptyLogo;
-use ratatui::{
+use ratatui_tact::{
     Frame,
     buffer::Buffer,
     layout::{Position, Rect},
@@ -39,7 +39,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Clear, Widget},
 };
-use ratatui_image::sliced::{SignedPosition, SlicedImage};
+use ratatui_image_tact::sliced::{SignedPosition, SlicedImage};
 use std::{
     collections::{HashMap, hash_map::Entry},
     ops::Range,
@@ -1435,7 +1435,7 @@ impl LayoutCache {
     fn image(
         &mut self,
         anchor: Anchor,
-    ) -> Option<(usize, Arc<ratatui_image::sliced::SlicedProtocol>)> {
+    ) -> Option<(usize, Arc<ratatui_image_tact::sliced::SlicedProtocol>)> {
         let workspace = &self.workspace;
         let images = &mut self.images;
         self.entries.get_mut(&anchor.entry).and_then(|cached| {
@@ -1619,7 +1619,7 @@ impl Component for Transcript {
         let mut visible_images: Vec<(
             EntryId,
             usize,
-            Arc<ratatui_image::sliced::SlicedProtocol>,
+            Arc<ratatui_image_tact::sliced::SlicedProtocol>,
             SignedPosition,
         )> = Vec::new();
         for anchor in anchors {
@@ -2025,14 +2025,14 @@ mod tests {
             transcript::{EntryKind, LocalEvent, SessionStarted, TranscriptRecord, TurnId},
         },
     };
-    use crossterm::event::{
+    use crossterm_tact::event::{
         Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
     use nanocodex::{
         Model,
         agent::events::{AgentEvent, AgentEventKind},
     };
-    use ratatui::{Terminal, backend::TestBackend, layout::Position, style::Color};
+    use ratatui_tact::{Terminal, backend::TestBackend, layout::Position, style::Color};
     use serde_json::{json, value::to_raw_value};
     use std::{
         fs::File,

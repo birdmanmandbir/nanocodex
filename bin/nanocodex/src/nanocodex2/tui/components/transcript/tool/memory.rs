@@ -4,7 +4,7 @@
 
 use super::{Presentation, generic};
 use crate::tui::{theme::Theme, transcript::ToolEntry};
-use ratatui::{style::Style, text::Line};
+use ratatui_tact::{style::Style, text::Line};
 use serde_json::{Map, Value};
 
 const MAX_SCAN_CANDIDATES: usize = 8;
@@ -535,7 +535,7 @@ mod tests {
         }
     }
 
-    fn text(lines: &[ratatui::text::Line<'_>]) -> String {
+    fn text(lines: &[ratatui_tact::text::Line<'_>]) -> String {
         lines
             .iter()
             .map(ToString::to_string)

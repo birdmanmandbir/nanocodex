@@ -9,8 +9,8 @@ use super::{
     waved_text::WavedText,
 };
 use crate::tui::{format::sanitize_terminal_text_inline, prompt::Submission, theme::Theme};
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::{
+use crossterm_tact::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui_tact::{
     Frame,
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
@@ -244,7 +244,7 @@ impl MessageQueue {
     }
 
     pub(super) fn focus_row(&mut self, row: u16, area: Rect) -> bool {
-        if !area.contains(ratatui::layout::Position::new(area.x, row)) {
+        if !area.contains(ratatui_tact::layout::Position::new(area.x, row)) {
             return false;
         }
         let offset = row.saturating_sub(area.y + 1);
@@ -561,8 +561,8 @@ mod tests {
         truncate,
     };
     use crate::tui::theme::Theme;
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-    use ratatui::{Terminal, backend::TestBackend, style::Color};
+    use crossterm_tact::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use ratatui_tact::{Terminal, backend::TestBackend, style::Color};
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> QueueEvent {
         QueueEvent::Terminal(Event::Key(KeyEvent::new(code, modifiers)))

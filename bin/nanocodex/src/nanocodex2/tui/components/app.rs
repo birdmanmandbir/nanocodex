@@ -19,9 +19,9 @@ use crate::{
         transcript::TranscriptRecord,
     },
 };
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
+use crossterm_tact::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use nanocodex::Model;
-use ratatui::{
+use ratatui_tact::{
     Frame,
     layout::{Position, Rect},
     style::{Modifier, Style},
@@ -816,11 +816,11 @@ mod tests {
             transcript::{LocalEvent, TranscriptRecord, TurnId},
         },
     };
-    use crossterm::event::{
+    use crossterm_tact::event::{
         Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
     use nanocodex::Model;
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui_tact::{Terminal, backend::TestBackend};
     use semver::Version;
     use std::{path::PathBuf, sync::Arc};
     use tact_memory::{MemoryAccess, MemoryKey, MemoryRecord, MemorySource};
@@ -921,7 +921,7 @@ mod tests {
         assert_eq!(update.render, super::RenderRequest::Immediate);
         assert_eq!(
             app.theme.code_background(),
-            ratatui::style::Color::Rgb(0xEE, 0xEE, 0xEE)
+            ratatui_tact::style::Color::Rgb(0xEE, 0xEE, 0xEE)
         );
 
         app.set_theme_mode(ThemeMode::Dark);
@@ -929,7 +929,7 @@ mod tests {
         assert_eq!(update.render, super::RenderRequest::None);
         assert_eq!(
             app.theme.code_background(),
-            ratatui::style::Color::Rgb(0x26, 0x26, 0x26)
+            ratatui_tact::style::Color::Rgb(0x26, 0x26, 0x26)
         );
     }
 

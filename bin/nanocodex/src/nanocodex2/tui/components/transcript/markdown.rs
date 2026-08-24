@@ -3,12 +3,12 @@
 
 
 use crate::tui::{format::sanitize_terminal_text, theme::Theme};
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
-use ratatui::{
+use pulldown_cmark_tact::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use ratatui_tact::{
     style::{Modifier, Style},
     text::{Line, Span},
 };
-use ratatui_image::sliced::SlicedProtocol;
+use ratatui_image_tact::sliced::SlicedProtocol;
 use std::{ops::Range, path::Path, sync::Arc};
 use syntect::easy::HighlightLines;
 use unicode_segmentation::UnicodeSegmentation;
@@ -470,7 +470,7 @@ impl<'a> Renderer<'a> {
                             self.image_selection_modes.push(ImageSelectionMode::Hidden);
                             self.push_unlinked(Span::styled(
                                 "image could not be rendered",
-                                Style::default().fg(ratatui::style::Color::Red),
+                                Style::default().fg(ratatui_tact::style::Color::Red),
                             ));
                         }
                     }
@@ -1533,7 +1533,7 @@ mod tests {
         ImageState, Layout, render, render_cached,
     };
     use crate::tui::theme::Theme;
-    use ratatui::style::{Color, Modifier};
+    use ratatui_tact::style::{Color, Modifier};
     use std::{fs::File, path::Path, sync::Arc, time::Instant};
 
     fn write_png(path: &Path) {

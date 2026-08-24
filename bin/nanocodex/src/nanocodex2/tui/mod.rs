@@ -55,7 +55,7 @@ use crate::{
         worker::{AuxiliaryContext, AuxiliaryError, ReflectionContext, WorkerCommand, WorkerEvent},
     },
 };
-use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
+use crossterm_tact::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use futures_util::StreamExt;
 use nanocodex::Model;
 use std::{
@@ -2828,7 +2828,7 @@ mod tests {
 
     #[test]
     fn control_or_super_v_requests_an_image_paste() {
-        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        use crossterm_tact::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
         assert!(is_image_paste(&Event::Key(KeyEvent::new(
             KeyCode::Char('v'),

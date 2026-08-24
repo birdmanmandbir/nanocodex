@@ -5,7 +5,7 @@
 //! Shared chrome and layout for centered modal components.
 
 use crate::tui::theme::Theme;
-use ratatui::{
+use ratatui_tact::{
     Frame,
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
@@ -193,7 +193,7 @@ fn split_footer(inner: Rect, footer_height: u16) -> (Rect, Rect) {
 mod tests {
     use super::Floating;
     use crate::tui::theme::Theme;
-    use ratatui::{Terminal, backend::TestBackend, layout::Rect, style::Color};
+    use ratatui_tact::{Terminal, backend::TestBackend, layout::Rect, style::Color};
 
     #[test]
     fn floating_centers_rounded_chrome_and_styles_keys_separately_from_help() {

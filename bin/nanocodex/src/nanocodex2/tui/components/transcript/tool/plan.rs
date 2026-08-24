@@ -4,7 +4,7 @@
 
 use super::Presentation;
 use crate::tui::{theme::Theme, transcript::ToolEntry};
-use ratatui::style::Style;
+use ratatui_tact::style::Style;
 use serde_json::Value;
 
 pub(super) fn present(tool: &ToolEntry, width: u16, theme: &Theme, expanded: bool) -> Presentation {

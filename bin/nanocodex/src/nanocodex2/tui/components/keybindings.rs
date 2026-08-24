@@ -9,8 +9,8 @@ use super::{
     node::{Component, ComponentUpdate, RenderRequest},
 };
 use crate::tui::theme::Theme;
-use crossterm::event::{Event, KeyCode, KeyEventKind};
-use ratatui::{
+use crossterm_tact::event::{Event, KeyCode, KeyEventKind};
+use ratatui_tact::{
     Frame,
     layout::Rect,
     style::{Modifier, Style},
@@ -139,8 +139,8 @@ fn binding_line(
 mod tests {
     use super::{BINDINGS, Component, KeybindingsEffect, KeybindingsEvent, KeybindingsHelp};
     use crate::tui::theme::Theme;
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-    use ratatui::{Terminal, backend::TestBackend, style::Color};
+    use crossterm_tact::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use ratatui_tact::{Terminal, backend::TestBackend, style::Color};
 
     #[test]
     fn popup_right_aligns_muted_descriptions() {

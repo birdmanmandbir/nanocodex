@@ -5,7 +5,7 @@
 //! Stateful component ownership and update results.
 
 use crate::tui::theme::Theme;
-use ratatui::{Frame, layout::Rect};
+use ratatui_tact::{Frame, layout::Rect};
 
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum RenderRequest {

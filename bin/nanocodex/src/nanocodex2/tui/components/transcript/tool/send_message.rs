@@ -4,7 +4,7 @@
 
 use super::{super::markdown::wrap_plain, Presentation};
 use crate::tui::{theme::Theme, transcript::ToolEntry};
-use ratatui::style::Style;
+use ratatui_tact::style::Style;
 use serde_json::Value;
 use std::borrow::Cow;
 

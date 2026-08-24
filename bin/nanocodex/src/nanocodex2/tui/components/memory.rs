@@ -10,8 +10,8 @@ use super::{
 };
 use crate::tui::{session::format_age, theme::Theme};
 use chrono::{DateTime, Utc};
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::{
+use crossterm_tact::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui_tact::{
     Frame,
     layout::Rect,
     style::{Modifier, Style},
@@ -1227,8 +1227,8 @@ mod tests {
         NamespaceScope, ReturnView, SortMode,
     };
     use crate::tui::theme::Theme;
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-    use ratatui::{Terminal, backend::TestBackend};
+    use crossterm_tact::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+    use ratatui_tact::{Terminal, backend::TestBackend};
     use tact_memory::{MemoryAccess, MemoryKey, MemoryRecord, MemorySource, RemoteRole};
 
     fn local_access() -> MemoryAccess {

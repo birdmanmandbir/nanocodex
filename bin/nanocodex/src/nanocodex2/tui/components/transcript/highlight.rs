@@ -4,7 +4,7 @@
 
 //! Shared, cached syntax highlighting for transcript code.
 
-use ratatui::{
+use ratatui_tact::{
     style::{Color, Modifier, Style},
     text::Span,
 };

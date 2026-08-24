@@ -9,8 +9,8 @@ use super::{
     node::{Component, ComponentUpdate, RenderRequest},
 };
 use crate::{app::config::ReasoningEffort, tui::theme::Theme};
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
-use ratatui::{
+use crossterm_tact::event::{Event, KeyCode, KeyEvent, KeyEventKind};
+use ratatui_tact::{
     Frame,
     buffer::Buffer,
     layout::{Alignment, Position, Rect},
@@ -373,8 +373,8 @@ mod tests {
         EffortSelector,
     };
     use crate::{app::config::ReasoningEffort, tui::theme::Theme};
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-    use ratatui::{Terminal, backend::TestBackend, style::Color};
+    use crossterm_tact::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use ratatui_tact::{Terminal, backend::TestBackend, style::Color};
     use std::time::{Duration, Instant};
 
     fn key(code: KeyCode, now: Instant) -> EffortEvent {

@@ -10,8 +10,8 @@ use super::{
     node::{Component, ComponentUpdate, RenderRequest},
 };
 use crate::{core::extensions::Skill, tui::theme::Theme};
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
-use ratatui::{
+use crossterm_tact::event::{Event, KeyCode, KeyEvent, KeyEventKind};
+use ratatui_tact::{
     Frame,
     layout::Rect,
     style::{Modifier, Style},
@@ -202,7 +202,7 @@ impl Component for SkillPicker {
 mod tests {
     use super::{Component, SkillPicker, SkillPickerEffect, SkillPickerEvent};
     use crate::core::extensions::Skill;
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use crossterm_tact::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
     fn key(code: KeyCode) -> SkillPickerEvent {
         SkillPickerEvent::Terminal(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))

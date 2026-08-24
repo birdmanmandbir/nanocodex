@@ -31,10 +31,13 @@ tempo = [
 [dependencies]
 arboard.workspace = true
 async-trait.workspace = true
+axum.workspace = true
 alloy-primitives = { workspace = true, optional = true }
 base64.workspace = true
 clap.workspace = true
 crossterm.workspace = true
+crossterm-tact = { package = "crossterm", version = "0.29.0", features = ["event-stream", "osc52"] }
+dark-light = "2.0.0"
 dotenvy.workspace = true
 eyre.workspace = true
 flate2.workspace = true
@@ -52,16 +55,21 @@ nanocodex-voice.workspace = true
 nix.workspace = true
 nanousd = { workspace = true, optional = true }
 pulldown-cmark.workspace = true
+pulldown-cmark-tact = { package = "pulldown-cmark", version = "0.13.4", default-features = false }
 mpp = { workspace = true, optional = true, features = ["middleware", "sqlite", "tempo", "reqwest-rustls-tls-no-provider"] }
 nanocodex-egress = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 ratatui.workspace = true
+ratatui-tact = { package = "ratatui", version = "0.30.2" }
+ratatui-image-tact = { package = "ratatui-image", version = "11.0.6", default-features = false, features = ["crossterm"] }
 ratatex.workspace = true
+rayon = "1.12.0"
 reqwest = { workspace = true, features = ["blocking", "stream"] }
 self-replace.workspace = true
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+png = "0.18.1"
 syntect.workspace = true
 two-face.workspace = true
 sha2.workspace = true
@@ -78,6 +86,7 @@ url.workspace = true
 uuid.workspace = true
 yansi.workspace = true
 zeroize.workspace = true
+zstd.workspace = true
 
 [target.'cfg(any(all(target_os = "linux", not(target_env = "musl")), all(target_os = "macos", target_arch = "aarch64")))'.dependencies]
 arcbox-ext4.workspace = true

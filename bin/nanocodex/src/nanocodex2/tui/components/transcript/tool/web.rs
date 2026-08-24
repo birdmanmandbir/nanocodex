@@ -4,7 +4,7 @@
 
 use super::{Presentation, format_bytes};
 use crate::tui::{theme::Theme, transcript::ToolEntry};
-use ratatui::style::Style;
+use ratatui_tact::style::Style;
 use serde_json::Value;
 
 const OPERATIONS: [&str; 9] = [
@@ -114,7 +114,7 @@ fn operation_details(
     arguments: &Value,
     width: u16,
     theme: &Theme,
-) -> Vec<ratatui::text::Line<'static>> {
+) -> Vec<ratatui_tact::text::Line<'static>> {
     let mut details = Vec::new();
     for operation in OPERATIONS {
         let Some(values) = arguments.get(operation).and_then(Value::as_array) else {

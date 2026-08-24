@@ -4,7 +4,7 @@
 
 use super::{Presentation, format_bytes};
 use crate::tui::{format::shorten_home, theme::Theme, transcript::ToolEntry};
-use ratatui::{
+use ratatui_tact::{
     style::{Color, Style},
     text::Span,
 };

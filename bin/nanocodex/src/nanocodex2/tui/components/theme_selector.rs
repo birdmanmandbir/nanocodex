@@ -9,8 +9,8 @@ use super::{
     node::{Component, ComponentUpdate, RenderRequest},
 };
 use crate::tui::theme::{Theme, ThemeMode};
-use crossterm::event::{Event, KeyCode, KeyEventKind};
-use ratatui::{
+use crossterm_tact::event::{Event, KeyCode, KeyEventKind};
+use ratatui_tact::{
     Frame,
     layout::{Position, Rect},
     style::{Modifier, Style},
@@ -45,7 +45,7 @@ impl ThemeSelector {
 
     fn update_key(
         &mut self,
-        key: crossterm::event::KeyEvent,
+        key: crossterm_tact::event::KeyEvent,
     ) -> ComponentUpdate<ThemeSelectorEffect> {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return ComponentUpdate::none();
@@ -121,7 +121,7 @@ impl Component for ThemeSelector {
 mod tests {
     use super::{Component, ThemeSelector, ThemeSelectorEffect, ThemeSelectorEvent};
     use crate::tui::theme::ThemeMode;
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use crossterm_tact::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
     fn key(code: KeyCode) -> ThemeSelectorEvent {
         ThemeSelectorEvent::Terminal(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))

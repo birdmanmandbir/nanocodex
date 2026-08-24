@@ -6,7 +6,7 @@
 
 use crate::app::config::ReasoningEffort;
 use nanocodex::Model;
-use ratatui::style::Color;
+use ratatui_tact::style::Color;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::{fmt, str::FromStr};
 use tokio::{sync::mpsc, time::Duration};
@@ -372,7 +372,7 @@ impl fmt::Display for ColorName {
 mod tests {
     use super::{ColorScheme, SYSTEM_SCHEME_POLL_INTERVAL, Theme, ThemeMode};
     use nanocodex::Model;
-    use ratatui::style::Color;
+    use ratatui_tact::style::Color;
 
     #[test]
     fn auto_defaults_to_the_dark_palette_until_the_os_mode_is_known() {

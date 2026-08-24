@@ -4,7 +4,7 @@
 
 //! Terminal lifecycle and synchronized Ratatui frames.
 
-use crossterm::{
+use crossterm_tact::{
     clipboard::CopyToClipboard,
     cursor::{Hide, Show},
     event::{
@@ -18,7 +18,7 @@ use crossterm::{
         disable_raw_mode, enable_raw_mode,
     },
 };
-use ratatui::{
+use ratatui_tact::{
     Frame, Terminal,
     backend::{Backend, ClearType, CrosstermBackend, WindowSize},
     buffer::Cell,
@@ -383,7 +383,7 @@ mod tests {
             theme::Theme,
         },
     };
-    use ratatui::{Terminal, backend::TestBackend, layout::Position};
+    use ratatui_tact::{Terminal, backend::TestBackend, layout::Position};
     use std::path::Path;
 
     #[test]

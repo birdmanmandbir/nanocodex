@@ -9,9 +9,9 @@ use super::{
     node::{Component, ComponentUpdate, RenderRequest},
 };
 use crate::tui::theme::Theme;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm_tact::event::{Event, KeyCode, KeyEvent, KeyEventKind};
 use nanocodex::Model;
-use ratatui::{
+use ratatui_tact::{
     Frame,
     layout::{Alignment, Rect},
     style::{Modifier, Style},
@@ -263,8 +263,8 @@ fn model_name(model: Model) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyEvent, KeyModifiers};
-    use ratatui::{Terminal, backend::TestBackend, style::Color};
+    use crossterm_tact::event::{KeyEvent, KeyModifiers};
+    use ratatui_tact::{Terminal, backend::TestBackend, style::Color};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)

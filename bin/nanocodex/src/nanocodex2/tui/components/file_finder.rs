@@ -9,8 +9,8 @@ use super::{
     node::{Component, ComponentUpdate, RenderRequest},
 };
 use crate::tui::theme::Theme;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
-use ratatui::{
+use crossterm_tact::event::{Event, KeyCode, KeyEvent, KeyEventKind};
+use ratatui_tact::{
     Frame,
     layout::Rect,
     style::{Modifier, Style},
@@ -303,8 +303,8 @@ mod tests {
         Component, FileFinder, FileFinderEffect, FileFinderEvent, discover_paths, fuzzy_score,
     };
     use crate::tui::theme::Theme;
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-    use ratatui::{Terminal, backend::TestBackend};
+    use crossterm_tact::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use ratatui_tact::{Terminal, backend::TestBackend};
     use std::fs;
 
     fn key(code: KeyCode) -> FileFinderEvent {

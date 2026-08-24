@@ -9,8 +9,8 @@ use super::{
     node::{Component, ComponentUpdate, RenderRequest},
 };
 use crate::tui::theme::Theme;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::{
+use crossterm_tact::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui_tact::{
     Frame,
     layout::Rect,
     style::{Modifier, Style},
@@ -426,8 +426,8 @@ fn visible_query_tail(query: &str, width: usize) -> &str {
 mod tests {
     use super::{Action, ActionAvailability, ActionsEffect, ActionsEvent, ActionsMenu, Component};
     use crate::tui::theme::Theme;
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-    use ratatui::{Terminal, backend::TestBackend, style::Color};
+    use crossterm_tact::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use ratatui_tact::{Terminal, backend::TestBackend, style::Color};
 
     fn key(code: KeyCode) -> ActionsEvent {
         ActionsEvent::Terminal(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))

@@ -4,7 +4,7 @@
 
 //! Reusable demand-driven text wave for compact status labels.
 
-use ratatui::{
+use ratatui_tact::{
     style::{Color, Modifier, Style},
     text::Span,
 };

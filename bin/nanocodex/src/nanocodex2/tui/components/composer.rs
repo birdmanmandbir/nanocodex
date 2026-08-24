@@ -24,11 +24,11 @@ use crate::{
         theme::Theme,
     },
 };
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm_tact::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use history::PromptHistory;
 use layout::{VisualLayout, byte_at_column, grapheme_at_column};
 use nanocodex::Model;
-use ratatui::{
+use ratatui_tact::{
     Frame,
     buffer::Buffer,
     layout::{Position, Rect},
@@ -1577,12 +1577,12 @@ mod tests {
         app::config::{ReasoningEffort, ReasoningMode},
         tui::theme::Theme,
     };
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use crossterm_tact::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use nanocodex::{
         Model,
         agent::input::{PromptInput, UserInput},
     };
-    use ratatui::{
+    use ratatui_tact::{
         Terminal,
         backend::TestBackend,
         layout::{Position, Rect},
@@ -1767,7 +1767,7 @@ mod tests {
 
         assert!(rendered.contains("medium ⚡"));
         assert_eq!(top[bolt].fg, Color::Yellow);
-        assert!(top[bolt].modifier.contains(ratatui::style::Modifier::BOLD));
+        assert!(top[bolt].modifier.contains(ratatui_tact::style::Modifier::BOLD));
     }
 
     #[test]
@@ -1789,7 +1789,7 @@ mod tests {
         assert!(rendered.contains("medium ⚡  pro"));
         for cell in &top[pro..pro + 3] {
             assert_eq!(cell.fg, Color::Green);
-            assert!(cell.modifier.contains(ratatui::style::Modifier::BOLD));
+            assert!(cell.modifier.contains(ratatui_tact::style::Modifier::BOLD));
         }
     }
 
@@ -1849,7 +1849,7 @@ mod tests {
         assert!(rendered.contains("◉ dev  /work"));
         for cell in &row[badge_start..badge_start + 5] {
             assert_eq!(cell.fg, Color::Red);
-            assert!(cell.modifier.contains(ratatui::style::Modifier::BOLD));
+            assert!(cell.modifier.contains(ratatui_tact::style::Modifier::BOLD));
         }
     }
 

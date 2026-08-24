@@ -40,9 +40,9 @@ use crate::{
         transcript::TranscriptRecord,
     },
 };
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
+use crossterm_tact::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use nanocodex::Model;
-use ratatui::{
+use ratatui_tact::{
     Frame,
     layout::{Position, Rect},
     style::{Color, Modifier, Style},
@@ -2983,7 +2983,7 @@ fn is_left_click_in(event: &Event, area: Rect) -> bool {
     let Event::Mouse(mouse) = event else {
         unreachable!("left click helper only accepts mouse events");
     };
-    area.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+    area.contains(ratatui_tact::layout::Position::new(mouse.column, mouse.row))
 }
 
 fn is_left_click(event: &Event) -> bool {
@@ -3063,7 +3063,7 @@ mod tests {
             transcript::{LocalEvent, TranscriptRecord, TurnId},
         },
     };
-    use crossterm::event::{
+    use crossterm_tact::event::{
         Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
         MouseEventKind,
     };
@@ -3074,7 +3074,7 @@ mod tests {
             input::{PromptInput, UserInput},
         },
     };
-    use ratatui::{
+    use ratatui_tact::{
         Terminal,
         backend::TestBackend,
         layout::Position,
@@ -3136,7 +3136,7 @@ mod tests {
         }))
     }
 
-    fn text_column(buffer: &ratatui::buffer::Buffer, row: u16, text: &str) -> u16 {
+    fn text_column(buffer: &ratatui_tact::buffer::Buffer, row: u16, text: &str) -> u16 {
         let symbols = text
             .chars()
             .map(|character| character.to_string())
@@ -4889,7 +4889,7 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let left = (40 - ("Copied selection to clipboard.".len() as u16 + 4)) / 2;
         assert_eq!(buffer[(left, 0)].symbol(), "╭");
-        assert_eq!(buffer[(left, 0)].fg, ratatui::style::Color::Green);
+        assert_eq!(buffer[(left, 0)].fg, ratatui_tact::style::Color::Green);
         assert!(buffer[(left + 2, 1)].modifier.contains(Modifier::BOLD));
 
         let deadline = root.notification.as_ref().unwrap().deadline;

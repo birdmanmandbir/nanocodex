@@ -3,8 +3,8 @@
 
 
 use image::{DynamicImage, ImageReader};
-use ratatui::layout::Size;
-use ratatui_image::{
+use ratatui_tact::layout::Size;
+use ratatui_image_tact::{
     FontSize, Resize,
     picker::{Picker, ProtocolType},
     sliced::SlicedProtocol,
@@ -579,8 +579,8 @@ mod tests {
         SOURCE_CACHE_CAPACITY, Target, picker_supports_tmux_passthrough, protocol_hint,
         protocol_override, queries_terminal_for_image_capabilities, supports_inline_images,
     };
-    use ratatui::layout::Size;
-    use ratatui_image::picker::ProtocolType;
+    use ratatui_tact::layout::Size;
+    use ratatui_image_tact::picker::ProtocolType;
     use std::{
         fs::File,
         sync::Arc,
@@ -607,7 +607,7 @@ mod tests {
         destination: &str,
         workspace: &std::path::Path,
         width: u16,
-    ) -> std::sync::Arc<ratatui_image::sliced::SlicedProtocol> {
+    ) -> std::sync::Arc<ratatui_image_tact::sliced::SlicedProtocol> {
         eventually(|| {
             cache.poll(Instant::now());
             loaded(cache.load(destination, workspace, width))
@@ -625,7 +625,7 @@ mod tests {
         }
     }
 
-    fn loaded(result: LoadResult) -> Option<Arc<ratatui_image::sliced::SlicedProtocol>> {
+    fn loaded(result: LoadResult) -> Option<Arc<ratatui_image_tact::sliced::SlicedProtocol>> {
         match result {
             LoadResult::Loaded(protocol) => Some(protocol),
             _ => None,

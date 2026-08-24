@@ -5,7 +5,7 @@
 //! Structured rendering for unified and `apply_patch` diffs.
 
 use crate::tui::theme::Theme;
-use ratatui::{
+use ratatui_tact::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
@@ -562,7 +562,7 @@ fn truncate(text: &str, width: u16) -> String {
 mod tests {
     use super::render;
     use crate::tui::theme::Theme;
-    use ratatui::style::Color;
+    use ratatui_tact::style::Color;
 
     const TWO_HUNKS: &str = "diff --git a/src/lib.rs b/src/lib.rs\n\
 --- a/src/lib.rs\n\

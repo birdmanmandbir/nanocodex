@@ -19,7 +19,7 @@ use crate::tui::{
     theme::Theme,
     transcript::{ToolEntry, ToolState},
 };
-use ratatui::{
+use ratatui_tact::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
@@ -666,7 +666,7 @@ mod tests {
         theme::Theme,
         transcript::{ToolEntry, ToolState},
     };
-    use ratatui::style::{Color, Modifier};
+    use ratatui_tact::style::{Color, Modifier};
     use serde_json::json;
 
     fn tool(name: &str, arguments: serde_json::Value) -> ToolEntry {

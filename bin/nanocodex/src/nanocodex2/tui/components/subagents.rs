@@ -16,9 +16,9 @@ use crate::{
     app::config::DEFAULT_MAX_SUBAGENTS,
     tui::{format::sanitize_terminal_text_inline, theme::Theme, transcript::TranscriptRecord},
 };
-use crossterm::event::{Event, KeyCode, KeyEventKind};
+use crossterm_tact::event::{Event, KeyCode, KeyEventKind};
 use nanocodex::Model;
-use ratatui::{
+use ratatui_tact::{
     Frame,
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -1105,14 +1105,14 @@ fn model_name(model: Model) -> &'static str {
 mod tests {
     use super::{SubagentEffect, SubagentTree};
     use crate::{app::config::ReasoningEffort, tui::theme::Theme};
-    use crossterm::event::{
+    use crossterm_tact::event::{
         Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
     use nanocodex::{
         Model,
         agent::events::{AgentEvent, AgentEventKind},
     };
-    use ratatui::{Terminal, backend::TestBackend, style::Color};
+    use ratatui_tact::{Terminal, backend::TestBackend, style::Color};
     use serde_json::{json, value::to_raw_value};
     use std::{
         sync::Arc,

@@ -7,8 +7,8 @@ use super::{
     node::{Component, ComponentUpdate, RenderRequest},
 };
 use crate::tui::theme::Theme;
-use crossterm::event::{Event, KeyCode, KeyEventKind};
-use ratatui::{
+use crossterm_tact::event::{Event, KeyCode, KeyEventKind};
+use ratatui_tact::{
     Frame,
     layout::Rect,
     style::Style,
@@ -76,7 +76,7 @@ impl Component for ReviewDownloadConfirmation {
 mod tests {
     use super::{Component, ReviewDownloadConfirmation};
     use crate::tui::theme::Theme;
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui_tact::{Terminal, backend::TestBackend};
 
     #[test]
     fn download_message_fits_inside_the_popup() {

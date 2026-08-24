@@ -10,8 +10,8 @@ use super::{
     node::{Component, ComponentUpdate, RenderRequest},
 };
 use crate::tui::{session::RecentPrompt, theme::Theme};
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::{
+use crossterm_tact::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui_tact::{
     Frame,
     layout::Rect,
     style::{Modifier, Style},
@@ -360,8 +360,8 @@ mod tests {
         RecentPromptScope,
     };
     use crate::tui::{session::RecentPrompt, theme::Theme};
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-    use ratatui::{Terminal, backend::TestBackend};
+    use crossterm_tact::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use ratatui_tact::{Terminal, backend::TestBackend};
     use std::path::PathBuf;
 
     fn prompt(text: &str, session_id: &str, workspace: &str) -> RecentPrompt {

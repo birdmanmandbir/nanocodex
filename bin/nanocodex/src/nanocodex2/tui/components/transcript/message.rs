@@ -6,7 +6,7 @@
 
 use super::markdown::{sanitize, wrap_plain, wrap_spans};
 use crate::tui::{theme::Theme, transcript::DirectedMessageEntry};
-use ratatui::{
+use ratatui_tact::{
     style::{Modifier, Style},
     text::{Line, Span},
 };
@@ -261,7 +261,7 @@ fn delivery_label(state: &MessageDeliveryState, theme: &Theme) -> (String, Style
         ),
         MessageDeliveryState::Delivered { disposition } => (
             format!("delivered · {}", disposition_label(*disposition)),
-            Style::default().fg(ratatui::style::Color::Green),
+            Style::default().fg(ratatui_tact::style::Color::Green),
         ),
         MessageDeliveryState::Failed { error } => (
             format!("failed · {}", first_line(error)),

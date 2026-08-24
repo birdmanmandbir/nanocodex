@@ -90,10 +90,10 @@ mod tui {
 use components::{AppEvent, AppNode, RootNode};
 use config::{ReasoningEffort, ReasoningMode};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm_tact::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use nanocodex::agent::events::{AgentEvent, AgentEventKind};
 use pane::PaneId;
-use ratatui::{Terminal, backend::TestBackend};
+use ratatui_tact::{Terminal, backend::TestBackend};
 use serde_json::{json, value::to_raw_value};
 use std::{
     hint::black_box,

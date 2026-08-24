@@ -5,7 +5,7 @@
 //! Demand-driven empty transcript animation.
 
 use crate::{app::config::ReasoningEffort, tui::theme::Theme};
-use ratatui::{
+use ratatui_tact::{
     Frame,
     layout::{Position, Rect},
     style::{Modifier, Style},
@@ -149,7 +149,7 @@ fn mask(area: Rect) -> Option<Rect> {
 mod tests {
     use super::{EmptyLogo, FRAME_INTERVAL, WORDMARK, corner_inset, mask};
     use crate::{app::config::ReasoningEffort, tui::theme::Theme};
-    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+    use ratatui_tact::{Terminal, backend::TestBackend, layout::Rect};
     use std::time::Instant;
 
     fn render(logo: &EmptyLogo, width: u16, height: u16) -> Terminal<TestBackend> {
@@ -226,8 +226,8 @@ mod tests {
         assert_eq!(
             colors,
             [
-                ratatui::style::Color::Red,
-                ratatui::style::Color::Rgb(0xD7, 0xD7, 0xD7),
+                ratatui_tact::style::Color::Red,
+                ratatui_tact::style::Color::Rgb(0xD7, 0xD7, 0xD7),
             ]
             .into_iter()
             .collect()
