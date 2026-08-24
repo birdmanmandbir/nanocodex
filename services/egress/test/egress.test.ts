@@ -369,10 +369,11 @@ describe("per-user credential broker", () => {
   });
 
   it("stores only opaque subject mappings in the directory DO", async () => {
-    const stub = workerEnv.AGENT_SUBJECTS.getByName("agent-subjects-v1");
+    const stub = workerEnv.AGENT_SUBJECTS.getByName(`subject-v1:${subjectA}`);
     await runInDurableObject(stub, async (_instance: AgentSubjectDirectory, state) => {
       const mappings = await state.storage.list();
       expect(mappings.get(`subject:${subjectA}`)).toBe("user-openai-a");
+      expect(mappings.has(`subject:${subjectB}`)).toBe(false);
       expect(JSON.stringify([...mappings])).not.toContain("sk-user-a-secret");
     });
   });

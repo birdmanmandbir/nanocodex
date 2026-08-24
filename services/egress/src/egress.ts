@@ -13,7 +13,6 @@ import { canonicalConnectorPath } from "./connector-path";
 export { AgentSubjectDirectory, UserCredentialBroker } from "./broker";
 export { UserConnectorBroker } from "./connector-broker";
 
-const SUBJECT_DIRECTORY_NAME = "agent-subjects-v1";
 const SUBJECT = /^[A-Za-z0-9_-]{43,128}$/;
 const USER_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const SUBJECT_HEADER = "x-nanocodex-subject";
@@ -276,11 +275,14 @@ async function handleControl(request: Request, url: URL, env: EgressEnv): Promis
     const body = await readJson(request, MAX_CONTROL_BODY_BYTES);
     const userId = stringField(body, "user_id");
     if (!USER_ID.test(userId ?? "")) return jsonError(400, "invalid_request");
-    return directory(env).fetch(`https://subjects.internal/v1/${request.method === "PUT" ? "bind" : "unbind"}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ subject: subjectMatch[1], user_id: userId }),
-    });
+    return subjectDirectory(env, subjectMatch[1]!).fetch(
+      `https://subjects.internal/v1/${request.method === "PUT" ? "bind" : "unbind"}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ subject: subjectMatch[1], user_id: userId }),
+      },
+    );
   }
 
   const connectorMatch = url.pathname.match(
@@ -370,7 +372,7 @@ async function handleReadiness(request: Request, env: EgressEnv): Promise<Respon
   }
   try {
     const [subjects, credentials] = await Promise.all([
-      directory(env).fetch("https://subjects.internal/v1/health"),
+      subjectDirectory(env, "broker-readiness-v1").fetch("https://subjects.internal/v1/health"),
       userBroker(env, "broker-readiness-v1").fetch("https://credentials.internal/v1/health"),
     ]);
     if (!subjects.ok || !credentials.ok) {
@@ -483,11 +485,14 @@ async function fetchUpstream(
 }
 
 async function resolveSubject(env: EgressEnv, subject: string): Promise<string> {
-  const response = await directory(env).fetch("https://subjects.internal/v1/resolve", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ subject }),
-  });
+  const response = await subjectDirectory(env, subject).fetch(
+    "https://subjects.internal/v1/resolve",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ subject }),
+    },
+  );
   if (!response.ok) {
     await readBoundedText(response, MAX_BROKER_RESPONSE_BYTES);
     throw new EgressFailure(response.status === 404 ? 403 : 503, "agent_subject_unavailable");
@@ -553,8 +558,11 @@ async function replayableBody(request: Request, operation: ModelOperation): Prom
   return body;
 }
 
-function directory(env: EgressEnv): DurableObjectStub<AgentSubjectDirectory> {
-  return env.AGENT_SUBJECTS.getByName(SUBJECT_DIRECTORY_NAME);
+function subjectDirectory(
+  env: EgressEnv,
+  subject: string,
+): DurableObjectStub<AgentSubjectDirectory> {
+  return env.AGENT_SUBJECTS.getByName(`subject-v1:${subject}`);
 }
 function userBroker(env: EgressEnv, userId: string): DurableObjectStub<UserCredentialBroker> {
   return env.USER_CREDENTIALS.getByName(userId);
