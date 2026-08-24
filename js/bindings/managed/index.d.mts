@@ -5,9 +5,10 @@ export type {
   Event as ManagedEvent,
   EventData as ManagedEventData,
   HistoryCitation as ManagedHistoryCitation,
-  FindThreadsResponse as ManagedFindThreadsResponse,
-  ReadThreadResponse as ManagedReadThreadResponse,
-  HistorySearchResponse as ManagedHistorySearchResponse,
+  FindSessionsResponse as ManagedFindSessionsResponse,
+  ReadSessionResponse as ManagedReadSessionResponse,
+  MemoryKey as ManagedMemoryKey,
+  MemoryRecord as ManagedMemoryRecord,
   Turn as ManagedTurn,
   TurnResult as ManagedTurnResult,
 } from "./Agent.mjs";

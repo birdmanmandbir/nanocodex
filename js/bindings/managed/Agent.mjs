@@ -4,7 +4,7 @@ const API_KEY = /^ncx_live_[A-Za-z0-9_-]{12}_[A-Za-z0-9_-]{43}$/;
 const CURSOR = /^(?:0|[1-9][0-9]*)$/;
 const LATEST_CURSOR = "latest";
 const IDEMPOTENCY_KEY = /^[\x21-\x7e]{1,256}$/;
-const THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const TURN_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 const TERMINAL_TYPES = new Set([
   "turn_completed",
@@ -63,51 +63,45 @@ export async function remove(id, options = {}) {
 
 export { remove as delete };
 
-/** Search completed threads owned by the authenticated account. */
-export async function searchHistory(request, options = {}) {
-  if (!request || typeof request !== "object" || Array.isArray(request)) {
-    throw new TypeError("managed history search request must be an object");
-  }
-  const unsupported = Object.keys(request).find((key) => !["query", "limit", "agentic"].includes(key));
-  if (unsupported) throw new TypeError(`managed history search does not accept ${unsupported}`);
-  if (typeof request.query !== "string" || !request.query.trim()) {
-    throw new TypeError("managed history search query must be a non-empty string");
-  }
-  if (request.limit !== undefined
-    && (!Number.isSafeInteger(request.limit) || request.limit < 1 || request.limit > 20)) {
-    throw new TypeError("managed history search limit must be an integer from 1 through 20");
-  }
-  if (request.agentic !== undefined && typeof request.agentic !== "boolean") {
-    throw new TypeError("managed history search agentic must be a boolean");
-  }
-  const body = await managedClient(options).json("/v1/history/search", {
+/** Find candidate completed sessions owned by the authenticated account. */
+export async function findSessions(request, options = {}) {
+  validateFindSessionsRequest(request);
+  const body = await managedClient(options).json("/v1/history/sessions/search", {
     method: "POST",
     body: JSON.stringify(request),
   });
-  return managedHistorySearchResponse(body);
+  return managedFindSessionsResponse(body);
 }
 
-/** Find candidate completed threads owned by the authenticated account. */
-export async function findThreads(request, options = {}) {
-  validateFindThreadsRequest(request);
-  const body = await managedClient(options).json("/v1/history/threads/search", {
-    method: "POST",
-    body: JSON.stringify(request),
-  });
-  return managedFindThreadsResponse(body);
-}
-
-/** Read exact projected turns from one completed account thread. */
-export async function readThread(request, options = {}) {
-  validateReadThreadRequest(request);
+/** Read exact projected turns from one completed account session. */
+export async function readSession(request, options = {}) {
+  validateReadSessionRequest(request);
   const body = await managedClient(options).json(
-    `/v1/history/threads/${encodeURIComponent(request.thread_id)}/read`,
+    `/v1/history/sessions/${encodeURIComponent(request.session_id)}/read`,
     {
       method: "POST",
       body: JSON.stringify(request.turn_ids === undefined ? {} : { turn_ids: request.turn_ids }),
     },
   );
-  return managedReadThreadResponse(body);
+  return managedReadSessionResponse(body);
+}
+
+/** List the authenticated account's hosted durable memory. */
+export async function listMemories(options = {}) {
+  const body = await managedClient(options).json("/v1/memory");
+  if (!body || typeof body !== "object" || Array.isArray(body) || !Array.isArray(body.memories)) {
+    throw new ManagedError("invalid_response", "managed memory list is malformed");
+  }
+  return Object.freeze(body.memories.map(managedMemoryRecord));
+}
+
+/** Compare-and-swap delete one account-owned hosted memory. */
+export async function deleteMemory(key, options = {}) {
+  validateMemoryKey(key);
+  await managedClient(options).empty(
+    `/v1/memory/${key.id}?version=${key.version}`,
+    { method: "DELETE" },
+  );
 }
 
 function agentHandle(client, id, summary) {
@@ -297,41 +291,25 @@ function terminalResult(turnId, terminal, cursor) {
   throw new ManagedError(code, message);
 }
 
-function managedHistorySearchResponse(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)
-    || typeof value.query !== "string"
-    || typeof value.agentic !== "boolean"
-    || (value.answer !== null && typeof value.answer !== "string")) {
-    throw new ManagedError("invalid_response", "managed history search response is malformed");
-  }
-  return Object.freeze({
-    query: value.query,
-    agentic: value.agentic,
-    answer: value.answer,
-    results: managedHistoryHits(value.results),
-    citations: managedCitations(value.citations),
-  });
-}
-
-function managedFindThreadsResponse(value) {
+function managedFindSessionsResponse(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)
     || typeof value.query !== "string") {
-    throw new ManagedError("invalid_response", "managed find threads response is malformed");
+    throw new ManagedError("invalid_response", "managed find sessions response is malformed");
   }
   return Object.freeze({
     query: value.query,
-    results: managedHistoryHits(value.results),
+    results: managedSessionSearchHits(value.results),
     citations: managedCitations(value.citations),
   });
 }
 
-function managedHistoryHits(value) {
+function managedSessionSearchHits(value) {
   if (!Array.isArray(value)) {
     throw new ManagedError("invalid_response", "managed history results are malformed");
   }
   return Object.freeze(value.map((result) => {
     if (!result || typeof result !== "object" || Array.isArray(result)
-      || typeof result.thread_id !== "string"
+      || typeof result.session_id !== "string"
       || typeof result.title !== "string"
       || typeof result.turn_id !== "string"
       || typeof result.cursor !== "string" || !CURSOR.test(result.cursor)
@@ -340,7 +318,7 @@ function managedHistoryHits(value) {
       throw new ManagedError("invalid_response", "managed history search result is malformed");
     }
     return Object.freeze({
-      thread_id: result.thread_id,
+      session_id: result.session_id,
       title: result.title,
       turn_id: result.turn_id,
       cursor: result.cursor,
@@ -350,22 +328,22 @@ function managedHistoryHits(value) {
   }));
 }
 
-function managedReadThreadResponse(value) {
+function managedReadSessionResponse(value) {
   if (!value || typeof value !== "object" || Array.isArray(value) || !Array.isArray(value.turns)) {
-    throw new ManagedError("invalid_response", "managed read thread response is malformed");
+    throw new ManagedError("invalid_response", "managed read session response is malformed");
   }
   const turns = value.turns.map((turn) => {
     if (!turn || typeof turn !== "object" || Array.isArray(turn)
-      || typeof turn.thread_id !== "string"
+      || typeof turn.session_id !== "string"
       || typeof turn.title !== "string"
       || typeof turn.turn_id !== "string"
       || typeof turn.cursor !== "string" || !CURSOR.test(turn.cursor)
       || typeof turn.user !== "string"
       || typeof turn.assistant !== "string") {
-      throw new ManagedError("invalid_response", "managed thread turn is malformed");
+      throw new ManagedError("invalid_response", "managed session turn is malformed");
     }
     return Object.freeze({
-      thread_id: turn.thread_id,
+      session_id: turn.session_id,
       title: turn.title,
       turn_id: turn.turn_id,
       cursor: turn.cursor,
@@ -376,6 +354,37 @@ function managedReadThreadResponse(value) {
   return Object.freeze({
     turns: Object.freeze(turns),
     citations: managedCitations(value.citations),
+  });
+}
+
+function managedMemoryRecord(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ManagedError("invalid_response", "managed memory record is malformed");
+  }
+  validateMemoryKeyResponse(value.key);
+  for (const field of ["created_at_ms", "updated_at_ms", "scan_count", "use_count"]) {
+    if (!Number.isSafeInteger(value[field]) || value[field] < 0) {
+      throw new ManagedError("invalid_response", "managed memory record is malformed");
+    }
+  }
+  for (const field of ["last_scanned_at_ms", "last_used_at_ms", "probation_until_ms"]) {
+    if (value[field] !== null && (!Number.isSafeInteger(value[field]) || value[field] < 0)) {
+      throw new ManagedError("invalid_response", "managed memory record is malformed");
+    }
+  }
+  if (typeof value.content !== "string") {
+    throw new ManagedError("invalid_response", "managed memory record is malformed");
+  }
+  return Object.freeze({
+    key: Object.freeze({ id: value.key.id, version: value.key.version }),
+    content: value.content,
+    created_at_ms: value.created_at_ms,
+    updated_at_ms: value.updated_at_ms,
+    last_scanned_at_ms: value.last_scanned_at_ms,
+    scan_count: value.scan_count,
+    last_used_at_ms: value.last_used_at_ms,
+    use_count: value.use_count,
+    probation_until_ms: value.probation_until_ms,
   });
 }
 
@@ -766,34 +775,53 @@ function validateAgentId(id) {
   }
 }
 
-function validateFindThreadsRequest(request) {
+function validateFindSessionsRequest(request) {
   if (!request || typeof request !== "object" || Array.isArray(request)) {
-    throw new TypeError("managed find threads request must be an object");
+    throw new TypeError("managed find sessions request must be an object");
   }
   const unsupported = Object.keys(request).find((key) => !["query", "limit"].includes(key));
-  if (unsupported) throw new TypeError(`managed find threads does not accept ${unsupported}`);
+  if (unsupported) throw new TypeError(`managed find sessions does not accept ${unsupported}`);
   if (typeof request.query !== "string" || !request.query.trim()) {
-    throw new TypeError("managed find threads query must be a non-empty string");
+    throw new TypeError("managed find sessions query must be a non-empty string");
   }
   if (request.limit !== undefined
     && (!Number.isSafeInteger(request.limit) || request.limit < 1 || request.limit > 20)) {
-    throw new TypeError("managed find threads limit must be an integer from 1 through 20");
+    throw new TypeError("managed find sessions limit must be an integer from 1 through 20");
   }
 }
 
-function validateReadThreadRequest(request) {
+function validateReadSessionRequest(request) {
   if (!request || typeof request !== "object" || Array.isArray(request)) {
-    throw new TypeError("managed read thread request must be an object");
+    throw new TypeError("managed read session request must be an object");
   }
-  const unsupported = Object.keys(request).find((key) => !["thread_id", "turn_ids"].includes(key));
-  if (unsupported) throw new TypeError(`managed read thread does not accept ${unsupported}`);
-  if (typeof request.thread_id !== "string" || !THREAD_ID.test(request.thread_id)) {
-    throw new TypeError("managed thread id is invalid");
+  const unsupported = Object.keys(request).find((key) => !["session_id", "turn_ids"].includes(key));
+  if (unsupported) throw new TypeError(`managed read session does not accept ${unsupported}`);
+  if (typeof request.session_id !== "string" || !SESSION_ID.test(request.session_id)) {
+    throw new TypeError("managed session id is invalid");
   }
   if (request.turn_ids !== undefined && (!Array.isArray(request.turn_ids)
     || request.turn_ids.length > 20
     || request.turn_ids.some((id) => typeof id !== "string" || !TURN_ID.test(id)))) {
-    throw new TypeError("managed read thread turn_ids must contain at most 20 valid turn ids");
+    throw new TypeError("managed read session turn_ids must contain at most 20 valid turn ids");
+  }
+}
+
+function validateMemoryKey(key) {
+  if (!key || typeof key !== "object" || Array.isArray(key)
+    || Object.keys(key).some((field) => field !== "id" && field !== "version")
+    || !Number.isSafeInteger(key.id) || key.id < 1
+    || !Number.isSafeInteger(key.version) || key.version < 1) {
+    throw new TypeError("managed memory key must contain positive safe integer id and version");
+  }
+}
+
+function validateMemoryKeyResponse(key) {
+  try {
+    validateMemoryKey(key);
+  } catch (error) {
+    throw new ManagedError("invalid_response", "managed memory record has an invalid key", {
+      cause: error,
+    });
   }
 }
 

@@ -6,50 +6,53 @@ export type HistoryCitation = Readonly<{
   title: string;
   sources: readonly HistorySource[];
 }>;
-export type HistorySearchHit = Readonly<{
-  thread_id: string;
+export type SessionSearchHit = Readonly<{
+  session_id: string;
   title: string;
   turn_id: string;
   cursor: string;
   score: number;
   snippet: string;
 }>;
-export type HistorySearchRequest = Readonly<{
-  query: string;
-  limit?: number | undefined;
-  agentic?: boolean | undefined;
-}>;
-export type HistorySearchResponse = Readonly<{
-  query: string;
-  agentic: boolean;
-  answer: string | null;
-  results: readonly HistorySearchHit[];
-  citations: readonly HistoryCitation[];
-}>;
-export type FindThreadsRequest = Readonly<{
+export type FindSessionsRequest = Readonly<{
   query: string;
   limit?: number | undefined;
 }>;
-export type FindThreadsResponse = Readonly<{
+export type FindSessionsResponse = Readonly<{
   query: string;
-  results: readonly HistorySearchHit[];
+  results: readonly SessionSearchHit[];
   citations: readonly HistoryCitation[];
 }>;
-export type ReadThreadRequest = Readonly<{
-  thread_id: string;
+export type ReadSessionRequest = Readonly<{
+  session_id: string;
   turn_ids?: readonly string[] | undefined;
 }>;
-export type ThreadTurn = Readonly<{
-  thread_id: string;
+export type SessionTurn = Readonly<{
+  session_id: string;
   title: string;
   turn_id: string;
   cursor: string;
   user: string;
   assistant: string;
 }>;
-export type ReadThreadResponse = Readonly<{
-  turns: readonly ThreadTurn[];
+export type ReadSessionResponse = Readonly<{
+  turns: readonly SessionTurn[];
   citations: readonly HistoryCitation[];
+}>;
+export type MemoryKey = Readonly<{
+  id: number;
+  version: number;
+}>;
+export type MemoryRecord = Readonly<{
+  key: MemoryKey;
+  content: string;
+  created_at_ms: number;
+  updated_at_ms: number;
+  last_scanned_at_ms: number | null;
+  scan_count: number;
+  last_used_at_ms: number | null;
+  use_count: number;
+  probation_until_ms: number | null;
 }>;
 
 export type Options = Readonly<{
@@ -224,6 +227,9 @@ export function get(id: string, options?: Options): Promise<Agent>;
 export function open(id: string, options?: Options): Agent;
 export function remove(id: string, options?: Options): Promise<void>;
 export { remove as delete };
-export function searchHistory(request: HistorySearchRequest, options?: Options): Promise<HistorySearchResponse>;
-export function findThreads(request: FindThreadsRequest, options?: Options): Promise<FindThreadsResponse>;
-export function readThread(request: ReadThreadRequest, options?: Options): Promise<ReadThreadResponse>;
+export function findSessions(request: FindSessionsRequest, options?: Options): Promise<FindSessionsResponse>;
+export function readSession(request: ReadSessionRequest, options?: Options): Promise<ReadSessionResponse>;
+/** List the authenticated account's hosted durable memory. */
+export function listMemories(options?: Options): Promise<readonly MemoryRecord[]>;
+/** Compare-and-swap delete one hosted durable memory; deleting an absent id is idempotent. */
+export function deleteMemory(key: MemoryKey, options?: Options): Promise<void>;
