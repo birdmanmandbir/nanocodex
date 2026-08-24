@@ -19,10 +19,19 @@ enabled until Nanocodex has an authoritative membership service. App metadata,
 build jobs, revisions, state, Git repositories, launch tickets, and mounted
 agents are resolved inside that tenant boundary.
 
-Launching an app mints a signed, one-use, 60-second ticket. The public runtime
-redeems it over the private `RuntimePlatform` binding and sets a host-only,
-HTTP-only cookie scoped to exactly one tenant and app. The account cookie and
-provider credentials never reach generated code.
+Launching an app first creates a signed account intent. The runtime establishes
+a high-entropy, HTTP-only browser transaction and returns to the authenticated
+account before the control plane mints a signed, one-use, 60-second ticket. A
+copied ticket cannot be redeemed from a different browser. The runtime session
+cookie is path-scoped to the app's immutable ID, so multiple private apps can
+remain open without sharing ambient authority.
+
+The authenticated runtime page is host-owned. It places generated UI in a
+sandboxed iframe without `allow-same-origin`, using a separate signed URL bound
+to one actor, tenant, app, and expiry. The host overwrites generated security
+headers and CSP: service workers and external browser connections are denied,
+while API calls back to the same app frame are permitted. Account cookies,
+runtime cookies, API keys, and provider credentials never reach generated code.
 
 ## Build and version-control pipeline
 
@@ -38,16 +47,20 @@ Each Cloudflare Workflow run:
 
 The Git repository uses the existing Smart HTTP, Durable Object, pack, and R2
 implementation, but app repositories occupy a separate private namespace and
-have no public `/git/app-*` route. A revision records both its SHA-256 executable
+have no public `/git/app-*` route. After each push, the builder fetches into a
+fresh filesystem, proves the advertised commit is the expected direct
+fast-forward, and compares every tracked file to the generated project before
+publication. A revision records both its SHA-256 executable
 artifact ID and its SHA-1 source commit. Updates append commits. Rollback only
 moves the active revision pointer; it never rewrites Git history. One build per
 app may be active at a time.
 
 ## Generated-app bindings
 
-Dynamic Workers receive only `NANOCODEX`; ambient outbound networking is
-disabled. The binding exposes app-scoped state and text generation methods, and
-also implements `fetch()` for durable Nanocodex agents:
+Builders explicitly approve a fixed capability manifest before creating an
+app. Dynamic Workers receive only `NANOCODEX`; ambient outbound networking is
+disabled. The binding exposes profile read, app-scoped state, text generation,
+and durable Nanocodex agents:
 
 ```js
 const created = await env.NANOCODEX.fetch("https://agents.internal/v1/agents", {
@@ -79,7 +92,8 @@ npm run check
 
 The control Worker requires `LAUNCH_TICKET_SECRET`; the runtime Worker requires
 the independently generated `RUNTIME_SESSION_SECRET`. Each must contain at
-least 32 UTF-8 bytes.
+least 32 UTF-8 bytes. `RUNTIME_ORIGIN` on control and `MANAGED_ORIGIN` on runtime
+are fixed HTTPS origins, never caller-provided redirect targets.
 
 ```sh
 openssl rand -base64 48 | npx wrangler secret put LAUNCH_TICKET_SECRET

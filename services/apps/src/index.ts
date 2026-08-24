@@ -1,11 +1,13 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 
 import {
+  issueLaunchIntent,
   issueLaunchTicket,
-  validateRuntimeSessionClaims,
+  validateFrameSessionClaims,
+  verifyLaunchIntent,
   verifyLaunchTicket,
+  type FrameSessionClaims,
   type LaunchTicketClaims,
-  type RuntimeSessionClaims,
 } from "./auth";
 import { appRequest, appResponse } from "./boundary";
 import { parseArtifact, type BuildArtifact } from "./builder";
@@ -18,7 +20,9 @@ import {
 import type { AppGitService } from "./git";
 import {
   LaunchTicketStore,
+  consumeLaunchIntent,
   consumeLaunchTicket,
+  recordLaunchIntent,
   recordLaunchTicket,
 } from "./launch-tickets";
 import {
@@ -50,7 +54,8 @@ const APP_GRANTS = Object.freeze([
   "agents:run",
 ]);
 const USER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-const APP_PATH = /^\/a\/([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(\/.*)?$/;
+const APP_PATH = /^\/a\/([A-Za-z0-9._:-]+)\/([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(\/.*)?$/;
+const TRANSACTION = /^[A-Za-z0-9_-]{22,64}$/;
 
 export interface Env {
   AI: Ai;
@@ -113,25 +118,32 @@ export class AppPlatform extends WorkerEntrypoint<Env, AppPlatformProps> {
 }
 
 export class RuntimePlatform extends WorkerEntrypoint<Env, RuntimePlatformProps> {
-  async redeemLaunchTicket(token: string): Promise<LaunchTicketClaims | null> {
+  async redeemLaunchTicket(token: string, transaction: string): Promise<LaunchTicketClaims | null> {
     this.#requireRuntime();
     if (!configured(this.env)) return null;
     const claims = await verifyLaunchTicket(token, this.env.LAUNCH_TICKET_SECRET);
-    if (!claims) return null;
+    if (!claims || claims.transaction !== transaction || !TRANSACTION.test(transaction)) return null;
     return await consumeLaunchTicket(this.env.APP_LAUNCH_TICKETS, claims) ? claims : null;
   }
 
-  async invokeApp(claimsInput: RuntimeSessionClaims, request: Request): Promise<Response> {
+  async invokeApp(
+    claimsInput: FrameSessionClaims,
+    request: Request,
+    publicPrefix: string,
+  ): Promise<Response> {
     this.#requireRuntime();
     if (!configured(this.env)) return json({ error: "platform_unavailable" }, 503);
-    const claims = validateRuntimeSessionClaims(claimsInput);
+    const claims = validateFrameSessionClaims(claimsInput);
     if (!claims || !USER_ID.test(claims.actorUserId)) return json({ error: "unauthorized" }, 401);
     const tenantId = validateTenantId(claims.tenantId);
     const app = await getApp(this.env.APP_REGISTRY, tenantId, claims.appId);
     if (!app || app.slug !== claims.slug || app.ownerId !== tenantId) {
       return json({ error: "not_found" }, 404);
     }
-    return invokeDynamicApp(request, this.env, this.ctx, claims, app);
+    if (!validPublicPrefix(publicPrefix, app.appId, app.slug)) {
+      return json({ error: "invalid_public_prefix" }, 400);
+    }
+    return invokeDynamicApp(request, this.env, this.ctx, claims, app, publicPrefix);
   }
 
   #requireRuntime(): void {
@@ -149,6 +161,30 @@ async function routePlatformApi(
   actorUserId: string,
 ): Promise<Response> {
   try {
+    if (url.pathname === "/apps/api/launch/complete" && request.method === "GET") {
+      const intents = url.searchParams.getAll("intent");
+      const transactions = url.searchParams.getAll("transaction");
+      if (intents.length !== 1 || intents[0].length > 2 * 1024
+        || transactions.length !== 1 || !TRANSACTION.test(transactions[0])) {
+        return json({ error: "invalid_launch" }, 400);
+      }
+      const intent = await verifyLaunchIntent(intents[0], env.LAUNCH_TICKET_SECRET);
+      if (!intent || intent.actorUserId !== actorUserId || intent.tenantId !== tenantId) {
+        return json({ error: "invalid_launch" }, 401);
+      }
+      const app = await getApp(env.APP_REGISTRY, tenantId, intent.appId);
+      if (!app || app.slug !== intent.slug) return json({ error: "not_found" }, 404);
+      if (!await consumeLaunchIntent(env.APP_LAUNCH_TICKETS, intent)) {
+        return json({ error: "invalid_launch" }, 401);
+      }
+      const ticket = await issueLaunchTicket(env.LAUNCH_TICKET_SECRET, intent, transactions[0]);
+      const claims = await verifyLaunchTicket(ticket, env.LAUNCH_TICKET_SECRET);
+      if (!claims) throw new Error("launch ticket self-verification failed");
+      await recordLaunchTicket(env.APP_LAUNCH_TICKETS, claims);
+      const target = new URL("/__auth/launch", env.RUNTIME_ORIGIN);
+      target.searchParams.set("ticket", ticket);
+      return redirect(target);
+    }
     if (url.pathname === "/apps/api/apps" && request.method === "GET") {
       const apps = await listApps(env.APP_REGISTRY, tenantId);
       return json({ apps: apps.map(appView), tenant: { id: tenantId, kind: "personal" } }, 200);
@@ -158,6 +194,9 @@ async function routePlatformApi(
       if (body instanceof Response) return body;
       const prompt = typeof body.prompt === "string" ? body.prompt.trim() : "";
       const updateAppId = typeof body.app_id === "string" && body.app_id ? body.app_id : undefined;
+      if (!hasApprovedAppGrants(body.grants)) {
+        return json({ error: "capability_approval_required", grants: APP_GRANTS }, 400);
+      }
       if (!prompt || prompt.length > MAX_PROMPT_CHARS) {
         return json({ error: "prompt must contain 1-24576 characters" }, 400);
       }
@@ -210,25 +249,18 @@ async function routePlatformApi(
     if (launchMatch && request.method === "POST") {
       const app = await getApp(env.APP_REGISTRY, tenantId, launchMatch[1]);
       if (!app) return json({ error: "not_found" }, 404);
-      const ticket = await issueLaunchTicket(env.LAUNCH_TICKET_SECRET, {
+      const launchIntent = await issueLaunchIntent(env.LAUNCH_TICKET_SECRET, {
         actorUserId,
         appId: app.appId,
         slug: app.slug,
         tenantId,
       });
-      const claims = await verifyLaunchTicket(ticket, env.LAUNCH_TICKET_SECRET);
-      if (!claims) throw new Error("launch ticket self-verification failed");
-      await recordLaunchTicket(env.APP_LAUNCH_TICKETS, claims);
-      const target = new URL("/__auth/launch", env.RUNTIME_ORIGIN);
-      target.searchParams.set("ticket", ticket);
-      return new Response(null, {
-        status: 303,
-        headers: {
-          "cache-control": "no-store",
-          location: target.href,
-          "referrer-policy": "no-referrer",
-        },
-      });
+      const claims = await verifyLaunchIntent(launchIntent, env.LAUNCH_TICKET_SECRET);
+      if (!claims) throw new Error("launch intent self-verification failed");
+      await recordLaunchIntent(env.APP_LAUNCH_TICKETS, claims);
+      const target = new URL("/__auth/begin", env.RUNTIME_ORIGIN);
+      target.searchParams.set("intent", launchIntent);
+      return redirect(target);
     }
     const activateMatch = url.pathname.match(/^\/apps\/api\/apps\/([A-Za-z0-9._:-]+)\/activate$/);
     if (activateMatch && request.method === "POST") {
@@ -271,8 +303,9 @@ async function invokeDynamicApp(
   request: Request,
   env: ConfiguredEnv,
   ctx: ExecutionContext,
-  claims: RuntimeSessionClaims,
+  claims: FrameSessionClaims,
   app: App,
+  publicPrefix: string,
 ): Promise<Response> {
   const revision = app.revisions.find((candidate) => candidate.revisionId === app.activeRevisionId);
   if (!revision) return json({ error: "active_revision_missing" }, 503);
@@ -308,7 +341,7 @@ async function invokeDynamicApp(
     props: {
       actorUserId: claims.actorUserId,
       appId: app.appId,
-      basePath: `/a/${app.slug}/`,
+      basePath: `${publicPrefix}/`,
       displayName: app.displayName,
       grants: APP_GRANTS,
       revision: revision.revisionId,
@@ -328,37 +361,55 @@ async function invokeDynamicApp(
   );
   const incoming = new URL(request.url);
   const route = APP_PATH.exec(incoming.pathname);
-  if (!route || route[1] !== app.slug) return json({ error: "not_found" }, 404);
-  const virtualUrl = new URL(`https://app.internal${route[2] || "/"}`);
+  if (!route || route[1] !== app.appId || route[2] !== app.slug) return json({ error: "not_found" }, 404);
+  const virtualUrl = new URL(`https://app.internal${route[3] || "/"}`);
   virtualUrl.search = incoming.search;
   const sanitized = appRequest(request);
   const headers = new Headers(sanitized.headers);
-  headers.set("x-forwarded-prefix", `/a/${app.slug}`);
+  headers.set("x-forwarded-prefix", publicPrefix);
   const forwarded = new Request(virtualUrl, new Request(sanitized, { headers }));
   try {
     const response = await worker.getEntrypoint().fetch(
       forwarded as unknown as Request<unknown, CfProperties<unknown>>,
     );
-    return rewriteAppResponse(appResponse(response), app.slug);
-  } catch (error) {
+    return rewriteAppResponse(appResponse(response), publicPrefix);
+  } catch {
     console.error(JSON.stringify({
       type: "dynamic_app.failed",
       app_id: app.appId,
       revision: revision.revisionId,
       tenant_id: claims.tenantId,
-      error: errorMessage(error),
     }));
     return json({ error: "app_failed" }, 502);
   }
 }
 
-function rewriteAppResponse(response: Response, slug: string): Response {
+function rewriteAppResponse(response: Response, publicPrefix: string): Response {
   const headers = new Headers(response.headers);
   const location = headers.get("location");
   if (location?.startsWith("/") && !location.startsWith("//")) {
-    headers.set("location", `/a/${slug}${location}`);
+    headers.set("location", `${publicPrefix}${location}`);
   }
   return new Response(response.body, { headers, status: response.status, statusText: response.statusText });
+}
+
+function validPublicPrefix(prefix: string, appId: string, slug: string): boolean {
+  if (prefix.length > 3 * 1024 || !prefix.endsWith(`/a/${appId}/${slug}`)) return false;
+  const token = prefix.slice("/__frame/".length, -(`/a/${appId}/${slug}`).length);
+  return prefix.startsWith("/__frame/")
+    && token.length <= 2 * 1024
+    && /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}$/.test(token);
+}
+
+function redirect(target: URL): Response {
+  return new Response(null, {
+    status: 303,
+    headers: {
+      "cache-control": "no-store",
+      location: target.href,
+      "referrer-policy": "no-referrer",
+    },
+  });
 }
 
 async function serveConsoleAsset(request: Request, env: ConfiguredEnv, url: URL): Promise<Response> {
@@ -398,9 +449,11 @@ function configured(env: Env): env is ConfiguredEnv {
 
 async function readJson(request: Request): Promise<Record<string, unknown> | Response> {
   const length = Number(request.headers.get("content-length") ?? "0");
-  if (!Number.isFinite(length) || length > MAX_JSON_BYTES) return json({ error: "request_too_large" }, 413);
-  const text = await request.text();
-  if (text.length > MAX_JSON_BYTES) return json({ error: "request_too_large" }, 413);
+  if (!Number.isFinite(length) || length < 0 || length > MAX_JSON_BYTES) {
+    return json({ error: "request_too_large" }, 413);
+  }
+  const text = await readBoundedText(request, MAX_JSON_BYTES);
+  if (text === undefined) return json({ error: "request_too_large" }, 413);
   try {
     const value = JSON.parse(text) as unknown;
     return value && typeof value === "object" && !Array.isArray(value)
@@ -408,6 +461,32 @@ async function readJson(request: Request): Promise<Record<string, unknown> | Res
       : json({ error: "invalid_json" }, 400);
   } catch {
     return json({ error: "invalid_json" }, 400);
+  }
+}
+
+async function readBoundedText(request: Request, maxBytes: number): Promise<string | undefined> {
+  if (!request.body) return "";
+  const reader = request.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let total = 0;
+  let text = "";
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      total += next.value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel("request body exceeds limit").catch(() => undefined);
+        return undefined;
+      }
+      text += decoder.decode(next.value, { stream: true });
+    }
+    text += decoder.decode();
+    return text;
+  } catch {
+    return undefined;
+  } finally {
+    reader.releaseLock();
   }
 }
 
@@ -429,6 +508,7 @@ function appView(app: App | AppSummary): object {
     created_at: app.createdAt,
     display_name: app.displayName,
     id: app.appId,
+    grants: APP_GRANTS,
     live_slug: app.liveSlug,
     revisions: app.revisions.map((revision) => ({
       artifact_bytes: revision.artifactBytes,
@@ -441,6 +521,12 @@ function appView(app: App | AppSummary): object {
     slug: app.slug,
     updated_at: app.updatedAt,
   };
+}
+
+function hasApprovedAppGrants(value: unknown): boolean {
+  return Array.isArray(value)
+    && value.length === APP_GRANTS.length
+    && APP_GRANTS.every((grant, index) => value[index] === grant);
 }
 
 function json(body: unknown, status: number): Response {

@@ -1,6 +1,10 @@
 import { beforeAll, describe, expect, it, vi } from "vitest";
 
-import { RUNTIME_SESSION_AUDIENCE, type RuntimeSessionClaims } from "../src/auth";
+import {
+  FRAME_SESSION_AUDIENCE,
+  type FrameSessionClaims,
+  verifyLaunchTicket,
+} from "../src/auth";
 import { buildProject, serializeArtifact } from "../src/builder";
 import type { Env } from "../src/index";
 
@@ -142,8 +146,19 @@ describe("tenant app control plane", () => {
     const denied = await gateway.request("forged", new Request("https://nanocodex.test/apps/api/apps"));
     expect(denied.status).toBe(401);
 
+    const unapproved = await gateway.request(USER_ID, new Request("https://nanocodex.test/apps/api/builds", {
+      body: JSON.stringify({ prompt: "Build without reviewing app powers" }),
+      headers: { "content-type": "application/json", origin: "https://nanocodex.test" },
+      method: "POST",
+    }));
+    expect(unapproved.status).toBe(400);
+    expect(await unapproved.json()).toMatchObject({ error: "capability_approval_required" });
+
     const response = await gateway.request(USER_ID, new Request("https://nanocodex.test/apps/api/builds", {
-      body: JSON.stringify({ prompt: "Build me a tiny issue tracker" }),
+      body: JSON.stringify({
+        grants: ["profile:read", "state:read", "state:write", "ai:generate", "agents:run"],
+        prompt: "Build me a tiny issue tracker",
+      }),
       headers: { "content-type": "application/json", origin: "https://nanocodex.test" },
       method: "POST",
     }));
@@ -164,10 +179,13 @@ describe("tenant app control plane", () => {
     expect(crossOrigin.status).toBe(403);
   });
 
-  it("mints an account-authorized one-time launch instead of exposing a runtime URL", async () => {
+  it("completes an account-authorized launch only after binding a runtime browser transaction", async () => {
     const app = appRecord();
     const registry = { getApp: vi.fn(async () => app) };
-    const ticketStore = { issue: vi.fn(async () => undefined) };
+    const ticketStore = {
+      consume: vi.fn(async () => true),
+      issue: vi.fn(async () => undefined),
+    };
     const env = configuredEnv({
       APP_LAUNCH_TICKETS: { getByName: vi.fn(() => ticketStore) } as unknown as Env["APP_LAUNCH_TICKETS"],
       APP_REGISTRY: {
@@ -182,9 +200,28 @@ describe("tenant app control plane", () => {
     expect(response.status).toBe(303);
     const location = new URL(response.headers.get("location")!);
     expect(location.origin).toBe("https://runtime.example.test");
-    expect(location.pathname).toBe("/__auth/launch");
-    expect(location.searchParams.get("ticket")).toMatch(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}$/);
+    expect(location.pathname).toBe("/__auth/begin");
+    const intent = location.searchParams.get("intent")!;
+    expect(intent).toMatch(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}$/);
     expect(ticketStore.issue).toHaveBeenCalledOnce();
+
+    const transaction = "transaction-nonce-12345678";
+    const completion = await appGateway(env).request(USER_ID, new Request(
+      `https://nanocodex.test/apps/api/launch/complete?intent=${intent}&transaction=${transaction}`,
+    ));
+    expect(completion.status).toBe(303);
+    const launch = new URL(completion.headers.get("location")!);
+    expect(launch.origin).toBe("https://runtime.example.test");
+    expect(launch.pathname).toBe("/__auth/launch");
+    const ticket = launch.searchParams.get("ticket")!;
+    expect(await verifyLaunchTicket(ticket, TICKET_SECRET)).toMatchObject({
+      actorUserId: USER_ID,
+      appId: app.appId,
+      tenantId: TENANT_ID,
+      transaction,
+    });
+    expect(ticketStore.consume).toHaveBeenCalledOnce();
+    expect(ticketStore.issue).toHaveBeenCalledTimes(2);
   });
 
   it("loads an exact immutable revision for only the attested runtime tenant and app", async () => {
@@ -221,16 +258,17 @@ describe("tenant app control plane", () => {
       LOADER: loader as unknown as WorkerLoader,
     });
     const capability = { marker: "host-owned" };
-    const claims = runtimeClaims(app.appId, app.slug);
+    const claims = frameClaims(app.appId, app.slug);
+    const publicPrefix = `/__frame/${"a".repeat(24)}.${"b".repeat(43)}/a/${app.appId}/${app.slug}`;
     const response = await runtimeGateway(env, {
       exports: { NanocodexCapability: () => capability },
     }).invokeApp(claims, new Request(
-      "https://runtime.example.test/a/tiny-app/api/items?q=one",
+      `https://runtime.example.test/a/${app.appId}/tiny-app/api/items?q=one`,
       { headers: { authorization: "Bearer forged", cookie: "private=1" } },
-    ));
+    ), publicPrefix);
 
     expect(response.status).toBe(302);
-    expect(response.headers.get("location")).toBe("/a/tiny-app/next");
+    expect(response.headers.get("location")).toBe(`${publicPrefix}/next`);
     expect(response.headers.get("set-cookie")).toBeNull();
     expect(loader.get).toHaveBeenCalledWith(
       `${TENANT_ID}:${app.appId}:${artifact.revision}:1`,
@@ -245,7 +283,7 @@ describe("tenant app control plane", () => {
     expect(invoked?.url).toBe("https://app.internal/api/items?q=one");
     expect(invoked?.headers.get("cookie")).toBeNull();
     expect(invoked?.headers.get("authorization")).toBeNull();
-    expect(invoked?.headers.get("x-forwarded-prefix")).toBe("/a/tiny-app");
+    expect(invoked?.headers.get("x-forwarded-prefix")).toBe(publicPrefix);
   });
 
   it("rejects a self-validating artifact that does not match the registry revision", async () => {
@@ -272,8 +310,9 @@ describe("tenant app control plane", () => {
     });
 
     const response = await runtimeGateway(env).invokeApp(
-      runtimeClaims(app.appId, app.slug),
-      new Request("https://runtime.example.test/a/tiny-app/"),
+      frameClaims(app.appId, app.slug),
+      new Request(`https://runtime.example.test/a/${app.appId}/tiny-app/`),
+      `/__frame/${"a".repeat(24)}.${"b".repeat(43)}/a/${app.appId}/tiny-app`,
     );
 
     expect(response.status).toBe(503);
@@ -290,22 +329,24 @@ describe("tenant app control plane", () => {
       } as unknown as Env["APP_REGISTRY"],
     });
     const response = await runtimeGateway(env).invokeApp(
-      runtimeClaims("0198e2c4-365e-7a66-a58f-d4e5b46a7dae", "tiny-app"),
-      new Request("https://runtime.example.test/a/tiny-app/"),
+      frameClaims("0198e2c4-365e-7a66-a58f-d4e5b46a7dae", "tiny-app"),
+      new Request("https://runtime.example.test/a/0198e2c4-365e-7a66-a58f-d4e5b46a7dae/tiny-app/"),
+      `/__frame/${"a".repeat(24)}.${"b".repeat(43)}/a/0198e2c4-365e-7a66-a58f-d4e5b46a7dae/tiny-app`,
     );
     expect(response.status).toBe(404);
   });
 });
 
-function runtimeClaims(appId: string, slug: string): RuntimeSessionClaims {
+function frameClaims(appId: string, slug: string): FrameSessionClaims {
   return {
     actorUserId: USER_ID,
     appId,
-    audience: RUNTIME_SESSION_AUDIENCE,
+    audience: FRAME_SESSION_AUDIENCE,
     expiry: Math.floor(Date.now() / 1_000) + 3_600,
     nonce: "abcdefghijklmnopqrstuvwxyz",
     slug,
     tenantId: TENANT_ID,
+    transaction: "transaction-nonce-12345678",
     version: 1,
   };
 }

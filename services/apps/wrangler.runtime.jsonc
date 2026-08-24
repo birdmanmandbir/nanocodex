@@ -21,5 +21,8 @@
       "entrypoint": "RuntimePlatform",
       "props": { "clientId": "nanocodex-app-runtime" }
     }
-  ]
+  ],
+  "vars": {
+    "MANAGED_ORIGIN": "https://nanocodex.gakonst.workers.dev"
+  }
 }

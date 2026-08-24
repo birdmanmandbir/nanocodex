@@ -59,21 +59,23 @@ export async function commitProject(
   const fs = createMemoryGitFs();
   const http = appGitHttp(service, repository);
   const remoteUrl = repositoryUrl(repository);
-
-  await prepareRepository(fs, http, remoteUrl);
-  const head = await resolveHead(fs);
-  if (head && await headBelongsToJob(fs, head, input.jobId)) {
-    return { oid: head, repository };
-  }
-
-  const tracked = new Set(await git.listFiles({ fs, dir: DIRECTORY }));
-  const desired = new Map(project.files.map((file) => [file.path, file.content]));
-  desired.set(MANIFEST_PATH, canonicalJson({
+  const manifest = canonicalJson({
     appId: input.appId,
     entryPoint: project.entryPoint,
     jobId: input.jobId,
     policyVersion: APP_POLICY_VERSION,
-  }));
+  });
+  const desired = new Map(project.files.map((file) => [file.path, file.content]));
+  desired.set(MANIFEST_PATH, manifest);
+
+  await prepareRepository(fs, http, remoteUrl);
+  const head = await resolveHead(fs);
+  if (head && await headBelongsToJob(fs, head, input.jobId)) {
+    await verifyCheckedOutProject(fs, head, desired);
+    return { oid: head, repository };
+  }
+
+  const tracked = new Set(await git.listFiles({ fs, dir: DIRECTORY }));
 
   for (const path of tracked) {
     if (desired.has(path)) continue;
@@ -116,6 +118,7 @@ export async function commitProject(
   if (await remoteHead(http, remoteUrl) !== oid) {
     throw new Error("app repository did not publish the expected commit");
   }
+  await verifyPublishedProject(service, repository, oid, head, desired);
   return { oid, repository };
 }
 
@@ -196,6 +199,47 @@ async function headBelongsToJob(
     return value.jobId === jobId;
   } catch {
     return false;
+  }
+}
+
+async function verifyPublishedProject(
+  service: AppGitService,
+  repository: string,
+  expectedOid: string,
+  previousOid: string | undefined,
+  desired: ReadonlyMap<string, string>,
+): Promise<void> {
+  const fs = createMemoryGitFs();
+  const http = appGitHttp(service, repository);
+  await prepareRepository(fs, http, repositoryUrl(repository));
+  const head = await resolveHead(fs);
+  if (head !== expectedOid) throw new Error("app repository readback returned a different head");
+  const { commit } = await git.readCommit({ fs, dir: DIRECTORY, oid: expectedOid });
+  if (previousOid && (commit.parent.length !== 1 || commit.parent[0] !== previousOid)) {
+    throw new Error("app repository update is not a direct fast-forward");
+  }
+  if (!previousOid && commit.parent.length !== 0) {
+    throw new Error("initial app repository commit has an unexpected parent");
+  }
+  await verifyCheckedOutProject(fs, expectedOid, desired);
+}
+
+async function verifyCheckedOutProject(
+  fs: ReturnType<typeof createMemoryGitFs>,
+  oid: string,
+  desired: ReadonlyMap<string, string>,
+): Promise<void> {
+  const tracked = (await git.listFiles({ fs, dir: DIRECTORY })).sort();
+  const expected = [...desired.keys()].sort();
+  if (tracked.length !== expected.length || tracked.some((path, index) => path !== expected[index])) {
+    throw new Error("app repository readback returned a different source tree");
+  }
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  for (const [path, content] of desired) {
+    const { blob } = await git.readBlob({ fs, dir: DIRECTORY, oid, filepath: path });
+    if (decoder.decode(blob) !== content) {
+      throw new Error(`app repository readback changed ${path}`);
+    }
   }
 }
 

@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  FRAME_SESSION_AUDIENCE,
+  LAUNCH_INTENT_AUDIENCE,
+  LAUNCH_INTENT_TTL_SECONDS,
   LAUNCH_TICKET_AUDIENCE,
   LAUNCH_TICKET_TTL_SECONDS,
   RUNTIME_SESSION_AUDIENCE,
@@ -9,11 +12,15 @@ import {
   cookieValue,
   expiredRuntimeSessionCookie,
   isSameOriginPost,
+  issueFrameSession,
+  issueLaunchIntent,
   issueLaunchTicket,
   issueRuntimeSession,
   runtimeSessionCookie,
   validateLaunchTicketClaims,
   validateRuntimeSessionClaims,
+  verifyFrameSession,
+  verifyLaunchIntent,
   verifyLaunchTicket,
   verifyRuntimeSession,
 } from "../src/auth";
@@ -26,11 +33,12 @@ const IDENTITY = Object.freeze({
   slug: "tiny-app",
   tenantId: "user:018f9f7e-72c0-7000-8000-000000000001",
 });
+const TRANSACTION = "transaction-nonce-12345678";
 
 describe("dynamic app authentication", () => {
   it("issues bounded, audience-specific launch ticket claims", async () => {
     const now = Date.UTC(2026, 7, 24, 12);
-    const ticket = await issueLaunchTicket(CONTROL_SECRET, IDENTITY, now);
+    const ticket = await issueLaunchTicket(CONTROL_SECRET, IDENTITY, TRANSACTION, now);
     const claims = await verifyLaunchTicket(ticket, CONTROL_SECRET, now);
 
     expect(claims).toMatchObject({
@@ -38,6 +46,7 @@ describe("dynamic app authentication", () => {
       audience: LAUNCH_TICKET_AUDIENCE,
       expiry: Math.floor(now / 1_000) + LAUNCH_TICKET_TTL_SECONDS,
       nonce: expect.stringMatching(/^[A-Za-z0-9_-]{24}$/),
+      transaction: TRANSACTION,
       version: 1,
     });
     expect(await verifyLaunchTicket(ticket, "x".repeat(32), now)).toBeUndefined();
@@ -48,7 +57,7 @@ describe("dynamic app authentication", () => {
 
   it("rejects tampered, noncanonical, oversized, and out-of-policy claims", async () => {
     const now = Date.UTC(2026, 7, 24, 12);
-    const ticket = await issueLaunchTicket(CONTROL_SECRET, IDENTITY, now);
+    const ticket = await issueLaunchTicket(CONTROL_SECRET, IDENTITY, TRANSACTION, now);
     const [payload, signature] = ticket.split(".");
     const tampered = `${payload}.${signature[0] === "a" ? "b" : "a"}${signature.slice(1)}`;
     expect(await verifyLaunchTicket(tampered, CONTROL_SECRET, now)).toBeUndefined();
@@ -59,6 +68,7 @@ describe("dynamic app authentication", () => {
       audience: LAUNCH_TICKET_AUDIENCE,
       expiry: Math.floor(now / 1_000) + 30,
       nonce: "n".repeat(24),
+      transaction: TRANSACTION,
       version: 1,
     } as const;
     expect(validateLaunchTicketClaims(valid, now)).toEqual(valid);
@@ -66,6 +76,17 @@ describe("dynamic app authentication", () => {
     expect(validateLaunchTicketClaims({ ...valid, slug: "Wrong_Slug" }, now)).toBeUndefined();
     expect(validateLaunchTicketClaims({ ...valid, expiry: valid.expiry + 31 }, now)).toBeUndefined();
     expect(validateLaunchTicketClaims({ ...valid, extra: "claim" }, now)).toBeUndefined();
+  });
+
+  it("separates account launch intents from browser-bound launch tickets", async () => {
+    const now = Date.UTC(2026, 7, 24, 12);
+    const intent = await issueLaunchIntent(CONTROL_SECRET, IDENTITY, now);
+    expect(await verifyLaunchIntent(intent, CONTROL_SECRET, now)).toMatchObject({
+      ...IDENTITY,
+      audience: LAUNCH_INTENT_AUDIENCE,
+      expiry: Math.floor(now / 1_000) + LAUNCH_INTENT_TTL_SECONDS,
+    });
+    expect(await verifyLaunchTicket(intent, CONTROL_SECRET, now)).toBeUndefined();
   });
 
   it("mints a distinct runtime-only session for the exact app identity", async () => {
@@ -86,17 +107,29 @@ describe("dynamic app authentication", () => {
       .toBeUndefined();
   });
 
+  it("uses a separate signed audience for opaque app frames", async () => {
+    const now = Date.UTC(2026, 7, 24, 12);
+    const token = await issueFrameSession(RUNTIME_SECRET, IDENTITY, TRANSACTION, now);
+    const claims = await verifyFrameSession(token, RUNTIME_SECRET, now);
+    expect(claims).toMatchObject({
+      ...IDENTITY,
+      audience: FRAME_SESSION_AUDIENCE,
+      transaction: TRANSACTION,
+    });
+    expect(await verifyRuntimeSession(token, RUNTIME_SECRET, now)).toBeUndefined();
+  });
+
   it("marks runtime cookies host-only and clears only the runtime cookie", async () => {
     const token = await issueRuntimeSession(RUNTIME_SECRET, IDENTITY);
-    const header = runtimeSessionCookie(token);
+    const header = runtimeSessionCookie(token, IDENTITY.appId);
     expect(header).toContain(`${RUNTIME_SESSION_COOKIE}=${token}`);
-    expect(header).toContain("Path=/");
+    expect(header).toContain(`Path=/a/${IDENTITY.appId}/`);
     expect(header).toContain("HttpOnly");
     expect(header).toContain("Secure");
     expect(header).toContain("SameSite=Lax");
     expect(header).not.toContain("Domain=");
-    expect(expiredRuntimeSessionCookie()).toContain(`${RUNTIME_SESSION_COOKIE}=;`);
-    expect(expiredRuntimeSessionCookie()).toContain("Max-Age=0");
+    expect(expiredRuntimeSessionCookie(IDENTITY.appId)).toContain(`${RUNTIME_SESSION_COOKIE}=;`);
+    expect(expiredRuntimeSessionCookie(IDENTITY.appId)).toContain("Max-Age=0");
   });
 
   it("parses only the exact cookie name", () => {

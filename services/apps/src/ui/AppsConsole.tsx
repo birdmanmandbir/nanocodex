@@ -11,6 +11,14 @@ import {
 
 type JobStatus = "building" | "completed" | "failed";
 
+const APP_GRANTS = Object.freeze([
+  "profile:read",
+  "state:read",
+  "state:write",
+  "ai:generate",
+  "agents:run",
+]);
+
 export type BuildJob = Readonly<{
   id: string;
   app_id: string;
@@ -45,6 +53,7 @@ export type GeneratedApp = Readonly<{
   live_slug: string;
   active_revision: string;
   created_at: string;
+  grants: readonly string[];
   updated_at: string;
   revisions: readonly AppRevision[];
 }>;
@@ -104,6 +113,7 @@ export function AppsConsole() {
   const [notice, setNotice] = useState<Notice>();
   const [jobs, setJobs] = useState<readonly TrackedJob[]>([]);
   const [createPrompt, setCreatePrompt] = useState("");
+  const [createApproved, setCreateApproved] = useState(false);
   const [updatePrompts, setUpdatePrompts] = useState<Record<string, string>>({});
   const [creating, setCreating] = useState(false);
   const [updatingAppIds, setUpdatingAppIds] = useState<ReadonlySet<string>>(new Set());
@@ -182,13 +192,14 @@ export function AppsConsole() {
   const createApp = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const prompt = createPrompt.trim();
-    if (!prompt || creating) return;
+    if (!prompt || !createApproved || creating) return;
     setCreating(true);
     setNotice(undefined);
     try {
       const response = await startBuild(prompt);
       setJobs((current) => [trackJob(response.job, prompt), ...current]);
       setCreatePrompt("");
+      setCreateApproved(false);
       setNotice({ kind: "success", message: "Build accepted. Its status will stay here while it runs." });
     } catch (error) {
       setNotice({ kind: "error", message: actionableError(error, "The build could not be started.") });
@@ -287,9 +298,25 @@ export function AppsConsole() {
               maxLength={24_576}
               required
             />
+            <label className="capability-approval">
+              <input
+                type="checkbox"
+                checked={createApproved}
+                onChange={(event) => setCreateApproved(event.currentTarget.checked)}
+                required
+              />
+              <span>
+                <strong>Grant this private app access</strong>
+                <small>Profile, app state, Workers AI, and Nanocodex agents. Credentials remain host-managed.</small>
+              </span>
+            </label>
             <div className="composer-footer">
               <span>Include the audience, workflow, and visual direction.</span>
-              <button className="primary-button" type="submit" disabled={creating || !createPrompt.trim()}>
+              <button
+                className="primary-button"
+                type="submit"
+                disabled={creating || !createApproved || !createPrompt.trim()}
+              >
                 Build app
               </button>
             </div>
@@ -457,6 +484,10 @@ function AppCard({
         </div>
       </dl>
 
+      <p className="capability-summary">
+        <strong>Granted:</strong> profile, private state, Workers AI, and Nanocodex agents
+      </p>
+
       <form className="update-form" id={`update-${app.id}`} onSubmit={onSubmit}>
         <label htmlFor={`update-prompt-${app.id}`}>Describe an update</label>
         <textarea
@@ -525,6 +556,7 @@ function AppCard({
 
 async function startBuild(prompt: string, appId?: string): Promise<JobResponse> {
   return requestJson<JobResponse>("/apps/api/builds", jsonPost({
+    grants: APP_GRANTS,
     prompt,
     ...(appId ? { app_id: appId } : {}),
   }));

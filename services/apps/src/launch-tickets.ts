@@ -1,14 +1,16 @@
 import { DurableObject } from "cloudflare:workers";
 
-import type { LaunchTicketClaims } from "./auth";
+import type { LaunchIntentClaims, LaunchTicketClaims } from "./auth";
+
+type LaunchClaims = LaunchIntentClaims | LaunchTicketClaims;
 
 type StoredTicket = Readonly<{
-  claims: LaunchTicketClaims;
+  claims: LaunchClaims;
   consumed: boolean;
 }>;
 
 export class LaunchTicketStore extends DurableObject {
-  async issue(claims: LaunchTicketClaims): Promise<void> {
+  async issue(claims: LaunchClaims): Promise<void> {
     await this.ctx.storage.transaction(async (storage) => {
       const existing = await storage.get<StoredTicket>("ticket");
       if (existing) {
@@ -20,7 +22,7 @@ export class LaunchTicketStore extends DurableObject {
     });
   }
 
-  async consume(claims: LaunchTicketClaims): Promise<boolean> {
+  async consume(claims: LaunchClaims): Promise<boolean> {
     return this.ctx.storage.transaction(async (storage) => {
       const stored = await storage.get<StoredTicket>("ticket");
       if (!stored || stored.consumed || stored.claims.expiry <= Math.floor(Date.now() / 1_000)) {
@@ -35,6 +37,20 @@ export class LaunchTicketStore extends DurableObject {
   async alarm(): Promise<void> {
     await this.ctx.storage.deleteAll();
   }
+}
+
+export async function recordLaunchIntent(
+  namespace: DurableObjectNamespace<LaunchTicketStore>,
+  claims: LaunchIntentClaims,
+): Promise<void> {
+  return namespace.getByName(claims.nonce).issue(claims);
+}
+
+export async function consumeLaunchIntent(
+  namespace: DurableObjectNamespace<LaunchTicketStore>,
+  claims: LaunchIntentClaims,
+): Promise<boolean> {
+  return namespace.getByName(claims.nonce).consume(claims);
 }
 
 export async function recordLaunchTicket(

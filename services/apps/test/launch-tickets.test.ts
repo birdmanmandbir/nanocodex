@@ -18,6 +18,7 @@ const claims = {
   nonce: "abcdefghijklmnopqrstuvwxyz",
   slug: "private-app",
   tenantId: "user:0198e2c4-365e-7a66-a58f-d4e5b46a7dad",
+  transaction: "transaction-nonce-12345678",
   version: 1,
 } satisfies LaunchTicketClaims;
 
