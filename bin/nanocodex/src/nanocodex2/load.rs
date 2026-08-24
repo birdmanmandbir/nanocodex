@@ -1481,7 +1481,7 @@ fn classify_room_error(phase: &'static str, error: &RoomError) -> FailureKey {
         RoomError::InvalidReceipt(_) => ("invalid_http_receipt", None, None),
         RoomError::Protocol(_) => ("websocket_protocol", None, None),
         RoomError::HandshakeTimeout => ("websocket_handshake_timeout", None, None),
-        RoomError::WebSocket(_) => ("websocket_transport", None, None),
+        RoomError::WebSocket(error) => classify_websocket_error(error),
         RoomError::ClosedBeforeReady => ("websocket_closed_before_ready", None, None),
         RoomError::CommandChannelClosed => ("websocket_command_closed", None, None),
     };
@@ -1490,6 +1490,34 @@ fn classify_room_error(phase: &'static str, error: &RoomError) -> FailureKey {
         class,
         http_status,
         code,
+    }
+}
+
+fn classify_websocket_error(
+    error: &tokio_tungstenite::tungstenite::Error,
+) -> (&'static str, Option<u16>, Option<String>) {
+    use tokio_tungstenite::tungstenite::Error;
+
+    match error {
+        Error::ConnectionClosed => ("websocket_closed", None, None),
+        Error::AlreadyClosed => ("websocket_already_closed", None, None),
+        Error::Io(error) => (
+            "websocket_io",
+            None,
+            Some(format!(
+                "io_{}",
+                safe_code(&format!("{:?}", error.kind()).to_lowercase())
+            )),
+        ),
+        Error::Tls(_) => ("websocket_tls", None, None),
+        Error::Capacity(_) => ("websocket_capacity", None, None),
+        Error::Protocol(_) => ("websocket_wire_protocol", None, None),
+        Error::WriteBufferFull(_) => ("websocket_write_buffer_full", None, None),
+        Error::Utf8(_) => ("websocket_utf8", None, None),
+        Error::AttackAttempt => ("websocket_attack_attempt", None, None),
+        Error::Url(_) => ("websocket_url", None, None),
+        Error::Http(response) => ("websocket_http", Some(response.status().as_u16()), None),
+        Error::HttpFormat(_) => ("websocket_http_format", None, None),
     }
 }
 
@@ -1555,9 +1583,10 @@ mod tests {
     use super::{
         CleanupLedger, ConnectReplayBehavior, MAX_AGENT_PROMPTS_PER_ROOM, MAX_GUESTS_PER_ROOM,
         MAX_MESSAGES_PER_GUEST, MAX_ROOMS, MAX_WALL_TIME, MIN_WALL_TIME, OperationSamples,
-        RunRecord, SaturationConfig, exact_origin, nearest_rank, percentiles, safe_code,
+        RunRecord, SaturationConfig, classify_room_error, exact_origin, nearest_rank, percentiles,
+        safe_code,
     };
-    use crate::room::{AccountKey, RoomId};
+    use crate::room::{AccountKey, RoomError, RoomId};
     use url::Url;
 
     fn config() -> SaturationConfig {
@@ -1687,5 +1716,16 @@ mod tests {
         assert_eq!(safe_code("contains-secret-value!"), "invalid_error_code");
         assert_eq!(safe_code(&"a".repeat(65)), "invalid_error_code");
         assert!(!format!("{:?}", config()).contains(&"b".repeat(43)));
+    }
+
+    #[test]
+    fn websocket_io_failures_retain_only_the_safe_error_kind() {
+        let error = RoomError::WebSocket(tokio_tungstenite::tungstenite::Error::Io(
+            std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+        ));
+        let classified = classify_room_error("connect", &error);
+        assert_eq!(classified.class, "websocket_io");
+        assert_eq!(classified.code.as_deref(), Some("io_connectionreset"));
+        assert_eq!(classified.http_status, None);
     }
 }
