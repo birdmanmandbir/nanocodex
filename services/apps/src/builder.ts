@@ -77,6 +77,7 @@ Rules:
 - Agent IDs returned by this binding are private app-scoped handles. Poll the turn resource to a terminal state. The host supplies user authorization and credentials; never add Authorization headers.
 - Never reference credentials, account identity, hidden bindings, or APIs not listed above.
 - Serve a polished, responsive, accessible browser interface from GET /. Browser links and fetch URLs must be relative (for example "api/items", never "/api/items") because the host mounts the app below a private path prefix.
+- Mobile layouts must have zero horizontal overflow. Editable controls must use a computed font size of at least 16px, and every interactive touch target must be at least 44 by 44 CSS pixels.
 - Do not render spinners, skeletons, transient loading copy, or blank placeholders. Preserve complete content and show actionable errors only after failures.
 - Encode all source code as JSON strings. Do not emit Markdown fences, commentary, or keys outside the schema.`;
 

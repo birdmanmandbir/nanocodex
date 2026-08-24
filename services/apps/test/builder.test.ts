@@ -175,5 +175,8 @@ describe("Workers AI output", () => {
       expect(PROJECT_SYSTEM_PROMPT).toContain(`${method}(`);
     }
     expect(PROJECT_SYSTEM_PROMPT).toContain("There is no global fetch");
+    expect(PROJECT_SYSTEM_PROMPT).toContain("at least 16px");
+    expect(PROJECT_SYSTEM_PROMPT).toContain("at least 44 by 44 CSS pixels");
+    expect(PROJECT_SYSTEM_PROMPT).toContain("zero horizontal overflow");
   });
 });
