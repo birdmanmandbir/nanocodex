@@ -1,6 +1,12 @@
 //! Nanocodex2: the Tact-parity terminal client for managed Nanocodex agents.
 
+mod app;
 mod client;
+mod core;
+mod engine;
+mod review;
+mod room;
+mod tui;
 
 use std::{
     env,
@@ -10,11 +16,21 @@ use std::{
 
 use clap::{Args, Parser, Subcommand, builder::NonEmptyStringValueParser};
 use client::{ApiKey, EventCursor, ManagedClient, ManagedError, ManagedEventData, PromptInput};
+use room::{
+    AccountKey, RoomApi, RoomConnection, RoomCursor, RoomError, RoomEventMessage, RoomEvents,
+    RoomInvitation, RoomServerMessage, RoomTarget,
+};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 
 const MANAGED_URL_ENV: &str = "NANOCODEX_MANAGED_URL";
 const API_KEY_ENV: &str = "NANOCODEX_API_KEY";
+
+pub(crate) fn install_tls_provider() {
+    nanocodex::oai::transport::install_default_rustls_crypto_provider();
+}
 
 #[derive(Parser)]
 #[command(
@@ -48,6 +64,36 @@ enum Command {
     Steer(Steer),
     /// Cancel an active managed turn.
     Cancel(TurnId),
+    /// Create or join a shared managed-agent room.
+    Room(Room),
+}
+
+#[derive(Args)]
+struct Room {
+    #[command(subcommand)]
+    command: RoomCommand,
+}
+
+#[derive(Subcommand)]
+enum RoomCommand {
+    /// Create a room, print its invite, and connect as its owner.
+    Create(RoomCreate),
+    /// Read an invite URL from stdin and connect as a guest.
+    Join(RoomJoin),
+}
+
+#[derive(Args)]
+struct RoomCreate {
+    /// Name shown to other room members.
+    #[arg(long, default_value = "Host")]
+    name: String,
+}
+
+#[derive(Args)]
+struct RoomJoin {
+    /// Name shown to other room members.
+    #[arg(long, default_value = "Guest")]
+    name: String,
 }
 
 #[derive(Args)]
@@ -68,7 +114,7 @@ struct TurnId {
 struct Run {
     /// Prompt text.
     #[arg(value_parser = NonEmptyStringValueParser::new())]
-    prompt: String,
+    prompt: Option<String>,
     /// Resume this account-owned agent. A new one is created when omitted.
     #[arg(long)]
     agent: Option<String>,
@@ -132,8 +178,15 @@ fn try_main() -> Result<(), ManagedError> {
 }
 
 async fn run(cli: Cli) -> Result<(), ManagedError> {
+    let command = cli.command;
+    if matches!(&command, Command::Run(command) if command.prompt.is_none()) {
+        return run_tui().await;
+    }
+    if let Command::Room(command) = command {
+        return run_room(command).await.map_err(room_error);
+    }
     let client = client_from_environment()?;
-    match cli.command {
+    match command {
         Command::New => write_json(&client.create().await?),
         Command::List => write_json(&client.list().await?),
         Command::State(command) => write_json(&client.state(&command.agent_id).await?),
@@ -162,18 +215,12 @@ async fn run(cli: Cli) -> Result<(), ManagedError> {
         Command::Cancel(command) => {
             write_json(&client.cancel(&command.agent_id, &command.turn_id).await?)
         }
+        Command::Room(_) => unreachable!("room command returned before managed-agent dispatch"),
     }
 }
 
-fn client_from_environment() -> Result<ManagedClient, ManagedError> {
-    let base_url = env::var(MANAGED_URL_ENV).map_err(|_| {
-        ManagedError::Configuration(format!(
-            "{MANAGED_URL_ENV} must be set to the managed origin"
-        ))
-    })?;
-    let base_url = Url::parse(&base_url).map_err(|_| {
-        ManagedError::Configuration(format!("{MANAGED_URL_ENV} is not a valid URL"))
-    })?;
+pub(crate) fn client_from_environment() -> Result<ManagedClient, ManagedError> {
+    let base_url = managed_url_from_environment()?;
     let api_key = env::var(API_KEY_ENV).map_err(|_| {
         ManagedError::Configuration(format!(
             "{API_KEY_ENV} must be set to an account-issued ncx_live key"
@@ -182,7 +229,165 @@ fn client_from_environment() -> Result<ManagedClient, ManagedError> {
     ManagedClient::new(base_url, ApiKey::parse(api_key)?)
 }
 
+fn managed_url_from_environment() -> Result<Url, ManagedError> {
+    let base_url = env::var(MANAGED_URL_ENV).map_err(|_| {
+        ManagedError::Configuration(format!(
+            "{MANAGED_URL_ENV} must be set to the managed origin"
+        ))
+    })?;
+    let base_url = Url::parse(&base_url).map_err(|_| {
+        ManagedError::Configuration(format!("{MANAGED_URL_ENV} is not a valid URL"))
+    })?;
+    Ok(base_url)
+}
+
+async fn run_room(command: Room) -> Result<(), RoomError> {
+    let managed_url = managed_url_from_environment()
+        .map_err(|error| RoomError::Configuration(error.to_string()))?;
+    match command.command {
+        RoomCommand::Create(command) => {
+            let api_key = env::var(API_KEY_ENV).map_err(|_| {
+                RoomError::Configuration(format!(
+                    "{API_KEY_ENV} must be set to create a managed room"
+                ))
+            })?;
+            let api = RoomApi::authenticated(managed_url, AccountKey::parse(api_key)?)?;
+            let membership = api.create(&command.name).await?;
+            let invitation = membership.receipt().invitation().to_url()?;
+            println!("Room: {}", membership.receipt().room_id());
+            println!("Invite: {invitation}");
+            println!(
+                "Share that invite with the second terminal. Type /agent <prompt> to ask the hosted agent, or /quit to leave."
+            );
+            let (connection, events) = membership.connect(&RoomCursor::zero()).await?;
+            run_room_terminal(connection, events).await
+        }
+        RoomCommand::Join(command) => {
+            eprint!("Paste the room invite URL: ");
+            io::stderr().flush().map_err(|error| {
+                RoomError::Configuration(format!("failed to prompt for room invite: {error}"))
+            })?;
+            let mut input = String::new();
+            BufReader::new(tokio::io::stdin())
+                .read_line(&mut input)
+                .await
+                .map_err(|error| {
+                    RoomError::Configuration(format!("failed to read room invite: {error}"))
+                })?;
+            let invitation = RoomInvitation::parse(input.trim())?;
+            let api = RoomApi::public(managed_url)?;
+            let membership = api.join(&invitation, &command.name).await?;
+            println!(
+                "Joined room {} as {}.",
+                membership.receipt().room_id(),
+                command.name
+            );
+            println!("Type /agent <prompt> to ask the hosted agent, or /quit to leave.");
+            let (connection, events) = membership.connect(&RoomCursor::zero()).await?;
+            run_room_terminal(connection, events).await
+        }
+    }
+}
+
+async fn run_room_terminal(
+    connection: RoomConnection,
+    mut events: RoomEvents,
+) -> Result<(), RoomError> {
+    println!(
+        "Connected: {} member(s), {} online.",
+        connection.ready().members.len(),
+        connection.ready().online_member_ids.len()
+    );
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    loop {
+        tokio::select! {
+            line = lines.next_line() => {
+                let line = line.map_err(|error| {
+                    RoomError::Configuration(format!("failed to read room input: {error}"))
+                })?;
+                let Some(line) = line else {
+                    connection.close().await?;
+                    return Ok(());
+                };
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if line == "/quit" {
+                    connection.close().await?;
+                    return Ok(());
+                }
+                if let Some(prompt) = line.strip_prefix("/agent ") {
+                    connection.say_agent(prompt).await?;
+                } else if let Some(message) = line.strip_prefix("/room ") {
+                    connection.say_room(message).await?;
+                } else {
+                    connection.say_room(line).await?;
+                }
+            }
+            event = events.next() => {
+                let Some(event) = event else {
+                    return Err(RoomError::CommandChannelClosed);
+                };
+                print_room_message(event?);
+            }
+            signal = tokio::signal::ctrl_c() => {
+                signal.map_err(|error| {
+                    RoomError::Configuration(format!("failed to listen for Ctrl-C: {error}"))
+                })?;
+                connection.close().await?;
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn print_room_message(message: RoomServerMessage) {
+    match message {
+        RoomServerMessage::RoomEvent { event, .. } => match event {
+            RoomEventMessage::MemberJoined { member } => {
+                println!("• {} joined", member.name);
+            }
+            RoomEventMessage::MemberMessage {
+                member,
+                text,
+                target,
+                ..
+            } => match target {
+                RoomTarget::Room => println!("{}: {text}", member.name),
+                RoomTarget::Agent => println!("{} → agent: {text}", member.name),
+            },
+            RoomEventMessage::AgentMessage { text, .. } => println!("agent: {text}"),
+            RoomEventMessage::AgentError { code, .. } => {
+                println!("agent error: {code:?}");
+            }
+        },
+        RoomServerMessage::ReplayPaused {
+            cursor,
+            latest_cursor,
+        } => {
+            println!("• replay {cursor}/{latest_cursor}");
+        }
+        RoomServerMessage::Presence { online_member_ids } => {
+            println!("• {} member(s) online", online_member_ids.len());
+        }
+        RoomServerMessage::Error { code, message, .. } => {
+            eprintln!("Room error ({code}): {message}");
+        }
+        RoomServerMessage::Accepted { .. }
+        | RoomServerMessage::Pong { .. }
+        | RoomServerMessage::Ready { .. } => {}
+    }
+}
+
+fn room_error(error: RoomError) -> ManagedError {
+    ManagedError::Configuration(error.to_string())
+}
+
 async fn run_turn(client: &ManagedClient, command: Run) -> Result<(), ManagedError> {
+    let prompt = command.prompt.ok_or_else(|| {
+        ManagedError::Configuration("interactive run was routed to headless execution".to_owned())
+    })?;
     let agent_id = match command.agent {
         Some(agent_id) => {
             client.state(&agent_id).await?;
@@ -201,7 +406,7 @@ async fn run_turn(client: &ManagedClient, command: Run) -> Result<(), ManagedErr
             &agent_id,
             Some(&turn_id),
             &idempotency_key,
-            &PromptInput::Text(command.prompt),
+            &PromptInput::Text(prompt),
         )
         .await?;
     let accepted_turn_id = accepted.turn_id.clone();
@@ -240,6 +445,22 @@ async fn run_turn(client: &ManagedClient, command: Run) -> Result<(), ManagedErr
             }
         }
     }
+}
+
+async fn run_tui() -> Result<(), ManagedError> {
+    let config = app::config::Config::load(app::config::ConfigOverrides::default())
+        .map_err(|error| ManagedError::Configuration(error.to_string()))?;
+    let shutdown = CancellationToken::new();
+    let signal_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            signal_shutdown.cancel();
+        }
+    });
+    tui::run(config, tui::StartupMode::NewSession, shutdown)
+        .await
+        .map(|_| ())
+        .map_err(|error| ManagedError::Configuration(error.to_string()))
 }
 
 async fn watch(client: &ManagedClient, command: Watch) -> Result<(), ManagedError> {
