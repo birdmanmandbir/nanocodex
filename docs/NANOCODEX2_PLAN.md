@@ -39,9 +39,19 @@ product contract.
 - [x] Create the isolated `feat/nanocodex2` worktree and pin the Tact parity
   checkpoint.
 - [x] Add the second Rust binary target and the typed managed REST/SSE client.
+- [x] Import the pinned Tact terminal component tree under Apache-2.0
+  attribution, without importing its local model runtime.
+- [x] Import the account-scoped managed history search and canonical
+  Rust-backed subagent implementation from the supplied
+  `nanocodex-memory-search` working slice.
 - [ ] Finish slice 1 with the shared replayable subscriber/cache layer and a
   real managed-agent detach/resume smoke.
-- [ ] Port and adapt the complete pinned Tact TUI.
+- [ ] Finish adapting the pinned Tact TUI to the managed lifecycle.
+- [ ] Prove two independent Nanocodex2 processes can create/join one managed
+  room, exchange replayable messages, and address the room's private managed
+  agent without sharing account or provider credentials.
+- [ ] Saturate the managed-agent and multiplayer Durable Object paths with a
+  bounded Rust harness, fix each owning bottleneck, and rerun the affected ramp.
 - [ ] Close every missing managed capability required by a visible Tact flow.
 - [ ] Pass the PTY parity, representative replay, performance, and release
   gates.
@@ -75,6 +85,20 @@ product contract.
 | Cancel | `POST /v1/agents/:id/turns/:turn/cancel` |
 | Delete | `DELETE /v1/agents/:id` |
 | Reconnect | reopen the retained agent and continue strictly after the saved cursor |
+| Create multiplayer room | account-authenticated `POST /v1/rooms` |
+| Join multiplayer room | invite-capability `POST /v1/rooms/:id/join` |
+| Shared room replay/live stream | member-cookie WebSocket `GET /v1/rooms/:id/ws?cursor=...` |
+| Ask the room's managed agent | room WebSocket `say` with `target: "agent"` |
+| Account history answer | `POST /v1/history/search` |
+| Account history candidates | `POST /v1/history/threads/search` |
+| Exact retained thread turns | `POST /v1/history/threads/:id/read` |
+
+Completed managed turns project idempotently into the account's `MemoryScope`.
+The terminal may search and render that source, but it must not recreate a
+local memory database or emulate Tact's local memory mutations. Agentic history
+search runs through the managed service's canonical Rust subagent task tree;
+Nanocodex2 contains only task-tree presentation and never owns a child-agent
+scheduler.
 
 The Rust client follows the existing JavaScript client contract in
 `js/bindings/managed/Agent.mjs`: strict IDs and cursors, three idempotent
@@ -186,6 +210,34 @@ feedback, cancellation, and recovery behavior at the pinned checkpoint.
 Exit: Nanocodex2 passes the Tact parity fixtures and real PTY journeys, remains
 responsive on representative long sessions, and all inference observed during
 validation belongs to managed agents.
+
+### 7. Multiplayer and Durable Object saturation
+
+- Add room create/join/connect/send/replay commands whose membership cookie is
+  retained only in process memory. The creator prints a bounded invite URL;
+  the joiner pastes it through standard input so the capability is absent from
+  process arguments and normal logs.
+- First prove two independent CLI processes observe the same ordered member
+  events and managed-agent reply, then reuse that exact Rust transport in the
+  load harness rather than maintaining a synthetic second protocol client.
+- Ramp allocator pressure, concurrent rooms, members per room, room-message
+  fanout, managed-agent turns, reconnect/replay storms, deliberately stalled
+  acknowledgements, and create/delete churn independently before combining
+  them. Record request and frame throughput, p50/p95/p99 latency, durable cursor
+  lag, reconnect recovery, error classes, Worker/DO logs, CPU time, storage
+  operations, alarms, retries, and cost-relevant operation counts.
+- Treat documented quotas and explicit backpressure as expected outcomes.
+  Stop a ramp on credential leakage, unrelated-service impact, uncontrolled
+  spend, sustained data loss/reordering, unrecovered Durable Object failures,
+  or a rising error/latency curve whose owning boundary is already clear.
+- Fix the highest boundary that owns each demonstrated bottleneck, deploy the
+  coherent slice, rerun the failing stage, and push the measured result before
+  expanding concurrency further.
+
+Exit: the two-CLI room journey passes locally and on a disposable Cloudflare
+deployment; the saturation ledger names the tested envelope, first limiting
+resource, intended quota behavior, defects found, fixes adopted, and the
+retested throughput/latency envelope.
 
 ## Stop conditions
 
