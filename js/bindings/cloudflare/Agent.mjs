@@ -10,11 +10,23 @@ import {
 
 const STARTUP_TIMEOUT_MS = 10_000;
 const APPLICATION_OPTIONS = new Set(["instructions", "tools"]);
+const EPHEMERAL_APPLICATION_OPTIONS = new Set([
+  "fastMode",
+  "instructions",
+  "model",
+  "reasoningMode",
+  "resume",
+  "sessionId",
+  "thinking",
+  "tools",
+  "workspace",
+]);
 
 /** @internal Binds the package-owned module to the public Cloudflare namespace. */
 export function bindAgent(module) {
   return Object.freeze({
     create: (owner, options) => create(module, owner, options),
+    createEphemeral: (owner, options) => createEphemeral(module, owner, options),
     destroy,
   });
 }
@@ -107,6 +119,49 @@ export async function create(module, owner, options = {}) {
   }));
 }
 
+/** @internal Creates one non-durable Agent in the current Cloudflare isolate. */
+export async function createEphemeral(module, owner, options = {}) {
+  const { egress, subject } = resolveOwner(owner);
+  const agentOptions = ephemeralApplicationOptions(options);
+  const endpoint = cloudflareEgress({
+    binding: scopeCloudflareEgress(egress, subject),
+  });
+  const startup = deferred();
+  const transport = Transport.hostManaged({
+    ...endpoint,
+    websocketPreconnect: true,
+    async createWebSocket(url, id, request) {
+      try {
+        const opened = await endpoint.createWebSocket(url, id, request);
+        if (request.authorization === "preconnect") startup.resolve();
+        return opened;
+      } catch (error) {
+        if (request.authorization === "preconnect") startup.reject(error);
+        throw error;
+      }
+    },
+  });
+
+  let agent;
+  try {
+    agent = await HostAgent.create({
+      ...agentOptions,
+      module,
+      toolMode: "direct",
+      transport,
+    });
+    await withTimeout(
+      startup.promise,
+      STARTUP_TIMEOUT_MS,
+      "Cloudflare ephemeral Agent EGRESS startup validation timed out",
+    );
+    return agent;
+  } catch (error) {
+    if (agent) await agent.session.shutdown().catch(() => {});
+    throw error;
+  }
+}
+
 function resolveOwner(owner) {
   const context = resolveContext(owner);
   const egress = owner.env?.NANOCODEX;
@@ -141,6 +196,20 @@ function applicationOptions(options) {
     if (!APPLICATION_OPTIONS.has(name)) {
       throw new TypeError(
         `Cloudflare Agent.create does not accept ${name}; only instructions and tools are configurable`,
+      );
+    }
+  }
+  return options;
+}
+
+function ephemeralApplicationOptions(options) {
+  if (!options || typeof options !== "object" || Array.isArray(options)) {
+    throw new TypeError("Cloudflare Agent.createEphemeral options must be an object");
+  }
+  for (const name of Object.keys(options)) {
+    if (!EPHEMERAL_APPLICATION_OPTIONS.has(name)) {
+      throw new TypeError(
+        `Cloudflare Agent.createEphemeral does not accept ${name}; transport and runtime policy are owned by the adapter`,
       );
     }
   }

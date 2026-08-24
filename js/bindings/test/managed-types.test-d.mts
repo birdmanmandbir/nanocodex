@@ -26,6 +26,26 @@ async function checkManaged() {
   const result: ManagedTurnResult = await turn.result();
   result.finalMessage;
   result.usage?.input_tokens;
+  result.citations[0]?.sources[0]?.cursor;
+  const searched = await Agent.searchHistory(
+    { query: "remember", limit: 8, agentic: true },
+    { baseUrl: "https://managed.example", apiKey },
+  );
+  searched.answer;
+  searched.citations[0]?.thread_id;
+  const found = await Agent.findThreads(
+    { query: "remember", limit: 8 },
+    { baseUrl: "https://managed.example", apiKey },
+  );
+  const read = await Agent.readThread(
+    {
+      thread_id: found.results[0]!.thread_id,
+      turn_ids: [found.results[0]!.turn_id],
+    },
+    { baseUrl: "https://managed.example", apiKey },
+  );
+  read.turns[0]?.assistant;
+  read.citations[0]?.sources[0]?.cursor;
   for await (const event of serverAgent.events.watch({ cursor: result.cursor ?? "0" })) {
     const typed: ManagedEvent = event;
     typed.cursor;

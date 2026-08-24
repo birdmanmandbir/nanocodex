@@ -71,6 +71,22 @@ import {
   type AccountAuthEnv,
 } from "./account-auth";
 import { routeBrowserModel } from "./browser-model";
+import {
+  HistorySearchError,
+  mergeHistoryCitations,
+  parseHistoryFindThreadsInput,
+  parseHistoryReadThreadInput,
+  parseHistorySearchInput,
+  type HistoryCitation,
+  type HistoryFindThreadsInput,
+  type HistoryProjection,
+  type HistoryReadThreadInput,
+  type HistoryReadThreadResponse,
+  type HistorySearchInput,
+  type HistorySearchResponse,
+} from "./history-search";
+import { MemoryScope } from "./memory-scope";
+export { MemoryScope } from "./memory-scope";
 export { ApiKeyRecord, NonceStorage, UserAccount } from "./account-auth";
 
 const MAX_CLIENT_MESSAGE_BYTES = 1024 * 1024;
@@ -94,8 +110,10 @@ export interface Env extends AccountAuthEnv {
   NANOCODEX_SESSIONS: DurableObjectNamespace<NanocodexSession>;
   NANOCODEX_ROOMS: DurableObjectNamespace<MultiplayerRoom>;
   NANOCODEX_MULTIPLAYER_QUOTA: DurableObjectNamespace<MultiplayerQuota>;
+  NANOCODEX_MEMORY: DurableObjectNamespace<MemoryScope>;
   NANOCODEX: Fetcher;
   NANOCODEX_ADMIN_TOKEN: string;
+  HISTORY_AI_SEARCH?: AiSearchInstance;
   AGENT_IDLE_TIMEOUT_MS?: string;
 }
 
@@ -161,6 +179,13 @@ type ManagedTurnSubmission = {
   row: ManagedTurnRow;
 };
 
+type HistoryProjectionOutboxRow = {
+  turn_id: string;
+  payload_json: string;
+  attempt_count: number;
+  retry_at: number;
+};
+
 type ManagedTransition = TurnTerminal | Extract<StreamMessage, { type: "turn_cancelling" }>;
 
 type AgentRuntimeProfile = "managed" | "multiplayer";
@@ -217,6 +242,8 @@ export default {
         }])),
       });
     }
+    const history = await routeHistoryRequest(request, env, url);
+    if (history) return history;
     if (request.method === "POST" && url.pathname === "/v1/rooms") {
       const principal = await authenticate(request, env, url);
       if (!principal) return json({ error: "unauthorized" }, { status: 401 });
@@ -297,8 +324,12 @@ export default {
       const agentId = uuidV7();
       const subject = env.NANOCODEX_SESSIONS.idFromName(agentId).toString();
       const stub = env.NANOCODEX_SESSIONS.getByName(agentId);
-      const [credentialBinding, initialization] = await Promise.allSettled([
+      const memory = env.NANOCODEX_MEMORY.getByName(principal.userId);
+      const memorySubject = env.NANOCODEX_MEMORY.idFromName(principal.userId).toString();
+      const [credentialBinding, memoryCredentialBinding, initialization, memoryInitialization]
+        = await Promise.allSettled([
         bindAgentCredential(env.NANOCODEX, subject, principal.userId),
+        bindAgentCredential(env.NANOCODEX, memorySubject, principal.userId),
         stub.fetch("https://session.internal/initialize", {
           method: "PUT",
           headers: { "content-type": "application/json" },
@@ -308,20 +339,27 @@ export default {
             public_origin: url.origin,
           }),
         }),
+        initializeMemoryScope(memory, principal.userId),
       ]);
       if (initialization.status === "fulfilled") {
         await initialization.value.body?.cancel();
       }
+      if (memoryInitialization.status === "fulfilled") {
+        await memoryInitialization.value.body?.cancel();
+      }
       if (credentialBinding.status === "rejected"
+        || memoryCredentialBinding.status === "rejected"
         || initialization.status === "rejected"
-        || !initialization.value.ok) {
+        || memoryInitialization.status === "rejected"
+        || !initialization.value.ok
+        || !memoryInitialization.value.ok) {
         await Promise.all([
           stub.fetch("https://session.internal/session", { method: "DELETE" })
             .then((response) => response.body?.cancel())
             .catch(() => {}),
           unbindAgentCredential(env.NANOCODEX, subject, principal.userId).catch(() => {}),
         ]);
-        return credentialBinding.status === "rejected"
+        return credentialBinding.status === "rejected" || memoryCredentialBinding.status === "rejected"
           ? json({ error: "credential_broker_unavailable" }, { status: 503 })
           : json({ error: "agent initialization failed" }, { status: 503 });
       }
@@ -484,6 +522,7 @@ export class NanocodexSession extends DurableComputerSession {
   readonly #cancellationTasks = new Map<string, Promise<void>>();
   readonly #inFlight = new Set<Promise<unknown>>();
   #recoveryTask?: Promise<void>;
+  #historyProjectionTask?: Promise<void>;
   #streamError?: string;
   #deleting = false;
   #deletionMarkerTask?: Promise<void>;
@@ -527,6 +566,16 @@ export class NanocodexSession extends DurableComputerSession {
       );
       CREATE UNIQUE INDEX IF NOT EXISTS managed_turns_request_key
         ON managed_turns(request_key) WHERE request_key IS NOT NULL;
+      CREATE TABLE IF NOT EXISTS history_projection_outbox (
+        turn_id TEXT PRIMARY KEY,
+        payload_json TEXT NOT NULL,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        retry_at INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS turn_history_citations (
+        turn_id TEXT PRIMARY KEY,
+        citations_json TEXT NOT NULL
+      );
     `);
     this.#eventLog = new DurableEventLog<StreamMessage>(this.ctx.storage);
     const sessionColumns = new Set(this.ctx.storage.sql.exec<{ name: string }>(
@@ -557,7 +606,10 @@ export class NanocodexSession extends DurableComputerSession {
       // Re-admission or deletion may load external resources, so neither sits
       // on the object's request-readiness boundary.
       if (this.#deleting) this.#scheduleDeletion();
-      else this.#scheduleRecovery();
+      else {
+        this.#scheduleRecovery();
+        this.#scheduleHistoryProjection();
+      }
     });
   }
 
@@ -775,6 +827,8 @@ export class NanocodexSession extends DurableComputerSession {
       }
       return;
     }
+    if (this.#historyProjectionTask) await this.#historyProjectionTask.catch(() => {});
+    else await this.#drainHistoryProjections();
     if (this.#turns.size > 0 || this.#pendingTurnIds.size > 0 || this.#agentPromise) {
       await this.ctx.storage.setAlarm(Date.now() + this.#idleTimeoutMs());
       return;
@@ -1207,9 +1261,24 @@ export class NanocodexSession extends DurableComputerSession {
 
   async #performOwnedSessionDeletion(): Promise<void> {
     this.#deleting = true;
-    const runtimeProfile = this.#session()?.runtime_profile;
+    const session = this.#session();
+    const runtimeProfile = session?.runtime_profile;
     await this.#stop(true);
     await Promise.allSettled([...this.#inFlight]);
+    if (this.#historyProjectionTask) await this.#historyProjectionTask.catch(() => {});
+    if (session?.runtime_profile === "managed") {
+      const memory = this.env.NANOCODEX_MEMORY.getByName(session.owner_id);
+      const initialized = await initializeMemoryScope(memory, session.owner_id);
+      if (!initialized.ok) throw new Error("memory scope initialization failed during deletion");
+      const tombstoned = await memory.fetch(
+        `https://memory.internal/threads/${session.session_id}`,
+        {
+          method: "DELETE",
+          headers: { [SESSION_OWNER_ASSERTION]: session.owner_id },
+        },
+      );
+      if (!tombstoned.ok) throw new Error(`memory tombstone failed with HTTP ${tombstoned.status}`);
+    }
     for (const socket of this.ctx.getWebSockets()) closeSocket(socket, 1000, "session deleted");
     if (runtimeProfile !== "multiplayer") {
       const workspace = await getWorkspace(this);
@@ -1226,6 +1295,8 @@ export class NanocodexSession extends DurableComputerSession {
     CloudflareAgent.destroy(this);
     this.ctx.storage.transactionSync(() => {
       this.ctx.storage.sql.exec("DELETE FROM managed_turns");
+      this.ctx.storage.sql.exec("DELETE FROM history_projection_outbox");
+      this.ctx.storage.sql.exec("DELETE FROM turn_history_citations");
       this.#eventLog.clear();
       this.ctx.storage.sql.exec("DELETE FROM completed_operations");
       this.ctx.storage.sql.exec("DELETE FROM session_state");
@@ -1346,6 +1417,84 @@ export class NanocodexSession extends DurableComputerSession {
               workspace: "/workspace",
             }),
           },
+          {
+            name: "search_history",
+            description: [
+              "Search the authenticated user's completed Nanocodex threads.",
+              "Set agentic=false for direct retrieval or agentic=true for a bounded Luna search agent.",
+              "Returned citations identify the exact thread turns used by the result.",
+            ].join(" "),
+            parameters: {
+              type: "object",
+              properties: {
+                query: { type: "string" },
+                limit: { type: "integer", minimum: 1, maximum: 20 },
+                agentic: { type: "boolean" },
+              },
+              required: ["query", "limit", "agentic"],
+              additionalProperties: false,
+            },
+            handler: async (input: unknown) => {
+              const response = await this.#searchHistory(parseHistorySearchInput(input));
+              const turnId = this.#eventTurnId;
+              if (turnId !== undefined && response.citations.length > 0) {
+                this.#recordHistoryCitations(turnId, response.citations);
+              }
+              return response;
+            },
+          },
+          {
+            name: "find_threads",
+            description: [
+              "Find candidate completed threads in the authenticated user's Nanocodex history.",
+              "This is direct retrieval; use read_thread to verify relevant candidates before answering.",
+            ].join(" "),
+            parameters: {
+              type: "object",
+              properties: {
+                query: { type: "string" },
+                limit: { type: "integer", minimum: 1, maximum: 20 },
+              },
+              required: ["query", "limit"],
+              additionalProperties: false,
+            },
+            handler: async (input: unknown) => {
+              const found = await this.#findThreads(parseHistoryFindThreadsInput(input));
+              const turnId = this.#eventTurnId;
+              if (turnId !== undefined && found.citations.length > 0) {
+                this.#recordHistoryCitations(turnId, found.citations);
+              }
+              return { results: found.results };
+            },
+          },
+          {
+            name: "read_thread",
+            description: [
+              "Read exact completed turns from one candidate Nanocodex thread.",
+              "Pass turn_ids to select exact search hits, or omit them to read the newest bounded thread context.",
+            ].join(" "),
+            parameters: {
+              type: "object",
+              properties: {
+                thread_id: { type: "string" },
+                turn_ids: {
+                  type: "array",
+                  items: { type: "string" },
+                  maxItems: 20,
+                },
+              },
+              required: ["thread_id"],
+              additionalProperties: false,
+            },
+            handler: async (input: unknown) => {
+              const read = await this.#readHistoryThread(parseHistoryReadThreadInput(input));
+              const turnId = this.#eventTurnId;
+              if (turnId !== undefined && read.citations.length > 0) {
+                this.#recordHistoryCitations(turnId, read.citations);
+              }
+              return { turns: read.turns };
+            },
+          },
         ],
       });
     } catch (error) {
@@ -1357,9 +1506,83 @@ export class NanocodexSession extends DurableComputerSession {
     return agent;
   }
 
+  async #searchHistory(input: HistorySearchInput): Promise<HistorySearchResponse> {
+    const session = this.#session();
+    if (!session) throw new HistorySearchError(404, "not_found", "session is not initialized");
+    const memory = this.env.NANOCODEX_MEMORY.getByName(session.owner_id);
+    const [initialized] = await Promise.all([
+      initializeMemoryScope(memory, session.owner_id),
+      bindAgentCredential(
+        this.env.NANOCODEX,
+        this.env.NANOCODEX_MEMORY.idFromName(session.owner_id).toString(),
+        session.owner_id,
+      ),
+    ]);
+    if (!initialized.ok) {
+      throw new HistorySearchError(initialized.status, "memory_scope_unavailable", "memory scope is unavailable");
+    }
+    const response = await memory.fetch("https://memory.internal/search", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        [SESSION_OWNER_ASSERTION]: session.owner_id,
+      },
+      body: JSON.stringify(input),
+    });
+    if (!response.ok) throw await historySearchResponseError(response);
+    return response.json<HistorySearchResponse>();
+  }
+
+  async #findThreads(input: HistoryFindThreadsInput): Promise<HistorySearchResponse> {
+    return this.#searchHistory({ ...input, agentic: false });
+  }
+
+  async #readHistoryThread(input: HistoryReadThreadInput): Promise<HistoryReadThreadResponse> {
+    const session = this.#session();
+    if (!session) throw new HistorySearchError(404, "not_found", "session is not initialized");
+    const memory = this.env.NANOCODEX_MEMORY.getByName(session.owner_id);
+    const initialized = await initializeMemoryScope(memory, session.owner_id);
+    if (!initialized.ok) {
+      throw new HistorySearchError(initialized.status, "memory_scope_unavailable", "memory scope is unavailable");
+    }
+    const response = await memory.fetch("https://memory.internal/read", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        [SESSION_OWNER_ASSERTION]: session.owner_id,
+      },
+      body: JSON.stringify(input),
+    });
+    if (!response.ok) throw await historySearchResponseError(response);
+    return response.json<HistoryReadThreadResponse>();
+  }
+
+  #historyCitations(turnId: string): HistoryCitation[] {
+    const row = this.ctx.storage.sql.exec<{ citations_json: string }>(
+      "SELECT citations_json FROM turn_history_citations WHERE turn_id = ?",
+      turnId,
+    ).toArray()[0];
+    return row === undefined ? [] : JSON.parse(row.citations_json) as HistoryCitation[];
+  }
+
+  #recordHistoryCitations(turnId: string, citations: readonly HistoryCitation[]): void {
+    this.ctx.storage.transactionSync(() => {
+      const merged = mergeHistoryCitations(this.#historyCitations(turnId), citations);
+      this.ctx.storage.sql.exec(
+        `INSERT INTO turn_history_citations (turn_id, citations_json) VALUES (?, ?)
+         ON CONFLICT(turn_id) DO UPDATE SET citations_json = excluded.citations_json`,
+        turnId,
+        JSON.stringify(merged),
+      );
+    });
+  }
+
   async #complete(id: string, turn: Turn): Promise<void> {
     try {
-      const materialized = await materializeTurnTerminal(id, turn);
+      const terminal = await materializeTurnTerminal(id, turn);
+      const materialized = terminal.type === "turn_completed"
+        ? { ...terminal, citations: this.#historyCitations(id) }
+        : terminal;
       try {
         this.#commitManagedMessage(id, materialized);
       } catch (error) {
@@ -1472,6 +1695,25 @@ export class NanocodexSession extends DurableComputerSession {
           id,
           now,
         );
+        const session = this.#session();
+        if (session?.runtime_profile === "managed" && message.type === "turn_completed") {
+          const projection: HistoryProjection = {
+            thread_id: session.session_id,
+            turn_id: id,
+            cursor: event.cursor,
+            title: conversationTitle(this.#firstPrompt()),
+            input: JSON.parse(row.input_json) as PromptInput,
+            final_message: message.final_message,
+            created_at: row.created_at,
+          };
+          this.ctx.storage.sql.exec(
+            `INSERT INTO history_projection_outbox (turn_id, payload_json, attempt_count, retry_at)
+             VALUES (?, ?, 0, 0)
+             ON CONFLICT(turn_id) DO UPDATE SET payload_json = excluded.payload_json`,
+            id,
+            JSON.stringify(projection),
+          );
+        }
       }
       this.ctx.storage.sql.exec(
         `UPDATE session_state
@@ -1480,10 +1722,73 @@ export class NanocodexSession extends DurableComputerSession {
          WHERE singleton = 1`,
         now,
       );
+      if (terminal) {
+        this.ctx.storage.sql.exec("DELETE FROM turn_history_citations WHERE turn_id = ?", id);
+      }
       committed = this.#managedTurn(id) ?? row;
     });
     if (event) this.#publish(event);
+    if (committed.state === "completed") this.#scheduleHistoryProjection();
     return committed;
+  }
+
+  #scheduleHistoryProjection(): void {
+    if (this.#deleting || this.#historyProjectionTask) return;
+    const task = this.#drainHistoryProjections();
+    this.#historyProjectionTask = task;
+    void task.finally(() => {
+      if (this.#historyProjectionTask === task) this.#historyProjectionTask = undefined;
+    }).catch(() => {});
+    this.ctx.waitUntil(task.catch(async (error) => {
+      console.error("managed history projection failed", errorMessage(error));
+      await this.#scheduleNextAlarm();
+    }));
+  }
+
+  async #drainHistoryProjections(): Promise<void> {
+    if (this.#deleting) return;
+    const session = this.#session();
+    if (!session || session.runtime_profile !== "managed") return;
+    const memory = this.env.NANOCODEX_MEMORY.getByName(session.owner_id);
+    const initialized = await initializeMemoryScope(memory, session.owner_id);
+    if (!initialized.ok) throw new Error(`memory scope initialization failed with HTTP ${initialized.status}`);
+    const rows = this.ctx.storage.sql.exec<HistoryProjectionOutboxRow>(
+      `SELECT turn_id, payload_json, attempt_count, retry_at
+       FROM history_projection_outbox
+       WHERE retry_at <= ?
+       ORDER BY rowid
+       LIMIT 16`,
+      Date.now(),
+    ).toArray();
+    for (const row of rows) {
+      if (this.#deleting) return;
+      try {
+        const projected = await memory.fetch("https://memory.internal/project", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            [SESSION_OWNER_ASSERTION]: session.owner_id,
+          },
+          body: row.payload_json,
+        });
+        if (!projected.ok) throw new Error(`memory projection failed with HTTP ${projected.status}`);
+        this.ctx.storage.sql.exec(
+          "DELETE FROM history_projection_outbox WHERE turn_id = ?",
+          row.turn_id,
+        );
+      } catch (error) {
+        const attempt = row.attempt_count + 1;
+        this.ctx.storage.sql.exec(
+          `UPDATE history_projection_outbox
+           SET attempt_count = ?, retry_at = ?
+           WHERE turn_id = ?`,
+          attempt,
+          Date.now() + retryDelayMs(attempt),
+          row.turn_id,
+        );
+        throw error;
+      }
+    }
   }
 
   #recordAgentEvent(event: AgentEvent): void {
@@ -1667,6 +1972,10 @@ export class NanocodexSession extends DurableComputerSession {
         else targets.push(now + 1);
       }
     }
+    const projection = this.ctx.storage.sql.exec<{ retry_at: number }>(
+      "SELECT retry_at FROM history_projection_outbox ORDER BY retry_at LIMIT 1",
+    ).toArray()[0];
+    if (projection) targets.push(Math.max(now + 1, projection.retry_at));
     if (targets.length === 0) {
       await this.ctx.storage.deleteAlarm();
       return;
@@ -1859,6 +2168,119 @@ function managedHttpError(error: unknown, fallbackCode = "managed_request_failed
 function managedErrorResponse(error: unknown, fallbackCode?: string): Response {
   const failure = managedHttpError(error, fallbackCode);
   return json({ error: failure.code, message: failure.message }, { status: failure.status });
+}
+
+async function parseHistorySearchRequest(request: Request): Promise<HistorySearchInput> {
+  return parseHistorySearchInput(await parseHistoryRequestBody(request));
+}
+
+async function parseHistoryRequestBody(request: Request): Promise<unknown> {
+  let value: unknown;
+  try {
+    value = JSON.parse(await readBoundedRequestText(request, MAX_REQUEST_BODY_BYTES));
+  } catch (error) {
+    if (error instanceof ManagedRequestError) throw error;
+    throw new HistorySearchError(400, "invalid_json", "request body must be JSON");
+  }
+  return value;
+}
+
+async function routeHistoryRequest(
+  request: Request,
+  env: Env,
+  url: URL,
+): Promise<Response | undefined> {
+  const search = url.pathname === "/v1/history/search";
+  const find = url.pathname === "/v1/history/threads/search";
+  const read = url.pathname.match(/^\/v1\/history\/threads\/([^/]+)\/read$/);
+  if (!search && !find && !read) return undefined;
+  if (request.method !== "POST") {
+    return json({ error: "method_not_allowed" }, { status: 405 });
+  }
+  const principal = await authenticate(request, env, url);
+  if (!principal) return json({ error: "unauthorized" }, { status: 401 });
+  const originFailure = requireSameOriginMutation(request, url, principal);
+  if (originFailure) return originFailure;
+
+  try {
+    let internalPath: "/search" | "/read";
+    let input: HistorySearchInput | HistoryReadThreadInput;
+    let modelAccess = false;
+    if (search) {
+      input = await parseHistorySearchRequest(request);
+      internalPath = "/search";
+      modelAccess = input.agentic;
+    } else if (find) {
+      const found = parseHistoryFindThreadsInput(await parseHistoryRequestBody(request));
+      input = { ...found, agentic: false };
+      internalPath = "/search";
+    } else {
+      const value = await parseHistoryRequestBody(request);
+      if (!value || typeof value !== "object" || Array.isArray(value)
+        || Object.keys(value).some((key) => key !== "turn_ids")) {
+        throw new HistorySearchError(400, "invalid_request", "supported field is turn_ids");
+      }
+      input = parseHistoryReadThreadInput({
+        ...value,
+        thread_id: read![1],
+      });
+      internalPath = "/read";
+    }
+
+    const memory = env.NANOCODEX_MEMORY.getByName(principal.userId);
+    const initializedPromise = initializeMemoryScope(memory, principal.userId);
+    const bindingPromise = modelAccess
+      ? bindAgentCredential(
+        env.NANOCODEX,
+        env.NANOCODEX_MEMORY.idFromName(principal.userId).toString(),
+        principal.userId,
+      )
+      : Promise.resolve();
+    const [initialized] = await Promise.all([initializedPromise, bindingPromise]);
+    if (!initialized.ok) return initialized;
+    const response = await memory.fetch(`https://memory.internal${internalPath}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        [SESSION_OWNER_ASSERTION]: principal.userId,
+      },
+      body: JSON.stringify(input),
+    });
+    if (!find || !response.ok) return response;
+    const found = await response.json<HistorySearchResponse>();
+    return json({
+      query: found.query,
+      results: found.results,
+      citations: found.citations,
+    });
+  } catch (error) {
+    return historySearchErrorResponse(error);
+  }
+}
+
+function historySearchErrorResponse(error: unknown): Response {
+  if (error instanceof HistorySearchError) {
+    return json({ error: error.code, message: error.message }, { status: error.status });
+  }
+  if (error instanceof ManagedRequestError) return managedErrorResponse(error);
+  return json({ error: "history_search_failed", message: errorMessage(error) }, { status: 500 });
+}
+
+async function historySearchResponseError(response: Response): Promise<HistorySearchError> {
+  const value = await response.json<{ error?: unknown; message?: unknown }>().catch(() => undefined);
+  const code = typeof value?.error === "string" ? value.error : "history_search_failed";
+  const message = typeof value?.message === "string" ? value.message : `history search failed with HTTP ${response.status}`;
+  return new HistorySearchError(response.status, code, message);
+}
+
+function initializeMemoryScope(
+  memory: DurableObjectStub<MemoryScope>,
+  ownerId: string,
+): Promise<Response> {
+  return memory.fetch("https://memory.internal/initialize", {
+    method: "PUT",
+    headers: { [SESSION_OWNER_ASSERTION]: ownerId },
+  });
 }
 
 async function readBoundedRequestText(request: Request, limit: number): Promise<string> {

@@ -282,6 +282,73 @@ attempt count and exponential retry time; an ambiguous operation becomes
 the agent. Deletion clears the journal, managed rows, event log, and Computer
 workspace.
 
+Completed turns are projected idempotently from each Agent Durable Object into
+one `MemoryScope` Durable Object keyed by the authenticated user. The scope owns
+its thread catalog, turn text, source cursors, SQLite FTS index, deletion
+tombstones, and AI Search indexing outbox. Search never fans out across Agent
+objects. A stale AI Search candidate is returned only after the scope rehydrates
+it from authoritative SQLite state.
+
+Search directly, or use the bounded Luna search agent over the same
+`find_threads`/`read_thread` abstraction:
+
+```sh
+curl -fsS -X POST \
+  -H "Authorization: Bearer $account_api_key" \
+  -H 'Content-Type: application/json' \
+  --data '{"query":"what did we decide about memory?","limit":8,"agentic":false}' \
+  http://127.0.0.1:8787/v1/history/search
+```
+
+Clients can also use the lower-level retrieval boundary directly:
+
+```sh
+curl -fsS -X POST \
+  -H "Authorization: Bearer $account_api_key" \
+  -H 'Content-Type: application/json' \
+  --data '{"query":"memory scope","limit":8}' \
+  http://127.0.0.1:8787/v1/history/threads/search
+
+curl -fsS -X POST \
+  -H "Authorization: Bearer $account_api_key" \
+  -H 'Content-Type: application/json' \
+  --data '{"turn_ids":["turn-42"]}' \
+  http://127.0.0.1:8787/v1/history/threads/<thread-id>/read
+```
+
+These are the HTTP equivalents of `find_threads` and `read_thread`. Browser
+clients may use the HttpOnly account cookie instead of an API key; non-browser
+clients use the same account-issued `ncx_live_...` bearer as every other managed
+operation. The caller never supplies a user or memory-scope identifier.
+
+The response contains `results` and citations grouped by `thread_id`, with the
+exact `turn_id` and durable source cursor. Completed turn responses likewise
+contain `citations`; they are empty unless that answer used `search_history`,
+`find_threads`, or `read_thread`. Managed agents expose all three tools.
+`find_threads` performs direct candidate retrieval and `read_thread` returns
+exact projected user/assistant turns, either for selected `turn_ids` or the
+newest bounded context from a thread. They use the same account MemoryScope as
+`search_history`; no per-thread search fan-out or second index is introduced.
+Agentic search keeps `results` bounded by `limit`, while citations retain every
+turn inspected for the answer, including sources beyond that display limit.
+Local Wrangler uses the scope's SQLite FTS implementation because AI Search has
+no local simulator. A hosted deployment can bind an AI Search instance as
+`HISTORY_AI_SEARCH`; projection uploads only text already committed to the
+MemoryScope. Configure the instance with `scope_id` and `segment_id` text custom
+metadata fields. Simple search merges vector retrieval with authoritative local
+FTS while indexing is pending or unavailable, and applies a minimum vector
+similarity before returning results so an unrelated query can return an empty
+result and citation set. Agentic search invokes the canonical Rust task-tree
+handlers directly: it spawns a Luna child in priority mode, waits for its
+structured result, and closes it through the same subagent registry. The child
+starts with the initial `find_threads` result already in context, saving one
+model/tool round trip while retaining both tools for follow-up retrieval.
+
+Set `NANOCODEX_HISTORY_AI_SEARCH_INSTANCE` when starting `npm run dev` to bind
+that hosted instance remotely while keeping the managed Worker, broker, and
+Durable Objects in local Wrangler. Without it, local development remains
+FTS-only.
+
 Start workerd in one terminal and run the live probes in another:
 
 ```sh

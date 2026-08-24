@@ -170,6 +170,52 @@ describe("per-user credential broker", () => {
     expect(localRelayRequest?.headers.get("authorization")).toMatch(/^Bearer [^.]+\.[^.]+\.[^.]+$/);
     expect(localRelayRequest?.headers.get("x-nanocodex-subject")).toBeNull();
 
+    const capability = "C".repeat(43);
+    let capabilityRequest: Request | undefined;
+    const throughCapability = await handleEgress(
+      modelRequest(subject),
+      {
+        ...workerEnv,
+        CODEX_RELAY_URL: `http://127.0.0.1:49152/v1/${capability}`,
+        ALLOW_INSECURE_LOOPBACK_RELAY: "true",
+      },
+      undefined,
+      async (input, init) => {
+        capabilityRequest = input instanceof Request ? input : new Request(input, init);
+        return Response.json({ ok: true });
+      },
+    );
+    expect(throughCapability.status).toBe(200);
+    expect(capabilityRequest?.url).toBe(
+      `http://127.0.0.1:49152/v1/${capability}/http/codex-web-search`,
+    );
+
+    let capabilitySocketRequest: Request | undefined;
+    const throughCapabilitySocket = await handleEgress(
+      new Request("https://nanocodex.internal/v1/responses", {
+        headers: {
+          authorization: "Bearer NANOCODEX_PROVIDER_CREDENTIAL",
+          "openai-beta": "responses_websockets=2026-02-06",
+          upgrade: "websocket",
+          "x-nanocodex-subject": subject,
+        },
+      }),
+      {
+        ...workerEnv,
+        CODEX_RELAY_URL: `http://127.0.0.1:49152/v1/${capability}`,
+        ALLOW_INSECURE_LOOPBACK_RELAY: "true",
+      },
+      undefined,
+      async (input, init) => {
+        capabilitySocketRequest = input instanceof Request ? input : new Request(input, init);
+        return Response.json({ ok: true });
+      },
+    );
+    expect(throughCapabilitySocket.status).toBe(200);
+    expect(capabilitySocketRequest?.url).toBe(
+      `http://127.0.0.1:49152/v1/${capability}`,
+    );
+
     let containerRequest: Request | undefined;
     let containerName: string | undefined;
     const throughContainer = await handleEgress(
@@ -295,6 +341,30 @@ describe("per-user credential broker", () => {
       },
     );
     expect(await ready.json()).toEqual({ ready: true });
+
+    const streamedEmptyPost = await handleEgress(
+      new Request("https://broker.test/.well-known/nanocodex/broker-readiness", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer probe-token-that-is-at-least-thirty-two-bytes",
+        },
+        body: new Uint8Array(),
+      }),
+      workerEnv,
+    );
+    expect(await streamedEmptyPost.json()).toEqual({ ready: true });
+
+    const bodyRejected = await handleEgress(
+      new Request("https://broker.test/.well-known/nanocodex/broker-readiness", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer probe-token-that-is-at-least-thirty-two-bytes",
+        },
+        body: "x",
+      }),
+      workerEnv,
+    );
+    expect(bodyRejected.status).toBe(404);
   });
 
   it("stores only opaque subject mappings in the directory DO", async () => {

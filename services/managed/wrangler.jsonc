@@ -45,6 +45,10 @@
       {
         "name": "NANOCODEX_API_KEYS",
         "class_name": "ApiKeyRecord"
+      },
+      {
+        "name": "NANOCODEX_MEMORY",
+        "class_name": "MemoryScope"
       }
     ]
   },
@@ -56,6 +60,10 @@
     {
       "tag": "v2",
       "new_sqlite_classes": ["NonceStorage", "UserAccount", "ApiKeyRecord"]
+    },
+    {
+      "tag": "v3",
+      "new_sqlite_classes": ["MemoryScope"]
     }
   ],
   "vars": {

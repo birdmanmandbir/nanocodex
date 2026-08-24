@@ -410,6 +410,93 @@ test("Node-hosted WASM runs the canonical Rust subagent task tree", async () => 
   }
 });
 
+test("Node host invokes canonical subagent handlers without a root model turn", async () => {
+  const server = await startServer();
+  const agent = await createWarmAgent({
+    apiKey: "test-key",
+    websocketUrl: server.url,
+    thinking: "none",
+    sessionId: "018f1f9a-7b3c-7a09-8000-000000000009",
+    tools: [{
+      name: "find_threads",
+      description: "Find one memory thread.",
+      parameters: { type: "object" },
+      handler: () => ({ thread_id: "thread-memory" }),
+    }, ...Subagents.create({ maxConcurrency: 1 })],
+  });
+
+  try {
+    const startedPromise = Subagents.spawn(agent, {
+      role: "memory-search",
+      task: "Use find_threads and return its thread ID.",
+      model: "luna",
+      thinking: "low",
+      outputSchema: {
+        type: "object",
+        properties: { answer: { type: "string" } },
+        required: ["answer"],
+        additionalProperties: false,
+      },
+    });
+    const childSocket = await bounded(server.connection, "child connection");
+    const childReader = messageReader(childSocket);
+    await bounded(childReader.next(), "child warmup");
+    sendWarmup(childSocket, "direct-child-warmup");
+    const started = await bounded(startedPromise, "direct spawn");
+    assert.deepEqual(started, {
+      agent_id: 1,
+      role: "memory-search",
+      status: { state: "running" },
+    });
+    await bounded(childReader.next(), "child task");
+    sendCompleted(childSocket, "direct-find", [{
+      type: "function_call",
+      call_id: "direct-find-call",
+      name: "find_threads",
+      arguments: "{}",
+    }]);
+    const found = await bounded(childReader.next(), "find_threads output");
+    assert.deepEqual(JSON.parse(found.input[0].output), { thread_id: "thread-memory" });
+    sendCompleted(childSocket, "direct-submit", [{
+      type: "function_call",
+      call_id: "direct-submit-call",
+      name: "submit_result",
+      arguments: JSON.stringify({
+        turn_token: 1,
+        output: { answer: "thread-memory" },
+      }),
+    }]);
+    const submitted = await bounded(childReader.next(), "submit_result output");
+    assert.deepEqual(JSON.parse(submitted.input[0].output), { accepted: true });
+    sendFinal(childSocket, "direct-final", "submitted");
+
+    const waited = await bounded(Subagents.wait(agent, {
+      agentIds: [started.agent_id],
+      timeoutMs: 5_000,
+    }), "direct wait");
+    assert.equal(waited.timed_out, false);
+    assert.deepEqual(waited.agents[0].status, {
+      state: "completed",
+      output: { answer: "thread-memory" },
+    });
+    await Subagents.close(agent, started.agent_id);
+    await assert.rejects(
+      Subagents.wait(agent, { agentIds: [started.agent_id], timeoutMs: 0 }),
+      /timeoutMs must be greater than zero/,
+    );
+    const nonRoot = await agent.session.spawn();
+    await assert.rejects(
+      Subagents.wait(nonRoot, { agentIds: [started.agent_id], timeoutMs: 1 }),
+      /require the owning root agent/,
+    );
+    nonRoot.dispose();
+    assert.equal(server.connections, 1);
+  } finally {
+    await agent.session.shutdown();
+    await server.close();
+  }
+});
+
 test("WASM snapshots resume authoritative history in a fresh agent", async () => {
   const originalServer = await startServer();
   const original = await createWarmAgent({
@@ -650,6 +737,20 @@ function messageReader(socket) {
       return new Promise((resolve) => { waiter = resolve; });
     },
   };
+}
+
+async function bounded(promise, stage) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`timed out waiting for ${stage}`)), 5_000);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 class ManagedSocket extends EventTarget {

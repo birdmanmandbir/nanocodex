@@ -7,6 +7,98 @@ const origin = "https://managed.example";
 const agentId = "0198d3f0-8844-7000-8000-000000000001";
 const apiKey = `ncx_live_${"a".repeat(12)}_${"b".repeat(43)}`;
 
+test("managed history search validates and preserves citation provenance", async () => {
+  const fetch = async (input, init) => {
+    const request = new Request(input, init);
+    assert.equal(new URL(request.url).pathname, "/v1/history/search");
+    assert.equal(request.method, "POST");
+    assert.deepEqual(await request.json(), { query: "copper", limit: 4, agentic: false });
+    return Response.json({
+      query: "copper",
+      agentic: false,
+      answer: null,
+      results: [{
+        thread_id: agentId,
+        title: "Copper notes",
+        turn_id: "turn-1",
+        cursor: "7",
+        score: 0.9,
+        snippet: "remember copper",
+      }],
+      citations: [{
+        thread_id: agentId,
+        title: "Copper notes",
+        sources: [{ turn_id: "turn-1", cursor: "7" }],
+      }],
+    });
+  };
+  const result = await Agent.searchHistory(
+    { query: "copper", limit: 4, agentic: false },
+    { baseUrl: origin, apiKey, fetch },
+  );
+  assert.equal(result.results[0].thread_id, agentId);
+  assert.deepEqual(result.citations[0].sources, [{ turn_id: "turn-1", cursor: "7" }]);
+});
+
+test("managed account clients expose find_threads and read_thread over the same bearer", async () => {
+  const requests = [];
+  const fetch = async (input, init) => {
+    const request = new Request(input, init);
+    requests.push(request);
+    const path = new URL(request.url).pathname;
+    if (path === "/v1/history/threads/search") {
+      assert.deepEqual(await request.json(), { query: "copper", limit: 4 });
+      return Response.json({
+        query: "copper",
+        results: [{
+          thread_id: agentId,
+          title: "Copper notes",
+          turn_id: "turn-1",
+          cursor: "7",
+          score: 0.9,
+          snippet: "remember copper",
+        }],
+        citations: [{
+          thread_id: agentId,
+          title: "Copper notes",
+          sources: [{ turn_id: "turn-1", cursor: "7" }],
+        }],
+      });
+    }
+    if (path === `/v1/history/threads/${agentId}/read`) {
+      assert.deepEqual(await request.json(), { turn_ids: ["turn-1"] });
+      return Response.json({
+        turns: [{
+          thread_id: agentId,
+          title: "Copper notes",
+          turn_id: "turn-1",
+          cursor: "7",
+          user: "remember copper",
+          assistant: "remembered",
+        }],
+        citations: [{
+          thread_id: agentId,
+          title: "Copper notes",
+          sources: [{ turn_id: "turn-1", cursor: "7" }],
+        }],
+      });
+    }
+    return Response.json({ error: "not_found" }, { status: 404 });
+  };
+  const options = { baseUrl: origin, apiKey, fetch };
+  const found = await Agent.findThreads({ query: "copper", limit: 4 }, options);
+  const read = await Agent.readThread({ thread_id: agentId, turn_ids: ["turn-1"] }, options);
+
+  assert.equal(found.results[0].thread_id, agentId);
+  assert.equal(read.turns[0].assistant, "remembered");
+  assert.deepEqual(read.citations[0].sources, [{ turn_id: "turn-1", cursor: "7" }]);
+  for (const request of requests) {
+    assert.equal(request.method, "POST");
+    assert.equal(request.credentials, "omit");
+    assert.equal(request.headers.get("authorization"), `Bearer ${apiKey}`);
+  }
+});
+
 test("managed Agent covers account-scoped create, list, get, and delete", async () => {
   const calls = [];
   const fetch = async (input, init) => {
@@ -205,13 +297,16 @@ test("prompts and a watcher multiplex one active managed event request without s
     id: `turn-${number}`,
     final_message: `done ${number}`,
     usage: null,
+    ...(number === 1 ? {} : { citations: [] }),
   })).join(""));
 
-  assert.deepEqual((await Promise.all(results)).map((result) => result.finalMessage), [
+  const completed = await Promise.all(results);
+  assert.deepEqual(completed.map((result) => result.finalMessage), [
     "done 1",
     "done 2",
     "done 3",
   ]);
+  assert.deepEqual(completed[0].citations, []);
   await watching;
   assert.deepEqual(watched.map((event) => event.data.id), ["turn-1", "turn-2", "turn-3"]);
   assert.equal(eventRequests, 1);
@@ -288,12 +383,14 @@ test("shared event replay reconnect resolves one turn and delivers each cursor e
     id: "turn-1",
     final_message: "done",
     usage: null,
+    citations: [],
   })}`);
 
   assert.deepEqual(await firstResult, {
     turnId: "turn-1",
     finalMessage: "done",
     usage: null,
+    citations: [],
     cursor: "7",
   });
   assert.strictEqual(await turn.result(), await turn.result());
@@ -347,6 +444,7 @@ test("turn result without an event watcher opens one shared stream and preserves
         id: "turn-1",
         final_message: "done",
         usage: null,
+        citations: [],
       })]);
     }
     return Response.json({ error: "not_found" }, { status: 404 });
@@ -364,6 +462,7 @@ test("turn result without an event watcher opens one shared stream and preserves
     turnId: "turn-1",
     finalMessage: "done",
     usage: null,
+    citations: [],
     cursor: "7",
   });
   assert.strictEqual(await turn.result(), await turn.result());

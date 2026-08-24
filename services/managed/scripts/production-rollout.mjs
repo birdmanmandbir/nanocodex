@@ -81,8 +81,8 @@ export function buildManagedProductionConfig(baseConfig, {
       binding?.class_name,
     ]),
   );
-  if ((baseConfig.durable_objects?.bindings ?? []).length !== 6
-    || durableObjects.size !== 6) {
+  if ((baseConfig.durable_objects?.bindings ?? []).length !== 7
+    || durableObjects.size !== 7) {
     throw new Error("production managed Worker has an unexpected Durable Object binding");
   }
   for (const [name, className] of [
@@ -92,14 +92,15 @@ export function buildManagedProductionConfig(baseConfig, {
     ["NANOCODEX_AUTH", "NonceStorage"],
     ["NANOCODEX_USERS", "UserAccount"],
     ["NANOCODEX_API_KEYS", "ApiKeyRecord"],
+    ["NANOCODEX_MEMORY", "MemoryScope"],
   ]) {
     if (durableObjects.get(name) !== className) {
       throw new Error(`production managed Worker requires ${name}`);
     }
   }
   const migrationTags = baseConfig.migrations?.map((migration) => migration?.tag);
-  if (JSON.stringify(migrationTags) !== JSON.stringify(["v1", "v2"])) {
-    throw new Error("production managed Worker requires the current v1 and v2 migrations");
+  if (JSON.stringify(migrationTags) !== JSON.stringify(["v1", "v2", "v3"])) {
+    throw new Error("production managed Worker requires the current v1, v2, and v3 migrations");
   }
   const v1 = baseConfig.migrations[0];
   if (!["NanocodexSession", "MultiplayerRoom", "MultiplayerQuota"].every(
@@ -112,6 +113,10 @@ export function buildManagedProductionConfig(baseConfig, {
     if (!v2?.new_sqlite_classes?.includes(className)) {
       throw new Error(`production managed Worker requires ${className} in migration v2`);
     }
+  }
+  const v3 = baseConfig.migrations[2];
+  if (!v3?.new_sqlite_classes?.includes("MemoryScope")) {
+    throw new Error("production managed Worker requires MemoryScope in migration v3");
   }
   assertNoProviderConfiguration(baseConfig, "managed config");
 

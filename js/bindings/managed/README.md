@@ -27,6 +27,27 @@ const agent = await Agent.get(process.env.NANOCODEX_AGENT_ID, {
 });
 ```
 
+The same account client can search all completed managed conversations without
+opening an agent turn:
+
+```js
+const found = await Agent.findThreads(
+  { query: "what did we decide about memory?", limit: 8 },
+  { baseUrl: process.env.NANOCODEX_MANAGED_URL, apiKey: process.env.NANOCODEX_API_KEY },
+);
+const thread = await Agent.readThread(
+  {
+    thread_id: found.results[0].thread_id,
+    turn_ids: [found.results[0].turn_id],
+  },
+  { baseUrl: process.env.NANOCODEX_MANAGED_URL, apiKey: process.env.NANOCODEX_API_KEY },
+);
+```
+
+`Agent.searchHistory` remains the combined direct/agentic operation. All three
+methods derive the account scope from the cookie or API key; no scope or user
+identifier is accepted from the caller.
+
 `Agent.list()` returns agent handles, `agent.state()` reads current state, and
 `agent.delete()` removes the agent and its retained state. `agent.events.watch`
 is an async iterator over durable events. Pass its last decimal `cursor` to a

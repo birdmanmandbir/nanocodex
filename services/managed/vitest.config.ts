@@ -92,8 +92,150 @@ export default {
       const imageOutput = input.find((item) => (
         item?.type === "function_call_output" && item.call_id === "managed-image"
       ));
+      const memoryFind = input.find((item) => (
+        item?.type === "function_call_output" && item.call_id === "memory-find"
+      ));
+      const memoryRead = input.find((item) => (
+        item?.type === "function_call_output" && item.call_id === "memory-read"
+      ));
+      const memorySubmit = input.find((item) => (
+        item?.type === "function_call_output" && item.call_id === "memory-submit"
+      ));
+      const managedMemoryFind = input.find((item) => (
+        item?.type === "function_call_output" && item.call_id === "managed-memory-find"
+      ));
+      const managedMemoryRead = input.find((item) => (
+        item?.type === "function_call_output" && item.call_id === "managed-memory-read"
+      ));
       pendingResponse = setTimeout(() => {
         pendingResponse = undefined;
+        if (managedMemoryRead) {
+          const valid = String(managedMemoryRead.output).includes("COPPER_LIGHTHOUSE_MEMORY");
+          server.send(JSON.stringify({
+            type: "response.completed",
+            response: {
+              id: crypto.randomUUID(),
+              status: "completed",
+              output: [{
+                type: "message",
+                role: "assistant",
+                content: [{
+                  type: "output_text",
+                  text: valid ? "MANAGED_MEMORY_TOOLS_OK" : "MANAGED_MEMORY_TOOLS_BAD",
+                }],
+              }],
+              usage: null,
+            },
+          }));
+          return;
+        }
+        if (managedMemoryFind) {
+          let found;
+          try { found = JSON.parse(String(managedMemoryFind.output)); } catch {}
+          const hit = found?.results?.[0];
+          server.send(JSON.stringify({
+            type: "response.completed",
+            response: {
+              id: crypto.randomUUID(),
+              status: "completed",
+              output: [{
+                type: "function_call",
+                call_id: "managed-memory-read",
+                name: "read_thread",
+                arguments: JSON.stringify({
+                  thread_id: hit?.thread_id,
+                  turn_ids: hit?.turn_id ? [hit.turn_id] : [],
+                }),
+              }],
+              usage: null,
+            },
+          }));
+          return;
+        }
+        if (memorySubmit) {
+          server.send(JSON.stringify({
+            type: "response.completed",
+            response: {
+              id: crypto.randomUUID(),
+              status: "completed",
+              output: [{
+                type: "message",
+                role: "assistant",
+                content: [{ type: "output_text", text: "memory result submitted" }],
+              }],
+              usage: null,
+            },
+          }));
+          return;
+        }
+        if (memoryRead) {
+          const turnToken = Number(text.match(/turn_token:\s*(\d+)/)?.[1] ?? 1);
+          server.send(JSON.stringify({
+            type: "response.completed",
+            response: {
+              id: crypto.randomUUID(),
+              status: "completed",
+              output: [{
+                type: "function_call",
+                call_id: "memory-submit",
+                name: "submit_result",
+                arguments: JSON.stringify({
+                  turn_token: turnToken,
+                  output: { answer: "MEMORY_AGENTIC_OK" },
+                }),
+              }],
+              usage: null,
+            },
+          }));
+          return;
+        }
+        if (memoryFind) {
+          let found;
+          try { found = JSON.parse(String(memoryFind.output)); } catch {}
+          const hit = found?.results?.[0];
+          server.send(JSON.stringify({
+            type: "response.completed",
+            response: {
+              id: crypto.randomUUID(),
+              status: "completed",
+              output: [{
+                type: "function_call",
+                call_id: "memory-read",
+                name: "read_thread",
+                arguments: JSON.stringify({
+                  thread_id: hit?.thread_id,
+                  turn_ids: hit?.turn_id ? [hit.turn_id] : [],
+                }),
+              }],
+              usage: null,
+            },
+          }));
+          return;
+        }
+        if (command.model === "gpt-5.6-luna"
+          && command.service_tier === "priority"
+          && text.includes("recall copper lighthouse")
+          && text.includes("Initial find_threads result (already computed)")) {
+          const threadId = text.match(/[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/)?.[0];
+          server.send(JSON.stringify({
+            type: "response.completed",
+            response: {
+              id: crypto.randomUUID(),
+              status: "completed",
+              output: [{
+                type: "function_call",
+                call_id: "memory-read",
+                name: "read_thread",
+                arguments: JSON.stringify({
+                  thread_id: threadId,
+                  turn_ids: ["turn-memory"],
+                }),
+              }],
+              usage: null,
+            },
+          }));
+          return;
+        }
         if (toolOutput && imageOutput) {
           const valid = String(toolOutput.output).includes("MANAGED_WEB_SEARCH_OK")
             && String(imageOutput.output).includes("TUFOQUdFRF9JTUFHRV9PSw==");
@@ -128,6 +270,26 @@ export default {
                 call_id: "managed-image",
                 name: "image_gen__imagegen",
                 arguments: JSON.stringify({ prompt: "draw managed" }),
+              }],
+              usage: null,
+            },
+          }));
+          return;
+        }
+        if (text === "E2E_MEMORY_TOOL") {
+          server.send(JSON.stringify({
+            type: "response.completed",
+            response: {
+              id: crypto.randomUUID(),
+              status: "completed",
+              output: [{
+                type: "function_call",
+                call_id: "managed-memory-find",
+                name: "find_threads",
+                arguments: JSON.stringify({
+                  query: "copper lighthouse",
+                  limit: 8,
+                }),
               }],
               usage: null,
             },

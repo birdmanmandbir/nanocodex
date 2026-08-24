@@ -24,6 +24,7 @@ describe("materializeTurnTerminal", () => {
       id: "turn-1",
       final_message: "done",
       usage,
+      citations: [],
     });
     expect(result.usage).toHaveBeenCalledOnce();
     expect(dispose).toHaveBeenCalledOnce();
@@ -41,6 +42,7 @@ describe("materializeTurnTerminal", () => {
       id: "turn-2",
       final_message: "done",
       usage: null,
+      citations: [],
       usage_error: "usage payload is invalid",
     });
     expect(result.usage).toHaveBeenCalledOnce();

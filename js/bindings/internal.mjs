@@ -117,6 +117,22 @@ export async function spawn(agent) {
   return createAgent(await state.raw.spawn(), state.runtime);
 }
 
+export async function spawnSubagent(agent, options) {
+  return JSON.parse(await agentState(agent).raw.spawnSubagent(JSON.stringify(options)));
+}
+
+export async function waitSubagents(agent, options) {
+  return JSON.parse(await agentState(agent).raw.waitSubagents(JSON.stringify(options)));
+}
+
+export async function interruptSubagent(agent, agentId) {
+  return JSON.parse(await agentState(agent).raw.interruptSubagent(JSON.stringify({ agentId })));
+}
+
+export async function closeSubagent(agent, agentId) {
+  return JSON.parse(await agentState(agent).raw.closeSubagent(JSON.stringify({ agentId })));
+}
+
 export function setThinking(agent, thinking) {
   return agentState(agent).raw.setThinking(thinking);
 }

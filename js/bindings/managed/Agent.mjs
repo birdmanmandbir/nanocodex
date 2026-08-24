@@ -4,6 +4,7 @@ const API_KEY = /^ncx_live_[A-Za-z0-9_-]{12}_[A-Za-z0-9_-]{43}$/;
 const CURSOR = /^(?:0|[1-9][0-9]*)$/;
 const LATEST_CURSOR = "latest";
 const IDEMPOTENCY_KEY = /^[\x21-\x7e]{1,256}$/;
+const THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const TURN_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 const TERMINAL_TYPES = new Set([
   "turn_completed",
@@ -61,6 +62,53 @@ export async function remove(id, options = {}) {
 }
 
 export { remove as delete };
+
+/** Search completed threads owned by the authenticated account. */
+export async function searchHistory(request, options = {}) {
+  if (!request || typeof request !== "object" || Array.isArray(request)) {
+    throw new TypeError("managed history search request must be an object");
+  }
+  const unsupported = Object.keys(request).find((key) => !["query", "limit", "agentic"].includes(key));
+  if (unsupported) throw new TypeError(`managed history search does not accept ${unsupported}`);
+  if (typeof request.query !== "string" || !request.query.trim()) {
+    throw new TypeError("managed history search query must be a non-empty string");
+  }
+  if (request.limit !== undefined
+    && (!Number.isSafeInteger(request.limit) || request.limit < 1 || request.limit > 20)) {
+    throw new TypeError("managed history search limit must be an integer from 1 through 20");
+  }
+  if (request.agentic !== undefined && typeof request.agentic !== "boolean") {
+    throw new TypeError("managed history search agentic must be a boolean");
+  }
+  const body = await managedClient(options).json("/v1/history/search", {
+    method: "POST",
+    body: JSON.stringify(request),
+  });
+  return managedHistorySearchResponse(body);
+}
+
+/** Find candidate completed threads owned by the authenticated account. */
+export async function findThreads(request, options = {}) {
+  validateFindThreadsRequest(request);
+  const body = await managedClient(options).json("/v1/history/threads/search", {
+    method: "POST",
+    body: JSON.stringify(request),
+  });
+  return managedFindThreadsResponse(body);
+}
+
+/** Read exact projected turns from one completed account thread. */
+export async function readThread(request, options = {}) {
+  validateReadThreadRequest(request);
+  const body = await managedClient(options).json(
+    `/v1/history/threads/${encodeURIComponent(request.thread_id)}/read`,
+    {
+      method: "POST",
+      body: JSON.stringify(request.turn_ids === undefined ? {} : { turn_ids: request.turn_ids }),
+    },
+  );
+  return managedReadThreadResponse(body);
+}
 
 function agentHandle(client, id, summary) {
   validateAgentId(id);
@@ -239,6 +287,7 @@ function terminalResult(turnId, terminal, cursor) {
       turnId,
       finalMessage: terminal.final_message,
       usage: terminal.usage ?? null,
+      citations: managedCitations(terminal.citations ?? []),
       ...(typeof terminal.usage_error === "string" ? { usageError: terminal.usage_error } : {}),
       ...(typeof cursor === "string" ? { cursor } : {}),
     });
@@ -246,6 +295,115 @@ function terminalResult(turnId, terminal, cursor) {
   const code = typeof terminal.type === "string" ? terminal.type : "turn_failed";
   const message = stringOr(terminal.error, `managed ${code.replaceAll("_", " ")}`);
   throw new ManagedError(code, message);
+}
+
+function managedHistorySearchResponse(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || typeof value.query !== "string"
+    || typeof value.agentic !== "boolean"
+    || (value.answer !== null && typeof value.answer !== "string")) {
+    throw new ManagedError("invalid_response", "managed history search response is malformed");
+  }
+  return Object.freeze({
+    query: value.query,
+    agentic: value.agentic,
+    answer: value.answer,
+    results: managedHistoryHits(value.results),
+    citations: managedCitations(value.citations),
+  });
+}
+
+function managedFindThreadsResponse(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || typeof value.query !== "string") {
+    throw new ManagedError("invalid_response", "managed find threads response is malformed");
+  }
+  return Object.freeze({
+    query: value.query,
+    results: managedHistoryHits(value.results),
+    citations: managedCitations(value.citations),
+  });
+}
+
+function managedHistoryHits(value) {
+  if (!Array.isArray(value)) {
+    throw new ManagedError("invalid_response", "managed history results are malformed");
+  }
+  return Object.freeze(value.map((result) => {
+    if (!result || typeof result !== "object" || Array.isArray(result)
+      || typeof result.thread_id !== "string"
+      || typeof result.title !== "string"
+      || typeof result.turn_id !== "string"
+      || typeof result.cursor !== "string" || !CURSOR.test(result.cursor)
+      || typeof result.score !== "number" || !Number.isFinite(result.score)
+      || typeof result.snippet !== "string") {
+      throw new ManagedError("invalid_response", "managed history search result is malformed");
+    }
+    return Object.freeze({
+      thread_id: result.thread_id,
+      title: result.title,
+      turn_id: result.turn_id,
+      cursor: result.cursor,
+      score: result.score,
+      snippet: result.snippet,
+    });
+  }));
+}
+
+function managedReadThreadResponse(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || !Array.isArray(value.turns)) {
+    throw new ManagedError("invalid_response", "managed read thread response is malformed");
+  }
+  const turns = value.turns.map((turn) => {
+    if (!turn || typeof turn !== "object" || Array.isArray(turn)
+      || typeof turn.thread_id !== "string"
+      || typeof turn.title !== "string"
+      || typeof turn.turn_id !== "string"
+      || typeof turn.cursor !== "string" || !CURSOR.test(turn.cursor)
+      || typeof turn.user !== "string"
+      || typeof turn.assistant !== "string") {
+      throw new ManagedError("invalid_response", "managed thread turn is malformed");
+    }
+    return Object.freeze({
+      thread_id: turn.thread_id,
+      title: turn.title,
+      turn_id: turn.turn_id,
+      cursor: turn.cursor,
+      user: turn.user,
+      assistant: turn.assistant,
+    });
+  });
+  return Object.freeze({
+    turns: Object.freeze(turns),
+    citations: managedCitations(value.citations),
+  });
+}
+
+function managedCitations(value) {
+  if (!Array.isArray(value)) {
+    throw new ManagedError("invalid_response", "managed citations are malformed");
+  }
+  return Object.freeze(value.map((citation) => {
+    if (!citation || typeof citation !== "object" || Array.isArray(citation)
+      || typeof citation.thread_id !== "string"
+      || typeof citation.title !== "string"
+      || !Array.isArray(citation.sources)) {
+      throw new ManagedError("invalid_response", "managed citation is malformed");
+    }
+    const sources = citation.sources.map((source) => {
+      if (!source || typeof source !== "object" || Array.isArray(source)
+        || typeof source.turn_id !== "string"
+        || typeof source.cursor !== "string" || !CURSOR.test(source.cursor)) {
+        throw new ManagedError("invalid_response", "managed citation source is malformed");
+      }
+      return Object.freeze({ turn_id: source.turn_id, cursor: source.cursor });
+    });
+    return Object.freeze({
+      thread_id: citation.thread_id,
+      title: citation.title,
+      sources: Object.freeze(sources),
+    });
+  }));
 }
 
 function replayableEventStream(client, agentId) {
@@ -605,6 +763,37 @@ function turnPath(agentId, turnId) {
 function validateAgentId(id) {
   if (typeof id !== "string" || !TURN_ID.test(id)) {
     throw new TypeError("managed agent id is invalid");
+  }
+}
+
+function validateFindThreadsRequest(request) {
+  if (!request || typeof request !== "object" || Array.isArray(request)) {
+    throw new TypeError("managed find threads request must be an object");
+  }
+  const unsupported = Object.keys(request).find((key) => !["query", "limit"].includes(key));
+  if (unsupported) throw new TypeError(`managed find threads does not accept ${unsupported}`);
+  if (typeof request.query !== "string" || !request.query.trim()) {
+    throw new TypeError("managed find threads query must be a non-empty string");
+  }
+  if (request.limit !== undefined
+    && (!Number.isSafeInteger(request.limit) || request.limit < 1 || request.limit > 20)) {
+    throw new TypeError("managed find threads limit must be an integer from 1 through 20");
+  }
+}
+
+function validateReadThreadRequest(request) {
+  if (!request || typeof request !== "object" || Array.isArray(request)) {
+    throw new TypeError("managed read thread request must be an object");
+  }
+  const unsupported = Object.keys(request).find((key) => !["thread_id", "turn_ids"].includes(key));
+  if (unsupported) throw new TypeError(`managed read thread does not accept ${unsupported}`);
+  if (typeof request.thread_id !== "string" || !THREAD_ID.test(request.thread_id)) {
+    throw new TypeError("managed thread id is invalid");
+  }
+  if (request.turn_ids !== undefined && (!Array.isArray(request.turn_ids)
+    || request.turn_ids.length > 20
+    || request.turn_ids.some((id) => typeof id !== "string" || !TURN_ID.test(id)))) {
+    throw new TypeError("managed read thread turn_ids must contain at most 20 valid turn ids");
   }
 }
 

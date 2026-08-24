@@ -1202,7 +1202,7 @@ impl Registry {
         }
     }
 
-    pub(super) async fn interrupt(
+    pub async fn interrupt(
         &self,
         session_id: &str,
         id: AgentId,

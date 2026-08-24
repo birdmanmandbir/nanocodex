@@ -1,5 +1,57 @@
 import type { PromptInput, TurnUsage } from "../types.mjs";
 
+export type HistorySource = Readonly<{ turn_id: string; cursor: string }>;
+export type HistoryCitation = Readonly<{
+  thread_id: string;
+  title: string;
+  sources: readonly HistorySource[];
+}>;
+export type HistorySearchHit = Readonly<{
+  thread_id: string;
+  title: string;
+  turn_id: string;
+  cursor: string;
+  score: number;
+  snippet: string;
+}>;
+export type HistorySearchRequest = Readonly<{
+  query: string;
+  limit?: number | undefined;
+  agentic?: boolean | undefined;
+}>;
+export type HistorySearchResponse = Readonly<{
+  query: string;
+  agentic: boolean;
+  answer: string | null;
+  results: readonly HistorySearchHit[];
+  citations: readonly HistoryCitation[];
+}>;
+export type FindThreadsRequest = Readonly<{
+  query: string;
+  limit?: number | undefined;
+}>;
+export type FindThreadsResponse = Readonly<{
+  query: string;
+  results: readonly HistorySearchHit[];
+  citations: readonly HistoryCitation[];
+}>;
+export type ReadThreadRequest = Readonly<{
+  thread_id: string;
+  turn_ids?: readonly string[] | undefined;
+}>;
+export type ThreadTurn = Readonly<{
+  thread_id: string;
+  title: string;
+  turn_id: string;
+  cursor: string;
+  user: string;
+  assistant: string;
+}>;
+export type ReadThreadResponse = Readonly<{
+  turns: readonly ThreadTurn[];
+  citations: readonly HistoryCitation[];
+}>;
+
 export type Options = Readonly<{
   /** Managed service origin. Defaults to the current browser origin. */
   baseUrl?: string | URL | undefined;
@@ -86,6 +138,7 @@ export type CompletedEventData = Readonly<{
   id: string;
   final_message: string;
   usage: TurnUsage | null;
+  citations: readonly HistoryCitation[];
   usage_error?: string | undefined;
 }>;
 
@@ -136,6 +189,7 @@ export type TurnResult = Readonly<{
   turnId: string;
   finalMessage: string;
   usage: TurnUsage | null;
+  citations: readonly HistoryCitation[];
   usageError?: string | undefined;
   cursor?: string | undefined;
 }>;
@@ -170,3 +224,6 @@ export function get(id: string, options?: Options): Promise<Agent>;
 export function open(id: string, options?: Options): Agent;
 export function remove(id: string, options?: Options): Promise<void>;
 export { remove as delete };
+export function searchHistory(request: HistorySearchRequest, options?: Options): Promise<HistorySearchResponse>;
+export function findThreads(request: FindThreadsRequest, options?: Options): Promise<FindThreadsResponse>;
+export function readThread(request: ReadThreadRequest, options?: Options): Promise<ReadThreadResponse>;

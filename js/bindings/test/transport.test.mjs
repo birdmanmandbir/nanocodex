@@ -25,7 +25,7 @@ test("Responses transports own authentication and connection setup", () => {
 });
 
 test("subagents are an explicit branded Rust extension", () => {
-  assert.deepEqual(Object.keys(Subagents), ["create"]);
+  assert.deepEqual(Object.keys(Subagents), ["close", "create", "interrupt", "spawn", "wait"]);
   const subagents = Subagents.create({ maxConcurrency: 7 });
   const handler = () => "pong";
   assert.deepEqual(resolveTools([{

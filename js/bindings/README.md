@@ -168,6 +168,13 @@ native and WASM consumers run the same Rust implementation and receive the
 same seven tools: `spawn_agent`, `submit_result`, `send_agent_message`,
 `list_agents`, `wait_agent`, `interrupt_agent`, and `close_agent`.
 
+Application-owned composite tools can invoke that runtime without asking a
+root model turn to call the tools. `Subagents.spawn(agent, task)`,
+`Subagents.wait(agent, options)`, `Subagents.interrupt(agent, id)`, and
+`Subagents.close(agent, id)` are thin calls into the same Rust registry
+handlers. Children still use `submit_result` and the configured output schema;
+the JavaScript surface does not implement a second child lifecycle.
+
 Inside a caller-owned Worker or server isolate, host capabilities stay as
 ordinary functions without crossing another compatibility protocol:
 

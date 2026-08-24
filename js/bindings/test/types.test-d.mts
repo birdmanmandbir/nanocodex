@@ -25,6 +25,7 @@ import {
 import {
   Agent as HostAgent,
   type BrowserWebSocketRequest,
+  type DefaultAgent,
   Transport as HostTransport,
 } from "../host/index.mjs";
 import type * as RootPublicTypes from "../index.mjs";
@@ -171,6 +172,23 @@ async function check() {
   const cloudflareApplication: true = extendedCloudflareAgent.application;
   void cloudflareApplication;
   CloudflareAgent.destroy(cloudflareOwner);
+  const ephemeralCloudflareAgent: DefaultAgent = await CloudflareAgent.createEphemeral(
+    cloudflareOwner,
+    {
+      instructions: "Search the caller's account history.",
+      model: "gpt-5.6-sol",
+      tools: [{
+        name: "search",
+        description: "Search account history",
+        handler: async () => [],
+      }],
+    },
+  );
+  ephemeralCloudflareAgent.turn.prompt({ input: "find a prior answer" });
+  await CloudflareAgent.createEphemeral(cloudflareOwner, {
+    // @ts-expect-error transport remains owned by the Cloudflare adapter.
+    transport: HostTransport.hostManaged(),
+  });
   await CloudflareAgent.create(cloudflareOwner, {
     // @ts-expect-error broker subjects are not caller-selected.
     subject: "caller-selected",
@@ -226,6 +244,25 @@ async function check() {
     workspace: nodeWorkspace.root,
     tools: [...Subagents.create({ maxConcurrency: 8 })],
   });
+  const child = await Subagents.spawn(agent, {
+    role: "memory-search",
+    task: "Search the available history tools.",
+    model: "luna",
+    thinking: "low",
+    outputSchema: {
+      type: "object",
+      properties: { answer: { type: "string" } },
+      required: ["answer"],
+      additionalProperties: false,
+    },
+  });
+  const childWait = await Subagents.wait(agent, {
+    agentIds: [child.agent_id],
+    timeoutMs: 30_000,
+  });
+  childWait.agents[0]?.status.state;
+  await Subagents.interrupt(agent, child.agent_id);
+  await Subagents.close(agent, child.agent_id);
   await agent.session.compact();
   const sessionContext: AgentSessionContext = await agent.session.appendDeveloperMessage(
     "voice started",

@@ -206,6 +206,153 @@ describe("managed agents REST and resumable SSE", () => {
     await events.cancel();
   });
 
+  it("projects completed turns into the account memory scope and tombstones deleted threads", async () => {
+    const agent = await createAgent();
+    const accepted = await submit(agent, "turn-memory", "COPPER_LIGHTHOUSE_MEMORY");
+    const events = sseReader(await SELF.fetch(
+      `${agent.events_url}?cursor=${accepted.accepted_cursor}`,
+    ));
+    let terminal;
+    do {
+      terminal = await nextWithin(events, "memory projection source turn");
+    } while (!String(terminal.data.type).startsWith("turn_completed"));
+    expect(terminal.data).toMatchObject({
+      type: "turn_completed",
+      id: "turn-memory",
+      citations: [],
+    });
+    await events.cancel();
+
+    const found = await eventuallyHistorySearch("copper lighthouse", API_KEY, (body) => (
+      body.results.length === 1
+    ));
+    expect(found).toMatchObject({
+      query: "copper lighthouse",
+      agentic: false,
+      answer: null,
+      results: [{
+        thread_id: agent.agent_id,
+        turn_id: "turn-memory",
+        cursor: expect.any(String),
+        snippet: expect.stringContaining("COPPER_LIGHTHOUSE_MEMORY"),
+      }],
+      citations: [{
+        thread_id: agent.agent_id,
+        sources: [{ turn_id: "turn-memory", cursor: expect.any(String) }],
+      }],
+    });
+
+    const candidates = await historyFindThreads("copper lighthouse", API_KEY);
+    expect(candidates).toMatchObject({
+      query: "copper lighthouse",
+      results: [{
+        thread_id: agent.agent_id,
+        turn_id: "turn-memory",
+      }],
+      citations: [{
+        thread_id: agent.agent_id,
+        sources: [{ turn_id: "turn-memory", cursor: expect.any(String) }],
+      }],
+    });
+    const read = await historyReadThread(agent.agent_id, ["turn-memory"], API_KEY);
+    expect(read).toMatchObject({
+      turns: [{
+        thread_id: agent.agent_id,
+        turn_id: "turn-memory",
+        user: "COPPER_LIGHTHOUSE_MEMORY",
+        assistant: expect.any(String),
+      }],
+      citations: [{
+        thread_id: agent.agent_id,
+        sources: [{ turn_id: "turn-memory", cursor: expect.any(String) }],
+      }],
+    });
+
+    const crowdedOut = await historySearch(
+      "copper lighthouse nonexistent insurance policy",
+      API_KEY,
+    );
+    expect(crowdedOut.results).toEqual([]);
+    expect(crowdedOut.citations).toEqual([]);
+
+    const exact = await historySearch("COPPER_LIGHTHOUSE_MEMORY", API_KEY);
+    expect(exact.results).toMatchObject([{
+      thread_id: agent.agent_id,
+      turn_id: "turn-memory",
+    }]);
+
+    const isolated = await historySearch("copper lighthouse", OTHER_API_KEY);
+    expect(isolated.results).toEqual([]);
+    expect(isolated.citations).toEqual([]);
+    expect((await historyFindThreads("copper lighthouse", OTHER_API_KEY)).results).toEqual([]);
+    expect((await historyReadThread(agent.agent_id, ["turn-memory"], OTHER_API_KEY)).turns).toEqual([]);
+
+    const agentic = await historySearch("recall copper lighthouse", API_KEY, true);
+    expect(agentic).toMatchObject({
+      query: "recall copper lighthouse",
+      agentic: true,
+      answer: "MEMORY_AGENTIC_OK",
+      results: [{ thread_id: agent.agent_id, turn_id: "turn-memory" }],
+      citations: [{
+        thread_id: agent.agent_id,
+        sources: [{ turn_id: "turn-memory", cursor: expect.any(String) }],
+      }],
+    });
+
+    const consumer = await createAgent();
+    const consumed = await submit(consumer, "turn-memory-consumer", "E2E_MEMORY_TOOL");
+    const consumerEvents = sseReader(await SELF.fetch(
+      `${consumer.events_url}?cursor=${consumed.accepted_cursor}`,
+    ));
+    let consumerTerminal;
+    do {
+      consumerTerminal = await nextWithin(consumerEvents, "managed memory tool completion");
+    } while (consumerTerminal.data.type !== "turn_completed");
+    expect(consumerTerminal.data).toMatchObject({
+      type: "turn_completed",
+      id: "turn-memory-consumer",
+      final_message: "MANAGED_MEMORY_TOOLS_OK",
+      citations: [{
+        thread_id: agent.agent_id,
+        sources: [{ turn_id: "turn-memory", cursor: expect.any(String) }],
+      }],
+    });
+    await consumerEvents.cancel();
+
+    const deleted = await SELF.fetch(agent.events_url.replace(/\/events$/, ""), { method: "DELETE" });
+    expect(deleted.status).toBe(204);
+    createdAgents.delete(agent.agent_id);
+    const tombstoned = await eventuallyHistorySearch("copper lighthouse", API_KEY, (body) => (
+      body.results.length === 0
+    ));
+    expect(tombstoned.citations).toEqual([]);
+  });
+
+  it("requires account authentication for every public history operation", async () => {
+    const requests = [
+      new Request("https://example.test/v1/history/search", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ query: "memory", limit: 8, agentic: false }),
+      }),
+      new Request("https://example.test/v1/history/threads/search", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ query: "memory", limit: 8 }),
+      }),
+      new Request("https://example.test/v1/history/threads/018f1f9a-7b3c-7a09-8000-000000000009/read", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ turn_ids: ["turn-1"] }),
+      }),
+    ];
+    for (const request of requests) {
+      const response = await RAW_SELF.fetch(request);
+      expect(response.status).toBe(401);
+      expect(await response.json()).toEqual({ error: "unauthorized" });
+    }
+  });
+
   it("does not let an unrelated bearer mint managed agents", async () => {
     const response = await RAW_SELF.fetch("https://example.test/v1/agents", {
       method: "POST",
@@ -764,6 +911,14 @@ type ManagedTurnView = {
   turn_id: string;
 };
 
+type HistorySearchBody = {
+  query: string;
+  agentic: boolean;
+  answer: string | null;
+  results: Array<Record<string, unknown>>;
+  citations: Array<Record<string, unknown>>;
+};
+
 async function createAgent(): Promise<AgentReceipt> {
   const response = await SELF.fetch("https://example.test/v1/agents", {
     method: "POST",
@@ -856,6 +1011,69 @@ async function submit(agent: AgentReceipt, id: string, input: string): Promise<M
   });
   expect(response.status).toBe(202);
   return response.json<ManagedTurnView>();
+}
+
+async function historySearch(
+  query: string,
+  apiKey: string,
+  agentic = false,
+): Promise<HistorySearchBody> {
+  const response = await RAW_SELF.fetch("https://example.test/v1/history/search", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${apiKey}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ query, limit: 8, agentic }),
+  });
+  expect(response.status).toBe(200);
+  return response.json<HistorySearchBody>();
+}
+
+async function historyFindThreads(query: string, apiKey: string): Promise<HistorySearchBody> {
+  const response = await RAW_SELF.fetch("https://example.test/v1/history/threads/search", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${apiKey}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ query, limit: 8 }),
+  });
+  expect(response.status).toBe(200);
+  return response.json<HistorySearchBody>();
+}
+
+async function historyReadThread(threadId: string, turnIds: string[], apiKey: string) {
+  const response = await RAW_SELF.fetch(
+    `https://example.test/v1/history/threads/${threadId}/read`,
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${apiKey}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ turn_ids: turnIds }),
+    },
+  );
+  expect(response.status).toBe(200);
+  return response.json<{
+    turns: Array<Record<string, unknown>>;
+    citations: Array<Record<string, unknown>>;
+  }>();
+}
+
+async function eventuallyHistorySearch(
+  query: string,
+  apiKey: string,
+  ready: (body: HistorySearchBody) => boolean,
+): Promise<HistorySearchBody> {
+  let latest: HistorySearchBody | undefined;
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    latest = await historySearch(query, apiKey);
+    if (ready(latest)) return latest;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`history search did not converge: ${JSON.stringify(latest)}`);
 }
 
 function sseReader(response: Response) {

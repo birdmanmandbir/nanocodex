@@ -18,6 +18,13 @@ const MAX_CONTROL_BODY_BYTES = 16 * 1024;
 const MAX_BROKER_RESPONSE_BYTES = 4 * 1024;
 const MAX_MODEL_BODY_BYTES = 32 * 1024 * 1024;
 const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
+const RELAY_CAPABILITY_PATH = /^\/v1\/[A-Za-z0-9_-]{43,}$/;
+const RELAY_HTTP_ROUTES: Readonly<Record<ModelOperation["id"], string | undefined>> = {
+  responses: undefined,
+  search: "codex-web-search",
+  "image-generation": "codex-image-generation",
+  "image-edit": "codex-image-edit",
+};
 
 export interface EgressEnv extends BrokerEnv {
   USER_CREDENTIALS: DurableObjectNamespace<UserCredentialBroker>;
@@ -254,7 +261,12 @@ async function handleControl(request: Request, url: URL, env: EgressEnv): Promis
 }
 
 async function handleReadiness(request: Request, env: EgressEnv): Promise<Response> {
-  if (request.method !== "POST" || request.body !== null) return jsonError(404, "not_found");
+  if (request.method !== "POST") return jsonError(404, "not_found");
+  try {
+    // workerd may represent an empty POST as a zero-byte stream rather than
+    // null. Reject actual content without making nullability a wire contract.
+    await readBoundedText(request, 0);
+  } catch { return jsonError(404, "not_found"); }
   const token = env.NANOCODEX_BROKER_PROBE_TOKEN;
   if (!token || token.length < 32 || token.length > 512
     || request.headers.get("authorization") !== `Bearer ${token}`) {
@@ -331,11 +343,18 @@ function upstreamUrl(
   const publicRelay = relay.protocol === "https:" && !relay.port;
   const localRelay = env.ALLOW_INSECURE_LOOPBACK_RELAY === "true"
     && relay.protocol === "http:" && relay.hostname === "127.0.0.1" && Boolean(relay.port);
-  if ((!publicRelay && !localRelay) || relay.username || relay.password || relay.pathname !== "/"
-    || relay.search || relay.hash) {
+  const capabilityRelay = RELAY_CAPABILITY_PATH.test(relay.pathname);
+  if ((!publicRelay && !localRelay) || relay.username || relay.password
+    || (relay.pathname !== "/" && !capabilityRelay) || relay.search || relay.hash) {
     throw new EgressFailure(503, "invalid_codex_relay_url");
   }
-  relay.pathname = new URL(operation.chatgpt).pathname;
+  if (!capabilityRelay) {
+    relay.pathname = new URL(operation.chatgpt).pathname;
+  } else if (!operation.websocket) {
+    const httpRoute = RELAY_HTTP_ROUTES[operation.id];
+    if (!httpRoute) throw new EgressFailure(503, "invalid_codex_relay_url");
+    relay.pathname = `${relay.pathname}/http/${httpRoute}`;
+  }
   return relay;
 }
 
