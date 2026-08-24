@@ -10,7 +10,8 @@ mod protocol;
 mod socket;
 
 pub(crate) use api::{
-    AccountKey, CreatedRoom, JoinedRoom, RoomApi, RoomError, RoomInvitation, RoomMembership,
+    AccountKey, CreatedRoom, JoinedRoom, PreparedRoomCreate, RoomApi, RoomError, RoomInvitation,
+    RoomMembership,
 };
 pub(crate) use protocol::{
     AgentErrorCode, MemberId, MessageId, ProtocolError, Ready, RoomCursor, RoomEventMessage,

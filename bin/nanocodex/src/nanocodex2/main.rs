@@ -296,7 +296,15 @@ async fn run_load(command: Load) -> Result<(), ManagedError> {
     })
     .await
     .map_err(|error| ManagedError::Configuration(error.to_string()))?;
-    write_json(&summary)
+    let passed = summary.passed();
+    write_json(&summary)?;
+    if passed {
+        Ok(())
+    } else {
+        Err(ManagedError::Configuration(
+            "managed-room saturation reported failures; inspect the JSON summary".to_owned(),
+        ))
+    }
 }
 
 async fn run_room(command: Room) -> Result<(), RoomError> {

@@ -102,18 +102,40 @@ impl RoomApi {
     }
 
     pub(crate) async fn create(&self, display_name: &str) -> Result<CreatedRoom, RoomError> {
+        let create = self.prepare_create(display_name)?;
+        self.execute_create(&create).await
+    }
+
+    /// Allocates a stable room-create operation without performing network I/O.
+    ///
+    /// Retaining this value lets a caller execute the same idempotent create
+    /// again after an ambiguous transport result and recover the owner
+    /// membership needed to clean up a committed room.
+    pub(crate) fn prepare_create(
+        &self,
+        display_name: &str,
+    ) -> Result<PreparedRoomCreate, RoomError> {
         let display_name = validated_display_name(display_name)?;
-        let Some(http) = self.account_http.as_ref() else {
-            return Err(RoomError::AuthenticationRequired);
-        };
         let create_id = ReceiptId::generate();
         let body = serde_json::to_vec(&CreateRequest {
             create_id: create_id.as_str(),
             display_name,
         })
         .map_err(|_| RoomError::InvalidReceipt("failed to encode room creation"))?;
+        Ok(PreparedRoomCreate { body })
+    }
+
+    /// Executes a previously prepared create without changing its idempotency
+    /// identity or request body.
+    pub(crate) async fn execute_create(
+        &self,
+        create: &PreparedRoomCreate,
+    ) -> Result<CreatedRoom, RoomError> {
+        let Some(http) = self.account_http.as_ref() else {
+            return Err(RoomError::AuthenticationRequired);
+        };
         let url = self.route("v1/rooms")?;
-        let response = send_with_transport_retry(http, url, &body).await?;
+        let response = send_with_transport_retry(http, url, &create.body).await?;
         if response.status() != StatusCode::CREATED {
             return Err(response_error(response).await);
         }
@@ -191,9 +213,6 @@ impl RoomApi {
     /// cleanup is still pending, so it is retried a small, bounded number of
     /// times; other HTTP and transport failures remain typed for the caller.
     pub(crate) async fn delete_owned_room(&self, owner: &CreatedRoom) -> Result<(), RoomError> {
-        let Some(http) = self.account_http.as_ref() else {
-            return Err(RoomError::AuthenticationRequired);
-        };
         if owner.origin.origin() != self.base_url.origin() {
             return Err(RoomError::Configuration(
                 "room owner origin does not match the managed origin".to_owned(),
@@ -205,7 +224,8 @@ impl RoomApi {
         let room_id = owner.receipt.room_id();
         let url = self.route(&format!("v1/rooms/{room_id}"))?;
         for attempt in 0..DELETE_ATTEMPTS {
-            let response = http
+            let response = self
+                .public_http
                 .delete(url.clone())
                 .header(header::COOKIE, cookie.clone())
                 .timeout(DELETE_REQUEST_TIMEOUT)
@@ -229,6 +249,24 @@ impl RoomApi {
         self.base_url
             .join(path)
             .map_err(|_| RoomError::InvalidReceipt("managed room route is invalid"))
+    }
+}
+
+pub(crate) struct PreparedRoomCreate {
+    // The retained bytes own the generated create identity and ensure every
+    // execution sends exactly the same operation.
+    body: Vec<u8>,
+}
+
+impl fmt::Debug for PreparedRoomCreate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PreparedRoomCreate([REDACTED])")
+    }
+}
+
+impl Drop for PreparedRoomCreate {
+    fn drop(&mut self) {
+        self.body.zeroize();
     }
 }
 
@@ -768,15 +806,19 @@ pub(crate) enum RoomError {
 #[cfg(test)]
 mod tests {
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
 
     use axum::{
-        Json, Router, extract::State, http::HeaderMap as AxumHeaderMap, response::IntoResponse,
-        routing::delete,
+        Json, Router,
+        extract::State,
+        http::HeaderMap as AxumHeaderMap,
+        response::IntoResponse,
+        routing::{delete, post},
     };
     use reqwest::header::{HeaderMap, HeaderValue, SET_COOKIE};
+    use serde::Deserialize;
     use serde_json::json;
 
     use super::super::protocol::{MemberId, RoomId};
@@ -847,6 +889,48 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn prepared_create_reuses_identity_and_recovers_owner_membership() {
+        crate::install_tls_provider();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let origin = format!("http://{address}");
+        let state = Arc::new(CreateServerState {
+            create_ids: Mutex::new(Vec::new()),
+            origin: origin.clone(),
+        });
+        let app = Router::new()
+            .route("/v1/rooms", post(create_room))
+            .with_state(Arc::clone(&state));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let api = RoomApi::authenticated(
+            origin.parse().unwrap(),
+            AccountKey::parse(format!("ncx_live_{}_{}", "a".repeat(12), "b".repeat(43))).unwrap(),
+        )
+        .unwrap();
+
+        let create = api.prepare_create("Ada").unwrap();
+        assert_eq!(format!("{create:?}"), "PreparedRoomCreate([REDACTED])");
+
+        let first = api.execute_create(&create).await.unwrap();
+        let recovered = api.execute_create(&create).await.unwrap();
+
+        let create_ids = state.create_ids.lock().unwrap();
+        assert_eq!(create_ids.len(), 2);
+        assert_eq!(create_ids[0], create_ids[1]);
+        assert!(!format!("{create:?}").contains(&create_ids[0]));
+        assert_eq!(first.receipt.room_id, recovered.receipt.room_id);
+        assert_eq!(first.receipt.member_id, recovered.receipt.member_id);
+        assert_eq!(first.receipt.websocket_url, recovered.receipt.websocket_url);
+        assert_eq!(first.cookie.as_str(), recovered.cookie.as_str());
+        assert_eq!(
+            first.receipt.invitation.invite(),
+            recovered.receipt.invitation.invite()
+        );
+        drop(create_ids);
+        server.abort();
     }
 
     #[tokio::test]
@@ -925,7 +1009,7 @@ mod tests {
         State(attempts): State<Arc<AtomicUsize>>,
         headers: AxumHeaderMap,
     ) -> impl IntoResponse {
-        assert!(headers.contains_key(axum::http::header::AUTHORIZATION));
+        assert!(!headers.contains_key(axum::http::header::AUTHORIZATION));
         assert!(headers.contains_key(axum::http::header::COOKIE));
         if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
             (
@@ -936,5 +1020,45 @@ mod tests {
         } else {
             axum::http::StatusCode::NO_CONTENT.into_response()
         }
+    }
+
+    struct CreateServerState {
+        create_ids: Mutex<Vec<String>>,
+        origin: String,
+    }
+
+    #[derive(Deserialize)]
+    struct ObservedCreateRequest {
+        create_id: String,
+        display_name: String,
+    }
+
+    async fn create_room(
+        State(state): State<Arc<CreateServerState>>,
+        Json(request): Json<ObservedCreateRequest>,
+    ) -> impl IntoResponse {
+        assert_eq!(request.display_name, "Ada");
+        state.create_ids.lock().unwrap().push(request.create_id);
+        let cookie = format!(
+            "nanocodex_room_{}={INVITE}; Path=/v1/rooms/{ROOM}; HttpOnly",
+            ROOM.replace('-', "")
+        );
+        (
+            axum::http::StatusCode::CREATED,
+            [(axum::http::header::SET_COOKIE, cookie)],
+            Json(json!({
+                "room_id": ROOM,
+                "member_id": "0198d214-0d9d-7a45-8a89-123456789abd",
+                "invite": INVITE,
+                "invite_url": format!(
+                    "{}/multiplayer?room={ROOM}#invite={INVITE}",
+                    state.origin
+                ),
+                "websocket_url": format!(
+                    "{}/v1/rooms/{ROOM}/ws",
+                    state.origin.replace("http://", "ws://")
+                ),
+            })),
+        )
     }
 }

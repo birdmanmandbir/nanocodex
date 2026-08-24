@@ -18,8 +18,8 @@ use tokio::{sync::mpsc, task::JoinHandle, time::Instant as TokioInstant};
 use url::Url;
 
 use super::room::{
-    AccountKey, CreatedRoom, JoinedRoom, MessageId, RoomApi, RoomConnection, RoomCursor, RoomError,
-    RoomEventMessage, RoomEvents, RoomServerMessage, RoomTarget,
+    AccountKey, CreatedRoom, JoinedRoom, MessageId, PreparedRoomCreate, RoomApi, RoomConnection,
+    RoomCursor, RoomError, RoomEventMessage, RoomEvents, RoomServerMessage, RoomTarget,
 };
 
 const MAX_ROOMS: usize = 8;
@@ -134,6 +134,12 @@ pub(crate) struct SaturationSummary {
     pub(crate) invariants: InvariantSummary,
 }
 
+impl SaturationSummary {
+    pub(crate) fn passed(&self) -> bool {
+        !self.timed_out && self.failures.is_empty() && self.invariants.violations == 0
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct RequestedLoad {
     rooms: usize,
@@ -212,6 +218,7 @@ pub(crate) struct FailureSummary {
 pub(crate) struct InvariantSummary {
     checks: u64,
     violations: u64,
+    requested_population_admitted: bool,
     all_accepted: bool,
     globally_ordered_fanout: bool,
     complete_live_fanout: bool,
@@ -249,18 +256,20 @@ pub(crate) async fn run_saturation(
         shape,
         workload_deadline,
     );
-    let timed_out = tokio::time::timeout_at(workload_deadline, workload)
+    let workload_timed_out = tokio::time::timeout_at(workload_deadline, workload)
         .await
         .is_err();
-    if timed_out {
+    if workload_timed_out {
         record
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .failure(FailureKey::simple("workload", "wall_time_exceeded"));
     }
 
-    cleanup_created_rooms(&api, &ledger, &record, final_deadline).await;
+    let cleanup_timed_out = cleanup_created_rooms(&api, &ledger, &record, final_deadline).await;
     cleanup_guard.settled_if_empty();
+    let timed_out =
+        workload_timed_out || cleanup_timed_out || TokioInstant::now() >= final_deadline;
 
     let pending_rooms = ledger.len() as u64;
     let mut record = Arc::try_unwrap(record)
@@ -340,22 +349,32 @@ async fn create_rooms(
     let mut pending = FuturesUnordered::new();
     for ordinal in 0..count {
         record_lock(record).operations.create.attempt();
+        let prepared = match api.prepare_create(&format!("saturation-owner-{ordinal:02}")) {
+            Ok(prepared) => Arc::new(prepared),
+            Err(error) => {
+                record_room_failure(record, "create", &error);
+                continue;
+            }
+        };
+        let cleanup = Arc::new(CleanupEntry::new(Arc::clone(&prepared)));
+        ledger.register(Arc::clone(&cleanup));
         let api = api.clone();
         let ledger = Arc::clone(ledger);
         pending.push(async move {
             let started = Instant::now();
-            let result = tokio::time::timeout_at(
-                deadline,
-                api.create(&format!("saturation-owner-{ordinal:02}")),
-            )
-            .await;
+            let result = tokio::time::timeout_at(deadline, api.execute_create(&prepared)).await;
             let result = match result {
                 Ok(Ok(room)) => {
                     let owner = Arc::new(room);
-                    ledger.register(Arc::clone(&owner));
+                    cleanup.set_owner(Arc::clone(&owner));
                     Ok(Ok(owner))
                 }
-                Ok(Err(error)) => Ok(Err(error)),
+                Ok(Err(error)) => {
+                    if !create_may_have_committed(&error) {
+                        ledger.settle(&cleanup);
+                    }
+                    Ok(Err(error))
+                }
                 Err(elapsed) => Err(elapsed),
             };
             (ordinal, started.elapsed(), result)
@@ -527,8 +546,14 @@ struct TrackedMessage {
 }
 
 struct TrackedRun {
-    messages: Vec<TrackedMessage>,
-    clients_per_room: HashMap<usize, usize>,
+    events_by_room: HashMap<usize, Vec<ExpectedRoomEvent>>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ExpectedRoomEvent {
+    cursor: u64,
+    created_at: u64,
+    event: RoomEventMessage,
 }
 
 enum Observed {
@@ -685,10 +710,27 @@ async fn exercise_live_fanout(
         .enumerate()
         .map(|(index, message)| (message.id.as_str().to_owned(), index))
         .collect::<HashMap<_, _>>();
-    let mut client_sequences = vec![Vec::<u64>::new(); clients.len()];
+    let initial_heads = clients
+        .iter()
+        .map(|client| {
+            client
+                .connection
+                .ready()
+                .latest_cursor
+                .as_str()
+                .parse::<u64>()
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_else(|_| {
+            record_lock(record).violation("fanout", "ready_cursor_out_of_range");
+            vec![u64::MAX; clients.len()]
+        });
+    let mut client_events = vec![Vec::<ExpectedRoomEvent>::new(); clients.len()];
     let mut clients_closed = 0_usize;
     loop {
-        if live_complete(&tracked, &clients_per_room) || clients_closed == clients.len() {
+        if live_complete(&tracked, &clients_per_room, &client_events, &initial_heads)
+            || clients_closed == clients.len()
+        {
             break;
         }
         let observed = match tokio::time::timeout_at(deadline, observed_rx.recv()).await {
@@ -710,7 +752,7 @@ async fn exercise_live_fanout(
                     clients,
                     &by_id,
                     &mut tracked,
-                    &mut client_sequences,
+                    &mut client_events,
                     client,
                     message,
                 ),
@@ -722,17 +764,8 @@ async fn exercise_live_fanout(
     for reader in readers {
         reader.abort();
     }
-    verify_live(
-        record,
-        clients,
-        &tracked,
-        &clients_per_room,
-        &client_sequences,
-    );
-    TrackedRun {
-        messages: tracked,
-        clients_per_room,
-    }
+    let events_by_room = verify_live(record, clients, &tracked, &clients_per_room, &client_events);
+    TrackedRun { events_by_room }
 }
 
 fn deterministic_id(value: String) -> Result<MessageId, RoomError> {
@@ -762,7 +795,7 @@ fn observe_live_message(
     clients: &[ConnectedMember],
     by_id: &HashMap<String, usize>,
     tracked: &mut [TrackedMessage],
-    sequences: &mut [Vec<u64>],
+    client_events: &mut [Vec<ExpectedRoomEvent>],
     client: usize,
     message: RoomServerMessage,
 ) {
@@ -792,16 +825,24 @@ fn observe_live_message(
                     .succeed(sent_at.elapsed());
             }
         }
-        RoomServerMessage::RoomEvent { cursor, event, .. } => {
+        RoomServerMessage::RoomEvent {
+            cursor,
+            created_at,
+            event,
+        } => {
             let Some(cursor) = decimal_cursor(record, "fanout", &cursor) else {
                 return;
             };
-            if let Some(previous) = sequences[client].last()
-                && cursor <= *previous
+            if let Some(previous) = client_events[client].last()
+                && previous.cursor.checked_add(1) != Some(cursor)
             {
-                record_lock(record).violation("fanout", "cursor_not_strictly_increasing");
+                record_lock(record).violation("fanout", "cursor_not_contiguous");
             }
-            sequences[client].push(cursor);
+            client_events[client].push(ExpectedRoomEvent {
+                cursor,
+                created_at,
+                event: event.clone(),
+            });
             match event {
                 RoomEventMessage::MemberMessage {
                     id, text, target, ..
@@ -928,16 +969,30 @@ fn decimal_cursor(
     }
 }
 
-fn live_complete(tracked: &[TrackedMessage], clients_per_room: &HashMap<usize, usize>) -> bool {
-    tracked.iter().all(|message| {
-        message.rejected
-            || (message.accepted_cursor.is_some()
-                && message.seen_clients.len()
-                    == clients_per_room.get(&message.room).copied().unwrap_or(0)
-                && (message.target != RoomTarget::Agent
-                    || message.terminal_clients.len()
-                        == clients_per_room.get(&message.room).copied().unwrap_or(0)))
-    })
+fn live_complete(
+    tracked: &[TrackedMessage],
+    clients_per_room: &HashMap<usize, usize>,
+    client_events: &[Vec<ExpectedRoomEvent>],
+    initial_heads: &[u64],
+) -> bool {
+    let initial_replay_complete = client_events
+        .iter()
+        .zip(initial_heads)
+        .all(|(events, head)| {
+            events
+                .last()
+                .map_or(*head == 0, |event| event.cursor >= *head)
+        });
+    initial_replay_complete
+        && tracked.iter().all(|message| {
+            message.rejected
+                || (message.accepted_cursor.is_some()
+                    && message.seen_clients.len()
+                        == clients_per_room.get(&message.room).copied().unwrap_or(0)
+                    && (message.target != RoomTarget::Agent
+                        || message.terminal_clients.len()
+                            == clients_per_room.get(&message.room).copied().unwrap_or(0)))
+        })
 }
 
 fn verify_live(
@@ -945,8 +1000,8 @@ fn verify_live(
     clients: &[ConnectedMember],
     tracked: &[TrackedMessage],
     clients_per_room: &HashMap<usize, usize>,
-    sequences: &[Vec<u64>],
-) {
+    client_events: &[Vec<ExpectedRoomEvent>],
+) -> HashMap<usize, Vec<ExpectedRoomEvent>> {
     for message in tracked {
         if !message.rejected && message.accepted_cursor.is_none() {
             record_lock(record).violation("accepted", "acceptance_missing");
@@ -967,15 +1022,24 @@ fn verify_live(
             .iter()
             .enumerate()
             .filter(|(_, client)| client.room == *room)
-            .map(|(client, _)| sequences[client].as_slice());
+            .map(|(client, _)| client_events[client].as_slice());
         if let Some(expected) = room_sequences.next() {
             for actual in room_sequences {
                 if actual != expected {
-                    record_lock(record).violation("fanout", "client_order_disagreed");
+                    record_lock(record).violation("fanout", "client_event_stream_disagreed");
                 }
             }
         }
     }
+    clients_per_room
+        .keys()
+        .filter_map(|room| {
+            clients
+                .iter()
+                .position(|client| client.room == *room)
+                .map(|client| (*room, client_events[client].clone()))
+        })
+        .collect()
 }
 
 async fn exercise_replay(
@@ -984,31 +1048,17 @@ async fn exercise_replay(
     tracked: &TrackedRun,
     deadline: TokioInstant,
 ) {
-    let expected_by_room = tracked.messages.iter().fold(
-        HashMap::<usize, (HashSet<String>, HashSet<u64>)>::new(),
-        |mut expected, message| {
-            if !message.rejected {
-                expected
-                    .entry(message.room)
-                    .or_default()
-                    .0
-                    .insert(message.id.as_str().to_owned());
-                if message.target == RoomTarget::Agent
-                    && let Some(cursor) = message.accepted_cursor
-                {
-                    expected.entry(message.room).or_default().1.insert(cursor);
-                }
-            }
-            expected
-        },
-    );
     let mut pending = FuturesUnordered::new();
     for (client, member) in clients.iter().enumerate() {
         record_lock(record).operations.connect.attempt();
         record_lock(record).operations.replay.attempt();
         let membership = member.membership.clone();
         let room = member.room;
-        let expected = expected_by_room.get(&room).cloned().unwrap_or_default();
+        let expected = tracked
+            .events_by_room
+            .get(&room)
+            .cloned()
+            .unwrap_or_default();
         pending.push(async move { replay_one(client, room, membership, expected, deadline).await });
     }
     while let Some(result) = pending.next().await {
@@ -1053,7 +1103,7 @@ async fn replay_one(
     client: usize,
     room: usize,
     membership: RetainedMembership,
-    expected: (HashSet<String>, HashSet<u64>),
+    expected: Vec<ExpectedRoomEvent>,
     deadline: TokioInstant,
 ) -> Result<ReplayResult, ReplayFailure> {
     let started = Instant::now();
@@ -1069,37 +1119,36 @@ async fn replay_one(
         .as_str()
         .parse()
         .map_err(|_| ReplayFailure::Order)?;
+    if expected
+        .last()
+        .map_or(latest != 0, |event| event.cursor != latest)
+    {
+        return Err(ReplayFailure::Order);
+    }
     let mut previous = 0_u64;
-    let mut seen_messages = HashSet::new();
-    let mut seen_terminals = HashSet::new();
+    let mut replayed = Vec::new();
     while previous < latest {
         let message = tokio::time::timeout_at(deadline, events.next())
             .await
             .map_err(|_| ReplayFailure::Timeout)?
             .ok_or(ReplayFailure::Order)?
             .map_err(ReplayFailure::Room)?;
-        if let RoomServerMessage::RoomEvent { cursor, event, .. } = message {
+        if let RoomServerMessage::RoomEvent {
+            cursor,
+            created_at,
+            event,
+        } = message
+        {
             let cursor: u64 = cursor.as_str().parse().map_err(|_| ReplayFailure::Order)?;
-            if cursor <= previous {
+            if previous.checked_add(1) != Some(cursor) {
                 return Err(ReplayFailure::Order);
             }
             previous = cursor;
-            match event {
-                RoomEventMessage::MemberMessage { id, .. } => {
-                    if expected.0.contains(id.as_str()) {
-                        seen_messages.insert(id.as_str().to_owned());
-                    }
-                }
-                RoomEventMessage::AgentMessage { reply_to, .. }
-                | RoomEventMessage::AgentError { reply_to, .. } => {
-                    if let Ok(reply_to) = reply_to.as_str().parse::<u64>()
-                        && expected.1.contains(&reply_to)
-                    {
-                        seen_terminals.insert(reply_to);
-                    }
-                }
-                RoomEventMessage::MemberJoined { .. } => {}
-            }
+            replayed.push(ExpectedRoomEvent {
+                cursor,
+                created_at,
+                event,
+            });
         }
     }
     let _ = connection.close().await;
@@ -1108,11 +1157,39 @@ async fn replay_one(
         room,
         connect_elapsed,
         replay_elapsed: started.elapsed(),
-        complete: seen_messages == expected.0 && seen_terminals == expected.1,
+        complete: replayed == expected,
     })
 }
 
-struct CleanupLedger<T = CreatedRoom> {
+struct CleanupEntry {
+    create: Arc<PreparedRoomCreate>,
+    owner: Mutex<Option<Arc<CreatedRoom>>>,
+}
+
+impl CleanupEntry {
+    fn new(create: Arc<PreparedRoomCreate>) -> Self {
+        Self {
+            create,
+            owner: Mutex::new(None),
+        }
+    }
+
+    fn owner(&self) -> Option<Arc<CreatedRoom>> {
+        self.owner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn set_owner(&self, owner: Arc<CreatedRoom>) {
+        *self
+            .owner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(owner);
+    }
+}
+
+struct CleanupLedger<T = CleanupEntry> {
     rooms: Mutex<Vec<Arc<T>>>,
 }
 
@@ -1154,9 +1231,9 @@ impl<T> CleanupLedger<T> {
     }
 }
 
-impl CleanupLedger<CreatedRoom> {
-    fn settle(&self, owner: &CreatedRoom) {
-        self.retain(|pending| pending.receipt().room_id() != owner.receipt().room_id());
+impl CleanupLedger<CleanupEntry> {
+    fn settle(&self, entry: &Arc<CleanupEntry>) {
+        self.retain(|pending| !Arc::ptr_eq(pending, entry));
     }
 }
 
@@ -1191,16 +1268,16 @@ impl Drop for CleanupGuard {
             runtime.spawn(async move {
                 let rooms = ledger.snapshot();
                 let mut deletes = FuturesUnordered::new();
-                for room in rooms {
+                for entry in rooms {
                     let api = api.clone();
                     deletes.push(async move {
-                        let result = api.delete_owned_room(&room).await;
-                        (room, result)
+                        let result = recover_and_delete(&api, &entry).await;
+                        (entry, result)
                     });
                 }
-                while let Some((room, result)) = deletes.next().await {
+                while let Some((entry, result)) = deletes.next().await {
                     if result.is_ok() {
-                        ledger.settle(&room);
+                        ledger.settle(&entry);
                     }
                 }
             });
@@ -1213,34 +1290,65 @@ async fn cleanup_created_rooms(
     ledger: &Arc<CleanupLedger>,
     record: &Arc<Mutex<RunRecord>>,
     deadline: TokioInstant,
-) {
-    let rooms = ledger.snapshot();
+) -> bool {
+    let entries = ledger.snapshot();
     {
         let mut run = record_lock(record);
-        run.cleanup.created_rooms = rooms.len() as u64;
-        run.operations.cleanup.attempt_many(rooms.len() as u64);
+        run.cleanup.created_rooms = entries
+            .iter()
+            .filter(|entry| entry.owner().is_some())
+            .count() as u64;
+        run.operations.cleanup.attempt_many(entries.len() as u64);
     }
     let mut pending = FuturesUnordered::new();
-    for room in rooms {
+    for entry in entries {
         let api = api.clone();
         pending.push(async move {
             let started = Instant::now();
-            let result = tokio::time::timeout_at(deadline, api.delete_owned_room(&room)).await;
-            (room, started.elapsed(), result)
+            let result = tokio::time::timeout_at(deadline, recover_and_delete(&api, &entry)).await;
+            (entry, started.elapsed(), result)
         });
     }
-    while let Some((room, elapsed, result)) = pending.next().await {
+    let mut timed_out = false;
+    while let Some((entry, elapsed, result)) = pending.next().await {
         match result {
             Ok(Ok(())) => {
-                ledger.settle(&room);
+                ledger.settle(&entry);
                 let mut run = record_lock(record);
                 run.operations.cleanup.succeed(elapsed);
                 run.cleanup.settled_rooms += 1;
             }
             Ok(Err(error)) => record_room_failure(record, "cleanup", &error),
-            Err(_) => record_lock(record).failure(FailureKey::simple("cleanup", "timeout")),
+            Err(_) => {
+                timed_out = true;
+                record_lock(record).failure(FailureKey::simple("cleanup", "timeout"));
+            }
         }
     }
+    timed_out
+}
+
+async fn recover_and_delete(api: &RoomApi, entry: &CleanupEntry) -> Result<(), RoomError> {
+    let owner = match entry.owner() {
+        Some(owner) => owner,
+        None => match api.execute_create(&entry.create).await {
+            Ok(owner) => {
+                let owner = Arc::new(owner);
+                entry.set_owner(Arc::clone(&owner));
+                owner
+            }
+            Err(error) if !create_may_have_committed(&error) => return Ok(()),
+            Err(error) => return Err(error),
+        },
+    };
+    api.delete_owned_room(&owner).await
+}
+
+fn create_may_have_committed(error: &RoomError) -> bool {
+    matches!(
+        error,
+        RoomError::Transport(_) | RoomError::ResponseTooLarge | RoomError::InvalidReceipt(_)
+    )
 }
 
 #[derive(Default)]
@@ -1372,7 +1480,22 @@ impl RunRecord {
         pending_rooms: u64,
     ) -> SaturationSummary {
         self.cleanup.pending_rooms = pending_rooms;
-        self.invariant_checks += 6;
+        self.invariant_checks += 7;
+        let expected_rooms = self.requested.rooms as u64;
+        let expected_joins = expected_rooms * self.requested.guests_per_room as u64;
+        let expected_clients = expected_rooms * (self.requested.guests_per_room as u64 + 1);
+        let expected_connects = expected_clients
+            * if self.requested.connect_replay == ConnectReplayBehavior::ReconnectAllFromZero {
+                2
+            } else {
+                1
+            };
+        let requested_population_admitted = self.operations.create.attempted == expected_rooms
+            && self.operations.create.succeeded == expected_rooms
+            && self.operations.join.attempted == expected_joins
+            && self.operations.join.succeeded == expected_joins
+            && self.operations.connect.attempted == expected_connects
+            && self.operations.connect.succeeded == expected_connects;
         let all_accepted =
             self.accepted_ok && self.operations.send.succeeded == self.operations.send.attempted;
         let globally_ordered_fanout = self.ordered_ok;
@@ -1386,6 +1509,7 @@ impl RunRecord {
             self.replay_ok && self.operations.replay.succeeded == self.operations.replay.attempted;
         let cleanup_settled = pending_rooms == 0;
         self.invariant_violations += [
+            requested_population_admitted,
             all_accepted,
             globally_ordered_fanout,
             complete_live_fanout,
@@ -1420,6 +1544,7 @@ impl RunRecord {
             invariants: InvariantSummary {
                 checks: self.invariant_checks,
                 violations: self.invariant_violations,
+                requested_population_admitted,
                 all_accepted,
                 globally_ordered_fanout,
                 complete_live_fanout,
@@ -1690,13 +1815,14 @@ mod tests {
         record.fanout.expected_live_deliveries = 1;
         let summary = record.finish("https://managed.example".to_owned(), 1, false, 0);
 
+        assert!(!summary.invariants.requested_population_admitted);
         assert!(!summary.invariants.all_accepted);
         assert!(!summary.invariants.complete_live_fanout);
         assert!(summary.invariants.globally_ordered_fanout);
         assert!(summary.invariants.complete_agent_terminals);
         assert!(summary.invariants.complete_replay);
         assert!(summary.invariants.cleanup_settled);
-        assert_eq!(summary.invariants.violations, 2);
+        assert_eq!(summary.invariants.violations, 3);
     }
 
     #[test]
