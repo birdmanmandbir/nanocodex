@@ -1501,14 +1501,18 @@ fn classify_websocket_error(
     match error {
         Error::ConnectionClosed => ("websocket_closed", None, None),
         Error::AlreadyClosed => ("websocket_already_closed", None, None),
-        Error::Io(error) => (
-            "websocket_io",
-            None,
-            Some(format!(
-                "io_{}",
-                safe_code(&format!("{:?}", error.kind()).to_lowercase())
-            )),
-        ),
+        Error::Io(error) => {
+            let code = error.raw_os_error().map_or_else(
+                || {
+                    format!(
+                        "io_{}",
+                        safe_code(&format!("{:?}", error.kind()).to_lowercase())
+                    )
+                },
+                |number| format!("os_{number}"),
+            );
+            ("websocket_io", None, Some(code))
+        }
         Error::Tls(_) => ("websocket_tls", None, None),
         Error::Capacity(_) => ("websocket_capacity", None, None),
         Error::Protocol(_) => ("websocket_wire_protocol", None, None),
