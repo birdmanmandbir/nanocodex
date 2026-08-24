@@ -18,6 +18,7 @@ import { startSubscriptionEgressProxy } from "./subscription-egress-proxy.mjs";
 
 const workersRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const brokerRoot = resolve(workersRoot, "../egress");
+const nanocodex2LoadBinary = process.env.NANOCODEX2_LOAD_BINARY?.trim();
 const modeArgument = process.argv.slice(2).find((argument) => argument.startsWith("--auth-mode="));
 const authMode = modeArgument?.slice("--auth-mode=".length)
   ?? process.env.NANOCODEX_AUTH_MODE
@@ -36,6 +37,11 @@ const rateNamespace = 100_000_000 + (randomBytes(4).readUInt32BE(0) % 800_000_00
 const wranglerTimeoutMs = positiveInteger("NANOCODEX_WRANGLER_TIMEOUT_MS", 120_000);
 const cleanupWranglerTimeoutMs = positiveInteger("NANOCODEX_CLEANUP_WRANGLER_TIMEOUT_MS", 60_000);
 const smokeProcessTimeoutMs = positiveInteger("NANOCODEX_MULTIPLAYER_PROCESS_TIMEOUT_MS", 240_000);
+const loadRooms = boundedInteger("NANOCODEX2_LOAD_ROOMS", 8, 1, 8);
+const loadGuestsPerRoom = boundedInteger("NANOCODEX2_LOAD_GUESTS_PER_ROOM", 15, 1, 15);
+const loadMessagesPerGuest = boundedInteger("NANOCODEX2_LOAD_MESSAGES_PER_GUEST", 8, 0, 8);
+const loadAgentPromptsPerRoom = boundedInteger("NANOCODEX2_LOAD_AGENT_PROMPTS_PER_ROOM", 0, 0, 4);
+const loadMaxSeconds = boundedInteger("NANOCODEX2_LOAD_MAX_SECONDS", 180, 30, 900);
 const temporaryDirectory = await mkdtemp(join(tmpdir(), "nanocodex-multiplayer-cloudflare-"));
 const brokerConfigPath = join(temporaryDirectory, "wrangler.broker.json");
 const managedConfigPath = join(temporaryDirectory, "wrangler.managed.json");
@@ -78,6 +84,7 @@ let failure;
 let result;
 let cleanupPromise;
 let termination;
+let loadAccount;
 
 const terminationHandlers = {
   SIGINT: () => requestTermination("SIGINT", new Error("received SIGINT"), 130),
@@ -104,7 +111,7 @@ try {
       { label: "codex_access_token", value: auth.accessToken },
       { label: "codex_account_id", value: auth.accountId },
     );
-    brokerSecrets.CODEX_OAUTH_BOOTSTRAP = JSON.stringify({
+    brokerSecrets.LOCAL_CHATGPT_BOOTSTRAP = JSON.stringify({
       access_token: auth.accessToken,
       account_id: auth.accountId,
       fedramp: auth.fedramp,
@@ -157,60 +164,95 @@ try {
   ]);
   diagnostics.push(managedOutput);
 
-  recordDeploymentIntent(proxyName);
-  const proxyOutput = await runWrangler([
-    "deploy",
-    "-c",
-    proxyConfigPath,
-    "--secrets-file",
-    proxySecretsPath,
-  ]);
-  diagnostics.push(proxyOutput);
-  const origin = proxyOutput.match(/https:\/\/[a-z0-9.-]+\.workers\.dev/i)?.[0];
-  if (!origin) throw new Error("Wrangler did not report the public Multiplayer proxy URL");
-  credentialSafeHttpOrigin(origin, "deployed Multiplayer Worker origin");
+  if (nanocodex2LoadBinary) {
+    const origin = managedOutput.match(/https:\/\/[a-z0-9.-]+\.workers\.dev/i)?.[0];
+    if (!origin) throw new Error("Wrangler did not report the public managed Worker URL");
+    credentialSafeHttpOrigin(origin, "deployed managed Worker origin");
+    await waitUntilReady(`${origin}/health`);
+    loadAccount = await createLoadAccount(origin);
+    redactions.push(loadAccount.apiKey);
+    const loadOutput = await runNanocodex2Load(origin, loadAccount.apiKey);
+    diagnostics.push(loadOutput);
+    const loadResult = lastJsonLine(loadOutput);
+    if (!validLoadResult(loadResult)) {
+      throw new Error(`nanocodex2 load returned an unexpected result: ${JSON.stringify(loadResult)}`);
+    }
+    result = {
+      status: "ok",
+      auth_mode: authMode,
+      managed_origin: origin,
+      load: loadResult,
+      credential_boundary: "account-key-client/private-provider-broker",
+      cleanup: "disposable rooms, account key, managed Worker, and broker Worker deleted",
+    };
+  } else {
 
-  await waitUntilReady(`${origin}/health`);
-  const descriptors = secretDigestDescriptors(forbiddenPublicValues);
-  const smokeOutput = await runNode(
-    smokeScript,
-    sanitizedSmokeEnvironment(origin, descriptors),
-  );
-  diagnostics.push(smokeOutput);
-  const smokeResult = lastJsonLine(smokeOutput);
-  if (smokeResult?.status !== "ok"
-    || smokeResult?.auth_mode !== authMode
-    || smokeResult?.players !== 3
-    || smokeResult?.agent_reply !== true
-    || smokeResult?.durable_replay !== true
-    || smokeResult?.replayed_events !== 2
-    || smokeResult?.credential_boundary !== "private-egress-service-binding"
-    || smokeResult?.ingress_boundary !== "private-multiplayer-service-binding"
-    || smokeResult?.credential_scan !== "exact-secret-digests-clear"
-    || smokeResult?.credential_digests_checked !== descriptors.length) {
-    throw new Error(`Multiplayer smoke returned an unexpected result: ${JSON.stringify(smokeResult)}`);
+    recordDeploymentIntent(proxyName);
+    const proxyOutput = await runWrangler([
+      "deploy",
+      "-c",
+      proxyConfigPath,
+      "--secrets-file",
+      proxySecretsPath,
+    ]);
+    diagnostics.push(proxyOutput);
+    const origin = proxyOutput.match(/https:\/\/[a-z0-9.-]+\.workers\.dev/i)?.[0];
+    if (!origin) throw new Error("Wrangler did not report the public Multiplayer proxy URL");
+    credentialSafeHttpOrigin(origin, "deployed Multiplayer Worker origin");
+
+    await waitUntilReady(`${origin}/health`);
+    const descriptors = secretDigestDescriptors(forbiddenPublicValues);
+    const smokeOutput = await runNode(
+      smokeScript,
+      sanitizedSmokeEnvironment(origin, descriptors),
+    );
+    diagnostics.push(smokeOutput);
+    const smokeResult = lastJsonLine(smokeOutput);
+    if (smokeResult?.status !== "ok"
+      || smokeResult?.auth_mode !== authMode
+      || smokeResult?.players !== 3
+      || smokeResult?.agent_reply !== true
+      || smokeResult?.durable_replay !== true
+      || smokeResult?.replayed_events !== 2
+      || smokeResult?.credential_boundary !== "private-egress-service-binding"
+      || smokeResult?.ingress_boundary !== "private-multiplayer-service-binding"
+      || smokeResult?.credential_scan !== "exact-secret-digests-clear"
+      || smokeResult?.credential_digests_checked !== descriptors.length) {
+      throw new Error(`Multiplayer smoke returned an unexpected result: ${JSON.stringify(smokeResult)}`);
+    }
+    result = {
+      status: "ok",
+      auth_mode: authMode,
+      players: smokeResult.players,
+      durable_replay: smokeResult.durable_replay,
+      agent_reply: smokeResult.agent_reply,
+      credential_boundary: smokeResult.credential_boundary,
+      ingress_boundary: smokeResult.ingress_boundary,
+      credential_scan: smokeResult.credential_scan,
+      cleanup: "all three disposable ordinary Workers deleted",
+    };
   }
-  result = {
-    status: "ok",
-    auth_mode: authMode,
-    players: smokeResult.players,
-    durable_replay: smokeResult.durable_replay,
-    agent_reply: smokeResult.agent_reply,
-    credential_boundary: smokeResult.credential_boundary,
-    ingress_boundary: smokeResult.ingress_boundary,
-    credential_scan: smokeResult.credential_scan,
-    cleanup: "all three disposable ordinary Workers deleted",
-  };
 } catch (error) {
   const detail = redact(diagnostics.join("").trim());
   failure = new Error(`${redact(errorMessage(error))}${detail ? `\nDiagnostics:\n${detail}` : ""}`);
 } finally {
+  let accountCleanupFailure;
+  try {
+    if (loadAccount) await revokeLoadAccountKey(loadAccount);
+  } catch (error) {
+    accountCleanupFailure = error;
+  }
   try {
     await cleanup();
   } catch (error) {
-    failure = failure
-      ? new AggregateError([failure, error], "Live Multiplayer smoke failed")
+    accountCleanupFailure = accountCleanupFailure
+      ? new AggregateError([accountCleanupFailure, error], "Disposable account and Worker cleanup failed")
       : error;
+  }
+  if (accountCleanupFailure) {
+    failure = failure
+      ? new AggregateError([failure, accountCleanupFailure], "Live Multiplayer smoke failed")
+      : accountCleanupFailure;
   }
 }
 
@@ -233,13 +275,25 @@ function brokerConfig() {
     workers_dev: false,
     minify: true,
     vars: {
-      AGENT_ID: "live-multiplayer-smoke",
       ALLOWED_POLICIES: brokerPolicyForAuthMode(authMode),
+      ...(nanocodex2LoadBinary ? {
+        ALLOW_LOCAL_CREDENTIAL_CLAIM: "true",
+        ENVIRONMENT: "local",
+      } : { ENVIRONMENT: "production" }),
     },
     durable_objects: {
-      bindings: [{ name: "CODEX_OAUTH", class_name: "CodexOAuthBroker" }],
+      bindings: [
+        { name: "USER_CREDENTIALS", class_name: "UserCredentialBroker" },
+        { name: "AGENT_SUBJECTS", class_name: "AgentSubjectDirectory" },
+        { name: "USER_CONNECTORS", class_name: "UserConnectorBroker" },
+      ],
     },
-    migrations: [{ tag: "v1", new_sqlite_classes: ["CodexOAuthBroker"] }],
+    migrations: [
+      { tag: "v1", new_sqlite_classes: ["CodexOAuthBroker"] },
+      { tag: "v2", new_sqlite_classes: ["UserCredentialBroker", "AgentSubjectDirectory"] },
+      { tag: "v3", deleted_classes: ["CodexOAuthBroker"] },
+      { tag: "v4", new_sqlite_classes: ["UserConnectorBroker"] },
+    ],
   };
 }
 
@@ -249,23 +303,28 @@ function managedConfig() {
     main: resolve(workersRoot, "src/index.ts"),
     compatibility_date: "2026-07-29",
     compatibility_flags: ["nodejs_compat", "global_fetch_strictly_public"],
-    workers_dev: false,
+    workers_dev: Boolean(nanocodex2LoadBinary),
     minify: true,
     rules: [{ type: "CompiledWasm", globs: ["**/*.wasm"], fallthrough: true }],
-    services: [{ binding: "EGRESS", service: brokerName }],
+    services: [{ binding: "NANOCODEX", service: brokerName }],
     durable_objects: {
       bindings: [
         { name: "NANOCODEX_SESSIONS", class_name: "NanocodexSession" },
         { name: "NANOCODEX_ROOMS", class_name: "MultiplayerRoom" },
         { name: "NANOCODEX_MULTIPLAYER_QUOTA", class_name: "MultiplayerQuota" },
+        { name: "NANOCODEX_AUTH", class_name: "NonceStorage" },
+        { name: "NANOCODEX_USERS", class_name: "UserAccount" },
+        { name: "NANOCODEX_API_KEYS", class_name: "ApiKeyRecord" },
+        { name: "NANOCODEX_MEMORY", class_name: "MemoryScope" },
       ],
     },
     migrations: [
       {
         tag: "v1",
-        new_sqlite_classes: ["NanocodexSession", "MultiplayerRoom"],
+        new_sqlite_classes: ["NanocodexSession", "MultiplayerRoom", "MultiplayerQuota"],
       },
-      { tag: "v5", new_sqlite_classes: ["MultiplayerQuota"] },
+      { tag: "v2", new_sqlite_classes: ["NonceStorage", "UserAccount", "ApiKeyRecord"] },
+      { tag: "v3", new_sqlite_classes: ["MemoryScope"] },
     ],
     vars: {
       AGENT_IDLE_TIMEOUT_MS: "30000",
@@ -437,6 +496,113 @@ async function boundedJson(response, limit) {
   } finally {
     reader.releaseLock();
   }
+}
+
+async function createLoadAccount(origin) {
+  const session = await fetch(`${origin}/v1/me`, {
+    signal: AbortSignal.any([lifecycleAbort.signal, AbortSignal.timeout(10_000)]),
+  });
+  if (!session.ok) throw new Error(`load account bootstrap returned HTTP ${session.status}`);
+  await session.body?.cancel();
+  const cookie = session.headers.get("set-cookie")?.split(";", 1)[0];
+  if (!cookie || /[\r\n]/.test(cookie)) throw new Error("load account bootstrap omitted its session cookie");
+
+  const credentialPath = authMode === "chatgpt"
+    ? "/v1/credentials/local-claim"
+    : "/v1/credentials/openai";
+  const credential = await fetch(`${origin}${credentialPath}`, {
+    method: authMode === "chatgpt" ? "POST" : "PUT",
+    headers: {
+      cookie,
+      origin,
+      ...(authMode === "api_key" ? { "content-type": "application/json" } : {}),
+    },
+    ...(authMode === "api_key" ? {
+      body: JSON.stringify({ api_key: process.env.OPENAI_API_KEY?.trim() }),
+    } : {}),
+    signal: AbortSignal.any([lifecycleAbort.signal, AbortSignal.timeout(10_000)]),
+  });
+  if (!credential.ok) {
+    const body = await boundedJson(credential, 4 * 1024);
+    throw new Error(`load credential bootstrap returned HTTP ${credential.status}: ${JSON.stringify(body)}`);
+  }
+  await credential.body?.cancel();
+
+  const created = await fetch(`${origin}/v1/api-keys`, {
+    method: "POST",
+    headers: { cookie, origin, "content-type": "application/json" },
+    body: JSON.stringify({ label: "disposable nanocodex2 Cloudflare load" }),
+    signal: AbortSignal.any([lifecycleAbort.signal, AbortSignal.timeout(10_000)]),
+  });
+  const body = await boundedJson(created, 8 * 1024);
+  if (created.status !== 201
+    || typeof body?.api_key !== "string"
+    || typeof body?.key?.id !== "string") {
+    throw new Error(`load API-key creation returned HTTP ${created.status}`);
+  }
+  return { apiKey: body.api_key, cookie, keyId: body.key.id, origin };
+}
+
+async function revokeLoadAccountKey(account) {
+  const response = await fetch(`${account.origin}/v1/api-keys/${encodeURIComponent(account.keyId)}`, {
+    method: "DELETE",
+    headers: { cookie: account.cookie, origin: account.origin },
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (response.status !== 204 && response.status !== 404) {
+    await response.body?.cancel();
+    throw new Error(`load API-key revocation returned HTTP ${response.status}`);
+  }
+  await response.body?.cancel();
+  loadAccount = undefined;
+}
+
+async function runNanocodex2Load(origin, apiKey) {
+  if (!await executable(nanocodex2LoadBinary)) {
+    throw new Error("NANOCODEX2_LOAD_BINARY must name an executable nanocodex2 binary");
+  }
+  const arguments_ = [
+    "load",
+    "--rooms", String(loadRooms),
+    "--guests-per-room", String(loadGuestsPerRoom),
+    "--messages-per-guest", String(loadMessagesPerGuest),
+    "--agent-prompts-per-room", String(loadAgentPromptsPerRoom),
+    "--replay",
+    "--max-seconds", String(loadMaxSeconds),
+  ];
+  const environment = sanitizedLoadEnvironment(origin, apiKey);
+  return runProcess(nanocodex2LoadBinary, arguments_, workersRoot, environment, {
+    label: "nanocodex2 managed-room load",
+    signal: lifecycleAbort.signal,
+    timeoutMs: (loadMaxSeconds + 15) * 1_000,
+  });
+}
+
+function validLoadResult(value) {
+  return value?.timed_out === false
+    && Array.isArray(value?.failures)
+    && value.failures.length === 0
+    && value?.invariants?.violations === 0
+    && value?.invariants?.requested_population_admitted === true
+    && value?.invariants?.complete_live_fanout === true
+    && value?.invariants?.complete_agent_terminals === true
+    && value?.invariants?.complete_replay === true
+    && value?.invariants?.cleanup_settled === true;
+}
+
+function sanitizedLoadEnvironment(origin, apiKey) {
+  const environment = { ...process.env };
+  for (const name of [
+    ...PROVIDER_ENVIRONMENT_NAMES,
+    ...CLOUDFLARE_CONTROL_ENVIRONMENT_NAMES,
+    "NANOCODEX_ADMIN_TOKEN",
+    "NANOCODEX_ROOM_ALLOCATOR_TOKEN",
+    "MULTIPLAYER_ALLOCATOR_TOKEN",
+    "MULTIPLAYER_ADMIN_TOKEN",
+  ]) delete environment[name];
+  environment.NANOCODEX_MANAGED_URL = origin;
+  environment.NANOCODEX_API_KEY = apiKey;
+  return environment;
 }
 
 function sanitizedSmokeEnvironment(origin, descriptors) {
@@ -637,6 +803,14 @@ function positiveInteger(name, fallback) {
   const value = Number(process.env[name] ?? fallback);
   if (!Number.isSafeInteger(value) || value <= 0) {
     throw new Error(`${name} must be a positive integer`);
+  }
+  return value;
+}
+
+function boundedInteger(name, fallback, minimum, maximum) {
+  const value = Number(process.env[name] ?? fallback);
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`${name} must be ${minimum} through ${maximum}`);
   }
   return value;
 }
