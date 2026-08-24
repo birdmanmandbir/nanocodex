@@ -1,7 +1,6 @@
 // Modified from clabby/tact@a2de8ae1e0b6ce8d8f0a251a9d681dc430b247aa for Nanocodex2.
 // SPDX-License-Identifier: Apache-2.0
 
-
 //! Application-level ownership for the primary and optional forked panes.
 
 use super::{
@@ -11,6 +10,7 @@ use super::{
 };
 use crate::{
     app::config::{ReasoningEffort, ReasoningMode},
+    client::{MemoryKey, MemoryRecord},
     core::extensions::Skill,
     tui::{
         pane::PaneId,
@@ -21,6 +21,7 @@ use crate::{
 };
 use crossterm_tact::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use nanocodex::Model;
+use nanocodex_subagents::AgentUpdate;
 use ratatui_tact::{
     Frame,
     layout::{Position, Rect},
@@ -29,8 +30,6 @@ use ratatui_tact::{
 };
 use semver::Version;
 use std::{path::PathBuf, sync::Arc, time::Instant};
-use tact_memory::{MemoryAccess, MemoryKey, MemoryRecord, MemorySource};
-use tact_subagents::AgentUpdate;
 use unicode_width::UnicodeWidthStr;
 
 const SPLIT_HINT: &str = " mouse: focus · Ctrl+C: clear · Ctrl+C×2: close ";
@@ -136,13 +135,10 @@ pub(crate) enum AppEvent {
     },
     MemoriesLoaded {
         pane: PaneId,
-        access: MemoryAccess,
         records: Vec<MemoryRecord>,
     },
     MemoryLoadFailed {
         pane: PaneId,
-        source: MemorySource,
-        access: Option<MemoryAccess>,
         error: String,
     },
     MemoryDeleted {
@@ -180,7 +176,6 @@ pub(crate) enum AppEvent {
         pane: PaneId,
         theme: Theme,
         preferred_reasoning_mode: ReasoningMode,
-        memory_enabled: bool,
         message: String,
     },
     ConfigReloadFailed {
@@ -369,24 +364,12 @@ impl AppNode {
             AppEvent::SessionLoadFailed { pane, error } => {
                 self.update_root(pane, RootEvent::SessionLoadFailed(error))
             }
-            AppEvent::MemoriesLoaded {
-                pane,
-                access,
-                records,
-            } => self.update_root(pane, RootEvent::MemoriesLoaded { access, records }),
-            AppEvent::MemoryLoadFailed {
-                pane,
-                source,
-                access,
-                error,
-            } => self.update_root(
-                pane,
-                RootEvent::MemoryLoadFailed {
-                    source,
-                    access,
-                    error,
-                },
-            ),
+            AppEvent::MemoriesLoaded { pane, records } => {
+                self.update_root(pane, RootEvent::MemoriesLoaded { records })
+            }
+            AppEvent::MemoryLoadFailed { pane, error } => {
+                self.update_root(pane, RootEvent::MemoryLoadFailed { error })
+            }
             AppEvent::MemoryDeleted { pane, key } => {
                 self.update_root(pane, RootEvent::MemoryDeleted { key })
             }
@@ -433,7 +416,6 @@ impl AppNode {
                 pane,
                 theme,
                 preferred_reasoning_mode,
-                memory_enabled,
                 message,
             } => {
                 self.theme.replace_from_config(theme);
@@ -445,8 +427,6 @@ impl AppNode {
                     fork.component_mut().set_theme_mode(mode);
                 }
                 self.set_preferred_reasoning_mode(preferred_reasoning_mode);
-                self.set_memory_enabled(false);
-                self.set_memory_enabled(memory_enabled);
                 self.update_root(pane, RootEvent::NotifySuccess(message))
             }
             AppEvent::ConfigReloadFailed { pane, error } => {
@@ -810,6 +790,7 @@ mod tests {
     };
     use crate::{
         app::config::{ReasoningEffort, ReasoningMode},
+        client::{MemoryKey, MemoryRecord},
         tui::{
             pane::PaneId,
             theme::{ColorScheme, Theme, ThemeMode},
@@ -823,15 +804,6 @@ mod tests {
     use ratatui_tact::{Terminal, backend::TestBackend};
     use semver::Version;
     use std::{path::PathBuf, sync::Arc};
-    use tact_memory::{MemoryAccess, MemoryKey, MemoryRecord, MemorySource};
-
-    fn local_memory_access() -> MemoryAccess {
-        MemoryAccess {
-            source: MemorySource::Local,
-            namespace: None,
-            role: None,
-        }
-    }
 
     fn app() -> AppNode {
         let workspace = PathBuf::from("/workspace");
@@ -869,9 +841,9 @@ mod tests {
         assert_eq!(root.composer().model(), Model::Luna);
     }
 
-    fn memory_record(id: i64, content: &str) -> MemoryRecord {
+    fn memory_record(id: u64, content: &str) -> MemoryRecord {
         MemoryRecord {
-            key: MemoryKey::local(id, 1),
+            key: MemoryKey { id, version: 1 },
             content: content.to_owned(),
             created_at_ms: 0,
             updated_at_ms: 0,
@@ -1389,12 +1361,10 @@ mod tests {
 
         app.update(AppEvent::MemoriesLoaded {
             pane: PaneId::Main,
-            access: local_memory_access(),
             records: vec![memory_record(1, "main pane memory")],
         });
         app.update(AppEvent::MemoriesLoaded {
             pane: PaneId::Fork(1),
-            access: local_memory_access(),
             records: vec![memory_record(2, "fork pane memory")],
         });
         let output = rendered(&mut app, 120, 24);
@@ -1404,7 +1374,7 @@ mod tests {
     }
 
     #[test]
-    fn config_reload_updates_memory_action_availability_for_every_root() {
+    fn config_reload_preserves_account_memory_availability_for_every_root() {
         let mut app = app();
         app.update(control('t'));
         app.update(AppEvent::ForkReady {
@@ -1415,7 +1385,6 @@ mod tests {
             pane: PaneId::Main,
             theme: Theme::default(),
             preferred_reasoning_mode: ReasoningMode::Standard,
-            memory_enabled: true,
             message: "enabled memory".to_owned(),
         });
         for pane in [PaneId::Main, PaneId::Fork(1)] {
@@ -1432,11 +1401,16 @@ mod tests {
             pane: PaneId::Main,
             theme: Theme::default(),
             preferred_reasoning_mode: ReasoningMode::Standard,
-            memory_enabled: false,
             message: "disabled memory".to_owned(),
         });
         for pane in [PaneId::Main, PaneId::Fork(1)] {
-            assert!(open_memory(&mut app, pane).effects.is_empty());
+            assert!(matches!(
+                open_memory(&mut app, pane).effects.as_slice(),
+                [AppEffect::Pane {
+                    pane: effect_pane,
+                    effect: super::RootEffect::LoadMemories,
+                }] if *effect_pane == pane
+            ));
         }
     }
 }

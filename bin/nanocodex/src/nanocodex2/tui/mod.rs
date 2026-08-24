@@ -1,7 +1,6 @@
 // Modified from clabby/tact@a2de8ae1e0b6ce8d8f0a251a9d681dc430b247aa for Nanocodex2.
 // SPDX-License-Identifier: Apache-2.0
 
-
 //! Interactive terminal runtime.
 
 mod agent_events;
@@ -19,7 +18,6 @@ pub(crate) mod session;
 mod shell;
 mod spinner;
 pub(crate) mod storage;
-mod subagent_updates;
 mod terminal;
 pub(crate) mod theme;
 pub(crate) mod transcript;
@@ -31,6 +29,7 @@ use crate::{
         error::{Result, RuntimeError},
         herdr, hook,
     },
+    client::{ManagedClient, ManagedError, MemoryKey, MemoryRecord},
     core::{ConfiguredAgent, extensions::Skill},
     tui::{
         agent_events::ForwardedAgentEvent,
@@ -46,7 +45,6 @@ use crate::{
         scheduler::{RenderScheduler, STREAM_FRAME_INTERVAL},
         session::{RecentPrompt, SessionSummary},
         shell::ShellExecution,
-        subagent_updates::ForwardedSubagentUpdate,
         terminal::TerminalSession,
         transcript::{
             LocalEvent, SessionEnded, SessionOutcome, SessionStarted, ShellId, TranscriptError,
@@ -55,7 +53,9 @@ use crate::{
         worker::{AuxiliaryContext, AuxiliaryError, ReflectionContext, WorkerCommand, WorkerEvent},
     },
 };
-use crossterm_tact::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
+use crossterm_tact::event::{
+    Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
+};
 use futures_util::StreamExt;
 use nanocodex::Model;
 use std::{
@@ -68,11 +68,6 @@ use std::{
     },
     time::Instant,
 };
-use tact_memory::{
-    MemoryAccess, MemoryError, MemoryKey, MemoryRecord, MemorySource, MemoryStore,
-    SelectedMemoryStore,
-};
-use tact_subagents::Subagents;
 use tokio::{
     sync::mpsc,
     task::{JoinHandle, JoinSet},
@@ -274,7 +269,6 @@ struct PaneRuntime {
     current_model: Model,
     active_shells: usize,
     generation: u64,
-    subagent_control: Subagents,
 }
 
 struct WriterCompletion {
@@ -300,9 +294,7 @@ enum MemoryCompletion {
     Listed {
         pane: PaneId,
         generation: u64,
-        source: MemorySource,
-        result:
-            std::result::Result<(MemoryAccess, Vec<MemoryRecord>), (Option<MemoryAccess>, String)>,
+        result: std::result::Result<Vec<MemoryRecord>, String>,
     },
     Deleted {
         pane: PaneId,
@@ -329,24 +321,14 @@ impl MemoryCompletion {
         match self {
             Self::Listed {
                 pane,
-                result: Ok((access, records)),
+                result: Ok(records),
                 ..
-            } => AppEvent::MemoriesLoaded {
-                pane,
-                access,
-                records,
-            },
+            } => AppEvent::MemoriesLoaded { pane, records },
             Self::Listed {
                 pane,
-                source,
-                result: Err((access, error)),
+                result: Err(error),
                 ..
-            } => AppEvent::MemoryLoadFailed {
-                pane,
-                source,
-                access,
-                error,
-            },
+            } => AppEvent::MemoryLoadFailed { pane, error },
             Self::Deleted {
                 pane,
                 key,
@@ -370,30 +352,31 @@ impl MemoryCompletion {
 async fn run_memory_operation(
     pane: PaneId,
     generation: u64,
-    store: &SelectedMemoryStore,
+    client: &ManagedClient,
     operation: MemoryOperation,
 ) -> MemoryCompletion {
     match operation {
         MemoryOperation::List => MemoryCompletion::Listed {
             pane,
             generation,
-            source: store.source(),
-            result: match store.access().await {
-                Ok(access) => store
-                    .list()
-                    .await
-                    .map(|records| (access.clone(), records))
-                    .map_err(|error| (Some(access), error.to_string())),
-                Err(error) => Err((None, error.to_string())),
-            },
+            result: client
+                .list_memories()
+                .await
+                .map_err(|error| error.to_string()),
         },
         MemoryOperation::Delete(key) => {
-            let result = store.delete(key.clone()).await;
+            let result = client.delete_memory(key).await;
             MemoryCompletion::Deleted {
                 pane,
                 generation,
                 key,
-                conflict: matches!(result, Err(MemoryError::Conflict)),
+                conflict: matches!(
+                    &result,
+                    Err(ManagedError::Http {
+                        status: reqwest::StatusCode::CONFLICT,
+                        ..
+                    })
+                ),
                 result: result.map_err(|error| error.to_string()),
             }
         }
@@ -404,12 +387,6 @@ fn next_memory_generation(generations: &mut HashMap<PaneId, u64>, pane: PaneId) 
     let generation = generations.entry(pane).or_default();
     *generation = generation.wrapping_add(1).max(1);
     *generation
-}
-
-fn invalidate_memory_generations(generations: &mut HashMap<PaneId, u64>) {
-    for generation in generations.values_mut() {
-        *generation = generation.wrapping_add(1).max(1);
-    }
 }
 
 impl PaneRuntime {
@@ -423,17 +400,6 @@ impl PaneRuntime {
         (self.previously_persisted || self.persisted_transcript.load(Ordering::Acquire))
             .then(|| self.session_id.clone())
     }
-}
-
-fn subagent_pane(
-    panes: &HashMap<PaneId, PaneRuntime>,
-    event: &ForwardedSubagentUpdate,
-) -> Option<PaneId> {
-    panes.iter().find_map(|(&pane, runtime)| {
-        (runtime.session_id == event.root_session_id
-            && runtime.subagent_control.runtime_id() == event.runtime_id)
-            .then_some(pane)
-    })
 }
 
 pub(crate) async fn run(
@@ -466,34 +432,32 @@ pub(crate) async fn run(
                 session_id.clone(),
             );
             let (snapshot, records) = tokio::join!(checkpoint, transcript);
-            let snapshot = snapshot.map_err(RuntimeError::SessionTask)??;
+            let resume_state = snapshot.map_err(RuntimeError::SessionTask)??;
+            let (snapshot, _, _) = resume_state.into_parts();
             let records = records?;
-            tokio::task::spawn_blocking(move || -> Result<_> {
-                let reasoning_mode = session::reasoning_mode(&records);
-                let model = session::model(&records);
-                let next_sequence = session::next_sequence(&records);
-                let projection = RootNode::project_session(initial_effort, records);
-                let configured = ConfiguredAgent::from_config_with_session(
-                    &restored_config,
-                    initial_effort,
-                    reasoning_mode,
-                    model,
-                    Some(&session_id),
-                    Some(snapshot),
-                )?;
-                Ok((
-                    configured,
-                    Some(projection),
-                    reasoning_mode,
-                    model,
-                    next_sequence,
-                ))
-            })
-            .await
-            .map_err(RuntimeError::SessionTask)??
+            let reasoning_mode = session::reasoning_mode(&records);
+            let model = session::model(&records);
+            let next_sequence = session::next_sequence(&records);
+            let projection = RootNode::project_session(initial_effort, records);
+            let configured = ConfiguredAgent::from_config_with_session(
+                &restored_config,
+                initial_effort,
+                reasoning_mode,
+                model,
+                Some(&session_id),
+                Some(snapshot),
+            )
+            .await?;
+            (
+                configured,
+                Some(projection),
+                reasoning_mode,
+                model,
+                next_sequence,
+            )
         } else {
             (
-                ConfiguredAgent::from_config(&config)?,
+                ConfiguredAgent::from_config(&config).await?,
                 None,
                 preferred_reasoning_mode,
                 Model::Sol,
@@ -507,10 +471,8 @@ pub(crate) async fn run(
         instructions,
         skills,
         memory_enabled,
-        subagent_updates,
-        subagent_control,
     } = configured;
-    let main_session_id = agent.session_id().to_string();
+    let main_session_id = agent.identity().session_id().to_owned();
     let mut herdr = herdr::Reporter::from_env(&main_session_id);
     let (writer_sender, mut writer_updates) = mpsc::unbounded_channel();
     let mut panes = HashMap::new();
@@ -529,7 +491,6 @@ pub(crate) async fn run(
             &config,
             PaneSettings::new(initial_effort, reasoning_mode, initial_fast_mode, model),
             instructions,
-            subagent_control.clone(),
             &writer_sender,
         )?,
     );
@@ -542,18 +503,13 @@ pub(crate) async fn run(
     let workspace = config.agent().workspace().to_path_buf();
     let (agent_event_sender, mut agent_events) = mpsc::unbounded_channel();
     agent_events::forward(PaneId::Main, 0, events, agent_event_sender.clone());
-    let (subagent_sender, mut subagent_events) = mpsc::unbounded_channel();
-    subagent_updates::forward(
-        subagent_control.runtime_id(),
-        subagent_updates,
-        subagent_sender.clone(),
-    );
     let mut root = RootNode::new(&workspace, initial_effort);
     root.set_reasoning_modes(reasoning_mode, preferred_reasoning_mode);
     root.set_fast_mode(initial_fast_mode);
     root.set_max_subagents(initial_max_subagents);
-    let mut memory_store = crate::core::configured_memory_store(&config, &workspace)?;
-    root.set_memory_enabled(memory_store.is_some());
+    let memory_client =
+        crate::client_from_environment().map_err(crate::engine::EngineError::from)?;
+    root.set_memory_enabled(true);
     if let Some(projection) = restored_projection {
         root.install_session_projection(
             &workspace,
@@ -597,14 +553,12 @@ pub(crate) async fn run(
     let mut stopping = false;
     let mut worker_stopped = false;
     let mut herdr_turns = HashSet::new();
-    let mut worker_error = None::<nanocodex::NanocodexError>;
+    let mut worker_error = None::<crate::engine::EngineError>;
     let mut writer_error = None::<TranscriptError>;
     let mut writers_open = 1_usize;
     let mut shell_tasks = JoinSet::<(PaneId, ShellExecution)>::new();
     let mut memory_tasks = JoinSet::<MemoryCompletion>::new();
     let mut memory_generations = HashMap::<PaneId, u64>::new();
-    let mut subagent_shutdowns = JoinSet::<()>::new();
-    let mut subagents_stopping = false;
 
     macro_rules! apply_app_update {
         ($update:expr) => {
@@ -634,10 +588,9 @@ pub(crate) async fn run(
                     scheduler: &mut scheduler,
                     panes: &mut panes,
                     shell_tasks: &mut shell_tasks,
-                    memory_store: &mut memory_store,
+                    memory_client: &memory_client,
                     memory_tasks: &mut memory_tasks,
                     memory_generations: &mut memory_generations,
-                    subagent_shutdowns: &mut subagent_shutdowns,
                 },
             )
             .await?;
@@ -658,17 +611,10 @@ pub(crate) async fn run(
             handoff_controller.cancel();
             memory_tasks.abort_all();
         }
-        if stopping && !subagents_stopping {
-            for runtime in panes.values() {
-                schedule_subagent_shutdown(runtime, &mut subagent_shutdowns);
-            }
-            subagents_stopping = true;
-        }
         if stopping
             && worker_stopped
             && panes.values().all(|pane| pane.event_streams_open == 0)
             && shell_tasks.is_empty()
-            && subagent_shutdowns.is_empty()
         {
             close_journals(&mut panes, worker_error.as_ref())?;
             if writers_open == 0 {
@@ -788,14 +734,6 @@ pub(crate) async fn run(
                             schedule(app.update(AppEvent::AgentStreamClosed(pane)), &mut scheduler);
                         }
                     }
-                }
-            }
-            Some(event) = subagent_events.recv(), if !stopping => {
-                if let Some(pane) = subagent_pane(&panes, &event) {
-                    apply_app_update!(app.update(AppEvent::Subagent {
-                        pane,
-                        update: event.update,
-                    }));
                 }
             }
             Some(ready) = review_ready_updates.recv(), if !stopping => {
@@ -993,7 +931,7 @@ pub(crate) async fn run(
                         parent_sequence,
                         events,
                     } => {
-                        let session_id = events.request_id().to_owned();
+                        let session_id = events.identity().session_id().to_owned();
                         let parent_session_id = panes
                             .get(&main_pane)
                             .map(|runtime| runtime.session_id.clone());
@@ -1013,11 +951,6 @@ pub(crate) async fn run(
                             .get(&main_pane)
                             .expect("main pane must exist")
                             .current_model;
-                        let subagent_control = panes
-                            .get(&main_pane)
-                            .expect("main pane must exist")
-                            .subagent_control
-                            .clone();
                         let instructions = Arc::clone(
                             &panes
                                 .get(&main_pane)
@@ -1043,7 +976,6 @@ pub(crate) async fn run(
                                 &config,
                                 PaneSettings::new(effort, reasoning_mode, fast_mode, model),
                                 instructions,
-                                subagent_control.clone(),
                                 &writer_sender,
                             )?;
                         let started = runtime
@@ -1082,7 +1014,6 @@ pub(crate) async fn run(
                             schedule(app.update(AppEvent::Transcript { pane, record }), &mut scheduler);
                         }
                         runtime.current_effort = effort;
-                        runtime.subagent_control.set_thinking(effort.into());
                         if app.main_pane() == Some(pane) {
                             config.set_thinking(effort);
                         }
@@ -1104,7 +1035,6 @@ pub(crate) async fn run(
                             schedule(app.update(AppEvent::Transcript { pane, record }), &mut scheduler);
                         }
                         runtime.current_fast_mode = enabled;
-                        runtime.subagent_control.set_fast_mode(enabled);
                         if app.main_pane() == Some(pane) {
                             config.set_fast_mode(enabled);
                         }
@@ -1159,9 +1089,6 @@ pub(crate) async fn run(
                     continue;
                 }
                 schedule(app.update(completion.into_event()), &mut scheduler);
-            }
-            result = subagent_shutdowns.join_next(), if !subagent_shutdowns.is_empty() => {
-                drop(result);
             }
             result = async {
                 editor_task
@@ -1248,10 +1175,8 @@ pub(crate) async fn run(
                             &mut panes,
                             &commands,
                             &agent_event_sender,
-                            &subagent_sender,
                             &writer_sender,
                             &mut writers_open,
-                            &mut subagent_shutdowns,
                         )?;
                         schedule(
                             app.update(AppEvent::HandoffReady {
@@ -1295,10 +1220,8 @@ pub(crate) async fn run(
                             &mut panes,
                             &commands,
                             &agent_event_sender,
-                            &subagent_sender,
                             &writer_sender,
                             &mut writers_open,
-                            &mut subagent_shutdowns,
                         );
                         let skills = skills?;
                         schedule(
@@ -1440,19 +1363,13 @@ pub(crate) async fn run(
                             instructions,
                             skills,
                             memory_enabled,
-                            subagent_updates,
-                            subagent_control,
                         } = configured;
-                        let session_id = events.request_id().to_owned();
+                        let session_id = events.identity().session_id().to_owned();
                         let generation = panes
                             .get(&pane)
                             .expect("resumed pane must exist")
                             .generation
                             .saturating_add(1);
-                        schedule_subagent_shutdown(
-                            panes.get(&pane).expect("resumed pane must exist"),
-                            &mut subagent_shutdowns,
-                        );
                         close_pane_journal(
                             panes.get_mut(&pane).expect("resumed pane must exist"),
                             SessionOutcome::Closed,
@@ -1470,7 +1387,6 @@ pub(crate) async fn run(
                                 &config,
                                 PaneSettings::new(effort, reasoning_mode, fast_mode, model),
                                 instructions,
-                                subagent_control.clone(),
                                 &writer_sender,
                             )?,
                         );
@@ -1480,11 +1396,6 @@ pub(crate) async fn run(
                             generation,
                             events,
                             agent_event_sender.clone(),
-                        );
-                        subagent_updates::forward(
-                            subagent_control.runtime_id(),
-                            subagent_updates,
-                            subagent_sender.clone(),
                         );
                         commands
                             .send(WorkerCommand::ReplaceAgent {
@@ -1571,10 +1482,8 @@ fn install_configured_agent(
     panes: &mut HashMap<PaneId, PaneRuntime>,
     commands: &mpsc::UnboundedSender<WorkerCommand>,
     agent_event_sender: &mpsc::UnboundedSender<ForwardedAgentEvent>,
-    subagent_sender: &mpsc::UnboundedSender<ForwardedSubagentUpdate>,
     writer_sender: &mpsc::UnboundedSender<WriterCompletion>,
     writers_open: &mut usize,
-    subagent_shutdowns: &mut JoinSet<()>,
 ) -> Result<Arc<[Skill]>> {
     let ConfiguredAgent {
         agent,
@@ -1582,19 +1491,13 @@ fn install_configured_agent(
         instructions,
         skills,
         memory_enabled,
-        subagent_updates,
-        subagent_control,
     } = configured;
-    let session_id = events.request_id().to_owned();
+    let session_id = events.identity().session_id().to_owned();
     let generation = panes
         .get(&pane)
         .expect("replacement pane must exist")
         .generation
         .saturating_add(1);
-    schedule_subagent_shutdown(
-        panes.get(&pane).expect("replacement pane must exist"),
-        subagent_shutdowns,
-    );
     close_pane_journal(
         panes.get_mut(&pane).expect("replacement pane must exist"),
         SessionOutcome::Closed,
@@ -1608,17 +1511,11 @@ fn install_configured_agent(
             config,
             settings,
             instructions,
-            subagent_control.clone(),
             writer_sender,
         )?,
     );
     *writers_open = writers_open.saturating_add(1);
     agent_events::forward(pane, generation, events, agent_event_sender.clone());
-    subagent_updates::forward(
-        subagent_control.runtime_id(),
-        subagent_updates,
-        subagent_sender.clone(),
-    );
     commands
         .send(WorkerCommand::ReplaceAgent {
             pane,
@@ -1642,7 +1539,6 @@ fn open_pane(
     config: &Config,
     settings: PaneSettings,
     instructions: Arc<str>,
-    subagent_control: Subagents,
     writer_updates: &mpsc::UnboundedSender<WriterCompletion>,
 ) -> Result<PaneRuntime> {
     let PaneGeneration { pane, generation } = identity;
@@ -1711,13 +1607,12 @@ fn open_pane(
         current_model: model,
         active_shells: 0,
         generation,
-        subagent_control,
     })
 }
 
 fn close_journals(
     panes: &mut HashMap<PaneId, PaneRuntime>,
-    worker_error: Option<&nanocodex::NanocodexError>,
+    worker_error: Option<&crate::engine::EngineError>,
 ) -> Result<()> {
     let outcome = if worker_error.is_some() {
         SessionOutcome::Failed
@@ -1728,14 +1623,6 @@ fn close_journals(
         close_pane_journal(runtime, outcome, worker_error.map(ToString::to_string))?;
     }
     Ok(())
-}
-
-fn schedule_subagent_shutdown(runtime: &PaneRuntime, tasks: &mut JoinSet<()>) {
-    let control = runtime.subagent_control.clone();
-    let root_session_id = runtime.session_id.clone();
-    tasks.spawn(async move {
-        control.close_all(&root_session_id).await;
-    });
 }
 
 fn close_pane_journal(
@@ -1827,10 +1714,9 @@ struct EffectContext<'a> {
     scheduler: &'a mut RenderScheduler,
     panes: &'a mut HashMap<PaneId, PaneRuntime>,
     shell_tasks: &'a mut JoinSet<(PaneId, ShellExecution)>,
-    memory_store: &'a mut Option<SelectedMemoryStore>,
+    memory_client: &'a ManagedClient,
     memory_tasks: &'a mut JoinSet<MemoryCompletion>,
     memory_generations: &'a mut HashMap<PaneId, u64>,
-    subagent_shutdowns: &'a mut JoinSet<()>,
 }
 
 async fn apply_update(
@@ -1858,9 +1744,6 @@ async fn apply_update(
                     .map_err(|_| RuntimeError::AgentWorkerStopped)?;
             }
             AppEffect::ClosePane(pane) => {
-                if let Some(runtime) = context.panes.get(&pane) {
-                    schedule_subagent_shutdown(runtime, context.subagent_shutdowns);
-                }
                 context
                     .commands
                     .send(WorkerCommand::ClosePane(pane))
@@ -2080,9 +1963,10 @@ fn apply_pane_effect(
                 .expect("model pane must have a runtime")
                 .current_fast_mode;
             let config = context.config.clone();
-            *context.new_session_task = Some(tokio::task::spawn_blocking(move || {
+            *context.new_session_task = Some(tokio::spawn(async move {
                 let configured =
-                    ConfiguredAgent::from_config_with_model(&config, effort, reasoning_mode, model);
+                    ConfiguredAgent::from_config_with_model(&config, effort, reasoning_mode, model)
+                        .await;
                 (
                     pane,
                     effort,
@@ -2108,44 +1992,19 @@ fn apply_pane_effect(
             context.config.persist_max_subagents(limit)?;
             context.config.set_max_subagents(limit);
             context.app.set_max_subagents(limit);
-            for runtime in context.panes.values() {
-                runtime.subagent_control.set_max_concurrency(limit);
-            }
         }
         components::RootEffect::LoadMemories => {
-            let Some(store) = context.memory_store.clone() else {
-                schedule(
-                    context.app.update(AppEvent::MemoryLoadFailed {
-                        pane,
-                        source: MemorySource::Local,
-                        access: None,
-                        error: "Memory is disabled. Enable it with memory.enabled = true."
-                            .to_owned(),
-                    }),
-                    context.scheduler,
-                );
-                return Ok(());
-            };
+            let client = context.memory_client.clone();
             let generation = next_memory_generation(context.memory_generations, pane);
             context.memory_tasks.spawn(async move {
-                run_memory_operation(pane, generation, &store, MemoryOperation::List).await
+                run_memory_operation(pane, generation, &client, MemoryOperation::List).await
             });
         }
         components::RootEffect::DeleteMemory(key) => {
-            let Some(store) = context.memory_store.clone() else {
-                schedule(
-                    context.app.update(AppEvent::MemoryDeleteFailed {
-                        pane,
-                        error: "Memory was disabled before the deletion completed.".to_owned(),
-                        conflict: false,
-                    }),
-                    context.scheduler,
-                );
-                return Ok(());
-            };
+            let client = context.memory_client.clone();
             let generation = next_memory_generation(context.memory_generations, pane);
             context.memory_tasks.spawn(async move {
-                run_memory_operation(pane, generation, &store, MemoryOperation::Delete(key)).await
+                run_memory_operation(pane, generation, &client, MemoryOperation::Delete(key)).await
             });
         }
         components::RootEffect::ReloadConfig => match context.config.reload() {
@@ -2154,39 +2013,18 @@ fn apply_pane_effect(
                 let theme = config.theme().clone();
                 let max_subagents = config.agent().max_subagents();
                 let preferred_reasoning_mode = config.agent().reasoning_mode();
-                let memory_enabled = config.memory().enabled();
-                let selected_memory_store =
-                    match crate::core::configured_memory_store(&config, context.workspace) {
-                        Ok(store) => store,
-                        Err(error) => {
-                            schedule(
-                                context.app.update(AppEvent::ConfigReloadFailed {
-                                    pane,
-                                    error: format!("Could not apply memory configuration: {error}"),
-                                }),
-                                context.scheduler,
-                            );
-                            return Ok(());
-                        }
-                    };
-                invalidate_memory_generations(context.memory_generations);
-                *context.memory_store = selected_memory_store;
                 context.app.set_max_subagents(max_subagents);
-                for runtime in context.panes.values() {
-                    runtime.subagent_control.set_max_concurrency(max_subagents);
-                }
                 *context.config = config;
                 let message = if workspace_changed {
-                    "Reloaded config · theme, UI, and memory browser applied · agent/auth/tool settings apply to new sessions · workspace requires restart"
+                    "Reloaded config · theme and UI applied · agent settings apply to new sessions · workspace requires restart"
                 } else {
-                    "Reloaded config · theme, UI, and memory browser applied · agent/auth/tool settings apply to new sessions"
+                    "Reloaded config · theme and UI applied · agent settings apply to new sessions"
                 };
                 schedule(
                     context.app.update(AppEvent::ConfigReloaded {
                         pane,
                         theme,
                         preferred_reasoning_mode,
-                        memory_enabled,
                         message: message.to_owned(),
                     }),
                     context.scheduler,
@@ -2205,7 +2043,7 @@ fn apply_pane_effect(
             let effort = context.config.agent().thinking();
             let reasoning_mode = context.config.agent().reasoning_mode();
             let config = context.config.clone();
-            *context.new_session_task = Some(tokio::task::spawn_blocking(move || {
+            *context.new_session_task = Some(tokio::spawn(async move {
                 let fast_mode = config.agent().fast_mode();
                 let configured = ConfiguredAgent::from_config_with_session(
                     &config,
@@ -2214,7 +2052,8 @@ fn apply_pane_effect(
                     Model::Sol,
                     None,
                     None,
-                );
+                )
+                .await;
                 (
                     pane,
                     effort,
@@ -2353,31 +2192,29 @@ fn apply_pane_effect(
                     session::load_transcript_async(config.path().to_path_buf(), session_id.clone());
                 let restored = async {
                     let (snapshot, records) = tokio::join!(checkpoint, transcript);
-                    let snapshot = snapshot.map_err(RuntimeError::SessionTask)??;
+                    let resume_state = snapshot.map_err(RuntimeError::SessionTask)??;
+                    let (snapshot, _, _) = resume_state.into_parts();
                     let records = records?;
-                    tokio::task::spawn_blocking(move || -> Result<_> {
-                        let reasoning_mode = session::reasoning_mode(&records);
-                        let model = session::model(&records);
-                        let next_sequence = session::next_sequence(&records);
-                        let projection = RootNode::project_session(effort, records);
-                        let configured = ConfiguredAgent::from_config_with_session(
-                            &config,
-                            effort,
-                            reasoning_mode,
-                            model,
-                            Some(&session_id),
-                            Some(snapshot),
-                        )?;
-                        Ok(RestoredSession {
-                            configured,
-                            projection,
-                            reasoning_mode,
-                            model,
-                            next_sequence,
-                        })
+                    let reasoning_mode = session::reasoning_mode(&records);
+                    let model = session::model(&records);
+                    let next_sequence = session::next_sequence(&records);
+                    let projection = RootNode::project_session(effort, records);
+                    let configured = ConfiguredAgent::from_config_with_session(
+                        &config,
+                        effort,
+                        reasoning_mode,
+                        model,
+                        Some(&session_id),
+                        Some(snapshot),
+                    )
+                    .await?;
+                    Ok(RestoredSession {
+                        configured,
+                        projection,
+                        reasoning_mode,
+                        model,
+                        next_sequence,
                     })
-                    .await
-                    .map_err(RuntimeError::SessionTask)?
                 }
                 .await;
                 (pane, effort, preferred_reasoning_mode, fast_mode, restored)
@@ -2430,10 +2267,6 @@ fn apply_pane_effect(
             );
         }
         components::RootEffect::CancelTurns => {
-            let runtime = context.panes.get(&pane).expect("cancelled pane must exist");
-            let subagents = runtime.subagent_control.clone();
-            let root_session_id = runtime.session_id.clone();
-            tokio::spawn(async move { subagents.cancel_all(&root_session_id).await });
             context
                 .commands
                 .send(WorkerCommand::CancelAll(pane))
@@ -2610,7 +2443,7 @@ async fn prepare_handoff(
     let effort = config.agent().thinking();
     let reasoning_mode = config.agent().reasoning_mode();
     let fast_mode = config.agent().fast_mode();
-    let task = tokio::task::spawn_blocking(move || {
+    let task = tokio::spawn(async move {
         ConfiguredAgent::from_config_with_session(
             &config,
             effort,
@@ -2619,6 +2452,7 @@ async fn prepare_handoff(
             None,
             None,
         )
+        .await
     });
     let configured = tokio::select! {
         result = task => result
@@ -2800,31 +2634,17 @@ fn request_render(request: RenderRequest, scheduler: &mut RenderScheduler) {
 #[cfg(test)]
 mod tests {
     use super::{
-        MemoryCompletion, MemoryOperation, PaneGeneration, PaneSession, PaneSettings,
-        PendingSubmission, close_pane_journal, copy_selection_with, invalidate_memory_generations,
-        is_image_paste, local_link_path, merge_recent_prompts, next_memory_generation, open_pane,
-        run_memory_operation, send_submission, subagent_pane, validate_interactive,
+        PendingSubmission, copy_selection_with, is_image_paste, local_link_path,
+        merge_recent_prompts, send_submission, validate_interactive,
     };
     use crate::{
-        app::{
-            config::{Config, ConfigOverrides, ReasoningEffort, ReasoningMode},
-            error::{Error, RuntimeError},
-        },
-        core::configured_memory_store,
+        app::error::{Error, RuntimeError},
         tui::{
-            components::RecentPromptDraft,
-            pane::PaneId,
-            session::{self, RecentPrompt},
-            subagent_updates::ForwardedSubagentUpdate,
-            transcript::{LocalEvent, TurnId},
+            components::RecentPromptDraft, pane::PaneId, session::RecentPrompt, transcript::TurnId,
             worker::WorkerCommand,
         },
     };
-    use nanocodex::Model;
-    use std::{cell::Cell, collections::HashMap, fs, path::Path, sync::Arc};
-    use tact_memory::{MemoryStore, SelectedMemoryStore};
-    use tact_subagents::{AgentId, AgentStatus, AgentUpdate};
-    use tempfile::tempdir;
+    use std::{cell::Cell, path::Path};
 
     #[test]
     fn control_or_super_v_requests_an_image_paste() {
@@ -2975,300 +2795,5 @@ mod tests {
                     && prompt.display_text()
                         == "<local_shell_result>done</local_shell_result>\n\nexplain it"
         ));
-    }
-
-    #[test]
-    fn disabled_memory_does_not_construct_or_open_the_database() {
-        let directory = tempdir().unwrap();
-        let config_path = directory.path().join("config.toml");
-        fs::write(&config_path, "").unwrap();
-        let config = Config::load(ConfigOverrides {
-            path: Some(config_path),
-            workspace: Some(directory.path().to_path_buf()),
-            ..ConfigOverrides::default()
-        })
-        .unwrap();
-        let memory_path = config.memory_path();
-
-        assert!(
-            configured_memory_store(&config, config.agent().workspace())
-                .unwrap()
-                .is_none()
-        );
-        assert!(!memory_path.exists());
-    }
-
-    #[test]
-    fn enabled_memory_constructs_the_global_store_without_eagerly_opening_it() {
-        let directory = tempdir().unwrap();
-        let config_path = directory.path().join("config.toml");
-        fs::write(&config_path, "[memory]\nenabled = true\n").unwrap();
-        let config = Config::load(ConfigOverrides {
-            path: Some(config_path),
-            workspace: Some(directory.path().to_path_buf()),
-            ..ConfigOverrides::default()
-        })
-        .unwrap();
-        let memory_path = config.memory_path();
-
-        assert!(
-            configured_memory_store(&config, config.agent().workspace())
-                .unwrap()
-                .is_some()
-        );
-        assert!(!memory_path.exists());
-    }
-
-    #[tokio::test]
-    async fn memory_list_inspection_does_not_change_use_telemetry() {
-        let directory = tempdir().unwrap();
-        let store = SelectedMemoryStore::local(directory.path().join("memory.sqlite3"));
-        store.put("inspect without using", None).await.unwrap();
-
-        let MemoryCompletion::Listed {
-            pane: PaneId::Fork(4),
-            result: Ok((access, records)),
-            ..
-        } = run_memory_operation(PaneId::Fork(4), 1, &store, MemoryOperation::List).await
-        else {
-            panic!("list should complete for the originating pane");
-        };
-
-        assert_eq!(access.source, tact_memory::MemorySource::Local);
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].scan_count, 0);
-        assert_eq!(records[0].last_scanned_at_ms, None);
-        assert_eq!(records[0].use_count, 0);
-        assert_eq!(records[0].last_used_at_ms, None);
-    }
-
-    #[test]
-    fn newer_memory_operations_supersede_older_pane_completions() {
-        let mut generations = HashMap::new();
-
-        assert_eq!(next_memory_generation(&mut generations, PaneId::Main), 1);
-        assert_eq!(next_memory_generation(&mut generations, PaneId::Fork(1)), 1);
-        assert_eq!(next_memory_generation(&mut generations, PaneId::Main), 2);
-        assert_eq!(generations[&PaneId::Main], 2);
-
-        invalidate_memory_generations(&mut generations);
-        assert_eq!(generations[&PaneId::Main], 3);
-        assert_eq!(generations[&PaneId::Fork(1)], 2);
-    }
-
-    #[tokio::test]
-    async fn stale_human_delete_is_reported_to_the_originating_pane() {
-        let directory = tempdir().unwrap();
-        let store = SelectedMemoryStore::local(directory.path().join("memory.sqlite3"));
-        let original = store.put("old value", None).await.unwrap();
-        store
-            .put("new value", Some(original.key.clone()))
-            .await
-            .unwrap();
-
-        let completion = run_memory_operation(
-            PaneId::Fork(9),
-            1,
-            &store,
-            MemoryOperation::Delete(original.key.clone()),
-        )
-        .await;
-
-        assert!(matches!(
-            completion,
-            MemoryCompletion::Deleted {
-                pane: PaneId::Fork(9),
-                key,
-                conflict: true,
-                result: Err(error),
-                ..
-            } if key == original.key && error.contains("changed since it was read")
-        ));
-    }
-
-    #[tokio::test]
-    async fn fork_pane_has_an_independent_session_and_persisted_transcript() {
-        let directory = tempdir().unwrap();
-        let config_path = directory.path().join("config.toml");
-        fs::write(&config_path, "").unwrap();
-        let config = Config::load(ConfigOverrides {
-            path: Some(config_path),
-            workspace: Some(directory.path().to_path_buf()),
-            ..ConfigOverrides::default()
-        })
-        .unwrap();
-        let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
-        let (subagent_control, _updates) = tact_subagents::Subagents::new(32);
-        let main = open_pane(
-            PaneGeneration {
-                pane: PaneId::Main,
-                generation: 0,
-            },
-            PaneSession::new("main-session", None, None, 1, false),
-            &config,
-            PaneSettings::new(
-                ReasoningEffort::Low,
-                ReasoningMode::Standard,
-                false,
-                Model::Luna,
-            ),
-            Arc::from("instructions"),
-            subagent_control.clone(),
-            &sender,
-        )
-        .unwrap();
-        let fork = open_pane(
-            PaneGeneration {
-                pane: PaneId::Fork(1),
-                generation: 0,
-            },
-            PaneSession::new("fork-session", Some("main-session"), Some(0), 1, false),
-            &config,
-            PaneSettings::new(
-                ReasoningEffort::Low,
-                ReasoningMode::Standard,
-                false,
-                Model::Luna,
-            ),
-            Arc::from("instructions"),
-            subagent_control.clone(),
-            &sender,
-        )
-        .unwrap();
-        let mut panes = HashMap::from([(PaneId::Main, main), (PaneId::Fork(1), fork)]);
-        let fork_update = ForwardedSubagentUpdate {
-            runtime_id: subagent_control.runtime_id(),
-            root_session_id: "fork-session".to_owned(),
-            update: AgentUpdate::Status {
-                id: AgentId::new(1),
-                status: AgentStatus::Closed,
-            },
-        };
-
-        assert_eq!(subagent_pane(&panes, &fork_update), Some(PaneId::Fork(1)));
-
-        let (other_control, _other_updates) = tact_subagents::Subagents::new(32);
-        let stale_update = ForwardedSubagentUpdate {
-            runtime_id: other_control.runtime_id(),
-            root_session_id: "fork-session".to_owned(),
-            update: AgentUpdate::Status {
-                id: AgentId::new(1),
-                status: AgentStatus::Closed,
-            },
-        };
-        assert_eq!(subagent_pane(&panes, &stale_update), None);
-
-        let mut main = panes.remove(&PaneId::Main).unwrap();
-        let mut fork = panes.remove(&PaneId::Fork(1)).unwrap();
-        let main_path = main.writer_path.clone();
-        fork.journal_mut()
-            .unwrap()
-            .append_local(LocalEvent::UserSubmitted {
-                id: TurnId::new(1),
-                text: "fork-only prompt".to_owned(),
-            })
-            .unwrap();
-
-        assert_eq!(main.session_id, "main-session");
-        assert_eq!(fork.session_id, "fork-session");
-        assert_eq!(main.writer_path, fork.writer_path);
-
-        drop(main.journal.take());
-        drop(fork.journal.take());
-        for _ in 0..2 {
-            completions.recv().await.unwrap().result.unwrap();
-        }
-        assert!(main_path.exists());
-        assert!(main.exit_session_id().is_none());
-        assert_eq!(fork.exit_session_id().as_deref(), Some("fork-session"));
-        let records = session::load_transcript(config.path(), "fork-session").unwrap();
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0].kind(), "session.started");
-        let started = records[0]
-            .decode_payload::<crate::tui::transcript::SessionStarted>()
-            .unwrap();
-        assert_eq!(started.parent_session_id.as_deref(), Some("main-session"));
-        assert_eq!(started.model, Model::Luna.to_string());
-        assert_eq!(records[1].kind(), "user.submitted");
-    }
-
-    #[tokio::test]
-    async fn replacing_a_pane_does_not_persist_the_new_session_until_it_has_transcript_items() {
-        let directory = tempdir().unwrap();
-        let config_path = directory.path().join("config.toml");
-        fs::write(&config_path, "").unwrap();
-        let config = Config::load(ConfigOverrides {
-            path: Some(config_path),
-            workspace: Some(directory.path().to_path_buf()),
-            ..ConfigOverrides::default()
-        })
-        .unwrap();
-        let (sender, mut completions) = tokio::sync::mpsc::unbounded_channel();
-        let (subagent_control, _updates) = tact_subagents::Subagents::new(32);
-        let mut old = open_pane(
-            PaneGeneration {
-                pane: PaneId::Main,
-                generation: 0,
-            },
-            PaneSession::new("old-session", None, None, 1, false),
-            &config,
-            PaneSettings::new(
-                ReasoningEffort::Medium,
-                ReasoningMode::Standard,
-                false,
-                Model::Sol,
-            ),
-            Arc::from("instructions"),
-            subagent_control.clone(),
-            &sender,
-        )
-        .unwrap();
-        old.journal_mut()
-            .unwrap()
-            .append_local(LocalEvent::UserSubmitted {
-                id: TurnId::new(1),
-                text: "old prompt".to_owned(),
-            })
-            .unwrap();
-
-        close_pane_journal(&mut old, super::SessionOutcome::Closed, None).unwrap();
-        let mut new = open_pane(
-            PaneGeneration {
-                pane: PaneId::Main,
-                generation: 1,
-            },
-            PaneSession::new("new-session", None, None, 1, false),
-            &config,
-            PaneSettings::new(
-                ReasoningEffort::Medium,
-                ReasoningMode::Standard,
-                false,
-                Model::Sol,
-            ),
-            Arc::from("instructions"),
-            subagent_control,
-            &sender,
-        )
-        .unwrap();
-        drop(new.journal.take());
-
-        for _ in 0..2 {
-            completions.recv().await.unwrap().result.unwrap();
-        }
-        let old_records = session::load_transcript(config.path(), "old-session").unwrap();
-
-        assert_eq!(old_records.last().unwrap().kind(), "session.ended");
-        let ended = old_records
-            .last()
-            .unwrap()
-            .decode_payload::<crate::tui::transcript::SessionEnded>()
-            .unwrap();
-        assert_eq!(ended.outcome, super::SessionOutcome::Closed);
-        assert!(
-            session::load_transcript(config.path(), "new-session")
-                .unwrap()
-                .is_empty()
-        );
-        assert!(new.exit_session_id().is_none());
     }
 }

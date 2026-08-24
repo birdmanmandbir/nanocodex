@@ -15,3 +15,11 @@ pub(crate) struct UpdateError;
 pub(crate) async fn check_for_update() -> Result<Option<Version>, UpdateError> {
     Ok(None)
 }
+
+pub(crate) async fn download_verified_release_artifact(
+    _version: &Version,
+    _archive_name: &str,
+    _max_archive_bytes: u64,
+) -> Result<tempfile::NamedTempFile, UpdateError> {
+    Err(UpdateError)
+}

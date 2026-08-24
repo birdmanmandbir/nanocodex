@@ -161,6 +161,65 @@ impl ManagedClient {
         Ok(())
     }
 
+    pub(crate) async fn find_sessions(
+        &self,
+        request: &FindSessionsRequest,
+    ) -> Result<FindSessionsResponse, ManagedError> {
+        request.validate()?;
+        let body = serde_json::to_vec(request)
+            .map_err(|_| ManagedError::InvalidResponse("failed to encode session search"))?;
+        self.json(
+            Method::POST,
+            "/v1/history/sessions/search",
+            Some(&body),
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn read_session(
+        &self,
+        request: &ReadSessionRequest,
+    ) -> Result<ReadSessionResponse, ManagedError> {
+        request.validate()?;
+        let body = serde_json::to_vec(&ReadSessionBody {
+            turn_ids: request.turn_ids.as_deref(),
+        })
+        .map_err(|_| ManagedError::InvalidResponse("failed to encode session read"))?;
+        self.json(
+            Method::POST,
+            &format!("/v1/history/sessions/{}/read", request.session_id),
+            Some(&body),
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn list_memories(&self) -> Result<Vec<MemoryRecord>, ManagedError> {
+        let response: MemoryListResponse = self.json(Method::GET, "/v1/memory", None, None).await?;
+        for memory in &response.memories {
+            memory.key.validate()?;
+        }
+        Ok(response.memories)
+    }
+
+    pub(crate) async fn delete_memory(&self, key: MemoryKey) -> Result<(), ManagedError> {
+        key.validate()?;
+        let mut url = self.url(&format!("/v1/memory/{}", key.id))?;
+        url.query_pairs_mut()
+            .append_pair("version", &key.version.to_string());
+        let response = self
+            .http
+            .delete(url)
+            .send()
+            .await
+            .map_err(ManagedError::Transport)?;
+        if !response.status().is_success() {
+            return Err(response_error(response).await);
+        }
+        Ok(())
+    }
+
     pub(crate) async fn history(
         &self,
         agent_id: &str,
@@ -447,6 +506,150 @@ pub(crate) struct AgentSummary {
     pub(crate) created_at: f64,
     pub(crate) updated_at: f64,
     pub(crate) turn_count: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct FindSessionsRequest {
+    pub(crate) query: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) limit: Option<u8>,
+}
+
+impl FindSessionsRequest {
+    fn validate(&self) -> Result<(), ManagedError> {
+        if self.query.trim().is_empty() || self.query.len() > 4_096 {
+            return Err(ManagedError::Configuration(
+                "managed history query must contain 1-4096 UTF-8 bytes".to_owned(),
+            ));
+        }
+        if self.limit.is_some_and(|limit| !(1..=20).contains(&limit)) {
+            return Err(ManagedError::Configuration(
+                "managed history limit must be from 1 through 20".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ReadSessionRequest {
+    pub(crate) session_id: String,
+    pub(crate) turn_ids: Option<Vec<String>>,
+}
+
+impl ReadSessionRequest {
+    fn validate(&self) -> Result<(), ManagedError> {
+        let session_id = uuid::Uuid::parse_str(&self.session_id).map_err(|_| {
+            ManagedError::Configuration("managed history session id must be a UUIDv7".to_owned())
+        })?;
+        if session_id.get_version_num() != 7 {
+            return Err(ManagedError::Configuration(
+                "managed history session id must be a UUIDv7".to_owned(),
+            ));
+        }
+        if self.turn_ids.as_ref().is_some_and(|ids| ids.len() > 20) {
+            return Err(ManagedError::Configuration(
+                "managed history turn ids must contain at most 20 entries".to_owned(),
+            ));
+        }
+        for turn_id in self.turn_ids.iter().flatten() {
+            validate_id("turn", turn_id)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize)]
+struct ReadSessionBody<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    turn_ids: Option<&'a [String]>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct HistorySource {
+    pub(crate) turn_id: String,
+    pub(crate) cursor: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct HistoryCitation {
+    pub(crate) thread_id: String,
+    pub(crate) title: String,
+    pub(crate) sources: Vec<HistorySource>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct SessionSearchHit {
+    pub(crate) session_id: String,
+    pub(crate) title: String,
+    pub(crate) turn_id: String,
+    pub(crate) cursor: String,
+    pub(crate) score: f64,
+    pub(crate) snippet: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct FindSessionsResponse {
+    pub(crate) query: String,
+    pub(crate) results: Vec<SessionSearchHit>,
+    pub(crate) citations: Vec<HistoryCitation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct SessionTurn {
+    pub(crate) session_id: String,
+    pub(crate) title: String,
+    pub(crate) turn_id: String,
+    pub(crate) cursor: String,
+    pub(crate) user: String,
+    pub(crate) assistant: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ReadSessionResponse {
+    pub(crate) turns: Vec<SessionTurn>,
+    pub(crate) citations: Vec<HistoryCitation>,
+}
+
+const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub(crate) struct MemoryKey {
+    pub(crate) id: u64,
+    pub(crate) version: u64,
+}
+
+impl MemoryKey {
+    fn validate(self) -> Result<(), ManagedError> {
+        if self.id == 0
+            || self.version == 0
+            || self.id > MAX_SAFE_INTEGER
+            || self.version > MAX_SAFE_INTEGER
+        {
+            return Err(ManagedError::Configuration(
+                "managed memory id and version must be positive safe integers".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct MemoryRecord {
+    pub(crate) key: MemoryKey,
+    pub(crate) content: String,
+    pub(crate) created_at_ms: i64,
+    pub(crate) updated_at_ms: i64,
+    pub(crate) last_scanned_at_ms: Option<i64>,
+    pub(crate) scan_count: u64,
+    pub(crate) last_used_at_ms: Option<i64>,
+    pub(crate) use_count: u64,
+    pub(crate) probation_until_ms: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct MemoryListResponse {
+    memories: Vec<MemoryRecord>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -901,7 +1104,8 @@ mod tests {
     };
 
     use super::{
-        ApiKey, EventCursor, ManagedClient, ManagedEventData, parse_sse_frame, valid_api_key,
+        ApiKey, EventCursor, FindSessionsRequest, ManagedClient, ManagedEventData, MemoryKey,
+        ReadSessionRequest, parse_sse_frame, valid_api_key,
     };
 
     fn key() -> String {
@@ -945,6 +1149,57 @@ mod tests {
         let mut cursor = EventCursor::parse("9").unwrap();
         assert!(cursor.observe("10".to_owned()).unwrap());
         assert!(!cursor.observe("2".to_owned()).unwrap());
+    }
+
+    #[test]
+    fn validates_account_history_requests_before_network_io() {
+        assert!(
+            FindSessionsRequest {
+                query: " ".to_owned(),
+                limit: None,
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            FindSessionsRequest {
+                query: "memory".to_owned(),
+                limit: Some(21),
+            }
+            .validate()
+            .is_err()
+        );
+        let session_id = uuid::Uuid::now_v7().to_string();
+        assert!(
+            ReadSessionRequest {
+                session_id,
+                turn_ids: Some(vec!["turn-1".to_owned(); 20]),
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            ReadSessionRequest {
+                session_id: uuid::Uuid::new_v4().to_string(),
+                turn_ids: None,
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn memory_keys_must_be_positive_safe_integers() {
+        assert!(MemoryKey { id: 1, version: 1 }.validate().is_ok());
+        assert!(MemoryKey { id: 0, version: 1 }.validate().is_err());
+        assert!(
+            MemoryKey {
+                id: 9_007_199_254_740_992,
+                version: 1,
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]

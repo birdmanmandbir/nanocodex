@@ -1,7 +1,6 @@
 // Modified from clabby/tact@a2de8ae1e0b6ce8d8f0a251a9d681dc430b247aa for Nanocodex2.
 // SPDX-License-Identifier: Apache-2.0
 
-
 //! Root layout and component event routing.
 
 use super::{
@@ -31,6 +30,7 @@ use super::{
 };
 use crate::{
     app::config::{ReasoningEffort, ReasoningMode},
+    client::{MemoryKey, MemoryRecord},
     core::extensions::Skill,
     tui::{
         context::ContextDiagnostics,
@@ -40,8 +40,11 @@ use crate::{
         transcript::TranscriptRecord,
     },
 };
-use crossterm_tact::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
+use crossterm_tact::event::{
+    Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+};
 use nanocodex::Model;
+use nanocodex_subagents::{AgentId, AgentStatus, AgentUpdate, MessageSender};
 use ratatui_tact::{
     Frame,
     layout::{Position, Rect},
@@ -55,8 +58,6 @@ use std::{
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tact_memory::{MemoryAccess, MemoryKey, MemoryRecord, MemorySource};
-use tact_subagents::{AgentId, AgentStatus, AgentUpdate, MessageSender};
 
 const KEY_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(2);
 const SELECTION_SCROLL_INTERVAL: Duration = Duration::from_millis(60);
@@ -171,12 +172,9 @@ pub(crate) enum RootEvent {
     RecentPromptLoadFailed(String),
     SessionLoadFailed(String),
     MemoriesLoaded {
-        access: MemoryAccess,
         records: Vec<MemoryRecord>,
     },
     MemoryLoadFailed {
-        source: MemorySource,
-        access: Option<MemoryAccess>,
         error: String,
     },
     MemoryDeleted {
@@ -385,7 +383,7 @@ impl RootNode {
             review_url: None,
             fork_available: true,
             skills: Arc::from([]),
-            memory_enabled: false,
+            memory_enabled: true,
             interactive: true,
             theme_mode: ThemeMode::Auto,
             preferred_reasoning_mode: ReasoningMode::Standard,
@@ -2677,18 +2675,12 @@ impl Component for RootNode {
             } => self.recent_prompts_loaded(session_id, prompts),
             RootEvent::RecentPromptLoadFailed(message) => self.recent_prompt_load_failed(message),
             RootEvent::SessionLoadFailed(message) => self.session_load_failed(message),
-            RootEvent::MemoriesLoaded { access, records } => {
-                self.update_memory(MemoryBrowserEvent::Loaded { access, records })
+            RootEvent::MemoriesLoaded { records } => {
+                self.update_memory(MemoryBrowserEvent::Loaded { records })
             }
-            RootEvent::MemoryLoadFailed {
-                source,
-                access,
-                error,
-            } => self.update_memory(MemoryBrowserEvent::LoadFailed {
-                source,
-                access,
-                error,
-            }),
+            RootEvent::MemoryLoadFailed { error } => {
+                self.update_memory(MemoryBrowserEvent::LoadFailed { error })
+            }
             RootEvent::MemoryDeleted { key } => {
                 self.update_memory(MemoryBrowserEvent::Deleted { key })
             }
@@ -3056,6 +3048,7 @@ mod tests {
     };
     use crate::{
         app::config::{ReasoningEffort, ReasoningMode},
+        client::{MemoryKey, MemoryRecord},
         core::extensions::Skill,
         tui::{
             session::{RecentPrompt, SessionSummary},
@@ -3074,6 +3067,9 @@ mod tests {
             input::{PromptInput, UserInput},
         },
     };
+    use nanocodex_subagents::{
+        AgentDescriptor, AgentId, AgentMessageUpdate, AgentStatus, AgentUpdate,
+    };
     use ratatui_tact::{
         Terminal,
         backend::TestBackend,
@@ -3088,24 +3084,18 @@ mod tests {
         sync::Arc,
         time::{Duration, Instant},
     };
-    use tact_memory::{MemoryAccess, MemoryKey, MemoryRecord, MemorySource};
-    use tact_subagents::{AgentDescriptor, AgentId, AgentMessageUpdate, AgentStatus, AgentUpdate};
-
-    fn local_memory_access() -> MemoryAccess {
-        MemoryAccess {
-            source: MemorySource::Local,
-            namespace: None,
-            role: None,
-        }
-    }
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> super::RootEvent {
         super::RootEvent::Terminal(Event::Key(KeyEvent::new(code, modifiers)))
     }
 
-    fn memory_record(id: i64, version: u64, content: &str) -> MemoryRecord {
+    fn agent_id(value: u64) -> AgentId {
+        serde_json::from_value(json!(value)).unwrap()
+    }
+
+    fn memory_record(id: u64, version: u64, content: &str) -> MemoryRecord {
         MemoryRecord {
-            key: MemoryKey::local(id, version),
+            key: MemoryKey { id, version },
             content: content.to_owned(),
             created_at_ms: 0,
             updated_at_ms: 0,
@@ -3368,9 +3358,8 @@ mod tests {
         root.overlay = None;
         root.update(super::RootEvent::Subagent(AgentUpdate::Added(
             AgentDescriptor {
-                id: AgentId::new(1),
+                id: agent_id(1),
                 session_id: "child".to_owned(),
-                model: Model::Sol,
                 role: "worker".to_owned(),
                 task: "work".to_owned(),
                 parent: None,
@@ -3396,9 +3385,8 @@ mod tests {
     fn root_messages_render_once_in_main_and_are_projected_into_child_transcripts() {
         let mut root = RootNode::new(Path::new("/work"), ReasoningEffort::Medium);
         root.update(RootEvent::Subagent(AgentUpdate::Added(AgentDescriptor {
-            id: AgentId::new(1),
+            id: agent_id(1),
             session_id: "child".to_owned(),
-            model: Model::Sol,
             role: "worker".to_owned(),
             task: "verify ordering".to_owned(),
             parent: None,
@@ -3456,7 +3444,7 @@ mod tests {
         child
             .draw(|frame| {
                 root.subagents.render_transcript(
-                    AgentId::new(1),
+                    agent_id(1),
                     frame,
                     frame.area(),
                     &Theme::default(),
@@ -3483,9 +3471,8 @@ mod tests {
         let mut root = RootNode::new(Path::new("/work"), ReasoningEffort::Medium);
         for (id, role) in [(1, "sender"), (2, "recipient")] {
             root.update(RootEvent::Subagent(AgentUpdate::Added(AgentDescriptor {
-                id: AgentId::new(id),
+                id: agent_id(id),
                 session_id: format!("child-{id}"),
-                model: Model::Sol,
                 role: role.to_owned(),
                 task: "coordinate with a peer".to_owned(),
                 parent: None,
@@ -3526,16 +3513,15 @@ mod tests {
         let mut root = RootNode::new(Path::new("/work"), ReasoningEffort::Medium);
         root.update(super::RootEvent::Subagent(AgentUpdate::Added(
             AgentDescriptor {
-                id: AgentId::new(1),
+                id: agent_id(1),
                 session_id: "child".to_owned(),
-                model: Model::Sol,
                 role: "worker".to_owned(),
                 task: "work".to_owned(),
                 parent: None,
             },
         )));
         root.update(super::RootEvent::Subagent(AgentUpdate::Status {
-            id: AgentId::new(1),
+            id: agent_id(1),
             status: AgentStatus::Completed {
                 output: json!({ "report": "done" }),
             },
@@ -3560,9 +3546,8 @@ mod tests {
         let mut root = RootNode::new(Path::new("/work"), ReasoningEffort::Medium);
         root.update(super::RootEvent::Subagent(AgentUpdate::Added(
             AgentDescriptor {
-                id: AgentId::new(1),
+                id: agent_id(1),
                 session_id: "child".to_owned(),
-                model: Model::Sol,
                 role: "worker".to_owned(),
                 task: "inspect the queue".to_owned(),
                 parent: None,
@@ -3570,7 +3555,7 @@ mod tests {
         )));
 
         let update = root.update(super::RootEvent::Subagent(AgentUpdate::Status {
-            id: AgentId::new(1),
+            id: agent_id(1),
             status: AgentStatus::Completed {
                 output: json!({ "report": "queue is sound" }),
             },
@@ -3592,9 +3577,8 @@ mod tests {
         root.in_flight_turns = 1;
         root.update(super::RootEvent::Subagent(AgentUpdate::Added(
             AgentDescriptor {
-                id: AgentId::new(1),
+                id: agent_id(1),
                 session_id: "child".to_owned(),
-                model: Model::Sol,
                 role: "worker".to_owned(),
                 task: "inspect the queue".to_owned(),
                 parent: None,
@@ -3602,7 +3586,7 @@ mod tests {
         )));
 
         let update = root.update(super::RootEvent::Subagent(AgentUpdate::Status {
-            id: AgentId::new(1),
+            id: agent_id(1),
             status: AgentStatus::Completed {
                 output: json!({ "report": "queue is sound" }),
             },
@@ -3617,17 +3601,16 @@ mod tests {
         let mut root = RootNode::new(Path::new("/work"), ReasoningEffort::Medium);
         root.update(super::RootEvent::Subagent(AgentUpdate::Added(
             AgentDescriptor {
-                id: AgentId::new(2),
+                id: agent_id(2),
                 session_id: "grandchild".to_owned(),
-                model: Model::Sol,
                 role: "worker".to_owned(),
                 task: "inspect the queue".to_owned(),
-                parent: Some(AgentId::new(1)),
+                parent: Some(agent_id(1)),
             },
         )));
 
         let update = root.update(super::RootEvent::Subagent(AgentUpdate::Status {
-            id: AgentId::new(2),
+            id: agent_id(2),
             status: AgentStatus::Completed {
                 output: json!({ "report": "queue is sound" }),
             },
@@ -6018,7 +6001,6 @@ mod tests {
         assert!(root.composer().draft().is_empty());
 
         root.update(RootEvent::MemoriesLoaded {
-            access: local_memory_access(),
             records: vec![memory_record(7, 3, "remember this")],
         });
         let inspected = root.update(key(KeyCode::Enter, KeyModifiers::NONE));
@@ -6029,14 +6011,14 @@ mod tests {
         let deleted = root.update(key(KeyCode::Delete, KeyModifiers::NONE));
         assert_eq!(
             deleted.effects,
-            [RootEffect::DeleteMemory(MemoryKey::local(7, 3))]
+            [RootEffect::DeleteMemory(MemoryKey { id: 7, version: 3 })]
         );
         assert!(root.composer().draft().is_empty());
 
         root.update(RootEvent::MemoryDeleted {
-            key: MemoryKey::local(7, 3),
+            key: MemoryKey { id: 7, version: 3 },
         });
-        assert!(render_root_text(&mut root, 80, 20).contains("Local memory is empty"));
+        assert!(render_root_text(&mut root, 80, 20).contains("Account memory is empty"));
     }
 
     #[test]
@@ -6053,16 +6035,13 @@ mod tests {
 
         for event in [
             RootEvent::MemoriesLoaded {
-                access: local_memory_access(),
                 records: vec![memory_record(1, 1, "stale")],
             },
             RootEvent::MemoryLoadFailed {
-                source: MemorySource::Local,
-                access: None,
                 error: "stale load".to_owned(),
             },
             RootEvent::MemoryDeleted {
-                key: MemoryKey::local(1, 1),
+                key: MemoryKey { id: 1, version: 1 },
             },
             RootEvent::MemoryDeleteFailed {
                 error: "stale delete".to_owned(),
