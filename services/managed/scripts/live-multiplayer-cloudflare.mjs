@@ -182,6 +182,7 @@ try {
       auth_mode: authMode,
       managed_origin: origin,
       load: loadResult,
+      load_account_attempts: loadAccount.bootstrapAttempts,
       credential_boundary: "account-key-client/private-provider-broker",
       cleanup: "disposable rooms, account key, managed Worker, and broker Worker deleted",
     };
@@ -499,10 +500,23 @@ async function boundedJson(response, limit) {
 }
 
 async function createLoadAccount(origin) {
-  const session = await fetch(`${origin}/v1/me`, {
-    signal: AbortSignal.any([lifecycleAbort.signal, AbortSignal.timeout(10_000)]),
-  });
-  if (!session.ok) throw new Error(`load account bootstrap returned HTTP ${session.status}`);
+  let session;
+  let bootstrapAttempts = 0;
+  let bootstrapFailure;
+  while (bootstrapAttempts < 5) {
+    bootstrapAttempts += 1;
+    session = await fetch(`${origin}/v1/me`, {
+      signal: AbortSignal.any([lifecycleAbort.signal, AbortSignal.timeout(10_000)]),
+    });
+    if (session.ok) break;
+    const body = await boundedJson(session, 4 * 1024);
+    bootstrapFailure = `HTTP ${session.status}: ${JSON.stringify(body)}`;
+    if (!retryableBootstrapStatus(session.status) || bootstrapAttempts === 5) {
+      throw new Error(`load account bootstrap returned ${bootstrapFailure}`);
+    }
+    await delay(250 * (2 ** (bootstrapAttempts - 1)), lifecycleAbort.signal);
+  }
+  if (!session?.ok) throw new Error(`load account bootstrap failed: ${bootstrapFailure}`);
   await session.body?.cancel();
   const cookie = session.headers.get("set-cookie")?.split(";", 1)[0];
   if (!cookie || /[\r\n]/.test(cookie)) throw new Error("load account bootstrap omitted its session cookie");
@@ -540,7 +554,11 @@ async function createLoadAccount(origin) {
     || typeof body?.key?.id !== "string") {
     throw new Error(`load API-key creation returned HTTP ${created.status}`);
   }
-  return { apiKey: body.api_key, cookie, keyId: body.key.id, origin };
+  return { apiKey: body.api_key, bootstrapAttempts, cookie, keyId: body.key.id, origin };
+}
+
+function retryableBootstrapStatus(status) {
+  return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
 }
 
 async function revokeLoadAccountKey(account) {
