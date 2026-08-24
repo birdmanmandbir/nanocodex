@@ -12,6 +12,9 @@ use super::protocol::{MemberId, ProtocolError, RoomId, valid_token, validated_di
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const TRANSPORT_ATTEMPTS: usize = 3;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const DELETE_ATTEMPTS: usize = 3;
+const DELETE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const DELETE_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 pub(crate) struct AccountKey(String);
 
@@ -22,7 +25,13 @@ impl AccountKey {
                 "NANOCODEX_API_KEY must be an ncx_live account API key".to_owned(),
             ));
         };
-        let Some((id, secret)) = rest.split_once('_') else {
+        if rest.len() != 12 + 1 + 43 || !rest.is_ascii() {
+            return Err(RoomError::Configuration(
+                "NANOCODEX_API_KEY must be an ncx_live account API key".to_owned(),
+            ));
+        }
+        let (id, separator_and_secret) = rest.split_at(12);
+        let Some(secret) = separator_and_secret.strip_prefix('_') else {
             return Err(RoomError::Configuration(
                 "NANOCODEX_API_KEY must be an ncx_live account API key".to_owned(),
             ));
@@ -173,6 +182,36 @@ impl RoomApi {
                 websocket_url,
             },
         })
+    }
+
+    /// Deletes an account-owned room without exposing its owner capability.
+    ///
+    /// Deletion is settled by either 204 or 404. A 503 means durable child
+    /// cleanup is still pending, so it is retried a small, bounded number of
+    /// times; other HTTP and transport failures remain typed for the caller.
+    pub(crate) async fn delete_owned_room(&self, room_id: &RoomId) -> Result<(), RoomError> {
+        let Some(http) = self.account_http.as_ref() else {
+            return Err(RoomError::AuthenticationRequired);
+        };
+        let url = self.route(&format!("v1/rooms/{room_id}"))?;
+        for attempt in 0..DELETE_ATTEMPTS {
+            let response = http
+                .delete(url.clone())
+                .timeout(DELETE_REQUEST_TIMEOUT)
+                .send()
+                .await
+                .map_err(RoomError::Transport)?;
+            match response.status() {
+                StatusCode::NO_CONTENT | StatusCode::NOT_FOUND => return Ok(()),
+                StatusCode::SERVICE_UNAVAILABLE if attempt + 1 < DELETE_ATTEMPTS => {
+                    tokio::time::sleep(DELETE_RETRY_DELAY * (attempt as u32 + 1)).await;
+                }
+                _ => return Err(response_error(response).await),
+            }
+        }
+        Err(RoomError::InvalidReceipt(
+            "room deletion exhausted its bounded retry policy",
+        ))
     }
 
     fn route(&self, path: &str) -> Result<Url, RoomError> {
@@ -717,10 +756,20 @@ pub(crate) enum RoomError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use axum::{
+        Json, Router, extract::State, http::HeaderMap as AxumHeaderMap, response::IntoResponse,
+        routing::delete,
+    };
     use reqwest::header::{HeaderMap, HeaderValue, SET_COOKIE};
+    use serde_json::json;
 
     use super::super::protocol::RoomId;
-    use super::{AccountKey, MembershipCookie, RoomInvitation};
+    use super::{AccountKey, MembershipCookie, RoomApi, RoomInvitation};
 
     const ROOM: &str =
         "0198d214-0d9d-7a45-8a89-123456789abc~AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -752,6 +801,12 @@ mod tests {
     }
 
     #[test]
+    fn account_key_id_may_contain_base64url_underscore() {
+        let key = AccountKey::parse(format!("ncx_live_{}_{}", "abc_defghijk", "b".repeat(43)));
+        assert!(key.is_ok());
+    }
+
+    #[test]
     fn parses_fragment_only_invitation() {
         let encoded = format!("https://managed.example/multiplayer?room={ROOM}#invite={INVITE}");
         let invitation = RoomInvitation::parse(encoded).unwrap();
@@ -778,5 +833,66 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn owner_delete_retries_bounded_cleanup_pending_and_settles() {
+        crate::install_tls_provider();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/v1/rooms/{room_id}", delete(delete_room))
+            .with_state(Arc::clone(&attempts));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let api = RoomApi::authenticated(
+            format!("http://{address}").parse().unwrap(),
+            AccountKey::parse(format!("ncx_live_{}_{}", "a".repeat(12), "b".repeat(43))).unwrap(),
+        )
+        .unwrap();
+
+        api.delete_owned_room(&RoomId::parse(ROOM).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn owner_delete_treats_absent_room_as_settled() {
+        crate::install_tls_provider();
+        let app = Router::new().route(
+            "/v1/rooms/{room_id}",
+            delete(|| async { axum::http::StatusCode::NOT_FOUND }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let api = RoomApi::authenticated(
+            format!("http://{address}").parse().unwrap(),
+            AccountKey::parse(format!("ncx_live_{}_{}", "a".repeat(12), "b".repeat(43))).unwrap(),
+        )
+        .unwrap();
+
+        api.delete_owned_room(&RoomId::parse(ROOM).unwrap())
+            .await
+            .unwrap();
+        server.abort();
+    }
+
+    async fn delete_room(
+        State(attempts): State<Arc<AtomicUsize>>,
+        headers: AxumHeaderMap,
+    ) -> impl IntoResponse {
+        assert!(headers.contains_key(axum::http::header::AUTHORIZATION));
+        if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "agent_cleanup_pending"})),
+            )
+                .into_response()
+        } else {
+            axum::http::StatusCode::NO_CONTENT.into_response()
+        }
     }
 }

@@ -4,6 +4,7 @@ mod app;
 mod client;
 mod core;
 mod engine;
+mod load;
 mod review;
 mod room;
 mod tui;
@@ -12,10 +13,12 @@ use std::{
     env,
     io::{self, Write},
     process::ExitCode,
+    time::Duration,
 };
 
 use clap::{Args, Parser, Subcommand, builder::NonEmptyStringValueParser};
 use client::{ApiKey, EventCursor, ManagedClient, ManagedError, ManagedEventData, PromptInput};
+use load::{ConnectReplayBehavior, SaturationConfig};
 use room::{
     AccountKey, RoomApi, RoomConnection, RoomCursor, RoomError, RoomEventMessage, RoomEvents,
     RoomInvitation, RoomServerMessage, RoomTarget,
@@ -66,6 +69,30 @@ enum Command {
     Cancel(TurnId),
     /// Create or join a shared managed-agent room.
     Room(Room),
+    /// Run a bounded, cleanup-owning managed-room saturation wave.
+    Load(Load),
+}
+
+#[derive(Args)]
+struct Load {
+    /// Independent rooms created concurrently (1 through 8).
+    #[arg(long, default_value_t = 1)]
+    rooms: usize,
+    /// Anonymous invited members per room (1 through 15).
+    #[arg(long, default_value_t = 1)]
+    guests_per_room: usize,
+    /// Durable room messages sent by each guest (0 through 8).
+    #[arg(long, default_value_t = 1)]
+    messages_per_guest: usize,
+    /// Hosted agent prompts sent in each room (0 through 4).
+    #[arg(long, default_value_t = 0)]
+    agent_prompts_per_room: usize,
+    /// Reconnect every member at cursor zero and verify complete replay.
+    #[arg(long)]
+    replay: bool,
+    /// Hard wall-clock deadline, including cleanup (30 through 900 seconds).
+    #[arg(long, default_value_t = 60)]
+    max_seconds: u64,
 }
 
 #[derive(Args)]
@@ -186,6 +213,9 @@ async fn run(cli: Cli) -> Result<(), ManagedError> {
     if let Command::Room(command) = command {
         return run_room(command).await.map_err(room_error);
     }
+    if let Command::Load(command) = command {
+        return run_load(command).await;
+    }
     let client = client_from_environment()?;
     match command {
         Command::New => write_json(&client.create().await?),
@@ -217,6 +247,7 @@ async fn run(cli: Cli) -> Result<(), ManagedError> {
             write_json(&client.cancel(&command.agent_id, &command.turn_id).await?)
         }
         Command::Room(_) => unreachable!("room command returned before managed-agent dispatch"),
+        Command::Load(_) => unreachable!("load command returned before managed-agent dispatch"),
     }
 }
 
@@ -240,6 +271,32 @@ fn managed_url_from_environment() -> Result<Url, ManagedError> {
         ManagedError::Configuration(format!("{MANAGED_URL_ENV} is not a valid URL"))
     })?;
     Ok(base_url)
+}
+
+async fn run_load(command: Load) -> Result<(), ManagedError> {
+    let managed_url = managed_url_from_environment()?;
+    let account_key = env::var(API_KEY_ENV).map_err(|_| {
+        ManagedError::Configuration(format!(
+            "{API_KEY_ENV} must be set to run managed-room saturation"
+        ))
+    })?;
+    let summary = load::run_saturation(SaturationConfig {
+        managed_url,
+        account_key: AccountKey::parse(account_key).map_err(room_error)?,
+        rooms: command.rooms,
+        guests_per_room: command.guests_per_room,
+        messages_per_guest: command.messages_per_guest,
+        agent_prompts_per_room: command.agent_prompts_per_room,
+        connect_replay: if command.replay {
+            ConnectReplayBehavior::ReconnectAllFromZero
+        } else {
+            ConnectReplayBehavior::LiveOnly
+        },
+        max_wall_time: Duration::from_secs(command.max_seconds),
+    })
+    .await
+    .map_err(|error| ManagedError::Configuration(error.to_string()))?;
+    write_json(&summary)
 }
 
 async fn run_room(command: Room) -> Result<(), RoomError> {
