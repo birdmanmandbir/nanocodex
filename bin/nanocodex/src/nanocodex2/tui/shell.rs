@@ -268,7 +268,7 @@ mod tests {
             Duration::from_secs(5),
             execute(
                 ShellId::new(2),
-                "(sleep 10) & printf done".to_owned(),
+                "sleep 10 & printf done".to_owned(),
                 workspace.path().to_path_buf(),
             ),
         )

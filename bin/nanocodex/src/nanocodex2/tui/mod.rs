@@ -2768,7 +2768,11 @@ mod tests {
             error,
             Error::Runtime(RuntimeError::InteractiveTerminal)
         ));
-        assert!(error.to_string().contains("tact run <PROMPT>"));
+        assert!(
+            error
+                .to_string()
+                .contains("use a Nanocodex2 headless command for JSONL output")
+        );
     }
 
     #[test]

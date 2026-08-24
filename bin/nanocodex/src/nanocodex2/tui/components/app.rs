@@ -1385,7 +1385,7 @@ mod tests {
             pane: PaneId::Main,
             theme: Theme::default(),
             preferred_reasoning_mode: ReasoningMode::Standard,
-            message: "enabled memory".to_owned(),
+            message: "first reload".to_owned(),
         });
         for pane in [PaneId::Main, PaneId::Fork(1)] {
             assert!(matches!(
@@ -1395,13 +1395,17 @@ mod tests {
                     effect: super::RootEffect::LoadMemories,
                 }] if *effect_pane == pane
             ));
+            app.update(AppEvent::Terminal(Event::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            ))));
         }
 
         app.update(AppEvent::ConfigReloaded {
             pane: PaneId::Main,
             theme: Theme::default(),
             preferred_reasoning_mode: ReasoningMode::Standard,
-            message: "disabled memory".to_owned(),
+            message: "second reload".to_owned(),
         });
         for pane in [PaneId::Main, PaneId::Fork(1)] {
             assert!(matches!(

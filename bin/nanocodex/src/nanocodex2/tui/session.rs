@@ -403,7 +403,6 @@ mod tests {
     };
     use nanocodex::Model;
     use rusqlite::Connection;
-    use serde_json::Value;
     use std::sync::Arc;
     use tempfile::tempdir;
 
@@ -711,10 +710,9 @@ mod tests {
         save_checkpoint(&config, "session", &snapshot("second"), "second", true).unwrap();
 
         let restored = load_checkpoint(&config, "session").unwrap();
-        let (snapshot, instructions, catalog) = restored.into_parts();
-        let snapshot = serde_json::to_value(snapshot).unwrap();
+        let (actual, instructions, catalog) = restored.into_parts();
 
-        assert_eq!(snapshot["lineage_id"], Value::String("second".to_owned()));
+        assert_eq!(actual, snapshot("second"));
         assert_eq!(instructions, "second");
         assert_eq!(catalog, Some(true));
     }
