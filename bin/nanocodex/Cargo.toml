@@ -6,7 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 authors.workspace = true
-license.workspace = true
+license = "Apache-2.0"
 homepage.workspace = true
 repository.workspace = true
 description = "Daily-driver TUI and headless JSONL adapter for Nanocodex"
@@ -104,6 +104,10 @@ harness = false
 [[test]]
 name = "tui_split"
 path = "tests/tui_split.rs"
+
+[[test]]
+name = "nanocodex2_managed"
+path = "tests/nanocodex2_managed.rs"
 
 [[bin]]
 name = "nanocodex"
