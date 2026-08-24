@@ -44,16 +44,16 @@ product contract.
 - [x] Import the account-scoped managed history search and canonical
   Rust-backed subagent implementation from the supplied
   `nanocodex-memory-search` working slice.
-- [ ] Finish slice 1 with the shared replayable subscriber/cache layer and a
+- [x] Finish slice 1 with the shared replayable subscriber/cache layer and a
   real managed-agent detach/resume smoke.
-- [ ] Finish adapting the pinned Tact TUI to the managed lifecycle.
-- [ ] Prove two independent Nanocodex2 processes can create/join one managed
+- [x] Finish adapting the pinned Tact TUI to the managed lifecycle.
+- [x] Prove two independent Nanocodex2 processes can create/join one managed
   room, exchange replayable messages, and address the room's private managed
   agent without sharing account or provider credentials.
-- [ ] Saturate the managed-agent and multiplayer Durable Object paths with a
+- [x] Saturate the managed-agent and multiplayer Durable Object paths with a
   bounded Rust harness, fix each owning bottleneck, and rerun the affected ramp.
-- [ ] Close every missing managed capability required by a visible Tact flow.
-- [ ] Pass the PTY parity, representative replay, performance, and release
+- [x] Close every missing managed capability required by a visible Tact flow.
+- [x] Pass the PTY parity, representative replay, performance, and release
   gates.
 
 ## Ownership
@@ -89,9 +89,10 @@ product contract.
 | Join multiplayer room | invite-capability `POST /v1/rooms/:id/join` |
 | Shared room replay/live stream | member-cookie WebSocket `GET /v1/rooms/:id/ws?cursor=...` |
 | Ask the room's managed agent | room WebSocket `say` with `target: "agent"` |
-| Account history answer | `POST /v1/history/search` |
-| Account history candidates | `POST /v1/history/threads/search` |
-| Exact retained thread turns | `POST /v1/history/threads/:id/read` |
+| Account history candidates | `POST /v1/history/sessions/search` |
+| Exact retained session turns | `POST /v1/history/sessions/:id/read` |
+| Account memory list | `GET /v1/memory` |
+| Account memory read | `GET /v1/memory/:id` |
 
 Completed managed turns project idempotently into the account's `MemoryScope`.
 The terminal may search and render that source, but it must not recreate a

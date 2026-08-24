@@ -28,9 +28,49 @@ logs or retained artifacts.
 The deployment-wide `MultiplayerQuota` singleton is on every room allocation,
 release, and room-agent admission. Within a room, `#sayTail` serializes budget
 checks, event append, idempotency binding, and managed-agent job creation.
-Fanout then schedules catch-up work per socket. These are the first suspected
-contention boundaries; the measurements, not the source shape, decide whether
-they are bottlenecks.
+Fanout then schedules catch-up work per socket. Measurements identified a
+separate, accidental singleton in the egress subject directory as the first
+real cross-room bottleneck; subject ownership is now sharded by subject. The
+deployment-wide quota object intentionally remains a singleton.
+
+## Measured evidence
+
+The following disposable Cloudflare waves used the repository driver and the
+same Rust transport as `nanocodex2 room`. Every completed wave revoked its
+temporary API key, deleted all run-owned rooms, and removed both disposable
+Workers.
+
+| Wave | Result | High-signal latency |
+| --- | --- | --- |
+| canary: 1 room, 3 clients, 1 chat, 1 hosted turn | 9/9 chat deliveries, 3/3 terminal deliveries, 3/3 replay | clean cleanup |
+| mixed: 4 rooms, 9 clients/room, 6 chats/guest, 1 hosted turn/room | 196 sends, 1,764 chat deliveries, 36 terminal deliveries, 36 replay | clean cleanup |
+| max transport: 8 rooms, 16 clients/room, 8 chats/guest | 256 connect/reconnect, 960 sends, 15,360/15,360 fanout, 128/128 replay | create p99 3.319s; connect p99 15.336s; fanout p99 682ms; replay p99 15.887s |
+| hosted-turn validation: 2 rooms, 2 prompts/room | 4/4 turns, 12/12 terminal deliveries, 6/6 replay | terminal p99 6.949s |
+| hosted-turn wave: 8 rooms, 4 prompts/room, 4 observers/room | 32/32 turns, 128/128 live terminal deliveries, 32/32 replay | terminal p50 7.654s; p95 12.239s; p99/max 12.325s |
+
+The max transport wave completed in 36.581 seconds with no failed operation or
+invariant violation. The corrected 32-turn wave completed in 23.894 seconds;
+all terminals were normal `messages`, with no rate-limit or error terminal.
+
+## Bottlenecks found and fixed
+
+1. Fresh disposable deployments intermittently returned 500 while Durable
+   Object classes propagated. The driver now records a bounded 10-second warmup
+   before account bootstrap and retries only the cold bootstrap boundary.
+2. Concurrent room initialization serialized through one global
+   `AgentSubjectDirectory` Durable Object, causing `room_initialization_failed`
+   at 8-room admission. Subject bind/resolve ownership now uses
+   `subject-v1:<subject>` shards; the same 8-room stage then admitted 8/8 rooms.
+3. A transient create response could lose the caller's durable identity. The
+   Rust client now retries the exact serialized create body and `create_id`
+   across the server's initialization alarm window.
+4. The first multi-room hosted-turn wave keyed terminals by cursor alone.
+   Cursors are room-local, so valid terminals collided in the harness. Terminal
+   identity is now `(room, accepted_cursor)` and the full 32-turn wave passed.
+5. At the 128-client local envelope, the default macOS 256-descriptor ceiling
+   caused exactly 10 client-side WebSocket upgrade failures. Raising the
+   harness shell to 4,096 descriptors produced exact 15,360-message fanout;
+   this was a load-generator ceiling, not a Durable Object failure.
 
 ## Ordered ramps
 
@@ -103,5 +143,7 @@ Hold the current level when p99 exceeds twice the prior stable stage for three
 windows, unexpected failures exceed 0.5% for one minute, or the low-rate canary
 p95 doubles. Stop producers immediately when the configured rooms, agents,
 sockets, model turns, bytes, wall time, or estimated spend budget is reached.
-Drain observers and delete only run-owned resources recorded in the
-crash-resumable cleanup ledger.
+Drain observers and delete only run-owned resources recorded in the in-memory
+cleanup ledger. Normal completion, typed failure, timeout, SIGINT, and SIGTERM
+run cleanup. SIGKILL cannot execute cleanup; disposable Workers are uniquely
+named for operator removal and rooms retain the bounded two-hour lease.
