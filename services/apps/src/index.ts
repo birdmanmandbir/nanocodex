@@ -280,7 +280,19 @@ async function invokeDynamicApp(
   try {
     const object = await env.APP_ARTIFACTS.get(revision.artifactKey);
     if (!object) throw new Error("artifact missing");
-    artifact = await parseArtifact(await object.text());
+    const encoded = await object.text();
+    artifact = await parseArtifact(encoded);
+    const expectedKey = `apps/${app.appId}/revisions/${revision.revisionId}/worker.json`;
+    if (
+      artifact.revision !== revision.revisionId
+      || revision.artifactHash !== revision.revisionId
+      || revision.artifactKey !== expectedKey
+      || new TextEncoder().encode(encoded).byteLength !== revision.artifactBytes
+      || artifact.mainModule !== revision.mainModule
+      || artifact.policyVersion !== revision.policyVersion
+    ) {
+      throw new Error("artifact does not match the immutable registry revision");
+    }
   } catch (error) {
     console.error(JSON.stringify({
       type: "dynamic_app.artifact_failed",

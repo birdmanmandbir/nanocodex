@@ -248,6 +248,39 @@ describe("tenant app control plane", () => {
     expect(invoked?.headers.get("x-forwarded-prefix")).toBe("/a/tiny-app");
   });
 
+  it("rejects a self-validating artifact that does not match the registry revision", async () => {
+    const artifact = await buildProject({
+      entryPoint: "src/index.ts",
+      files: [{ path: "src/index.ts", content: "export default {fetch(){return new Response('ok')}}" }],
+      name: "Tiny app",
+      slug: "tiny-app",
+    }, async () => ({
+      mainModule: "bundle.js",
+      modules: { "bundle.js": "export default {fetch(){return new Response('ok')}}" },
+    }));
+    const encoded = serializeArtifact(artifact);
+    const app = appRecord("c".repeat(64), new TextEncoder().encode(encoded).byteLength);
+    const registry = { getApp: vi.fn(async () => app) };
+    const loader = { get: vi.fn() };
+    const env = configuredEnv({
+      APP_ARTIFACTS: { get: vi.fn(async () => ({ text: async () => encoded })) } as unknown as R2Bucket,
+      APP_REGISTRY: {
+        get: vi.fn(() => registry),
+        idFromName: vi.fn((tenant: string) => tenant),
+      } as unknown as Env["APP_REGISTRY"],
+      LOADER: loader as unknown as WorkerLoader,
+    });
+
+    const response = await runtimeGateway(env).invokeApp(
+      runtimeClaims(app.appId, app.slug),
+      new Request("https://runtime.example.test/a/tiny-app/"),
+    );
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: "app_artifact_unavailable" });
+    expect(loader.get).not.toHaveBeenCalled();
+  });
+
   it("conceals an app from a mismatched tenant/runtime claim", async () => {
     const registry = { getApp: vi.fn(async () => null) };
     const env = configuredEnv({
