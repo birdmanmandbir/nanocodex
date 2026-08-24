@@ -32,6 +32,10 @@ to one actor, tenant, app, and expiry. The host overwrites generated security
 headers and CSP: service workers and external browser connections are denied,
 while API calls back to the same app frame are permitted. Account cookies,
 runtime cookies, API keys, and provider credentials never reach generated code.
+Generated source is nevertheless builder-approved code: it can deliberately
+navigate its own sandboxed frame and encode app-visible data in that navigation.
+The boundary isolates Nanocodex credentials, the host page, and other apps; it
+does not claim to make source approved by the builder non-exfiltrating.
 
 ## Build and version-control pipeline
 
@@ -47,10 +51,13 @@ Each Cloudflare Workflow run:
 
 The Git repository uses the existing Smart HTTP, Durable Object, pack, and R2
 implementation, but app repositories occupy a separate private namespace and
-have no public `/git/app-*` route. After each push, the builder fetches into a
-fresh filesystem, proves the advertised commit is the expected direct
-fast-forward, and compares every tracked file to the generated project before
-publication. A revision records both its SHA-256 executable
+have no public `/git/app-*` route. Before moving a ref, the receiver validates
+the checksums and identities of every retained Git object, requires a direct
+fast-forward commit, and proves its complete reachable tree contains only
+supported source objects. After each push, the builder fetches into a fresh
+filesystem, proves the advertised commit is the expected direct fast-forward,
+and compares every tracked file to the generated project before publication. A
+revision records both its SHA-256 executable
 artifact ID and its SHA-1 source commit. Updates append commits. Rollback only
 moves the active revision pointer; it never rewrites Git history. One build per
 app may be active at a time.
