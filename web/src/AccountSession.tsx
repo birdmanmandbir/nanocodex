@@ -8,6 +8,8 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { Provider, Storage, webAuthn } from "accounts";
+import { clientFailureMessage } from "./clientFailure";
 import { deploymentHealth } from "./deploymentHealth";
 import { localDevelopmentCredential } from "./localDevelopmentCredential";
 
@@ -17,7 +19,7 @@ export type AuthenticatedAccount = Readonly<{
 }>;
 
 type SessionStatus = "checking" | "ready" | "error";
-type AccountOperation = "register" | "sign-in" | "sign-out";
+type AccountOperation = "new-account" | "register" | "sign-in" | "sign-out";
 
 type AccountSession = Readonly<{
   status: SessionStatus;
@@ -25,6 +27,7 @@ type AccountSession = Readonly<{
   error: string | null;
   operation: AccountOperation | null;
   refresh: () => Promise<void>;
+  startNewAccount: () => Promise<void>;
   register: () => Promise<void>;
   signIn: () => Promise<void>;
   signOut: () => Promise<void>;
@@ -33,8 +36,7 @@ type AccountSession = Readonly<{
 const AccountSessionContext = createContext<AccountSession | null>(null);
 const USER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
-async function createAccountProvider() {
-  const { Provider, Storage, webAuthn } = await import("accounts");
+function createAccountProvider() {
   return Provider.create({
     adapter: webAuthn({
       auth: "/webauthn",
@@ -119,7 +121,7 @@ export function AccountSessionProvider({ children }: { children: ReactNode }) {
     setError(null);
     try {
       if (method === "register" && !user) throw new Error("The browser identity is not ready.");
-      await (await accountProvider()).request(method === "register"
+      await accountProvider().request(method === "register"
         ? {
             method: "wallet_connect",
             params: [{ capabilities: {
@@ -149,11 +151,27 @@ export function AccountSessionProvider({ children }: { children: ReactNode }) {
 
   const register = useCallback(() => connect("register"), [connect]);
   const signIn = useCallback(() => connect("login"), [connect]);
+  const startNewAccount = useCallback(async () => {
+    setOperation("new-account");
+    setError(null);
+    try {
+      const nextUser = await getCurrentUser();
+      if (!nextUser) throw new Error("The browser session was not created.");
+      await claimLocalCredential(nextUser.id);
+      requestId.current++;
+      setUser(nextUser);
+      setStatus("ready");
+    } catch (cause) {
+      setError(accountFailure(cause, "Couldn’t start a new account. Try again."));
+    } finally {
+      setOperation(null);
+    }
+  }, [claimLocalCredential]);
   const signOut = useCallback(async () => {
     setOperation("sign-out");
     setError(null);
     try {
-      await (await accountProvider()).request({ method: "wallet_disconnect" });
+      await accountProvider().request({ method: "wallet_disconnect" });
       const nextUser = await getCurrentUser();
       if (nextUser) await claimLocalCredential(nextUser.id);
       requestId.current++;
@@ -173,10 +191,11 @@ export function AccountSessionProvider({ children }: { children: ReactNode }) {
     error,
     operation,
     refresh,
+    startNewAccount,
     register,
     signIn,
     signOut,
-  }), [error, operation, refresh, register, signIn, signOut, status, user]);
+  }), [error, operation, refresh, register, signIn, signOut, startNewAccount, status, user]);
 
   return (
     <AccountSessionContext.Provider value={value}>
@@ -198,7 +217,10 @@ async function getCurrentUser(): Promise<AuthenticatedAccount | null> {
     headers: { accept: "application/json" },
   });
   if (response.status === 401) {
-    await response.body?.cancel();
+    const body: unknown = await response.json().catch(() => undefined);
+    if (isRecord(body) && body.error === "invalid_session") {
+      throw new Error("Your account session expired. Retry to start a new browser session, or sign in with your passkey.");
+    }
     return null;
   }
   if (!response.ok) throw await responseFailure(response, "Account service unavailable.");
@@ -230,7 +252,7 @@ function accountFailure(cause: unknown, fallback: string): string {
   if (cause instanceof DOMException && cause.name === "NotAllowedError") {
     return "The passkey request was cancelled or timed out. Try again.";
   }
-  return cause instanceof Error && cause.message ? cause.message : fallback;
+  return clientFailureMessage(cause, fallback);
 }
 
 export function isRecord(value: unknown): value is Record<string, unknown> {

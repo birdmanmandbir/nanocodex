@@ -4,8 +4,14 @@ import {
   UserCredentialBroker,
   type UserCredentialSnapshot,
 } from "./broker";
+import {
+  UserConnectorBroker,
+  type ConnectorBrokerEnv,
+} from "./connector-broker";
+import { canonicalConnectorPath } from "./connector-path";
 
 export { AgentSubjectDirectory, UserCredentialBroker } from "./broker";
+export { UserConnectorBroker } from "./connector-broker";
 
 const SUBJECT_DIRECTORY_NAME = "agent-subjects-v1";
 const SUBJECT = /^[A-Za-z0-9_-]{43,128}$/;
@@ -25,9 +31,35 @@ const RELAY_HTTP_ROUTES: Readonly<Record<ModelOperation["id"], string | undefine
   "image-generation": "codex-image-generation",
   "image-edit": "codex-image-edit",
 };
+const CONNECTOR_METHODS = new Set(["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]);
 
-export interface EgressEnv extends BrokerEnv {
+type ConnectorOperation = Readonly<{
+  id: "github" | "gmail" | "gdrive";
+  origin: `https://${string}`;
+  paths: readonly RegExp[];
+}>;
+
+const CONNECTOR_OPERATIONS: readonly ConnectorOperation[] = [
+  {
+    id: "github",
+    origin: "https://api.github.com",
+    paths: [/^\//],
+  },
+  {
+    id: "gmail",
+    origin: "https://gmail.googleapis.com",
+    paths: [/^\/gmail\/v1\/users\/me(?:\/|$)/],
+  },
+  {
+    id: "gdrive",
+    origin: "https://www.googleapis.com",
+    paths: [/^\/drive\/v3(?:\/|$)/, /^\/upload\/drive\/v3(?:\/|$)/],
+  },
+];
+
+export interface EgressEnv extends BrokerEnv, ConnectorBrokerEnv {
   USER_CREDENTIALS: DurableObjectNamespace<UserCredentialBroker>;
+  USER_CONNECTORS: DurableObjectNamespace<UserConnectorBroker>;
   AGENT_SUBJECTS: DurableObjectNamespace<AgentSubjectDirectory>;
   CHATGPT_EGRESS?: DurableObjectNamespace;
   CODEX_RELAY_URL?: string;
@@ -95,7 +127,11 @@ export async function handleEgress(
   const started = Date.now();
   let url: URL;
   try { url = new URL(request.url); } catch { return jsonError(400, "invalid_url"); }
-  if (url.username || url.password || url.search || url.hash) return jsonError(403, "destination_denied");
+  if (url.username || url.password || url.hash) return jsonError(403, "destination_denied");
+
+  const connector = connectorOperation(url);
+  if (connector) return handleConnectorEgress(request, url, connector, env, started);
+  if (url.search) return jsonError(403, "destination_denied");
 
   if (url.pathname.startsWith("/subjects/") || url.pathname.startsWith("/users/")) {
     return handleControl(request, url, env);
@@ -175,6 +211,42 @@ export async function handleEgress(
   }
 }
 
+async function handleConnectorEgress(
+  request: Request,
+  url: URL,
+  connector: ConnectorOperation,
+  env: EgressEnv,
+  started: number,
+): Promise<Response> {
+  if (!CONNECTOR_METHODS.has(request.method)) {
+    return auditedError(403, "method_denied", request, url, connector.id, started);
+  }
+  const subject = request.headers.get(SUBJECT_HEADER);
+  if (!subject || !SUBJECT.test(subject)) {
+    return auditedError(403, "agent_subject_required", request, url, connector.id, started);
+  }
+  if (request.headers.get("authorization") !== PROVIDER_PLACEHOLDER) {
+    return auditedError(403, "credential_placeholder_mismatch", request, url, connector.id, started);
+  }
+  try {
+    const userId = await resolveSubject(env, subject);
+    const response = await connectorBroker(env, userId).fetch(request);
+    audit(response.status >= 500 ? "error" : response.status >= 400 ? "deny" : "allow",
+      request, url, connector.id, started, { status: response.status });
+    return sanitizeUpstreamResponse(response);
+  } catch (error) {
+    const problem = egressFailure(error);
+    return auditedError(problem.status, problem.code, request, url, connector.id, started);
+  }
+}
+
+function connectorOperation(url: URL): ConnectorOperation | undefined {
+  if (url.href.length > 8_192) return undefined;
+  return CONNECTOR_OPERATIONS.find((candidate) => candidate.origin === url.origin
+    && canonicalConnectorPath(candidate.id, url.pathname)
+    && candidate.paths.some((path) => path.test(url.pathname)));
+}
+
 function sanitizeUpstreamResponse(upstream: Response): Response {
   // An upgraded socket must be returned intact. Its peer is the explicitly
   // trusted provider/relay selected by the fixed rule, never caller input.
@@ -208,6 +280,30 @@ async function handleControl(request: Request, url: URL, env: EgressEnv): Promis
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ subject: subjectMatch[1], user_id: userId }),
+    });
+  }
+
+  const connectorMatch = url.pathname.match(
+    /^\/users\/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\/connectors(?:\/(github|gmail|gdrive)(\/callback)?)?$/,
+  );
+  if (connectorMatch) {
+    const userId = connectorMatch[1]!;
+    const connector = connectorMatch[2];
+    const callback = connectorMatch[3] === "/callback";
+    const target = connector
+      ? `https://connectors.internal/v1/${connector}${callback ? "/callback" : request.method === "POST" ? "/start" : ""}`
+      : "https://connectors.internal/v1/status";
+    if ((!connector && request.method !== "GET")
+      || (connector && callback && request.method !== "POST")
+      || (connector && !callback && request.method !== "POST" && request.method !== "DELETE")) {
+      return jsonError(405, "method_not_allowed");
+    }
+    return connectorBroker(env, userId).fetch(target, {
+      method: request.method,
+      ...(request.body === null ? {} : {
+        headers: { "content-type": request.headers.get("content-type") ?? "" },
+        body: request.body,
+      }),
     });
   }
 
@@ -463,6 +559,9 @@ function directory(env: EgressEnv): DurableObjectStub<AgentSubjectDirectory> {
 function userBroker(env: EgressEnv, userId: string): DurableObjectStub<UserCredentialBroker> {
   return env.USER_CREDENTIALS.getByName(userId);
 }
+function connectorBroker(env: EgressEnv, userId: string): DurableObjectStub<UserConnectorBroker> {
+  return env.USER_CONNECTORS.getByName(userId);
+}
 function localClaimEnabled(env: EgressEnv): boolean {
   const environment = env.ENVIRONMENT?.trim().toLowerCase();
   return env.ALLOW_LOCAL_CREDENTIAL_CLAIM === "true"
@@ -527,13 +626,14 @@ function audit(
   started: number,
   detail: Record<string, unknown>,
 ): void {
+  const connector = rule === "github" || rule === "gmail" || rule === "gdrive";
   console.log(JSON.stringify({
     type: "egress.request",
     action,
     rule,
     method: request.method,
     host: url.host,
-    path: url.pathname,
+    path: connector ? "/provider-api" : url.pathname,
     duration_ms: Date.now() - started,
     ...detail,
   }));

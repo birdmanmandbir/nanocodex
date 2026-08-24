@@ -24,6 +24,200 @@ afterEach(async () => {
 });
 
 describe("managed agents REST and resumable SSE", () => {
+  it("keeps connector OAuth state and credentials behind a persistent account", async () => {
+    const publicEgressEnvelope = JSON.stringify({
+      thread_id: "77777777-7777-4777-8777-777777777777",
+      url: "https://example.com/public",
+      method: "GET",
+      headers: { accept: "application/json" },
+    });
+    const unauthenticated = await RAW_SELF.fetch("https://example.test/v1/egress", {
+      method: "POST",
+      headers: { origin: "https://example.test", "content-type": "application/json" },
+      body: publicEgressEnvelope,
+    });
+    expect(unauthenticated.status).toBe(401);
+    expect(await unauthenticated.json()).toEqual({ error: "unauthorized" });
+
+    const apiKeyPrincipal = await RAW_SELF.fetch("https://example.test/v1/egress", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${API_KEY}`,
+        origin: "https://example.test",
+        "content-type": "application/json",
+      },
+      body: publicEgressEnvelope,
+    });
+    expect(apiKeyPrincipal.status).toBe(401);
+
+    const session = await RAW_SELF.fetch("https://example.test/v1/me");
+    const anonymousCookie = session.headers.get("set-cookie")?.split(";", 1)[0];
+    expect(anonymousCookie).toMatch(/^nanocodex_account=a_[A-Za-z0-9_-]{43}$/);
+
+    const anonymous = await RAW_SELF.fetch("https://example.test/v1/connectors", {
+      headers: { cookie: anonymousCookie! },
+    });
+    expect(anonymous.status).toBe(401);
+    expect(await anonymous.json()).toEqual({ error: "unauthorized" });
+
+    const anonymousEgress = await RAW_SELF.fetch("https://example.test/v1/egress", {
+      method: "POST",
+      headers: {
+        cookie: anonymousCookie!,
+        origin: "https://example.test",
+        "content-type": "application/json",
+      },
+      body: publicEgressEnvelope,
+    });
+    expect(anonymousEgress.status).toBe(401);
+
+    const connectorUserId = "55555555-5555-4555-8555-555555555555";
+    const connectorToken = "c".repeat(43);
+    await seedPasskeySession(connectorUserId, connectorToken);
+    const cookie = `nanocodex_account=${connectorToken}`;
+
+    const initial = await RAW_SELF.fetch("https://example.test/v1/connectors", {
+      headers: { cookie },
+    });
+    expect(initial.status).toBe(200);
+    expect(await initial.json()).toMatchObject({
+      connectors: {
+        github: { connected: false },
+        gmail: { connected: false },
+        gdrive: { connected: false },
+      },
+    });
+
+    const missingOrigin = await RAW_SELF.fetch("https://example.test/v1/connectors/github", {
+      method: "POST",
+      headers: { cookie, "content-type": "application/json" },
+      body: JSON.stringify({ return_to: "/agent" }),
+    });
+    expect(missingOrigin.status).toBe(403);
+
+    const started = await RAW_SELF.fetch("https://example.test/v1/connectors/github", {
+      method: "POST",
+      headers: {
+        cookie,
+        "content-type": "application/json",
+        origin: "https://example.test",
+      },
+      body: JSON.stringify({ return_to: "/agent?thread=connector" }),
+    });
+    expect(started.status).toBe(200);
+    const authorization = new URL((await started.json<{ authorization_url: string }>()).authorization_url);
+    expect(authorization.origin).toBe("https://provider.test");
+    expect(authorization.searchParams.get("redirect_uri")).toBe(
+      "https://example.test/v1/connectors/github/callback",
+    );
+
+    const callback = await RAW_SELF.fetch(
+      `https://example.test/v1/connectors/github/callback?${new URLSearchParams({
+        code: "authorization-code",
+        state: authorization.searchParams.get("state")!,
+      })}`,
+      { headers: { cookie }, redirect: "manual" },
+    );
+    expect(callback.status).toBe(303);
+    expect(callback.headers.get("location")).toBe(
+      "https://example.test/agent?thread=connector&connector=github&connector_result=connected",
+    );
+
+    const connected = await RAW_SELF.fetch("https://example.test/v1/connectors", {
+      headers: { cookie },
+    });
+    expect(await connected.json()).toMatchObject({
+      connectors: { github: { connected: true, label: "Nano Cat" } },
+    });
+
+    const egressEnvelope = JSON.stringify({
+      thread_id: "77777777-7777-4777-8777-777777777777",
+      url: "https://api.github.com/repos/gakonst/nanocodex",
+      method: "GET",
+      headers: { accept: "application/json" },
+    });
+    const crossOriginRead = await RAW_SELF.fetch("https://example.test/v1/egress", {
+      method: "POST",
+      headers: { cookie, origin: "https://attacker.test", "content-type": "application/json" },
+      body: egressEnvelope,
+    });
+    expect(crossOriginRead.status).toBe(403);
+
+    const githubRead = await RAW_SELF.fetch("https://example.test/v1/egress", {
+      method: "POST",
+      headers: { cookie, origin: "https://example.test", "content-type": "application/json" },
+      body: egressEnvelope,
+    });
+    expect(githubRead.status).toBe(200);
+    expect(githubRead.headers.get("cache-control")).toBe("no-store");
+    const githubValue = await githubRead.json<{ subject: string }>();
+    expect(githubValue).toMatchObject({
+      cookie: null,
+      full_name: "gakonst/nanocodex",
+      subject: expect.stringMatching(/^[A-Za-z0-9_-]{43}$/),
+    });
+
+    const forgedOuterPrincipal = await RAW_SELF.fetch("https://example.test/v1/egress", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${OTHER_API_KEY}`,
+        cookie,
+        origin: "https://example.test",
+        "content-type": "application/json",
+        "x-nanocodex-subject": "b".repeat(43),
+      },
+      body: egressEnvelope,
+    });
+    expect(forgedOuterPrincipal.status).toBe(200);
+    expect((await forgedOuterPrincipal.json<{ subject: string }>()).subject).toBe(githubValue.subject);
+
+    for (const forged of [
+      { authorization: "Bearer attacker" },
+      { cookie: "nanocodex_account=attacker" },
+      { "proxy-authorization": "Basic attacker" },
+      { "x-nanocodex-subject": "a".repeat(43) },
+    ]) {
+      const response = await RAW_SELF.fetch("https://example.test/v1/egress", {
+        method: "POST",
+        headers: { cookie, origin: "https://example.test", "content-type": "application/json" },
+        body: JSON.stringify({
+          ...JSON.parse(egressEnvelope),
+          headers: forged,
+        }),
+      });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ error: "invalid_headers" });
+    }
+    for (const field of ["principal", "subject", "user_id"]) {
+      const response = await RAW_SELF.fetch("https://example.test/v1/egress", {
+        method: "POST",
+        headers: { cookie, origin: "https://example.test", "content-type": "application/json" },
+        body: JSON.stringify({
+          ...JSON.parse(egressEnvelope),
+          [field]: connectorUserId,
+        }),
+      });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ error: "invalid_request" });
+    }
+
+    const deniedDestination = await RAW_SELF.fetch("https://example.test/v1/egress", {
+      method: "POST",
+      headers: { cookie, origin: "https://example.test", "content-type": "application/json" },
+      body: JSON.stringify({
+        thread_id: "77777777-7777-4777-8777-777777777777",
+        url: "http://127.0.0.1/private",
+      }),
+    });
+    expect(deniedDestination.status).toBe(403);
+
+    const disconnected = await RAW_SELF.fetch("https://example.test/v1/connectors/github", {
+      method: "DELETE",
+      headers: { cookie, origin: "https://example.test" },
+    });
+    expect(disconnected.status).toBe(204);
+  });
+
   it("bootstraps one browser identity and binds passkey options to it", async () => {
     const first = await RAW_SELF.fetch("https://example.test/v1/me");
     expect(first.status).toBe(200);
@@ -73,6 +267,51 @@ describe("managed agents REST and resumable SSE", () => {
     expect(response.status).toBe(401);
     expect(await response.json()).toEqual({ error: "unauthorized" });
     expect(response.headers.get("set-cookie")).toBeNull();
+  });
+
+  it("rejects and clears stale account cookies instead of minting a replacement identity", async () => {
+    const expiredToken = `a_${"e".repeat(43)}`;
+    const auth = testEnv.NANOCODEX_AUTH.getByName("account");
+    const stored = await auth.fetch(
+      `https://do.invalid/set?key=${encodeURIComponent(`session:${expiredToken}`)}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          value: {
+            userId: "44444444-4444-4444-8444-444444444444",
+            issuedAt: 1,
+            expiresAt: 2,
+          },
+          ttl: 60,
+        }),
+      },
+    );
+    expect(stored.ok).toBe(true);
+
+    for (const token of [
+      "malformed",
+      `a_${"z".repeat(43)}`,
+      expiredToken,
+      "z".repeat(43),
+    ]) {
+      const response = await RAW_SELF.fetch("https://example.test/v1/me", {
+        headers: { cookie: `other=value; nanocodex_account=${token}` },
+      });
+      expect(response.status).toBe(401);
+      expect(await response.json()).toEqual({ error: "invalid_session" });
+      expect(response.headers.get("set-cookie")).toMatch(
+        /^nanocodex_account=; Path=\/; Max-Age=0; HttpOnly; SameSite=Lax; Secure$/,
+      );
+    }
+
+    const unrelatedCookie = await RAW_SELF.fetch("https://example.test/v1/me", {
+      headers: { cookie: "other=value" },
+    });
+    expect(unrelatedCookie.status).toBe(200);
+    expect(unrelatedCookie.headers.get("set-cookie")).toMatch(
+      /^nanocodex_account=a_[A-Za-z0-9_-]{43};/,
+    );
   });
 
   it("recognizes passkey sessions even when their random token begins with the anonymous prefix", async () => {
@@ -389,6 +628,27 @@ describe("managed agents REST and resumable SSE", () => {
       method: "DELETE",
       headers: { authorization: `Bearer ${API_KEY}` },
     })).status).toBe(204);
+  });
+
+  it("runs the normal tool composition through durable in-process Just Bash", async () => {
+    const agent = await createAgent();
+    const accepted = await submit(agent, "turn-computer-runtime", "E2E_COMPUTER_RUNTIME");
+    const events = sseReader(await SELF.fetch(
+      `${agent.events_url}?cursor=${accepted.accepted_cursor}`,
+    ));
+    let event;
+    const observed: unknown[] = [];
+    do {
+      event = await nextWithin(events, "Computer runtime tool completion");
+      observed.push(event.data);
+    } while (event.data.type !== "turn_completed");
+    expect(JSON.stringify(observed)).toContain("COMPUTER_RUNTIME_OK");
+    expect(event.data).toMatchObject({
+      id: "turn-computer-runtime",
+      final_message: "COMPUTER_TOOLS_OK",
+      type: "turn_completed",
+    });
+    await events.cancel();
   });
 
   it("does not let an unrelated bearer mint managed agents", async () => {
