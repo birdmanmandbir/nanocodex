@@ -5256,6 +5256,7 @@ dependencies = [
  "arboard",
  "arcbox-ext4",
  "async-trait",
+ "axum",
  "base64 0.22.1",
  "chrono",
  "clap",
@@ -5306,9 +5307,11 @@ dependencies = [
  "two-face",
  "unicode-segmentation",
  "unicode-width 0.2.0",
+ "url",
  "uuid",
  "vergen",
  "yansi",
+ "zeroize",
 ]
 
 [[package]]

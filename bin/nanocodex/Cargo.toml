@@ -74,7 +74,10 @@ tempo-alloy = { workspace = true, optional = true }
 tracing.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
+url.workspace = true
+uuid.workspace = true
 yansi.workspace = true
+zeroize.workspace = true
 
 [target.'cfg(any(all(target_os = "linux", not(target_env = "musl")), all(target_os = "macos", target_arch = "aarch64")))'.dependencies]
 arcbox-ext4.workspace = true
@@ -85,13 +88,13 @@ nanocodex-eval-adapters.workspace = true
 nanocodex-vm.workspace = true
 regex.workspace = true
 sysinfo.workspace = true
-uuid.workspace = true
 
 [build-dependencies]
 chrono.workspace = true
 vergen = { workspace = true, features = ["build", "git", "gitcl"] }
 
 [dev-dependencies]
+axum.workspace = true
 criterion.workspace = true
 
 [[bench]]
@@ -107,6 +110,11 @@ name = "nanocodex"
 path = "src/main.rs"
 doc = false
 test = false
+
+[[bin]]
+name = "nanocodex2"
+path = "src/nanocodex2/main.rs"
+doc = false
 
 [lints]
 workspace = true
