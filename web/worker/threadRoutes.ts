@@ -20,6 +20,10 @@ import {
   type ThreadPack,
   type ThreadPackMetadata,
 } from "./threadRepository.ts";
+import {
+  DEFAULT_APP_GIT_VALIDATION_LIMITS,
+  validateAppGitPush,
+} from "./appGitValidation.ts";
 
 // Smart-HTTP/DO/R2 ownership follows the MIT-licensed Git-on-Cloudflare design.
 // Its account, admin, registry, and D1 product layers are intentionally absent;
@@ -233,6 +237,35 @@ async function receivePack(
   }
   if (!command || !pack || !packMetadata) return gitError("invalid receive state", 500);
 
+  if (repositoryNamespace === "app-repositories") {
+    const repository = await getThreadRepository(env, repositoryName);
+    if (repository instanceof Response) return repository;
+    const currentHead = repository?.head ?? ZERO_OID;
+    if (currentHead !== command.oldOid) {
+      return receiveResponse(
+        buildReceiveReport(command, "stale ref; pull and retry"),
+        sideBand64k,
+      );
+    }
+    try {
+      const retained = await loadValidatedPacks(
+        env.GIT_OBJECTS!,
+        repository?.packs ?? [],
+        pack.byteLength,
+      );
+      validateAppGitPush({
+        packs: [...retained, pack],
+        oldOid: command.oldOid,
+        newOid: command.newOid,
+      });
+    } catch {
+      return receiveResponse(
+        buildReceiveReport(command, "app source pack failed object validation"),
+        sideBand64k,
+      );
+    }
+  }
+
   const stub = repositoryStub(env, repositoryName);
   const begin = await stub.fetch("https://repository.internal/receive/begin", {
     method: "POST",
@@ -293,6 +326,39 @@ async function receivePack(
     else await cleanup;
     return receiveResponse(buildReceiveReport(command, errorMessage(error)), sideBand64k);
   }
+}
+
+async function loadValidatedPacks(
+  bucket: R2Bucket,
+  packs: readonly ThreadPack[],
+  stagedBytes: number,
+): Promise<readonly Uint8Array[]> {
+  if (packs.length > DEFAULT_APP_GIT_VALIDATION_LIMITS.maxPacks - 1) {
+    throw new Error("app source repository has too many packs");
+  }
+  const loaded: Uint8Array[] = [];
+  let compressedBytes = 0;
+  for (const metadata of packs) {
+    compressedBytes += metadata.size;
+    if (!Number.isSafeInteger(compressedBytes)
+      || compressedBytes > DEFAULT_APP_GIT_VALIDATION_LIMITS.maxCompressedBytes - stagedBytes) {
+      throw new Error("app source repository exceeds compressed byte limit");
+    }
+    const object = await bucket.get(metadata.key);
+    if (!object) throw new Error("retained app source pack is missing");
+    if (object.size !== metadata.size) {
+      throw new Error("retained app source pack size does not match metadata");
+    }
+    const bytes = new Uint8Array(await object.arrayBuffer());
+    const actual = await validatePack(bytes);
+    if (actual.hash !== metadata.hash
+      || actual.size !== metadata.size
+      || actual.objectCount !== metadata.objectCount) {
+      throw new Error("retained app source pack metadata does not match its bytes");
+    }
+    loaded.push(bytes);
+  }
+  return loaded;
 }
 
 async function validatePack(pack: Uint8Array): Promise<{

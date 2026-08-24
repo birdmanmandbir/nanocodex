@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { test } from "node:test";
+import { deflateSync } from "node:zlib";
 
 import { encodePacketLine, parsePacketLines } from "./threadProtocol.ts";
 import { ThreadGitRepository, type ThreadRepository } from "./threadRepository.ts";
@@ -102,6 +103,7 @@ test("app Git lane requires exact props, repository names, URL locators, and met
 });
 
 test("app Git lane creates, fetches, and CAS-updates an isolated repository", async () => {
+  const fixture = appSourceFixture();
   const repositories = repositoryNamespace();
   const bucket = new MemoryBucket();
   const env = {
@@ -112,33 +114,51 @@ test("app Git lane creates, fetches, and CAS-updates an isolated repository", as
   assert.equal((await advertiseApp(env, appRepositoryV7)).status, 200);
   const empty = await advertiseApp(env, appRepository);
   assert.match((await responseLines(empty))[1]!, new RegExp(`^${zero} capabilities\\^\\{\\}`));
-  assert.equal((await pushApp(env, appRepository, zero, headA)).status, 200);
-  assert.equal((await pushApp(env, appRepository, headA, headB)).status, 200);
+  const forged = await pushApp(env, appRepository, zero, headA);
+  assert.deepEqual((await responseLines(forged)).slice(0, 2), [
+    "unpack error app source pack failed object validation\n",
+    `ng ${ref} app source pack failed object validation\n`,
+  ]);
+  assert.equal(bucket.objects.size, 0);
+  assert.equal((await pushApp(
+    env, appRepository, zero, fixture.oldCommit, fixture.initialPack,
+  )).status, 200);
+  assert.equal((await pushApp(
+    env, appRepository, fixture.oldCommit, fixture.newCommit, fixture.updatePack,
+  )).status, 200);
 
   const repository = await currentRepository(repositories.repository(appRepository));
-  assert.equal(repository.head, headB);
+  assert.equal(repository.head, fixture.newCommit);
   assert.deepEqual(repository.packs.map(({ oldOid, newOid }) => ({ oldOid, newOid })), [
-    { oldOid: zero, newOid: headA },
-    { oldOid: headA, newOid: headB },
+    { oldOid: zero, newOid: fixture.oldCommit },
+    { oldOid: fixture.oldCommit, newOid: fixture.newCommit },
   ]);
   assert.ok(repository.packs.every(({ key }) => key.startsWith(
     `app-repositories/${appRepository}/`,
   )));
 
-  const fetched = await fetchAppV2(env, appRepository, headB, [headA]);
-  assert.equal(packObjectCount(await uploadPackBytes(fetched)), 1);
+  const fetched = await fetchAppV2(
+    env, appRepository, fixture.newCommit, [fixture.oldCommit],
+  );
+  assert.equal(packObjectCount(await uploadPackBytes(fetched)), 3);
 
-  const stale = await pushApp(env, appRepository, headA, headC);
+  const stale = await pushApp(
+    env, appRepository, fixture.oldCommit, headC, fixture.updatePack,
+  );
   assert.equal(stale.status, 200);
   assert.deepEqual((await responseLines(stale)).slice(0, 2), [
     "unpack error stale ref; pull and retry\n",
     `ng ${ref} stale ref; pull and retry\n`,
   ]);
-  assert.equal((await currentRepository(repositories.repository(appRepository))).head, headB);
+  assert.equal(
+    (await currentRepository(repositories.repository(appRepository))).head,
+    fixture.newCommit,
+  );
   assert.equal(bucket.objects.size, 2);
 });
 
 test("app and public thread Git retain distinct DO and R2 namespaces", async () => {
+  const fixture = appSourceFixture();
   const repositories = repositoryNamespace();
   const bucket = new MemoryBucket();
   const env = {
@@ -147,9 +167,14 @@ test("app and public thread Git retain distinct DO and R2 namespaces", async () 
   };
   const matchingThread = "thread-12345678-1234-4123-8123-123456789abc";
 
-  assert.equal((await pushApp(env, appRepository, zero, headA)).status, 200);
+  assert.equal((await pushApp(
+    env, appRepository, zero, fixture.oldCommit, fixture.initialPack,
+  )).status, 200);
   assert.equal((await pushThread(env, matchingThread, zero, headB)).status, 200);
-  assert.equal((await currentRepository(repositories.repository(appRepository))).head, headA);
+  assert.equal(
+    (await currentRepository(repositories.repository(appRepository))).head,
+    fixture.oldCommit,
+  );
   assert.equal((await currentRepository(repositories.repository(matchingThread))).head, headB);
   assert.deepEqual(new Set([...bucket.objects.keys()].map((key) => key.split("/", 1)[0])), new Set([
     "app-repositories",
@@ -331,10 +356,12 @@ async function advertiseApp(env: {
 async function pushApp(env: {
   GIT_OBJECTS: R2Bucket;
   THREAD_GIT_REPOSITORY: DurableObjectNamespace;
-}, name: string, oldOid: string, newOid: string): Promise<Response> {
+}, name: string, oldOid: string, newOid: string, pack = sourcePack()): Promise<Response> {
   return handleAppGitRequest(
     name,
-    receiveRequest(`https://repository.test/git/${name}/git-receive-pack`, oldOid, newOid),
+    receiveRequest(
+      `https://repository.test/git/${name}/git-receive-pack`, oldOid, newOid, pack,
+    ),
     env,
     { clientId: "nanocodex-apps" },
   );
@@ -354,11 +381,16 @@ async function pushThread(env: {
   return response;
 }
 
-function receiveRequest(url: string, oldOid: string, newOid: string): Request {
+function receiveRequest(
+  url: string,
+  oldOid: string,
+  newOid: string,
+  pack = sourcePack(),
+): Request {
   const body = concatenate([
     encodePacketLine(`${oldOid} ${newOid} ${ref}\0 report-status\n`),
     encoder.encode("0000"),
-    sourcePack(),
+    pack,
   ]);
   return new Request(url, { method: "POST", body: body.slice().buffer });
 }
@@ -514,13 +546,84 @@ class MemoryBucket {
   async get(key: string) {
     this.getCalls.push(key);
     const bytes = this.objects.get(key);
-    return bytes ? { arrayBuffer: async () => bytes.slice().buffer } : null;
+    return bytes ? { size: bytes.byteLength, arrayBuffer: async () => bytes.slice().buffer } : null;
   }
 
   resetReads() {
     this.headCalls.length = 0;
     this.getCalls.length = 0;
   }
+}
+
+function appSourceFixture() {
+  const oldBlob = gitObject("blob", encoder.encode("export default 'old';\n"));
+  const oldTree = gitObject("tree", treeObject("index.js", oldBlob.oid));
+  const oldCommit = gitObject("commit", commitObject(oldTree.oid));
+  const newBlob = gitObject("blob", encoder.encode("export default 'new';\n"));
+  const newTree = gitObject("tree", treeObject("index.js", newBlob.oid));
+  const newCommit = gitObject("commit", commitObject(newTree.oid, oldCommit.oid));
+  return {
+    oldCommit: oldCommit.oid,
+    newCommit: newCommit.oid,
+    initialPack: directPack([oldBlob, oldTree, oldCommit]),
+    updatePack: directPack([newBlob, newTree, newCommit]),
+  };
+}
+
+function gitObject(type: "blob" | "tree" | "commit", content: Uint8Array) {
+  const hash = createHash("sha1");
+  hash.update(`${type} ${content.byteLength}\0`);
+  hash.update(content);
+  return { type, content, oid: hash.digest("hex") };
+}
+
+function treeObject(name: string, oid: string): Uint8Array {
+  return concatenate([encoder.encode(`100644 ${name}\0`), bytesFromHex(oid)]);
+}
+
+function commitObject(tree: string, parent?: string): Uint8Array {
+  return encoder.encode(
+    `tree ${tree}\n${parent ? `parent ${parent}\n` : ""}`
+      + "author Nanocodex Apps <apps@nanocodex.dev> 1700000000 +0000\n"
+      + "committer Nanocodex Apps <apps@nanocodex.dev> 1700000000 +0000\n\nBuild app\n",
+  );
+}
+
+function directPack(objects: readonly ReturnType<typeof gitObject>[]): Uint8Array {
+  const header = new Uint8Array(12);
+  header.set(encoder.encode("PACK"));
+  const view = new DataView(header.buffer);
+  view.setUint32(4, 2);
+  view.setUint32(8, objects.length);
+  const chunks: Uint8Array[] = [header];
+  for (const object of objects) {
+    const type = { commit: 1, tree: 2, blob: 3 }[object.type];
+    chunks.push(
+      packObjectHeader(type, object.content.byteLength),
+      new Uint8Array(deflateSync(object.content)),
+    );
+  }
+  const body = concatenate(chunks);
+  return concatenate([body, new Uint8Array(createHash("sha1").update(body).digest())]);
+}
+
+function packObjectHeader(type: number, size: number): Uint8Array {
+  const bytes = [(type << 4) | (size % 16)];
+  let remaining = Math.floor(size / 16);
+  while (remaining > 0) {
+    bytes[bytes.length - 1]! |= 0x80;
+    bytes.push(remaining % 128);
+    remaining = Math.floor(remaining / 128);
+  }
+  return new Uint8Array(bytes);
+}
+
+function bytesFromHex(value: string): Uint8Array {
+  const bytes = new Uint8Array(value.length / 2);
+  for (let index = 0; index < bytes.byteLength; index++) {
+    bytes[index] = Number.parseInt(value.slice(index * 2, index * 2 + 2), 16);
+  }
+  return bytes;
 }
 
 function sourcePack(): Uint8Array {
