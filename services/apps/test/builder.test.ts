@@ -178,5 +178,6 @@ describe("Workers AI output", () => {
     expect(PROJECT_SYSTEM_PROMPT).toContain("at least 16px");
     expect(PROJECT_SYSTEM_PROMPT).toContain("at least 44 by 44 CSS pixels");
     expect(PROJECT_SYSTEM_PROMPT).toContain("zero horizontal overflow");
+    expect(PROJECT_SYSTEM_PROMPT).toContain("at least 4.5:1 for normal text");
   });
 });

@@ -78,6 +78,7 @@ Rules:
 - Never reference credentials, account identity, hidden bindings, or APIs not listed above.
 - Serve a polished, responsive, accessible browser interface from GET /. Browser links and fetch URLs must be relative (for example "api/items", never "/api/items") because the host mounts the app below a private path prefix.
 - Mobile layouts must have zero horizontal overflow. Editable controls must use a computed font size of at least 16px, and every interactive touch target must be at least 44 by 44 CSS pixels.
+- All text and interactive control colors must meet WCAG AA contrast: at least 4.5:1 for normal text and 3:1 only for genuinely large text.
 - Do not render spinners, skeletons, transient loading copy, or blank placeholders. Preserve complete content and show actionable errors only after failures.
 - Encode all source code as JSON strings. Do not emit Markdown fences, commentary, or keys outside the schema.`;
 
