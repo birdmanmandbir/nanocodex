@@ -84,7 +84,13 @@ import { routeBrowserModel } from "./browser-model";
 import { routeAccountLinkRequest } from "./account-links";
 import { routeManagedRealtimeTransport } from "./managed-realtime-transport";
 export { ApiKeyRecord, NonceStorage, UserAccount } from "./account-auth";
-export { MemoryScope, Organization } from "./reserved-durable-objects";
+export { MemoryScope } from "./reserved-durable-objects";
+import {
+  authorizeTeam as authorizeTeamMembership,
+  routeTeamRequest,
+  type TeamAuthorization,
+} from "./organization";
+export { Organization } from "./organization";
 
 const MAX_CLIENT_MESSAGE_BYTES = 1024 * 1024;
 const MAX_ACTIVE_TURNS = 16;
@@ -307,6 +313,11 @@ const json = (body: unknown, init: ResponseInit = {}) => Response.json(body, {
 const MANAGED_APPS_CLIENT_ID = "nanocodex-apps";
 
 export class ManagedAgentEntrypoint extends WorkerEntrypoint<Env, ManagedAgentClientProps> {
+  async authorizeTeam(actorUserId: string, teamId: string): Promise<TeamAuthorization> {
+    if (!this.#isAppsClient()) return { authorized: false };
+    return authorizeTeamMembership(this.env, actorUserId, teamId);
+  }
+
   async createAgent(userId: string, input: ManagedAgentCreateInput): Promise<ManagedAgentRpcResult> {
     if (!this.#isAppsClient()) return rpcForbidden();
     const error = validateRpcOwnerAndOrigin(userId, input);
@@ -601,6 +612,8 @@ export default {
     if (realtimeTransport) return realtimeTransport;
     const accountLink = await routeAccountLinkRequest(request, env, url);
     if (accountLink) return accountLink;
+    const team = await routeTeamRequest(request, env, url);
+    if (team) return team;
     const account = await routeAccountRequest(request, env, url);
     if (account) return account;
     const credential = await routeCredentialRequest(request, env, url);

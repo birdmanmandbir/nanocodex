@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
-import { fetchResponseWithDeadline } from "./deadline";
+import { fetchResponseWithDeadline, withHardDeadline } from "./deadline";
 import { Handler, Kv } from "accounts/server";
+import type { TeamSummary } from "./organization";
 
 const ACCOUNT_COOKIE = "nanocodex_account";
 const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
@@ -8,6 +9,8 @@ const USER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f
 const API_KEY = /^ncx_live_([A-Za-z0-9_-]{12})_([A-Za-z0-9_-]{43})$/;
 const ANONYMOUS_SESSION_TOKEN = /^a_[A-Za-z0-9_-]{43}$/;
 const DEFAULT_OWNERSHIP_IO_TIMEOUT_MS = 10_000;
+const MAX_ORGANIZATION_REFS = 64;
+const TEAM_REVALIDATION_CONCURRENCY = 8;
 const CONNECT_SERVICE_ORIGIN = "https://nanocodex.internal";
 const CONNECT_USER_HEADER = "x-nanocodex-connect-user";
 const accountSessionKey = (token: string) => `session:${token}`;
@@ -22,6 +25,7 @@ export interface AccountAuthEnv {
   NANOCODEX_AUTH: DurableObjectNamespace;
   NANOCODEX_USERS: DurableObjectNamespace<UserAccount>;
   NANOCODEX_API_KEYS: DurableObjectNamespace<ApiKeyRecord>;
+  NANOCODEX_ORGANIZATIONS: DurableObjectNamespace;
 }
 
 export type Principal = Readonly<{
@@ -99,6 +103,9 @@ export async function routeAccountRequest(
         persistent: resolved.persistent,
       },
       authentication: principal.kind,
+      teams: resolved.persistent
+        ? await listRevalidatedTeamSummaries(env, principal.userId)
+        : [],
     }, resolved.cookie ? { headers: { "set-cookie": resolved.cookie } } : undefined);
   }
   if (url.pathname === "/v1/api-keys") {
@@ -195,6 +202,119 @@ export async function listAgents(env: AccountAuthEnv, userId: string): Promise<A
   const response = await env.NANOCODEX_USERS.getByName(userId).fetch("https://user.internal/agents");
   if (!response.ok) throw new Error("agent listing failed");
   return response.json<AgentSummary[]>();
+}
+
+export async function attachOrganization(
+  env: AccountAuthEnv,
+  userId: string,
+  organizationId: string,
+): Promise<"attached" | "existing" | "limit"> {
+  const response = await env.NANOCODEX_USERS.getByName(userId).fetch(
+    "https://user.internal/organizations",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ organizationId }),
+    },
+  );
+  await response.body?.cancel();
+  if (response.status === 409) return "limit";
+  if (!response.ok) throw new Error("organization discovery attachment failed");
+  return response.status === 201 ? "attached" : "existing";
+}
+
+export async function detachOrganization(
+  env: AccountAuthEnv,
+  userId: string,
+  organizationId: string,
+): Promise<void> {
+  const response = await env.NANOCODEX_USERS.getByName(userId).fetch(
+    `https://user.internal/organizations/${organizationId}`,
+    { method: "DELETE" },
+  );
+  await response.body?.cancel();
+  if (!response.ok && response.status !== 404) {
+    throw new Error("organization discovery detachment failed");
+  }
+}
+
+export async function listRevalidatedTeamSummaries(
+  env: AccountAuthEnv,
+  userId: string,
+): Promise<TeamSummary[]> {
+  try {
+    return await withHardDeadline(
+      "team summary revalidation",
+      DEFAULT_OWNERSHIP_IO_TIMEOUT_MS,
+      () => listRevalidatedTeamSummariesWithinDeadline(env, userId),
+    );
+  } catch {
+    return [];
+  }
+}
+
+async function listRevalidatedTeamSummariesWithinDeadline(
+  env: AccountAuthEnv,
+  userId: string,
+): Promise<TeamSummary[]> {
+  let ids: string[];
+  try {
+    const response = await env.NANOCODEX_USERS.getByName(userId).fetch(
+      "https://user.internal/organizations",
+    );
+    if (!response.ok) {
+      await response.body?.cancel();
+      return [];
+    }
+    const value = await response.json<unknown>();
+    ids = Array.isArray(value)
+      ? value.filter((id): id is string => typeof id === "string" && USER_ID.test(id))
+        .slice(0, MAX_ORGANIZATION_REFS)
+      : [];
+  } catch { return []; }
+
+  const summaries: Array<TeamSummary | undefined> = new Array(ids.length);
+  let cursor = 0;
+  await Promise.all(Array.from(
+    { length: Math.min(TEAM_REVALIDATION_CONCURRENCY, ids.length) },
+    async () => {
+      while (cursor < ids.length) {
+        const index = cursor++;
+        const id = ids[index]!;
+        try {
+          const response = await env.NANOCODEX_ORGANIZATIONS.getByName(id).fetch(
+            `https://organization.internal/authority/${userId}`,
+          );
+          if (!response.ok) {
+            await response.body?.cancel();
+            continue;
+          }
+          const value = await response.json<unknown>();
+          if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+          const authorization = value as {
+            authorized?: unknown;
+            team?: { id?: unknown; name?: unknown; created_at?: unknown };
+            membership?: { user_id?: unknown; role?: unknown; joined_at?: unknown };
+          };
+          if (authorization.authorized !== true
+            || authorization.team?.id !== id
+            || typeof authorization.team.name !== "string"
+            || !Number.isSafeInteger(authorization.team.created_at)
+            || authorization.membership?.user_id !== userId
+            || (authorization.membership.role !== "owner"
+              && authorization.membership.role !== "member")
+            || !Number.isSafeInteger(authorization.membership.joined_at)) continue;
+          summaries[index] = {
+            id,
+            name: authorization.team.name,
+            role: authorization.membership.role,
+            created_at: Number(authorization.team.created_at),
+          };
+        } catch { /* Organization authority is fail-closed for discovery. */ }
+      }
+    },
+  ));
+  return summaries.filter((summary): summary is TeamSummary => summary !== undefined);
 }
 
 export async function attachAgent(
@@ -549,6 +669,42 @@ export class UserAccount extends DurableObject<AccountAuthEnv> {
         await this.ctx.storage.put("apiKeys", keys);
         return new Response(null, { status: 204 });
       }
+    }
+    if (url.pathname === "/organizations") {
+      const organizationIds = await this.ctx.storage.get<string[]>("organizationIds") ?? [];
+      if (request.method === "GET") {
+        return json(organizationIds
+          .filter((id) => USER_ID.test(id))
+          .slice(0, MAX_ORGANIZATION_REFS));
+      }
+      if (request.method === "POST") {
+        const body = await request.json<{ organizationId?: unknown }>();
+        const organizationId = typeof body.organizationId === "string"
+          ? body.organizationId.toLowerCase()
+          : "";
+        if (!USER_ID.test(organizationId)) {
+          return json({ error: "invalid_organization" }, { status: 400 });
+        }
+        if (organizationIds.includes(organizationId)) return new Response(null, { status: 200 });
+        if (organizationIds.length >= MAX_ORGANIZATION_REFS) {
+          return json({ error: "organization_limit_reached" }, { status: 409 });
+        }
+        organizationIds.push(organizationId);
+        await this.ctx.storage.put("organizationIds", organizationIds);
+        return new Response(null, { status: 201 });
+      }
+    }
+    const organizationMatch = url.pathname.match(
+      /^\/organizations\/([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/,
+    );
+    if (organizationMatch && request.method === "DELETE") {
+      const organizationIds = await this.ctx.storage.get<string[]>("organizationIds") ?? [];
+      const next = organizationIds.filter((id) => id !== organizationMatch[1]);
+      if (next.length === organizationIds.length) {
+        return json({ error: "not_found" }, { status: 404 });
+      }
+      await this.ctx.storage.put("organizationIds", next);
+      return new Response(null, { status: 204 });
     }
     const keyMatch = url.pathname.match(/^\/api-keys\/([A-Za-z0-9_-]{12})$/);
     if (keyMatch) {

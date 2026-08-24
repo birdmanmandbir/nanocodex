@@ -11,6 +11,9 @@ test("managed browser callbacks bypass the local document fallback", () => {
   assert.equal(isManagedRoutePath("/apps"), true);
   assert.equal(isManagedRoutePath("/apps/"), true);
   assert.equal(isManagedRoutePath("/apps/tiny-app/settings"), true);
+  assert.equal(isManagedRoutePath("/v1/teams"), true);
+  assert.equal(isManagedRoutePath("/v1/teams/team-id/invitations"), true);
+  assert.equal(isManagedRoutePath("/v1/team-invitations/accept"), true);
   assert.equal(isManagedRoutePath("/applications"), false);
   assert.equal(isManagedRoutePath("/apps-evil"), false);
   assert.equal(isManagedRoutePath("/definitely-not-a-route"), false);
@@ -40,6 +43,8 @@ test("projects only the managed product surface through one private binding", as
     "/v1/connectors/x/callback?code=code&state=state",
     "/v1/agents/agent-id/events?cursor=7",
     "/v1/rooms/room-id/ws?cursor=9",
+    "/v1/teams/team-id/members/user-id",
+    "/v1/team-invitations/accept",
     "/apps",
     "/apps/tiny-app?view=settings",
   ]) {

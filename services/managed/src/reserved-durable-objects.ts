@@ -10,5 +10,3 @@ class ReservedDurableObject extends DurableObject {
 }
 
 export class MemoryScope extends ReservedDurableObject {}
-
-export class Organization extends ReservedDurableObject {}
