@@ -11,7 +11,9 @@ use super::protocol::{MemberId, ProtocolError, RoomId, valid_token, validated_di
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const TRANSPORT_ATTEMPTS: usize = 3;
+const CREATE_HTTP_ATTEMPTS: usize = 3;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const CREATE_RETRY_DELAY: Duration = Duration::from_millis(250);
 const DELETE_ATTEMPTS: usize = 3;
 const DELETE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const DELETE_RETRY_DELAY: Duration = Duration::from_millis(250);
@@ -135,7 +137,7 @@ impl RoomApi {
             return Err(RoomError::AuthenticationRequired);
         };
         let url = self.route("v1/rooms")?;
-        let response = send_with_transport_retry(http, url, &create.body).await?;
+        let response = send_create_with_retry(http, url, &create.body).await?;
         if response.status() != StatusCode::CREATED {
             return Err(response_error(response).await);
         }
@@ -690,6 +692,34 @@ async fn send_with_transport_retry(
     )?))
 }
 
+async fn send_create_with_retry(
+    http: &reqwest::Client,
+    url: Url,
+    body: &[u8],
+) -> Result<reqwest::Response, RoomError> {
+    for attempt in 0..CREATE_HTTP_ATTEMPTS {
+        let response = send_with_transport_retry(http, url.clone(), body).await?;
+        if !retryable_create_status(response.status()) || attempt + 1 == CREATE_HTTP_ATTEMPTS {
+            return Ok(response);
+        }
+        response.bytes().await.map_err(RoomError::Transport)?;
+        tokio::time::sleep(CREATE_RETRY_DELAY * (1_u32 << attempt)).await;
+    }
+    Err(RoomError::InvalidReceipt(
+        "room create retry lost its response",
+    ))
+}
+
+fn retryable_create_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
 async fn response_error(response: reqwest::Response) -> RoomError {
     let status = response.status();
     let code = decode_body::<ErrorBody>(response)
@@ -934,6 +964,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_create_retries_transient_http_failure_with_same_identity() {
+        crate::install_tls_provider();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let origin = format!("http://{address}");
+        let state = Arc::new(CreateServerState {
+            create_ids: Mutex::new(Vec::new()),
+            origin: origin.clone(),
+        });
+        let app = Router::new()
+            .route("/v1/rooms", post(create_room_after_500))
+            .with_state(Arc::clone(&state));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let api = RoomApi::authenticated(
+            origin.parse().unwrap(),
+            AccountKey::parse(format!("ncx_live_{}_{}", "a".repeat(12), "b".repeat(43))).unwrap(),
+        )
+        .unwrap();
+
+        let created = api.create("Ada").await.unwrap();
+        assert_eq!(created.receipt.room_id.as_str(), ROOM);
+        let create_ids = state.create_ids.lock().unwrap();
+        assert_eq!(create_ids.len(), 2);
+        assert_eq!(create_ids[0], create_ids[1]);
+        drop(create_ids);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn owner_delete_retries_bounded_cleanup_pending_and_settles() {
         crate::install_tls_provider();
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -1036,9 +1095,13 @@ mod tests {
     async fn create_room(
         State(state): State<Arc<CreateServerState>>,
         Json(request): Json<ObservedCreateRequest>,
-    ) -> impl IntoResponse {
+    ) -> axum::response::Response {
         assert_eq!(request.display_name, "Ada");
         state.create_ids.lock().unwrap().push(request.create_id);
+        create_room_response(&state)
+    }
+
+    fn create_room_response(state: &CreateServerState) -> axum::response::Response {
         let cookie = format!(
             "nanocodex_room_{}={INVITE}; Path=/v1/rooms/{ROOM}; HttpOnly",
             ROOM.replace('-', "")
@@ -1060,5 +1123,25 @@ mod tests {
                 ),
             })),
         )
+            .into_response()
+    }
+
+    async fn create_room_after_500(
+        State(state): State<Arc<CreateServerState>>,
+        Json(request): Json<ObservedCreateRequest>,
+    ) -> axum::response::Response {
+        assert_eq!(request.display_name, "Ada");
+        let mut create_ids = state.create_ids.lock().unwrap();
+        create_ids.push(request.create_id.clone());
+        let first = create_ids.len() == 1;
+        drop(create_ids);
+        if first {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "transient platform failure",
+            )
+                .into_response();
+        }
+        create_room_response(&state)
     }
 }
