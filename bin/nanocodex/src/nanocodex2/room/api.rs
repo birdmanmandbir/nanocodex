@@ -11,7 +11,7 @@ use super::protocol::{MemberId, ProtocolError, RoomId, valid_token, validated_di
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const TRANSPORT_ATTEMPTS: usize = 3;
-const CREATE_HTTP_ATTEMPTS: usize = 3;
+const CREATE_HTTP_ATTEMPTS: usize = 4;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CREATE_RETRY_DELAY: Duration = Duration::from_millis(250);
 const DELETE_ATTEMPTS: usize = 3;
@@ -986,8 +986,12 @@ mod tests {
         let created = api.create("Ada").await.unwrap();
         assert_eq!(created.receipt.room_id.as_str(), ROOM);
         let create_ids = state.create_ids.lock().unwrap();
-        assert_eq!(create_ids.len(), 2);
-        assert_eq!(create_ids[0], create_ids[1]);
+        assert_eq!(create_ids.len(), 4);
+        assert!(
+            create_ids
+                .iter()
+                .all(|create_id| create_id == &create_ids[0])
+        );
         drop(create_ids);
         server.abort();
     }
@@ -1133,9 +1137,9 @@ mod tests {
         assert_eq!(request.display_name, "Ada");
         let mut create_ids = state.create_ids.lock().unwrap();
         create_ids.push(request.create_id.clone());
-        let first = create_ids.len() == 1;
+        let transient = create_ids.len() < 4;
         drop(create_ids);
-        if first {
+        if transient {
             return (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "transient platform failure",
