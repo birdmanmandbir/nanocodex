@@ -8,16 +8,21 @@ system.
 ## Trust and tenancy
 
 The website and managed Worker authenticate the existing persistent passkey
-account. The managed Worker passes the verified user ID to the private
-`AppPlatform` service binding and removes authorization and caller-supplied
-identity headers. API keys are intentionally not accepted for the browser app
-console.
+account. The managed Worker derives a typed personal or team access record and
+passes it to the private `AppPlatform` service binding after removing
+authorization and caller-supplied identity headers. API keys are intentionally
+not accepted for the browser app console.
 
 Every registry is sharded by an opaque tenant ID. Personal tenants use
-`user:<uuid>`. The registry also accepts `team:<id>`, but team selection is not
-enabled until Nanocodex has an authoritative membership service. App metadata,
-build jobs, revisions, state, Git repositories, launch tickets, and mounted
-agents are resolved inside that tenant boundary.
+`user:<uuid>` and teams use `team:<opaque Durable Object ID>`. Only namespace-
+issued team IDs are accepted, so forged selectors cannot allocate Organization
+objects. Organization membership is authoritative; UserAccount team references
+are discovery hints that are revalidated before use. Members may read and run
+team apps, while owners may also build, update, activate, and roll back them.
+App metadata, build jobs, revisions, state, Git repositories, and launch tickets
+are resolved inside that tenant boundary. Shared app state uses the team tenant,
+while mounted agents and provider-backed actions remain owned by the acting
+member.
 
 Launching an app first creates a signed account intent. The runtime establishes
 a high-entropy, HTTP-only browser transaction and returns to the authenticated
@@ -25,6 +30,11 @@ account before the control plane mints a signed, one-use, 60-second ticket. A
 copied ticket cannot be redeemed from a different browser. The runtime session
 cookie is path-scoped to the app's immutable ID, so multiple private apps can
 remain open without sharing ambient authority.
+
+Team authority is checked when the launch completes, when its ticket is
+redeemed, and on every app invocation. Removing a member therefore revokes an
+already-open team app on its next request; membership-service failures fail
+closed without adding that dependency to personal app invocations.
 
 The authenticated runtime page is host-owned. It places generated UI in a
 sandboxed iframe without `allow-same-origin`, using a separate signed URL bound
