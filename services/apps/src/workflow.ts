@@ -51,11 +51,16 @@ type StoredArtifact = Readonly<{
   sourceSummary: string;
 }>;
 
+type BaseSource = Readonly<{
+  expectedParentOid: string;
+  project: GeneratedProject;
+}>;
+
 export class AppBuildWorkflow extends WorkflowEntrypoint<BuildWorkflowEnv, BuildWorkflowParams> {
   async run(event: Readonly<WorkflowEvent<BuildWorkflowParams>>, step: WorkflowStep): Promise<App> {
     const params = event.payload;
     try {
-      const baseProject = await step.do<GeneratedProject | null>(
+      const base = await step.do<BaseSource | null>(
         "load active source",
         async () => this.#loadBaseProject(params.tenantId, params.updateAppId),
       );
@@ -66,7 +71,7 @@ export class AppBuildWorkflow extends WorkflowEntrypoint<BuildWorkflowEnv, Build
           timeout: "5 minutes",
           sensitive: "output",
         },
-        async () => generateProject(this.env.AI, params.prompt, baseProject ?? undefined),
+        async () => generateProject(this.env.AI, params.prompt, base?.project),
       );
       const stored = await step.do<StoredArtifact>(
         "bundle and store immutable artifact",
@@ -86,6 +91,7 @@ export class AppBuildWorkflow extends WorkflowEntrypoint<BuildWorkflowEnv, Build
         async () => commitProject(this.env.APP_GIT, {
           appId: params.updateAppId ?? params.appId,
           createdAt: params.createdAt,
+          expectedParentOid: base?.expectedParentOid ?? null,
           jobId: params.jobId,
           project,
           prompt: params.prompt,
@@ -131,13 +137,16 @@ export class AppBuildWorkflow extends WorkflowEntrypoint<BuildWorkflowEnv, Build
   async #loadBaseProject(
     tenantId: TenantId,
     updateAppId: string | undefined,
-  ): Promise<GeneratedProject | null> {
+  ): Promise<BaseSource | null> {
     if (!updateAppId) return null;
     const base = await getAppBase(this.env.APP_REGISTRY, tenantId, updateAppId);
     if (!base) throw new Error("update target no longer exists");
     const object = await this.env.APP_ARTIFACTS.get(base.revision.artifactKey);
     if (!object) throw new Error("active app artifact is missing");
-    return (await parseArtifact(await object.text())).project;
+    return {
+      expectedParentOid: base.revision.sourceCommitOid,
+      project: (await parseArtifact(await object.text())).project,
+    };
   }
 
   async #buildAndStore(

@@ -27,6 +27,7 @@ export interface AppGitService {
 
 export type CommitProjectInput = Readonly<{
   appId: string;
+  expectedParentOid: string | null;
   jobId: string;
   prompt: string;
   createdAt: string;
@@ -71,8 +72,11 @@ export async function commitProject(
   await prepareRepository(fs, http, remoteUrl);
   const head = await resolveHead(fs);
   if (head && await headBelongsToJob(fs, head, input.jobId)) {
-    await verifyCheckedOutProject(fs, head, desired);
+    await verifyCheckedOutProject(fs, head, input.expectedParentOid, desired);
     return { oid: head, repository };
+  }
+  if (head !== (input.expectedParentOid ?? undefined)) {
+    throw new Error("app repository head does not match the active source revision");
   }
 
   const tracked = new Set(await git.listFiles({ fs, dir: DIRECTORY }));
@@ -118,7 +122,7 @@ export async function commitProject(
   if (await remoteHead(http, remoteUrl) !== oid) {
     throw new Error("app repository did not publish the expected commit");
   }
-  await verifyPublishedProject(service, repository, oid, head, desired);
+  await verifyPublishedProject(service, repository, oid, input.expectedParentOid, desired);
   return { oid, repository };
 }
 
@@ -206,7 +210,7 @@ async function verifyPublishedProject(
   service: AppGitService,
   repository: string,
   expectedOid: string,
-  previousOid: string | undefined,
+  previousOid: string | null,
   desired: ReadonlyMap<string, string>,
 ): Promise<void> {
   const fs = createMemoryGitFs();
@@ -221,14 +225,23 @@ async function verifyPublishedProject(
   if (!previousOid && commit.parent.length !== 0) {
     throw new Error("initial app repository commit has an unexpected parent");
   }
-  await verifyCheckedOutProject(fs, expectedOid, desired);
+  await verifyCheckedOutProject(fs, expectedOid, previousOid, desired);
 }
 
 async function verifyCheckedOutProject(
   fs: ReturnType<typeof createMemoryGitFs>,
   oid: string,
+  expectedParentOid: string | null,
   desired: ReadonlyMap<string, string>,
 ): Promise<void> {
+  const { commit } = await git.readCommit({ fs, dir: DIRECTORY, oid });
+  if (expectedParentOid) {
+    if (commit.parent.length !== 1 || commit.parent[0] !== expectedParentOid) {
+      throw new Error("app repository retry is not the expected direct fast-forward");
+    }
+  } else if (commit.parent.length !== 0) {
+    throw new Error("initial app repository retry has an unexpected parent");
+  }
   const tracked = (await git.listFiles({ fs, dir: DIRECTORY })).sort();
   const expected = [...desired.keys()].sort();
   if (tracked.length !== expected.length || tracked.some((path, index) => path !== expected[index])) {
