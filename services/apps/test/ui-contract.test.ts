@@ -2,7 +2,12 @@
 
 import { describe, expect, it } from "vitest";
 
-import { appLaunchPath, formatBytes, hasCompletedBuild } from "../src/ui/AppsConsole";
+import {
+  appLaunchPath,
+  formatBytes,
+  hasCompletedBuild,
+  workspacePath,
+} from "../src/ui/AppsConsole";
 import consoleSource from "../src/ui/AppsConsole.tsx?raw";
 import mainSource from "../src/ui/main.tsx?raw";
 
@@ -16,12 +21,45 @@ describe("owner console contract", () => {
     expect(`${mainSource}\n${consoleSource}`).not.toMatch(/\b(?:loading|spinner|skeleton|Suspense)\b/i);
   });
 
-  it("builds account-gated launch paths and readable artifact sizes", () => {
-    expect(appLaunchPath("0198e2c4-365e-7a66-a58f-d4e5b46a7dad")).toBe(
-      "/apps/api/apps/0198e2c4-365e-7a66-a58f-d4e5b46a7dad/launch",
+  it("adds one canonical workspace selector to every app operation", () => {
+    const opaqueTeamId = "a".repeat(64);
+    expect(workspacePath("/apps/api/apps", "personal")).toBe(
+      "/apps/api/apps?workspace=personal",
+    );
+    expect(workspacePath("/apps/api/builds/job-one", `team:${opaqueTeamId}`)).toBe(
+      `/apps/api/builds/job-one?workspace=team%3A${opaqueTeamId}`,
+    );
+    expect(appLaunchPath("app-one", `team:${opaqueTeamId}`)).toBe(
+      `/apps/api/apps/app-one/launch?workspace=team%3A${opaqueTeamId}`,
+    );
+    expect(() => workspacePath("/apps/api/apps?workspace=personal", "personal")).toThrow(
+      "workspace selector is already present",
     );
     expect(formatBytes(913)).toBe("913 B");
     expect(formatBytes(1_536)).toBe("1.5 KB");
+  });
+
+  it("keeps team authority and invitations in component state", () => {
+    expect(consoleSource).toContain('requestJson<MeResponse>("/v1/me")');
+    expect(consoleSource).toContain('"/v1/team-invitations/accept"');
+    expect(consoleSource).toContain("setFreshInvitation");
+    expect(consoleSource).toContain("navigator.clipboard.writeText(freshInvitation.token)");
+    expect(consoleSource).not.toMatch(/localStorage|sessionStorage|location\.(?:hash|search)/);
+  });
+
+  it("gates owner mutations while retaining member launch and history", () => {
+    expect(consoleSource).toContain('const canManage = selectedWorkspace === "personal" || selectedTeam?.role === "owner"');
+    expect(consoleSource).toContain("{canManage ? (");
+    expect(consoleSource).toContain("<LaunchApp app={app} workspace={workspace}");
+    expect(consoleSource).toContain("canManage && !isActive");
+  });
+
+  it("threads the selected workspace through list, build, poll, activate, and launch", () => {
+    expect(consoleSource).toContain('workspacePath("/apps/api/apps", workspace)');
+    expect(consoleSource).toContain("workspacePath(`/apps/api/builds/${encodeURIComponent(id)}`, workspace)");
+    expect(consoleSource).toContain('workspacePath("/apps/api/builds", workspace)');
+    expect(consoleSource).toContain("workspacePath(`/apps/api/apps/${encodeURIComponent(app.id)}/activate`, workspace)");
+    expect(consoleSource).toContain("appLaunchPath(app.id, workspace)");
   });
 
   it("detects a published build directly from polled API state", () => {
