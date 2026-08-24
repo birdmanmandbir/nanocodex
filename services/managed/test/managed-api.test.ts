@@ -66,6 +66,12 @@ describe("managed apps trust boundary", () => {
     });
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({
+      access: {
+        actorUserId: appsUserId,
+        tenantId: `user:${appsUserId}`,
+        kind: "personal",
+        role: "owner",
+      },
       authorization: null,
       body: null,
       cookie: `nanocodex_account=${token}`,
@@ -75,6 +81,100 @@ describe("managed apps trust boundary", () => {
       url: "https://example.test/apps/tiny?view=settings",
       userId: appsUserId,
     });
+  });
+
+  it("resolves canonical personal and authoritative team workspaces before delegation", async () => {
+    const ownerId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const memberId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const outsiderId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const ownerToken = "t".repeat(43);
+    const memberToken = "u".repeat(43);
+    const outsiderToken = "v".repeat(43);
+    await Promise.all([
+      seedPasskeySession(ownerId, ownerToken),
+      seedPasskeySession(memberId, memberToken),
+      seedPasskeySession(outsiderId, outsiderToken),
+    ]);
+    const headers = (token: string, mutation = false): HeadersInit => ({
+      cookie: `nanocodex_account=${token}`,
+      ...(mutation ? { "content-type": "application/json", origin: "https://example.test" } : {}),
+    });
+    const created = await RAW_SELF.fetch("https://example.test/v1/teams", {
+      method: "POST",
+      headers: headers(ownerToken, true),
+      body: JSON.stringify({ name: "Apps Team" }),
+    });
+    expect(created.status).toBe(201);
+    const team = (await created.json<{ team: { id: string } }>()).team;
+    expect(team.id).toMatch(/^[0-9a-f]{64}$/);
+    const invited = await RAW_SELF.fetch(`https://example.test/v1/teams/${team.id}/invitations`, {
+      method: "POST",
+      headers: headers(ownerToken, true),
+      body: JSON.stringify({ role: "member" }),
+    });
+    const invitation = (await invited.json<{ invitation: string }>()).invitation;
+    expect((await RAW_SELF.fetch("https://example.test/v1/team-invitations/accept", {
+      method: "POST",
+      headers: headers(memberToken, true),
+      body: JSON.stringify({ invitation }),
+    })).status).toBe(201);
+
+    const personal = await RAW_SELF.fetch(
+      "https://example.test/apps/api/apps?workspace=personal",
+      { headers: headers(ownerToken) },
+    );
+    expect(await personal.json()).toMatchObject({
+      access: {
+        actorUserId: ownerId,
+        tenantId: `user:${ownerId}`,
+        kind: "personal",
+        role: "owner",
+      },
+    });
+
+    for (const [token, actorUserId, role] of [
+      [ownerToken, ownerId, "owner"],
+      [memberToken, memberId, "member"],
+    ] as const) {
+      const response = await RAW_SELF.fetch(
+        `https://example.test/apps/api/apps?workspace=team:${team.id}`,
+        { headers: headers(token) },
+      );
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        access: {
+          actorUserId,
+          tenantId: `team:${team.id}`,
+          kind: "team",
+          role,
+        },
+      });
+    }
+
+    const outsider = await RAW_SELF.fetch(
+      `https://example.test/apps/api/apps?workspace=team:${team.id}`,
+      { headers: headers(outsiderToken) },
+    );
+    expect(outsider.status).toBe(404);
+    expect(await outsider.json()).toEqual({ error: "not_found" });
+
+    for (const suffix of [
+      "",
+      "?workspace=personal&workspace=personal",
+      "?workspace=team:not-canonical",
+    ]) {
+      const invalid = await RAW_SELF.fetch(`https://example.test/apps/api/apps${suffix}`, {
+        headers: headers(ownerToken),
+      });
+      expect(invalid.status).toBe(400);
+      expect(await invalid.json()).toEqual({ error: "invalid_workspace" });
+    }
+    const forged = await RAW_SELF.fetch(
+      `https://example.test/apps/api/apps?workspace=team:${"f".repeat(64)}`,
+      { headers: headers(ownerToken) },
+    );
+    expect(forged.status).toBe(404);
+    expect(await forged.json()).toEqual({ error: "not_found" });
   });
 
   it("requires same-origin mutations and reports a missing apps binding", async () => {
@@ -102,6 +202,12 @@ describe("managed apps trust boundary", () => {
       });
     expect(delegated.status).toBe(200);
     expect(await delegated.json()).toEqual({
+      access: {
+        actorUserId: appsUserId,
+        tenantId: `user:${appsUserId}`,
+        kind: "personal",
+        role: "owner",
+      },
       authorization: null,
       body: { model: "gpt-5" },
       cookie: `nanocodex_account=${token}`,

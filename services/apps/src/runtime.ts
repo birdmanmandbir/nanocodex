@@ -146,13 +146,16 @@ function parseFrameRoute(pathname: string): FrameRoute | undefined {
 
 function beginLaunch(url: URL, env: ConfiguredEnv): Response {
   const intents = url.searchParams.getAll("intent");
-  if (intents.length !== 1 || !isBoundedLaunchTicket(intents[0])) {
+  const workspaces = url.searchParams.getAll("workspace");
+  if (intents.length !== 1 || !isBoundedLaunchTicket(intents[0])
+    || workspaces.length !== 1 || !validWorkspace(workspaces[0])) {
     return failurePage("This app launch request is invalid.", 400);
   }
   const transaction = createLaunchTransaction();
   const target = new URL("/apps/api/launch/complete", env.MANAGED_ORIGIN);
   target.searchParams.set("intent", intents[0]);
   target.searchParams.set("transaction", transaction);
+  target.searchParams.set("workspace", workspaces[0]);
   return new Response(null, {
     status: 303,
     headers: {
@@ -162,6 +165,12 @@ function beginLaunch(url: URL, env: ConfiguredEnv): Response {
       "set-cookie": launchTransactionCookie(transaction),
     },
   });
+}
+
+function validWorkspace(value: string | undefined): boolean {
+  return value === "personal"
+    || (typeof value === "string"
+      && /^team:[0-9a-f]{64}$/.test(value));
 }
 
 async function launch(request: Request, url: URL, env: ConfiguredEnv): Promise<Response> {

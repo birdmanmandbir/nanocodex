@@ -352,8 +352,9 @@ export default {
 const TEST_APP_PLATFORM = `
 import { WorkerEntrypoint } from "cloudflare:workers";
 export class AppPlatform extends WorkerEntrypoint {
-  async request(userId, request) {
+  async request(access, request) {
     return Response.json({
+      access,
       body: request.method === "GET" || request.method === "HEAD" ? null : await request.json(),
       authorization: request.headers.get("authorization"),
       cookie: request.headers.get("cookie"),
@@ -361,7 +362,7 @@ export class AppPlatform extends WorkerEntrypoint {
       origin: request.headers.get("origin"),
       ownerId: request.headers.get("x-nanocodex-owner-id"),
       url: request.url,
-      userId,
+      userId: access.actorUserId,
     });
   }
 }

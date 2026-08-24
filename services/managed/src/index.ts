@@ -135,8 +135,15 @@ export interface Env extends AccountAuthEnv {
 }
 
 export interface AppsServiceBinding extends Fetcher {
-  request(userId: string, request: Request): Promise<Response>;
+  request(access: AppAccess, request: Request): Promise<Response>;
 }
+
+export type AppAccess = Readonly<{
+  actorUserId: string;
+  tenantId: `user:${string}` | `team:${string}`;
+  kind: "personal" | "team";
+  role: "owner" | "member";
+}>;
 
 export type ManagedAgentClientProps = Readonly<{
   clientId: "nanocodex-apps";
@@ -598,6 +605,16 @@ async function rpcResult(response: Response): Promise<ManagedAgentRpcResult> {
   }
 }
 
+function requestedAppWorkspace(url: URL): "personal" | `team:${string}` | undefined {
+  const values = url.searchParams.getAll("workspace");
+  if (values.length === 0 && !url.pathname.startsWith("/apps/api/")) return "personal";
+  if (values.length !== 1) return undefined;
+  if (values[0] === "personal") return "personal";
+  return /^team:[0-9a-f]{64}$/.test(values[0]!)
+    ? values[0] as `team:${string}`
+    : undefined;
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -639,7 +656,31 @@ export default {
       if (!env.NANOCODEX_APPS) {
         return json({ error: "apps_service_unavailable" }, { status: 503 });
       }
-      return env.NANOCODEX_APPS.request(principal.userId, appsRequest);
+      const workspace = requestedAppWorkspace(url);
+      if (!workspace) return json({ error: "invalid_workspace" }, { status: 400 });
+      let access: AppAccess;
+      if (workspace === "personal") {
+        access = {
+          actorUserId: principal.userId,
+          tenantId: `user:${principal.userId}`,
+          kind: "personal",
+          role: "owner",
+        };
+      } else {
+        const authorization = await authorizeTeamMembership(
+          env,
+          principal.userId,
+          workspace.slice("team:".length),
+        );
+        if (!authorization.authorized) return json({ error: "not_found" }, { status: 404 });
+        access = {
+          actorUserId: principal.userId,
+          tenantId: `team:${authorization.team.id}`,
+          kind: "team",
+          role: authorization.membership.role,
+        };
+      }
+      return env.NANOCODEX_APPS.request(access, appsRequest);
     }
     if (request.method === "GET") {
       const asset = webAsset(url.pathname);

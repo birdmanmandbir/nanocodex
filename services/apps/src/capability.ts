@@ -28,6 +28,14 @@ export type ManagedAgentRpcResult = Readonly<{
 }>;
 
 export interface ManagedAgentService {
+  authorizeTeam(actorUserId: string, teamId: string): Promise<Readonly<
+    | { authorized: false }
+    | {
+      authorized: true;
+      team: Readonly<{ id: string; name: string; created_at: number }>;
+      membership: Readonly<{ user_id: string; role: "owner" | "member"; joined_at: number }>;
+    }
+  >>;
   createAgent(userId: string, input: { publicOrigin: string }): Promise<ManagedAgentRpcResult>;
   submitTurn(userId: string, agentId: string, input: {
     id: string;

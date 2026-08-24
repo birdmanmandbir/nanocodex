@@ -54,6 +54,7 @@ const APP_GRANTS = Object.freeze([
   "agents:run",
 ]);
 const USER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const TEAM_ID = /^[0-9a-f]{64}$/;
 const APP_PATH = /^\/a\/([A-Za-z0-9._:-]+)\/([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(\/.*)?$/;
 const TRANSACTION = /^[A-Za-z0-9_-]{22,64}$/;
 
@@ -75,6 +76,13 @@ export interface Env {
 type AppPlatformProps = Readonly<{ clientId: "nanocodex-managed" }>;
 type RuntimePlatformProps = Readonly<{ clientId: "nanocodex-app-runtime" }>;
 
+export type AppAccess = Readonly<{
+  actorUserId: string;
+  tenantId: `user:${string}` | `team:${string}`;
+  kind: "personal" | "team";
+  role: "owner" | "member";
+}>;
+
 type AppLoopbackExports = Readonly<{
   NanocodexCapability(options: { props: CapabilityProps }): Fetcher;
 }>;
@@ -93,13 +101,14 @@ const health = {
 export default health;
 
 export class AppPlatform extends WorkerEntrypoint<Env, AppPlatformProps> {
-  async request(userId: string, request: Request): Promise<Response> {
+  async request(accessInput: AppAccess, request: Request): Promise<Response> {
     if (this.ctx.props.clientId !== "nanocodex-managed") {
       throw new Error("app platform is restricted to the managed account gateway");
     }
     if (!configured(this.env)) return json({ error: "platform_unavailable" }, 503);
-    if (!USER_ID.test(userId)) return json({ error: "unauthorized" }, 401);
-    const tenantId = validateTenantId(`user:${userId}`);
+    const access = validateAppAccess(accessInput);
+    if (!access) return json({ error: "unauthorized" }, 401);
+    const tenantId = validateTenantId(access.tenantId);
     const url = new URL(request.url);
     if (url.pathname !== "/apps" && !url.pathname.startsWith("/apps/")) {
       return json({ error: "not_found" }, 404);
@@ -108,7 +117,8 @@ export class AppPlatform extends WorkerEntrypoint<Env, AppPlatformProps> {
       if (request.headers.get("origin") !== url.origin) return json({ error: "forbidden" }, 403);
     }
     if (url.pathname.startsWith("/apps/api/")) {
-      return routePlatformApi(request, this.env, url, tenantId, userId);
+      if (!workspaceMatchesAccess(url, access)) return json({ error: "invalid_workspace" }, 400);
+      return routePlatformApi(request, this.env, url, tenantId, access);
     }
     if (request.method === "GET" || request.method === "HEAD") {
       return serveConsoleAsset(request, this.env, url);
@@ -123,6 +133,7 @@ export class RuntimePlatform extends WorkerEntrypoint<Env, RuntimePlatformProps>
     if (!configured(this.env)) return null;
     const claims = await verifyLaunchTicket(token, this.env.LAUNCH_TICKET_SECRET);
     if (!claims || claims.transaction !== transaction || !TRANSACTION.test(transaction)) return null;
+    if (!await authorizeClaims(this.env, claims.actorUserId, claims.tenantId)) return null;
     return await consumeLaunchTicket(this.env.APP_LAUNCH_TICKETS, claims) ? claims : null;
   }
 
@@ -136,6 +147,9 @@ export class RuntimePlatform extends WorkerEntrypoint<Env, RuntimePlatformProps>
     const claims = validateFrameSessionClaims(claimsInput);
     if (!claims || !USER_ID.test(claims.actorUserId)) return json({ error: "unauthorized" }, 401);
     const tenantId = validateTenantId(claims.tenantId);
+    if (!await authorizeClaims(this.env, claims.actorUserId, tenantId)) {
+      return json({ error: "not_found" }, 404);
+    }
     const app = await getApp(this.env.APP_REGISTRY, tenantId, claims.appId);
     if (!app || app.slug !== claims.slug || app.ownerId !== tenantId) {
       return json({ error: "not_found" }, 404);
@@ -158,7 +172,7 @@ async function routePlatformApi(
   env: ConfiguredEnv,
   url: URL,
   tenantId: TenantId,
-  actorUserId: string,
+  access: AppAccess,
 ): Promise<Response> {
   try {
     if (url.pathname === "/apps/api/launch/complete" && request.method === "GET") {
@@ -169,8 +183,11 @@ async function routePlatformApi(
         return json({ error: "invalid_launch" }, 400);
       }
       const intent = await verifyLaunchIntent(intents[0], env.LAUNCH_TICKET_SECRET);
-      if (!intent || intent.actorUserId !== actorUserId || intent.tenantId !== tenantId) {
+      if (!intent || intent.actorUserId !== access.actorUserId || intent.tenantId !== tenantId) {
         return json({ error: "invalid_launch" }, 401);
+      }
+      if (!await authorizeClaims(env, intent.actorUserId, intent.tenantId)) {
+        return json({ error: "not_found" }, 404);
       }
       const app = await getApp(env.APP_REGISTRY, tenantId, intent.appId);
       if (!app || app.slug !== intent.slug) return json({ error: "not_found" }, 404);
@@ -187,9 +204,13 @@ async function routePlatformApi(
     }
     if (url.pathname === "/apps/api/apps" && request.method === "GET") {
       const apps = await listApps(env.APP_REGISTRY, tenantId);
-      return json({ apps: apps.map(appView), tenant: { id: tenantId, kind: "personal" } }, 200);
+      return json({
+        apps: apps.map(appView),
+        tenant: { id: tenantId, kind: access.kind, role: access.role },
+      }, 200);
     }
     if (url.pathname === "/apps/api/builds" && request.method === "POST") {
+      if (access.role !== "owner") return json({ error: "forbidden" }, 403);
       const body = await readJson(request);
       if (body instanceof Response) return body;
       const prompt = typeof body.prompt === "string" ? body.prompt.trim() : "";
@@ -250,7 +271,7 @@ async function routePlatformApi(
       const app = await getApp(env.APP_REGISTRY, tenantId, launchMatch[1]);
       if (!app) return json({ error: "not_found" }, 404);
       const launchIntent = await issueLaunchIntent(env.LAUNCH_TICKET_SECRET, {
-        actorUserId,
+        actorUserId: access.actorUserId,
         appId: app.appId,
         slug: app.slug,
         tenantId,
@@ -260,10 +281,12 @@ async function routePlatformApi(
       await recordLaunchIntent(env.APP_LAUNCH_TICKETS, claims);
       const target = new URL("/__auth/begin", env.RUNTIME_ORIGIN);
       target.searchParams.set("intent", launchIntent);
+      target.searchParams.set("workspace", workspaceForAccess(access));
       return redirect(target);
     }
     const activateMatch = url.pathname.match(/^\/apps\/api\/apps\/([A-Za-z0-9._:-]+)\/activate$/);
     if (activateMatch && request.method === "POST") {
+      if (access.role !== "owner") return json({ error: "forbidden" }, 403);
       const body = await readJson(request);
       if (body instanceof Response) return body;
       if (typeof body.revision !== "string" || !/^[0-9a-f]{64}$/.test(body.revision)) {
@@ -296,6 +319,47 @@ async function routePlatformApi(
       error: errorMessage(error),
     }));
     return json({ error: "platform_failure" }, 500);
+  }
+}
+
+function validateAppAccess(value: AppAccess): AppAccess | undefined {
+  if (!value || typeof value !== "object" || !USER_ID.test(value.actorUserId)) return undefined;
+  if (value.kind === "personal") {
+    return value.role === "owner" && value.tenantId === `user:${value.actorUserId}` ? value : undefined;
+  }
+  if (value.kind !== "team" || (value.role !== "owner" && value.role !== "member")) return undefined;
+  const teamId = typeof value.tenantId === "string" && value.tenantId.startsWith("team:")
+    ? value.tenantId.slice("team:".length)
+    : "";
+  return TEAM_ID.test(teamId) ? value : undefined;
+}
+
+function workspaceForAccess(access: AppAccess): "personal" | `team:${string}` {
+  return access.kind === "personal" ? "personal" : access.tenantId as `team:${string}`;
+}
+
+function workspaceMatchesAccess(url: URL, access: AppAccess): boolean {
+  const workspace = url.searchParams.getAll("workspace");
+  return workspace.length === 1 && workspace[0] === workspaceForAccess(access);
+}
+
+async function authorizeClaims(
+  env: ConfiguredEnv,
+  actorUserId: string,
+  tenantId: string,
+): Promise<boolean> {
+  if (!USER_ID.test(actorUserId)) return false;
+  if (tenantId === `user:${actorUserId}`) return true;
+  const teamId = tenantId.startsWith("team:") ? tenantId.slice("team:".length) : "";
+  if (!TEAM_ID.test(teamId)) return false;
+  try {
+    const authorization = await env.NANOCODEX_AGENTS.authorizeTeam(actorUserId, teamId);
+    return authorization.authorized === true
+      && authorization.team.id === teamId
+      && authorization.membership.user_id === actorUserId
+      && (authorization.membership.role === "owner" || authorization.membership.role === "member");
+  } catch {
+    return false;
   }
 }
 
@@ -447,6 +511,7 @@ function configured(env: Env): env is ConfiguredEnv {
     && typeof env.APP_STATE?.get === "function"
     && typeof env.LOADER?.get === "function"
     && typeof env.NANOCODEX_AGENTS?.createAgent === "function"
+    && typeof env.NANOCODEX_AGENTS?.authorizeTeam === "function"
     && typeof env.AI?.run === "function";
 }
 

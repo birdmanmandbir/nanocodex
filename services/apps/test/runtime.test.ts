@@ -98,13 +98,14 @@ describe("public dynamic app runtime", () => {
     const platform = new FakePlatform();
     const intent = await issueLaunchIntent(CONTROL_SECRET, IDENTITY);
     const begin = await runtime.fetch(
-      new Request(`https://apps.example.test/__auth/begin?intent=${intent}`),
+      new Request(`https://apps.example.test/__auth/begin?intent=${intent}&workspace=personal`),
       environment(platform),
     );
     expect(begin.status).toBe(303);
     const completion = new URL(begin.headers.get("location")!);
     expect(completion.origin).toBe("https://nanocodex.example.test");
     expect(completion.pathname).toBe("/apps/api/launch/complete");
+    expect(completion.searchParams.get("workspace")).toBe("personal");
     const transaction = completion.searchParams.get("transaction")!;
     expect(begin.headers.get("set-cookie")).toContain(`${LAUNCH_TRANSACTION_COOKIE}=${transaction}`);
 
@@ -147,6 +148,31 @@ describe("public dynamic app runtime", () => {
     ), environment(platform));
     expect(invalid.status).toBe(401);
     expect(invalid.headers.get("set-cookie")).toBeNull();
+  });
+
+  it("round-trips only one canonical workspace selector through launch completion", async () => {
+    const intent = await issueLaunchIntent(CONTROL_SECRET, IDENTITY);
+    for (const query of [
+      `intent=${intent}`,
+      `intent=${intent}&workspace=personal&workspace=personal`,
+      `intent=${intent}&workspace=team:not-canonical`,
+      `intent=${intent}&workspace=team:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa`,
+    ]) {
+      const response = await runtime.fetch(
+        new Request(`https://apps.example.test/__auth/begin?${query}`),
+        environment(),
+      );
+      expect(response.status).toBe(400);
+    }
+
+    const teamWorkspace = `team:${"a".repeat(64)}`;
+    const accepted = await runtime.fetch(
+      new Request(`https://apps.example.test/__auth/begin?intent=${intent}&workspace=${teamWorkspace}`),
+      environment(),
+    );
+    expect(accepted.status).toBe(303);
+    expect(new URL(accepted.headers.get("location")!).searchParams.get("workspace"))
+      .toBe(teamWorkspace);
   });
 
   it("serves only a trusted host document for an authenticated app route", async () => {
