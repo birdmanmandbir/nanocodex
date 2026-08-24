@@ -205,6 +205,9 @@ async function invokeFrame(request: Request, env: ConfiguredEnv, route: FrameRou
   if (!claims || claims.appId !== route.appId || claims.slug !== route.slug) {
     return json({ error: "unauthorized" }, 401);
   }
+  if (request.headers.get("sec-fetch-dest") === "document") {
+    return failurePage("Open this private app through its Nanocodex app window.", 403);
+  }
   if (request.method === "OPTIONS") return framePreflight(request);
   if (cookieValue(request, frameSessionCookieName(route.appId)) !== claims.transaction) {
     return json({ error: "unauthorized" }, 401);
@@ -276,6 +279,7 @@ async function frameResponse(response: Response, runtimeOrigin: string): Promise
     "base-uri 'none'",
     `frame-ancestors ${source}`,
     `navigate-to ${source}`,
+    "sandbox allow-forms allow-modals allow-scripts",
   ].join("; "));
   headers.set("cross-origin-resource-policy", "same-site");
   headers.set("permissions-policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()");

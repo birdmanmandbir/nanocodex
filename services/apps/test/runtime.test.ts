@@ -213,11 +213,28 @@ describe("public dynamic app runtime", () => {
     expect(response.headers.get("access-control-allow-origin")).toBe("null");
     expect(response.headers.get("content-security-policy")).toContain("worker-src 'none'");
     expect(response.headers.get("content-security-policy")).toContain("connect-src https://apps.example.test");
+    expect(response.headers.get("content-security-policy"))
+      .toContain("sandbox allow-forms allow-modals allow-scripts");
     expect(response.headers.get("x-frame-options")).toBe("SAMEORIGIN");
 
     const copied = await runtime.fetch(new Request(url), environment(platform));
     expect(copied.status).toBe(401);
     expect(platform.invocations).toHaveLength(1);
+  });
+
+  it("refuses to execute a retained authenticated frame URL as a top-level document", async () => {
+    const platform = new FakePlatform();
+    const response = await runtime.fetch(new Request(await frameUrl("/"), {
+      headers: {
+        accept: "text/html",
+        cookie: frameCookieHeader(),
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "same-origin",
+      },
+    }), environment(platform));
+    expect(response.status).toBe(403);
+    expect(platform.invocations).toHaveLength(0);
   });
 
   it("preflights only the bounded headers used by generated app APIs", async () => {

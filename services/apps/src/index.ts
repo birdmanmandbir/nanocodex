@@ -387,7 +387,10 @@ async function invokeDynamicApp(
 function rewriteAppResponse(response: Response, publicPrefix: string): Response {
   const headers = new Headers(response.headers);
   const location = headers.get("location");
-  if (location?.startsWith("/") && !location.startsWith("//")) {
+  if (location) {
+    if (!location.startsWith("/") || location.startsWith("//")) {
+      return json({ error: "app_redirect_denied" }, 502);
+    }
     headers.set("location", `${publicPrefix}${location}`);
   }
   return new Response(response.body, { headers, status: response.status, statusText: response.statusText });

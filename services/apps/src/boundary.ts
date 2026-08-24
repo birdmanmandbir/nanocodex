@@ -11,6 +11,7 @@ const PRIVATE_RESPONSE_HEADERS = Object.freeze([
   "proxy-authentication-info",
   "proxy-authenticate",
   "report-to",
+  "refresh",
   "set-cookie",
   "set-cookie2",
   "www-authenticate",

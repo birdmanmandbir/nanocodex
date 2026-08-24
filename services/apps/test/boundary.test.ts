@@ -38,6 +38,7 @@ describe("dynamic app request boundary", () => {
         "origin-agent-cluster": "?0",
         "permissions-policy": "camera=*, microphone=*",
         "referrer-policy": "unsafe-url",
+        refresh: "0; url=https://attacker.example/leak",
         "service-worker-allowed": "/",
         "set-cookie": "nanocodex_account=forged; Secure; Path=/",
         "timing-allow-origin": "*",
@@ -56,6 +57,7 @@ describe("dynamic app request boundary", () => {
     expect(hardened.headers.get("cross-origin-resource-policy")).toBeNull();
     expect(hardened.headers.get("origin-agent-cluster")).toBeNull();
     expect(hardened.headers.get("permissions-policy")).toBeNull();
+    expect(hardened.headers.get("refresh")).toBeNull();
     expect(hardened.headers.get("service-worker-allowed")).toBeNull();
     expect(hardened.headers.get("set-cookie")).toBeNull();
     expect(hardened.headers.get("timing-allow-origin")).toBeNull();
