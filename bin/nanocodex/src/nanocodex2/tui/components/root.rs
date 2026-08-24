@@ -2585,7 +2585,7 @@ impl Component for RootNode {
                 )
             }
             RootEvent::ReviewReady(url) => {
-                self.review_url = Some(url.clone());
+                self.review_url = Some(url);
                 self.update_composer(
                     ComposerEvent::ReviewWaiting {
                         waiting: true,

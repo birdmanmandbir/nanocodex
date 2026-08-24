@@ -1,21 +1,22 @@
 // Modified from clabby/tact@a2de8ae1e0b6ce8d8f0a251a9d681dc430b247aa for Nanocodex2.
 // SPDX-License-Identifier: Apache-2.0
 
-
 //! Criterion baselines for foundational TUI operations.
 
 #![allow(dead_code, unused_imports)]
 
+#[path = "../client.rs"]
+pub(crate) mod client;
 #[path = "../app/config.rs"]
 pub(crate) mod config;
+#[path = "../engine/mod.rs"]
+pub(crate) mod engine;
 #[path = "../app/error.rs"]
 pub(crate) mod error;
 #[path = "../app/installation.rs"]
 pub(crate) mod installation;
-#[path = "../app/secret.rs"]
-pub(crate) mod secret;
 mod app {
-    pub(crate) use crate::{config, error, installation, secret};
+    pub(crate) use crate::{config, error, installation};
 }
 
 mod core {
@@ -474,28 +475,7 @@ fn write_mixed_session_segment(config_path: &Path, session_id: &str, workspace: 
 }
 
 fn save_benchmark_checkpoint(config_path: &Path, session_id: &str) {
-    let snapshot = serde_json::from_value(json!({
-        "version": 1,
-        "model": nanocodex::oai::MODEL,
-        "lineage_id": session_id,
-        "prompt_cache_key": "benchmark-cache-key",
-        "workspace": "/benchmark-workspace",
-        "request_prefix": [
-            {"type": "additional_tools", "role": "developer", "tools": []},
-            {"type": "message", "role": "developer", "content": []}
-        ],
-        "canonical_context": {
-            "type": "message",
-            "role": "user",
-            "content": [{"type": "input_text", "text": "benchmark"}]
-        },
-        "history": [{
-            "type": "message",
-            "role": "user",
-            "content": [{"type": "input_text", "text": "benchmark"}]
-        }]
-    }))
-    .unwrap();
+    let snapshot = session::ManagedSessionSnapshot::new(format!("benchmark-agent-{session_id}"));
     let resume_state =
         session::encode_checkpoint(&snapshot, "benchmark instructions", false).unwrap();
     storage::SessionStorage::open(config_path)

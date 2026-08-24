@@ -817,7 +817,7 @@ async fn steer_turn(
         .filter(|(key, _)| key.pane == pane)
         .collect::<Vec<_>>();
     active.sort_unstable_by_key(|(key, _)| key.id);
-    for (_, control) in active {
+    if let Some((_, control)) = active.into_iter().next() {
         match control.steer(memory_review.steer_prompt(&prompt)).await {
             Ok(()) => {
                 drop(updates.send(WorkerEvent::SteerAdmitted { pane, queue_id }));

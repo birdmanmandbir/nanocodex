@@ -1,4 +1,15 @@
 //! Nanocodex2: the Tact-parity terminal client for managed Nanocodex agents.
+#![allow(
+    dead_code,
+    unused_imports,
+    reason = "the pinned Tact parity surface includes benchmark and managed-capability entry points outside the default CLI graph"
+)]
+#![allow(
+    clippy::missing_const_for_fn,
+    clippy::too_many_arguments,
+    clippy::use_self,
+    reason = "preserve the reviewed Tact component ownership and signatures while adapting only its engine boundary"
+)]
 
 mod app;
 mod client;
@@ -477,12 +488,12 @@ async fn run_turn(client: &ManagedClient, command: Run) -> Result<(), ManagedErr
         .await?;
     let accepted_turn_id = accepted.turn_id.clone();
 
-    if let Some(terminal) = accepted.terminal {
-        if let Some(result) = terminal.terminal_result(&accepted_turn_id) {
-            let final_message = result?;
-            eprintln!("{final_message}");
-            return Ok(());
-        }
+    if let Some(terminal) = accepted.terminal
+        && let Some(result) = terminal.terminal_result(&accepted_turn_id)
+    {
+        let final_message = result?;
+        eprintln!("{final_message}");
+        return Ok(());
     }
 
     let cursor = EventCursor::parse(accepted.accepted_cursor)?;
@@ -503,12 +514,10 @@ async fn run_turn(client: &ManagedClient, command: Run) -> Result<(), ManagedErr
         }
         let belongs_to_turn = event.turn_id.as_deref() == Some(&accepted_turn_id)
             || event.data.turn_id() == Some(&accepted_turn_id);
-        if belongs_to_turn {
-            if let Some(result) = event.data.terminal_result(&accepted_turn_id) {
-                let final_message = result?;
-                eprintln!("{final_message}");
-                return Ok(());
-            }
+        if belongs_to_turn && let Some(result) = event.data.terminal_result(&accepted_turn_id) {
+            let final_message = result?;
+            eprintln!("{final_message}");
+            return Ok(());
         }
     }
 }
