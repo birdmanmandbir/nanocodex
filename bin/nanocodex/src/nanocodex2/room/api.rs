@@ -184,19 +184,30 @@ impl RoomApi {
         })
     }
 
-    /// Deletes an account-owned room without exposing its owner capability.
+    /// Deletes an account-owned room using its retained owner capability
+    /// without exposing that capability.
     ///
     /// Deletion is settled by either 204 or 404. A 503 means durable child
     /// cleanup is still pending, so it is retried a small, bounded number of
     /// times; other HTTP and transport failures remain typed for the caller.
-    pub(crate) async fn delete_owned_room(&self, room_id: &RoomId) -> Result<(), RoomError> {
+    pub(crate) async fn delete_owned_room(&self, owner: &CreatedRoom) -> Result<(), RoomError> {
         let Some(http) = self.account_http.as_ref() else {
             return Err(RoomError::AuthenticationRequired);
         };
+        if owner.origin.origin() != self.base_url.origin() {
+            return Err(RoomError::Configuration(
+                "room owner origin does not match the managed origin".to_owned(),
+            ));
+        }
+        let mut cookie = reqwest::header::HeaderValue::from_str(owner.cookie.as_str())
+            .map_err(|_| RoomError::InvalidReceipt("room owner cookie is invalid"))?;
+        cookie.set_sensitive(true);
+        let room_id = owner.receipt.room_id();
         let url = self.route(&format!("v1/rooms/{room_id}"))?;
         for attempt in 0..DELETE_ATTEMPTS {
             let response = http
                 .delete(url.clone())
+                .header(header::COOKIE, cookie.clone())
                 .timeout(DELETE_REQUEST_TIMEOUT)
                 .send()
                 .await
@@ -768,8 +779,11 @@ mod tests {
     use reqwest::header::{HeaderMap, HeaderValue, SET_COOKIE};
     use serde_json::json;
 
-    use super::super::protocol::RoomId;
-    use super::{AccountKey, MembershipCookie, RoomApi, RoomInvitation};
+    use super::super::protocol::{MemberId, RoomId};
+    use super::{
+        AccountKey, CreateReceipt, CreatedRoom, MembershipCookie, RoomApi, RoomInvitation,
+        RoomMembership,
+    };
 
     const ROOM: &str =
         "0198d214-0d9d-7a45-8a89-123456789abc~AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -851,9 +865,8 @@ mod tests {
         )
         .unwrap();
 
-        api.delete_owned_room(&RoomId::parse(ROOM).unwrap())
-            .await
-            .unwrap();
+        let owner = test_owner(&format!("http://{address}"));
+        api.delete_owned_room(&owner).await.unwrap();
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
         server.abort();
     }
@@ -874,10 +887,38 @@ mod tests {
         )
         .unwrap();
 
-        api.delete_owned_room(&RoomId::parse(ROOM).unwrap())
-            .await
-            .unwrap();
+        let owner = test_owner(&format!("http://{address}"));
+        api.delete_owned_room(&owner).await.unwrap();
         server.abort();
+    }
+
+    fn test_owner(origin: &str) -> CreatedRoom {
+        let room_id = RoomId::parse(ROOM).unwrap();
+        let member_id: MemberId =
+            serde_json::from_str("\"0198d214-0d9d-7a45-8a89-123456789abd\"").unwrap();
+        let invitation =
+            RoomInvitation::parse(format!("{origin}/multiplayer?room={ROOM}#invite={INVITE}"))
+                .unwrap();
+        RoomMembership {
+            receipt: CreateReceipt {
+                room_id: room_id.clone(),
+                member_id,
+                websocket_url: format!(
+                    "{}/v1/rooms/{ROOM}/ws",
+                    origin
+                        .replace("http://", "ws://")
+                        .replace("https://", "wss://")
+                )
+                .parse()
+                .unwrap(),
+                invitation,
+            },
+            cookie: MembershipCookie(format!(
+                "nanocodex_room_{}={INVITE}",
+                room_id.as_str().replace('-', "")
+            )),
+            origin: origin.parse().unwrap(),
+        }
     }
 
     async fn delete_room(
@@ -885,6 +926,7 @@ mod tests {
         headers: AxumHeaderMap,
     ) -> impl IntoResponse {
         assert!(headers.contains_key(axum::http::header::AUTHORIZATION));
+        assert!(headers.contains_key(axum::http::header::COOKIE));
         if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
             (
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,

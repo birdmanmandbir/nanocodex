@@ -19,7 +19,7 @@ use url::Url;
 
 use super::room::{
     AccountKey, CreatedRoom, JoinedRoom, MessageId, RoomApi, RoomConnection, RoomCursor, RoomError,
-    RoomEventMessage, RoomEvents, RoomId, RoomServerMessage, RoomTarget,
+    RoomEventMessage, RoomEvents, RoomServerMessage, RoomTarget,
 };
 
 const MAX_ROOMS: usize = 8;
@@ -349,9 +349,15 @@ async fn create_rooms(
                 api.create(&format!("saturation-owner-{ordinal:02}")),
             )
             .await;
-            if let Ok(Ok(room)) = &result {
-                ledger.register(room.receipt().room_id().clone());
-            }
+            let result = match result {
+                Ok(Ok(room)) => {
+                    let owner = Arc::new(room);
+                    ledger.register(Arc::clone(&owner));
+                    Ok(Ok(owner))
+                }
+                Ok(Err(error)) => Ok(Err(error)),
+                Err(elapsed) => Err(elapsed),
+            };
             (ordinal, started.elapsed(), result)
         });
     }
@@ -363,7 +369,7 @@ async fn create_rooms(
                 record_lock(record).operations.create.succeed(elapsed);
                 rooms.push(RoomState {
                     ordinal,
-                    owner: Arc::new(owner),
+                    owner,
                     guests: Vec::new(),
                 });
             }
@@ -1106,31 +1112,38 @@ async fn replay_one(
     })
 }
 
-#[derive(Default)]
-struct CleanupLedger {
-    rooms: Mutex<Vec<RoomId>>,
+struct CleanupLedger<T = CreatedRoom> {
+    rooms: Mutex<Vec<Arc<T>>>,
 }
 
-impl CleanupLedger {
-    fn register(&self, room_id: RoomId) {
+impl<T> Default for CleanupLedger<T> {
+    fn default() -> Self {
+        Self {
+            rooms: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl<T> CleanupLedger<T> {
+    fn register(&self, room: Arc<T>) {
         self.rooms
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(room_id);
+            .push(room);
     }
 
-    fn snapshot(&self) -> Vec<RoomId> {
+    fn snapshot(&self) -> Vec<Arc<T>> {
         self.rooms
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
 
-    fn settle(&self, room_id: &RoomId) {
+    fn retain(&self, retain: impl FnMut(&Arc<T>) -> bool) {
         self.rooms
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .retain(|pending| pending != room_id);
+            .retain(retain);
     }
 
     fn len(&self) -> usize {
@@ -1138,6 +1151,12 @@ impl CleanupLedger {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .len()
+    }
+}
+
+impl CleanupLedger<CreatedRoom> {
+    fn settle(&self, owner: &CreatedRoom) {
+        self.retain(|pending| pending.receipt().room_id() != owner.receipt().room_id());
     }
 }
 
@@ -1653,11 +1672,12 @@ mod tests {
             "0198d214-0d9d-7a45-8a89-123456789abc~AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         )
         .unwrap();
-        let ledger = CleanupLedger::default();
-        ledger.register(room.clone());
+        let room = std::sync::Arc::new(room);
+        let ledger = CleanupLedger::<RoomId>::default();
+        ledger.register(std::sync::Arc::clone(&room));
         assert_eq!(ledger.len(), 1);
-        assert_eq!(ledger.snapshot(), vec![room.clone()]);
-        ledger.settle(&room);
+        assert_eq!(ledger.snapshot(), vec![std::sync::Arc::clone(&room)]);
+        ledger.retain(|pending| pending != &room);
         assert_eq!(ledger.len(), 0);
     }
 
