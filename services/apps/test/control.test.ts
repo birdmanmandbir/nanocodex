@@ -25,9 +25,10 @@ vi.mock("cloudflare:workers", () => ({
 
 let AppPlatform: typeof import("../src/index").AppPlatform;
 let RuntimePlatform: typeof import("../src/index").RuntimePlatform;
+let controlWorker: typeof import("../src/index").default;
 
 beforeAll(async () => {
-  ({ AppPlatform, RuntimePlatform } = await import("../src/index"));
+  ({ AppPlatform, RuntimePlatform, default: controlWorker } = await import("../src/index"));
 });
 
 const USER_ID = "0198e2c4-365e-7a66-a58f-d4e5b46a7dad";
@@ -95,6 +96,7 @@ function configuredEnv(overrides: Partial<Env> = {}): Env {
       idFromName: vi.fn((tenantId: string) => tenantId),
     } as unknown as Env["APP_REGISTRY"],
     APP_STATE: { get: vi.fn(), idFromName: vi.fn() } as unknown as Env["APP_STATE"],
+    ASSETS: { fetch: vi.fn(async () => new Response("console")) } as unknown as Fetcher,
     LAUNCH_TICKET_SECRET: TICKET_SECRET,
     LOADER: { get: vi.fn() } as unknown as WorkerLoader,
     NANOCODEX_AGENTS: {
@@ -121,6 +123,17 @@ function runtimeGateway(env: Env, ctx: Record<string, unknown> = {}) {
 }
 
 describe("tenant app control plane", () => {
+  it("serves console assets through the default service-binding entrypoint", async () => {
+    const env = configuredEnv();
+    const response = await controlWorker.fetch!(
+      new Request("https://assets.local/index.html"),
+      env,
+    );
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe("console");
+    expect(env.ASSETS.fetch).toHaveBeenCalledWith(expect.objectContaining({ method: "GET" }));
+  });
+
   it("derives the personal tenant from managed identity and starts a durable build", async () => {
     const env = configuredEnv();
     const gateway = appGateway(env);

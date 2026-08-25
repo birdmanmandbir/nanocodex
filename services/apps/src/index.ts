@@ -66,6 +66,7 @@ export interface Env {
   APP_LAUNCH_TICKETS: DurableObjectNamespace<LaunchTicketStore>;
   APP_REGISTRY: DurableObjectNamespace<AppRegistry>;
   APP_STATE: DurableObjectNamespace<AppState>;
+  ASSETS: Fetcher;
   LAUNCH_TICKET_SECRET?: string;
   LOADER: WorkerLoader;
   NANOCODEX_AGENTS: ManagedAgentService;
@@ -89,11 +90,14 @@ type AppLoopbackExports = Readonly<{
 const health = {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname !== "/__health" || request.method !== "GET") {
-      return json({ error: "not_found" }, 404);
+    if (url.pathname === "/__health" && request.method === "GET") {
+      const ready = configured(env);
+      return json({ ready, runtime: "dynamic-app-control" }, ready ? 200 : 503);
     }
-    const ready = configured(env);
-    return json({ ready, runtime: "dynamic-app-control" }, ready ? 200 : 503);
+    if (request.method === "GET" || request.method === "HEAD") {
+      return env.ASSETS.fetch(request);
+    }
+    return json({ error: "not_found" }, 404);
   },
 } satisfies ExportedHandler<Env>;
 
