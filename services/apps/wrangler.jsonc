@@ -30,7 +30,7 @@
   "services": [
     {
       "binding": "APP_GIT",
-      "service": "nanocodex",
+      "service": "nanocodex-dynamic-apps-branch-poc",
       "entrypoint": "AppGitService",
       "props": { "clientId": "nanocodex-apps" }
     },
