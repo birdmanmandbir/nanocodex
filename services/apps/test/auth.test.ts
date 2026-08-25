@@ -11,6 +11,8 @@ import {
   RUNTIME_SESSION_TTL_SECONDS,
   cookieValue,
   expiredRuntimeSessionCookie,
+  frameSessionCookie,
+  frameSessionCookieName,
   isSameOriginPost,
   issueFrameSession,
   issueLaunchIntent,
@@ -117,6 +119,16 @@ describe("dynamic app authentication", () => {
       transaction: TRANSACTION,
     });
     expect(await verifyRuntimeSession(token, RUNTIME_SECRET, now)).toBeUndefined();
+  });
+
+  it("allows the opaque app frame to send only its path-scoped session cookie", () => {
+    const header = frameSessionCookie(IDENTITY.appId, TRANSACTION);
+    expect(header).toContain(`${frameSessionCookieName(IDENTITY.appId)}=${TRANSACTION}`);
+    expect(header).toContain("Path=/__frame/");
+    expect(header).toContain("HttpOnly");
+    expect(header).toContain("Secure");
+    expect(header).toContain("SameSite=None");
+    expect(header).not.toContain("Domain=");
   });
 
   it("marks runtime cookies host-only and clears only the runtime cookie", async () => {

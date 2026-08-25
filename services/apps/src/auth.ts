@@ -232,7 +232,13 @@ export function frameSessionCookieName(appId: string): string {
 
 export function frameSessionCookie(appId: string, transaction: string): string {
   if (!NONCE.test(transaction)) throw new TypeError("invalid frame transaction");
-  return hostCookie(frameSessionCookieName(appId), transaction, FRAME_SESSION_TTL_SECONDS, "/__frame/");
+  return hostCookie(
+    frameSessionCookieName(appId),
+    transaction,
+    FRAME_SESSION_TTL_SECONDS,
+    "/__frame/",
+    "None",
+  );
 }
 
 export function isSameOriginPost(request: Request): boolean {
@@ -412,8 +418,14 @@ function validSecret(secret: string): boolean {
   return length >= 32 && length <= MAX_SECRET_BYTES;
 }
 
-function hostCookie(name: string, token: string, maxAge: number, path: string): string {
-  return `${name}=${token}; Path=${path}; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=Lax`;
+function hostCookie(
+  name: string,
+  token: string,
+  maxAge: number,
+  path: string,
+  sameSite: "Lax" | "None" = "Lax",
+): string {
+  return `${name}=${token}; Path=${path}; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=${sameSite}`;
 }
 
 function expiredHostCookie(name: string, path: string): string {
