@@ -23,6 +23,6 @@
     }
   ],
   "vars": {
-    "MANAGED_ORIGIN": "https://nanocodex.gakonst.workers.dev"
+    "MANAGED_ORIGIN": "https://nanocodex-dynamic-apps-branch-poc.gakonst.workers.dev"
   }
 }
