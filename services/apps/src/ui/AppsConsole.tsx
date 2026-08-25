@@ -83,6 +83,7 @@ type AppsResponse = Readonly<{
 
 type JobResponse = Readonly<{ job: BuildJob }>;
 type ActivateResponse = Readonly<{ app: GeneratedApp }>;
+type LaunchResponse = Readonly<{ launch_url: string }>;
 type TeamResponse = Readonly<{ team: Team; replayed?: boolean }>;
 type MembersResponse = Readonly<{ data: readonly TeamMember[] }>;
 type InvitationResponse = Readonly<{
@@ -772,7 +773,34 @@ function LaunchApp({ app, workspace, className, label }: Readonly<{
   className: string;
   label: string;
 }>) {
-  return <form action={appLaunchPath(app.id, workspace)} method="post" target="_blank"><button className={className} type="submit">{label} <span aria-hidden="true">↗</span></button></form>;
+  const [opening, setOpening] = useState(false);
+  const [failure, setFailure] = useState<string>();
+  const launch = async () => {
+    if (opening) return;
+    const popup = window.open("about:blank", "_blank");
+    if (!popup) {
+      setFailure("Your browser blocked the app window. Allow popups for Nanocodex and try again.");
+      return;
+    }
+    popup.opener = null;
+    setOpening(true);
+    setFailure(undefined);
+    try {
+      const response = await requestJson<LaunchResponse>(
+        appLaunchPath(app.id, workspace),
+        jsonMutation("POST", {}),
+      );
+      const target = new URL(response.launch_url);
+      if (target.protocol !== "https:") throw new Error("The app runtime returned an unsafe launch URL.");
+      popup.location.replace(target.href);
+    } catch (error) {
+      popup.close();
+      setFailure(actionableError(error, "The app could not be opened."));
+    } finally {
+      setOpening(false);
+    }
+  };
+  return <div className="launch-action"><button className={className} type="button" disabled={opening} onClick={() => void launch()}>{label} <span aria-hidden="true">↗</span></button>{failure ? <p role="alert">{failure}</p> : null}</div>;
 }
 
 function mergeTeam(teams: readonly Team[], team: Team): readonly Team[] {

@@ -544,8 +544,25 @@ button:disabled {
   border-bottom: 1px solid var(--line);
 }
 
-.app-card-header form,
+.app-card-header .launch-action,
 .job-card form { margin: 0; }
+
+.launch-action {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.launch-action p {
+  max-width: 28rem;
+  margin: 0;
+  color: #ffb8bb;
+  font-size: 0.78rem;
+  line-height: 1.4;
+  text-align: right;
+}
 
 .app-identity { display: flex; min-width: 0; align-items: center; gap: 14px; }
 
@@ -739,7 +756,9 @@ footer {
   .composer-footer { align-items: stretch; flex-direction: column; padding: 13px; }
   .primary-button { width: 100%; }
   .app-card-header { align-items: stretch; flex-direction: column; padding: 20px; }
-  .app-card-header form, .launch-button { width: 100%; }
+  .app-card-header .launch-action, .launch-button { width: 100%; }
+  .launch-action { align-items: stretch; }
+  .launch-action p { max-width: none; text-align: left; }
   .app-meta, .update-form { padding-right: 20px; padding-left: 20px; }
   .revision-history summary, .revision-history ol { padding-right: 20px; padding-left: 20px; }
   .revision-history li { align-items: flex-start; flex-direction: column; }

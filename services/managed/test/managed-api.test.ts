@@ -54,6 +54,11 @@ describe("managed apps trust boundary", () => {
     const consoleDocument = await RAW_SELF.fetch("https://example.test/apps/");
     expect(consoleDocument.status).toBe(200);
     expect(await consoleDocument.text()).toBe("apps console");
+    const launchCompletion = await RAW_SELF.fetch(
+      "https://example.test/apps/api/launch/complete?intent=signed&transaction=transaction-nonce-12345678&workspace=personal",
+    );
+    expect(launchCompletion.status).toBe(200);
+    expect(await launchCompletion.json()).toEqual({ completed: "/apps/api/launch/complete" });
     const denied = await RAW_SELF.fetch("https://example.test/apps/api/apps?workspace=personal");
     expect(denied.status).toBe(401);
     const apiKeyAccess = await RAW_SELF.fetch("https://example.test/apps/api/apps?workspace=personal", {

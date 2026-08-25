@@ -272,10 +272,10 @@ describe("tenant app control plane", () => {
     });
     const response = await appGateway(env).request(PERSONAL_ACCESS, new Request(
       `https://nanocodex.test/apps/api/apps/${app.appId}/launch?workspace=personal`,
-      { method: "POST", headers: { origin: "https://nanocodex.test" } },
+      { method: "POST", headers: { accept: "application/json", origin: "https://nanocodex.test" } },
     ));
-    expect(response.status).toBe(303);
-    const location = new URL(response.headers.get("location")!);
+    expect(response.status).toBe(200);
+    const location = new URL((await response.json<{ launch_url: string }>()).launch_url);
     expect(location.origin).toBe("https://runtime.example.test");
     expect(location.pathname).toBe("/__auth/begin");
     const intent = location.searchParams.get("intent")!;
@@ -283,7 +283,7 @@ describe("tenant app control plane", () => {
     expect(ticketStore.issue).toHaveBeenCalledOnce();
 
     const transaction = "transaction-nonce-12345678";
-    const completion = await appGateway(env).request(PERSONAL_ACCESS, new Request(
+    const completion = await appGateway(env).completeLaunch(new Request(
       `https://nanocodex.test/apps/api/launch/complete?intent=${intent}&transaction=${transaction}&workspace=personal`,
     ));
     expect(completion.status).toBe(303);
@@ -328,21 +328,21 @@ describe("tenant app control plane", () => {
     const intent = new URL(started.headers.get("location")!).searchParams.get("intent")!;
     const transaction = "transaction-nonce-12345678";
 
-    const tampered = await gateway.request(PERSONAL_ACCESS, new Request(
+    const tampered = await gateway.completeLaunch(new Request(
       `https://nanocodex.test/apps/api/launch/complete?intent=${intent}&transaction=${transaction}&workspace=personal`,
     ));
     expect(tampered.status).toBe(401);
     expect(ticketStore.consume).not.toHaveBeenCalled();
 
     authorizeTeam.mockResolvedValueOnce({ authorized: false });
-    const removed = await gateway.request(TEAM_OWNER_ACCESS, new Request(
+    const removed = await gateway.completeLaunch(new Request(
       `https://nanocodex.test/apps/api/launch/complete?intent=${intent}&transaction=${transaction}&workspace=${TEAM_TENANT}`,
     ));
     expect(removed.status).toBe(404);
     expect(ticketStore.consume).not.toHaveBeenCalled();
 
     authorizeTeam.mockRejectedValueOnce(new Error("authority unavailable"));
-    const unavailable = await gateway.request(TEAM_OWNER_ACCESS, new Request(
+    const unavailable = await gateway.completeLaunch(new Request(
       `https://nanocodex.test/apps/api/launch/complete?intent=${intent}&transaction=${transaction}&workspace=${TEAM_TENANT}`,
     ));
     expect(unavailable.status).toBe(404);

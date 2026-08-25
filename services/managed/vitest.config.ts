@@ -352,6 +352,9 @@ export default {
 const TEST_APP_PLATFORM = `
 import { WorkerEntrypoint } from "cloudflare:workers";
 export class AppPlatform extends WorkerEntrypoint {
+  async completeLaunch(request) {
+    return Response.json({ completed: new URL(request.url).pathname });
+  }
   async request(access, request) {
     return Response.json({
       access,

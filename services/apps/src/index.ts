@@ -104,6 +104,18 @@ const health = {
 export default health;
 
 export class AppPlatform extends WorkerEntrypoint<Env, AppPlatformProps> {
+  async completeLaunch(request: Request): Promise<Response> {
+    if (this.ctx.props.clientId !== "nanocodex-managed") {
+      throw new Error("app platform is restricted to the managed account gateway");
+    }
+    if (!configured(this.env)) return json({ error: "platform_unavailable" }, 503);
+    const url = new URL(request.url);
+    if (url.pathname !== "/apps/api/launch/complete" || request.method !== "GET") {
+      return json({ error: "not_found" }, 404);
+    }
+    return completeLaunch(request, this.env, url);
+  }
+
   async request(accessInput: AppAccess, request: Request): Promise<Response> {
     if (this.ctx.props.clientId !== "nanocodex-managed") {
       throw new Error("app platform is restricted to the managed account gateway");
@@ -175,33 +187,6 @@ async function routePlatformApi(
   access: AppAccess,
 ): Promise<Response> {
   try {
-    if (url.pathname === "/apps/api/launch/complete" && request.method === "GET") {
-      const intents = url.searchParams.getAll("intent");
-      const transactions = url.searchParams.getAll("transaction");
-      if (intents.length !== 1 || intents[0].length > 2 * 1024
-        || transactions.length !== 1 || !TRANSACTION.test(transactions[0])) {
-        return json({ error: "invalid_launch" }, 400);
-      }
-      const intent = await verifyLaunchIntent(intents[0], env.LAUNCH_TICKET_SECRET);
-      if (!intent || intent.actorUserId !== access.actorUserId || intent.tenantId !== tenantId) {
-        return json({ error: "invalid_launch" }, 401);
-      }
-      if (!await authorizeClaims(env, intent.actorUserId, intent.tenantId)) {
-        return json({ error: "not_found" }, 404);
-      }
-      const app = await getApp(env.APP_REGISTRY, tenantId, intent.appId);
-      if (!app || app.slug !== intent.slug) return json({ error: "not_found" }, 404);
-      if (!await consumeLaunchIntent(env.APP_LAUNCH_TICKETS, intent)) {
-        return json({ error: "invalid_launch" }, 401);
-      }
-      const ticket = await issueLaunchTicket(env.LAUNCH_TICKET_SECRET, intent, transactions[0]);
-      const claims = await verifyLaunchTicket(ticket, env.LAUNCH_TICKET_SECRET);
-      if (!claims) throw new Error("launch ticket self-verification failed");
-      await recordLaunchTicket(env.APP_LAUNCH_TICKETS, claims);
-      const target = new URL("/__auth/launch", env.RUNTIME_ORIGIN);
-      target.searchParams.set("ticket", ticket);
-      return redirect(target);
-    }
     if (url.pathname === "/apps/api/apps" && request.method === "GET") {
       const apps = await listApps(env.APP_REGISTRY, tenantId);
       return json({
@@ -282,6 +267,9 @@ async function routePlatformApi(
       const target = new URL("/__auth/begin", env.RUNTIME_ORIGIN);
       target.searchParams.set("intent", launchIntent);
       target.searchParams.set("workspace", workspaceForAccess(access));
+      if (request.headers.get("accept")?.split(",").some((value) => value.trim().startsWith("application/json"))) {
+        return json({ launch_url: target.href }, 200);
+      }
       return redirect(target);
     }
     const activateMatch = url.pathname.match(/^\/apps\/api\/apps\/([A-Za-z0-9._:-]+)\/activate$/);
@@ -320,6 +308,45 @@ async function routePlatformApi(
     }));
     return json({ error: "platform_failure" }, 500);
   }
+}
+
+async function completeLaunch(
+  _request: Request,
+  env: ConfiguredEnv,
+  url: URL,
+): Promise<Response> {
+  const intents = url.searchParams.getAll("intent");
+  const transactions = url.searchParams.getAll("transaction");
+  const workspaces = url.searchParams.getAll("workspace");
+  if (intents.length !== 1 || intents[0].length > 2 * 1024
+    || transactions.length !== 1 || !TRANSACTION.test(transactions[0])
+    || workspaces.length !== 1) {
+    return json({ error: "invalid_launch" }, 400);
+  }
+  const intent = await verifyLaunchIntent(intents[0], env.LAUNCH_TICKET_SECRET);
+  const tenantId = intent ? validateTenantId(intent.tenantId) : undefined;
+  if (!intent || !tenantId || workspaceForTenant(tenantId) !== workspaces[0]) {
+    return json({ error: "invalid_launch" }, 401);
+  }
+  if (!await authorizeClaims(env, intent.actorUserId, tenantId)) {
+    return json({ error: "not_found" }, 404);
+  }
+  const app = await getApp(env.APP_REGISTRY, tenantId, intent.appId);
+  if (!app || app.slug !== intent.slug) return json({ error: "not_found" }, 404);
+  if (!await consumeLaunchIntent(env.APP_LAUNCH_TICKETS, intent)) {
+    return json({ error: "invalid_launch" }, 401);
+  }
+  const ticket = await issueLaunchTicket(env.LAUNCH_TICKET_SECRET, intent, transactions[0]);
+  const claims = await verifyLaunchTicket(ticket, env.LAUNCH_TICKET_SECRET);
+  if (!claims) throw new Error("launch ticket self-verification failed");
+  await recordLaunchTicket(env.APP_LAUNCH_TICKETS, claims);
+  const target = new URL("/__auth/launch", env.RUNTIME_ORIGIN);
+  target.searchParams.set("ticket", ticket);
+  return redirect(target);
+}
+
+function workspaceForTenant(tenantId: TenantId): "personal" | `team:${string}` {
+  return tenantId.startsWith("user:") ? "personal" : tenantId as `team:${string}`;
 }
 
 function validateAppAccess(value: AppAccess): AppAccess | undefined {
