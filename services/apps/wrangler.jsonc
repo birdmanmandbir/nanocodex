@@ -17,7 +17,7 @@
   "assets": {
     "binding": "ASSETS",
     "directory": "./dist-ui",
-    "not_found_handling": "none"
+    "not_found_handling": "single-page-application"
   },
   "ai": {
     "binding": "AI"
