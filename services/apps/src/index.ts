@@ -500,10 +500,10 @@ async function serveConsoleAsset(request: Request, env: ConfiguredEnv, url: URL)
     return new Response(null, { status: 308, headers: { location: "/apps/" } });
   }
   const assetUrl = new URL(request.url);
-  assetUrl.pathname = url.pathname === "/apps/" ? "/" : url.pathname.slice("/apps".length);
+  assetUrl.pathname = url.pathname === "/apps/" ? "/index.html" : url.pathname.slice("/apps".length);
   const response = await env.ASSETS.fetch(new Request(assetUrl, request));
   if (response.status !== 404 || assetUrl.pathname.startsWith("/assets/")) return response;
-  assetUrl.pathname = "/";
+  assetUrl.pathname = "/index.html";
   return env.ASSETS.fetch(new Request(assetUrl, request));
 }
 

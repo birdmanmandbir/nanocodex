@@ -143,7 +143,7 @@ describe("tenant app control plane", () => {
     );
     expect(root.status).toBe(200);
     expect(await root.text()).toBe("console");
-    expect(rootPaths).toEqual(["/"]);
+    expect(rootPaths).toEqual(["/index.html"]);
 
     const nestedPaths: string[] = [];
     const nestedEnv = configuredEnv({
@@ -162,7 +162,7 @@ describe("tenant app control plane", () => {
     );
     expect(nested.status).toBe(200);
     expect(await nested.text()).toBe("console");
-    expect(nestedPaths).toEqual(["/settings", "/"]);
+    expect(nestedPaths).toEqual(["/settings", "/index.html"]);
     expect((await appGateway(nestedEnv).serveConsole(
       new Request("https://nanocodex.test/apps/api/apps"),
     )).status).toBe(404);
