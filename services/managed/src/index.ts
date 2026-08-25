@@ -128,6 +128,7 @@ export interface Env extends AccountAuthEnv {
   NANOCODEX_ROOMS: DurableObjectNamespace<MultiplayerRoom>;
   NANOCODEX_MULTIPLAYER_QUOTA: DurableObjectNamespace<MultiplayerQuota>;
   NANOCODEX: Fetcher;
+  NANOCODEX_APP_ASSETS?: Fetcher;
   NANOCODEX_APPS?: AppsServiceBinding;
   NANOCODEX_ADMIN_TOKEN: string;
   AGENT_IDLE_TIMEOUT_MS?: string;
@@ -135,8 +136,7 @@ export interface Env extends AccountAuthEnv {
   MANAGED_OWNERSHIP_IO_TIMEOUT_MS?: string;
 }
 
-export interface AppsServiceBinding extends Fetcher {
-  serveConsole(request: Request): Promise<Response>;
+export interface AppsServiceBinding {
   request(access: AppAccess, request: Request): Promise<Response>;
 }
 
@@ -651,10 +651,10 @@ export default {
       const appsRequest = new Request(request, { headers });
       if ((request.method === "GET" || request.method === "HEAD")
         && !url.pathname.startsWith("/apps/api/")) {
-        if (!env.NANOCODEX_APPS) {
+        if (!env.NANOCODEX_APP_ASSETS) {
           return json({ error: "apps_service_unavailable" }, { status: 503 });
         }
-        return env.NANOCODEX_APPS.serveConsole(appsRequest);
+        return serveAppsConsole(request, env.NANOCODEX_APP_ASSETS, url);
       }
       // A passkey session wins over any ambient or forged bearer credential.
       // Persistent API-key accounts use the same user/team authority for
@@ -912,6 +912,19 @@ export default {
     return json({ error: "method_not_allowed" }, { status: 405 });
   },
 };
+
+async function serveAppsConsole(request: Request, assets: Fetcher, url: URL): Promise<Response> {
+  if (url.pathname === "/apps") {
+    return new Response(null, { status: 308, headers: { location: "/apps/" } });
+  }
+  const assetPath = url.pathname === "/apps/" ? "/index.html" : url.pathname.slice("/apps".length);
+  const fetchAsset = (path: string) => assets.fetch(new Request(`https://assets.local${path}`, {
+    method: request.method,
+  }));
+  const response = await fetchAsset(assetPath);
+  if (response.status !== 404 || assetPath.startsWith("/assets/")) return response;
+  return fetchAsset("/index.html");
+}
 
 class DurableComputerObject extends DurableObject<Env> {
   get computerContext(): DurableObjectState { return this.ctx; }

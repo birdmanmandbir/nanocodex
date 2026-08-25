@@ -95,7 +95,6 @@ function configuredEnv(overrides: Partial<Env> = {}): Env {
       idFromName: vi.fn((tenantId: string) => tenantId),
     } as unknown as Env["APP_REGISTRY"],
     APP_STATE: { get: vi.fn(), idFromName: vi.fn() } as unknown as Env["APP_STATE"],
-    ASSETS: { fetch: vi.fn(async () => new Response("console")) } as unknown as Fetcher,
     LAUNCH_TICKET_SECRET: TICKET_SECRET,
     LOADER: { get: vi.fn() } as unknown as WorkerLoader,
     NANOCODEX_AGENTS: {
@@ -122,58 +121,6 @@ function runtimeGateway(env: Env, ctx: Record<string, unknown> = {}) {
 }
 
 describe("tenant app control plane", () => {
-  it("keeps the console and its SPA fallback rooted under /apps", async () => {
-    const rootRequests: Array<{ host: string; method: string; pathname: string }> = [];
-    const rootEnv = configuredEnv({
-      ASSETS: {
-        fetch: vi.fn(async (request: Request) => {
-          const url = new URL(request.url);
-          rootRequests.push({ host: url.host, method: request.method, pathname: url.pathname });
-          return new Response("console");
-        }),
-      } as unknown as Fetcher,
-    });
-    const redirect = await appGateway(rootEnv).serveConsole(
-      new Request("https://nanocodex.test/apps"),
-    );
-    expect(redirect.status).toBe(308);
-    expect(redirect.headers.get("location")).toBe("/apps/");
-
-    const root = await appGateway(rootEnv).serveConsole(
-      new Request("https://nanocodex.test/apps/"),
-    );
-    expect(root.status).toBe(200);
-    expect(await root.text()).toBe("console");
-    expect(rootRequests).toEqual([{ host: "assets.local", method: "GET", pathname: "/index.html" }]);
-
-    await appGateway(rootEnv).serveConsole(
-      new Request("https://nanocodex.test/apps/", { method: "HEAD" }),
-    );
-    expect(rootRequests.at(-1)).toEqual({ host: "assets.local", method: "HEAD", pathname: "/index.html" });
-
-    const nestedPaths: string[] = [];
-    const nestedEnv = configuredEnv({
-      ASSETS: {
-        fetch: vi.fn(async (request: Request) => {
-          const pathname = new URL(request.url).pathname;
-          nestedPaths.push(pathname);
-          return pathname === "/settings"
-            ? new Response("missing", { status: 404 })
-            : new Response("console");
-        }),
-      } as unknown as Fetcher,
-    });
-    const nested = await appGateway(nestedEnv).serveConsole(
-      new Request("https://nanocodex.test/apps/settings"),
-    );
-    expect(nested.status).toBe(200);
-    expect(await nested.text()).toBe("console");
-    expect(nestedPaths).toEqual(["/settings", "/index.html"]);
-    expect((await appGateway(nestedEnv).serveConsole(
-      new Request("https://nanocodex.test/apps/api/apps"),
-    )).status).toBe(404);
-  });
-
   it("derives the personal tenant from managed identity and starts a durable build", async () => {
     const env = configuredEnv();
     const gateway = appGateway(env);

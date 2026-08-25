@@ -24,6 +24,10 @@
       "service": "nanocodex-dynamic-apps-poc",
       "entrypoint": "AppPlatform",
       "props": { "clientId": "nanocodex-managed" }
+    },
+    {
+      "binding": "NANOCODEX_APP_ASSETS",
+      "service": "nanocodex-dynamic-apps-poc"
     }
   ],
   "durable_objects": {

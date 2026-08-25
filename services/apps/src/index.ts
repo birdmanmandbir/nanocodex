@@ -66,7 +66,6 @@ export interface Env {
   APP_LAUNCH_TICKETS: DurableObjectNamespace<LaunchTicketStore>;
   APP_REGISTRY: DurableObjectNamespace<AppRegistry>;
   APP_STATE: DurableObjectNamespace<AppState>;
-  ASSETS?: Fetcher;
   LAUNCH_TICKET_SECRET?: string;
   LOADER: WorkerLoader;
   NANOCODEX_AGENTS: ManagedAgentService;
@@ -101,22 +100,6 @@ const health = {
 export default health;
 
 export class AppPlatform extends WorkerEntrypoint<Env, AppPlatformProps> {
-  async serveConsole(request: Request): Promise<Response> {
-    if (this.ctx.props.clientId !== "nanocodex-managed") {
-      throw new Error("app platform is restricted to the managed account gateway");
-    }
-    if (!configured(this.env)) return json({ error: "platform_unavailable" }, 503);
-    const url = new URL(request.url);
-    if (url.pathname !== "/apps" && !url.pathname.startsWith("/apps/")) {
-      return json({ error: "not_found" }, 404);
-    }
-    if (url.pathname.startsWith("/apps/api/")) return json({ error: "not_found" }, 404);
-    if (request.method !== "GET" && request.method !== "HEAD") {
-      return json({ error: "method_not_allowed" }, 405);
-    }
-    return serveConsoleAsset(request, this.env, url);
-  }
-
   async request(accessInput: AppAccess, request: Request): Promise<Response> {
     if (this.ctx.props.clientId !== "nanocodex-managed") {
       throw new Error("app platform is restricted to the managed account gateway");
@@ -135,9 +118,6 @@ export class AppPlatform extends WorkerEntrypoint<Env, AppPlatformProps> {
     if (url.pathname.startsWith("/apps/api/")) {
       if (!workspaceMatchesAccess(url, access)) return json({ error: "invalid_workspace" }, 400);
       return routePlatformApi(request, this.env, url, tenantId, access);
-    }
-    if (request.method === "GET" || request.method === "HEAD") {
-      return serveConsoleAsset(request, this.env, url);
     }
     return json({ error: "method_not_allowed" }, 405);
   }
@@ -495,21 +475,7 @@ function redirect(target: URL): Response {
   });
 }
 
-async function serveConsoleAsset(request: Request, env: ConfiguredEnv, url: URL): Promise<Response> {
-  if (url.pathname === "/apps") {
-    return new Response(null, { status: 308, headers: { location: "/apps/" } });
-  }
-  const assetPath = url.pathname === "/apps/" ? "/index.html" : url.pathname.slice("/apps".length);
-  const fetchAsset = (path: string) => env.ASSETS.fetch(new Request(`https://assets.local${path}`, {
-    method: request.method,
-  }));
-  const response = await fetchAsset(assetPath);
-  if (response.status !== 404 || assetPath.startsWith("/assets/")) return response;
-  return fetchAsset("/index.html");
-}
-
 type ConfiguredEnv = Env & {
-  ASSETS: Fetcher;
   LAUNCH_TICKET_SECRET: string;
   RUNTIME_ORIGIN: string;
 };
@@ -519,7 +485,6 @@ function configured(env: Env): env is ConfiguredEnv {
     && new TextEncoder().encode(env.LAUNCH_TICKET_SECRET).byteLength >= 32
     && typeof env.RUNTIME_ORIGIN === "string"
     && /^https:\/\/[^/]+$/.test(env.RUNTIME_ORIGIN)
-    && typeof env.ASSETS?.fetch === "function"
     && typeof env.APP_ARTIFACTS?.get === "function"
     && typeof env.APP_BUILDS?.create === "function"
     && typeof env.APP_GIT?.request === "function"

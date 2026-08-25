@@ -17,8 +17,7 @@
   "assets": {
     "binding": "ASSETS",
     "directory": "./dist-ui",
-    "not_found_handling": "none",
-    "run_worker_first": ["/*"]
+    "not_found_handling": "none"
   },
   "ai": {
     "binding": "AI"

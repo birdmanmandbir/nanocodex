@@ -48,7 +48,10 @@ describe("managed apps trust boundary", () => {
       authentication: "account_session",
       user: { id: appsUserId, persistent: true },
     });
-    const consoleDocument = await RAW_SELF.fetch("https://example.test/apps");
+    const consoleRedirect = await RAW_SELF.fetch("https://example.test/apps", { redirect: "manual" });
+    expect(consoleRedirect.status).toBe(308);
+    expect(consoleRedirect.headers.get("location")).toBe("/apps/");
+    const consoleDocument = await RAW_SELF.fetch("https://example.test/apps/");
     expect(consoleDocument.status).toBe(200);
     expect(await consoleDocument.text()).toBe("apps console");
     const denied = await RAW_SELF.fetch("https://example.test/apps/api/apps?workspace=personal");
@@ -251,7 +254,7 @@ describe("managed apps trust boundary", () => {
       new Request("https://example.test/apps", {
         headers: { cookie: `nanocodex_account=${token}` },
       }),
-      { ...testEnv, NANOCODEX_APPS: undefined } as Env,
+      { ...testEnv, NANOCODEX_APP_ASSETS: undefined, NANOCODEX_APPS: undefined } as Env,
       { waitUntil: vi.fn(), passThroughOnException: vi.fn() } as unknown as ExecutionContext,
     );
     expect(missing.status).toBe(503);

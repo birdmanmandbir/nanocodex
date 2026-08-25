@@ -136,7 +136,7 @@ export function buildManagedProductionConfig(baseConfig, {
     "NANOCODEX",
     BROKER_NAME,
     "production managed Worker",
-    2,
+    3,
   );
   const apps = baseConfig.services?.find((candidate) => candidate?.binding === "NANOCODEX_APPS");
   if (apps?.service !== "nanocodex-dynamic-apps-poc"
@@ -144,6 +144,11 @@ export function buildManagedProductionConfig(baseConfig, {
     || apps.props?.clientId !== "nanocodex-managed"
     || Object.keys(apps.props).length !== 1) {
     throw new Error("production managed Worker requires the private Nanocodex Apps gateway");
+  }
+  const appAssets = baseConfig.services?.find((candidate) => candidate?.binding === "NANOCODEX_APP_ASSETS");
+  if (appAssets?.service !== "nanocodex-dynamic-apps-poc"
+    || Object.keys(appAssets).length !== 2) {
+    throw new Error("production managed Worker requires the private Nanocodex Apps asset service");
   }
   const durableObjects = new Map(
     (baseConfig.durable_objects?.bindings ?? []).map((binding) => [

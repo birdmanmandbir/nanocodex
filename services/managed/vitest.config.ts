@@ -352,12 +352,6 @@ export default {
 const TEST_APP_PLATFORM = `
 import { WorkerEntrypoint } from "cloudflare:workers";
 export class AppPlatform extends WorkerEntrypoint {
-  async serveConsole(request) {
-    return new Response("apps console", {
-      headers: { "content-type": "text/html" },
-      status: request.method === "GET" || request.method === "HEAD" ? 200 : 405,
-    });
-  }
   async request(access, request) {
     return Response.json({
       access,
@@ -372,7 +366,15 @@ export class AppPlatform extends WorkerEntrypoint {
     });
   }
 }
-export default { async fetch() { return new Response("not found", { status: 404 }); } };
+export default {
+  async fetch(request) {
+    const pathname = new URL(request.url).pathname;
+    if (pathname === "/index.html") {
+      return new Response("apps console", { headers: { "content-type": "text/html" } });
+    }
+    return new Response("not found", { status: 404 });
+  },
+};
 `;
 
 export default defineConfig({

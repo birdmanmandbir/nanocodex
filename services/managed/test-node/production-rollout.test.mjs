@@ -186,6 +186,10 @@ test("managed production config retains the exact private eight-DO topology", as
       entrypoint: "AppPlatform",
       props: { clientId: "nanocodex-managed" },
     },
+    {
+      binding: "NANOCODEX_APP_ASSETS",
+      service: "nanocodex-dynamic-apps-poc",
+    },
   ]);
   assert.equal(config.durable_objects.bindings.length, 8);
   assert.deepEqual(config.migrations.map(({ tag }) => tag), ["v1", "v2", "v3", "v4"]);
