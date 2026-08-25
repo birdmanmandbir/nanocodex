@@ -10,6 +10,7 @@ use crate::{
     ResponsesHistory, ResponsesRetryPolicy, ResponsesTransport, Thinking, session::SessionBuilder,
 };
 
+pub use config::ContextWindow;
 #[doc(hidden)]
 pub use config::ModelConfig;
 pub use config::ModelConfig as ResponsesServiceConfig;
@@ -125,6 +126,17 @@ impl<F> OpenAiBuilder<F> {
     #[must_use]
     pub const fn model(mut self, model: Model) -> Self {
         self.config.model = model;
+        self
+    }
+
+    /// Sets the client-side context budget for new sessions and agents.
+    ///
+    /// The budget controls automatic compaction and tool-output trimming. It
+    /// does not change the capacity accepted by the provider. A higher-level
+    /// agent builder may override this reusable client default.
+    #[must_use]
+    pub const fn context_window(mut self, context_window: ContextWindow) -> Self {
+        self.config.context_window = context_window;
         self
     }
 
@@ -588,8 +600,8 @@ mod tests {
     use ::tower::{Service, service_fn, timeout::TimeoutLayer};
 
     use crate::{
-        ModelConfig, OpenAiAuthMode, ResponseError, ResponsesAttempt, ResponsesHistory,
-        ResponsesServiceResponse, ResponsesTransport,
+        ContextWindow, ModelConfig, OpenAiAuthMode, ResponseError, ResponsesAttempt,
+        ResponsesHistory, ResponsesServiceResponse, ResponsesTransport,
     };
 
     use super::{OpenAi, apply_mode_defaults};
@@ -626,6 +638,22 @@ mod tests {
         let second = session.build().unwrap();
 
         assert_ne!(first.id(), second.id());
+    }
+
+    #[test]
+    fn context_window_flows_from_the_client_recipe_to_sessions() {
+        let client = OpenAi::builder("test-key")
+            .context_window(ContextWindow::OneMillion)
+            .service(|| NeverCalled)
+            .build()
+            .unwrap();
+
+        let session = client
+            .instructions("Answer only from supplied facts.")
+            .build()
+            .unwrap();
+
+        assert_eq!(session.context_window(), ContextWindow::OneMillion);
     }
 
     #[test]

@@ -1,8 +1,43 @@
 use std::{borrow::Cow, sync::Arc};
 
-use crate::{Model, OpenAiAuth, ReasoningMode, ResponsesHistory, ResponsesTransport, Thinking};
+use crate::{
+    CONTEXT_WINDOW_TOKENS, Model, OpenAiAuth, ReasoningMode, ResponsesHistory, ResponsesTransport,
+    Thinking,
+};
 
 const SYSTEM_PROMPT: &str = include_str!("../../prompts/system.md");
+
+/// A model input budget and its automatic compaction policy.
+///
+/// The budget is a client-side policy: it controls when automatic compaction
+/// runs and how much tool output compaction requests retain. It does not alter
+/// the capacity accepted by the provider.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ContextWindow {
+    /// The standard 272,000-token GPT-5.6 policy.
+    #[default]
+    Standard,
+    /// A one-million-token policy with a 100,000-token compaction reserve.
+    OneMillion,
+}
+
+impl ContextWindow {
+    /// Returns the maximum input tokens retained before compaction.
+    #[must_use]
+    pub const fn token_limit(self) -> u64 {
+        match self {
+            Self::Standard => CONTEXT_WINDOW_TOKENS,
+            Self::OneMillion => 1_000_000,
+        }
+    }
+
+    /// Returns the automatic-compaction threshold, reserving ten percent.
+    #[must_use]
+    pub const fn auto_compact_token_limit(self) -> u64 {
+        let token_limit = self.token_limit();
+        token_limit - token_limit / 10
+    }
+}
 
 /// Validated, read-only settings passed to a [`ResponsesServiceFactory`].
 ///
@@ -15,6 +50,9 @@ const SYSTEM_PROMPT: &str = include_str!("../../prompts/system.md");
 pub struct ModelConfig {
     /// Selected GPT-5.6 coding model.
     pub model: Model,
+    /// Client-side input budget used by automatic compaction and tool-output
+    /// trimming.
+    pub context_window: ContextWindow,
     /// Optional namespace prepended to the model identifier on the wire.
     ///
     /// This preserves Nanocodex's closed typed model policy while allowing an
@@ -79,6 +117,7 @@ impl Default for ModelConfig {
     fn default() -> Self {
         Self {
             model: Model::default(),
+            context_window: ContextWindow::default(),
             model_id_prefix: None,
             auth: OpenAiAuth::api_key(String::new()),
             reasoning_mode: ReasoningMode::default(),

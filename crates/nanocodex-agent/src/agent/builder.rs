@@ -39,6 +39,18 @@ impl<F> NanocodexBuilder<F> {
         self
     }
 
+    /// Overrides the `OpenAi` recipe's client-side context budget for this
+    /// agent.
+    ///
+    /// The budget controls automatic compaction and tool-output trimming. It
+    /// does not change the capacity accepted by the provider. The selected
+    /// budget is fixed for the lifetime of the agent thread.
+    #[must_use]
+    pub const fn context_window(mut self, context_window: ContextWindow) -> Self {
+        self.config.context_window = context_window;
+        self
+    }
+
     /// Replaces the stable system/developer instructions.
     #[must_use]
     pub fn instructions(mut self, instructions: impl Into<Arc<str>>) -> Self {
@@ -369,6 +381,7 @@ mod tests {
     #[derive(Clone)]
     struct ObservingFactory {
         model: Arc<Mutex<Option<Model>>>,
+        context_window: Arc<Mutex<Option<ContextWindow>>>,
     }
 
     impl ResponsesServiceFactory for ObservingFactory {
@@ -376,6 +389,10 @@ mod tests {
 
         fn make(&self, config: Arc<ModelConfig>) -> Self::Service {
             *self.model.lock().expect("model observation lock") = Some(config.model);
+            *self
+                .context_window
+                .lock()
+                .expect("context window observation lock") = Some(config.context_window);
             PendingService
         }
     }
@@ -417,6 +434,7 @@ mod tests {
         }))
         .expect("valid session snapshot");
         let observed_model = Arc::new(Mutex::new(None));
+        let observed_context_window = Arc::new(Mutex::new(None));
         let mut config = ModelConfig {
             auth: OpenAiAuth::api_key("test-key"),
             ..ModelConfig::default()
@@ -437,14 +455,22 @@ mod tests {
             resume: Some(snapshot),
             factory: ObservingFactory {
                 model: Arc::clone(&observed_model),
+                context_window: Arc::clone(&observed_context_window),
             },
-        };
+        }
+        .context_window(ContextWindow::OneMillion);
 
         let (agent, events) = builder.build().expect("resumed agent");
 
         assert_eq!(
             *observed_model.lock().expect("model observation lock"),
             Some(Model::Luna)
+        );
+        assert_eq!(
+            *observed_context_window
+                .lock()
+                .expect("context window observation lock"),
+            Some(ContextWindow::OneMillion)
         );
         agent.shutdown().await.expect("agent shutdown");
         drop(events);

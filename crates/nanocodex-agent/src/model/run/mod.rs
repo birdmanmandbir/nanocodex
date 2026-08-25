@@ -23,7 +23,7 @@ use nanocodex_oai_api::{
         EventSink, ManagedSessionState, ModelConfig, ResponsesAttemptFactory,
         assign_missing_response_item_id, compaction, with_code_mode_tool_names,
     },
-    CONTEXT_WINDOW_TOKENS, Model, Prompt, Thinking,
+    Model, Prompt, Thinking,
     events::AgentEventKind,
     pricing::{ServiceTier, estimate_for_model},
     responses::{ContentItem, MessageRole, RequestProfile, ResponseItem, ToolDefinition, Usage},

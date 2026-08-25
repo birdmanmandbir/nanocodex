@@ -56,7 +56,7 @@ pub(crate) use events::{
 #[cfg(feature = "client")]
 pub(crate) use openai::ModelConfig;
 #[cfg(feature = "client")]
-pub use openai::{OpenAi, OpenAiBuilder, OpenAiError};
+pub use openai::{ContextWindow, OpenAi, OpenAiBuilder, OpenAiError};
 #[cfg(feature = "client")]
 pub(crate) use pricing::{CostStatus, EstimatedUsdCost};
 pub use responses::ResponseEvent;
@@ -192,7 +192,7 @@ impl FromStr for Model {
     }
 }
 
-/// Prompt-token budget used by automatic compaction to avoid long-context pricing.
+/// Default prompt-token budget used by automatic compaction to avoid long-context pricing.
 pub const CONTEXT_WINDOW_TOKENS: u64 = 272_000;
 
 /// User input for one agent turn.

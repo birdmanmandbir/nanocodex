@@ -6,7 +6,7 @@ pub use nanocodex_agent::{
     AgentEvents, AgentSessionContext, CostStatus, EstimatedUsdCost, Nanocodex, NanocodexBuilder,
     NanocodexError, PromptRoute, ServiceTier, Turn, TurnControl, TurnResult, TurnUsage, UsdAmount,
 };
-pub use nanocodex_oai_api::{Model, OpenAi, ReasoningMode, Thinking};
+pub use nanocodex_oai_api::{ContextWindow, Model, OpenAi, ReasoningMode, Thinking};
 #[cfg(not(target_family = "wasm"))]
 #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
 pub use nanocodex_tools::tool;

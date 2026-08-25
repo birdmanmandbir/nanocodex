@@ -14,7 +14,7 @@ use std::{
 use futures_util::Stream;
 use nanocodex_oai_api::{
     __private::{EventSink, ModelConfig, ResponsesServiceFactory, into_openai_parts},
-    Model, OpenAi, Prompt, ReasoningMode, ResponseError, Thinking,
+    ContextWindow, Model, OpenAi, Prompt, ReasoningMode, ResponseError, Thinking,
     auth::OpenAiAuthMode,
     events::{AgentEvent, AgentEvents},
     session::SessionId,

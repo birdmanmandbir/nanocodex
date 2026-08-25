@@ -4,8 +4,9 @@ use ::tower::Service;
 use tokio::sync::mpsc;
 
 use crate::{
-    ContentItem, EventSink, MessageRole, Model, OpenAi, ResponseItem, ResponsesAttempt,
-    ResponsesClient, ResponsesServiceResponse, Thinking, ToolDefinition, TransportStats,
+    ContentItem, ContextWindow, EventSink, MessageRole, Model, OpenAi, ResponseItem,
+    ResponsesAttempt, ResponsesClient, ResponsesServiceResponse, Thinking, ToolDefinition,
+    TransportStats,
     openai::{ResponsesServiceFactory, StandardServiceFactory},
     responses::RequestProfile,
 };
@@ -144,6 +145,7 @@ where
             next_call_index: 1,
             next_logical_turn: 1,
             model: config.model,
+            context_window: config.context_window,
             thinking: config.thinking,
             fast_mode: config.fast_mode,
             transport_stats: Arc::new(TransportStats::default()),
@@ -176,6 +178,7 @@ pub struct Session<S> {
     pub(super) next_call_index: u32,
     next_logical_turn: u64,
     pub(super) model: Model,
+    pub(super) context_window: ContextWindow,
     pub(super) thinking: Thinking,
     pub(super) fast_mode: bool,
     pub(super) transport_stats: Arc<TransportStats>,
@@ -186,6 +189,12 @@ impl<S> Session<S> {
     #[must_use]
     pub const fn id(&self) -> SessionId {
         self.id
+    }
+
+    /// Returns the client-side context budget for this session.
+    #[must_use]
+    pub const fn context_window(&self) -> ContextWindow {
+        self.context_window
     }
 
     /// Starts one logical agent turn.

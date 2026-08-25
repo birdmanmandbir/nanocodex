@@ -38,8 +38,9 @@ where
             .conversation
             .previous_response_id()
             .map(str::to_owned);
-        let auto_compact_token_limit = compaction::auto_compact_token_limit(self.model.as_str())
-            .unwrap_or(CONTEXT_WINDOW_TOKENS);
+        let auto_compact_token_limit =
+            compaction::auto_compact_token_limit(self.model.as_str(), self.config.context_window)
+                .unwrap_or_else(|| self.config.context_window.token_limit());
         let compacted = {
             let compaction = self.perform_compaction(
                 self.stats.model_calls,

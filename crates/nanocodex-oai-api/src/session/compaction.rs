@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::{
-    CONTEXT_WINDOW_TOKENS, ContentItem, FunctionOutputBody, FunctionOutputContent, ImageDetail,
+    ContentItem, ContextWindow, FunctionOutputBody, FunctionOutputContent, ImageDetail,
     ResponseItem, responses::ResponseHistory,
 };
 #[cfg(not(target_family = "wasm"))]
@@ -64,9 +64,9 @@ static ORIGINAL_IMAGE_ESTIMATE_CACHE: LazyLock<Mutex<OriginalImageEstimateCache>
     LazyLock::new(|| Mutex::new(OriginalImageEstimateCache::default()));
 
 #[must_use]
-pub fn auto_compact_token_limit(model: &str) -> Option<u64> {
+pub fn auto_compact_token_limit(model: &str, context_window: ContextWindow) -> Option<u64> {
     matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna")
-        .then_some((CONTEXT_WINDOW_TOKENS * 9) / 10)
+        .then_some(context_window.auto_compact_token_limit())
 }
 
 #[must_use]
@@ -77,6 +77,7 @@ pub const fn trigger() -> ResponseItem {
 pub fn trim_tool_outputs_to_fit_context_window(
     history: &mut ResponseHistory,
     request_prefix: &[ResponseItem],
+    context_window: ContextWindow,
 ) -> usize {
     let mut estimated_tokens = request_prefix
         .iter()
@@ -85,7 +86,7 @@ pub fn trim_tool_outputs_to_fit_context_window(
         .fold(0_u64, u64::saturating_add);
     let mut rewritten_outputs = Vec::new();
     for item in history.iter_rev() {
-        if estimated_tokens <= CONTEXT_WINDOW_TOKENS {
+        if estimated_tokens <= context_window.token_limit() {
             break;
         }
         let tokens_before = estimate_item_tokens(item);
@@ -474,10 +475,20 @@ mod tests {
 
     #[test]
     fn supported_models_compact_at_ninety_percent_of_the_policy_budget() {
-        assert_eq!(auto_compact_token_limit("gpt-5.6-sol"), Some(244_800));
-        assert_eq!(auto_compact_token_limit("gpt-5.6-terra"), Some(244_800));
-        assert_eq!(auto_compact_token_limit("gpt-5.6-luna"), Some(244_800));
-        assert_eq!(auto_compact_token_limit("unknown-model"), None);
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert_eq!(
+                auto_compact_token_limit(model, ContextWindow::default()),
+                Some(244_800)
+            );
+            assert_eq!(
+                auto_compact_token_limit(model, ContextWindow::OneMillion),
+                Some(900_000)
+            );
+        }
+        assert_eq!(
+            auto_compact_token_limit("unknown-model", ContextWindow::default()),
+            None
+        );
     }
 
     #[test]
@@ -548,7 +559,7 @@ mod tests {
             ),
         )]);
         assert_eq!(
-            trim_tool_outputs_to_fit_context_window(&mut history, &[]),
+            trim_tool_outputs_to_fit_context_window(&mut history, &[], ContextWindow::default()),
             1
         );
         assert!(matches!(
@@ -582,7 +593,7 @@ mod tests {
         }]);
 
         assert_eq!(
-            trim_tool_outputs_to_fit_context_window(&mut history, &[]),
+            trim_tool_outputs_to_fit_context_window(&mut history, &[], ContextWindow::default()),
             1
         );
         assert_eq!(
@@ -611,10 +622,27 @@ mod tests {
         let shared_tail = history.shared_tail();
 
         assert_eq!(
-            trim_tool_outputs_to_fit_context_window(&mut history, &[]),
+            trim_tool_outputs_to_fit_context_window(&mut history, &[], ContextWindow::default()),
             0
         );
         assert!(std::sync::Arc::ptr_eq(&history.shared_tail(), &shared_tail));
+    }
+
+    #[test]
+    fn one_million_context_keeps_tool_output_that_exceeds_the_default_budget() {
+        let mut history = ResponseHistory::new(vec![ResponseItem::custom_tool_output(
+            "call".to_owned(),
+            None,
+            FunctionOutputBody::Text(
+                "x".repeat(272_001 * APPROX_BYTES_PER_TOKEN)
+                    .into_boxed_str(),
+            ),
+        )]);
+
+        assert_eq!(
+            trim_tool_outputs_to_fit_context_window(&mut history, &[], ContextWindow::OneMillion),
+            0
+        );
     }
 
     fn message(text: &str) -> ResponseItem {
