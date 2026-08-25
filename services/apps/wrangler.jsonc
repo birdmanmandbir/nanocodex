@@ -36,7 +36,7 @@
     },
     {
       "binding": "NANOCODEX_AGENTS",
-      "service": "nanocodex-durable-agent",
+      "service": "nanocodex-dynamic-apps-managed-poc",
       "entrypoint": "ManagedAgentEntrypoint",
       "props": { "clientId": "nanocodex-apps" }
     }

@@ -35,7 +35,7 @@
   "services": [
     {
       "binding": "NANOCODEX_BACKEND",
-      "service": "nanocodex-durable-agent"
+      "service": "nanocodex-dynamic-apps-managed-poc"
     },
     {
       "binding": "NANOCODEX_CONNECT_DIALOG",

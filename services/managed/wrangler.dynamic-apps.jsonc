@@ -1,0 +1,80 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "nanocodex-dynamic-apps-managed-poc",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-29",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "workers_dev": false,
+  "minify": true,
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "invocation_logs": true,
+      "persist": true
+    }
+  },
+  "services": [
+    {
+      "binding": "NANOCODEX",
+      "service": "nanocodex-egress"
+    },
+    {
+      "binding": "NANOCODEX_APPS",
+      "service": "nanocodex-dynamic-apps-poc",
+      "entrypoint": "AppPlatform",
+      "props": { "clientId": "nanocodex-managed" }
+    },
+    {
+      "binding": "NANOCODEX_APP_ASSETS",
+      "service": "nanocodex-dynamic-apps-poc"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "NANOCODEX_SESSIONS",
+        "class_name": "NanocodexSession",
+        "script_name": "nanocodex-durable-agent"
+      },
+      {
+        "name": "NANOCODEX_ROOMS",
+        "class_name": "MultiplayerRoom",
+        "script_name": "nanocodex-durable-agent"
+      },
+      {
+        "name": "NANOCODEX_MULTIPLAYER_QUOTA",
+        "class_name": "MultiplayerQuota",
+        "script_name": "nanocodex-durable-agent"
+      },
+      {
+        "name": "NANOCODEX_AUTH",
+        "class_name": "NonceStorage",
+        "script_name": "nanocodex-durable-agent"
+      },
+      {
+        "name": "NANOCODEX_USERS",
+        "class_name": "UserAccount",
+        "script_name": "nanocodex-durable-agent"
+      },
+      {
+        "name": "NANOCODEX_API_KEYS",
+        "class_name": "ApiKeyRecord",
+        "script_name": "nanocodex-durable-agent"
+      },
+      {
+        "name": "NANOCODEX_MEMORY",
+        "class_name": "MemoryScope",
+        "script_name": "nanocodex-durable-agent"
+      },
+      {
+        "name": "NANOCODEX_ORGANIZATIONS",
+        "class_name": "Organization",
+        "script_name": "nanocodex-durable-agent"
+      }
+    ]
+  },
+  "vars": {
+    "AGENT_IDLE_TIMEOUT_MS": "30000"
+  }
+}
