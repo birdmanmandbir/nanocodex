@@ -132,15 +132,13 @@ describe("tenant app control plane", () => {
         }),
       } as unknown as Fetcher,
     });
-    const redirect = await appGateway(rootEnv).request(
-      PERSONAL_ACCESS,
+    const redirect = await appGateway(rootEnv).serveConsole(
       new Request("https://nanocodex.test/apps"),
     );
     expect(redirect.status).toBe(308);
     expect(redirect.headers.get("location")).toBe("/apps/");
 
-    const root = await appGateway(rootEnv).request(
-      PERSONAL_ACCESS,
+    const root = await appGateway(rootEnv).serveConsole(
       new Request("https://nanocodex.test/apps/"),
     );
     expect(root.status).toBe(200);
@@ -159,13 +157,15 @@ describe("tenant app control plane", () => {
         }),
       } as unknown as Fetcher,
     });
-    const nested = await appGateway(nestedEnv).request(
-      PERSONAL_ACCESS,
+    const nested = await appGateway(nestedEnv).serveConsole(
       new Request("https://nanocodex.test/apps/settings"),
     );
     expect(nested.status).toBe(200);
     expect(await nested.text()).toBe("console");
     expect(nestedPaths).toEqual(["/settings", "/"]);
+    expect((await appGateway(nestedEnv).serveConsole(
+      new Request("https://nanocodex.test/apps/api/apps"),
+    )).status).toBe(404);
   });
 
   it("derives the personal tenant from managed identity and starts a durable build", async () => {

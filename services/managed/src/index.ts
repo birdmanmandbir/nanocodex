@@ -136,7 +136,7 @@ export interface Env extends AccountAuthEnv {
 }
 
 export interface AppsServiceBinding extends Fetcher {
-  console(request: Request): Promise<Response>;
+  serveConsole(request: Request): Promise<Response>;
   request(access: AppAccess, request: Request): Promise<Response>;
 }
 
@@ -654,7 +654,7 @@ export default {
         if (!env.NANOCODEX_APPS) {
           return json({ error: "apps_service_unavailable" }, { status: 503 });
         }
-        return env.NANOCODEX_APPS.console(appsRequest);
+        return env.NANOCODEX_APPS.serveConsole(appsRequest);
       }
       // A passkey session wins over any ambient or forged bearer credential.
       // Persistent API-key accounts use the same user/team authority for

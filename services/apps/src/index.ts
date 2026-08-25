@@ -101,7 +101,7 @@ const health = {
 export default health;
 
 export class AppPlatform extends WorkerEntrypoint<Env, AppPlatformProps> {
-  async console(request: Request): Promise<Response> {
+  async serveConsole(request: Request): Promise<Response> {
     if (this.ctx.props.clientId !== "nanocodex-managed") {
       throw new Error("app platform is restricted to the managed account gateway");
     }
