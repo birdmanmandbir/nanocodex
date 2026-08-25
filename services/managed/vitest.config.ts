@@ -352,6 +352,12 @@ export default {
 const TEST_APP_PLATFORM = `
 import { WorkerEntrypoint } from "cloudflare:workers";
 export class AppPlatform extends WorkerEntrypoint {
+  async console(request) {
+    return new Response("apps console", {
+      headers: { "content-type": "text/html" },
+      status: request.method === "GET" || request.method === "HEAD" ? 200 : 405,
+    });
+  }
   async request(access, request) {
     return Response.json({
       access,

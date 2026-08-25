@@ -48,9 +48,12 @@ describe("managed apps trust boundary", () => {
       authentication: "account_session",
       user: { id: appsUserId, persistent: true },
     });
-    const denied = await RAW_SELF.fetch("https://example.test/apps");
+    const consoleDocument = await RAW_SELF.fetch("https://example.test/apps");
+    expect(consoleDocument.status).toBe(200);
+    expect(await consoleDocument.text()).toBe("apps console");
+    const denied = await RAW_SELF.fetch("https://example.test/apps/api/apps?workspace=personal");
     expect(denied.status).toBe(401);
-    const apiKeyAccess = await RAW_SELF.fetch("https://example.test/apps", {
+    const apiKeyAccess = await RAW_SELF.fetch("https://example.test/apps/api/apps?workspace=personal", {
       headers: { authorization: `Bearer ${API_KEY}` },
     });
     expect(apiKeyAccess.status).toBe(200);
@@ -81,7 +84,7 @@ describe("managed apps trust boundary", () => {
       body: "{}",
     })).status).toBe(200);
 
-    const response = await RAW_SELF.fetch("https://example.test/apps/tiny?view=settings", {
+    const response = await RAW_SELF.fetch("https://example.test/apps/api/tiny?workspace=personal&view=settings", {
       headers: {
         authorization: `Bearer ${OTHER_API_KEY}`,
         cookie: `nanocodex_account=${token}`,
@@ -104,7 +107,7 @@ describe("managed apps trust boundary", () => {
       method: "GET",
       origin: "https://example.test",
       ownerId: null,
-      url: "https://example.test/apps/tiny?view=settings",
+      url: "https://example.test/apps/api/tiny?workspace=personal&view=settings",
       userId: appsUserId,
     });
   });

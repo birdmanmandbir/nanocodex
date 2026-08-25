@@ -101,6 +101,22 @@ const health = {
 export default health;
 
 export class AppPlatform extends WorkerEntrypoint<Env, AppPlatformProps> {
+  async console(request: Request): Promise<Response> {
+    if (this.ctx.props.clientId !== "nanocodex-managed") {
+      throw new Error("app platform is restricted to the managed account gateway");
+    }
+    if (!configured(this.env)) return json({ error: "platform_unavailable" }, 503);
+    const url = new URL(request.url);
+    if (url.pathname !== "/apps" && !url.pathname.startsWith("/apps/")) {
+      return json({ error: "not_found" }, 404);
+    }
+    if (url.pathname.startsWith("/apps/api/")) return json({ error: "not_found" }, 404);
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      return json({ error: "method_not_allowed" }, 405);
+    }
+    return serveConsoleAsset(request, this.env, url);
+  }
+
   async request(accessInput: AppAccess, request: Request): Promise<Response> {
     if (this.ctx.props.clientId !== "nanocodex-managed") {
       throw new Error("app platform is restricted to the managed account gateway");
