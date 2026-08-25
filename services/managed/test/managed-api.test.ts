@@ -50,10 +50,36 @@ describe("managed apps trust boundary", () => {
     });
     const denied = await RAW_SELF.fetch("https://example.test/apps");
     expect(denied.status).toBe(401);
-    const apiKeyDenied = await RAW_SELF.fetch("https://example.test/apps", {
+    const apiKeyAccess = await RAW_SELF.fetch("https://example.test/apps", {
       headers: { authorization: `Bearer ${API_KEY}` },
     });
-    expect(apiKeyDenied.status).toBe(401);
+    expect(apiKeyAccess.status).toBe(200);
+    expect(await apiKeyAccess.json()).toMatchObject({
+      access: {
+        actorUserId: USER_ID,
+        tenantId: `user:${USER_ID}`,
+        kind: "personal",
+        role: "owner",
+      },
+      authorization: null,
+    });
+    expect((await RAW_SELF.fetch("https://example.test/apps/tiny", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${API_KEY}`,
+        "content-type": "application/json",
+        origin: "https://attacker.test",
+      },
+      body: "{}",
+    })).status).toBe(403);
+    expect((await RAW_SELF.fetch("https://example.test/apps/tiny", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${API_KEY}`,
+        "content-type": "application/json",
+      },
+      body: "{}",
+    })).status).toBe(200);
 
     const response = await RAW_SELF.fetch("https://example.test/apps/tiny?view=settings", {
       headers: {

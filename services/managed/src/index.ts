@@ -72,6 +72,7 @@ import {
   attachAgent,
   authenticate,
   authenticatePersistentAccount,
+  authenticatePersistentAppPrincipal,
   detachAgent,
   isUserId,
   listAgents,
@@ -647,11 +648,23 @@ export default {
       headers.delete("x-nanocodex-subject");
       headers.delete("x-nanocodex-user-id");
       const appsRequest = new Request(request, { headers });
-      const principal = await authenticatePersistentAccount(appsRequest, env, url);
+      // A passkey session wins over any ambient or forged bearer credential.
+      // Persistent API-key accounts use the same user/team authority for
+      // headless app lifecycle calls, but their secret never crosses this
+      // gateway into the app platform or generated Worker.
+      const principal = await authenticatePersistentAccount(appsRequest, env, url)
+        ?? await authenticatePersistentAppPrincipal(request, env, url);
       if (!principal) return json({ error: "unauthorized" }, { status: 401 });
       if (request.method !== "GET" && request.method !== "HEAD") {
-        const originFailure = requireSameOriginMutation(appsRequest, url, principal);
-        if (originFailure) return originFailure;
+        if (principal.kind === "account_session") {
+          const originFailure = requireSameOriginMutation(appsRequest, url, principal);
+          if (originFailure) return originFailure;
+        } else {
+          const origin = request.headers.get("origin");
+          if (origin && origin !== url.origin) {
+            return json({ error: "forbidden_origin" }, { status: 403 });
+          }
+        }
       }
       if (!env.NANOCODEX_APPS) {
         return json({ error: "apps_service_unavailable" }, { status: 503 });
