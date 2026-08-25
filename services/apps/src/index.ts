@@ -499,12 +499,13 @@ async function serveConsoleAsset(request: Request, env: ConfiguredEnv, url: URL)
   if (url.pathname === "/apps") {
     return new Response(null, { status: 308, headers: { location: "/apps/" } });
   }
-  const assetUrl = new URL(request.url);
-  assetUrl.pathname = url.pathname === "/apps/" ? "/index.html" : url.pathname.slice("/apps".length);
-  const response = await env.ASSETS.fetch(new Request(assetUrl, request));
-  if (response.status !== 404 || assetUrl.pathname.startsWith("/assets/")) return response;
-  assetUrl.pathname = "/index.html";
-  return env.ASSETS.fetch(new Request(assetUrl, request));
+  const assetPath = url.pathname === "/apps/" ? "/index.html" : url.pathname.slice("/apps".length);
+  const fetchAsset = (path: string) => env.ASSETS.fetch(new Request(`https://assets.local${path}`, {
+    method: request.method,
+  }));
+  const response = await fetchAsset(assetPath);
+  if (response.status !== 404 || assetPath.startsWith("/assets/")) return response;
+  return fetchAsset("/index.html");
 }
 
 type ConfiguredEnv = Env & {

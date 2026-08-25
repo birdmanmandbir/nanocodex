@@ -123,11 +123,12 @@ function runtimeGateway(env: Env, ctx: Record<string, unknown> = {}) {
 
 describe("tenant app control plane", () => {
   it("keeps the console and its SPA fallback rooted under /apps", async () => {
-    const rootPaths: string[] = [];
+    const rootRequests: Array<{ host: string; method: string; pathname: string }> = [];
     const rootEnv = configuredEnv({
       ASSETS: {
         fetch: vi.fn(async (request: Request) => {
-          rootPaths.push(new URL(request.url).pathname);
+          const url = new URL(request.url);
+          rootRequests.push({ host: url.host, method: request.method, pathname: url.pathname });
           return new Response("console");
         }),
       } as unknown as Fetcher,
@@ -143,7 +144,12 @@ describe("tenant app control plane", () => {
     );
     expect(root.status).toBe(200);
     expect(await root.text()).toBe("console");
-    expect(rootPaths).toEqual(["/index.html"]);
+    expect(rootRequests).toEqual([{ host: "assets.local", method: "GET", pathname: "/index.html" }]);
+
+    await appGateway(rootEnv).serveConsole(
+      new Request("https://nanocodex.test/apps/", { method: "HEAD" }),
+    );
+    expect(rootRequests.at(-1)).toEqual({ host: "assets.local", method: "HEAD", pathname: "/index.html" });
 
     const nestedPaths: string[] = [];
     const nestedEnv = configuredEnv({
