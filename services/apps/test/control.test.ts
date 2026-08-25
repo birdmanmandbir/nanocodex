@@ -31,6 +31,7 @@ beforeAll(async () => {
 });
 
 const USER_ID = "0198e2c4-365e-7a66-a58f-d4e5b46a7dad";
+const SECOND_USER_ID = "0198e2c4-365e-7a66-a58f-d4e5b46a7dac";
 const TENANT_ID = `user:${USER_ID}` as const;
 const PERSONAL_ACCESS = Object.freeze({
   actorUserId: USER_ID,
@@ -48,11 +49,11 @@ const TEAM_OWNER_ACCESS = Object.freeze({
 }) satisfies AppAccess;
 const TEAM_MEMBER_ACCESS = Object.freeze({ ...TEAM_OWNER_ACCESS, role: "member" }) satisfies AppAccess;
 
-function teamAuthorization(role: "owner" | "member" = "owner") {
+function teamAuthorization(role: "owner" | "member" = "owner", userId = USER_ID) {
   return {
     authorized: true as const,
     team: { id: TEAM_ID, name: "Builders", created_at: 1 },
-    membership: { user_id: USER_ID, role, joined_at: 2 },
+    membership: { user_id: userId, role, joined_at: 2 },
   };
 }
 const TICKET_SECRET = "ticket-secret-that-is-at-least-32-characters";
@@ -459,7 +460,7 @@ describe("tenant app control plane", () => {
     expect(response.headers.get("location")).toBe(`${publicPrefix}/next`);
     expect(response.headers.get("set-cookie")).toBeNull();
     expect(loader.get).toHaveBeenCalledWith(
-      `${TENANT_ID}:${app.appId}:${artifact.revision}:1`,
+      `${TENANT_ID}:${USER_ID}:${app.appId}:${artifact.revision}:1`,
       expect.any(Function),
     );
     expect(manifest).toMatchObject({
@@ -488,7 +489,7 @@ describe("tenant app control plane", () => {
     const app = appRecord(artifact.revision, serializeArtifact(artifact).length, TEAM_TENANT);
     const registry = { getApp: vi.fn(async () => app) };
     const authorizeTeam = vi.fn<Env["NANOCODEX_AGENTS"]["authorizeTeam"]>(
-      async () => teamAuthorization("member"),
+      async (actorUserId) => teamAuthorization("member", actorUserId),
     );
     const loader = {
       get: vi.fn(() => ({ getEntrypoint: () => ({ fetch: async () => new Response("team ok") }) })),
@@ -513,17 +514,34 @@ describe("tenant app control plane", () => {
     expect(allowed.status).toBe(200);
     expect(await allowed.text()).toBe("team ok");
     expect(loader.get).toHaveBeenCalledOnce();
+    expect(loader.get).toHaveBeenNthCalledWith(
+      1,
+      `${TEAM_TENANT}:${USER_ID}:${app.appId}:${artifact.revision}:1`,
+      expect.any(Function),
+    );
+
+    const secondMember = await gateway.invokeApp(
+      frameClaims(app.appId, app.slug, TEAM_TENANT, SECOND_USER_ID),
+      request(),
+      prefix,
+    );
+    expect(secondMember.status).toBe(200);
+    expect(loader.get).toHaveBeenNthCalledWith(
+      2,
+      `${TEAM_TENANT}:${SECOND_USER_ID}:${app.appId}:${artifact.revision}:1`,
+      expect.any(Function),
+    );
 
     authorizeTeam.mockResolvedValueOnce({ authorized: false });
     const removed = await gateway.invokeApp(claims, request(), prefix);
     expect(removed.status).toBe(404);
     expect(await removed.json()).toEqual({ error: "not_found" });
-    expect(loader.get).toHaveBeenCalledOnce();
+    expect(loader.get).toHaveBeenCalledTimes(2);
 
     authorizeTeam.mockRejectedValueOnce(new Error("authority unavailable"));
     const unavailable = await gateway.invokeApp(claims, request(), prefix);
     expect(unavailable.status).toBe(404);
-    expect(loader.get).toHaveBeenCalledOnce();
+    expect(loader.get).toHaveBeenCalledTimes(2);
   });
 
   it("rejects a self-validating artifact that does not match the registry revision", async () => {
@@ -577,9 +595,14 @@ describe("tenant app control plane", () => {
   });
 });
 
-function frameClaims(appId: string, slug: string, tenantId: string = TENANT_ID): FrameSessionClaims {
+function frameClaims(
+  appId: string,
+  slug: string,
+  tenantId: string = TENANT_ID,
+  actorUserId = USER_ID,
+): FrameSessionClaims {
   return {
-    actorUserId: USER_ID,
+    actorUserId,
     appId,
     audience: FRAME_SESSION_AUDIENCE,
     expiry: Math.floor(Date.now() / 1_000) + 3_600,

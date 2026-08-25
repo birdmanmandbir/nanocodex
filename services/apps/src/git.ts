@@ -12,12 +12,15 @@ import {
   validateProject,
 } from "./builder";
 import { createMemoryGitFs } from "./memory-fs";
+import type { TenantId } from "./registry";
 
 const DIRECTORY = "/workspace";
 const BRANCH = "nanocodex";
 const REMOTE = "origin";
 const MANIFEST_PATH = ".nanocodex/app.json";
 const APP_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-7][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const USER_TENANT = /^user:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const TEAM_TENANT = /^team:[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const COMMIT_OID = /^[0-9a-f]{40}$/;
 const MAX_HTTP_BODY_BYTES = 34 * 1024 * 1024;
 
@@ -27,6 +30,7 @@ export interface AppGitService {
 
 export type CommitProjectInput = Readonly<{
   appId: string;
+  tenantId: TenantId;
   expectedAncestorOid: string | null;
   jobId: string;
   prompt: string;
@@ -45,16 +49,23 @@ export type SourceHistoryEntry = Readonly<{
   committedAt: string;
 }>;
 
-export function appRepositoryName(appId: string): string {
+export async function appRepositoryName(tenantIdInput: TenantId, appId: string): Promise<string> {
+  const tenantId = canonicalTenantId(tenantIdInput);
   if (!APP_ID.test(appId)) throw new Error("appId must be a UUID");
-  return `app-${appId}`;
+  const identity = canonicalJson({ appId, namespace: "nanocodex-app-source-v1", tenantId });
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(identity)));
+  digest[6] = (digest[6]! & 0x0f) | 0x40;
+  digest[8] = (digest[8]! & 0x3f) | 0x80;
+  const hex = [...digest.subarray(0, 16)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `app-${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 export async function commitProject(
   service: AppGitService,
   input: CommitProjectInput,
 ): Promise<SourceCommit> {
-  const repository = appRepositoryName(input.appId);
+  const tenantId = canonicalTenantId(input.tenantId);
+  const repository = await appRepositoryName(tenantId, input.appId);
   const project = validateProject(input.project);
   const timestamp = canonicalTimestamp(input.createdAt);
   const fs = createMemoryGitFs();
@@ -65,6 +76,7 @@ export async function commitProject(
     entryPoint: project.entryPoint,
     jobId: input.jobId,
     policyVersion: APP_POLICY_VERSION,
+    tenantId,
   });
   const desired = new Map(project.files.map((file) => [file.path, file.content]));
   desired.set(MANIFEST_PATH, manifest);
@@ -124,15 +136,23 @@ export async function commitProject(
   return { oid, repository };
 }
 
+function canonicalTenantId(value: unknown): TenantId {
+  if (typeof value !== "string" || (!USER_TENANT.test(value) && !TEAM_TENANT.test(value))) {
+    throw new Error("tenantId must be user:<uuid> or team:<id>");
+  }
+  return value as TenantId;
+}
+
 export async function sourceHistory(
   service: AppGitService,
+  tenantId: TenantId,
   appId: string,
   depth = 100,
 ): Promise<readonly SourceHistoryEntry[]> {
   if (!Number.isSafeInteger(depth) || depth < 1 || depth > 200) {
     throw new Error("history depth must be between 1 and 200");
   }
-  const repository = appRepositoryName(appId);
+  const repository = await appRepositoryName(tenantId, appId);
   const fs = createMemoryGitFs();
   const http = appGitHttp(service, repository);
   const remoteUrl = repositoryUrl(repository);

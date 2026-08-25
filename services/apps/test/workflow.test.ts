@@ -117,6 +117,7 @@ describe("app build workflow source ancestry", () => {
       expectedAncestorOid: sourceB,
       jobId: "job-c",
       project: projectC,
+      tenantId,
     }));
     expect(mocks.publishRevision).toHaveBeenCalledWith(env.APP_REGISTRY, tenantId, expect.objectContaining({
       sourceCommitOid: sourceC,

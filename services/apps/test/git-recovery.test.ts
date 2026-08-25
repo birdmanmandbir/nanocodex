@@ -21,7 +21,8 @@ const mocks = vi.hoisted(() => ({
 vi.mock("isomorphic-git", () => ({ default: mocks }));
 
 import { canonicalJson } from "../src/builder";
-import { commitProject } from "../src/git";
+import { appRepositoryName, commitProject } from "../src/git";
+import type { TenantId } from "../src/registry";
 
 describe("app Git orphan-push recovery", () => {
   const appId = "0198e2c4-365e-7a66-a58f-d4e5b46a7dad";
@@ -29,11 +30,13 @@ describe("app Git orphan-push recovery", () => {
   const orphan = "2".repeat(40);
   const committed = "3".repeat(40);
   const source = "export default { fetch: () => new Response('C') };";
+  const tenantId = `team:${"a".repeat(64)}` as TenantId;
   const manifest = canonicalJson({
     appId,
     entryPoint: "src/index.ts",
     jobId: "job-c",
     policyVersion: 1,
+    tenantId,
   });
   const input = {
     appId,
@@ -47,6 +50,7 @@ describe("app Git orphan-push recovery", () => {
       files: [{ path: "src/index.ts", content: source }],
     },
     prompt: "Build C",
+    tenantId,
   };
 
   beforeEach(() => {
@@ -84,14 +88,15 @@ describe("app Git orphan-push recovery", () => {
 
   it("appends after a validated orphan commit and reuses the same commit on retry", async () => {
     const service = { request: vi.fn() };
+    const repository = await appRepositoryName(tenantId, appId);
 
     await expect(commitProject(service, input)).resolves.toEqual({
       oid: committed,
-      repository: `app-${appId}`,
+      repository,
     });
     await expect(commitProject(service, input)).resolves.toEqual({
       oid: committed,
-      repository: `app-${appId}`,
+      repository,
     });
 
     expect(mocks.isDescendent).toHaveBeenCalledWith(expect.objectContaining({

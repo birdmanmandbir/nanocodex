@@ -95,6 +95,7 @@ export class AppBuildWorkflow extends WorkflowEntrypoint<BuildWorkflowEnv, Build
           jobId: params.jobId,
           project,
           prompt: params.prompt,
+          tenantId: params.tenantId,
         }),
       );
       return await step.do<App>("publish and activate revision", async () => publishRevision(

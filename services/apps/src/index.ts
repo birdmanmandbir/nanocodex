@@ -413,7 +413,7 @@ async function invokeDynamicApp(
     },
   });
   const worker = env.LOADER.get(
-    `${claims.tenantId}:${app.appId}:${revision.revisionId}:${revision.policyVersion}`,
+    `${claims.tenantId}:${claims.actorUserId}:${app.appId}:${revision.revisionId}:${revision.policyVersion}`,
     async () => ({
       compatibilityDate: artifact.compatibilityDate,
       env: { NANOCODEX: capability },
