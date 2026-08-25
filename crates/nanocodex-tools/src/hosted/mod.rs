@@ -53,7 +53,9 @@ use std::{error::Error, fmt, future::Future, pin::Pin};
 use crate::{ToolContext, ToolDefinition, ToolInput, ToolOutput};
 
 pub use input::{prepare_output_images, prepare_user_input};
-pub use runtime::{HostedToolRuntime, HostedToolRuntimeControl, HostedTools};
+pub use runtime::{
+    HostedToolRuntime, HostedToolRuntimeControl, HostedTools, HostedToolsBuildError,
+};
 pub use types::{
     CodeModeExecution, CodeModeNotification, CodeModeObserver, CodeModeUpdate, NestedToolCall,
     OwnedToolContext,
@@ -139,6 +141,32 @@ pub trait CodeModeHost: Send + Sync + 'static {
         context: ToolContext<'a>,
     ) -> HostFuture<'a, Result<CodeModeExecution, CodeModeHostError>>;
 
+    /// Executes one Code Mode cell while reporting nested-tool lifecycle
+    /// updates at the boundary where the host observes them.
+    ///
+    /// The default preserves the complete execution contract for existing
+    /// hosts. Hosts that can observe live nested work should override this and
+    /// report updates at the actual start and completion boundaries.
+    fn execute_with_updates<'a>(
+        &'a self,
+        source: &'a str,
+        context: ToolContext<'a>,
+        observer: &'a mut dyn CodeModeObserver,
+    ) -> HostFuture<'a, Result<CodeModeExecution, CodeModeHostError>> {
+        Box::pin(async move {
+            let execution = self.execute(source, context).await?;
+            for call in &execution.nested_calls {
+                observer.update(CodeModeUpdate::NestedCallStarted {
+                    call_id: &call.call_id,
+                    name: &call.name,
+                    input: &call.input,
+                });
+                observer.update(CodeModeUpdate::NestedCallCompleted(call));
+            }
+            Ok(execution)
+        })
+    }
+
     /// Executes one directly exposed application tool.
     fn execute_tool<'a>(
         &'a self,
@@ -151,5 +179,10 @@ pub trait CodeModeHost: Send + Sync + 'static {
                 "direct hosted tool `{name}` is unavailable"
             )))
         })
+    }
+
+    /// Cancels host-owned Code Mode and nested-tool work for one agent session.
+    fn cancel<'a>(&'a self, _session_id: &'a str) -> HostFuture<'a, Result<(), CodeModeHostError>> {
+        Box::pin(async { Ok(()) })
     }
 }

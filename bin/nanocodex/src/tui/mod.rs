@@ -10,14 +10,15 @@ mod resume_picker;
 mod scheduler;
 mod selection;
 mod simplify;
+mod split;
 mod telemetry;
 mod terminal;
 mod transcript;
 mod view;
 
 use std::{
-    collections::VecDeque,
-    path::PathBuf,
+    collections::{HashMap, HashSet, VecDeque},
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::Arc,
     time::{Duration, Instant},
@@ -55,7 +56,10 @@ use self::{
     terminal::TerminalSession,
     transcript::TranscriptItem,
 };
-use crate::config::AgentArgs;
+use crate::{
+    config::AgentArgs,
+    subagents::{AgentId, AgentStatus, AgentUpdate, ScopedAgentUpdate},
+};
 
 pub(crate) use eval_attach::attach_evaluation;
 pub(crate) use resume_picker::select_resume_session;
@@ -71,6 +75,47 @@ const DEFAULT_JAEGER_UI_URL: &str = "http://127.0.0.1:16686";
 const JAEGER_UI_URL_ENV: &str = "NANOCODEX_JAEGER_UI_URL";
 const MOUSE_SCROLL_ROWS: usize = 3;
 const MAX_AGENT_EVENTS_PER_BATCH: usize = 256;
+
+#[derive(Default)]
+struct SubagentCompletionTracker {
+    direct_children: HashMap<String, HashSet<AgentId>>,
+    completed: HashMap<String, HashSet<AgentId>>,
+}
+
+impl SubagentCompletionTracker {
+    fn observe(&mut self, update: &ScopedAgentUpdate) -> Option<AgentId> {
+        let root_session_id = &update.root_session_id;
+        match &update.update {
+            AgentUpdate::Added(agent) => {
+                let direct_children = self
+                    .direct_children
+                    .entry(root_session_id.clone())
+                    .or_default();
+                if agent.parent.is_none() {
+                    direct_children.insert(agent.id);
+                } else {
+                    direct_children.remove(&agent.id);
+                }
+                None
+            }
+            AgentUpdate::Status { id, status } => {
+                let completed = self.completed.entry(root_session_id.clone()).or_default();
+                if !matches!(status, AgentStatus::Completed { .. }) {
+                    completed.remove(id);
+                    return None;
+                }
+                let newly_completed = completed.insert(*id);
+                (newly_completed
+                    && self
+                        .direct_children
+                        .get(root_session_id)
+                        .is_some_and(|children| children.contains(id)))
+                .then_some(*id)
+            }
+            AgentUpdate::Event { .. } | AgentUpdate::Message(_) => None,
+        }
+    }
+}
 
 pub(crate) struct InitialPrompt {
     display: String,
@@ -120,6 +165,10 @@ enum WorkerCommand {
     },
     CloseBtw {
         id: u64,
+    },
+    SplitBtw {
+        id: u64,
+        cwd: PathBuf,
     },
     EditHistorical {
         source_branch_id: u64,
@@ -208,6 +257,15 @@ enum WorkerEvent {
     BtwEventStreamClosed {
         id: u64,
     },
+    BtwSplitCompleted {
+        id: u64,
+        destination: &'static str,
+    },
+    BtwSplitFailed {
+        id: u64,
+        error: String,
+        detached: bool,
+    },
     MainBranchOpened {
         id: u64,
         parent_id: u64,
@@ -271,6 +329,9 @@ enum WorkerEvent {
     VoiceFailed {
         error: String,
     },
+    VoiceCommandFailed {
+        error: String,
+    },
     VoiceStopped,
 }
 
@@ -288,6 +349,7 @@ struct BtwWorker {
     request_id: Arc<str>,
     agent: Nanocodex,
     first_prompt: bool,
+    has_durable_turn: bool,
     turns: VecDeque<TrackedTurn>,
 }
 
@@ -561,6 +623,7 @@ enum Submission {
     Prompt(SubmittedPrompt),
     Btw(Option<SubmittedPrompt>),
     CloseBtw,
+    SplitBtw,
     Cancel,
     Trace,
     Fast(Option<bool>),
@@ -611,6 +674,7 @@ pub(crate) async fn run(
     let mut agent_events = configured.events;
     let realtime = configured.realtime;
     let root_session_id = Arc::<str>::from(agent_events.request_id());
+    let mut subagent_updates = configured.subagent_updates;
     let child_agents = configured.child_agents;
     let mpp_adapter = configured.mpp_adapter;
     let mcp = configured.mcp;
@@ -656,6 +720,7 @@ pub(crate) async fn run(
     let mut stream_telemetry = StreamTelemetry::default();
     let mut view_telemetry = ViewTelemetry::new(Arc::clone(&root_session_id));
     let mut notifier = Notifier::from_env();
+    let mut subagent_completion_tracker = SubagentCompletionTracker::default();
 
     submit_initial_prompt(&mut ui.app, &root_session_id, &worker_tx, initial_prompt)?;
 
@@ -726,6 +791,21 @@ pub(crate) async fn run(
                 }
                 if apply_update(update, &mut scheduler) {
                     break Ok(());
+                }
+            }
+            update = receive_subagent_update(&mut subagent_updates) => {
+                if let Some(update) = update {
+                    if handle_subagent_update(
+                        &mut subagent_completion_tracker,
+                        update,
+                        &mut ui.app,
+                        &root_session_id,
+                        &worker_tx,
+                    )? {
+                        scheduler.request_immediate(Instant::now());
+                    }
+                } else {
+                    subagent_updates = None;
                 }
             }
             _ = ticker.tick(), if ui.app.main.running
@@ -926,6 +1006,55 @@ fn ui_ticker() -> tokio::time::Interval {
     ticker
 }
 
+async fn receive_subagent_update(
+    updates: &mut Option<mpsc::UnboundedReceiver<ScopedAgentUpdate>>,
+) -> Option<ScopedAgentUpdate> {
+    match updates {
+        Some(updates) => updates.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn handle_subagent_update(
+    tracker: &mut SubagentCompletionTracker,
+    update: ScopedAgentUpdate,
+    app: &mut App,
+    initial_root_session_id: &str,
+    commands: &mpsc::UnboundedSender<WorkerCommand>,
+) -> Result<bool> {
+    let Some(agent_id) = tracker.observe(&update) else {
+        return Ok(false);
+    };
+    let active_root_session_id = app
+        .main_branch_request_id()
+        .unwrap_or(initial_root_session_id);
+    if update.root_session_id != active_root_session_id || !app.main_accepts_automatic_prompt() {
+        return Ok(false);
+    }
+
+    let display = format!("[Subagent {agent_id} completed]");
+    let mut prompt = SubmittedPrompt::text(display.clone());
+    prompt.set_instruction(format!(
+        "A direct subagent completed after the previous turn ended. Continue the current task by \
+         inspecting its structured result. Call list_agents with include_completed=true, find agent \
+         {agent_id}, integrate and verify the relevant findings, finish any remaining work, and then \
+         respond to the user. Do not merely repeat the raw subagent result.\n\n\
+         <subagent_completion agent_id=\"{agent_id}\" />"
+    ));
+    let prompt_id = app
+        .queue_prompt(PaneId::Main, display)
+        .ok_or_else(|| eyre::eyre!("main conversation disappeared before subagent continuation"))?;
+    send_command(
+        commands,
+        WorkerCommand::Prompt {
+            target: PaneId::Main,
+            prompt_id,
+            prompt,
+        },
+    )?;
+    Ok(true)
+}
+
 fn handle_worker_telemetry(update: &WorkerEvent, telemetry: &mut StreamTelemetry) -> bool {
     match update {
         WorkerEvent::TurnTraceStarted { target, id, span } => {
@@ -1024,10 +1153,18 @@ fn handle_worker_update(
             let _ = app.on_agent_event(PaneId::Btw(id), &event.event);
         }
         WorkerEvent::BtwEventStreamClosed { id } => {
-            if app.btw_id() == Some(id) {
+            if app.btw_id() == Some(id) && !app.btw_splitting(id) {
                 app.btw_failed(id, "BTW event stream closed".to_owned());
             }
         }
+        WorkerEvent::BtwSplitCompleted { id, destination } => {
+            app.btw_split_completed(id, destination);
+        }
+        WorkerEvent::BtwSplitFailed {
+            id,
+            error,
+            detached,
+        } => app.btw_split_failed(id, error, detached),
         WorkerEvent::MainBranchOpened {
             id,
             parent_id,
@@ -1110,7 +1247,14 @@ fn handle_worker_update(
             app.push_active_error(format!("Voice: {error}"));
             app.set_active_status("Voice unavailable");
         }
-        WorkerEvent::VoiceStopped => app.set_active_status("Voice stopped"),
+        WorkerEvent::VoiceCommandFailed { error } => {
+            app.push_active_error(format!("Voice: {error}"));
+        }
+        WorkerEvent::VoiceStopped => {
+            app.main
+                .push_output(TranscriptItem::Assistant("**Voice:** Stopped.".to_owned()));
+            app.set_active_status("Voice stopped");
+        }
     }
     Ok(())
 }
@@ -1142,6 +1286,7 @@ fn spawn_agent_worker(
             mcp,
             realtime,
             voice: None,
+            voice_shutdown: None,
             voice_agent_control: VoiceAgentControl::default(),
         };
         loop {
@@ -1157,7 +1302,8 @@ fn spawn_agent_worker(
                 }
             }
         }
-        worker.stop_voice().await;
+        worker.stop_voice();
+        worker.await_voice_shutdown().await;
     })
 }
 
@@ -1200,6 +1346,7 @@ struct AgentWorker {
     mcp: Option<McpHandle>,
     realtime: Option<OpenAi>,
     voice: Option<VoiceSession>,
+    voice_shutdown: Option<tokio::task::JoinHandle<()>>,
     voice_agent_control: VoiceAgentControl,
 }
 
@@ -1232,6 +1379,7 @@ impl AgentWorker {
                     self.btw = None;
                 }
             }
+            WorkerCommand::SplitBtw { id, cwd } => self.split_btw(id, &cwd).await,
             WorkerCommand::EditHistorical {
                 source_branch_id,
                 new_branch_id,
@@ -1268,15 +1416,15 @@ impl AgentWorker {
                 return;
             }
             VoiceControl::Stop => {
-                self.stop_voice().await;
+                self.stop_voice();
                 return;
             }
             VoiceControl::Toggle if running => {
-                self.stop_voice().await;
+                self.stop_voice();
                 return;
             }
             VoiceControl::Start(_) if running => {
-                drop(self.updates.send(WorkerEvent::VoiceFailed {
+                drop(self.updates.send(WorkerEvent::VoiceCommandFailed {
                     error: "voice is already active; use /voice off before changing it".to_owned(),
                 }));
                 return;
@@ -1288,6 +1436,7 @@ impl AgentWorker {
             VoiceControl::Toggle => None,
             VoiceControl::Stop | VoiceControl::List => return,
         };
+        self.await_voice_shutdown().await;
         if self.btw.is_some() {
             drop(self.updates.send(WorkerEvent::VoiceFailed {
                 error: "close /btw before starting voice".to_owned(),
@@ -1321,14 +1470,25 @@ impl AgentWorker {
         self.voice.as_ref().is_some_and(VoiceSession::is_running)
     }
 
-    async fn stop_voice(&mut self) {
+    fn stop_voice(&mut self) {
         let Some(mut voice) = self.voice.take() else {
             return;
         };
-        if let Err(error) = voice.shutdown().await {
-            drop(self.updates.send(WorkerEvent::VoiceFailed {
-                error: format!("failed to stop voice cleanly: {error}"),
-            }));
+        voice.stop();
+        drop(self.updates.send(WorkerEvent::VoiceStopped));
+        let updates = self.updates.clone();
+        self.voice_shutdown = Some(tokio::spawn(async move {
+            if let Err(error) = voice.shutdown().await {
+                drop(updates.send(WorkerEvent::VoiceFailed {
+                    error: format!("failed to stop voice cleanly: {error}"),
+                }));
+            }
+        }));
+    }
+
+    async fn await_voice_shutdown(&mut self) {
+        if let Some(shutdown) = self.voice_shutdown.take() {
+            let _ = shutdown.await;
         }
     }
 
@@ -1690,6 +1850,7 @@ impl AgentWorker {
                     request_id,
                     agent,
                     first_prompt: true,
+                    has_durable_turn: false,
                     turns: VecDeque::new(),
                 };
                 if let Some(prompt) = prompt {
@@ -1729,6 +1890,87 @@ impl AgentWorker {
                     error: error.to_string(),
                 }));
             }
+        }
+    }
+
+    async fn split_btw(&mut self, id: u64, cwd: &Path) {
+        let Some(branch) = self.btw.as_ref().filter(|branch| branch.id == id) else {
+            drop(self.updates.send(WorkerEvent::BtwSplitFailed {
+                id,
+                error: "BTW branch is not available".to_owned(),
+                detached: false,
+            }));
+            return;
+        };
+        if !branch.turns.is_empty() {
+            drop(self.updates.send(WorkerEvent::BtwSplitFailed {
+                id,
+                error: "BTW has an active turn; wait for it to finish before /split".to_owned(),
+                detached: false,
+            }));
+            return;
+        }
+        if !branch.has_durable_turn {
+            drop(
+                self.updates.send(WorkerEvent::BtwSplitFailed {
+                    id,
+                    error:
+                        "BTW needs one completed turn before it can be resumed in another terminal"
+                            .to_owned(),
+                    detached: false,
+                }),
+            );
+            return;
+        }
+        let Some(rollout) = branch.agent.rollout() else {
+            drop(
+                self.updates.send(WorkerEvent::BtwSplitFailed {
+                    id,
+                    error: "/split requires rollout recording; restart without `--rollouts false`"
+                        .to_owned(),
+                    detached: false,
+                }),
+            );
+            return;
+        };
+        let thread_id = rollout.thread_id().to_owned();
+        let prepared = match split::PreparedSplit::detect(cwd) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                drop(self.updates.send(WorkerEvent::BtwSplitFailed {
+                    id,
+                    error: error.to_string(),
+                    detached: false,
+                }));
+                return;
+            }
+        };
+
+        let Some(branch) = self.btw.take() else {
+            return;
+        };
+        if let Err(error) = branch.agent.shutdown().await {
+            drop(self.updates.send(WorkerEvent::BtwSplitFailed {
+                id,
+                error: format!(
+                    "failed to shut down BTW thread {thread_id}: {error}; try `nanocodex resume {thread_id}` manually"
+                ),
+                detached: true,
+            }));
+            return;
+        }
+        match prepared.launch(&thread_id) {
+            Ok(destination) => drop(
+                self.updates
+                    .send(WorkerEvent::BtwSplitCompleted { id, destination }),
+            ),
+            Err(error) => drop(self.updates.send(WorkerEvent::BtwSplitFailed {
+                id,
+                error: format!(
+                    "{error}; thread {thread_id} is saved — run `nanocodex resume {thread_id}` manually"
+                ),
+                detached: true,
+            })),
         }
     }
 
@@ -1874,6 +2116,7 @@ impl AgentWorker {
 
     fn finish_turn(&mut self, finished: FinishedTurn) {
         let main_branch_id = finished.main_branch_id;
+        let completed_durably = finished.result.is_some() && finished.error.is_none();
         match finished.target {
             PaneId::Main => {
                 let branch_id = main_branch_id.unwrap_or(self.main.id);
@@ -1894,6 +2137,7 @@ impl AgentWorker {
             PaneId::Btw(id) => {
                 if let Some(branch) = self.btw.as_mut().filter(|branch| branch.id == id) {
                     remove_finished(&mut branch.turns, finished.id);
+                    branch.has_durable_turn |= completed_durably;
                 }
             }
         }
@@ -2651,6 +2895,12 @@ fn submit(
     commands: &mpsc::UnboundedSender<WorkerCommand>,
     intent: SubmitIntent,
 ) -> Result<()> {
+    if let PaneId::Btw(id) = app.focus
+        && app.btw_splitting(id)
+    {
+        app.set_active_status("Moving BTW to another terminal");
+        return Ok(());
+    }
     let Some(input) = app.take_submission() else {
         return Ok(());
     };
@@ -2713,6 +2963,24 @@ fn submit(
                 }
             }
         }
+        Submission::SplitBtw => {
+            let Some(id) = app.btw_id() else {
+                app.push_active_error("/split requires an open /btw thread");
+                app.set_active_status("No BTW to split");
+                return Ok(());
+            };
+            if app.btw_busy() {
+                app.reject_btw_split_while_busy();
+            } else if app.begin_btw_split(id) {
+                send_command(
+                    commands,
+                    WorkerCommand::SplitBtw {
+                        id,
+                        cwd: app.cwd.clone(),
+                    },
+                )?;
+            }
+        }
         Submission::Cancel => {
             let target = app.focus;
             app.cancel_pending(target);
@@ -2773,6 +3041,12 @@ fn classify_submission(input: impl Into<SubmittedPrompt>) -> Submission {
     if trimmed == "/close" {
         return Submission::CloseBtw;
     }
+    if trimmed == "/split" {
+        return Submission::SplitBtw;
+    }
+    if trimmed.starts_with("/split ") {
+        return Submission::InvalidCommand("Usage: /split".to_owned());
+    }
     if trimmed == "/cancel" {
         return Submission::Cancel;
     }
@@ -2799,8 +3073,14 @@ fn classify_submission(input: impl Into<SubmittedPrompt>) -> Submission {
         if argument.is_some_and(|argument| argument.split_whitespace().count() != 1) {
             return Submission::InvalidCommand("Usage: /benchmark [profile]".to_owned());
         }
-        let instruction =
-            crate::benchmark::prompt(argument, std::path::Path::new("nanocodex.toml"), None, None);
+        let executable = std::env::current_exe().ok();
+        let instruction = crate::benchmark::prompt(
+            argument,
+            std::path::Path::new("nanocodex.toml"),
+            None,
+            None,
+            executable.as_deref(),
+        );
         input.set_display(display);
         input.set_instruction(instruction);
         return Submission::Prompt(input);
@@ -2812,7 +3092,7 @@ fn classify_submission(input: impl Into<SubmittedPrompt>) -> Submission {
         let argument = argument.trim();
         return match argument {
             "on" => Submission::Voice(VoiceControl::Start(None)),
-            "off" => Submission::Voice(VoiceControl::Stop),
+            "off" | "stop" => Submission::Voice(VoiceControl::Stop),
             "list" => Submission::Voice(VoiceControl::List),
             _ if argument.split_whitespace().count() == 1 => match argument.parse() {
                 Ok(voice) => Submission::Voice(VoiceControl::Start(Some(voice))),
@@ -2820,7 +3100,7 @@ fn classify_submission(input: impl Into<SubmittedPrompt>) -> Submission {
                     "Unknown voice. Use /voice list to see Codex voices.".to_owned(),
                 ),
             },
-            _ => Submission::InvalidCommand("Usage: /voice [on|off|list|<voice>]".to_owned()),
+            _ => Submission::InvalidCommand("Usage: /voice [on|off|stop|list|<voice>]".to_owned()),
         };
     }
     if trimmed == "/fast" {
@@ -2940,18 +3220,20 @@ mod tests {
         agent::events::AgentEventKind,
         oai::{__private::EventSink, PromptInput},
     };
+    use nanocodex_subagents::AgentDescriptor;
     use nanocodex_voice::RealtimeVoice;
     use serde_json::{Value, json};
     use tokio::{net::TcpListener, sync::mpsc, time::timeout};
     use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
     use super::{
-        BTW_BOUNDARY, PaneId, RedrawPriority, Submission, TerminalAction, UiAction, UiModel,
-        UiUpdate, VoiceControl, WorkerCommand, WorkerEvent, active_session_id,
-        apply_main_agent_event_batch, classify_submission, handle_key, handle_worker_update,
-        paste_clipboard_image, prepare_btw_prompt, report_cancel_outcome, session_trace_url,
-        spawn_agent_worker,
+        BTW_BOUNDARY, PaneId, RedrawPriority, SubagentCompletionTracker, Submission, SubmitIntent,
+        TerminalAction, UiAction, UiModel, UiUpdate, VoiceControl, WorkerCommand, WorkerEvent,
+        active_session_id, apply_main_agent_event_batch, classify_submission, handle_key,
+        handle_subagent_update, handle_worker_update, paste_clipboard_image, prepare_btw_prompt,
+        report_cancel_outcome, session_trace_url, spawn_agent_worker, submit,
     };
+    use crate::subagents::{AgentId, AgentStatus, AgentUpdate, ScopedAgentUpdate};
     use crate::tui::{
         app::App,
         scheduler::{RenderScheduler, STREAM_FRAME_INTERVAL},
@@ -2967,6 +3249,158 @@ mod tests {
         })
     }
 
+    fn agent_id(value: u64) -> AgentId {
+        serde_json::from_value(json!(value)).expect("agent id must deserialize")
+    }
+
+    fn scoped_agent_update(root_session_id: &str, update: AgentUpdate) -> ScopedAgentUpdate {
+        ScopedAgentUpdate {
+            root_session_id: root_session_id.to_owned(),
+            update,
+        }
+    }
+
+    fn added_agent(
+        root_session_id: &str,
+        id: AgentId,
+        parent: Option<AgentId>,
+    ) -> ScopedAgentUpdate {
+        scoped_agent_update(
+            root_session_id,
+            AgentUpdate::Added(AgentDescriptor {
+                id,
+                session_id: format!("agent-{id}"),
+                role: "reviewer".to_owned(),
+                task: "review the change".to_owned(),
+                parent,
+            }),
+        )
+    }
+
+    fn completed_agent(root_session_id: &str, id: AgentId) -> ScopedAgentUpdate {
+        scoped_agent_update(
+            root_session_id,
+            AgentUpdate::Status {
+                id,
+                status: AgentStatus::Completed {
+                    output: json!({ "result": "private structured output" }),
+                },
+            },
+        )
+    }
+
+    #[test]
+    fn subagent_completion_wakes_an_idle_root_once() {
+        let root_session_id = "root-session";
+        let id = agent_id(7);
+        let mut tracker = SubagentCompletionTracker::default();
+        assert_eq!(
+            tracker.observe(&added_agent(root_session_id, id, None)),
+            None
+        );
+
+        let mut app = App::new(PathBuf::from("."));
+        let (commands, mut worker) = mpsc::unbounded_channel();
+        assert!(
+            handle_subagent_update(
+                &mut tracker,
+                completed_agent(root_session_id, id),
+                &mut app,
+                root_session_id,
+                &commands,
+            )
+            .unwrap()
+        );
+        assert_eq!(app.main.pending_turns, 1);
+
+        let WorkerCommand::Prompt {
+            target,
+            prompt_id: _,
+            prompt,
+        } = worker.try_recv().unwrap()
+        else {
+            panic!("completion must submit a root prompt");
+        };
+        assert_eq!(target, PaneId::Main);
+        assert_eq!(prompt.display(), "[Subagent 7 completed]");
+        let prompt = format!("{prompt:?}");
+        assert!(prompt.contains("list_agents"));
+        assert!(prompt.contains("agent_id=\\\"7\\\""));
+        assert!(!prompt.contains("private structured output"));
+
+        assert_eq!(tracker.observe(&completed_agent(root_session_id, id)), None);
+    }
+
+    #[test]
+    fn subagent_completion_does_not_latch_while_root_is_busy() {
+        let root_session_id = "root-session";
+        let id = agent_id(8);
+        let mut tracker = SubagentCompletionTracker::default();
+        tracker.observe(&added_agent(root_session_id, id, None));
+        let mut app = App::new(PathBuf::from("."));
+        app.main.running = true;
+        let (commands, mut worker) = mpsc::unbounded_channel();
+
+        assert!(
+            !handle_subagent_update(
+                &mut tracker,
+                completed_agent(root_session_id, id),
+                &mut app,
+                root_session_id,
+                &commands,
+            )
+            .unwrap()
+        );
+        app.main.running = false;
+        assert!(
+            !handle_subagent_update(
+                &mut tracker,
+                completed_agent(root_session_id, id),
+                &mut app,
+                root_session_id,
+                &commands,
+            )
+            .unwrap()
+        );
+        assert!(worker.try_recv().is_err());
+    }
+
+    #[test]
+    fn nested_or_inactive_root_completions_do_not_wake_the_root() {
+        let active_root = "active-root";
+        let inactive_root = "inactive-root";
+        let parent = agent_id(9);
+        let nested = agent_id(10);
+        let direct = agent_id(11);
+        let mut tracker = SubagentCompletionTracker::default();
+        tracker.observe(&added_agent(active_root, nested, Some(parent)));
+        tracker.observe(&added_agent(inactive_root, direct, None));
+        let mut app = App::new(PathBuf::from("."));
+        let (commands, mut worker) = mpsc::unbounded_channel();
+
+        assert!(
+            !handle_subagent_update(
+                &mut tracker,
+                completed_agent(active_root, nested),
+                &mut app,
+                active_root,
+                &commands,
+            )
+            .unwrap()
+        );
+        assert!(
+            !handle_subagent_update(
+                &mut tracker,
+                completed_agent(inactive_root, direct),
+                &mut app,
+                active_root,
+                &commands,
+            )
+            .unwrap()
+        );
+        assert!(worker.try_recv().is_err());
+    }
+
     #[test]
     fn parses_tui_commands_without_capturing_similar_prompts() {
         assert_eq!(
@@ -2980,6 +3414,11 @@ mod tests {
         assert_eq!(
             classify_submission("/close".to_owned()),
             Submission::CloseBtw
+        );
+        assert_eq!(classify_submission(" /split "), Submission::SplitBtw);
+        assert_eq!(
+            classify_submission("/split right"),
+            Submission::InvalidCommand("Usage: /split".to_owned())
         );
         assert_eq!(
             classify_submission("/cancel".to_owned()),
@@ -3016,6 +3455,10 @@ mod tests {
         assert_eq!(
             classify_submission("/voice list"),
             Submission::Voice(VoiceControl::List)
+        );
+        assert_eq!(
+            classify_submission("/voice stop"),
+            Submission::Voice(VoiceControl::Stop)
         );
         assert_eq!(
             classify_submission("/voice junk"),
@@ -3064,6 +3507,10 @@ mod tests {
             Submission::Prompt("/btw-not-a-command".into())
         );
         assert_eq!(
+            classify_submission("/splitwise"),
+            Submission::Prompt("/splitwise".into())
+        );
+        assert_eq!(
             classify_submission("/simplify-this"),
             Submission::Prompt("/simplify-this".into())
         );
@@ -3079,6 +3526,25 @@ mod tests {
             classify_submission("/modeling"),
             Submission::Prompt("/modeling".into())
         );
+    }
+
+    #[test]
+    fn split_submission_marks_the_btw_and_requests_a_worker_handoff() {
+        let (commands, mut worker) = mpsc::unbounded_channel();
+        let mut app = App::new("/workspace".into());
+        let id = app.begin_btw();
+        app.btw_opened(id, Arc::from("btw-thread"));
+        app.input = "/split".to_owned();
+        app.cursor = app.input.len();
+
+        submit(&mut app, "main-thread", &commands, SubmitIntent::Immediate).unwrap();
+
+        assert!(app.btw_splitting(id));
+        assert!(matches!(
+            worker.try_recv(),
+            Ok(WorkerCommand::SplitBtw { id: split_id, cwd })
+                if split_id == id && cwd == PathBuf::from("/workspace")
+        ));
     }
 
     #[test]

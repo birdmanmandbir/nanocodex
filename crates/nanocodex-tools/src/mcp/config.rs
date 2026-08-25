@@ -1,4 +1,12 @@
-use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
+
+use async_trait::async_trait;
+use serde_json::Value;
 
 const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_mins(5);
@@ -39,10 +47,36 @@ pub struct McpServer {
     pub(crate) startup_timeout: Duration,
     pub(crate) tool_timeout: Duration,
     pub(crate) supports_parallel_tool_calls: bool,
+    pub(crate) parallel_tools: BTreeSet<String>,
     pub(crate) tool_exposure: McpToolExposure,
     pub(crate) enabled_tools: Option<Vec<String>>,
     pub(crate) disabled_tools: Vec<String>,
+    pub(crate) payment: Option<Arc<dyn McpPaymentProvider>>,
     pub(crate) unsupported_option: Option<&'static str>,
+}
+
+/// Creates and reconciles protocol-level MPP credentials for paid MCP calls.
+#[async_trait]
+pub trait McpPaymentProvider: Send + Sync {
+    /// Prepares one payment-required payload, or returns `None` when none of
+    /// its challenges are supported.
+    async fn prepare(
+        &self,
+        payment_required: &Value,
+    ) -> Result<Option<Box<dyn McpPendingPayment>>, String>;
+}
+
+/// One prepared MCP payment whose provider lifecycle follows request delivery.
+#[async_trait]
+pub trait McpPendingPayment: Send {
+    /// Returns the credential to attach to request metadata.
+    fn credential(&self) -> &Value;
+
+    /// Commits provider state after the paid retry succeeds.
+    async fn commit(self: Box<Self>) -> Result<(), String>;
+
+    /// Rolls provider state back after the credential was not sent or was rejected.
+    async fn rollback(self: Box<Self>) -> Result<(), String>;
 }
 
 #[derive(Clone)]
@@ -81,9 +115,11 @@ impl McpServer {
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             tool_timeout: DEFAULT_TOOL_TIMEOUT,
             supports_parallel_tool_calls: false,
+            parallel_tools: BTreeSet::new(),
             tool_exposure: McpToolExposure::default(),
             enabled_tools: None,
             disabled_tools: Vec::new(),
+            payment: None,
             unsupported_option: None,
         }
     }
@@ -101,9 +137,11 @@ impl McpServer {
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             tool_timeout: DEFAULT_TOOL_TIMEOUT,
             supports_parallel_tool_calls: false,
+            parallel_tools: BTreeSet::new(),
             tool_exposure: McpToolExposure::default(),
             enabled_tools: None,
             disabled_tools: Vec::new(),
+            payment: None,
             unsupported_option: None,
         }
     }
@@ -139,6 +177,16 @@ impl McpServer {
         self
     }
 
+    /// Declares specific remote tools safe to call concurrently.
+    ///
+    /// This supplements MCP's `annotations.readOnlyHint` without opting every
+    /// tool on the server into parallel execution.
+    #[must_use]
+    pub fn parallel_tools(mut self, tools: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.parallel_tools = tools.into_iter().map(Into::into).collect();
+        self
+    }
+
     /// Selects whether this server's tools are deferred, nested in Code Mode, both, or hidden.
     #[must_use]
     pub const fn tool_exposure(mut self, exposure: McpToolExposure) -> Self {
@@ -157,6 +205,13 @@ impl McpServer {
     #[must_use]
     pub fn disabled_tools(mut self, tools: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.disabled_tools = tools.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Enables protocol-level paid tool retries for this MCP server.
+    #[must_use]
+    pub fn payment_provider(mut self, provider: Arc<dyn McpPaymentProvider>) -> Self {
+        self.payment = Some(provider);
         self
     }
 
@@ -276,6 +331,8 @@ impl SecretSource {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::McpServer;
 
     #[test]
@@ -285,6 +342,12 @@ mod tests {
             McpServer::stdio("fixture")
                 .supports_parallel_tool_calls(true)
                 .supports_parallel_tool_calls
+        );
+        assert_eq!(
+            McpServer::stdio("fixture")
+                .parallel_tools(["lookup", "search"])
+                .parallel_tools,
+            BTreeSet::from(["lookup".to_owned(), "search".to_owned()])
         );
     }
 }

@@ -1,5 +1,4 @@
 import {
-  DEFAULT_THEMES,
   type CodeViewItem,
   type CodeViewOptions,
   type DiffIndicators,
@@ -7,11 +6,17 @@ import {
 import {
   CodeView,
   type CodeViewHandle,
+  type CodeViewProps,
   useStableCallback,
 } from "@pierre/diffs/react";
 import { ChevronDown } from "lucide-react";
-import { memo, type RefObject, useMemo } from "react";
-import { CODE_VIEW_CUSTOM_CSS, CODE_VIEW_LAYOUT } from "./pierreCodeView";
+import { memo, type RefObject, useEffect, useMemo } from "react";
+import {
+  CODE_VIEW_CUSTOM_CSS,
+  CODE_VIEW_LAYOUT,
+  CODE_VIEW_THEMES,
+  observePierreCodeScrollRegions,
+} from "./pierreCodeView";
 import type { Theme } from "./NanocodexApp";
 
 // Behavioral viewer port from pierrecomputer/pierre@4f94a5e765195b27e1e4188b943aab2ae44613cb
@@ -23,6 +28,7 @@ interface DiffsHubViewerProps {
   disableWorkerPool: boolean;
   initialItems: CodeViewItem<undefined>[];
   lineNumbers: boolean;
+  onScroll?: CodeViewProps<undefined>["onScroll"];
   overflow: "wrap" | "scroll";
   scrollRef: RefObject<HTMLDivElement | null>;
   showBackgrounds: boolean;
@@ -36,6 +42,7 @@ export const DiffsHubViewer = memo(function DiffsHubViewer({
   disableWorkerPool,
   initialItems,
   lineNumbers,
+  onScroll,
   overflow,
   scrollRef,
   showBackgrounds,
@@ -64,6 +71,26 @@ export const DiffsHubViewer = memo(function DiffsHubViewer({
     }
   });
 
+  useEffect(() => {
+    const container = scrollRef.current;
+    if (!container) return;
+
+    container.tabIndex = 0;
+    container.setAttribute("role", "region");
+    container.setAttribute("aria-label", "Commit diff stream");
+    return observePierreCodeScrollRegions(container);
+  }, [scrollRef]);
+
+  useEffect(() => {
+    if (initialItems.length === 0) return;
+    const frame = window.requestAnimationFrame(() => {
+      performance.mark("nanocodex:commits:viewer-frame", {
+        detail: { itemCount: initialItems.length },
+      });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [initialItems.length]);
+
   const renderHeaderPrefix = useStableCallback(
     (item: CodeViewItem<undefined>) => {
       if (item.type !== "diff") return null;
@@ -84,7 +111,7 @@ export const DiffsHubViewer = memo(function DiffsHubViewer({
     () =>
       ({
         layout: CODE_VIEW_LAYOUT,
-        theme: DEFAULT_THEMES,
+        theme: CODE_VIEW_THEMES,
         themeType: theme,
         diffStyle,
         diffIndicators,
@@ -115,6 +142,7 @@ export const DiffsHubViewer = memo(function DiffsHubViewer({
       className="commit-stream code-view cv-scrollbar"
       disableWorkerPool={disableWorkerPool}
       options={options}
+      onScroll={onScroll}
       renderHeaderPrefix={renderHeaderPrefix}
     />
   );

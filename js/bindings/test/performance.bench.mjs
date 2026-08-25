@@ -4,21 +4,33 @@ import { performance } from "node:perf_hooks";
 import { test } from "node:test";
 
 import { Actions } from "../index.mjs";
-import { Agent as BrowserAgent } from "../browser/index.mjs";
+import { Agent as HostAgent, Transport as HostTransport } from "../host/index.mjs";
+import {
+  createWorkerAgent,
+  installWorkerAgentRuntime,
+} from "../browser/WorkerAgent.mjs";
+import { initializeBrowserEngine } from "../browser/engine.mjs";
 import {
   createAgentClient,
   defineRuntime,
 } from "../internal.mjs";
-import { Agent as NodeAgent } from "../node/index.mjs";
+import { Agent as NodeAgent, Transport as NodeTransport } from "../node/index.mjs";
 import { createCodeRuntime } from "../runtime/code-runtime.mjs";
 
 const LIMITS = Object.freeze({
   coldNodeAgentMs: 250,
   warmAgentP50Ms: 1.5,
   warmAgentP95Ms: 10,
+  browserLinearMemoryBytes: 2_500_000,
   actionNanoseconds: 5_000,
   bufferedEventsMs: 50,
   codeModeMicroseconds: 250,
+  workerResultEnvelopeBytes: 256,
+});
+const nodeTransport = NodeTransport.openAi({ apiKey: "performance-test" });
+const browserTransport = HostTransport.openAi({
+  apiKey: "performance-test",
+  WebSocketImpl: class {},
 });
 
 test("Node reuses one compiled WASM instance and keeps warm agent creation sub-millisecond", async (context) => {
@@ -40,14 +52,14 @@ test("Node reuses one compiled WASM instance and keeps warm agent creation sub-m
   };
   try {
     const coldStarted = performance.now();
-    const cold = await NodeAgent.create({ apiKey: "performance-test" });
+    const cold = await NodeAgent.create({ transport: nodeTransport });
     const coldMs = performance.now() - coldStarted;
     cold.dispose();
 
     const samples = [];
     for (let index = 0; index < 64; index += 1) {
       const started = performance.now();
-      const agent = await NodeAgent.create({ apiKey: "performance-test" });
+      const agent = await NodeAgent.create({ transport: nodeTransport });
       samples.push(performance.now() - started);
       agent.dispose();
     }
@@ -83,18 +95,18 @@ test("a precompiled browser module instantiates once across isolated agents", as
   };
   try {
     const coldStarted = performance.now();
-    const cold = await BrowserAgent.create({
-      apiKey: "performance-test",
+    const cold = await HostAgent.create({
+      transport: browserTransport,
       module,
-      WebSocketImpl: class {},
     });
     const coldMs = performance.now() - coldStarted;
+    const engine = await initializeBrowserEngine({ module });
+    const coldLinearMemoryBytes = engine.memory.buffer.byteLength;
     cold.dispose();
     for (let index = 0; index < 16; index += 1) {
-      const agent = await BrowserAgent.create({
-        apiKey: "performance-test",
+      const agent = await HostAgent.create({
+        transport: browserTransport,
         module,
-        WebSocketImpl: class {},
       });
       agent.dispose();
     }
@@ -102,30 +114,122 @@ test("a precompiled browser module instantiates once across isolated agents", as
     const samples = [];
     for (let index = 0; index < 64; index += 1) {
       const started = performance.now();
-      const agent = await BrowserAgent.create({
-        apiKey: "performance-test",
+      const agent = await HostAgent.create({
+        transport: browserTransport,
         module,
-        WebSocketImpl: class {},
       });
       samples.push(performance.now() - started);
       agent.dispose();
     }
     const p50 = percentile(samples, 0.5);
     const p95 = percentile(samples, 0.95);
+    const retainedLinearMemoryBytes = engine.memory.buffer.byteLength;
     context.diagnostic(JSON.stringify({
       cold_ms: round(coldMs),
+      cold_linear_memory_bytes: coldLinearMemoryBytes,
       module_instantiations: instantiations,
+      retained_linear_memory_bytes: retainedLinearMemoryBytes,
       warm_p50_ms: round(p50),
       warm_p95_ms: round(p95),
     }));
 
     assert.equal(instantiations, 1);
+    assert.equal(retainedLinearMemoryBytes, coldLinearMemoryBytes);
+    assert.ok(
+      retainedLinearMemoryBytes <= LIMITS.browserLinearMemoryBytes,
+      `browser WASM retained ${retainedLinearMemoryBytes} linear-memory bytes`,
+    );
     assert.ok(coldMs <= LIMITS.coldNodeAgentMs, `cold browser Agent.create took ${coldMs} ms`);
     assert.ok(p50 <= LIMITS.warmAgentP50Ms, `warm browser Agent.create p50 was ${p50} ms`);
     assert.ok(p95 <= LIMITS.warmAgentP95Ms, `warm browser Agent.create p95 was ${p95} ms`);
   } finally {
     WebAssembly.instantiate = originalInstantiate;
   }
+});
+
+test("Worker completion keeps a large retained snapshot out of the eager crossover", async (context) => {
+  const retainedText = "x".repeat(8 * 1024 * 1024);
+  const encodedSnapshot = JSON.stringify({
+    version: 1,
+    model: "gpt-5.6-sol",
+    lineage_id: "large-worker-result",
+    prompt_cache_key: "large-worker-result",
+    workspace: "/workspace",
+    canonical_context: {},
+    history: [{ type: "message", role: "assistant", content: retainedText }],
+  });
+  const stats = { resultReleases: 0, snapshotReads: 0, usageReads: 0 };
+  const rawResult = {
+    finalMessage: "done",
+    snapshot() { stats.snapshotReads += 1; return encodedSnapshot; },
+    usage() {
+      stats.usageReads += 1;
+      return JSON.stringify({
+        input_tokens: 1,
+        cached_input_tokens: 0,
+        cache_write_input_tokens: 0,
+        output_tokens: 1,
+        reasoning_output_tokens: 0,
+        total_tokens: 2,
+        estimated_cost: null,
+        cost_status: "usage_not_reported",
+      });
+    },
+    free() { stats.resultReleases += 1; },
+  };
+  const runtime = defineRuntime({
+    // This is the simulated Worker isolate; the page-side Worker client owns
+    // the same-session reservation in this process.
+    reserveSessions: false,
+    create: ({ sessionId = "large-worker-result" } = {}) => ({
+      sessionId,
+      prompt() {
+        return {
+          result: async () => rawResult,
+          free() {},
+        };
+      },
+      free() {},
+    }),
+    decorate: (agent) => agent.extend(Actions.agentActions()),
+  });
+  const worker = new CrossoverLoopbackWorker((options) => createAgentClient(runtime, options));
+  const agent = await createWorkerAgent(
+    { sessionId: "large-worker-result", harness: false },
+    { worker },
+  );
+  const turn = agent.turn.prompt({ input: "measure the retained checkpoint" });
+  const result = await turn.result();
+  const completion = worker.outgoing.find((message) => message.value?.resultId);
+  const completionEnvelopeBytes = new TextEncoder().encode(JSON.stringify(completion.value)).byteLength;
+  const retainedSnapshotBytes = new TextEncoder().encode(encodedSnapshot).byteLength;
+
+  assert.deepEqual(Object.keys(completion.value).sort(), ["finalMessage", "resultId"]);
+  assert.deepEqual(stats, { resultReleases: 0, snapshotReads: 0, usageReads: 0 });
+  assert.ok(
+    completionEnvelopeBytes <= LIMITS.workerResultEnvelopeBytes,
+    `Worker result envelope used ${completionEnvelopeBytes} bytes`,
+  );
+
+  const [snapshot, sameSnapshot] = await Promise.all([result.snapshot(), result.snapshot()]);
+  assert.strictEqual(sameSnapshot, snapshot);
+  assert.equal(snapshot.history[0].content.length, retainedText.length);
+  assert.equal(stats.snapshotReads, 1);
+  assert.equal(worker.incoming.filter((message) => message.method === "result.snapshot").length, 1);
+  context.diagnostic(JSON.stringify({
+    avoided_eager_crossover_bytes: retainedSnapshotBytes,
+    completion_envelope_bytes: completionEnvelopeBytes,
+    eager_snapshot_materializations: 0,
+    retained_snapshot_bytes: retainedSnapshotBytes,
+    snapshot_materializations_after_demand: stats.snapshotReads,
+    snapshot_rpcs_after_concurrent_demand: 1,
+  }));
+
+  result.dispose();
+  turn.dispose();
+  agent.dispose();
+  assert.equal(stats.resultReleases, 1);
+  assert.equal(worker.terminated, 1);
 });
 
 test("JavaScript actions, event buffering, and Code Mode stay below binding-owned budgets", async (context) => {
@@ -226,4 +330,38 @@ function percentile(values, quantile) {
 
 function round(value) {
   return Math.round(value * 1_000) / 1_000;
+}
+
+class CrossoverLoopbackWorker {
+  constructor(createAgent) {
+    this.onmessage = null;
+    this.onerror = null;
+    this.onmessageerror = null;
+    this.incoming = [];
+    this.outgoing = [];
+    this.terminated = 0;
+    this.scope = {
+      onmessage: null,
+      postMessage: (message, transfer) => {
+        const cloned = transfer?.length
+          ? structuredClone(message, { transfer })
+          : structuredClone(message);
+        this.outgoing.push(cloned);
+        queueMicrotask(() => this.onmessage?.({ data: cloned }));
+      },
+    };
+    this.runtime = installWorkerAgentRuntime(this.scope, { createAgent });
+  }
+
+  postMessage(message) {
+    const cloned = structuredClone(message);
+    this.incoming.push(cloned);
+    queueMicrotask(() => this.scope.onmessage?.({ data: cloned }));
+  }
+
+  terminate() {
+    if (this.terminated) return;
+    this.terminated += 1;
+    this.runtime.dispose();
+  }
 }

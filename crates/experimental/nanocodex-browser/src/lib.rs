@@ -3,6 +3,7 @@
 
 mod cookie_source;
 mod features;
+mod ios;
 mod native;
 mod session;
 #[cfg(any(
@@ -66,14 +67,16 @@ pub use features::{
     BrowserCruxClient, BrowserCruxCollectionPeriod, BrowserCruxFormFactor, BrowserCruxFraction,
     BrowserCruxHistogramBin, BrowserCruxMetric, BrowserCruxReport, BrowserCruxScope,
     BrowserCssProperty, BrowserCssRule, BrowserCssSourceRange, BrowserDebuggerFrame,
-    BrowserDebuggerPause, BrowserDebuggerScope, BrowserDialog, BrowserDialogKind, BrowserDownload,
-    BrowserEgressPolicy, BrowserEventListener, BrowserFrame, BrowserGeolocation,
-    BrowserHarArtifact, BrowserHeapClass, BrowserHeapClassDelta, BrowserHeapComparison,
-    BrowserHeapDuplicateString, BrowserHeapInspection, BrowserHeapNode, BrowserHeapRetainerNode,
-    BrowserHeapRetainers, BrowserHeapSnapshot, BrowserImageArtifact, BrowserIndexedDbDatabase,
-    BrowserLighthouseCategory, BrowserLighthouseCategoryScore, BrowserLighthouseFinding,
-    BrowserLighthouseFormFactor, BrowserLighthouseReport, BrowserMatchedStyles, BrowserModelImage,
-    BrowserNetworkConditions, BrowserOriginStorage, BrowserPauseOnExceptions, BrowserPdfArtifact,
+    BrowserDebuggerPause, BrowserDebuggerScope, BrowserDeviceDescriptor, BrowserDevicePreset,
+    BrowserDialog, BrowserDialogKind, BrowserDownload, BrowserEgressPolicy, BrowserEventListener,
+    BrowserFrame, BrowserGeolocation, BrowserHarArtifact, BrowserHeapClass, BrowserHeapClassDelta,
+    BrowserHeapComparison, BrowserHeapDuplicateString, BrowserHeapInspection, BrowserHeapNode,
+    BrowserHeapRetainerNode, BrowserHeapRetainers, BrowserHeapSnapshot, BrowserImageArtifact,
+    BrowserIndexedDbDatabase, BrowserLighthouseCategory, BrowserLighthouseCategoryScore,
+    BrowserLighthouseFinding, BrowserLighthouseFormFactor, BrowserLighthouseReport,
+    BrowserMatchedStyles, BrowserMobileAudit, BrowserMobileAuditSample, BrowserMobileFinding,
+    BrowserMobileFindingSeverity, BrowserMobileState, BrowserModelImage, BrowserNetworkConditions,
+    BrowserOrientation, BrowserOriginStorage, BrowserPauseOnExceptions, BrowserPdfArtifact,
     BrowserPerformanceInsight, BrowserPerformanceSource, BrowserPerformanceTrace,
     BrowserPermission, BrowserPseudoClass, BrowserReducedMotion, BrowserRouteHeader,
     BrowserRouteResponse, BrowserScriptCoverage, BrowserServiceWorker, BrowserSessionTrace,
@@ -81,8 +84,14 @@ pub use features::{
     BrowserVisualAnomaly, BrowserVisualAnomalyKind, BrowserVisualDiff, BrowserVisualTrace,
     BrowserWebVitals,
 };
+pub use ios::{
+    BrowserIosConfig, BrowserIosDevice, BrowserIosDeviceInventory, BrowserIosDeviceKind,
+    BrowserIosDeviceSelector, BrowserIosError, IosBrowser,
+};
 pub use native::{BrowserBuildError, BrowserError};
-pub use session::{BraveSession, BraveSessionError, BrowserProfileKind};
+pub use session::{
+    BraveSession, BraveSessionError, BrowserCookieAuthorization, BrowserProfileKind,
+};
 
 const TOOL_DESCRIPTION: &str = r#"Control one server-managed browser session.
 
@@ -143,6 +152,20 @@ For pixel calibration, first use `set_viewport` with an explicit
 `device_scale_factor`, then pass the same element `target` to `screenshot`,
 `visual_baseline`, and `visual_diff`. Targeted captures crop to the element's
 rendered border box and cannot be combined with `full_page`.
+For mobile work use `set_device`, not `set_viewport`: it atomically applies a
+pinned viewport, screen orientation, DPR, touch capability, user agent, and
+platform. Follow it with `mobile_state` to prove what the page observes, then
+exercise controls with `touch_tap` and native `insert_text`. `mobile_audit`
+reloads the current URL across a bounded device/orientation matrix and reports
+emulation mismatches, missing viewport metadata, horizontal overflow,
+undersized touch targets, and iOS input-zoom risks. Supply `ready` for a
+client-rendered app so each reload waits for visible application content and
+cannot report a blank boot shell as a clean page. Its provider and engine
+fields deliberately distinguish Chromium emulation from real Safari hardware.
+When the harness explicitly supplies an Appium/XCUITest backend, the same
+mobile state/audit, raw touch, IME text, evaluation, URL/title, and plain
+screenshot actions run against real Mobile Safari. CDP-only actions fail as
+unsupported instead of silently launching or falling back to Chromium.
 Use `visual_baseline` plus `visual_diff` for deterministic before/after
 comparison. Use `visual_trace_start` and `visual_trace_stop` around an
 interaction to detect flashes, blank intermediate frames, and large visual
@@ -174,6 +197,10 @@ Diagnostic reads report retained and dropped counts and accept a limit up to
 Use `list_frames` and `evaluate_frame` for explicit frame work; snapshot
 references already retain their containing frame for normal DOM actions. Use
 `new_tab`, `list_tabs`, `select_tab`, and `close_tab` for multi-page workflows.
+Use `load_extension` before normal browsing with a path relative to the
+host-configured file root; installing a new unpacked Chrome extension restarts
+the private browser session. Then use `trigger_extension_action` to run its
+toolbar action on the active tab or an explicit tab returned by `list_tabs`.
 Pending JavaScript dialogs must be read with `dialog` and resolved with
 `handle_dialog`. `downloads` reports files retained in the session-private
 download directory.
@@ -189,6 +216,16 @@ Use `axe_audit` for the complete pinned axe-core engine, `pdf` for Chromium
 print output, `lighthouse_audit` for an exact explicitly configured Lighthouse
 CLI attached to this Chrome session, and `crux` for configured field data.
 Harness credentials and browser storage state never enter this action schema.
+When a virtual passkey store is configured, use `passkeys` to inspect its
+non-secret credential metadata. Before a WebAuthn ceremony, use `passkey_use`
+to expose one saved credential, `passkey_new` to expose an empty authenticator
+for registration, or `passkey_auto` to expose every saved credential and let
+the relying party choose. Persisted private keys never enter tool output.
+When host passkeys are explicitly configured, call `host_passkey_start` on the
+page that needs authentication. Complete the passkey ceremony in the isolated
+visible browser without closing it, then call `host_passkey_resume` to transfer
+the authenticated cookies back into this headless session. The host credential
+never enters Nanocodex or the tool output.
 Use `matched_styles`, `force_pseudo_state`, and `event_listeners` for authored
 CSS and listener provenance. The debugger actions expose source-mapped
 breakpoints, exception policy, pause stacks/scopes, resume, and stepping;
@@ -366,6 +403,29 @@ pub enum BrowserAction {
         height: u32,
         /// Device pixels per CSS pixel. Defaults to 1.0.
         device_scale_factor: Option<f64>,
+    },
+    /// Atomically apply a pinned mobile viewport, user agent, platform, and touch profile.
+    SetDevice {
+        device: BrowserDevicePreset,
+        /// Defaults to portrait.
+        #[serde(default)]
+        orientation: BrowserOrientation,
+    },
+    /// Read and verify the mobile capabilities visible to the active page.
+    MobileState,
+    /// Reload and audit the current URL across a bounded mobile device matrix.
+    /// The final audited profile remains active for follow-up touch and typing checks.
+    MobileAudit {
+        /// Empty selects the default phone matrix: iPhone SE, iPhone 15 Pro, Pixel 8, and Galaxy S24.
+        #[serde(default)]
+        devices: Vec<BrowserDevicePreset>,
+        /// Empty selects portrait only. At most two orientations are accepted.
+        #[serde(default)]
+        orientations: Vec<BrowserOrientation>,
+        /// After each reload, wait for this target to become visible before collecting evidence.
+        /// Use this for client-rendered applications so an empty boot shell cannot pass the audit.
+        #[serde(default)]
+        ready: Option<BrowserTarget>,
     },
     /// Navigate to the preceding history entry when one exists.
     GoBack,
@@ -650,6 +710,18 @@ pub enum BrowserAction {
         /// Chromium target identifier returned by `list_tabs`.
         tab_id: String,
     },
+    /// Install an unpacked Chrome extension, restarting the private session when necessary.
+    LoadExtension {
+        /// Extension directory relative to the browser's configured file root.
+        path: std::path::PathBuf,
+    },
+    /// Run an installed extension's default toolbar action on a browser tab.
+    TriggerExtensionAction {
+        /// Extension identifier returned by `load_extension`.
+        extension_id: String,
+        /// Chromium target identifier returned by `list_tabs`; defaults to the active tab.
+        tab_id: Option<String>,
+    },
     /// Read the currently pending JavaScript dialog, if any.
     Dialog,
     /// Accept or dismiss the currently pending JavaScript dialog.
@@ -701,6 +773,23 @@ pub enum BrowserAction {
     },
     /// Read downloads observed by the browser session.
     Downloads,
+    /// List persisted virtual passkeys and the current credential-selection mode.
+    Passkeys,
+    /// Expose only one persisted passkey to subsequent WebAuthn ceremonies.
+    PasskeyUse {
+        /// Base64-encoded credential identifier returned by `passkeys`.
+        credential_id: String,
+        /// Relying-party identifier returned by `passkeys`; required only when IDs are ambiguous.
+        relying_party_id: Option<String>,
+    },
+    /// Expose an empty virtual authenticator so the next ceremony can create a passkey.
+    PasskeyNew,
+    /// Expose every persisted passkey and let the relying party choose.
+    PasskeyAuto,
+    /// Open the active page in an isolated visible browser that can use host passkeys.
+    HostPasskeyStart,
+    /// Import the completed host-passkey session and close its visible browser.
+    HostPasskeyResume,
     /// Evaluate JavaScript in the active page.
     Evaluate {
         /// JavaScript expression to evaluate.
@@ -740,6 +829,9 @@ impl BrowserAction {
             Self::Drag { .. } => BrowserActionName::Drag,
             Self::UploadFiles { .. } => BrowserActionName::UploadFiles,
             Self::SetViewport { .. } => BrowserActionName::SetViewport,
+            Self::SetDevice { .. } => BrowserActionName::SetDevice,
+            Self::MobileState => BrowserActionName::MobileState,
+            Self::MobileAudit { .. } => BrowserActionName::MobileAudit,
             Self::GoBack => BrowserActionName::GoBack,
             Self::GoForward => BrowserActionName::GoForward,
             Self::WaitForSelector { .. } => BrowserActionName::WaitForSelector,
@@ -805,6 +897,8 @@ impl BrowserAction {
             Self::ListTabs => BrowserActionName::ListTabs,
             Self::SelectTab { .. } => BrowserActionName::SelectTab,
             Self::CloseTab { .. } => BrowserActionName::CloseTab,
+            Self::LoadExtension { .. } => BrowserActionName::LoadExtension,
+            Self::TriggerExtensionAction { .. } => BrowserActionName::TriggerExtensionAction,
             Self::Dialog => BrowserActionName::Dialog,
             Self::HandleDialog { .. } => BrowserActionName::HandleDialog,
             Self::NetworkRoute { .. } => BrowserActionName::NetworkRoute,
@@ -817,6 +911,12 @@ impl BrowserAction {
             Self::LighthouseAudit { .. } => BrowserActionName::LighthouseAudit,
             Self::Crux { .. } => BrowserActionName::Crux,
             Self::Downloads => BrowserActionName::Downloads,
+            Self::Passkeys => BrowserActionName::Passkeys,
+            Self::PasskeyUse { .. } => BrowserActionName::PasskeyUse,
+            Self::PasskeyNew => BrowserActionName::PasskeyNew,
+            Self::PasskeyAuto => BrowserActionName::PasskeyAuto,
+            Self::HostPasskeyStart => BrowserActionName::HostPasskeyStart,
+            Self::HostPasskeyResume => BrowserActionName::HostPasskeyResume,
             Self::Evaluate { .. } => BrowserActionName::Evaluate,
         }
     }
@@ -851,6 +951,9 @@ pub enum BrowserActionName {
     Drag,
     UploadFiles,
     SetViewport,
+    SetDevice,
+    MobileState,
+    MobileAudit,
     GoBack,
     GoForward,
     WaitForSelector,
@@ -914,6 +1017,8 @@ pub enum BrowserActionName {
     ListTabs,
     SelectTab,
     CloseTab,
+    LoadExtension,
+    TriggerExtensionAction,
     Dialog,
     HandleDialog,
     NetworkRoute,
@@ -926,6 +1031,12 @@ pub enum BrowserActionName {
     LighthouseAudit,
     Crux,
     Downloads,
+    Passkeys,
+    PasskeyUse,
+    PasskeyNew,
+    PasskeyAuto,
+    HostPasskeyStart,
+    HostPasskeyResume,
     Evaluate,
 }
 
@@ -1934,14 +2045,40 @@ pub enum BrowserGate {
     AccessDenied { evidence: String },
 }
 
+/// Explicit access to passkeys provided by the host operating system.
+///
+/// The configured desktop browser is launched only for a model-requested,
+/// user-visible authorization handoff. It receives an isolated temporary
+/// profile and never opens the user's ordinary browser profile. Credential
+/// material remains inside the host authenticator; only resulting browser
+/// cookies are synchronized back into the managed headless session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostPasskeyAuthenticator {
+    executable: std::path::PathBuf,
+}
+
+impl HostPasskeyAuthenticator {
+    /// Selects the signed desktop browser application used for host passkey UI.
+    #[must_use]
+    pub fn new(executable: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            executable: executable.into(),
+        }
+    }
+
+    pub(crate) fn executable(&self) -> &std::path::Path {
+        &self.executable
+    }
+}
+
 /// A virtual platform passkey authenticator owned by the browser session.
 ///
 /// This is harness policy rather than a model-callable browser action. The
 /// driver installs it after the first navigation so `WebAuthn` requests never
 /// fall through to the host's passkey UI.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VirtualAuthenticator {
-    _private: (),
+    credential_store: Option<std::path::PathBuf>,
 }
 
 impl VirtualAuthenticator {
@@ -1949,12 +2086,30 @@ impl VirtualAuthenticator {
     /// registration and authentication.
     #[must_use]
     pub const fn platform_passkey() -> Self {
-        Self { _private: () }
+        Self {
+            credential_store: None,
+        }
+    }
+
+    /// Persists virtual passkeys at the supplied path and restores them in
+    /// later browser sessions.
+    ///
+    /// The file contains credential private keys. The file and a newly created
+    /// immediate parent directory are restricted to the current user on Unix.
+    #[must_use]
+    pub fn credential_store(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.credential_store = Some(path.into());
+        self
+    }
+
+    pub(crate) fn credential_store_path(&self) -> Option<&std::path::Path> {
+        self.credential_store.as_deref()
     }
 }
 
 /// Public, non-secret metadata for a credential in the virtual authenticator.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VirtualCredential {
     /// Base64-encoded `WebAuthn` credential identifier.
     pub credential_id: String,
@@ -1970,6 +2125,22 @@ pub struct VirtualCredential {
     pub sign_count: i64,
 }
 
+/// Which persisted credentials are exposed to WebAuthn ceremonies.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BrowserPasskeyMode {
+    /// Expose every saved credential and let the relying party choose.
+    #[default]
+    Auto,
+    /// Expose only the selected saved credential.
+    Use {
+        credential_id: String,
+        relying_party_id: Option<String>,
+    },
+    /// Expose no saved credentials so a relying party can register a new one.
+    New,
+}
+
 /// Typed result of one browser action.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
@@ -1981,6 +2152,14 @@ pub enum BrowserActionResult {
         executed: bool,
         /// Present for a real browser and absent for the recording backend.
         outcome: Option<Box<BrowserActionOutcome>>,
+    },
+    /// Non-secret persisted passkey metadata and active selection mode.
+    Passkeys {
+        sequence: u64,
+        executed: bool,
+        action: BrowserActionName,
+        mode: BrowserPasskeyMode,
+        credentials: Vec<VirtualCredential>,
     },
     /// Accessibility-tree text and its stable element references.
     Snapshot {
@@ -2238,6 +2417,11 @@ pub enum BrowserActionResult {
         executed: bool,
         tabs: Vec<BrowserTab>,
     },
+    Extension {
+        sequence: u64,
+        executed: bool,
+        extension_id: String,
+    },
     Dialog {
         sequence: u64,
         executed: bool,
@@ -2252,6 +2436,16 @@ pub enum BrowserActionResult {
         sequence: u64,
         executed: bool,
         audit: BrowserAccessibilityAudit,
+    },
+    MobileState {
+        sequence: u64,
+        executed: bool,
+        state: BrowserMobileState,
+    },
+    MobileAudit {
+        sequence: u64,
+        executed: bool,
+        audit: BrowserMobileAudit,
     },
     Axe {
         sequence: u64,
@@ -2292,6 +2486,7 @@ impl BrowserActionResult {
     const fn action_name(&self) -> BrowserActionName {
         match self {
             Self::Action { action, .. } => *action,
+            Self::Passkeys { action, .. } => *action,
             Self::Snapshot { .. } => BrowserActionName::Snapshot,
             Self::SnapshotFind { .. } => BrowserActionName::SnapshotFind,
             Self::DomSnapshot { .. } => BrowserActionName::DomSnapshot,
@@ -2334,9 +2529,12 @@ impl BrowserActionResult {
             Self::Video { .. } => BrowserActionName::VideoStop,
             Self::Frames { .. } => BrowserActionName::ListFrames,
             Self::Tabs { .. } => BrowserActionName::ListTabs,
+            Self::Extension { .. } => BrowserActionName::LoadExtension,
             Self::Dialog { .. } => BrowserActionName::Dialog,
             Self::Har { .. } => BrowserActionName::ExportHar,
             Self::Accessibility { .. } => BrowserActionName::AccessibilityAudit,
+            Self::MobileState { .. } => BrowserActionName::MobileState,
+            Self::MobileAudit { .. } => BrowserActionName::MobileAudit,
             Self::Axe { .. } => BrowserActionName::AxeAudit,
             Self::Lighthouse { .. } => BrowserActionName::LighthouseAudit,
             Self::Crux { .. } => BrowserActionName::Crux,
@@ -2965,6 +3163,11 @@ fn recording_result(
             executed,
             tabs: Vec::new(),
         },
+        BrowserAction::LoadExtension { .. } => BrowserActionResult::Extension {
+            sequence,
+            executed,
+            extension_id: String::new(),
+        },
         BrowserAction::Dialog => BrowserActionResult::Dialog {
             sequence,
             executed,
@@ -2986,6 +3189,44 @@ fn recording_result(
                 url: current_url.to_owned(),
                 checked_elements: 0,
                 violations: Vec::new(),
+            },
+        },
+        BrowserAction::MobileState => BrowserActionResult::MobileState {
+            sequence,
+            executed,
+            state: BrowserMobileState {
+                provider: "chromium_emulation".to_owned(),
+                engine: "chromium".to_owned(),
+                url: current_url.to_owned(),
+                viewport_width: 0.0,
+                viewport_height: 0.0,
+                visual_viewport_width: None,
+                visual_viewport_height: None,
+                visual_viewport_scale: None,
+                screen_width: 0.0,
+                screen_height: 0.0,
+                device_pixel_ratio: 0.0,
+                user_agent: String::new(),
+                platform: String::new(),
+                max_touch_points: 0,
+                coarse_pointer: false,
+                no_hover: false,
+                orientation: String::new(),
+                meta_viewport: None,
+                verified: false,
+                mismatches: vec!["recording backend did not execute emulation".to_owned()],
+            },
+        },
+        BrowserAction::MobileAudit { .. } => BrowserActionResult::MobileAudit {
+            sequence,
+            executed,
+            audit: BrowserMobileAudit {
+                url: current_url.to_owned(),
+                provider: "chromium_emulation".to_owned(),
+                samples: Vec::new(),
+                error_count: 0,
+                warning_count: 0,
+                passed: false,
             },
         },
         BrowserAction::AxeAudit => BrowserActionResult::Axe {
@@ -3033,6 +3274,40 @@ fn recording_result(
             executed,
             downloads: Vec::new(),
         },
+        BrowserAction::Passkeys => BrowserActionResult::Passkeys {
+            sequence,
+            executed,
+            action: BrowserActionName::Passkeys,
+            mode: BrowserPasskeyMode::Auto,
+            credentials: Vec::new(),
+        },
+        BrowserAction::PasskeyUse {
+            credential_id,
+            relying_party_id,
+        } => BrowserActionResult::Passkeys {
+            sequence,
+            executed,
+            action: BrowserActionName::PasskeyUse,
+            mode: BrowserPasskeyMode::Use {
+                credential_id: credential_id.clone(),
+                relying_party_id: relying_party_id.clone(),
+            },
+            credentials: Vec::new(),
+        },
+        BrowserAction::PasskeyNew => BrowserActionResult::Passkeys {
+            sequence,
+            executed,
+            action: BrowserActionName::PasskeyNew,
+            mode: BrowserPasskeyMode::New,
+            credentials: Vec::new(),
+        },
+        BrowserAction::PasskeyAuto => BrowserActionResult::Passkeys {
+            sequence,
+            executed,
+            action: BrowserActionName::PasskeyAuto,
+            mode: BrowserPasskeyMode::Auto,
+            credentials: Vec::new(),
+        },
         BrowserAction::Evaluate { .. } => BrowserActionResult::Evaluation {
             sequence,
             executed,
@@ -3066,6 +3341,7 @@ fn recording_result(
         | BrowserAction::Drag { .. }
         | BrowserAction::UploadFiles { .. }
         | BrowserAction::SetViewport { .. }
+        | BrowserAction::SetDevice { .. }
         | BrowserAction::GoBack
         | BrowserAction::GoForward
         | BrowserAction::WaitForSelector { .. }
@@ -3083,11 +3359,14 @@ fn recording_result(
         | BrowserAction::NewTab { .. }
         | BrowserAction::SelectTab { .. }
         | BrowserAction::CloseTab { .. }
+        | BrowserAction::TriggerExtensionAction { .. }
         | BrowserAction::HandleDialog { .. }
         | BrowserAction::NetworkRoute { .. }
         | BrowserAction::RemoveNetworkRoute { .. }
         | BrowserAction::ClearNetworkRoutes
-        | BrowserAction::SetOffline { .. } => BrowserActionResult::Action {
+        | BrowserAction::SetOffline { .. }
+        | BrowserAction::HostPasskeyStart
+        | BrowserAction::HostPasskeyResume => BrowserActionResult::Action {
             sequence,
             action: action.name(),
             executed,
@@ -3105,6 +3384,7 @@ pub enum BrowserRecordingError {
 
 enum BrowserBackend {
     Managed(Browser),
+    Ios(IosBrowser),
     Recording(BrowserRecording),
 }
 
@@ -3114,73 +3394,16 @@ pub struct Browser {
     inner: Arc<native::NativeBrowser>,
 }
 
-/// A validated authentication handoff that has not opened the user's Brave yet.
-///
-/// This is a harness operation, not a model-callable [`BrowserAction`]. Opening
-/// consumes this value so callers cannot accidentally open arbitrary pages or
-/// resume a handoff that was never presented to the user.
-pub struct BraveAuthHandoff {
-    browser: Browser,
-    url: url::Url,
-}
-
-/// An authentication page opened in the user's ordinary Brave profile.
-///
-/// After the user completes the passkey or other authentication gate, call
-/// [`resume`](Self::resume) to take a fresh allowlisted cookie snapshot and
-/// reopen the protected URL in the dedicated browser. A local browser is
-/// relaunched with the new snapshot; a remote CDP browser receives refreshed
-/// cookies without restarting.
-pub struct OpenedBraveAuthHandoff {
-    browser: Browser,
-    url: url::Url,
-}
-
-impl BraveAuthHandoff {
-    /// Opens only the validated protected URL in the user's ordinary Brave.
-    ///
-    /// The passkey ceremony remains entirely in the user's browser. Nanocodex
-    /// does not receive credential material or control the visible page.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if Brave cannot be started or the URL is no longer
-    /// allowed by this browser's session policy.
-    pub fn open(self) -> Result<OpenedBraveAuthHandoff, BrowserError> {
-        self.browser.inner.open_auth_handoff(&self.url)?;
-        Ok(OpenedBraveAuthHandoff {
-            browser: self.browser,
-            url: self.url,
-        })
-    }
-}
-
-impl OpenedBraveAuthHandoff {
-    /// Refreshes the private headless session after the caller observes that
-    /// the user has completed authentication.
-    ///
-    /// A fresh filtered cookie snapshot is copied from Brave and the protected
-    /// URL is reopened before this future completes. A locally launched
-    /// browser discards its old private process and profile. A remote CDP
-    /// browser remains alive and receives a replacement cookie set.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the session cannot be refreshed, the fresh snapshot
-    /// cannot be prepared, or the protected page cannot be reopened.
-    pub async fn resume(self) -> Result<(), BrowserError> {
-        self.browser.inner.resume_auth_handoff(self.url).await
-    }
-}
-
 /// Configuration for one isolated [`Browser`] session.
 #[derive(Clone, Debug, Default)]
 pub struct BrowserBuilder {
     executable: Option<std::path::PathBuf>,
     cdp_endpoint: Option<url::Url>,
+    persistent_profile: Option<std::path::PathBuf>,
     brave_session: Option<BraveSession>,
     launch_brave_executable: bool,
     virtual_authenticator: Option<VirtualAuthenticator>,
+    host_passkey_authenticator: Option<HostPasskeyAuthenticator>,
     react_diagnostics: Option<ReactDiagnostics>,
     egress_policy: Option<BrowserEgressPolicy>,
     file_root: Option<std::path::PathBuf>,
@@ -3207,6 +3430,19 @@ impl BrowserBuilder {
     #[must_use]
     pub fn cdp_endpoint(mut self, endpoint: url::Url) -> Self {
         self.cdp_endpoint = Some(endpoint);
+        self
+    }
+
+    /// Stores the complete managed Chrome profile in a caller-owned directory.
+    ///
+    /// Unlike the default temporary profile, this directory is never deleted
+    /// by [`Browser`]. Cookies, granted extension permissions, and extension
+    /// storage therefore survive closing one browser and building another with
+    /// the same directory. The caller must prevent concurrent use and protect
+    /// the directory as sensitive browser state.
+    #[must_use]
+    pub fn persistent_profile(mut self, directory: impl Into<std::path::PathBuf>) -> Self {
+        self.persistent_profile = Some(directory.into());
         self
     }
 
@@ -3239,11 +3475,18 @@ impl BrowserBuilder {
 
     /// Enables a harness-owned virtual authenticator for passkey flows.
     #[must_use]
-    pub const fn virtual_authenticator(
-        mut self,
-        virtual_authenticator: VirtualAuthenticator,
-    ) -> Self {
+    pub fn virtual_authenticator(mut self, virtual_authenticator: VirtualAuthenticator) -> Self {
         self.virtual_authenticator = Some(virtual_authenticator);
+        self
+    }
+
+    /// Enables explicit interactive use of the host operating system's passkeys.
+    ///
+    /// The selected application receives a fresh isolated profile for each
+    /// handoff. This policy cannot be combined with a virtual authenticator.
+    #[must_use]
+    pub fn host_passkey_authenticator(mut self, authenticator: HostPasskeyAuthenticator) -> Self {
+        self.host_passkey_authenticator = Some(authenticator);
         self
     }
 
@@ -3268,10 +3511,10 @@ impl BrowserBuilder {
         self
     }
 
-    /// Allows upload actions to read relative paths beneath one host directory.
+    /// Allows upload and unpacked-extension actions to read relative paths beneath one host directory.
     ///
     /// The root is canonicalized at build time and is never exposed as a
-    /// model-callable setting. Uploads are unsupported across remote CDP
+    /// model-callable setting. Filesystem actions are unsupported across remote CDP
     /// because those paths would refer to another machine.
     #[must_use]
     pub fn file_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
@@ -3345,6 +3588,18 @@ impl BrowserBuilder {
                 message: "`cdp_endpoint` cannot be combined with `executable`".to_owned(),
             });
         }
+        if self.cdp_endpoint.is_some() && self.persistent_profile.is_some() {
+            return Err(BrowserBuildError::Configuration {
+                message: "`persistent_profile` is not supported across a remote CDP boundary"
+                    .to_owned(),
+            });
+        }
+        if self.brave_session.is_some() && self.persistent_profile.is_some() {
+            return Err(BrowserBuildError::Configuration {
+                message: "`persistent_profile` cannot be combined with a Brave profile snapshot"
+                    .to_owned(),
+            });
+        }
         if let Some(endpoint) = &self.cdp_endpoint
             && !matches!(endpoint.scheme(), "http" | "https" | "ws" | "wss")
         {
@@ -3376,6 +3631,32 @@ impl BrowserBuilder {
                 message: "`file_root` is not supported across a remote CDP boundary".to_owned(),
             });
         }
+        if self
+            .virtual_authenticator
+            .as_ref()
+            .and_then(VirtualAuthenticator::credential_store_path)
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err(BrowserBuildError::Configuration {
+                message: "the virtual credential store path cannot be empty".to_owned(),
+            });
+        }
+        if self.virtual_authenticator.is_some() && self.host_passkey_authenticator.is_some() {
+            return Err(BrowserBuildError::Configuration {
+                message: "host and virtual passkey authenticators cannot be enabled together"
+                    .to_owned(),
+            });
+        }
+        if let Some(authenticator) = &self.host_passkey_authenticator
+            && !authenticator.executable().is_file()
+        {
+            return Err(BrowserBuildError::Configuration {
+                message: format!(
+                    "host passkey browser executable is unavailable: {}",
+                    authenticator.executable().display()
+                ),
+            });
+        }
         if let Some(client) = &self.crux_client {
             if client.api_key.is_empty() {
                 return Err(BrowserBuildError::Configuration {
@@ -3400,6 +3681,14 @@ impl BrowserBuilder {
             .map(std::fs::canonicalize)
             .transpose()
             .map_err(BrowserBuildError::Io)?;
+        let persistent_profile = self
+            .persistent_profile
+            .map(|directory| {
+                std::fs::create_dir_all(&directory)?;
+                std::fs::canonicalize(directory)
+            })
+            .transpose()
+            .map_err(BrowserBuildError::Io)?;
         let egress_policy = self.egress_policy.or_else(|| {
             self.brave_session.as_ref().and_then(|session| {
                 if session.copies_all_cookies() {
@@ -3420,9 +3709,11 @@ impl BrowserBuilder {
             inner: native::NativeBrowser::new(
                 self.executable,
                 self.cdp_endpoint,
+                persistent_profile,
                 self.brave_session,
                 self.launch_brave_executable,
                 self.virtual_authenticator,
+                self.host_passkey_authenticator,
                 self.react_diagnostics,
                 egress_policy,
                 file_root,
@@ -3539,10 +3830,14 @@ impl Browser {
     ///
     /// Chromium starts on the first action. All clones address the same page,
     /// reference map, diagnostics, and monotonic action sequence.
+    /// On macOS, automatic selection is limited to chrome-headless-shell or
+    /// Chrome for Testing and never falls back to personal Chrome or an ambient
+    /// `CHROME` executable.
     ///
     /// # Errors
     ///
-    /// Returns an error when the private runtime directory cannot be created.
+    /// Returns an error when the private runtime directory cannot be created or
+    /// macOS has no dedicated automation browser installed.
     pub fn new() -> Result<Self, BrowserBuildError> {
         Self::builder().build()
     }
@@ -3639,26 +3934,6 @@ impl Browser {
         self.inner.restore_storage_state(state).await
     }
 
-    /// Prepares an explicit user authentication handoff for an allowlisted URL.
-    ///
-    /// This is available only for browsers configured with
-    /// [`BrowserBuilder::brave_session`]. It never becomes part of the browser
-    /// tool schema, so a model cannot open arbitrary pages in the user's
-    /// browser. The caller decides when to open the page and when authentication
-    /// has completed.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when no Brave session is configured or the URL's exact
-    /// origin is outside that session's allowlist.
-    pub fn auth_handoff(&self, url: url::Url) -> Result<BraveAuthHandoff, BrowserError> {
-        self.inner.validate_auth_handoff(&url)?;
-        Ok(BraveAuthHandoff {
-            browser: self.clone(),
-            url,
-        })
-    }
-
     /// Returns public metadata for credentials in the virtual authenticator.
     ///
     /// The authenticator is installed after the first successful navigation.
@@ -3687,6 +3962,10 @@ pub struct BrowserTool {
     backend: BrowserBackend,
 }
 
+fn browser_tool_builder() -> BrowserBuilder {
+    Browser::builder().virtual_authenticator(VirtualAuthenticator::platform_passkey())
+}
+
 impl BrowserTool {
     /// Creates an isolated in-process headless Chromium session.
     ///
@@ -3696,10 +3975,10 @@ impl BrowserTool {
     /// # Errors
     ///
     /// Returns an error when the private runtime configuration cannot be
-    /// created. A missing Chrome or Chromium installation is reported by the
-    /// first tool call.
+    /// created. On macOS, a missing dedicated automation browser is reported
+    /// here instead of falling back to personal Chrome.
     pub fn new() -> Result<Self, BrowserBuildError> {
-        Ok(Self::from_browser(Browser::new()?))
+        Ok(Self::from_browser(browser_tool_builder().build()?))
     }
 
     /// Creates a managed browser tool using an explicit Chromium executable.
@@ -3711,7 +3990,9 @@ impl BrowserTool {
     pub fn with_executable(
         executable: impl Into<std::path::PathBuf>,
     ) -> Result<Self, BrowserBuildError> {
-        Ok(Self::from_browser(Browser::with_executable(executable)?))
+        Ok(Self::from_browser(
+            browser_tool_builder().executable(executable).build()?,
+        ))
     }
 
     /// Wraps an existing browser handle as a Nanocodex tool.
@@ -3719,6 +4000,17 @@ impl BrowserTool {
     pub const fn from_browser(browser: Browser) -> Self {
         Self {
             backend: BrowserBackend::Managed(browser),
+        }
+    }
+
+    /// Wraps an explicit Appium/XCUITest Mobile Safari session as the browser tool.
+    ///
+    /// Keep a clone of `browser` when the harness needs to call
+    /// [`IosBrowser::close`] before shutting down its external Appium server.
+    #[must_use]
+    pub const fn from_ios(browser: IosBrowser) -> Self {
+        Self {
+            backend: BrowserBackend::Ios(browser),
         }
     }
 
@@ -3755,6 +4047,7 @@ impl Tool for BrowserTool {
         let action = input.decode_json::<BrowserAction>()?;
         let result = match &self.backend {
             BrowserBackend::Managed(browser) => browser.execute(action).await?,
+            BrowserBackend::Ios(browser) => browser.execute(action).await?,
             BrowserBackend::Recording(recording) => recording.record(action)?,
         };
         let mut content = Vec::new();

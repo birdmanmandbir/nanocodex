@@ -104,8 +104,10 @@ agent.shutdown().await?;
 - [`events`](nanocodex_agent::events) contains the complete typed lifecycle
   event taxonomy.
 - [`input`](nanocodex_agent::input) contains prompts and multimodal user input.
-- [`session`](nanocodex_agent::session) contains durable session identities and
-  snapshots.
+- [`session`](nanocodex_agent::session) contains session identities and
+  serializable resume snapshots.
+- [`execution`](nanocodex_agent::execution) is the neutral model/tool/checkpoint
+  interception seam implemented by optional higher-layer policies.
 - [`usage`](nanocodex_agent::usage) contains token accounting and USD estimates.
 - [`rollout`](nanocodex_agent::rollout) records and restores Codex-compatible
   sessions.
@@ -116,3 +118,9 @@ agent.shutdown().await?;
 
 OpenAI API-key and managed ChatGPT credentials belong to
 [`nanocodex_oai_api::auth`], independently of this lifecycle crate.
+Portable journals, durable admission, and recovery policy belong to
+`nanocodex-durability`, which depends on this crate; the agent never depends on
+that optional layer. An attached execution policy is owned by exactly one
+agent. `spawn` and `fork` therefore return an explicit error instead of creating
+a child that silently drops the policy; applications that need a child build it
+with its own policy.

@@ -54,25 +54,41 @@ type RunLegendItem = {
 };
 
 const effortOrder = ["low", "medium", "high", "xhigh"];
-const palette = ["#0a82e1", "#7557d9", "#e57522", "#d53b3b", "#128342", "#9b6b13"];
+const palette = [
+  "var(--eval-series-1)",
+  "var(--eval-series-2)",
+  "var(--eval-series-3)",
+  "var(--eval-series-4)",
+  "var(--eval-series-5)",
+  "var(--eval-series-6)",
+];
 const harnessColors: Record<string, string> = {
-  codex: "#0a82e1",
-  nanocodex: "#e57522",
+  codex: "var(--eval-codex)",
+  nanocodex: "var(--eval-nanocodex)",
 };
 const runColors: Record<string, Record<string, string>> = {
   codex: {
-    low: "#74b9f0",
-    medium: "#258fe5",
-    high: "#0968bd",
-    xhigh: "#5946c5",
+    low: "var(--eval-codex-low)",
+    medium: "var(--eval-codex-medium)",
+    high: "var(--eval-codex-high)",
+    xhigh: "var(--eval-codex-xhigh)",
   },
   nanocodex: {
-    low: "#f5a866",
-    medium: "#e57522",
-    high: "#c55319",
-    xhigh: "#9e2f32",
+    low: "var(--eval-nanocodex-low)",
+    medium: "var(--eval-nanocodex-medium)",
+    high: "var(--eval-nanocodex-high)",
+    xhigh: "var(--eval-nanocodex-xhigh)",
   },
 };
+
+function paletteColor(key: string) {
+  let hash = 2166136261;
+  for (let index = 0; index < key.length; index++) {
+    hash ^= key.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return palette[(hash >>> 0) % palette.length];
+}
 
 function harnessLabel(harness: string) {
   if (harness === "codex") return "Codex";
@@ -81,7 +97,7 @@ function harnessLabel(harness: string) {
 }
 
 function runColor(harness: string, thinking: string) {
-  return runColors[harness]?.[thinking] ?? harnessColors[harness] ?? "#7557d9";
+  return runColors[harness]?.[thinking] ?? harnessColors[harness] ?? paletteColor(`${harness}\u0000${thinking}`);
 }
 
 function effortRank(effort: string) {
@@ -99,10 +115,10 @@ const metrics = {
     tick: (value: number) => Intl.NumberFormat(undefined, { notation: "compact" }).format(value),
   },
   latency: {
-    title: "Score by elapsed time",
-    label: "Median elapsed time",
-    runTitle: "Elapsed time by run",
-    runLabel: "Elapsed time",
+    title: "Score by agent execution time",
+    label: "Median agent execution time",
+    runTitle: "Agent execution time by run",
+    runLabel: "Agent execution time",
     value: (point: EvalResultPoint) => point.durationMs,
     tick: (value: number) => value < 60_000 ? `${Math.round(value / 1_000)}s` : `${(value / 60_000).toFixed(1)}m`,
   },
@@ -149,8 +165,8 @@ const runMetrics = {
     tick: (value: number) => Intl.NumberFormat(undefined, { notation: "compact" }).format(value),
   },
   latency: {
-    title: "Elapsed time vs output tokens",
-    label: "Elapsed time",
+    title: "Agent execution time vs output tokens",
+    label: "Agent execution time",
     value: (point: EvalResultPoint) => point.durationMs,
     tick: metrics.latency.tick,
   },
@@ -309,8 +325,8 @@ function FrontierChart({ points, axisKey }: { points: EvalAnalyticsPoint[]; axis
                 <ChartTooltip active={active} payload={payload} axis={axis} />
               )} />
               <Legend verticalAlign="top" align="right" iconType="line" />
-              {series.map((line, index) => {
-                const color = palette[index % palette.length];
+              {series.map((line) => {
+                const color = paletteColor(line.key);
                 return (
                   <Scatter
                     key={line.key}
@@ -445,7 +461,7 @@ export const EvalAnalytics = memo(function EvalAnalytics({
             ? "Actual retained runs positioned by output-token volume. Circle means pass; × means failure."
             : "Codex and Nanocodex across model and thinking effort, using medians over retained repetitions."}</p>
           {runView ? (
-            <div className="eval-run-legend" aria-label="Run chart legend">
+            <div className="eval-run-legend" role="group" aria-label="Run chart legend">
               {runLegend.map((item) => (
                 <span key={item.key}><i style={{ backgroundColor: item.color }} /> {item.label}</span>
               ))}

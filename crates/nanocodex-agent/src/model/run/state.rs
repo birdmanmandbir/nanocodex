@@ -138,7 +138,7 @@ impl ConversationState {
         self.managed.set_previous_response_id(response_id);
     }
 
-    #[allow(dead_code, reason = "consumed by the native durability boundary only")]
+    #[allow(dead_code, reason = "consumed by the native rollout boundary only")]
     pub(super) const fn history_revision(&self) -> u64 {
         self.managed.history_revision()
     }
@@ -202,6 +202,10 @@ impl ConversationState {
 
     pub(super) fn commit_interrupted(&mut self) {
         self.managed.commit_interrupted();
+    }
+
+    pub(super) fn replace_rejected_images(&mut self) -> usize {
+        self.managed.replace_rejected_images()
     }
 
     pub(super) fn commit_tail(&mut self) {

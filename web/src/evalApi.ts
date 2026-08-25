@@ -24,6 +24,36 @@ export type EvalOverview = {
   worksets: EvalWorkset[];
 };
 
+export type EvalClusterCapacity = {
+  totalBytes: number;
+  availableBytes: number;
+};
+
+export type EvalClusterNode = {
+  id: string;
+  observedAtMs: number;
+  uptimeSeconds: number;
+  claimedTasks: number;
+  workerProcesses: number;
+  vmProcesses: number;
+  cpuCores: number;
+  cpuUsagePercent: number;
+  loadAverage: { one: number; five: number; fifteen: number };
+  memory: EvalClusterCapacity;
+  swap: EvalClusterCapacity;
+  pressure: {
+    cpuSomeAvg10: number | null;
+    memorySomeAvg10: number | null;
+    memoryFullAvg10: number | null;
+  };
+};
+
+export type EvalCluster = {
+  schemaVersion: number;
+  observedAtMs: number;
+  nodes: EvalClusterNode[];
+};
+
 export type EvalCoordinate = {
   id: string;
   repetition: number;
@@ -90,13 +120,6 @@ export type EvalResultPoint = {
   costUsd: number | null;
 };
 
-export type EvalWorksetResults = {
-  schemaVersion: number;
-  observedAtMs: number;
-  worksetId: string;
-  points: EvalResultPoint[];
-};
-
 export type EvalAnalyticsPoint = {
   harness: string;
   model: string;
@@ -119,11 +142,14 @@ export type EvalWorksetAnalytics = {
   points: EvalAnalyticsPoint[];
 };
 
-export type EvalTaskDetail = {
+export type EvalTaskSnapshot = {
   schemaVersion: number;
   observedAtMs: number;
   worksetId: string;
+  workset: EvalWorkset;
+  taskSummary: EvalTaskOverview;
   task: EvalTask;
+  points: EvalResultPoint[];
 };
 
 export type EvalCoordinateOutcome = {
@@ -162,19 +188,18 @@ export type EvalCase = {
 };
 
 export class EvalApiError extends Error {
-  constructor(
-    message: string,
-    readonly status: number,
-  ) {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
     super(message);
     this.name = "EvalApiError";
+    this.status = status;
   }
 }
 
 async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
   const response = await fetch(path, {
     headers: { accept: "application/json" },
-    cache: "no-store",
     signal,
   });
   if (!response.ok) {
@@ -190,6 +215,10 @@ export class EvalApiClient {
     return getJson<EvalOverview>("/api/evals", signal);
   }
 
+  cluster(signal?: AbortSignal) {
+    return getJson<EvalCluster>("/api/evals/cluster", signal);
+  }
+
   workset(id: string, signal?: AbortSignal) {
     return getJson<EvalWorksetDetail>(`/api/evals/worksets/${encodeURIComponent(id)}`, signal);
   }
@@ -201,15 +230,8 @@ export class EvalApiClient {
     );
   }
 
-  taskResults(worksetId: string, taskId: string, signal?: AbortSignal) {
-    return getJson<EvalWorksetResults>(
-      `/api/evals/worksets/${encodeURIComponent(worksetId)}/tasks/${encodeURIComponent(taskId)}/results`,
-      signal,
-    );
-  }
-
   task(worksetId: string, taskId: string, signal?: AbortSignal) {
-    return getJson<EvalTaskDetail>(
+    return getJson<EvalTaskSnapshot>(
       `/api/evals/worksets/${encodeURIComponent(worksetId)}/tasks/${encodeURIComponent(taskId)}`,
       signal,
     );

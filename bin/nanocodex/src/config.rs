@@ -36,6 +36,8 @@ pub(crate) struct ConfiguredAgent {
     pub(crate) events: AgentEvents,
     pub(crate) realtime: Option<OpenAi>,
     pub(crate) child_agents: Option<Arc<ChildAgents>>,
+    pub(crate) subagent_updates:
+        Option<tokio::sync::mpsc::UnboundedReceiver<nanocodex_subagents::ScopedAgentUpdate>>,
     pub(crate) mpp_adapter: Option<MppAdapter>,
     pub(crate) mcp: Option<McpHandle>,
     pub(crate) browser: Option<ConfiguredBrowser>,
@@ -59,6 +61,14 @@ pub(crate) struct AuthArgs {
     /// Explicitly use `ChatGPT` authorization from this credential file.
     #[arg(long, env = "NANOCODEX_AUTH_FILE")]
     auth_file: Option<PathBuf>,
+
+    /// Use a persistent `ChatGPT` Business or Enterprise access token.
+    #[arg(
+        long,
+        env = "CODEX_ACCESS_TOKEN",
+        value_parser = NonEmptyStringValueParser::new()
+    )]
+    access_token: Option<String>,
 }
 
 /// Model-facing flags shared by normal agents and evaluator agents.
@@ -78,6 +88,7 @@ pub(crate) struct ModelArgs {
 #[derive(Clone)]
 pub(crate) enum SharedAuth {
     ApiKey(Arc<str>),
+    AccessToken(Arc<str>),
     AuthFile(PathBuf),
 }
 
@@ -179,6 +190,15 @@ pub(crate) struct AgentArgs {
     #[arg(long, env = "OPENAI_RESPONSES_WEBSOCKET_URL")]
     websocket_url: Option<String>,
 
+    /// Prime the Responses WebSocket before the first model request.
+    #[arg(
+        long,
+        env = "NANOCODEX_WEBSOCKET_WARMUP",
+        default_value_t = false,
+        action = ArgAction::Set
+    )]
+    websocket_warmup: bool,
+
     /// Responses transport fixed for the complete agent session.
     ///
     /// Defaults to HTTPS for the Tempo provider and WebSocket for direct
@@ -239,6 +259,16 @@ impl AgentArgs {
         self.browser.uses_brave()
     }
 
+    #[cfg(test)]
+    pub(crate) const fn uses_interactive_browser_cookie_authorization(&self) -> bool {
+        self.browser.uses_interactive_cookie_authorization()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn uses_host_browser_passkeys(&self) -> bool {
+        self.browser.uses_host_passkeys()
+    }
+
     pub(crate) fn thinking(&self) -> Thinking {
         self.model_policy.thinking.unwrap_or_default()
     }
@@ -284,7 +314,7 @@ impl AgentArgs {
         self,
         durable: Option<DurableSession>,
         vm: VmArgs,
-        simplify_workflow: bool,
+        tui: bool,
     ) -> Result<ConfiguredAgent> {
         let thinking = self.thinking();
         let web_search = self.web_search();
@@ -307,7 +337,8 @@ impl AgentArgs {
         let mpp_adapter = self.mpp.start().await?;
         let mut openai = OpenAi::builder(auth)
             .transport(responses_transport)
-            .websocket_url(direct_websocket_url);
+            .websocket_url(direct_websocket_url)
+            .websocket_warmup(self.websocket_warmup);
         if let Some(prefix) = self.model_id_prefix.as_deref() {
             openai = openai.model_id_prefix(prefix);
         }
@@ -345,7 +376,7 @@ impl AgentArgs {
             .map_or_else(Tools::builder, ConfiguredVm::tools_builder)
             .web_search(web_search)
             .image_generation(self.image_generation);
-        let mcp = self.mcp.build(&codex_home)?;
+        let mcp = self.mcp.build(&codex_home, mpp_adapter.as_ref())?;
         let mcp_handle = mcp.as_ref().map(|mcp| mcp.handle.clone());
         if let Some(ConfiguredMcp { provider, .. }) = mcp {
             tools = tools.provider(provider);
@@ -361,7 +392,7 @@ impl AgentArgs {
         }
         let tools = tools.build()?;
         let generic_subagents = self.subagents;
-        let subagent_tools = selected_subagent_tools(generic_subagents, simplify_workflow);
+        let subagent_tools = selected_subagent_tools(generic_subagents, tui);
         let subagent_runtime = subagent_tools.map(|_| subagents::channel(self.max_subagents));
         let mut builder = Nanocodex::builder(openai)
             .model(self.model)
@@ -402,14 +433,28 @@ impl AgentArgs {
             builder
         };
         let (handle, events) = builder.build()?;
-        let child_agents = subagent_runtime.map(|(_, control, updates)| {
-            ChildAgents::new(handle.session_id().to_string(), control, updates)
-        });
+        let (child_agents, subagent_updates) =
+            subagent_runtime.map_or((None, None), |(_, control, updates)| {
+                let (drain_updates, subagent_updates) = if tui {
+                    (None, Some(updates))
+                } else {
+                    (Some(updates), None)
+                };
+                (
+                    Some(ChildAgents::new(
+                        handle.session_id().to_string(),
+                        control,
+                        drain_updates,
+                    )),
+                    subagent_updates,
+                )
+            });
         Ok(ConfiguredAgent {
             handle,
             events,
             realtime,
             child_agents,
+            subagent_updates,
             mpp_adapter,
             mcp: mcp_handle,
             browser: configured_browser,
@@ -456,7 +501,12 @@ fn session_instructions(custom: Option<String>, subagents_enabled: bool) -> Opti
 
 impl AuthArgs {
     fn resolve(self) -> Result<SharedAuth> {
-        select_shared_auth(self.api_key, self.auth_file, environment_api_key()?)
+        select_shared_auth(
+            self.api_key,
+            self.auth_file,
+            self.access_token,
+            environment_api_key()?,
+        )
     }
 }
 
@@ -489,6 +539,10 @@ impl SharedAuth {
     fn nanocodex(&self) -> Result<OpenAiAuth> {
         match self {
             Self::ApiKey(api_key) => Ok(OpenAiAuth::api_key(Arc::clone(api_key))),
+            Self::AccessToken(access_token) => {
+                nanocodex::oai::auth::chatgpt_access_token(Arc::clone(access_token))
+                    .map_err(Into::into)
+            }
             Self::AuthFile(path) => load_subscription_auth(path),
         }
     }
@@ -566,11 +620,13 @@ fn selected_api_base_url(generic: Option<String>, tempo: Option<&str>) -> Option
 fn select_auth(
     explicit_api_key: Option<String>,
     auth_file: Option<PathBuf>,
+    access_token: Option<String>,
     environment_api_key: Option<String>,
 ) -> Result<OpenAiAuth> {
     select_shared_auth_with_default(
         explicit_api_key,
         auth_file,
+        access_token,
         environment_api_key,
         default_auth_file,
     )
@@ -581,6 +637,7 @@ fn select_auth(
 fn select_auth_with_default<F>(
     explicit_api_key: Option<String>,
     auth_file: Option<PathBuf>,
+    access_token: Option<String>,
     environment_api_key: Option<String>,
     resolve_default_auth_file: F,
 ) -> Result<OpenAiAuth>
@@ -590,6 +647,7 @@ where
     select_shared_auth_with_default(
         explicit_api_key,
         auth_file,
+        access_token,
         environment_api_key,
         resolve_default_auth_file,
     )
@@ -599,11 +657,13 @@ where
 fn select_shared_auth(
     explicit_api_key: Option<String>,
     auth_file: Option<PathBuf>,
+    access_token: Option<String>,
     environment_api_key: Option<String>,
 ) -> Result<SharedAuth> {
     select_shared_auth_with_default(
         explicit_api_key,
         auth_file,
+        access_token,
         environment_api_key,
         default_auth_file,
     )
@@ -612,6 +672,7 @@ fn select_shared_auth(
 fn select_shared_auth_with_default<F>(
     explicit_api_key: Option<String>,
     auth_file: Option<PathBuf>,
+    access_token: Option<String>,
     environment_api_key: Option<String>,
     resolve_default_auth_file: F,
 ) -> Result<SharedAuth>
@@ -623,6 +684,11 @@ where
     }
     if let Some(auth_file) = auth_file {
         return Ok(SharedAuth::AuthFile(auth_file));
+    }
+    if let Some(access_token) = access_token {
+        return Ok(SharedAuth::AccessToken(
+            access_token.trim().to_owned().into(),
+        ));
     }
     let auth_file = resolve_default_auth_file()?;
     if auth_file
@@ -840,7 +906,7 @@ mod tests {
     }
 
     #[test]
-    fn standard_and_codex_config_mcp_servers_are_enabled_by_default() {
+    fn standard_mcp_servers_are_enabled_and_codex_config_is_opt_in() {
         let command = crate::Cli::command();
         let mcp_defaults = command
             .get_arguments()
@@ -853,7 +919,7 @@ mod tests {
             .get_arguments()
             .find(|argument| argument.get_id() == "mcp_codex_config")
             .expect("the CLI should expose the Codex MCP config argument");
-        assert_eq!(codex_config.get_default_values(), ["true"]);
+        assert_eq!(codex_config.get_default_values(), ["false"]);
     }
 
     #[test]
@@ -877,6 +943,12 @@ mod tests {
             .find(|argument| argument.get_id() == "store_responses")
             .expect("the CLI should expose the Responses storage argument");
         assert!(store.get_default_values().is_empty());
+
+        let warmup = command
+            .get_arguments()
+            .find(|argument| argument.get_id() == "websocket_warmup")
+            .expect("the CLI should expose the WebSocket warmup argument");
+        assert_eq!(warmup.get_default_values(), ["false"]);
     }
 
     #[test]
@@ -884,6 +956,7 @@ mod tests {
         let auth = select_auth(
             Some("explicit-key".into()),
             Some(auth_file()),
+            Some("at-access-token".into()),
             Some("environment-key".into()),
         )
         .unwrap();
@@ -896,10 +969,11 @@ mod tests {
         let auth_file = auth_file();
         write_chatgpt_auth(&auth_file);
 
-        let auth = select_auth_with_default(None, None, Some("environment-key".into()), || {
-            Ok(auth_file.clone())
-        })
-        .unwrap();
+        let auth =
+            select_auth_with_default(None, None, None, Some("environment-key".into()), || {
+                Ok(auth_file.clone())
+            })
+            .unwrap();
 
         assert_eq!(auth.mode(), OpenAiAuthMode::ChatGpt);
         std::fs::remove_file(auth_file).unwrap();
@@ -909,8 +983,10 @@ mod tests {
     fn environment_key_is_used_when_the_default_auth_file_is_missing() {
         let auth_file = auth_file();
         let auth =
-            select_auth_with_default(None, None, Some("environment-key".into()), || Ok(auth_file))
-                .unwrap();
+            select_auth_with_default(None, None, None, Some("environment-key".into()), || {
+                Ok(auth_file)
+            })
+            .unwrap();
 
         assert_eq!(auth.mode(), OpenAiAuthMode::ApiKey);
     }
@@ -920,10 +996,11 @@ mod tests {
         let auth_file = auth_file();
         std::fs::write(&auth_file, b"{}").unwrap();
 
-        let error = select_auth_with_default(None, None, Some("environment-key".into()), || {
-            Ok(auth_file.clone())
-        })
-        .unwrap_err();
+        let error =
+            select_auth_with_default(None, None, None, Some("environment-key".into()), || {
+                Ok(auth_file.clone())
+            })
+            .unwrap_err();
 
         assert!(error.to_string().contains("no ChatGPT tokens"));
         std::fs::remove_file(auth_file).unwrap();
@@ -937,11 +1014,30 @@ mod tests {
         let error = select_auth(
             None,
             Some(auth_file.clone()),
+            None,
             Some("environment-key".into()),
         )
         .unwrap_err();
 
         assert!(error.to_string().contains("no ChatGPT tokens"));
+        std::fs::remove_file(auth_file).unwrap();
+    }
+
+    #[test]
+    fn access_token_precedes_the_default_auth_file_and_environment_api_key() {
+        let auth_file = auth_file();
+        write_chatgpt_auth(&auth_file);
+
+        let auth = select_auth_with_default(
+            None,
+            None,
+            Some("at-persistent".into()),
+            Some("environment-key".into()),
+            || Ok(auth_file.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(auth.mode(), OpenAiAuthMode::ChatGpt);
         std::fs::remove_file(auth_file).unwrap();
     }
 }

@@ -1,9 +1,16 @@
+import type {
+  CodeEvaluator,
+  McpServers,
+  MppSession,
+  ToolMap,
+} from "../types.mjs";
+import type { Workspace } from "./workspace.mjs";
 export type BrowserTool = {
   description: string;
   parameters: Record<string, unknown>;
   handler: (
     input: unknown,
-    context: { sessionId: string },
+    context: { sessionId: string; signal: AbortSignal },
   ) => unknown | Promise<unknown>;
 };
 
@@ -22,9 +29,14 @@ export type BrowserWebSocketRequest = BrowserWebSocketMetadata & (
     bearerToken: string;
   }
   | {
-    authorization: "host_managed";
-    bearerToken?: never;
-  }
+      authorization: "host_managed";
+      bearerToken?: never;
+    }
+  | {
+      /** Credential-free eager connection; the later model connect consumes this exact socket. */
+      authorization: "preconnect";
+      bearerToken?: never;
+    }
 );
 
 export type BrowserWebSocketConnection = {
@@ -39,13 +51,21 @@ export type BrowserWebSocketConnection = {
 export function createBrowserHost(options?: {
   WebSocketImpl?: typeof WebSocket;
   hostAuth?: boolean;
+  hostManagedProtocol?: boolean;
   createWebSocket?: (
     endpoint: string,
     sessionId: string,
     request: BrowserWebSocketRequest,
   ) => WebSocket | BrowserWebSocketConnection | Promise<WebSocket | BrowserWebSocketConnection>;
+  filesystem?: Workspace;
+  filesystemTools?: boolean;
   onEvent?: (eventJson: string) => void;
-  tools?: BrowserToolMap;
+  tools?: ToolMap;
+  mpp?: MppSession;
+  /** Remote MCP servers exposed through native and Code Mode tool_search plus deferred tools. */
+  mcp?: McpServers;
+  codeEvaluator?: CodeEvaluator;
+  toolMode?: "code" | "direct";
   maxQueuedMessages?: number;
   maxQueuedBytes?: number;
   maxBufferedSendBytes?: number;

@@ -48,12 +48,12 @@ impl CommittedSession {
         self.selected_model
     }
 
-    #[allow(dead_code, reason = "consumed by the native durability boundary only")]
+    #[allow(dead_code, reason = "consumed by the native rollout boundary only")]
     pub(crate) fn rollout_history(&self) -> nanocodex_oai_api::responses::ResponseHistory {
         self.model.history()
     }
 
-    #[allow(dead_code, reason = "consumed by the native durability boundary only")]
+    #[allow(dead_code, reason = "consumed by the native rollout boundary only")]
     pub(crate) const fn history_revision(&self) -> u64 {
         self.model.history_revision()
     }
@@ -85,8 +85,10 @@ impl CommittedSession {
 /// value, but Nanocodex remains responsible for interpreting model history and
 /// cache state. Provider response IDs are deliberately excluded: the first
 /// resumed request replays the authoritative typed history, then subsequent
-/// requests follow the configured history policy. Resuming requires the same
-/// model instructions and tool definitions used to create the snapshot.
+/// requests follow the configured history policy. The stored request prefix
+/// records the completed boundary; a resumed runtime replaces it with its
+/// current instructions and tool definitions while retaining conversation
+/// history and cache lineage.
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
 pub struct SessionSnapshot {
     version: u32,
@@ -227,7 +229,6 @@ impl SessionSnapshot {
             lineage_id,
             prompt_cache_key,
             workspace: self.workspace,
-            base_instructions: self.base_instructions,
             canonical_context: self.canonical_context,
             history: self.history,
             context_baseline: self.context_snapshot,
@@ -241,7 +242,6 @@ pub(crate) struct SessionResume {
     pub(crate) lineage_id: Arc<str>,
     pub(crate) prompt_cache_key: Arc<str>,
     pub(crate) workspace: String,
-    pub(crate) base_instructions: Option<String>,
     pub(crate) canonical_context: ResponseItem,
     pub(crate) history: Vec<ResponseItem>,
     pub(crate) context_baseline: Option<ContextBaseline>,

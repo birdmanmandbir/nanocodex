@@ -27,6 +27,7 @@ test("concurrent submits share retryable creation and pagehide owns cleanup", as
   await Promise.all([first, second]);
 
   assert.deepEqual(firstAgent.prompts, ["first", "second"]);
+  assert.deepEqual(firstAgent.resultDisposals, [1, 1]);
   assert.deepEqual(firstAgent.turnDisposals, [1, 1]);
   concurrent.pagehide();
   await tick();
@@ -139,8 +140,8 @@ async function loadExample(Agent) {
 
   const source = moduleSource
     .replace(
-      /import \{ Agent \} from "[^"]+";/,
-      "const Agent = globalThis.__nanocodexTestAgent;",
+      /import \{ Agent, Transport \} from "[^"]+";/,
+      "const Agent = globalThis.__nanocodexTestAgent; const Transport = { hostManaged: (options) => options };",
     )
     .concat(`\n// deterministic test module ${moduleId++}`);
   await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
@@ -159,6 +160,7 @@ async function loadExample(Agent) {
 
 function fakeAgent({ shutdownError } = {}) {
   const prompts = [];
+  const resultDisposals = [];
   const turnDisposals = [];
   let shutdowns = 0;
   let disposals = 0;
@@ -173,9 +175,15 @@ function fakeAgent({ shutdownError } = {}) {
       prompt({ input }) {
         prompts.push(input);
         const index = turnDisposals.push(0) - 1;
+        resultDisposals.push(0);
         return {
           async result() {
-            return { finalMessage: input };
+            return {
+              finalMessage: input,
+              dispose() {
+                resultDisposals[index] += 1;
+              },
+            };
           },
           dispose() {
             turnDisposals[index] += 1;
@@ -190,6 +198,7 @@ function fakeAgent({ shutdownError } = {}) {
   return {
     agent,
     prompts,
+    resultDisposals,
     turnDisposals,
     get shutdowns() {
       return shutdowns;

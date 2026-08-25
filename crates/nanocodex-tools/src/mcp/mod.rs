@@ -26,8 +26,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{Instrument, info_span};
 
-pub use config::{McpServer, McpToolExposure};
-pub use oauth::{McpOAuthCredentials, McpOAuthStore};
+pub use config::{McpPaymentProvider, McpPendingPayment, McpServer, McpToolExposure};
+pub use oauth::{McpOAuthCredentials, McpOAuthRefreshGuard, McpOAuthStore};
 
 const MAX_TOOL_SEARCH_SOURCE_DESCRIPTION_BYTES: usize = 4 * 1024;
 
@@ -304,12 +304,9 @@ impl McpHandle {
                     .map(|tool| {
                         ToolEntry::new(
                             server_name,
-                            server.config.description.as_deref(),
                             &tool,
                             Arc::clone(&connected.client),
-                            server.config.tool_timeout,
-                            server.config.supports_parallel_tool_calls,
-                            server.config.tool_exposure,
+                            &server.config,
                         )
                     })
                     .collect();
@@ -481,15 +478,7 @@ impl DynamicToolProvider for Mcp {
                             .tools
                             .into_iter()
                             .map(|tool| {
-                                ToolEntry::new(
-                                    &name,
-                                    config.description.as_deref(),
-                                    &tool,
-                                    Arc::clone(&connected.client),
-                                    config.tool_timeout,
-                                    config.supports_parallel_tool_calls,
-                                    config.tool_exposure,
-                                )
+                                ToolEntry::new(&name, &tool, Arc::clone(&connected.client), &config)
                             })
                             .collect::<Vec<_>>();
                         ConnectedCatalog {
@@ -580,6 +569,14 @@ impl DynamicToolProvider for Mcp {
             mcp.arguments.count = argument_count,
             status = tracing::field::Empty,
         );
+        if let Err(error) = entry.client.refresh_oauth().await {
+            span.record("status", "failed");
+            span.record("otel.status_code", "ERROR");
+            return Some(ToolOutput::error(format!(
+                "MCP tool {}/{} could not refresh OAuth credentials: {error}",
+                entry.server_name, entry.remote_name
+            )));
+        }
         let result = match tokio::time::timeout(
             entry.timeout,
             entry.client.call_tool(params).instrument(span.clone()),
@@ -786,7 +783,7 @@ fn search_description(servers: &[NamedServer]) -> String {
         }
     }
     format!(
-        "# Tool discovery\n\nSearches over deferred tool metadata with BM25 and exposes matching tools for the next model call.\n\nYou have access to tools from the following sources:\n{sources}\nSome of the tools may not have been provided to you upfront, and you should use this tool (`tool_search`) to search for the required tools. For MCP tool discovery, always use `tool_search` instead of `list_mcp_resources` or `list_mcp_resource_templates`."
+        "# Tool discovery\n\nSearches over deferred tool metadata with BM25 and exposes matching tools for the next model call.\n\nYou have access to tools from the following sources:\n{sources}\nSome of the tools may not have been provided to you upfront, and you should use this tool (`tool_search`) to search for the required tools. For MCP tool discovery, always use `tool_search` instead of `list_mcp_resources` or `list_mcp_resource_templates`. Each search result reports whether it supports parallel tool calls. After discovery, invoke two or more independent supported tools together from one `exec` cell with `Promise.all` instead of using serial model rounds."
     )
 }
 
@@ -800,6 +797,8 @@ fn take_bytes_at_char_boundary(value: &str, max_bytes: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use super::*;
     use crate::runtime::ToolRuntime;
     use crate::{ToolOutputBody, Tools, contract::DEFAULT_TOOL_OUTPUT_TOKENS};
@@ -809,6 +808,74 @@ mod tests {
 
     fn test_context(session_id: &'static str, call_id: &'static str) -> ToolContext<'static> {
         ToolContext::new(MODEL, session_id, call_id, &[], DEFAULT_TOOL_OUTPUT_TOKENS)
+    }
+
+    #[derive(Default)]
+    struct FixturePayment {
+        lifecycle: Arc<FixturePaymentLifecycle>,
+    }
+
+    #[derive(Default)]
+    struct FixturePaymentLifecycle {
+        credentials: AtomicUsize,
+        commits: AtomicUsize,
+        rollbacks: AtomicUsize,
+        abandons: AtomicUsize,
+        fail_commit: AtomicBool,
+    }
+
+    #[async_trait]
+    impl McpPaymentProvider for FixturePayment {
+        async fn prepare(
+            &self,
+            payment_required: &Value,
+        ) -> Result<Option<Box<dyn McpPendingPayment>>, String> {
+            if payment_required.get("challenges").is_none() {
+                return Ok(None);
+            }
+            self.lifecycle.credentials.fetch_add(1, Ordering::Relaxed);
+            Ok(Some(Box::new(FixturePendingPayment {
+                lifecycle: Arc::clone(&self.lifecycle),
+                credential: json!("fixture-paid"),
+                active: true,
+            })))
+        }
+    }
+
+    struct FixturePendingPayment {
+        lifecycle: Arc<FixturePaymentLifecycle>,
+        credential: Value,
+        active: bool,
+    }
+
+    #[async_trait]
+    impl McpPendingPayment for FixturePendingPayment {
+        fn credential(&self) -> &Value {
+            &self.credential
+        }
+
+        async fn commit(mut self: Box<Self>) -> Result<(), String> {
+            self.lifecycle.commits.fetch_add(1, Ordering::Relaxed);
+            if self.lifecycle.fail_commit.load(Ordering::Relaxed) {
+                return Err("fixture commit failed".to_owned());
+            }
+            self.active = false;
+            Ok(())
+        }
+
+        async fn rollback(mut self: Box<Self>) -> Result<(), String> {
+            self.lifecycle.rollbacks.fetch_add(1, Ordering::Relaxed);
+            self.active = false;
+            Ok(())
+        }
+    }
+
+    impl Drop for FixturePendingPayment {
+        fn drop(&mut self) {
+            if self.active {
+                self.lifecycle.abandons.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     #[test]
@@ -851,7 +918,7 @@ mod tests {
             json!({
                 "type": "tool_search",
                 "execution": "client",
-                "description": "# Tool discovery\n\nSearches over deferred tool metadata with BM25 and exposes matching tools for the next model call.\n\nYou have access to tools from the following sources:\n- docs: Search product documentation.\nSome of the tools may not have been provided to you upfront, and you should use this tool (`tool_search`) to search for the required tools. For MCP tool discovery, always use `tool_search` instead of `list_mcp_resources` or `list_mcp_resource_templates`.",
+                "description": "# Tool discovery\n\nSearches over deferred tool metadata with BM25 and exposes matching tools for the next model call.\n\nYou have access to tools from the following sources:\n- docs: Search product documentation.\nSome of the tools may not have been provided to you upfront, and you should use this tool (`tool_search`) to search for the required tools. For MCP tool discovery, always use `tool_search` instead of `list_mcp_resources` or `list_mcp_resource_templates`. Each search result reports whether it supports parallel tool calls. After discovery, invoke two or more independent supported tools together from one `exec` cell with `Promise.all` instead of using serial model rounds.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1095,6 +1162,216 @@ mod tests {
             execution.output,
             ToolOutputBody::Text(output) if output.contains("fixture:hello")
         ));
+    }
+
+    #[tokio::test]
+    async fn paid_mcp_call_retries_with_metadata_and_commits_once() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/mcp-stdio-server.mjs");
+        let payment = Arc::new(FixturePayment::default());
+        let mcp = Mcp::builder()
+            .server(
+                "fixture",
+                McpServer::stdio("node")
+                    .arg(fixture.to_string_lossy())
+                    .env("NANOCODEX_MCP_FIXTURE_PAYMENT", "1")
+                    .payment_provider(payment.clone()),
+            )
+            .build()
+            .unwrap();
+        mcp.start();
+        let search = mcp
+            .search
+            .execute(
+                ToolInput::Function(to_raw_value(&json!({ "query": "echo" })).unwrap()),
+                test_context("paid-session", "search-call"),
+            )
+            .await
+            .unwrap();
+        assert!(search.success);
+
+        let execution = mcp
+            .execute(
+                "mcp__fixture__echo",
+                json!({ "message": "after-payment" }),
+                test_context("paid-session", "paid-call"),
+            )
+            .await
+            .unwrap();
+        assert!(execution.success);
+        assert!(matches!(
+            execution.output,
+            ToolOutputBody::Text(output) if output.contains("fixture:after-payment")
+        ));
+        assert_eq!(payment.lifecycle.credentials.load(Ordering::Relaxed), 1);
+        assert_eq!(payment.lifecycle.commits.load(Ordering::Relaxed), 1);
+        assert_eq!(payment.lifecycle.rollbacks.load(Ordering::Relaxed), 0);
+        assert_eq!(payment.lifecycle.abandons.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn payment_required_mcp_result_retries_and_commits_once() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/mcp-stdio-server.mjs");
+        let payment = Arc::new(FixturePayment::default());
+        let mcp = Mcp::builder()
+            .server(
+                "fixture",
+                McpServer::stdio("node")
+                    .arg(fixture.to_string_lossy())
+                    .env("NANOCODEX_MCP_FIXTURE_PAYMENT", "1")
+                    .env("NANOCODEX_MCP_FIXTURE_PAYMENT_RESULT", "1")
+                    .payment_provider(payment.clone()),
+            )
+            .build()
+            .unwrap();
+        mcp.start();
+        mcp.search
+            .execute(
+                ToolInput::Function(to_raw_value(&json!({ "query": "echo" })).unwrap()),
+                test_context("paid-result-session", "search-call"),
+            )
+            .await
+            .unwrap();
+
+        let execution = mcp
+            .execute(
+                "mcp__fixture__echo",
+                json!({ "message": "after-payment-result" }),
+                test_context("paid-result-session", "paid-call"),
+            )
+            .await
+            .unwrap();
+
+        assert!(execution.success);
+        assert_eq!(payment.lifecycle.credentials.load(Ordering::Relaxed), 1);
+        assert_eq!(payment.lifecycle.commits.load(Ordering::Relaxed), 1);
+        assert_eq!(payment.lifecycle.rollbacks.load(Ordering::Relaxed), 0);
+        assert_eq!(payment.lifecycle.abandons.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_paid_mcp_commit_abandons_once() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/mcp-stdio-server.mjs");
+        let payment = Arc::new(FixturePayment::default());
+        payment.lifecycle.fail_commit.store(true, Ordering::Relaxed);
+        let mcp = Mcp::builder()
+            .server(
+                "fixture",
+                McpServer::stdio("node")
+                    .arg(fixture.to_string_lossy())
+                    .env("NANOCODEX_MCP_FIXTURE_PAYMENT", "1")
+                    .payment_provider(payment.clone()),
+            )
+            .build()
+            .unwrap();
+        mcp.start();
+        mcp.search
+            .execute(
+                ToolInput::Function(to_raw_value(&json!({ "query": "echo" })).unwrap()),
+                test_context("failed-commit-session", "search-call"),
+            )
+            .await
+            .unwrap();
+
+        let execution = mcp
+            .execute(
+                "mcp__fixture__echo",
+                json!({ "message": "failed-commit" }),
+                test_context("failed-commit-session", "paid-call"),
+            )
+            .await
+            .unwrap();
+        assert!(!execution.success);
+        assert_eq!(payment.lifecycle.credentials.load(Ordering::Relaxed), 1);
+        assert_eq!(payment.lifecycle.commits.load(Ordering::Relaxed), 1);
+        assert_eq!(payment.lifecycle.rollbacks.load(Ordering::Relaxed), 0);
+        assert_eq!(payment.lifecycle.abandons.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn rejected_paid_mcp_call_rolls_back_once() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/mcp-stdio-server.mjs");
+        let payment = Arc::new(FixturePayment::default());
+        let mcp = Mcp::builder()
+            .server(
+                "fixture",
+                McpServer::stdio("node")
+                    .arg(fixture.to_string_lossy())
+                    .env("NANOCODEX_MCP_FIXTURE_PAYMENT", "1")
+                    .env("NANOCODEX_MCP_FIXTURE_PAYMENT_REJECT", "1")
+                    .payment_provider(payment.clone()),
+            )
+            .build()
+            .unwrap();
+        mcp.start();
+        let search = mcp
+            .search
+            .execute(
+                ToolInput::Function(to_raw_value(&json!({ "query": "echo" })).unwrap()),
+                test_context("rejected-paid-session", "search-call"),
+            )
+            .await
+            .unwrap();
+        assert!(search.success);
+
+        let execution = mcp
+            .execute(
+                "mcp__fixture__echo",
+                json!({ "message": "rejected-payment" }),
+                test_context("rejected-paid-session", "paid-call"),
+            )
+            .await
+            .unwrap();
+        assert!(!execution.success);
+        assert_eq!(payment.lifecycle.credentials.load(Ordering::Relaxed), 1);
+        assert_eq!(payment.lifecycle.commits.load(Ordering::Relaxed), 0);
+        assert_eq!(payment.lifecycle.rollbacks.load(Ordering::Relaxed), 1);
+        assert_eq!(payment.lifecycle.abandons.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_paid_mcp_call_abandons_once() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/mcp-stdio-server.mjs");
+        let payment = Arc::new(FixturePayment::default());
+        let mcp = Mcp::builder()
+            .server(
+                "fixture",
+                McpServer::stdio("node")
+                    .arg(fixture.to_string_lossy())
+                    .env("NANOCODEX_MCP_FIXTURE_PAYMENT", "1")
+                    .payment_provider(payment.clone()),
+            )
+            .build()
+            .unwrap();
+        mcp.start();
+        let search = mcp
+            .search
+            .execute(
+                ToolInput::Function(to_raw_value(&json!({ "query": "echo" })).unwrap()),
+                test_context("cancelled-paid-session", "search-call"),
+            )
+            .await
+            .unwrap();
+        assert!(search.success);
+
+        let execution = tokio::time::timeout(
+            Duration::from_millis(50),
+            mcp.execute(
+                "mcp__fixture__echo",
+                json!({ "message": "cancelled-payment", "delay_ms": 500 }),
+                test_context("cancelled-paid-session", "paid-call"),
+            ),
+        )
+        .await;
+        assert!(execution.is_err());
+        assert_eq!(payment.lifecycle.credentials.load(Ordering::Relaxed), 1);
+        assert_eq!(payment.lifecycle.commits.load(Ordering::Relaxed), 0);
+        assert_eq!(payment.lifecycle.rollbacks.load(Ordering::Relaxed), 0);
+        assert_eq!(payment.lifecycle.abandons.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

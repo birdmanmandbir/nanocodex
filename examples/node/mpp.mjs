@@ -1,7 +1,7 @@
 import { Expiry } from "accounts";
 import { Provider } from "accounts/cli";
 import { tempo } from "mppx/client";
-import { Agent } from "nanocodex/node";
+import { Agent, Transport } from "nanocodex/node";
 import { parseUnits } from "viem";
 import { connect } from "viem/experimental/erc7846";
 import { Actions } from "viem/tempo";
@@ -87,12 +87,13 @@ const mpp = tempo.session.manager({
 });
 let agent;
 let turn;
+let completed;
 let watch;
 let unwatch;
 
 try {
   agent = await Agent.create({
-    mpp,
+    transport: Transport.mpp({ session: mpp }),
     thinking: "none",
     fastMode: true,
     instructions: "Answer the user's request directly and concisely.",
@@ -107,8 +108,8 @@ try {
   const customPrompt = process.argv.slice(2).filter((argument) => argument !== "--close").join(" ").trim();
   const prompt = customPrompt || "Reply with exactly MPP_JS_OK and nothing else.";
   turn = agent.turn.prompt({ input: prompt });
-  const result = await turn.result();
-  const output = result.finalMessage;
+  completed = await turn.result();
+  const output = completed.finalMessage;
   if (!customPrompt && output.trim() !== "MPP_JS_OK") {
     throw new Error(`unexpected model output: ${JSON.stringify(output)}`);
   }
@@ -116,7 +117,11 @@ try {
   console.error(`Authorized cumulative payment: ${mpp.cumulative}`);
   console.error(`MPP channel: ${mpp.channelId}`);
 } finally {
-  turn?.dispose();
+  try {
+    completed?.dispose();
+  } finally {
+    turn?.dispose();
+  }
   unwatch?.();
   watch?.off();
   const cleanupErrors = [];

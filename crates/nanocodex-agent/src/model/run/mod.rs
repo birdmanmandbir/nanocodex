@@ -33,7 +33,7 @@ use nanocodex_oai_api::{
     },
     transport::{ResponsesError, ResponsesTransport, TransportStats},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, value::RawValue};
 use tokio::sync::{RwLock, watch};
 use tower::Service;
@@ -54,7 +54,7 @@ use super::{
 };
 use crate::{
     NanocodexError, Result,
-    agent::{AgentSend, ContextSource},
+    agent::{AgentSend, ContextSource, ExecutionSteps},
     prompt_cache::ModelPromptCache,
     usage::TurnUsage,
 };
@@ -90,6 +90,7 @@ pub(crate) struct ModelRun<S> {
     global_instructions: Option<Arc<str>>,
     force_compaction: bool,
     pending_developer_messages: Vec<ResponseItem>,
+    execution_steps: Option<ExecutionSteps>,
 }
 
 pub(crate) enum ModelTurnOutcome {
@@ -150,7 +151,7 @@ impl ModelCheckpoint {
         self.conversation.shared_history()
     }
 
-    #[allow(dead_code, reason = "consumed by the native durability boundary only")]
+    #[allow(dead_code, reason = "consumed by the native rollout boundary only")]
     pub(crate) const fn history_revision(&self) -> u64 {
         self.conversation.history_revision()
     }
@@ -234,6 +235,7 @@ impl<S> ModelRun<S> {
             global_instructions,
             force_compaction: false,
             pending_developer_messages: Vec::new(),
+            execution_steps: None,
         }
     }
 
@@ -300,6 +302,7 @@ impl<S> ModelRun<S> {
             global_instructions,
             force_compaction: false,
             pending_developer_messages: Vec::new(),
+            execution_steps: None,
         }
     }
 
@@ -320,25 +323,39 @@ impl<S> ModelRun<S> {
         }
     }
 
-    pub(crate) fn append_developer_message(&mut self, text: String) -> Option<ModelCheckpoint> {
+    pub(crate) fn append_developer_message(
+        &mut self,
+        text: String,
+        requested_workspace: Option<&str>,
+    ) -> Result<ModelCheckpoint> {
         let item = ResponseItem::message(
             MessageRole::Developer,
             [ContentItem::InputText {
                 text: text.into_boxed_str(),
             }],
         );
-        let Some(session) = &mut self.session else {
-            self.pending_developer_messages.push(item);
-            return None;
-        };
+        if self.session.is_none() {
+            self.session = Some(self.empty_session(requested_workspace)?);
+        }
+        let session = self.session.as_mut().ok_or_else(|| {
+            NanocodexError::InvalidSessionSnapshot(
+                "developer context did not establish a model session".to_owned(),
+            )
+        })?;
+        if !self.pending_developer_messages.is_empty() {
+            session
+                .conversation
+                .append(self.pending_developer_messages.drain(..));
+        }
         session.conversation.append([item]);
         session.conversation.commit_tail();
-        Some(ModelCheckpoint {
+        session.preserve_inherited_delta = true;
+        Ok(ModelCheckpoint {
             workspace: session.workspace.clone(),
             conversation: session.conversation.clone(),
             request_prefix: session.factory.profile().shared_prefix(),
             prompt_cache_key: Arc::from(session.factory.profile().prompt_cache_key()),
-            preserve_inherited_delta: false,
+            preserve_inherited_delta: true,
             global_instructions: self.global_instructions.clone(),
             context_baseline: session.context.baseline(),
         })
@@ -421,35 +438,28 @@ pub(crate) fn prepare_resumed_checkpoint(
     checkpoint.global_instructions = context_source
         .global_instructions()
         .or(checkpoint.global_instructions);
-    let prepared = prepare_checkpoint(checkpoint, config, tools, context_source);
-    let (tool_specs, code_mode_tool_names) = model_tool_contract(&prepared.runtime, session_id);
-    let expected = request_profile(
-        "resume-validation",
-        "resume-validation",
-        tool_specs,
-        code_mode_tool_names,
-        config.system_prompt(),
+    let runtime = tool_runtime(checkpoint.workspace(), config, tools);
+    let (tool_specs, code_mode_tool_names) = model_tool_contract(&runtime, session_id);
+    checkpoint.request_prefix = Arc::from(
+        request_profile(
+            session_id,
+            checkpoint.prompt_cache_key(),
+            tool_specs,
+            code_mode_tool_names,
+            config.system_prompt(),
+        )
+        .prefix()
+        .to_vec(),
     );
-    let expected =
-        serde_json::to_vec(&without_response_item_ids(expected.prefix())).map_err(|error| {
-            NanocodexError::InvalidSessionSnapshot(format!(
-                "failed to validate the request prefix: {error}"
-            ))
-        })?;
-    let stored = serde_json::to_vec(&without_response_item_ids(
-        prepared.checkpoint.request_prefix(),
-    ))
-    .map_err(|error| {
-        NanocodexError::InvalidSessionSnapshot(format!(
-            "failed to validate the stored request prefix: {error}"
-        ))
-    })?;
-    if expected != stored {
-        return Err(NanocodexError::InvalidSessionSnapshot(
-            "instructions or tool definitions do not match the resumed session".to_owned(),
-        ));
-    }
-    Ok(prepared)
+    let selected_agents_md = context_source
+        .project_instructions(checkpoint.workspace())
+        .map(Arc::from);
+    Ok(PreparedCheckpoint {
+        checkpoint,
+        runtime,
+        context_source,
+        selected_agents_md,
+    })
 }
 
 pub(crate) fn prepare_history_checkpoint(
@@ -495,15 +505,4 @@ pub(crate) fn prepare_history_checkpoint(
         context_source,
         selected_agents_md,
     })
-}
-
-fn without_response_item_ids(items: &[ResponseItem]) -> Vec<ResponseItem> {
-    items
-        .iter()
-        .cloned()
-        .map(|mut item| {
-            item.strip_id();
-            item
-        })
-        .collect()
 }

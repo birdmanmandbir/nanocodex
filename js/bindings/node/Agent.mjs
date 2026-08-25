@@ -7,11 +7,19 @@ import {
   bindHostSession,
   createAgentClient,
   createEventChannel,
+  createSessionId,
   defineRuntime,
+  loadDurabilityRuntime,
+  loadSubscriptionRuntime,
+  reportError,
+  registerDefinitionHost,
+  releaseDefinitionHost,
   releaseHostSession,
   toWasmConfig,
 } from "../internal.mjs";
 import { createNodeHost } from "./host.mjs";
+import { resolveResponsesTransport } from "../runtime/responses-transport.mjs";
+import { resolveTools } from "../runtime/tool-configuration.mjs";
 
 let initializedWeb;
 let NodeNanocodex;
@@ -26,48 +34,119 @@ export function create(options = {}) {
     sessionId,
     workspace,
     resume,
+    durability,
+    durabilityId,
+    transport,
+    module,
+    filesystem,
+    tools,
+    toolMode,
+    mcp,
+    codeEvaluator,
+  } = options;
+  const stableSessionId = sessionId ?? createSessionId();
+  const {
     apiKey,
+    subscription,
     mpp,
     websocketUrl,
     apiBaseUrl,
-    module,
+    websocketWarmup,
+  } = resolveResponsesTransport(transport);
+  const { tools: hostTools, subagents: subagentConfig } = resolveTools(
     tools,
-    toolMode,
-  } = options;
+    durability !== undefined || durabilityId !== undefined,
+  );
   const events = createEventChannel();
-  if (mpp !== undefined && apiKey !== undefined) {
-    throw new TypeError("apiKey and mpp are mutually exclusive");
+  if (filesystem && workspace !== undefined && workspace !== filesystem.root) {
+    throw new TypeError("workspace must match filesystem.root when both are provided");
   }
+  const tempoMcp = mpp?.[Symbol.for("nanocodex.tempo.mcp")];
+  let hostDefinitionId;
   const host = createNodeHost({
     mpp,
+    mcpServers: mcp === false
+      ? undefined
+      : tempoMcp ? { ...tempoMcp, ...mcp } : mcp,
     onEvent: events.emit,
-    tools,
+    filesystem,
+    tools: hostTools,
     toolMode,
-    workspace: workspace ?? resume?.workspace,
+    workspace: workspace ?? filesystem?.root ?? resume?.workspace,
+    codeEvaluator,
+    onDispose: () => releaseDefinitionHost(hostDefinitionId),
   });
+  let durabilityOwner;
+  let creationStarted = false;
+  hostDefinitionId = registerDefinitionHost(host);
   activateHost(host);
   const runtime = defineRuntime({
     key: "node-wasm",
     name: "Nanocodex Node WASM",
     type: "node",
     async create(config) {
-      activateHost(host);
-      const Nanocodex = module === undefined
-        ? loadNodeNanocodex()
-        : await loadWebNanocodex(module);
-      activateHost(host);
-      return new Nanocodex(JSON.stringify(toWasmConfig({
-        apiKey: apiKey ?? (mpp === undefined ? undefined : "mpp-managed"),
-        websocketUrl: websocketUrl ?? (mpp === undefined
-          ? undefined
-          : "wss://openai.mpp.tempo.xyz/v1/responses"),
-        apiBaseUrl,
-        ...config,
-      })));
+      creationStarted = true;
+      try {
+        if (durability !== undefined || durabilityId !== undefined) {
+          durabilityOwner = (await loadDurabilityRuntime()).own(
+            host,
+            durability,
+            durabilityId,
+          );
+        }
+        activateHost(host);
+        await host.ready();
+        const Nanocodex = module === undefined
+          ? loadNodeNanocodex()
+          : await loadWebNanocodex(module);
+        activateHost(host);
+        const configJson = JSON.stringify(toWasmConfig({
+          apiKey: apiKey ?? (subscription === undefined
+            ? mpp === undefined ? undefined : "mpp-managed"
+            : "subscription-managed"),
+          websocketUrl: websocketUrl ?? (mpp === undefined
+            ? undefined
+            : "wss://openai.mpp.tempo.xyz/v1/responses"),
+          apiBaseUrl,
+          websocketWarmup,
+          subagents: subagentConfig,
+          hostDefinitionId,
+          ...config,
+          durabilityHostId: durabilityOwner?.id,
+        }));
+        return subscription === undefined
+          ? Nanocodex.create(configJson)
+          : Nanocodex.createWithChatGpt(
+              configJson,
+              (await loadSubscriptionRuntime()).rawSubscription(subscription),
+            );
+      } catch (error) {
+        durabilityOwner?.abandon();
+        await host.dispose();
+        throw error;
+      }
     },
     subscribe: events.subscribe,
-    adopt: (raw) => bindHostSession(host, raw.sessionId),
-    release: (raw) => releaseHostSession(host, raw.sessionId),
+    adopt(raw) {
+      host.retain();
+      try {
+        durabilityOwner?.retain();
+        bindHostSession(host, raw.sessionId);
+        events.addSource(raw);
+      } catch (error) {
+        events.removeSource(raw);
+        durabilityOwner?.release();
+        releaseHost(host);
+        throw error;
+      }
+    },
+    release(raw) {
+      events.removeSource(raw);
+      host.releaseSession(raw.sessionId);
+      releaseHostSession(host, raw.sessionId);
+      durabilityOwner?.release();
+      releaseHost(host);
+    },
     decorate: (agent) => agent.extend(agentActions()),
   });
   return createAgentClient(runtime, {
@@ -76,10 +155,18 @@ export function create(options = {}) {
     reasoningMode,
     fastMode,
     instructions,
-    sessionId,
-    workspace,
+    sessionId: stableSessionId,
+    workspace: workspace ?? filesystem?.root,
     resume,
+    durabilityId,
+  }).catch(async (error) => {
+    if (!creationStarted) await host.dispose();
+    throw error;
   });
+}
+
+function releaseHost(host) {
+  void host.release().catch(reportError);
 }
 
 function loadNodeNanocodex() {

@@ -10,7 +10,7 @@ pub struct Nanocodex {
     pub(super) next_turn: Arc<AtomicU64>,
     pub(super) lineage_id: Arc<str>,
     pub(super) session_id: SessionId,
-    pub(super) durability: Durability,
+    pub(super) execution: Execution,
     pub(super) shutdown: DriverShutdown,
 }
 
@@ -22,7 +22,7 @@ impl Clone for Nanocodex {
             next_turn: Arc::clone(&self.next_turn),
             lineage_id: Arc::clone(&self.lineage_id),
             session_id: self.session_id,
-            durability: self.durability.clone(),
+            execution: self.execution.clone(),
             shutdown: self.shutdown.clone(),
         }
     }
@@ -35,6 +35,7 @@ impl Clone for Nanocodex {
 #[derive(Clone)]
 pub struct AgentHandle {
     pub(super) commands: mpsc::WeakSender<Command>,
+    pub(super) shutdown: DriverShutdown,
 }
 
 impl AgentHandle {
@@ -48,8 +49,20 @@ impl AgentHandle {
     ///
     /// Returns an error after the containing driver has stopped.
     pub async fn spawn(&self) -> Result<(Nanocodex, AgentEvents)> {
+        self.spawn_with(SpawnOptions::new()).await
+    }
+
+    /// Starts a clean agent with optional model and reasoning overrides.
+    ///
+    /// Unspecified values inherit this agent's settings when the driver handles
+    /// the spawn command. Overrides affect only the new child.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after the containing driver has stopped.
+    pub async fn spawn_with(&self, options: SpawnOptions) -> Result<(Nanocodex, AgentEvents)> {
         let commands = self.commands()?;
-        request_spawn(&commands).await
+        request_spawn(&commands, &self.shutdown, options).await
     }
 
     /// Forks the containing agent's latest safe model boundary.
@@ -60,7 +73,7 @@ impl AgentHandle {
     /// after the containing agent driver has stopped.
     pub async fn fork(&self) -> Result<(Nanocodex, AgentEvents)> {
         let commands = self.commands()?;
-        request_fork(&commands, None).await
+        request_fork(&commands, &self.shutdown, None).await
     }
 
     fn commands(&self) -> Result<mpsc::Sender<Command>> {
@@ -99,7 +112,7 @@ impl Nanocodex {
     #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
     #[must_use]
     pub const fn rollout(&self) -> Option<&RolloutInfo> {
-        self.durability.info()
+        self.execution.info()
     }
 
     /// Retries any pending rollout write and waits for a durable file flush.
@@ -115,7 +128,7 @@ impl Nanocodex {
     #[cfg(not(target_family = "wasm"))]
     #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
     pub async fn flush_rollout(&self) -> Result<()> {
-        self.durability.flush().await
+        self.execution.flush().await
     }
 
     /// Gracefully stops this agent and waits for all owned resources to close.
@@ -138,7 +151,7 @@ impl Nanocodex {
     pub async fn shutdown(&self) -> Result<()> {
         let (initiate, receiver) = self.shutdown.request();
         if initiate && self.commands.send(Command::Shutdown).await.is_err() {
-            let outcome = match self.durability.shutdown().await {
+            let outcome = match self.execution.shutdown().await {
                 Ok(()) => Err(NanocodexError::AgentStopped),
                 Err(error) => Err(error),
             };
@@ -151,26 +164,52 @@ impl Nanocodex {
         }
     }
 
-    /// Accepts the agent's prompt and immediately returns its turn handle.
+    /// Accepts a prompt submission and immediately returns its turn handle.
+    ///
+    /// When an execution policy is configured, strings and [`Prompt`] values
+    /// receive an automatically generated operation identity. Use
+    /// [`PromptRequest::request_id`] to supply a stable caller-owned identity.
     ///
     /// # Errors
     ///
-    /// Returns an error for an empty prompt or if the driver stopped.
-    pub async fn prompt(&self, prompt: impl Into<Prompt>) -> Result<Turn> {
-        let prompt = prompt.into();
+    /// Returns an error for an empty prompt or request ID, when identified
+    /// work is submitted without a configured policy, or if the driver stopped.
+    pub async fn prompt(&self, request: impl Into<PromptRequest>) -> Result<Turn> {
+        let PromptRequest { prompt, request_id } = request.into();
         prompt
             .validate()
             .map_err(|error| NanocodexError::InvalidRequest(error.to_string()))?;
+        if request_id
+            .as_deref()
+            .is_some_and(|request_id| request_id.trim().is_empty())
+        {
+            return Err(NanocodexError::InvalidRequest(
+                "request ID must not be empty".to_owned(),
+            ));
+        }
+        let execution_operation = request_id.map(ExecutionOperation::Caller).or_else(|| {
+            self.execution
+                .identifies_prompts()
+                .then(|| ExecutionOperation::Automatic(SessionId::new().to_string()))
+        });
         let key = TurnKey(self.next_turn.fetch_add(1, Ordering::Relaxed));
         let parent = tracing::Span::current();
         let parent = (!parent.is_disabled()).then_some(parent);
         let (events, event_stream) = self.events.mirrored_channel();
         let (result, receiver) = oneshot::channel();
+        let (accepted, acceptance) = if execution_operation.is_some() {
+            let (accepted, acceptance) = oneshot::channel();
+            (Some(accepted), Some(acceptance))
+        } else {
+            (None, None)
+        };
         if self
             .commands
             .send(Command::Prompt {
                 key,
                 prompt,
+                execution_operation,
+                accepted,
                 thinking: None,
                 fast_mode: None,
                 parent,
@@ -180,13 +219,26 @@ impl Nanocodex {
             .await
             .is_err()
         {
-            return Err(NanocodexError::AgentStopped);
+            return Err(self.shutdown.stopped_error().await);
         }
+        let request_id = if let Some(acceptance) = acceptance {
+            Some(match acceptance.await {
+                Ok(Ok(request_id)) => request_id,
+                Ok(Err(NanocodexError::AgentStopped)) | Err(_) => {
+                    return Err(self.shutdown.stopped_error().await);
+                }
+                Ok(Err(error)) => return Err(error),
+            })
+        } else {
+            None
+        };
         Ok(Turn {
             control: TurnControl {
                 key,
                 commands: self.commands.clone(),
+                shutdown: self.shutdown.clone(),
             },
+            request_id,
             events: event_stream,
             result: receiver,
         })
@@ -230,17 +282,23 @@ impl Nanocodex {
             .await
             .is_err()
         {
-            return Err(NanocodexError::AgentStopped);
+            return Err(self.shutdown.stopped_error().await);
         }
-        match route_receiver
-            .await
-            .map_err(|_| NanocodexError::AgentStopped)??
-        {
+        let route = match route_receiver.await {
+            Ok(Ok(route)) => route,
+            Ok(Err(NanocodexError::AgentStopped)) | Err(_) => {
+                return Err(self.shutdown.stopped_error().await);
+            }
+            Ok(Err(error)) => return Err(error),
+        };
+        match route {
             PromptRouteKind::Started => Ok(PromptRoute::Started(Turn {
                 control: TurnControl {
                     key,
                     commands: self.commands.clone(),
+                    shutdown: self.shutdown.clone(),
                 },
+                request_id: None,
                 events: event_stream,
                 result: turn_receiver,
             })),
@@ -257,9 +315,8 @@ impl Nanocodex {
     ///
     /// Returns an error if the agent driver has stopped.
     pub async fn set_thinking(&self, thinking: Thinking) -> Result<()> {
-        request_command(&self.commands, |result| Command::SetThinking {
-            thinking,
-            result,
+        request_command(&self.commands, &self.shutdown, |result| {
+            Command::SetThinking { thinking, result }
         })
         .await
     }
@@ -273,9 +330,8 @@ impl Nanocodex {
     ///
     /// Returns an error if the agent driver has stopped.
     pub async fn set_fast_mode(&self, enabled: bool) -> Result<()> {
-        request_command(&self.commands, |result| Command::SetFastMode {
-            enabled,
-            result,
+        request_command(&self.commands, &self.shutdown, |result| {
+            Command::SetFastMode { enabled, result }
         })
         .await
     }
@@ -314,7 +370,11 @@ impl Nanocodex {
     pub async fn compact(&self) -> Result<()> {
         let parent = tracing::Span::current();
         let parent = (!parent.is_disabled()).then_some(parent);
-        request_command(&self.commands, |result| Command::Compact { parent, result }).await
+        request_command(&self.commands, &self.shutdown, |result| Command::Compact {
+            parent,
+            result,
+        })
+        .await
     }
 
     /// Appends adapter-owned developer context at the next safe model boundary.
@@ -337,8 +397,23 @@ impl Nanocodex {
                 "developer message must not be empty".to_owned(),
             ));
         }
-        request_command(&self.commands, |result| Command::AppendDeveloperMessage {
-            text,
+        request_command(&self.commands, &self.shutdown, |result| {
+            Command::AppendDeveloperMessage { text, result }
+        })
+        .await
+    }
+
+    /// Returns complete model-visible context at the latest safe boundary.
+    ///
+    /// This is a read-only adapter view. The history can contain unredacted
+    /// prompts, responses, reasoning, and tool activity and must be protected
+    /// like a session snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after the agent driver has stopped.
+    pub async fn context(&self) -> Result<AgentSessionContext> {
+        request_command(&self.commands, &self.shutdown, |result| Command::Context {
             result,
         })
         .await
@@ -354,7 +429,19 @@ impl Nanocodex {
     ///
     /// Returns an error after this agent's driver has stopped.
     pub async fn spawn(&self) -> Result<(Self, AgentEvents)> {
-        request_spawn(&self.commands).await
+        self.spawn_with(SpawnOptions::new()).await
+    }
+
+    /// Starts a clean sibling with optional model and reasoning overrides.
+    ///
+    /// Unspecified values inherit this agent's settings when its driver handles
+    /// the spawn command. Overrides affect only the new sibling.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after this agent's driver has stopped.
+    pub async fn spawn_with(&self, options: SpawnOptions) -> Result<(Self, AgentEvents)> {
+        request_spawn(&self.commands, &self.shutdown, options).await
     }
 
     /// Forks from the latest safe model boundary into an independently driven
@@ -380,40 +467,58 @@ impl Nanocodex {
     /// Returns an error when the result belongs to another conversation or the
     /// driver stopped.
     pub async fn fork_from(&self, completed: &TurnResult) -> Result<(Self, AgentEvents)> {
-        if completed.checkpoint.lineage_id() != self.lineage_id.as_ref() {
+        let TurnCheckpoint::Live(checkpoint) = &completed.checkpoint else {
+            return Err(NanocodexError::ReplayedCheckpointUnavailable);
+        };
+        if checkpoint.lineage_id() != self.lineage_id.as_ref() {
             return Err(NanocodexError::CheckpointLineageMismatch);
         }
-        self.request_fork(Some(Arc::clone(&completed.checkpoint)))
-            .await
+        self.request_fork(Some(Arc::clone(checkpoint))).await
     }
 
     async fn request_fork(
         &self,
         checkpoint: Option<Arc<CommittedSession>>,
     ) -> Result<(Self, AgentEvents)> {
-        request_fork(&self.commands, checkpoint).await
+        request_fork(&self.commands, &self.shutdown, checkpoint).await
     }
 }
 
 async fn request_fork(
     commands: &mpsc::Sender<Command>,
+    shutdown: &DriverShutdown,
     checkpoint: Option<Arc<CommittedSession>>,
 ) -> Result<(Nanocodex, AgentEvents)> {
-    request_command(commands, |result| Command::Fork { checkpoint, result }).await
+    request_command(commands, shutdown, |result| Command::Fork {
+        checkpoint,
+        result,
+    })
+    .await
 }
 
-async fn request_spawn(commands: &mpsc::Sender<Command>) -> Result<(Nanocodex, AgentEvents)> {
-    request_command(commands, |result| Command::Spawn { result }).await
+async fn request_spawn(
+    commands: &mpsc::Sender<Command>,
+    shutdown: &DriverShutdown,
+    options: SpawnOptions,
+) -> Result<(Nanocodex, AgentEvents)> {
+    request_command(commands, shutdown, |result| Command::Spawn {
+        options,
+        result,
+    })
+    .await
 }
 
 pub(super) async fn request_command<T>(
     commands: &mpsc::Sender<Command>,
+    shutdown: &DriverShutdown,
     command: impl FnOnce(oneshot::Sender<Result<T>>) -> Command,
 ) -> Result<T> {
     let (result, receiver) = oneshot::channel();
-    commands
-        .send(command(result))
-        .await
-        .map_err(|_| NanocodexError::AgentStopped)?;
-    receiver.await.map_err(|_| NanocodexError::AgentStopped)?
+    if commands.send(command(result)).await.is_err() {
+        return Err(shutdown.stopped_error().await);
+    }
+    match receiver.await {
+        Ok(Err(NanocodexError::AgentStopped)) | Err(_) => Err(shutdown.stopped_error().await),
+        Ok(outcome) => outcome,
+    }
 }

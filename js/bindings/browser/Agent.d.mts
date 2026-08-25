@@ -1,36 +1,44 @@
 import type {
   AgentOptions,
   DefaultAgent,
-  MppSession,
-  ToolMap,
+  ExecutionEnvironment,
 } from "../types.mjs";
-import type {
-  BrowserWebSocketConnection,
-  BrowserWebSocketRequest,
-} from "./host.mjs";
+import type { WorkerTransport } from "./Transport.mjs";
 
 export type Agent = DefaultAgent;
 
-/** Creates a browser- or Worker-hosted Rust/WASM Agent. */
+type WorkerMcpServer = Readonly<{
+  url?: string | URL | undefined;
+  description?: string | undefined;
+  headers?: Readonly<Record<string, string>> | readonly (readonly [string, string])[] | undefined;
+  enabledTools?: readonly string[] | undefined;
+  disabledTools?: readonly string[] | undefined;
+  supportsParallelToolCalls?: boolean | undefined;
+  parallelTools?: readonly string[] | undefined;
+  startupTimeoutMs?: number | undefined;
+  timeoutMs?: number | undefined;
+}>;
+type WorkerMcpServers = Readonly<Record<string, string | URL | WorkerMcpServer>>;
+type WorkerToolExposureOptions =
+  | { mcp?: false | undefined; toolMode?: "code" | "direct" | undefined }
+  | { mcp: WorkerMcpServers; toolMode?: "code" | undefined };
+
+/** Creates a Rust/WASM Agent in a package-owned browser module Worker. */
 export function create(options?: create.Options): Promise<create.ReturnType>;
 export declare namespace create {
-  type Options = AgentOptions & (
-    | { apiKey?: string | undefined; hostAuth?: never; mpp?: never }
-    | { apiKey?: never; hostAuth?: true; mpp?: never }
-    | { apiKey?: never; hostAuth?: never; mpp: MppSession }
-  ) & {
-    WebSocketImpl?: typeof WebSocket | undefined;
-    apiBaseUrl?: string | undefined;
-    createWebSocket?(
-      endpoint: string,
-      sessionId: string,
-      request: BrowserWebSocketRequest,
-    ): WebSocket | BrowserWebSocketConnection | Promise<WebSocket | BrowserWebSocketConnection>;
-    module?: unknown;
-    tools?: ToolMap | undefined;
-    /** Direct dispatch is CSP-safe; Code Mode requires dynamic JavaScript evaluation. */
-    toolMode?: "code" | "direct" | undefined;
-    websocketUrl?: string | undefined;
+  type Options = AgentOptions & WorkerToolExposureOptions & {
+    /** Precompiled browser module; WebAssembly modules are structured-clone-safe. */
+    module?: WebAssembly.Module | undefined;
+    /** Fixed browser workspace facts, including its AGENTS.md snapshot. */
+    executionEnvironment?: ExecutionEnvironment | undefined;
+    /** Defaults to the same-origin Nanocodex `/api/responses` proxy. */
+    transport?: WorkerTransport | undefined;
+    /** Stable OPFS/Git workspace identity for the default browser harness. */
+    threadId?: string | undefined;
+    /** Set false to keep this browser session out of the IndexedDB durability store. */
+    durability?: false | undefined;
+    /** Set false to omit the default OPFS, shell, web, image, plan, and artifact tools. */
+    harness?: false | undefined;
   };
   type ReturnType = Agent;
 }

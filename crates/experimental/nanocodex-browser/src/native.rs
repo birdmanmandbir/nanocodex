@@ -1,13 +1,17 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 mod artifacts;
 mod audits;
+mod credential_store;
 mod devtools;
 mod har;
 mod interaction;
@@ -24,7 +28,7 @@ pub(crate) use artifacts::MAX_IMAGE_ARTIFACT_BYTES;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chromiumoxide::{
-    Browser as Chromium, Page,
+    Browser as Chromium, Command, Method, Page,
     browser::{BrowserConfig, BrowserConfigBuilder},
     cdp::{
         browser_protocol::{
@@ -40,10 +44,10 @@ use chromiumoxide::{
                 StringIndex,
             },
             emulation::{
-                MediaFeature, SetCpuThrottlingRateParams, SetDeviceMetricsOverrideParams,
-                SetEmulatedMediaParams, SetGeolocationOverrideParams, SetLocaleOverrideParams,
-                SetTimezoneOverrideParams, SetTouchEmulationEnabledParams,
-                SetUserAgentOverrideParams,
+                MediaFeature, ScreenOrientation, ScreenOrientationType, SetCpuThrottlingRateParams,
+                SetDeviceMetricsOverrideParams, SetEmulatedMediaParams,
+                SetGeolocationOverrideParams, SetLocaleOverrideParams, SetTimezoneOverrideParams,
+                SetTouchEmulationEnabledParams, SetUserAgentOverrideParams,
             },
             network::{
                 Cookie, CookieParam, CookieSameSite, EmulateNetworkConditionsByRuleParams,
@@ -61,11 +65,11 @@ use chromiumoxide::{
                 GetNavigationHistoryParams, HandleJavaScriptDialogParams,
                 NavigateToHistoryEntryParams, Viewport,
             },
-            target::{GetTargetsParams, SetAutoAttachParams, TargetId},
+            target::{FilterEntry, GetTargetsParams, SetAutoAttachParams, TargetFilter, TargetId},
             web_authn::{
-                AddVirtualAuthenticatorParams, AuthenticatorId, AuthenticatorProtocol,
-                AuthenticatorTransport, EnableParams, GetCredentialsParams,
-                VirtualAuthenticatorOptions,
+                AddCredentialParams, AddVirtualAuthenticatorParams, AuthenticatorId,
+                AuthenticatorProtocol, AuthenticatorTransport, Credential, EnableParams,
+                GetCredentialsParams, RemoveCredentialParams, VirtualAuthenticatorOptions,
             },
         },
         js_protocol::runtime::{
@@ -73,7 +77,7 @@ use chromiumoxide::{
             ReleaseObjectParams, RemoteObject, StackTrace,
         },
     },
-    error::CdpError,
+    error::{CdpError, ChannelError},
     layout::Point,
 };
 use futures_util::StreamExt;
@@ -86,23 +90,34 @@ use url::Url;
 use crate::{
     BraveSession, BraveSessionError, BrowserAction, BrowserActionName, BrowserActionOutcome,
     BrowserActionResult, BrowserAfterAction, BrowserClickOptions, BrowserConsoleEntry,
-    BrowserCookie, BrowserCookieSameSite, BrowserCruxClient, BrowserDialog, BrowserDialogKind,
-    BrowserDocumentReadyState, BrowserDomDocument, BrowserDomLayout, BrowserDomNode,
-    BrowserDomRect, BrowserDomSnapshot, BrowserDownload, BrowserEgressPolicy,
-    BrowserElementContext, BrowserElementReference, BrowserFrame, BrowserGate, BrowserHttpHeader,
-    BrowserImageArtifact, BrowserNetworkBodyKind, BrowserNetworkCallFrame, BrowserNetworkContext,
-    BrowserNetworkInitiator, BrowserNetworkRequest, BrowserNetworkTiming, BrowserOriginStorage,
-    BrowserPageError, BrowserPageState, BrowserPostActionSnapshot, BrowserReactEvent,
-    BrowserReactStatus, BrowserStorageState, BrowserTab, BrowserTarget, BrowserTargetIndex,
-    BrowserWebSocketDirection, BrowserWebSocketMessage, MAX_VIEWPORT_DIMENSION, ReactDiagnostics,
+    BrowserCookie, BrowserCookieAuthorization, BrowserCookieSameSite, BrowserCruxClient,
+    BrowserDialog, BrowserDialogKind, BrowserDocumentReadyState, BrowserDomDocument,
+    BrowserDomLayout, BrowserDomNode, BrowserDomRect, BrowserDomSnapshot, BrowserDownload,
+    BrowserEgressPolicy, BrowserElementContext, BrowserElementReference, BrowserFrame, BrowserGate,
+    BrowserHttpHeader, BrowserImageArtifact, BrowserNetworkBodyKind, BrowserNetworkCallFrame,
+    BrowserNetworkContext, BrowserNetworkInitiator, BrowserNetworkRequest, BrowserNetworkTiming,
+    BrowserOriginStorage, BrowserPageError, BrowserPageState, BrowserPasskeyMode,
+    BrowserPostActionSnapshot, BrowserReactEvent, BrowserReactStatus, BrowserStorageState,
+    BrowserTab, BrowserTarget, BrowserTargetIndex, BrowserWebSocketDirection,
+    BrowserWebSocketMessage, HostPasskeyAuthenticator, MAX_VIEWPORT_DIMENSION, ReactDiagnostics,
     VirtualAuthenticator, VirtualCredential,
-    features::{BrowserColorScheme, BrowserContext, BrowserPermission, BrowserReducedMotion},
+    features::{
+        BrowserColorScheme, BrowserContext, BrowserDeviceDescriptor, BrowserDevicePreset,
+        BrowserMobileAudit, BrowserMobileAuditSample, BrowserMobileFinding,
+        BrowserMobileFindingSeverity, BrowserMobileState, BrowserOrientation, BrowserPermission,
+        BrowserReducedMotion, BrowserViewport,
+    },
     session::cookie_applies_to,
     trace_serialized,
 };
+use credential_store::VirtualCredentialStore;
 
 const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(25);
 const DEFAULT_NAVIGATION_TIMEOUT: Duration = Duration::from_secs(5);
+const BROWSER_LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
+const COOKIE_AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(120);
+const COOKIE_AUTHORIZATION_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const SESSION_DISCARD_TIMEOUT: Duration = Duration::from_secs(3);
 const MAIN_CONTEXT_RETRY_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_EXPLICIT_WAIT: Duration = Duration::from_secs(30);
 const MAX_SCRIPT_EVALUATION: Duration = Duration::from_secs(30);
@@ -141,9 +156,11 @@ pub(crate) struct NativeBrowser {
     runtime_dir: TempDir,
     executable: Option<PathBuf>,
     cdp_endpoint: Option<Url>,
+    persistent_profile: Option<PathBuf>,
     brave_session: Option<BraveSession>,
     launch_brave_executable: bool,
     virtual_authenticator: Option<VirtualAuthenticator>,
+    host_passkey_authenticator: Option<HostPasskeyAuthenticator>,
     react_diagnostics: Option<ReactDiagnostics>,
     egress_policy: Option<BrowserEgressPolicy>,
     file_root: Option<PathBuf>,
@@ -160,7 +177,236 @@ pub(crate) struct NativeBrowser {
 struct BrowserState {
     next_sequence: u64,
     session: Option<Session>,
+    extension_paths: Vec<String>,
     closed: bool,
+}
+
+const DEFAULT_MOBILE_AUDIT_DEVICES: [BrowserDevicePreset; 4] = [
+    BrowserDevicePreset::IphoneSe,
+    BrowserDevicePreset::Iphone15Pro,
+    BrowserDevicePreset::Pixel8,
+    BrowserDevicePreset::GalaxyS24,
+];
+const MAX_MOBILE_AUDIT_DEVICES: usize = 8;
+
+fn mobile_audit_devices(
+    devices: Vec<BrowserDevicePreset>,
+) -> Result<Vec<BrowserDevicePreset>, BrowserError> {
+    let devices = if devices.is_empty() {
+        DEFAULT_MOBILE_AUDIT_DEVICES.to_vec()
+    } else {
+        devices
+    };
+    if devices.len() > MAX_MOBILE_AUDIT_DEVICES {
+        return Err(BrowserError::TooManyMobileAuditDevices {
+            count: devices.len(),
+            maximum: MAX_MOBILE_AUDIT_DEVICES,
+        });
+    }
+    Ok(devices)
+}
+
+fn mobile_audit_orientations(
+    orientations: Vec<BrowserOrientation>,
+) -> Result<Vec<BrowserOrientation>, BrowserError> {
+    let orientations = if orientations.is_empty() {
+        vec![BrowserOrientation::Portrait]
+    } else {
+        orientations
+    };
+    if orientations.len() > 2 {
+        return Err(BrowserError::TooManyMobileAuditOrientations {
+            count: orientations.len(),
+        });
+    }
+    Ok(orientations)
+}
+
+async fn apply_device_profile(
+    page: &Page,
+    descriptor: &BrowserDeviceDescriptor,
+) -> Result<(), BrowserError> {
+    let mut metrics = SetDeviceMetricsOverrideParams::new(
+        i64::from(descriptor.width),
+        i64::from(descriptor.height),
+        descriptor.device_scale_factor,
+        descriptor.mobile,
+    );
+    metrics.screen_width = Some(i64::from(descriptor.width));
+    metrics.screen_height = Some(i64::from(descriptor.height));
+    metrics.screen_orientation = Some(ScreenOrientation {
+        r#type: match descriptor.orientation {
+            BrowserOrientation::Portrait => ScreenOrientationType::PortraitPrimary,
+            BrowserOrientation::Landscape => ScreenOrientationType::LandscapePrimary,
+        },
+        angle: match descriptor.orientation {
+            BrowserOrientation::Portrait => 0,
+            BrowserOrientation::Landscape => 90,
+        },
+    });
+    page.execute(metrics).await?;
+    let mut touch = SetTouchEmulationEnabledParams::new(descriptor.touch);
+    touch.max_touch_points = Some(i64::from(descriptor.max_touch_points));
+    page.execute(touch).await?;
+    let mut user_agent = SetUserAgentOverrideParams::new(descriptor.user_agent.clone());
+    user_agent.platform = Some(descriptor.platform.clone());
+    page.execute(user_agent).await?;
+    Ok(())
+}
+
+async fn override_navigator_platform(page: &Page, platform: &str) -> Result<(), BrowserError> {
+    let platform = serde_json::to_string(platform)?;
+    let source = format!(
+        "(() => {{ Object.defineProperty(Navigator.prototype, 'platform', {{ configurable: true, get: () => {platform} }}); return true; }})()"
+    );
+    page.evaluate(source).await?;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MobileStateWire {
+    url: String,
+    viewport_width: f64,
+    viewport_height: f64,
+    visual_viewport_width: Option<f64>,
+    visual_viewport_height: Option<f64>,
+    visual_viewport_scale: Option<f64>,
+    screen_width: f64,
+    screen_height: f64,
+    device_pixel_ratio: f64,
+    user_agent: String,
+    platform: String,
+    max_touch_points: u64,
+    coarse_pointer: bool,
+    no_hover: bool,
+    orientation: String,
+    meta_viewport: Option<String>,
+}
+
+async fn read_mobile_state(
+    page: &Page,
+    context: &BrowserContext,
+) -> Result<BrowserMobileState, BrowserError> {
+    let wire: MobileStateWire = evaluate_typed(page, format!("({MOBILE_STATE_SCRIPT})()")).await?;
+    let mut mismatches = Vec::new();
+    if let Some(expected) = context.viewport {
+        if (wire.screen_width - f64::from(expected.width)).abs() > 1.0
+            || (wire.screen_height - f64::from(expected.height)).abs() > 1.0
+        {
+            mismatches.push(format!(
+                "screen is {}x{}, expected {}x{}",
+                wire.screen_width, wire.screen_height, expected.width, expected.height
+            ));
+        }
+        if (wire.device_pixel_ratio - expected.device_scale_factor).abs() > 0.01 {
+            mismatches.push(format!(
+                "devicePixelRatio is {}, expected {}",
+                wire.device_pixel_ratio, expected.device_scale_factor
+            ));
+        }
+        if expected.touch && wire.max_touch_points == 0 {
+            mismatches.push("touch emulation is not page-visible".to_owned());
+        }
+        if expected.mobile && (!wire.coarse_pointer || !wire.no_hover) {
+            mismatches.push("mobile pointer media features are not active".to_owned());
+        }
+    }
+    if let Some(expected) = &context.user_agent
+        && &wire.user_agent != expected
+    {
+        mismatches.push("navigator.userAgent does not match the active profile".to_owned());
+    }
+    if let Some(expected) = &context.platform
+        && &wire.platform != expected
+    {
+        mismatches.push(format!(
+            "navigator.platform is {:?}, expected {:?}",
+            wire.platform, expected
+        ));
+    }
+    Ok(BrowserMobileState {
+        provider: "chromium_emulation".to_owned(),
+        engine: "chromium".to_owned(),
+        url: wire.url,
+        viewport_width: wire.viewport_width,
+        viewport_height: wire.viewport_height,
+        visual_viewport_width: wire.visual_viewport_width,
+        visual_viewport_height: wire.visual_viewport_height,
+        visual_viewport_scale: wire.visual_viewport_scale,
+        screen_width: wire.screen_width,
+        screen_height: wire.screen_height,
+        device_pixel_ratio: wire.device_pixel_ratio,
+        user_agent: wire.user_agent,
+        platform: wire.platform,
+        max_touch_points: wire.max_touch_points,
+        coarse_pointer: wire.coarse_pointer,
+        no_hover: wire.no_hover,
+        orientation: wire.orientation,
+        meta_viewport: wire.meta_viewport,
+        verified: mismatches.is_empty(),
+        mismatches,
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MobileAuditWire {
+    document_width: f64,
+    horizontal_overflow: f64,
+    interactive_elements: usize,
+    findings: Vec<MobileFindingWire>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MobileFindingWire {
+    rule: String,
+    severity: BrowserMobileFindingSeverity,
+    message: String,
+    selector: Option<String>,
+    measured_width: Option<f64>,
+    measured_height: Option<f64>,
+}
+
+async fn mobile_audit_sample(
+    page: &Page,
+    device: BrowserDeviceDescriptor,
+    context: &BrowserContext,
+) -> Result<BrowserMobileAuditSample, BrowserError> {
+    let state = read_mobile_state(page, context).await?;
+    let wire: MobileAuditWire = evaluate_typed(page, format!("({MOBILE_AUDIT_SCRIPT})()")).await?;
+    let mut findings = wire
+        .findings
+        .into_iter()
+        .map(|finding| BrowserMobileFinding {
+            rule: finding.rule,
+            severity: finding.severity,
+            message: finding.message,
+            selector: finding.selector,
+            measured_width: finding.measured_width,
+            measured_height: finding.measured_height,
+        })
+        .collect::<Vec<_>>();
+    for mismatch in &state.mismatches {
+        findings.push(BrowserMobileFinding {
+            rule: "emulation-state".to_owned(),
+            severity: BrowserMobileFindingSeverity::Error,
+            message: mismatch.clone(),
+            selector: None,
+            measured_width: None,
+            measured_height: None,
+        });
+    }
+    Ok(BrowserMobileAuditSample {
+        device_name: device.name.clone(),
+        device: Some(device),
+        state,
+        document_width: wire.document_width,
+        horizontal_overflow: wire.horizontal_overflow,
+        interactive_elements: wire.interactive_elements,
+        findings,
+    })
 }
 
 #[allow(
@@ -180,8 +426,13 @@ struct Session {
     refs: HashMap<String, ElementTarget>,
     output_dir: PathBuf,
     virtual_authenticator: Option<VirtualAuthenticator>,
+    virtual_credential_store: Option<VirtualCredentialStore>,
+    passkey_mode: BrowserPasskeyMode,
+    host_passkey_authenticator: Option<HostPasskeyAuthenticator>,
+    host_passkey_broker: Option<HostPasskeyBroker>,
     react_diagnostics_enabled: bool,
     authenticators: HashMap<String, InstalledAuthenticator>,
+    closed_targets: HashSet<String>,
     allowed_origins: Vec<Url>,
     network_controls: network_control::NetworkControls,
     egress_targets: HashSet<String>,
@@ -204,6 +455,87 @@ struct Session {
     ffmpeg_executable: Option<PathBuf>,
     lighthouse_executable: Option<PathBuf>,
     crux_client: Option<BrowserCruxClient>,
+    poisoned: Arc<AtomicBool>,
+}
+
+struct HostPasskeyBroker {
+    browser: Chromium,
+    page: Page,
+    handler: JoinHandle<()>,
+    launcher: tokio::process::Child,
+    _profile: TempDir,
+    return_url: Url,
+}
+
+struct ActionLease {
+    poisoned: Arc<AtomicBool>,
+    completed: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TriggerExtensionActionParams {
+    id: String,
+    target_id: String,
+}
+
+impl Method for TriggerExtensionActionParams {
+    fn identifier(&self) -> chromiumoxide::types::MethodId {
+        "Extensions.triggerAction".into()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TriggerExtensionActionReturns {}
+
+impl Command for TriggerExtensionActionParams {
+    type Response = TriggerExtensionActionReturns;
+}
+
+#[derive(Debug, Default, Serialize)]
+struct GetExtensionsParams {}
+
+impl Method for GetExtensionsParams {
+    fn identifier(&self) -> chromiumoxide::types::MethodId {
+        "Extensions.getExtensions".into()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtensionInfo {
+    id: String,
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GetExtensionsReturns {
+    extensions: Vec<ExtensionInfo>,
+}
+
+impl Command for GetExtensionsParams {
+    type Response = GetExtensionsReturns;
+}
+
+impl ActionLease {
+    const fn new(poisoned: Arc<AtomicBool>) -> Self {
+        Self {
+            poisoned,
+            completed: false,
+        }
+    }
+
+    const fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for ActionLease {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.poisoned.store(true, Ordering::Release);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -644,9 +976,13 @@ fn trace_browser_configuration(owner: &NativeBrowser) {
     let value = serde_json::json!({
         "executable": owner.executable,
         "cdpEndpoint": owner.cdp_endpoint,
+        "persistentProfile": owner.persistent_profile,
         "braveSession": owner.brave_session.as_ref().map(BraveSession::trace_value),
         "launchBraveExecutable": owner.launch_brave_executable,
         "virtualAuthenticator": owner.virtual_authenticator.is_some(),
+        "hostPasskeyAuthenticator": owner.host_passkey_authenticator.as_ref().map(|authenticator| {
+            serde_json::json!({ "executable": authenticator.executable() })
+        }),
         "reactDiagnostics": owner.react_diagnostics.map(|diagnostics| {
             serde_json::json!({
                 "includeProfilingHooks": diagnostics.include_profiling_hooks(),
@@ -669,18 +1005,30 @@ impl Session {
         clippy::too_many_lines,
         reason = "launch ordering is security-sensitive: guards and observers precede any real navigation"
     )]
-    async fn launch(owner: &NativeBrowser) -> Result<Self, BrowserError> {
+    async fn launch(
+        owner: &NativeBrowser,
+        extension_paths: &[String],
+    ) -> Result<Self, BrowserError> {
         trace_browser_configuration(owner);
         let runtime_dir = owner.runtime_dir.path();
         let executable = owner.executable.as_deref();
         let cdp_endpoint = owner.cdp_endpoint.as_ref();
         let brave_session = owner.brave_session.as_ref();
         let launch_brave_executable = owner.launch_brave_executable;
-        let virtual_authenticator = owner.virtual_authenticator;
+        let virtual_authenticator = owner.virtual_authenticator.clone();
+        let host_passkey_authenticator = owner.host_passkey_authenticator.clone();
+        let virtual_credential_store = virtual_authenticator
+            .as_ref()
+            .and_then(VirtualAuthenticator::credential_store_path)
+            .map(|path| VirtualCredentialStore::load(path.to_path_buf()))
+            .transpose()?;
         let react_diagnostics = owner.react_diagnostics;
         let egress_policy = owner.egress_policy.clone();
         let file_root = owner.file_root.clone();
-        let profile = runtime_dir.join("profile");
+        let profile = owner
+            .persistent_profile
+            .clone()
+            .unwrap_or_else(|| runtime_dir.join("profile"));
         let output_dir = runtime_dir.join("screenshots");
         let download_dir = runtime_dir.join("downloads");
         tokio::fs::create_dir_all(&profile).await?;
@@ -709,9 +1057,17 @@ impl Session {
             let mut config = BrowserConfig::builder()
                 .user_data_dir(&profile)
                 .window_size(1280, 720)
+                .launch_timeout(BROWSER_LAUNCH_TIMEOUT)
                 .new_headless_mode();
             if opens_brave_profile {
                 config = profile_launch_config(config).arg("restore-last-session");
+            } else {
+                config = isolated_launch_config(config);
+            }
+            if !extension_paths.is_empty() {
+                config = config
+                    .arg("enable-unsafe-extension-debugging")
+                    .extensions(extension_paths.iter().cloned());
             }
             if let Some(executable) = executable {
                 config = config.chrome_executable(executable);
@@ -780,13 +1136,12 @@ impl Session {
             network_control::start(&page, network_controls.clone(), Arc::clone(&diagnostics))
                 .await?,
         );
-        let (network_observer, network_task) = network_observer::start(
+        let network_observer = network_observer::start(
             browser.websocket_address(),
             page.target_id().clone(),
             Arc::clone(&diagnostics),
         )
         .await?;
-        browser_tasks.push(network_task);
         let egress_targets = HashSet::from([page.target_id().as_ref().to_owned()]);
 
         Ok(Self {
@@ -802,8 +1157,13 @@ impl Session {
             refs: HashMap::new(),
             output_dir,
             virtual_authenticator,
+            virtual_credential_store,
+            passkey_mode: BrowserPasskeyMode::Auto,
+            host_passkey_authenticator,
+            host_passkey_broker: None,
             react_diagnostics_enabled: react_diagnostics.is_some(),
             authenticators: HashMap::new(),
+            closed_targets: HashSet::new(),
             allowed_origins: brave_session
                 .map(|session| session.allowed_origins().to_vec())
                 .unwrap_or_default(),
@@ -828,27 +1188,57 @@ impl Session {
             ffmpeg_executable: owner.ffmpeg_executable.clone(),
             lighthouse_executable: owner.lighthouse_executable.clone(),
             crux_client: owner.crux_client.clone(),
+            poisoned: Arc::new(AtomicBool::new(false)),
         })
     }
 
     async fn close(mut self) -> Result<(), BrowserError> {
+        let credential_sync = self.synchronize_virtual_credentials().await;
+        let host_passkey_shutdown = match self.host_passkey_broker.take() {
+            Some(mut broker) => broker.close().await,
+            None => Ok(()),
+        };
+        self.network_observer.abort();
         for task in &self.browser_tasks {
             task.abort();
         }
         for task in &self.page_tasks {
             task.abort();
         }
-        close_chromium(&mut self.browser, &self.handler).await
+        let close = close_chromium(&mut self.browser, &self.handler).await;
+        credential_sync?;
+        host_passkey_shutdown?;
+        close
     }
 
-    async fn refresh_remote_cookies(
-        &mut self,
-        runtime_dir: &Path,
-        brave_session: &BraveSession,
-    ) -> Result<(), BrowserError> {
-        let cookies = export_profile_cookies(runtime_dir, brave_session).await?;
-        trace_serialized("session.refreshed_brave_cookies", &cookies);
-        replace_browser_cookies(&self.browser, cookies).await?;
+    fn driver_finished(&self) -> bool {
+        self.handler.is_finished() || self.network_observer.is_finished()
+    }
+
+    fn unusable(&self) -> bool {
+        self.driver_finished() || self.poisoned.load(Ordering::Acquire)
+    }
+
+    async fn discard(mut self) -> Result<(), BrowserError> {
+        self.handler.abort();
+        self.network_observer.abort();
+        for task in &self.browser_tasks {
+            task.abort();
+        }
+        for task in &self.page_tasks {
+            task.abort();
+        }
+        match timeout(SESSION_DISCARD_TIMEOUT, self.browser.kill()).await {
+            Ok(Some(result)) => result?,
+            Ok(None) => {}
+            Err(_) => {
+                warn!(
+                    target: "nanocodex_browser",
+                    timeout_ms = SESSION_DISCARD_TIMEOUT.as_millis(),
+                    "timed out killing a discarded browser session"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1025,6 +1415,8 @@ impl Session {
                 .cloned()
         });
         page.close().await?;
+        self.authenticators.remove(tab_id);
+        self.closed_targets.insert(tab_id.to_owned());
         if let Some(Some(replacement)) = replacement {
             replacement.bring_to_front().await?;
             self.activate_page(replacement).await?;
@@ -1213,7 +1605,8 @@ impl Session {
     }
 
     fn validate_navigation(&self, url: &Url) -> Result<(), BrowserError> {
-        if self.allowed_origins.is_empty()
+        if url.scheme() == "chrome-extension"
+            || self.allowed_origins.is_empty()
             || self
                 .allowed_origins
                 .iter()
@@ -1258,6 +1651,73 @@ impl Session {
             resolved.push(candidate.to_string_lossy().into_owned());
         }
         Ok(resolved)
+    }
+
+    async fn extension_directory(&self, path: PathBuf) -> Result<String, BrowserError> {
+        let root = self
+            .file_root
+            .as_ref()
+            .ok_or(BrowserError::FileRootNotConfigured)?;
+        resolve_extension_directory(root, path).await
+    }
+
+    async fn loaded_extension_id(&self, path: &str) -> Result<String, BrowserError> {
+        self.browser
+            .execute(GetExtensionsParams::default())
+            .await?
+            .result
+            .extensions
+            .into_iter()
+            .find(|extension| extension.path == path)
+            .map(|extension| extension.id)
+            .ok_or_else(|| BrowserError::ExtensionNotLoaded {
+                path: PathBuf::from(path),
+            })
+    }
+
+    async fn extension_tab_target(&self, page_target_id: &str) -> Result<String, BrowserError> {
+        let page = self
+            .browser
+            .pages()
+            .await?
+            .into_iter()
+            .find(|page| page.target_id().as_ref() == page_target_id)
+            .ok_or_else(|| BrowserError::UnknownTab {
+                tab_id: page_target_id.to_owned(),
+            })?;
+        let url = page.url().await?.unwrap_or_default();
+        let title = page.get_title().await?.unwrap_or_default();
+        let tabs = self
+            .browser
+            .execute(
+                GetTargetsParams::builder()
+                    .filter(TargetFilter::new(vec![FilterEntry {
+                        exclude: Some(false),
+                        r#type: Some("tab".to_owned()),
+                    }]))
+                    .build(),
+            )
+            .await?;
+        let mut matches = tabs
+            .result
+            .target_infos
+            .into_iter()
+            .filter(|target| target.r#type == "tab" && target.url == url)
+            .collect::<Vec<_>>();
+        if matches.len() > 1 {
+            matches.retain(|target| target.title == title);
+        }
+        if matches.len() > 1 {
+            return Err(BrowserError::ExtensionTabTargetAmbiguous {
+                tab_id: page_target_id.to_owned(),
+            });
+        }
+        let target = matches
+            .pop()
+            .ok_or_else(|| BrowserError::ExtensionTabTargetUnavailable {
+                tab_id: page_target_id.to_owned(),
+            })?;
+        Ok(target.target_id.as_ref().to_owned())
     }
 
     #[allow(
@@ -1479,10 +1939,20 @@ impl Session {
             return Ok(());
         }
 
-        let mut pages = vec![self.page.clone()];
         let targets = self.browser.execute(GetTargetsParams::default()).await?;
+        let reported_targets = targets
+            .target_infos
+            .iter()
+            .map(|target| target.target_id.as_ref())
+            .collect::<HashSet<_>>();
+        self.closed_targets
+            .retain(|target_id| reported_targets.contains(target_id.as_str()));
+        let mut pages = Vec::new();
         for target in &targets.target_infos {
-            if target.r#type != "iframe" {
+            if !matches!(target.r#type.as_str(), "page" | "iframe") {
+                continue;
+            }
+            if self.closed_targets.contains(target.target_id.as_ref()) {
                 continue;
             }
             match self.browser.get_page(target.target_id.clone()).await {
@@ -1504,14 +1974,120 @@ impl Session {
             if self.authenticators.contains_key(&target_id) {
                 continue;
             }
-            let id = install_virtual_authenticator(&page).await?;
+            let credentials = self
+                .selected_virtual_credentials()
+                .into_values()
+                .collect::<Vec<_>>();
+            let id = install_virtual_authenticator(&page, &credentials).await?;
             self.authenticators
                 .insert(target_id, InstalledAuthenticator { page, id });
         }
         Ok(())
     }
 
+    async fn synchronize_virtual_credentials(&mut self) -> Result<(), BrowserError> {
+        if self.virtual_credential_store.is_none() {
+            return Ok(());
+        }
+        if self.authenticators.is_empty() {
+            return Ok(());
+        }
+        let presented = self
+            .selected_virtual_credentials()
+            .into_keys()
+            .collect::<BTreeSet<_>>();
+        let mut authenticators = self
+            .authenticators
+            .values()
+            .map(|authenticator| (authenticator.page.clone(), authenticator.id.clone()))
+            .collect::<Vec<_>>();
+        authenticators.sort_unstable_by(|left, right| {
+            left.0
+                .target_id()
+                .as_ref()
+                .cmp(right.0.target_id().as_ref())
+        });
+        let mut snapshots = Vec::with_capacity(authenticators.len());
+        for (page, id) in &authenticators {
+            snapshots.push(
+                page.execute(GetCredentialsParams::new(id.clone()))
+                    .await?
+                    .credentials
+                    .clone(),
+            );
+        }
+        self.virtual_credential_store
+            .as_mut()
+            .ok_or(BrowserError::VirtualCredentialStoreNotConfigured)?
+            .reconcile(&snapshots, &presented)?;
+        let expected = self.selected_virtual_credentials();
+        synchronize_authenticator_snapshots(authenticators, snapshots, &expected).await
+    }
+
+    async fn apply_passkey_mode(&self) -> Result<(), BrowserError> {
+        let mut authenticators = self
+            .authenticators
+            .values()
+            .map(|authenticator| (authenticator.page.clone(), authenticator.id.clone()))
+            .collect::<Vec<_>>();
+        authenticators.sort_unstable_by(|left, right| {
+            left.0
+                .target_id()
+                .as_ref()
+                .cmp(right.0.target_id().as_ref())
+        });
+        let mut snapshots = Vec::with_capacity(authenticators.len());
+        for (page, id) in &authenticators {
+            snapshots.push(
+                page.execute(GetCredentialsParams::new(id.clone()))
+                    .await?
+                    .credentials
+                    .clone(),
+            );
+        }
+        let expected = self.selected_virtual_credentials();
+        synchronize_authenticator_snapshots(authenticators, snapshots, &expected).await
+    }
+
+    fn selected_virtual_credentials(&self) -> BTreeMap<(String, String), Credential> {
+        let Some(store) = self.virtual_credential_store.as_ref() else {
+            return BTreeMap::new();
+        };
+        let mut credentials = store.snapshot();
+        match &self.passkey_mode {
+            BrowserPasskeyMode::Auto => {}
+            BrowserPasskeyMode::New => credentials.clear(),
+            BrowserPasskeyMode::Use {
+                credential_id,
+                relying_party_id,
+            } => credentials.retain(|(candidate_rp, candidate_id), _| {
+                candidate_id == credential_id
+                    && relying_party_id
+                        .as_ref()
+                        .is_none_or(|selected_rp| selected_rp == candidate_rp)
+            }),
+        }
+        credentials
+    }
+
+    fn persisted_virtual_credentials(&self) -> Result<Vec<VirtualCredential>, BrowserError> {
+        if self.virtual_authenticator.is_none() {
+            return Err(BrowserError::VirtualAuthenticatorNotConfigured);
+        }
+        let store = self
+            .virtual_credential_store
+            .as_ref()
+            .ok_or(BrowserError::VirtualCredentialStoreNotConfigured)?;
+        Ok(store
+            .credentials()
+            .map(virtual_credential_metadata)
+            .collect())
+    }
+
     async fn virtual_credentials(&self) -> Result<Vec<VirtualCredential>, BrowserError> {
+        if self.virtual_credential_store.is_some() {
+            return self.persisted_virtual_credentials();
+        }
         if self.virtual_authenticator.is_none() {
             return Err(BrowserError::VirtualAuthenticatorNotConfigured);
         }
@@ -1524,22 +2100,272 @@ impl Session {
                 .page
                 .execute(GetCredentialsParams::new(authenticator.id.clone()))
                 .await?;
-            credentials.extend(
-                response
-                    .credentials
-                    .iter()
-                    .map(|credential| VirtualCredential {
-                        credential_id: String::from(credential.credential_id.clone()),
-                        relying_party_id: credential.rp_id.clone(),
-                        is_resident: credential.is_resident_credential,
-                        user_name: credential.user_name.clone(),
-                        user_display_name: credential.user_display_name.clone(),
-                        sign_count: credential.sign_count,
-                    }),
-            );
+            credentials.extend(response.credentials.iter().map(virtual_credential_metadata));
         }
         Ok(credentials)
     }
+
+    fn resolve_passkey_mode(
+        &self,
+        credential_id: String,
+        relying_party_id: Option<String>,
+    ) -> Result<BrowserPasskeyMode, BrowserError> {
+        let store = self
+            .virtual_credential_store
+            .as_ref()
+            .ok_or(BrowserError::VirtualCredentialStoreNotConfigured)?;
+        let mut matches = store.credentials().filter(|credential| {
+            String::from(credential.credential_id.clone()) == credential_id
+                && relying_party_id
+                    .as_ref()
+                    .is_none_or(|selected| credential.rp_id.as_ref() == Some(selected))
+        });
+        let selected = matches
+            .next()
+            .ok_or_else(|| BrowserError::UnknownVirtualCredential {
+                credential_id: credential_id.clone(),
+            })?;
+        if matches.next().is_some() {
+            return Err(BrowserError::AmbiguousVirtualCredential { credential_id });
+        }
+        Ok(BrowserPasskeyMode::Use {
+            credential_id,
+            relying_party_id: selected.rp_id.clone(),
+        })
+    }
+
+    fn passkeys_result(
+        &self,
+        sequence: u64,
+        action: BrowserActionName,
+    ) -> Result<BrowserActionResult, BrowserError> {
+        Ok(BrowserActionResult::Passkeys {
+            sequence,
+            executed: true,
+            action,
+            mode: self.passkey_mode.clone(),
+            credentials: self.persisted_virtual_credentials()?,
+        })
+    }
+
+    async fn start_host_passkey_authorization(&mut self) -> Result<(), BrowserError> {
+        let authenticator = self
+            .host_passkey_authenticator
+            .as_ref()
+            .ok_or(BrowserError::HostPasskeyAuthenticatorNotConfigured)?;
+        if self.host_passkey_broker.is_some() {
+            return Err(BrowserError::HostPasskeyAuthorizationActive);
+        }
+        let raw_url = self.page.url().await?.unwrap_or_default();
+        validate_url(&raw_url)?;
+        let url = Url::parse(&raw_url)?;
+        self.validate_navigation(&url)?;
+        let cookies = self
+            .browser
+            .get_cookies()
+            .await?
+            .into_iter()
+            .filter_map(cookie_param)
+            .collect();
+        self.host_passkey_broker = Some(
+            HostPasskeyBroker::launch(&self.output_dir, authenticator.executable(), url, cookies)
+                .await?,
+        );
+        Ok(())
+    }
+
+    async fn resume_host_passkey_authorization(&mut self) -> Result<(), BrowserError> {
+        let mut broker = self
+            .host_passkey_broker
+            .take()
+            .ok_or(BrowserError::HostPasskeyAuthorizationNotActive)?;
+        let cookies = broker
+            .browser
+            .get_cookies()
+            .await
+            .map_err(BrowserError::from)
+            .map(|cookies| {
+                cookies
+                    .into_iter()
+                    .filter_map(cookie_param)
+                    .collect::<Vec<_>>()
+            });
+        let return_url = broker
+            .page
+            .url()
+            .await
+            .map_err(BrowserError::from)
+            .map(|url| {
+                url.and_then(|url| Url::parse(&url).ok())
+                    .unwrap_or_else(|| broker.return_url.clone())
+            });
+        let shutdown = broker.close().await;
+        let cookies = cookies?;
+        let return_url = return_url?;
+        shutdown?;
+        self.validate_navigation(&return_url)?;
+        replace_browser_cookies(&self.browser, cookies).await?;
+        navigate(&self.page, return_url.as_str()).await?;
+        self.refs.clear();
+        Ok(())
+    }
+}
+
+impl HostPasskeyBroker {
+    #[cfg(target_os = "macos")]
+    async fn launch(
+        runtime_dir: &Path,
+        executable: &Path,
+        return_url: Url,
+        cookies: Vec<CookieParam>,
+    ) -> Result<Self, BrowserError> {
+        let application =
+            macos_application_bundle(executable).ok_or_else(|| BrowserError::Configuration {
+                message: format!(
+                    "host passkeys require a macOS application bundle; {} is not inside one",
+                    executable.display()
+                ),
+            })?;
+        let profile = tempfile::Builder::new()
+            .prefix("nanocodex-host-passkey-")
+            .tempdir_in(runtime_dir)?;
+        let mut command = tokio::process::Command::new("/usr/bin/open");
+        command
+            .args(host_passkey_broker_arguments(application, profile.path()))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut launcher = command.spawn()?;
+        let endpoint = wait_for_macos_broker_endpoint(profile.path(), &mut launcher).await?;
+        let (browser, mut events) = Chromium::connect(endpoint.as_str()).await?;
+        let handler = tokio::spawn(async move {
+            while let Some(event) = events.next().await {
+                if let Err(error) = event {
+                    warn!(
+                        target: "nanocodex_browser",
+                        %error,
+                        "host passkey broker handler stopped"
+                    );
+                    break;
+                }
+            }
+        });
+        replace_browser_cookies(&browser, cookies).await?;
+        let page = match browser.pages().await?.into_iter().next() {
+            Some(page) => page,
+            None => browser.new_page("about:blank").await?,
+        };
+        navigate(&page, return_url.as_str()).await?;
+        info!(
+            target: "nanocodex_browser",
+            url = return_url.as_str(),
+            "opened isolated browser for host passkey authorization"
+        );
+        Ok(Self {
+            browser,
+            page,
+            handler,
+            launcher,
+            _profile: profile,
+            return_url,
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    async fn launch(
+        _runtime_dir: &Path,
+        _executable: &Path,
+        _return_url: Url,
+        _cookies: Vec<CookieParam>,
+    ) -> Result<Self, BrowserError> {
+        Err(BrowserError::HostPasskeyAuthenticatorUnsupported)
+    }
+
+    async fn close(&mut self) -> Result<(), BrowserError> {
+        let close = self
+            .browser
+            .close()
+            .await
+            .map(drop)
+            .map_err(BrowserError::from);
+        self.handler.abort();
+        let launcher_shutdown = match timeout(SESSION_DISCARD_TIMEOUT, self.launcher.wait()).await {
+            Ok(result) => result.map(drop).map_err(BrowserError::from),
+            Err(_) => {
+                self.launcher.kill().await?;
+                self.launcher.wait().await?;
+                Ok(())
+            }
+        };
+        close?;
+        launcher_shutdown
+    }
+}
+
+fn virtual_credential_metadata(credential: &Credential) -> VirtualCredential {
+    VirtualCredential {
+        credential_id: String::from(credential.credential_id.clone()),
+        relying_party_id: credential.rp_id.clone(),
+        is_resident: credential.is_resident_credential,
+        user_name: credential.user_name.clone(),
+        user_display_name: credential.user_display_name.clone(),
+        sign_count: credential.sign_count,
+    }
+}
+
+async fn synchronize_authenticator_snapshots(
+    authenticators: Vec<(Page, AuthenticatorId)>,
+    snapshots: Vec<Vec<Credential>>,
+    expected: &BTreeMap<(String, String), Credential>,
+) -> Result<(), BrowserError> {
+    for ((page, authenticator_id), snapshot) in authenticators.into_iter().zip(snapshots) {
+        let current = snapshot
+            .into_iter()
+            .filter_map(|credential| {
+                let relying_party = credential.rp_id.clone()?;
+                let key = (
+                    relying_party,
+                    String::from(credential.credential_id.clone()),
+                );
+                Some((key, credential))
+            })
+            .collect::<BTreeMap<_, _>>();
+        for (key, credential) in &current {
+            if !expected.contains_key(key) {
+                page.execute(RemoveCredentialParams::new(
+                    authenticator_id.clone(),
+                    credential.credential_id.clone(),
+                ))
+                .await?;
+            }
+        }
+        for (key, credential) in expected {
+            match current.get(key) {
+                Some(current) if current == credential => {}
+                Some(current) => {
+                    page.execute(RemoveCredentialParams::new(
+                        authenticator_id.clone(),
+                        current.credential_id.clone(),
+                    ))
+                    .await?;
+                    page.execute(AddCredentialParams::new(
+                        authenticator_id.clone(),
+                        credential.clone(),
+                    ))
+                    .await?;
+                }
+                None => {
+                    page.execute(AddCredentialParams::new(
+                        authenticator_id.clone(),
+                        credential.clone(),
+                    ))
+                    .await?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_snapshot_wire(
@@ -1566,17 +2392,65 @@ async fn export_profile_cookies(
     runtime_dir: &Path,
     brave_session: &BraveSession,
 ) -> Result<Vec<CookieParam>, BrowserError> {
+    let (source_cookie_count, cookies) = export_profile_cookies_once(
+        runtime_dir,
+        brave_session,
+        CookieBrokerPresentation::Background,
+    )
+    .await?;
+    if source_cookie_count > 0
+        && cookies.is_empty()
+        && brave_session.cookie_authorization_policy() == BrowserCookieAuthorization::Interactive
+    {
+        warn!(
+            target: "nanocodex_browser",
+            source_cookie_count,
+            timeout_seconds = COOKIE_AUTHORIZATION_TIMEOUT.as_secs(),
+            "opening a visible temporary browser for cookie authorization"
+        );
+        let (interactive_source_count, cookies) = export_profile_cookies_once(
+            runtime_dir,
+            brave_session,
+            CookieBrokerPresentation::Interactive,
+        )
+        .await?;
+        return finish_profile_cookie_export(brave_session, interactive_source_count, cookies);
+    }
+    finish_profile_cookie_export(brave_session, source_cookie_count, cookies)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CookieBrokerPresentation {
+    Background,
+    Interactive,
+}
+
+async fn export_profile_cookies_once(
+    runtime_dir: &Path,
+    brave_session: &BraveSession,
+    presentation: CookieBrokerPresentation,
+) -> Result<(i64, Vec<Cookie>), BrowserError> {
     let broker_profile = tempfile::Builder::new()
         .prefix("brave-cookie-broker-")
         .tempdir_in(runtime_dir)?;
-    brave_session.prepare(broker_profile.path()).await?;
+    let source_cookie_count = brave_session.prepare(broker_profile.path()).await?;
 
-    let config = profile_launch_config(
-        BrowserConfig::builder()
-            .user_data_dir(broker_profile.path())
-            .new_headless_mode(),
-    )
-    .chrome_executable(brave_session.executable());
+    #[cfg(target_os = "macos")]
+    if presentation == CookieBrokerPresentation::Interactive {
+        let cookies = export_profile_cookies_interactive_macos(
+            broker_profile.path(),
+            brave_session.executable(),
+        )
+        .await?;
+        return Ok((source_cookie_count, cookies));
+    }
+
+    let config = BrowserConfig::builder().user_data_dir(broker_profile.path());
+    let config = match presentation {
+        CookieBrokerPresentation::Background => config.new_headless_mode(),
+        CookieBrokerPresentation::Interactive => config.with_head().window_size(960, 640),
+    };
+    let config = profile_launch_config(config).chrome_executable(brave_session.executable());
     let (mut browser, mut events) = Chromium::launch(build_config(config)?).await?;
     let handler = tokio::spawn(async move {
         while let Some(event) = events.next().await {
@@ -1591,17 +2465,221 @@ async fn export_profile_cookies(
         }
     });
 
-    let exported = browser.get_cookies().await.map_err(BrowserError::from);
+    let exported = match presentation {
+        CookieBrokerPresentation::Background => {
+            browser.get_cookies().await.map_err(BrowserError::from)
+        }
+        CookieBrokerPresentation::Interactive => timeout(COOKIE_AUTHORIZATION_TIMEOUT, async {
+            loop {
+                let cookies = browser.get_cookies().await?;
+                if !cookies.is_empty() {
+                    return Ok::<Vec<Cookie>, CdpError>(cookies);
+                }
+                tokio::time::sleep(COOKIE_AUTHORIZATION_POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .map_err(|_| BrowserError::ProfileCookieAuthorizationTimedOut {
+            seconds: COOKIE_AUTHORIZATION_TIMEOUT.as_secs(),
+        })?
+        .map_err(BrowserError::from),
+    };
     let shutdown = close_chromium(&mut browser, &handler).await;
     let cookies = exported?;
     shutdown?;
 
+    Ok((source_cookie_count, cookies))
+}
+
+#[cfg(target_os = "macos")]
+async fn export_profile_cookies_interactive_macos(
+    broker_profile: &Path,
+    executable: &Path,
+) -> Result<Vec<Cookie>, BrowserError> {
+    let application = macos_application_bundle(executable).ok_or_else(|| {
+        BrowserError::Configuration {
+            message: format!(
+                "interactive cookie authorization requires a macOS application bundle; {} is not inside one",
+                executable.display()
+            ),
+        }
+    })?;
+    let mut launcher = tokio::process::Command::new("/usr/bin/open")
+        .args(interactive_cookie_broker_arguments(
+            application,
+            broker_profile,
+        ))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+
+    let endpoint = timeout(BROWSER_LAUNCH_TIMEOUT, async {
+        let active_port = broker_profile.join("DevToolsActivePort");
+        loop {
+            if let Ok(contents) = tokio::fs::read_to_string(&active_port).await {
+                let port = contents
+                    .lines()
+                    .next()
+                    .and_then(|line| line.parse::<u16>().ok())
+                    .filter(|port| *port != 0)
+                    .ok_or_else(|| BrowserError::Configuration {
+                        message: format!(
+                            "interactive cookie broker wrote an invalid {}",
+                            active_port.display()
+                        ),
+                    })?;
+                return Ok(format!("http://127.0.0.1:{port}"));
+            }
+            if let Some(status) = launcher.try_wait()? {
+                return Err(BrowserError::Configuration {
+                    message: format!(
+                        "interactive cookie broker exited before DevTools was ready: {status}"
+                    ),
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .map_err(|_| BrowserError::Configuration {
+        message: format!(
+            "interactive cookie broker did not expose DevTools within {} seconds",
+            BROWSER_LAUNCH_TIMEOUT.as_secs()
+        ),
+    })??;
+
+    let (mut browser, mut events) = Chromium::connect(endpoint.as_str()).await?;
+    let handler = tokio::spawn(async move {
+        while let Some(event) = events.next().await {
+            if let Err(error) = event {
+                warn!(
+                    target: "nanocodex_browser",
+                    %error,
+                    "interactive cookie broker handler stopped"
+                );
+                break;
+            }
+        }
+    });
+    let exported = timeout(COOKIE_AUTHORIZATION_TIMEOUT, async {
+        loop {
+            let cookies = browser.get_cookies().await?;
+            if !cookies.is_empty() {
+                return Ok::<Vec<Cookie>, CdpError>(cookies);
+            }
+            tokio::time::sleep(COOKIE_AUTHORIZATION_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .map_err(|_| BrowserError::ProfileCookieAuthorizationTimedOut {
+        seconds: COOKIE_AUTHORIZATION_TIMEOUT.as_secs(),
+    })?
+    .map_err(BrowserError::from);
+    let close = browser.close().await.map(drop).map_err(BrowserError::from);
+    handler.abort();
+    let launcher_shutdown = match timeout(SESSION_DISCARD_TIMEOUT, launcher.wait()).await {
+        Ok(result) => result.map(drop).map_err(BrowserError::from),
+        Err(_) => {
+            launcher.kill().await?;
+            launcher.wait().await?;
+            Ok(())
+        }
+    };
+    let cookies = exported?;
+    close?;
+    launcher_shutdown?;
+    Ok(cookies)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_application_bundle(executable: &Path) -> Option<&Path> {
+    executable
+        .ancestors()
+        .find(|path| path.extension().is_some_and(|extension| extension == "app"))
+}
+
+#[cfg(target_os = "macos")]
+fn interactive_cookie_broker_arguments(
+    application: &Path,
+    broker_profile: &Path,
+) -> Vec<std::ffi::OsString> {
+    [
+        "-n".into(),
+        "-W".into(),
+        "-a".into(),
+        application.as_os_str().to_owned(),
+        "--args".into(),
+        format!("--user-data-dir={}", broker_profile.display()).into(),
+        "--profile-directory=Default".into(),
+        "--remote-debugging-port=0".into(),
+        "--no-first-run".into(),
+        "about:blank".into(),
+    ]
+    .into()
+}
+
+#[cfg(target_os = "macos")]
+fn host_passkey_broker_arguments(
+    application: &Path,
+    broker_profile: &Path,
+) -> Vec<std::ffi::OsString> {
+    interactive_cookie_broker_arguments(application, broker_profile)
+}
+
+#[cfg(target_os = "macos")]
+async fn wait_for_macos_broker_endpoint(
+    broker_profile: &Path,
+    launcher: &mut tokio::process::Child,
+) -> Result<String, BrowserError> {
+    timeout(BROWSER_LAUNCH_TIMEOUT, async {
+        let active_port = broker_profile.join("DevToolsActivePort");
+        loop {
+            if let Ok(contents) = tokio::fs::read_to_string(&active_port).await {
+                let port = contents
+                    .lines()
+                    .next()
+                    .and_then(|line| line.parse::<u16>().ok())
+                    .filter(|port| *port != 0)
+                    .ok_or_else(|| BrowserError::Configuration {
+                        message: format!("browser wrote an invalid {}", active_port.display()),
+                    })?;
+                return Ok(format!("http://127.0.0.1:{port}"));
+            }
+            if let Some(status) = launcher.try_wait()? {
+                return Err(BrowserError::Configuration {
+                    message: format!("browser exited before DevTools was ready: {status}"),
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .map_err(|_| BrowserError::Configuration {
+        message: format!(
+            "browser did not expose DevTools within {} seconds",
+            BROWSER_LAUNCH_TIMEOUT.as_secs()
+        ),
+    })?
+}
+
+fn finish_profile_cookie_export(
+    brave_session: &BraveSession,
+    source_cookie_count: i64,
+    cookies: Vec<Cookie>,
+) -> Result<Vec<CookieParam>, BrowserError> {
     let cookies = allowed_cookie_params(
         cookies,
         (!brave_session.copies_all_cookies()).then(|| brave_session.allowed_origins()),
     );
+    if source_cookie_count > 0 && cookies.is_empty() {
+        return Err(BrowserError::ProfileCookieExportUnavailable {
+            source_cookie_count,
+        });
+    }
     info!(
         target: "nanocodex_browser",
+        source_cookie_count,
         browser_cookie_count = cookies.len(),
         browser_cookie_origin_count = brave_session.allowed_origins().len(),
         browser_cookie_all_origins = brave_session.copies_all_cookies(),
@@ -1698,7 +2776,10 @@ async fn close_chromium(
     wait
 }
 
-async fn install_virtual_authenticator(page: &Page) -> Result<AuthenticatorId, BrowserError> {
+async fn install_virtual_authenticator(
+    page: &Page,
+    credentials: &[Credential],
+) -> Result<AuthenticatorId, BrowserError> {
     page.execute(EnableParams::builder().enable_ui(false).build())
         .await?;
     let mut options = VirtualAuthenticatorOptions::new(
@@ -1712,6 +2793,13 @@ async fn install_virtual_authenticator(page: &Page) -> Result<AuthenticatorId, B
     let response = page
         .execute(AddVirtualAuthenticatorParams::new(options))
         .await?;
+    for credential in credentials {
+        page.execute(AddCredentialParams::new(
+            response.authenticator_id.clone(),
+            credential.clone(),
+        ))
+        .await?;
+    }
     Ok(response.authenticator_id.clone())
 }
 
@@ -1732,13 +2820,27 @@ async fn apply_browser_context(
     context: &BrowserContext,
 ) -> Result<(), BrowserError> {
     if let Some(viewport) = context.viewport {
-        page.execute(SetDeviceMetricsOverrideParams::new(
+        let mut metrics = SetDeviceMetricsOverrideParams::new(
             i64::from(viewport.width),
             i64::from(viewport.height),
             viewport.device_scale_factor,
             viewport.mobile,
-        ))
-        .await?;
+        );
+        metrics.screen_width = Some(i64::from(viewport.width));
+        metrics.screen_height = Some(i64::from(viewport.height));
+        metrics.screen_orientation = Some(ScreenOrientation {
+            r#type: if viewport.width <= viewport.height {
+                ScreenOrientationType::PortraitPrimary
+            } else {
+                ScreenOrientationType::LandscapePrimary
+            },
+            angle: if viewport.width <= viewport.height {
+                0
+            } else {
+                90
+            },
+        });
+        page.execute(metrics).await?;
         let mut touch = SetTouchEmulationEnabledParams::new(viewport.touch);
         if viewport.touch {
             touch.max_touch_points = Some(i64::from(viewport.max_touch_points));
@@ -1778,6 +2880,9 @@ async fn apply_browser_context(
         params.accept_language = accept_language.cloned();
         params.platform.clone_from(&context.platform);
         page.execute(params).await?;
+        if let Some(platform) = &context.platform {
+            override_navigator_platform(page, platform).await?;
+        }
     }
 
     let mut media_features = Vec::with_capacity(2);
@@ -2049,6 +3154,178 @@ impl Drop for NativeBrowser {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn preferred_automation_executable(
+    explicit: Option<PathBuf>,
+) -> Result<Option<PathBuf>, BrowserBuildError> {
+    if let Some(executable) = explicit {
+        return Ok(Some(executable));
+    }
+    if let Some(executable) = headless_shell_on_path().or_else(cached_headless_shell) {
+        info!(
+            target: "nanocodex_browser",
+            path = %executable.display(),
+            "selected headless shell to avoid macOS browser-profile services"
+        );
+        return Ok(Some(executable));
+    }
+    if let Some(executable) = chrome_for_testing_on_path()
+        .or_else(installed_chrome_for_testing)
+        .or_else(cached_chrome_for_testing)
+    {
+        info!(
+            target: "nanocodex_browser",
+            path = %executable.display(),
+            "selected Chrome for Testing for the private browser session"
+        );
+        return Ok(Some(executable));
+    }
+    Err(BrowserBuildError::Configuration {
+        message: "a private browser on macOS requires chrome-headless-shell or Chrome for Testing; install one or use `BrowserBuilder::executable` for a deliberate override".to_owned(),
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn preferred_automation_executable(
+    explicit: Option<PathBuf>,
+) -> Result<Option<PathBuf>, BrowserBuildError> {
+    Ok(explicit)
+}
+
+#[cfg(target_os = "macos")]
+fn chrome_for_testing_on_path() -> Option<PathBuf> {
+    executable_on_path(&["google-chrome-for-testing", "chrome-for-testing"])
+}
+
+#[cfg(target_os = "macos")]
+fn headless_shell_on_path() -> Option<PathBuf> {
+    executable_on_path(&["chrome-headless-shell", "headless_shell"])
+}
+
+#[cfg(target_os = "macos")]
+fn executable_on_path(names: &[&str]) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for directory in std::env::split_paths(&path) {
+        for name in names {
+            let candidate = directory.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn installed_chrome_for_testing() -> Option<PathBuf> {
+    let relative =
+        Path::new("Google Chrome for Testing.app").join("Contents/MacOS/Google Chrome for Testing");
+    let system = Path::new("/Applications").join(&relative);
+    if system.is_file() {
+        return Some(system);
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join("Applications").join(relative))
+        .filter(|candidate| candidate.is_file())
+}
+
+#[cfg(target_os = "macos")]
+fn cached_chrome_for_testing() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let agent_browser = home.as_ref().and_then(|home| {
+        latest_versioned_executable(
+            &home.join(".agent-browser/browsers"),
+            "chrome-",
+            &["Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"],
+        )
+    });
+    if agent_browser.is_some() {
+        return agent_browser;
+    }
+
+    let mut playwright_roots = Vec::new();
+    if let Some(root) = std::env::var_os("PLAYWRIGHT_BROWSERS_PATH")
+        && root != "0"
+    {
+        playwright_roots.push(PathBuf::from(root));
+    }
+    if let Some(home) = home {
+        playwright_roots.push(home.join("Library/Caches/ms-playwright"));
+        playwright_roots.push(home.join(".cache/ms-playwright"));
+    }
+    playwright_roots.into_iter().find_map(|root| {
+        latest_versioned_executable(
+            &root,
+            "chromium-",
+            &[
+                "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                "chrome-mac-x64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+            ],
+        )
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn latest_versioned_executable(
+    root: &Path,
+    prefix: &str,
+    relative_candidates: &[&str],
+) -> Option<PathBuf> {
+    let mut installations = std::fs::read_dir(root)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let version = numeric_version(name.to_str()?, prefix)?;
+            relative_candidates
+                .iter()
+                .map(|relative| entry.path().join(relative))
+                .find(|candidate| candidate.is_file())
+                .map(|executable| (version, executable))
+        })
+        .collect::<Vec<_>>();
+    installations.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    installations.pop().map(|(_, executable)| executable)
+}
+
+#[cfg(target_os = "macos")]
+fn numeric_version(name: &str, prefix: &str) -> Option<Vec<u64>> {
+    let version = name.strip_prefix(prefix)?;
+    if version.is_empty() {
+        return None;
+    }
+    version
+        .split('.')
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()
+}
+
+#[cfg(target_os = "macos")]
+fn cached_headless_shell() -> Option<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(root) = std::env::var_os("PLAYWRIGHT_BROWSERS_PATH")
+        && root != "0"
+    {
+        roots.push(PathBuf::from(root));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        roots.push(PathBuf::from(&home).join("Library/Caches/ms-playwright"));
+        roots.push(PathBuf::from(home).join(".cache/ms-playwright"));
+    }
+    roots.into_iter().find_map(|root| {
+        latest_versioned_executable(
+            &root,
+            "chromium_headless_shell-",
+            &[
+                "chrome-headless-shell-mac-arm64/chrome-headless-shell",
+                "chrome-headless-shell-mac-x64/chrome-headless-shell",
+            ],
+        )
+    })
+}
+
 impl NativeBrowser {
     #[allow(
         clippy::too_many_arguments,
@@ -2057,9 +3334,11 @@ impl NativeBrowser {
     pub(crate) fn new(
         executable: Option<PathBuf>,
         cdp_endpoint: Option<Url>,
+        persistent_profile: Option<PathBuf>,
         brave_session: Option<BraveSession>,
         launch_brave_executable: bool,
         virtual_authenticator: Option<VirtualAuthenticator>,
+        host_passkey_authenticator: Option<HostPasskeyAuthenticator>,
         react_diagnostics: Option<ReactDiagnostics>,
         egress_policy: Option<BrowserEgressPolicy>,
         file_root: Option<PathBuf>,
@@ -2070,15 +3349,18 @@ impl NativeBrowser {
         lighthouse_executable: Option<PathBuf>,
         crux_client: Option<BrowserCruxClient>,
     ) -> Result<Arc<Self>, BrowserBuildError> {
+        let executable = preferred_automation_executable(executable)?;
         Ok(Arc::new(Self {
             runtime_dir: tempfile::Builder::new()
                 .prefix("nanocodex-browser-")
                 .tempdir()?,
             executable,
             cdp_endpoint,
+            persistent_profile,
             brave_session,
             launch_brave_executable,
             virtual_authenticator,
+            host_passkey_authenticator,
             react_diagnostics,
             egress_policy,
             file_root,
@@ -2122,11 +3404,25 @@ impl NativeBrowser {
             if state.closed {
                 return Err(BrowserError::Closed);
             }
+            if let BrowserAction::LoadExtension { path } = &action {
+                let root = self
+                    .file_root
+                    .as_ref()
+                    .ok_or(BrowserError::FileRootNotConfigured)?;
+                let path = resolve_extension_directory(root, path.clone()).await?;
+                if !state.extension_paths.contains(&path) {
+                    if let Some(session) = state.session.take() {
+                        session.close().await?;
+                    }
+                    state.extension_paths.push(path);
+                }
+            }
             self.ensure_session(&mut state).await?;
             let session = state
                 .session
                 .as_mut()
                 .ok_or(BrowserError::SessionUnavailable)?;
+            let mut action_lease = ActionLease::new(Arc::clone(&session.poisoned));
             if !matches!(&action, BrowserAction::Open { .. }) {
                 session.sync_virtual_authenticators().await?;
             }
@@ -2157,6 +3453,13 @@ impl NativeBrowser {
                 Ok::<_, BrowserError>(result)
             }
             .await;
+            let execution = match execution {
+                Ok(result) => session
+                    .synchronize_virtual_credentials()
+                    .await
+                    .map(|()| result),
+                Err(error) => Err(error),
+            };
             let duration = started.elapsed();
             let result = match execution {
                 Ok(result) => {
@@ -2171,20 +3474,50 @@ impl NativeBrowser {
                             )
                             .await?;
                     }
+                    action_lease.complete();
                     result
                 }
                 Err(error) => {
-                    if let Some(trace) = session.action_trace.as_mut() {
-                        trace
-                            .record_failure(sequence, duration, trace_action, error.to_string())
-                            .await?;
-                    }
+                    let stopped = session_stopped(&error, session.driver_finished());
                     info!(
                         target: "nanocodex_browser",
                         sequence,
                         error = %error,
                         "browser action failed"
                     );
+                    if let Some(outcome_unknown) = stopped {
+                        if let Some(trace) = session.action_trace.as_mut()
+                            && let Err(trace_error) = trace
+                                .record_failure(sequence, duration, trace_action, error.to_string())
+                                .await
+                        {
+                            warn!(
+                                target: "nanocodex_browser",
+                                sequence,
+                                %trace_error,
+                                "failed to record a stopped browser action"
+                            );
+                        }
+                        let poisoned = state
+                            .session
+                            .take()
+                            .ok_or(BrowserError::SessionUnavailable)?;
+                        if let Err(discard_error) = poisoned.discard().await {
+                            warn!(
+                                target: "nanocodex_browser",
+                                sequence,
+                                %discard_error,
+                                "failed to clean up a stopped browser session"
+                            );
+                        }
+                        return Err(BrowserError::SessionStopped { outcome_unknown });
+                    }
+                    if let Some(trace) = session.action_trace.as_mut() {
+                        trace
+                            .record_failure(sequence, duration, trace_action, error.to_string())
+                            .await?;
+                    }
+                    action_lease.complete();
                     return Err(error);
                 }
             };
@@ -2261,8 +3594,25 @@ impl NativeBrowser {
     }
 
     async fn ensure_session(&self, state: &mut BrowserState) -> Result<(), BrowserError> {
+        if state.session.as_ref().is_some_and(Session::unusable) {
+            let session = state
+                .session
+                .take()
+                .ok_or(BrowserError::SessionUnavailable)?;
+            if let Err(error) = session.discard().await {
+                warn!(
+                    target: "nanocodex_browser",
+                    %error,
+                    "failed to clean up an unusable browser session"
+                );
+            }
+            warn!(
+                target: "nanocodex_browser",
+                "restarting unusable browser session"
+            );
+        }
         if state.session.is_none() {
-            state.session = Some(Session::launch(self).await?);
+            state.session = Some(Session::launch(self, &state.extension_paths).await?);
         }
         Ok(())
     }
@@ -2279,84 +3629,6 @@ impl NativeBrowser {
         Ok(())
     }
 
-    pub(crate) fn open_auth_handoff(&self, url: &Url) -> Result<(), BrowserError> {
-        let session = self
-            .brave_session
-            .as_ref()
-            .ok_or(BrowserError::BraveSessionNotConfigured)?;
-        session.open_handoff(url)?;
-        info!(
-            target: "nanocodex_browser",
-            url = url.as_str(),
-            "opened authentication handoff in ordinary Brave"
-        );
-        Ok(())
-    }
-
-    pub(crate) fn validate_auth_handoff(&self, url: &Url) -> Result<(), BrowserError> {
-        let session = self
-            .brave_session
-            .as_ref()
-            .ok_or(BrowserError::BraveSessionNotConfigured)?;
-        session.validate_handoff_url(url)?;
-        Ok(())
-    }
-
-    pub(crate) async fn resume_auth_handoff(&self, url: Url) -> Result<(), BrowserError> {
-        let span = info_span!(
-            target: "nanocodex_browser",
-            "browser.auth_handoff.resume"
-        );
-        async {
-            let mut state = self.state.lock().await;
-            if state.closed {
-                return Err(BrowserError::Closed);
-            }
-            let brave_session = self
-                .brave_session
-                .as_ref()
-                .ok_or(BrowserError::BraveSessionNotConfigured)?;
-            brave_session.validate_handoff_url(&url)?;
-            if self.cdp_endpoint.is_some() {
-                if let Some(session) = state.session.as_mut() {
-                    session
-                        .refresh_remote_cookies(self.runtime_dir.path(), brave_session)
-                        .await?;
-                } else {
-                    state.session = Some(Session::launch(self).await?);
-                }
-            } else {
-                if let Some(session) = state.session.take() {
-                    session.close().await?;
-                }
-                let profile = self.runtime_dir.path().join("profile");
-                match tokio::fs::remove_dir_all(&profile).await {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
-                }
-                state.session = Some(Session::launch(self).await?);
-            }
-            let session = state
-                .session
-                .as_mut()
-                .ok_or(BrowserError::SessionUnavailable)?;
-            validate_url(url.as_str())?;
-            session.validate_navigation(&url)?;
-            navigate(&session.page, url.as_str()).await?;
-            session.sync_virtual_authenticators().await?;
-            session.refs.clear();
-            info!(
-                target: "nanocodex_browser",
-                url = url.as_str(),
-                "resumed private headless browser after authentication handoff"
-            );
-            Ok(())
-        }
-        .instrument(span)
-        .await
-    }
-
     pub(crate) async fn virtual_credentials(&self) -> Result<Vec<VirtualCredential>, BrowserError> {
         let mut state = self.state.lock().await;
         if state.closed {
@@ -2367,7 +3639,21 @@ impl NativeBrowser {
             .as_mut()
             .ok_or(BrowserError::VirtualAuthenticatorNotReady)?;
         session.sync_virtual_authenticators().await?;
+        session.synchronize_virtual_credentials().await?;
         session.virtual_credentials().await
+    }
+}
+
+const fn session_stopped(error: &BrowserError, driver_finished: bool) -> Option<bool> {
+    match error {
+        BrowserError::Cdp(CdpError::ChannelSendError(ChannelError::Send(_))) => Some(false),
+        BrowserError::Cdp(CdpError::ChannelSendError(ChannelError::Canceled(_)))
+        | BrowserError::Cdp(CdpError::Timeout)
+        | BrowserError::NetworkObserver { .. }
+        | BrowserError::NavigationTimeout { .. }
+        | BrowserError::EvaluationTimeout { .. } => Some(true),
+        _ if driver_finished => Some(true),
+        _ => None,
     }
 }
 
@@ -2385,12 +3671,18 @@ async fn execute_action(
             validate_url(&url)?;
             session.validate_navigation(&Url::parse(&url)?)?;
             navigate(&session.page, &url).await?;
+            if let Some(platform) = &session.context.platform {
+                override_navigator_platform(&session.page, platform).await?;
+            }
             session.sync_virtual_authenticators().await?;
             session.refs.clear();
             Ok(action_result(sequence, BrowserActionName::Open))
         }
         BrowserAction::Reload => {
             reload(&session.page).await?;
+            if let Some(platform) = &session.context.platform {
+                override_navigator_platform(&session.page, platform).await?;
+            }
             session.sync_virtual_authenticators().await?;
             session.refs.clear();
             Ok(action_result(sequence, BrowserActionName::Reload))
@@ -2403,6 +3695,48 @@ async fn execute_action(
                 executed: true,
                 gate: classify_gate(&signals),
             })
+        }
+        BrowserAction::Passkeys => {
+            session.sync_virtual_authenticators().await?;
+            session.synchronize_virtual_credentials().await?;
+            session.passkeys_result(sequence, BrowserActionName::Passkeys)
+        }
+        BrowserAction::PasskeyUse {
+            credential_id,
+            relying_party_id,
+        } => {
+            session.sync_virtual_authenticators().await?;
+            session.synchronize_virtual_credentials().await?;
+            session.passkey_mode = session.resolve_passkey_mode(credential_id, relying_party_id)?;
+            session.apply_passkey_mode().await?;
+            session.passkeys_result(sequence, BrowserActionName::PasskeyUse)
+        }
+        BrowserAction::PasskeyNew => {
+            session.persisted_virtual_credentials()?;
+            session.sync_virtual_authenticators().await?;
+            session.synchronize_virtual_credentials().await?;
+            session.passkey_mode = BrowserPasskeyMode::New;
+            session.apply_passkey_mode().await?;
+            session.passkeys_result(sequence, BrowserActionName::PasskeyNew)
+        }
+        BrowserAction::PasskeyAuto => {
+            session.persisted_virtual_credentials()?;
+            session.sync_virtual_authenticators().await?;
+            session.synchronize_virtual_credentials().await?;
+            session.passkey_mode = BrowserPasskeyMode::Auto;
+            session.apply_passkey_mode().await?;
+            session.passkeys_result(sequence, BrowserActionName::PasskeyAuto)
+        }
+        BrowserAction::HostPasskeyStart => {
+            session.start_host_passkey_authorization().await?;
+            Ok(action_result(sequence, BrowserActionName::HostPasskeyStart))
+        }
+        BrowserAction::HostPasskeyResume => {
+            session.resume_host_passkey_authorization().await?;
+            Ok(action_result(
+                sequence,
+                BrowserActionName::HostPasskeyResume,
+            ))
         }
         BrowserAction::Snapshot {
             interactive,
@@ -2814,7 +4148,91 @@ return element.checked;"#
                     false,
                 ))
                 .await?;
+            session
+                .page
+                .execute(SetTouchEmulationEnabledParams::new(false))
+                .await?;
+            session.context.viewport = Some(BrowserViewport::desktop(width, height));
             Ok(action_result(sequence, BrowserActionName::SetViewport))
+        }
+        BrowserAction::SetDevice {
+            device,
+            orientation,
+        } => {
+            let descriptor = device.descriptor(orientation);
+            apply_device_profile(&session.page, &descriptor).await?;
+            session.context.viewport = Some(descriptor.viewport());
+            session.context.user_agent = Some(descriptor.user_agent);
+            session.context.platform = Some(descriptor.platform);
+            session.refs.clear();
+            Ok(action_result(sequence, BrowserActionName::SetDevice))
+        }
+        BrowserAction::MobileState => {
+            let state = read_mobile_state(&session.page, &session.context).await?;
+            Ok(BrowserActionResult::MobileState {
+                sequence,
+                executed: true,
+                state,
+            })
+        }
+        BrowserAction::MobileAudit {
+            devices,
+            orientations,
+            ready,
+        } => {
+            let devices = mobile_audit_devices(devices)?;
+            let orientations = mobile_audit_orientations(orientations)?;
+            let url = session.page.url().await?.unwrap_or_default();
+            if url.is_empty() || url == "about:blank" {
+                return Err(BrowserError::MobileAuditRequiresPage);
+            }
+            let mut samples = Vec::with_capacity(devices.len() * orientations.len());
+            for device in devices {
+                for orientation in orientations.iter().copied() {
+                    let descriptor = device.descriptor(orientation);
+                    apply_device_profile(&session.page, &descriptor).await?;
+                    session.context.viewport = Some(descriptor.viewport());
+                    session.context.user_agent = Some(descriptor.user_agent.clone());
+                    session.context.platform = Some(descriptor.platform.clone());
+                    reload(&session.page).await?;
+                    override_navigator_platform(&session.page, &descriptor.platform).await?;
+                    session.refs.clear();
+                    if let Some(ready) = ready.as_ref() {
+                        let target = session.target_for_wait(ready).await?;
+                        interaction::wait_for_selector(
+                            &session.page,
+                            &target,
+                            crate::BrowserWaitForSelectorState::Visible,
+                        )
+                        .await?;
+                    }
+                    samples.push(
+                        mobile_audit_sample(&session.page, descriptor, &session.context).await?,
+                    );
+                }
+            }
+            let error_count = samples
+                .iter()
+                .flat_map(|sample| &sample.findings)
+                .filter(|finding| finding.severity == BrowserMobileFindingSeverity::Error)
+                .count();
+            let warning_count = samples
+                .iter()
+                .flat_map(|sample| &sample.findings)
+                .filter(|finding| finding.severity == BrowserMobileFindingSeverity::Warning)
+                .count();
+            Ok(BrowserActionResult::MobileAudit {
+                sequence,
+                executed: true,
+                audit: BrowserMobileAudit {
+                    url,
+                    provider: "chromium_emulation".to_owned(),
+                    passed: error_count == 0,
+                    samples,
+                    error_count,
+                    warning_count,
+                },
+            })
         }
         BrowserAction::GoBack => {
             navigate_history(&session.page, -1).await?;
@@ -3844,11 +5262,39 @@ return {
         }),
         BrowserAction::SelectTab { tab_id } => {
             session.select_tab(&tab_id).await?;
+            session.sync_virtual_authenticators().await?;
             Ok(action_result(sequence, BrowserActionName::SelectTab))
         }
         BrowserAction::CloseTab { tab_id } => {
             session.close_tab(&tab_id).await?;
             Ok(action_result(sequence, BrowserActionName::CloseTab))
+        }
+        BrowserAction::LoadExtension { path } => {
+            let path = session.extension_directory(path).await?;
+            Ok(BrowserActionResult::Extension {
+                sequence,
+                executed: true,
+                extension_id: session.loaded_extension_id(&path).await?,
+            })
+        }
+        BrowserAction::TriggerExtensionAction {
+            extension_id,
+            tab_id,
+        } => {
+            let page_target_id =
+                tab_id.unwrap_or_else(|| session.page.target_id().as_ref().to_owned());
+            let target_id = session.extension_tab_target(&page_target_id).await?;
+            session
+                .browser
+                .execute(TriggerExtensionActionParams {
+                    id: extension_id,
+                    target_id,
+                })
+                .await?;
+            Ok(action_result(
+                sequence,
+                BrowserActionName::TriggerExtensionAction,
+            ))
         }
         BrowserAction::Dialog => {
             let dialog = session
@@ -4351,7 +5797,9 @@ fn decode_attributes(
         ));
     }
     attributes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             Ok((
                 snapshot_string(strings, pair[0])?.to_owned(),
@@ -5447,7 +6895,7 @@ return new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(
             reason: "element has an invalid rendered border box".to_owned(),
         });
     }
-    let mut points = coordinates.chunks_exact(2);
+    let mut points = coordinates.as_chunks::<2>().0.iter();
     let first = points.next().ok_or_else(|| BrowserError::Actionability {
         selector: target.query.display(),
         reason: "element has no rendered border box".to_owned(),
@@ -5730,7 +7178,9 @@ const fn requires_action_completion(action: BrowserActionName) -> bool {
             | BrowserActionName::SetChecked
             | BrowserActionName::Drag
             | BrowserActionName::UploadFiles
+            | BrowserActionName::TriggerExtensionAction
             | BrowserActionName::SetViewport
+            | BrowserActionName::SetDevice
             | BrowserActionName::GoBack
             | BrowserActionName::GoForward
             | BrowserActionName::HandleDialog
@@ -5842,17 +7292,46 @@ fn diagnostic_limit(limit: Option<u16>) -> usize {
 fn validate_url(value: &str) -> Result<(), BrowserError> {
     let url = Url::parse(value)?;
     match url.scheme() {
-        "http" | "https" | "data" | "about" => Ok(()),
+        "http" | "https" | "data" | "about" | "chrome-extension" => Ok(()),
         scheme => Err(BrowserError::UnsupportedUrlScheme {
             scheme: scheme.to_owned(),
         }),
     }
 }
 
+async fn resolve_extension_directory(root: &Path, path: PathBuf) -> Result<String, BrowserError> {
+    if path.is_absolute() {
+        return Err(BrowserError::FileOutsideRoot { path });
+    }
+    let candidate = tokio::fs::canonicalize(root.join(&path)).await?;
+    if !candidate.starts_with(root) {
+        return Err(BrowserError::FileOutsideRoot { path: candidate });
+    }
+    if !tokio::fs::metadata(&candidate).await?.is_dir() {
+        return Err(BrowserError::ExtensionDirectoryInvalid { path: candidate });
+    }
+    Ok(candidate.to_string_lossy().into_owned())
+}
+
 fn build_config(builder: BrowserConfigBuilder) -> Result<BrowserConfig, BrowserError> {
     builder
         .build()
         .map_err(|message| BrowserError::Configuration { message })
+}
+
+#[cfg(target_os = "macos")]
+fn isolated_launch_config(builder: BrowserConfigBuilder) -> BrowserConfigBuilder {
+    // Private automation must never wait for an interactive credential prompt
+    // before opening its DevTools socket. Spell out chromiumoxide's launch
+    // defaults so this invariant is independent from its default-argument set.
+    profile_launch_config(builder)
+        .arg(("password-store", "basic"))
+        .arg("use-mock-keychain")
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn isolated_launch_config(builder: BrowserConfigBuilder) -> BrowserConfigBuilder {
+    builder
 }
 
 fn profile_launch_config(builder: BrowserConfigBuilder) -> BrowserConfigBuilder {
@@ -6041,6 +7520,14 @@ pub enum BrowserError {
     BraveSession(#[from] BraveSessionError),
     #[error("browser configuration is invalid: {message}")]
     Configuration { message: String },
+    #[error(
+        "the source profile contains {source_cookie_count} selected cookies, but its browser exported none; unlock the source browser's credential storage and retry"
+    )]
+    ProfileCookieExportUnavailable { source_cookie_count: i64 },
+    #[error(
+        "interactive source-profile cookie authorization did not complete within {seconds} seconds"
+    )]
+    ProfileCookieAuthorizationTimedOut { seconds: u64 },
     #[error("browser action input is {bytes} bytes, above the {maximum}-byte limit")]
     ActionInputTooLarge { bytes: u64, maximum: u64 },
     #[error("browser action result is {bytes} bytes, above the {maximum}-byte limit")]
@@ -6079,6 +7566,10 @@ pub enum BrowserError {
     SessionUnavailable,
     #[error("browser session is closed")]
     Closed,
+    #[error(
+        "browser session became unusable during the action (the action may have executed: {outcome_unknown}); the session was discarded and the next action will start cleanly"
+    )]
+    SessionStopped { outcome_unknown: bool },
     #[error("browser diagnostics collector is unavailable")]
     DiagnosticsUnavailable,
     #[error("browser source-map registry is unavailable")]
@@ -6147,7 +7638,7 @@ pub enum BrowserError {
     UnknownTab { tab_id: String },
     #[error("the browser must retain at least one tab")]
     LastTab,
-    #[error("browser upload actions require a configured file root")]
+    #[error("browser filesystem actions require a configured file root")]
     FileRootNotConfigured,
     #[error("browser file path escapes the configured file root: {path:?}")]
     FileOutsideRoot { path: PathBuf },
@@ -6155,6 +7646,16 @@ pub enum BrowserError {
     UploadFileLimit { count: usize, maximum: usize },
     #[error("browser upload path is not a regular file: {path:?}")]
     UploadFileInvalid { path: PathBuf },
+    #[error("browser extension path is not a directory: {path:?}")]
+    ExtensionDirectoryInvalid { path: PathBuf },
+    #[error("Chrome did not load the unpacked extension at {path:?}")]
+    ExtensionNotLoaded { path: PathBuf },
+    #[error("Chrome did not expose an extension-action target for browser tab `{tab_id}`")]
+    ExtensionTabTargetUnavailable { tab_id: String },
+    #[error(
+        "Chrome exposed multiple extension-action targets for browser tab `{tab_id}`; select a tab with a unique URL and title"
+    )]
+    ExtensionTabTargetAmbiguous { tab_id: String },
     #[error("browser upload file {path:?} is {bytes} bytes, above the {maximum}-byte limit")]
     UploadFileTooLarge {
         path: PathBuf,
@@ -6254,10 +7755,26 @@ pub enum BrowserError {
     DialogNotPending,
     #[error("this browser was not configured with a virtual authenticator")]
     VirtualAuthenticatorNotConfigured,
-    #[error("this browser was not configured with an authenticated Brave session")]
-    BraveSessionNotConfigured,
+    #[error("model-controlled passkeys require a configured virtual credential store")]
+    VirtualCredentialStoreNotConfigured,
+    #[error("virtual credential `{credential_id}` is not present in the persisted store")]
+    UnknownVirtualCredential { credential_id: String },
+    #[error(
+        "virtual credential `{credential_id}` exists for multiple relying parties; provide relying_party_id"
+    )]
+    AmbiguousVirtualCredential { credential_id: String },
+    #[error("virtual credential store {} is invalid: {message}", path.display())]
+    VirtualCredentialStore { path: PathBuf, message: String },
     #[error("the virtual authenticator is not ready; navigate to a page first")]
     VirtualAuthenticatorNotReady,
+    #[error("this browser was not configured to use host passkeys")]
+    HostPasskeyAuthenticatorNotConfigured,
+    #[error("host passkeys are currently supported only on macOS")]
+    HostPasskeyAuthenticatorUnsupported,
+    #[error("a host passkey authorization browser is already open")]
+    HostPasskeyAuthorizationActive,
+    #[error("no host passkey authorization browser is open")]
+    HostPasskeyAuthorizationNotActive,
     #[error("selector `{selector}` was not found before the browser timeout")]
     SelectorTimeout { selector: String },
     #[error("selector `{selector}` did not reach state {state:?} before the browser timeout")]
@@ -6292,9 +7809,118 @@ pub enum BrowserError {
     NavigationTimeout { url: String, milliseconds: u128 },
     #[error("browser wait of {milliseconds}ms exceeds the maximum of {maximum}ms")]
     WaitTooLong { milliseconds: u64, maximum: u128 },
+    #[error("mobile audit requires an open page")]
+    MobileAuditRequiresPage,
+    #[error("mobile audit requested {count} devices; the maximum is {maximum}")]
+    TooManyMobileAuditDevices { count: usize, maximum: usize },
+    #[error("mobile audit requested {count} orientations; the maximum is 2")]
+    TooManyMobileAuditOrientations { count: usize },
     #[error("browser JavaScript evaluation exceeded the {maximum:?} deadline")]
     EvaluationTimeout { maximum: Duration },
 }
+
+const MOBILE_STATE_SCRIPT: &str = r#"function() {
+  const viewport = document.querySelector('meta[name="viewport" i]');
+  const ua = navigator.userAgent;
+  return {
+    url: location.href,
+    viewportWidth: window.innerWidth,
+    viewportHeight: window.innerHeight,
+    visualViewportWidth: window.visualViewport?.width ?? null,
+    visualViewportHeight: window.visualViewport?.height ?? null,
+    visualViewportScale: window.visualViewport?.scale ?? null,
+    screenWidth: window.screen.width,
+    screenHeight: window.screen.height,
+    devicePixelRatio: window.devicePixelRatio,
+    userAgent: ua,
+    platform: navigator.platform,
+    maxTouchPoints: navigator.maxTouchPoints || 0,
+    coarsePointer: matchMedia('(pointer: coarse)').matches,
+    noHover: matchMedia('(hover: none)').matches,
+    orientation: screen.orientation?.type || (innerWidth > innerHeight ? 'landscape' : 'portrait'),
+    metaViewport: viewport?.getAttribute('content') ?? null
+  };
+}"#;
+
+const MOBILE_AUDIT_SCRIPT: &str = r#"function() {
+  const findings = [];
+  const visible = element => {
+    const style = getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' &&
+      Number(style.opacity || 1) !== 0 && rect.width > 0 && rect.height > 0;
+  };
+  const selector = element => {
+    if (element.id) return `#${CSS.escape(element.id)}`;
+    const testId = element.getAttribute('data-testid');
+    if (testId) return `[data-testid="${CSS.escape(testId)}"]`;
+    const parts = [];
+    let current = element;
+    while (current && current.nodeType === 1 && parts.length < 4) {
+      let part = current.tagName.toLowerCase();
+      if (current.parentElement) {
+        const peers = Array.from(current.parentElement.children).filter(peer => peer.tagName === current.tagName);
+        if (peers.length > 1) part += `:nth-of-type(${peers.indexOf(current) + 1})`;
+      }
+      parts.unshift(part);
+      current = current.parentElement;
+    }
+    return parts.join(' > ');
+  };
+  const meta = document.querySelector('meta[name="viewport" i]');
+  if (!meta) findings.push({
+    rule: 'meta-viewport', severity: 'error',
+    message: 'Missing <meta name="viewport">; mobile layout will use a desktop-width viewport.',
+    selector: 'head', measuredWidth: null, measuredHeight: null
+  });
+  const root = document.documentElement;
+  const body = document.body;
+  const viewportWidth = window.visualViewport?.width ?? window.innerWidth;
+  const documentWidth = Math.max(root?.scrollWidth || 0, body?.scrollWidth || 0);
+  const overflow = Math.max(0, documentWidth - viewportWidth);
+  if (overflow > 1) findings.push({
+    rule: 'horizontal-overflow', severity: 'error',
+    message: `Document is ${Math.round(overflow)} CSS px wider than the viewport.`,
+    selector: 'html', measuredWidth: documentWidth, measuredHeight: null
+  });
+  const all = Array.from(document.querySelectorAll('body *')).filter(visible);
+  for (const element of all) {
+    if (findings.length >= 80) break;
+    const rect = element.getBoundingClientRect();
+    if (rect.right > viewportWidth + 1 && rect.left < viewportWidth && rect.width < documentWidth) {
+      findings.push({
+        rule: 'element-overflow', severity: 'warning',
+        message: 'Visible element extends beyond the right edge of the viewport.',
+        selector: selector(element), measuredWidth: rect.width, measuredHeight: rect.height
+      });
+    }
+  }
+  const interactiveSelector = 'a[href],button,input,select,textarea,[role="button"],[role="link"],[role="checkbox"],[role="radio"],[tabindex]';
+  const interactive = Array.from(document.querySelectorAll(interactiveSelector)).filter(visible);
+  for (const element of interactive) {
+    if (findings.length >= 80) break;
+    const rect = element.getBoundingClientRect();
+    if (rect.width < 44 || rect.height < 44) findings.push({
+      rule: 'touch-target-size', severity: 'warning',
+      message: `Interactive target is ${Math.round(rect.width)}x${Math.round(rect.height)} CSS px; expected at least 44x44.`,
+      selector: selector(element), measuredWidth: rect.width, measuredHeight: rect.height
+    });
+    if (element.matches('input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),textarea,select')) {
+      const fontSize = Number.parseFloat(getComputedStyle(element).fontSize);
+      if (fontSize < 16) findings.push({
+        rule: 'input-font-size', severity: 'warning',
+        message: `Editable control uses ${fontSize}px text; iOS may zoom the page on focus below 16px.`,
+        selector: selector(element), measuredWidth: rect.width, measuredHeight: rect.height
+      });
+    }
+  }
+  return {
+    documentWidth,
+    horizontalOverflow: overflow,
+    interactiveElements: interactive.length,
+    findings
+  };
+}"#;
 
 const DETECT_GATE_SCRIPT: &str = r#"function() {
   const visible = (element) => {
@@ -6547,23 +8173,33 @@ const REMOVE_ANNOTATIONS_SCRIPT: &str =
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex as StdMutex};
+    use std::time::Duration;
 
     use chromiumoxide::cdp::browser_protocol::network::{
         Cookie, CookieParam, CookiePriority, CookieSourceScheme, TimeSinceEpoch,
     };
     use futures_util::StreamExt;
+    use tokio::{io::AsyncReadExt, net::TcpListener};
 
+    #[cfg(target_os = "macos")]
+    use super::isolated_launch_config;
     use super::{
         BrowserConfig, Chromium, Diagnostics, GateSignals, MAX_ACTION_INPUT_BYTES,
         MAX_CONSOLE_ENTRIES, MAX_DIAGNOSTIC_TEXT_BYTES, MAX_NETWORK_REQUESTS, NetworkSource,
         allowed_cookie_params, build_config, classify_gate, close_chromium, cookie_param,
-        diagnostic_limit, profile_launch_config, trace_browser_configuration, validate_url,
+        diagnostic_limit, profile_launch_config, resolve_extension_directory, session_stopped,
+        trace_browser_configuration, validate_url,
     };
     use crate::{
         BraveSession, Browser, BrowserAction, BrowserActionResult, BrowserConsoleEntry,
         BrowserContext, BrowserCookie, BrowserCruxClient, BrowserError, BrowserGate,
-        BrowserNetworkRequest, BrowserOriginStorage, BrowserStorageState,
+        BrowserNetworkBodyKind, BrowserNetworkRequest, BrowserOriginStorage, BrowserStorageState,
+        BrowserTarget,
     };
+
+    type ExtensionSmokeResult = Result<(), Box<dyn std::error::Error>>;
+    type ExtensionSmokeFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = ExtensionSmokeResult>>>;
 
     #[derive(Clone, Default)]
     struct TraceLog(Arc<StdMutex<Vec<u8>>>);
@@ -6651,8 +8287,807 @@ mod tests {
         assert!(validate_url("http://127.0.0.1:3000").is_ok());
         assert!(validate_url("data:text/html,<h1>test</h1>").is_ok());
         assert!(validate_url("about:blank").is_ok());
+        assert!(validate_url("chrome://extensions").is_err());
+        assert!(validate_url("chrome-extension://abcdefghijklmnop/index.html").is_ok());
         assert!(validate_url("file:///etc/passwd").is_err());
         assert!(validate_url("/etc/passwd").is_err());
+    }
+
+    #[tokio::test]
+    async fn extension_directory_stays_beneath_the_configured_file_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let extension = root.path().join("extension");
+        std::fs::create_dir(&extension)?;
+        std::fs::write(extension.join("manifest.json"), "{}")?;
+        let canonical_root = std::fs::canonicalize(root.path())?;
+        let canonical_extension = std::fs::canonicalize(&extension)?;
+
+        let resolved = resolve_extension_directory(&canonical_root, "extension".into()).await?;
+        assert_eq!(std::path::Path::new(&resolved), canonical_extension);
+        assert!(matches!(
+            resolve_extension_directory(&canonical_root, "extension/manifest.json".into()).await,
+            Err(BrowserError::ExtensionDirectoryInvalid { .. })
+        ));
+        assert!(matches!(
+            resolve_extension_directory(&canonical_root, extension.clone()).await,
+            Err(BrowserError::FileOutsideRoot { .. })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a local Chrome or Chromium installation"]
+    async fn managed_browser_loads_and_triggers_an_unpackaged_extension()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let extension = root.path().join("extension");
+        std::fs::create_dir(&extension)?;
+        std::fs::write(
+            extension.join("manifest.json"),
+            r#"{
+                "manifest_version": 3,
+                "name": "Nanocodex managed-browser smoke",
+                "version": "0.0.1",
+                "action": {},
+                "background": { "service_worker": "background.js" }
+            }"#,
+        )?;
+        std::fs::write(
+            extension.join("background.js"),
+            "chrome.action.onClicked.addListener(() => {});",
+        )?;
+        std::fs::write(
+            extension.join("probe.html"),
+            "<!doctype html><title>Managed extension probe</title><h1>loaded</h1>",
+        )?;
+
+        let browser = Browser::builder().file_root(root.path()).build()?;
+        let result = browser
+            .execute(BrowserAction::LoadExtension {
+                path: "extension".into(),
+            })
+            .await?;
+        let BrowserActionResult::Extension { extension_id, .. } = result else {
+            return Err("load_extension returned the wrong result shape".into());
+        };
+        browser
+            .execute(BrowserAction::TriggerExtensionAction {
+                extension_id: extension_id.clone(),
+                tab_id: None,
+            })
+            .await?;
+        browser
+            .execute(BrowserAction::Open {
+                url: format!("chrome-extension://{extension_id}/probe.html"),
+            })
+            .await?;
+        let title = browser.execute(BrowserAction::GetTitle).await?;
+        assert!(matches!(
+            title,
+            BrowserActionResult::Title { title, .. } if title == "Managed extension probe"
+        ));
+        browser.close().await?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a local Chrome and NANOCODEX_BROWSER_EXTENSION_SMOKE_PATH"]
+    fn managed_browser_runs_a_configured_product_extension() -> ExtensionSmokeResult {
+        let outcome = std::thread::Builder::new()
+            .name("nanocodex-extension-smoke".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| error.to_string())?;
+                runtime
+                    .block_on(run_configured_product_extension_smoke())
+                    .map_err(|error| error.to_string())
+            })?
+            .join()
+            .map_err(|_| "extension smoke thread panicked")?;
+        outcome.map_err(Into::into)
+    }
+
+    fn run_configured_product_extension_smoke() -> ExtensionSmokeFuture {
+        Box::pin(async {
+            let extension = std::env::var_os("NANOCODEX_BROWSER_EXTENSION_SMOKE_PATH")
+                .ok_or("NANOCODEX_BROWSER_EXTENSION_SMOKE_PATH is not configured")?;
+            let source_extension = std::fs::canonicalize(extension)?;
+            let fixture_extension_root = tempfile::tempdir()?;
+            let extension = fixture_extension_root.path().join("extension");
+            copy_directory(&source_extension, &extension)?;
+            let permission = "http://127.0.0.1/*";
+            authorize_fixture_origin(&extension, permission)?;
+            let root = fixture_extension_root.path();
+            let relative = std::path::PathBuf::from("extension");
+            let fixture = TcpListener::bind(("127.0.0.1", 0)).await?;
+            let fixture_port = fixture.local_addr()?.port();
+            let fixture_task = tokio::spawn(serve_extension_cleanup_fixture(fixture));
+            let origin = format!("http://127.0.0.1:{fixture_port}");
+            let first_url = format!("{origin}/one");
+            let second_url = format!("{origin}/two");
+            let profile_root = tempfile::tempdir()?;
+            let profile = profile_root.path().join("chrome-profile");
+            let passkey_store = profile_root.path().join("passkeys.json");
+            let connect_smoke =
+                std::env::var_os("NANOCODEX_BROWSER_EXTENSION_CONNECT_SMOKE").is_some();
+
+            let mut first_builder = Browser::builder()
+                .file_root(root)
+                .persistent_profile(&profile);
+            if connect_smoke {
+                first_builder = first_builder.virtual_authenticator(
+                    crate::VirtualAuthenticator::platform_passkey()
+                        .credential_store(&passkey_store),
+                );
+            }
+            let first = first_builder.build()?;
+            let extension_id = load_product_extension(&first, relative.clone()).await?;
+            first
+                .execute(BrowserAction::Open {
+                    url: first_url.clone(),
+                })
+                .await?;
+            let first_tab = tab_for_url(&first, &first_url).await?;
+            first
+                .execute(BrowserAction::TriggerExtensionAction {
+                    extension_id: extension_id.clone(),
+                    tab_id: Some(first_tab.clone()),
+                })
+                .await?;
+
+            let sidepanel_url = format!("chrome-extension://{extension_id}/sidepanel.html");
+            first
+                .execute(BrowserAction::NewTab {
+                    url: Some(sidepanel_url.clone()),
+                })
+                .await?;
+            let sidepanel_tab = tab_for_url(&first, &sidepanel_url).await?;
+            if connect_smoke {
+                run_connect_popup_smoke(&first, &sidepanel_tab, true).await?;
+            }
+
+            let recipe = serde_json::json!({
+                "schema_version": 1,
+                "name": "Distraction-free torture fixture",
+                "css": "article { max-width: 42rem !important; margin-inline: auto !important; font-size: 18px !important; }",
+                "hide_selectors": ["#cookie-banner", "#newsletter-modal", ".ad-rail", ".recommendations", ".ticker"]
+            });
+            let flow = evaluate_json(
+            &first,
+            format!(
+                r#"(async () => {{
+                  const send = async (message) => {{
+                    const response = await chrome.runtime.sendMessage(message);
+                    if (response?.error) throw new Error(response.error);
+                    return response;
+                  }};
+                  const own = await chrome.tabs.getCurrent();
+                  const tabs = await chrome.tabs.query({{ url: {permission:?} }});
+                  const fixture = tabs.find((tab) => tab.url === {first_url:?});
+                  if (!own?.id || !fixture?.id) throw new Error('fixture or harness tab missing');
+                  await chrome.tabs.update(fixture.id, {{ active: true }});
+                  const claim = await send({{ type: 'page.claim' }});
+                  await chrome.tabs.update(own.id, {{ active: true }});
+                  const inspect = await send({{
+                    type: 'page.cleanup', lease_id: claim.lease_id,
+                    request_id: crypto.randomUUID(), input: {{ action: 'inspect' }}
+                  }});
+                  const preview = await send({{
+                    type: 'page.cleanup', lease_id: claim.lease_id,
+                    request_id: crypto.randomUUID(),
+                    input: {{ action: 'preview', document_revision: inspect.document_revision, recipe: {recipe} }}
+                  }});
+                  return {{
+                    lease_id: claim.lease_id,
+                    revision: inspect.document_revision,
+                    candidates: inspect.candidates.length,
+                    truncated: inspect.truncated,
+                    preview_id: preview.preview_id
+                  }};
+                }})()"#,
+                permission = permission,
+                first_url = first_url,
+                recipe = recipe,
+            ),
+        )
+        .await?;
+            let lease_id = flow["lease_id"]
+                .as_str()
+                .ok_or("cleanup flow did not return a lease")?
+                .to_owned();
+            let revision = flow["revision"]
+                .as_str()
+                .ok_or("cleanup flow did not return a document revision")?
+                .to_owned();
+            assert_eq!(flow["candidates"].as_u64(), Some(500));
+            assert_eq!(flow["truncated"].as_bool(), Some(true));
+            assert!(flow["preview_id"].as_str().is_some());
+
+            first
+                .execute(BrowserAction::SelectTab {
+                    tab_id: first_tab.clone(),
+                })
+                .await?;
+            assert_cleanup_state(&first, true, false).await?;
+
+            first
+                .execute(BrowserAction::SelectTab {
+                    tab_id: sidepanel_tab.clone(),
+                })
+                .await?;
+            evaluate_json(
+                &first,
+                format!(
+                    "chrome.runtime.sendMessage({{type:'preview.revert',lease_id:{lease_id:?}}})"
+                ),
+            )
+            .await?;
+            first
+                .execute(BrowserAction::SelectTab {
+                    tab_id: first_tab.clone(),
+                })
+                .await?;
+            assert_cleanup_state(&first, false, false).await?;
+
+            first
+                .execute(BrowserAction::SelectTab {
+                    tab_id: sidepanel_tab.clone(),
+                })
+                .await?;
+            evaluate_json(
+                &first,
+                format!(
+                    r#"chrome.runtime.sendMessage({{
+                  type:'page.cleanup', lease_id:{lease_id:?}, request_id:crypto.randomUUID(),
+                  input:{{action:'preview',document_revision:{revision:?},recipe:{recipe}}}
+                }})"#,
+                    lease_id = lease_id,
+                    revision = revision,
+                    recipe = recipe,
+                ),
+            )
+            .await?;
+            first
+                .execute(BrowserAction::NewTab {
+                    url: Some(second_url.clone()),
+                })
+                .await?;
+            let second_tab = tab_for_url(&first, &second_url).await?;
+            assert_cleanup_state(&first, false, false).await?;
+            first
+                .execute(BrowserAction::SelectTab {
+                    tab_id: sidepanel_tab.clone(),
+                })
+                .await?;
+            let kept = evaluate_json(
+            &first,
+            format!(
+                "chrome.runtime.sendMessage({{type:'recipe.keep',lease_id:{lease_id:?},origin:{origin:?}}})"
+            ),
+        )
+        .await?;
+            assert_eq!(kept["name"], "Distraction-free torture fixture");
+
+            for tab in [&first_tab, &second_tab] {
+                first
+                    .execute(BrowserAction::SelectTab {
+                        tab_id: tab.clone(),
+                    })
+                    .await?;
+                assert_cleanup_state(&first, false, true).await?;
+            }
+            first
+                .execute(BrowserAction::SelectTab { tab_id: first_tab })
+                .await?;
+            first.execute(BrowserAction::Reload).await?;
+            wait_for_persisted_recipe(&first).await?;
+            assert_cleanup_state(&first, false, true).await?;
+            assert_browser_diagnostics(&first).await?;
+            first.close().await?;
+
+            let mut second_builder = Browser::builder()
+                .file_root(root)
+                .persistent_profile(&profile);
+            if connect_smoke {
+                second_builder = second_builder.virtual_authenticator(
+                    crate::VirtualAuthenticator::platform_passkey()
+                        .credential_store(&passkey_store),
+                );
+            }
+            let second = second_builder.build()?;
+            let second_extension_id = load_product_extension(&second, relative.clone()).await?;
+            assert_eq!(second_extension_id, extension_id);
+            second
+                .execute(BrowserAction::Open {
+                    url: first_url.clone(),
+                })
+                .await?;
+            wait_for_persisted_recipe(&second).await?;
+            assert_cleanup_state(&second, false, true).await?;
+            let reopened_first_tab = tab_for_url(&second, &first_url).await?;
+            second
+                .execute(BrowserAction::NewTab {
+                    url: Some(second_url.clone()),
+                })
+                .await?;
+            wait_for_persisted_recipe(&second).await?;
+            assert_cleanup_state(&second, false, true).await?;
+            let reopened_second_tab = tab_for_url(&second, &second_url).await?;
+            second
+                .execute(BrowserAction::NewTab {
+                    url: Some(sidepanel_url.clone()),
+                })
+                .await?;
+            let reopened_sidepanel_tab = tab_for_url(&second, &sidepanel_url).await?;
+            if connect_smoke {
+                run_connect_popup_smoke(&second, &reopened_sidepanel_tab, false).await?;
+            }
+            second
+            .execute(BrowserAction::WaitForFunction {
+                expression: format!(
+                    "document.body.innerText.includes({origin:?}) && document.body.innerText.includes('Forget')"
+                ),
+            })
+            .await?;
+            let snapshot = second
+                .execute(BrowserAction::Snapshot {
+                    interactive: false,
+                    compact: true,
+                    depth: Some(12),
+                    selector: None,
+                    include_urls: false,
+                })
+                .await?;
+            assert!(matches!(
+                snapshot,
+                BrowserActionResult::Snapshot { snapshot, .. }
+                    if snapshot.contains("Saved sites")
+                        && snapshot.contains(&origin)
+                        && snapshot.contains("Forget")
+            ));
+            second
+                .execute(BrowserAction::Click {
+                    target: BrowserTarget::role("button").named("Forget"),
+                    options: None,
+                })
+                .await?;
+
+            for tab in [&reopened_first_tab, &reopened_second_tab] {
+                second
+                    .execute(BrowserAction::SelectTab {
+                        tab_id: tab.clone(),
+                    })
+                    .await?;
+                assert_cleanup_state(&second, false, false).await?;
+                second.execute(BrowserAction::Reload).await?;
+                assert_cleanup_state(&second, false, false).await?;
+            }
+            assert_browser_diagnostics(&second).await?;
+            second.close().await?;
+
+            let third = Browser::builder()
+                .file_root(root)
+                .persistent_profile(&profile)
+                .build()?;
+            assert_eq!(
+                load_product_extension(&third, relative).await?,
+                extension_id
+            );
+            third
+                .execute(BrowserAction::Open { url: first_url })
+                .await?;
+            assert_cleanup_state(&third, false, false).await?;
+            assert_browser_diagnostics(&third).await?;
+            third.close().await?;
+            fixture_task.abort();
+            Ok(())
+        })
+    }
+
+    async fn load_product_extension(
+        browser: &Browser,
+        path: std::path::PathBuf,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let result = browser
+            .execute(BrowserAction::LoadExtension { path })
+            .await?;
+        let BrowserActionResult::Extension { extension_id, .. } = result else {
+            return Err("load_extension returned the wrong result shape".into());
+        };
+        Ok(extension_id)
+    }
+
+    async fn tab_for_url(
+        browser: &Browser,
+        url: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let BrowserActionResult::Tabs { tabs, .. } =
+            browser.execute(BrowserAction::ListTabs).await?
+        else {
+            return Err("list_tabs returned the wrong result shape".into());
+        };
+        tabs.into_iter()
+            .find(|tab| tab.url == url)
+            .map(|tab| tab.tab_id)
+            .ok_or_else(|| format!("browser tab not found for {url}").into())
+    }
+
+    async fn tab_for_url_prefix(
+        browser: &Browser,
+        prefix: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        for _ in 0..50 {
+            let BrowserActionResult::Tabs { tabs, .. } =
+                browser.execute(BrowserAction::ListTabs).await?
+            else {
+                return Err("list_tabs returned the wrong result shape".into());
+            };
+            if let Some(tab) = tabs.into_iter().find(|tab| tab.url.starts_with(prefix)) {
+                return Ok(tab.tab_id);
+            }
+            browser
+                .execute(BrowserAction::WaitForTimeout { milliseconds: 100 })
+                .await?;
+        }
+        Err(format!("browser tab not found for URL prefix {prefix}").into())
+    }
+
+    async fn run_connect_popup_smoke(
+        browser: &Browser,
+        sidepanel_tab: &str,
+        create_passkey: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        browser
+            .execute(BrowserAction::Click {
+                target: BrowserTarget::role("button").named("Connect Nanocodex"),
+                options: None,
+            })
+            .await?;
+        let popup = tab_for_url_prefix(
+            browser,
+            "https://nanocodex.gakonst.workers.dev/connect-dialog/",
+        )
+        .await?;
+        browser
+            .execute(BrowserAction::SelectTab {
+                tab_id: popup.clone(),
+            })
+            .await?;
+        browser
+            .execute(BrowserAction::WaitForText {
+                text: "Connect to Nanocodex for Chrome".to_owned(),
+                target: None,
+                hidden: false,
+            })
+            .await?;
+        let consent = browser
+            .execute(BrowserAction::Snapshot {
+                interactive: false,
+                compact: true,
+                depth: Some(20),
+                selector: None,
+                include_urls: false,
+            })
+            .await?;
+        assert!(matches!(
+            consent,
+            BrowserActionResult::Snapshot { snapshot, .. }
+                if snapshot.contains("Connect to Nanocodex for Chrome")
+                    && snapshot.contains("ChatGPT")
+                    && snapshot.contains("X")
+                    && !snapshot.contains("MACHUSD")
+                    && !snapshot.contains("machineUSD spend permission")
+                    && !snapshot.contains("Mercator")
+        ));
+
+        browser
+            .execute(if create_passkey {
+                BrowserAction::PasskeyNew
+            } else {
+                BrowserAction::PasskeyAuto
+            })
+            .await?;
+        if create_passkey {
+            browser
+                .execute(BrowserAction::Click {
+                    target: BrowserTarget::role("button").named("New"),
+                    options: None,
+                })
+                .await?;
+        }
+        browser
+            .execute(BrowserAction::Click {
+                target: BrowserTarget::role("button").named(if create_passkey {
+                    "Create & approve"
+                } else {
+                    "Approve"
+                }),
+                options: None,
+            })
+            .await?;
+        browser
+            .execute(BrowserAction::WaitForTimeout { milliseconds: 3000 })
+            .await?;
+        let post_passkey = browser
+            .execute(BrowserAction::Snapshot {
+                interactive: false,
+                compact: true,
+                depth: Some(20),
+                selector: None,
+                include_urls: false,
+            })
+            .await?;
+        let BrowserActionResult::Snapshot { snapshot, .. } = post_passkey else {
+            return Err("Connect post-passkey snapshot returned the wrong shape".into());
+        };
+        let passkeys = browser.execute(BrowserAction::Passkeys).await?;
+        let credential_retained = matches!(
+            &passkeys,
+            BrowserActionResult::Passkeys { credentials, .. } if !credentials.is_empty()
+        );
+        if create_passkey {
+            if !credential_retained {
+                return Err(format!(
+                    "unexpected Connect registration state:\n{snapshot}\nPasskeys: {passkeys:#?}"
+                )
+                .into());
+            }
+        } else if snapshot.contains("Failed to request credential")
+            || !snapshot.contains("Use Nanocodex profile")
+        {
+            let network = connect_auth_diagnostics(browser).await?;
+            let page = evaluate_json(
+                browser,
+                "({focus:document.hasFocus(),visibility:document.visibilityState,url:location.href})"
+                    .to_owned(),
+            )
+            .await?;
+            return Err(format!(
+                "unexpected Connect post-passkey state:\n{snapshot}\nPage: {page}\nPasskeys: {passkeys:#?}\nWebAuthn network:\n{network}"
+            )
+            .into());
+        }
+
+        browser
+            .execute(BrowserAction::CloseTab { tab_id: popup })
+            .await?;
+        browser
+            .execute(BrowserAction::SelectTab {
+                tab_id: sidepanel_tab.to_owned(),
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn connect_auth_diagnostics(
+        browser: &Browser,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let BrowserActionResult::NetworkRequests { requests, .. } = browser
+            .execute(BrowserAction::NetworkRequests {
+                filter: None,
+                after: Some(0),
+                limit: Some(50),
+            })
+            .await?
+        else {
+            return Err("Connect network diagnostics returned the wrong shape".into());
+        };
+        let mut diagnostics = Vec::new();
+        for request in requests {
+            if !request.url.contains("/webauthn/") && !request.url.contains("/v1/connect/auth") {
+                continue;
+            }
+            let read_response = request.status.is_some_and(|status| status >= 400)
+                || request.url.ends_with("/webauthn/register/options")
+                || request.url.ends_with("/webauthn/login/options");
+            let mut entry = serde_json::json!({
+                "url": request.url,
+                "method": request.method,
+                "status": request.status,
+            });
+            if request.body_available && read_response {
+                match browser
+                    .execute(BrowserAction::NetworkBody {
+                        request_id: request.request_id,
+                        kind: BrowserNetworkBodyKind::Response,
+                    })
+                    .await
+                {
+                    Ok(BrowserActionResult::NetworkBody { body, .. }) => {
+                        entry["response"] = serde_json::from_str(&body)
+                            .unwrap_or_else(|_| serde_json::Value::String(body));
+                    }
+                    Ok(_) => entry["bodyError"] = "wrong result shape".into(),
+                    Err(error) => entry["bodyError"] = error.to_string().into(),
+                }
+            }
+            diagnostics.push(entry);
+        }
+        Ok(serde_json::to_string_pretty(&diagnostics)?)
+    }
+
+    async fn evaluate_json(
+        browser: &Browser,
+        expression: String,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let result = browser
+            .execute(BrowserAction::Evaluate { expression })
+            .await?;
+        let BrowserActionResult::Evaluation { value, .. } = result else {
+            return Err("evaluate returned the wrong result shape".into());
+        };
+        Ok(value)
+    }
+
+    async fn wait_for_persisted_recipe(
+        browser: &Browser,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        browser
+            .execute(BrowserAction::WaitForFunction {
+                expression: r#"document.getElementById('nanocodex-persisted-v1') !== null
+                  && getComputedStyle(document.getElementById('cookie-banner')).display === 'none'"#
+                    .to_owned(),
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn assert_cleanup_state(
+        browser: &Browser,
+        preview: bool,
+        persisted: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let state = evaluate_json(
+            browser,
+            r#"({
+              preview: document.getElementById('nanocodex-preview-v1') !== null,
+              persisted: document.getElementById('nanocodex-persisted-v1') !== null,
+              cookie: getComputedStyle(document.getElementById('cookie-banner')).display,
+              newsletter: getComputedStyle(document.getElementById('newsletter-modal')).display,
+              adRail: getComputedStyle(document.querySelector('.ad-rail')).display,
+              recommendations: getComputedStyle(document.querySelector('.recommendations')).display,
+              ticker: getComputedStyle(document.querySelector('.ticker')).display,
+              articleWidth: getComputedStyle(document.querySelector('article')).maxWidth
+            })"#
+            .to_owned(),
+        )
+        .await?;
+        assert_eq!(state["preview"], preview);
+        assert_eq!(state["persisted"], persisted);
+        let expected_display = if preview || persisted {
+            "none"
+        } else {
+            "block"
+        };
+        for key in [
+            "cookie",
+            "newsletter",
+            "adRail",
+            "recommendations",
+            "ticker",
+        ] {
+            assert_eq!(
+                state[key], expected_display,
+                "unexpected state for {key}: {state}"
+            );
+        }
+        if preview || persisted {
+            assert_eq!(state["articleWidth"], "672px");
+        }
+        Ok(())
+    }
+
+    async fn assert_browser_diagnostics(
+        browser: &Browser,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let errors = browser
+            .execute(BrowserAction::Errors { limit: Some(100) })
+            .await?;
+        assert!(matches!(
+            errors,
+            BrowserActionResult::Errors { errors, .. } if errors.is_empty()
+        ));
+        let console = browser
+            .execute(BrowserAction::Console { limit: Some(100) })
+            .await?;
+        assert!(matches!(
+            console,
+            BrowserActionResult::Console { entries, .. }
+                if entries.iter().all(|entry| entry.level != "error")
+        ));
+        let network = browser
+            .execute(BrowserAction::NetworkRequests {
+                filter: None,
+                after: Some(0),
+                limit: Some(100),
+            })
+            .await?;
+        assert!(matches!(
+            network,
+            BrowserActionResult::NetworkRequests { requests, .. }
+                if requests.iter().all(|request| {
+                    request.failure.is_none()
+                        && request.status.is_none_or(|status| status < 400)
+                })
+        ));
+        Ok(())
+    }
+
+    async fn serve_extension_cleanup_fixture(listener: TcpListener) {
+        let sections = (0..550)
+            .map(|index| format!("<section><h2>Feed item {index}</h2><p>Repeated noisy content {index}</p></section>"))
+            .collect::<String>();
+        let body = Arc::new(format!(
+            r#"<!doctype html><html><head><title>Nanocodex cleanup torture fixture</title>
+            <style>body {{ margin: 0 }} #cookie-banner, #newsletter-modal, .ad-rail, .recommendations, .ticker {{ display: block }} article {{ max-width: none }}</style>
+            </head><body>
+            <header><div class="ticker">BREAKING: an extremely distracting ticker</div></header>
+            <div id="cookie-banner">Accept twelve kinds of cookies</div>
+            <div id="newsletter-modal">Subscribe before reading anything</div>
+            <aside class="ad-rail">BUY THINGS BUY THINGS BUY THINGS</aside>
+            <main><article id="article"><h1>The actual article</h1><p>Useful content worth keeping.</p></article>
+            <aside class="recommendations">Infinite recommendations</aside>{sections}</main>
+            </body></html>"#
+        ));
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let body = Arc::clone(&body);
+            tokio::spawn(async move {
+                let mut request = [0_u8; 8192];
+                let _ = socket.read(&mut request).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
+                let _ = tokio::io::AsyncWriteExt::shutdown(&mut socket).await;
+            });
+        }
+    }
+
+    fn copy_directory(
+        source: &std::path::Path,
+        destination: &std::path::Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        std::fs::create_dir(destination)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            let target = destination.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                copy_directory(&entry.path(), &target)?;
+            } else {
+                std::fs::copy(entry.path(), target)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn authorize_fixture_origin(
+        extension: &std::path::Path,
+        permission: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let manifest_path = extension.join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+        let required = manifest["host_permissions"]
+            .as_array_mut()
+            .ok_or("extension manifest has no host_permissions array")?;
+        assert!(
+            !required
+                .iter()
+                .any(|value| value.as_str() == Some(permission)),
+            "the production extension must not require broad page access"
+        );
+        required.push(permission.into());
+        std::fs::write(manifest_path, serde_json::to_vec(&manifest)?)?;
+        Ok(())
     }
 
     #[test]
@@ -6823,6 +9258,393 @@ mod tests {
         assert_eq!(parameters[1].domain.as_deref(), Some("sibling.example.net"));
     }
 
+    #[test]
+    fn in_flight_timeouts_discard_the_session() {
+        assert_eq!(
+            session_stopped(
+                &BrowserError::EvaluationTimeout {
+                    maximum: Duration::from_secs(1),
+                },
+                false,
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            session_stopped(
+                &BrowserError::NavigationTimeout {
+                    url: "https://example.com".to_owned(),
+                    milliseconds: 1_000,
+                },
+                false,
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            session_stopped(
+                &BrowserError::Cdp(chromiumoxide::error::CdpError::Timeout),
+                false,
+            ),
+            Some(true)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn automation_executable_cache_uses_the_newest_chrome_for_testing() -> std::io::Result<()> {
+        let root = tempfile::tempdir()?;
+        let relative = "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing";
+        for version in ["99.0.9999.9", "152.0.7977.54", "not-a-version"] {
+            let executable = root.path().join(format!("chrome-{version}")).join(relative);
+            std::fs::create_dir_all(executable.parent().expect("executable has parent"))?;
+            std::fs::write(executable, [])?;
+        }
+
+        let executable = super::latest_versioned_executable(root.path(), "chrome-", &[relative])
+            .expect("Chrome for Testing installation");
+        assert!(executable.starts_with(root.path().join("chrome-152.0.7977.54")));
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn interactive_cookie_broker_uses_only_the_copied_profile() {
+        let executable =
+            std::path::Path::new("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser");
+        let application = super::macos_application_bundle(executable).unwrap();
+        let copied_profile = std::path::Path::new("/private/tmp/brave-cookie-broker-test");
+        let arguments = super::interactive_cookie_broker_arguments(application, copied_profile)
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            application,
+            std::path::Path::new("/Applications/Brave Browser.app")
+        );
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument == "--user-data-dir=/private/tmp/brave-cookie-broker-test")
+        );
+        assert!(!arguments.iter().any(|argument| {
+            argument.contains("Library/Application Support/BraveSoftware/Brave-Browser")
+                || argument.contains("use-mock-keychain")
+                || argument.contains("password-store=basic")
+                || argument.contains("enable-automation")
+        }));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_passkey_broker_uses_an_isolated_real_keychain_profile() {
+        let executable =
+            std::path::Path::new("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser");
+        let application = super::macos_application_bundle(executable).unwrap();
+        let isolated_profile = std::path::Path::new("/private/tmp/nanocodex-host-passkey-test");
+        let arguments = super::host_passkey_broker_arguments(application, isolated_profile)
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument
+                    == "--user-data-dir=/private/tmp/nanocodex-host-passkey-test")
+        );
+        assert!(!arguments.iter().any(|argument| {
+            argument.contains("Library/Application Support/BraveSoftware/Brave-Browser")
+                || argument.contains("headless")
+                || argument.contains("use-mock-keychain")
+                || argument.contains("password-store=basic")
+                || argument.contains("enable-automation")
+        }));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn explicit_automation_executable_remains_caller_owned() {
+        let explicit = std::path::PathBuf::from("/caller/selected/chrome");
+        assert_eq!(
+            super::preferred_automation_executable(Some(explicit.clone()))
+                .expect("explicit executable"),
+            Some(explicit)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn isolated_launch_is_noninteractive_but_profile_import_uses_the_keychain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir()?;
+        let executable = directory.path().join("browser-args");
+        let output = directory.path().join("args.txt");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$NANOCODEX_TEST_BROWSER_ARGS\"\n",
+        )?;
+        let mut permissions = std::fs::metadata(&executable)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions)?;
+
+        let mut isolated = build_config(
+            isolated_launch_config(BrowserConfig::builder())
+                .chrome_executable(&executable)
+                .env(
+                    "NANOCODEX_TEST_BROWSER_ARGS",
+                    output.to_string_lossy().into_owned(),
+                ),
+        )?
+        .launch()?;
+        assert!(isolated.wait().await?.success());
+        let arguments = std::fs::read_to_string(&output)?;
+        assert!(arguments.lines().any(|arg| arg == "--use-mock-keychain"));
+        assert!(arguments.lines().any(|arg| arg == "--password-store=basic"));
+
+        let mut profile = build_config(
+            profile_launch_config(BrowserConfig::builder())
+                .chrome_executable(&executable)
+                .env(
+                    "NANOCODEX_TEST_BROWSER_ARGS",
+                    output.to_string_lossy().into_owned(),
+                ),
+        )?
+        .launch()?;
+        assert!(profile.wait().await?.success());
+        let arguments = std::fs::read_to_string(output)?;
+        assert!(!arguments.lines().any(|arg| arg == "--use-mock-keychain"));
+        assert!(
+            !arguments
+                .lines()
+                .any(|arg| arg.starts_with("--password-store="))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a local Chrome or Chromium installation"]
+    async fn browser_recovers_after_the_devtools_driver_stops()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let browser = Browser::new()?;
+        browser.start().await?;
+        {
+            let state = browser.inner.state.lock().await;
+            state
+                .session
+                .as_ref()
+                .expect("started browser has a session")
+                .handler
+                .abort();
+        }
+        for _ in 0..100 {
+            let finished = {
+                let state = browser.inner.state.lock().await;
+                state
+                    .session
+                    .as_ref()
+                    .expect("started browser has a session")
+                    .driver_finished()
+            };
+            if finished {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let result = browser
+            .execute(BrowserAction::Evaluate {
+                expression: "1 + 1".to_owned(),
+            })
+            .await?;
+        let BrowserActionResult::Evaluation { value, .. } = result else {
+            return Err(std::io::Error::other("expected evaluation result").into());
+        };
+        assert_eq!(value.as_i64(), Some(2));
+        browser.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a local Chrome headless shell or Chromium installation"]
+    async fn browser_recovers_after_the_network_observer_stops()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let browser = Browser::new()?;
+        browser.start().await?;
+        {
+            let state = browser.inner.state.lock().await;
+            state
+                .session
+                .as_ref()
+                .expect("started browser has a session")
+                .network_observer
+                .abort();
+        }
+        for _ in 0..100 {
+            let finished = {
+                let state = browser.inner.state.lock().await;
+                state
+                    .session
+                    .as_ref()
+                    .expect("started browser has a session")
+                    .driver_finished()
+            };
+            if finished {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let result = browser
+            .execute(BrowserAction::Evaluate {
+                expression: "2 + 2".to_owned(),
+            })
+            .await?;
+        let BrowserActionResult::Evaluation { value, .. } = result else {
+            return Err(std::io::Error::other("expected evaluation result").into());
+        };
+        assert_eq!(value.as_i64(), Some(4));
+        browser.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a local Chrome headless shell or Chromium installation"]
+    async fn browser_repeatedly_recovers_from_driver_task_loss()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const RECOVERIES: i64 = 20;
+        const RECOVERY_TIMEOUT: Duration = Duration::from_secs(3);
+
+        let browser = Browser::new()?;
+        browser.start().await?;
+        for expected in 0..RECOVERIES {
+            {
+                let state = browser.inner.state.lock().await;
+                let session = state
+                    .session
+                    .as_ref()
+                    .expect("started browser has a session");
+                if expected % 2 == 0 {
+                    session.handler.abort();
+                } else {
+                    session.network_observer.abort();
+                }
+            }
+
+            tokio::time::timeout(RECOVERY_TIMEOUT, async {
+                loop {
+                    let finished = {
+                        let state = browser.inner.state.lock().await;
+                        state
+                            .session
+                            .as_ref()
+                            .expect("started browser has a session")
+                            .driver_finished()
+                    };
+                    if finished {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+
+            let result = tokio::time::timeout(
+                RECOVERY_TIMEOUT,
+                browser.execute(BrowserAction::Evaluate {
+                    expression: expected.to_string(),
+                }),
+            )
+            .await??;
+            let BrowserActionResult::Evaluation { value, .. } = result else {
+                return Err(std::io::Error::other("expected evaluation result").into());
+            };
+            assert_eq!(value.as_i64(), Some(expected));
+        }
+        browser.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a local Chrome headless shell or Chromium installation"]
+    async fn browser_discards_a_session_after_a_cancelled_action()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const ACTION_TIMEOUT: Duration = Duration::from_secs(3);
+
+        let browser = Browser::new()?;
+        browser.start().await?;
+        let (original_target, original_page) = {
+            let state = browser.inner.state.lock().await;
+            let page = state
+                .session
+                .as_ref()
+                .expect("started browser has a session")
+                .page
+                .clone();
+            (page.target_id().as_ref().to_owned(), page)
+        };
+        let cancelled_browser = browser.clone();
+        let cancelled = tokio::spawn(async move {
+            cancelled_browser
+                .execute(BrowserAction::Evaluate {
+                    expression: r#"(async () => {
+                        document.title = "action started";
+                        setTimeout(() => { document.title = "late mutation"; }, 100);
+                        await new Promise((resolve) => setTimeout(resolve, 1_000));
+                        return 1;
+                    })()"#
+                        .to_owned(),
+                })
+                .await
+        });
+        tokio::time::timeout(ACTION_TIMEOUT, async {
+            loop {
+                if matches!(
+                    original_page.get_title().await,
+                    Ok(Some(title)) if title == "action started"
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        cancelled.abort();
+        assert!(
+            cancelled
+                .await
+                .expect_err("action should be cancelled")
+                .is_cancelled()
+        );
+
+        let result = tokio::time::timeout(
+            ACTION_TIMEOUT,
+            browser.execute(BrowserAction::Evaluate {
+                expression: "document.title".to_owned(),
+            }),
+        )
+        .await??;
+        let BrowserActionResult::Evaluation { value, .. } = result else {
+            return Err(std::io::Error::other("expected evaluation result").into());
+        };
+        assert_eq!(value.as_str(), Some(""));
+        let replacement_target = {
+            let state = browser.inner.state.lock().await;
+            state
+                .session
+                .as_ref()
+                .expect("recovered browser has a session")
+                .page
+                .target_id()
+                .as_ref()
+                .to_owned()
+        };
+        assert_ne!(replacement_target, original_target);
+        browser.close().await?;
+        Ok(())
+    }
+
     #[tokio::test]
     #[ignore = "requires the standard Brave installation and internet access"]
     async fn brave_cookie_broker_seeds_a_remote_browser() -> Result<(), Box<dyn std::error::Error>>
@@ -6870,22 +9692,6 @@ mod tests {
             .await?;
         let BrowserActionResult::Evaluation { value, .. } = result else {
             return Err(std::io::Error::other("expected evaluation result").into());
-        };
-        assert_eq!(value.as_bool(), Some(true));
-
-        seed_brave_cookie(&executable, &source_profile, "refreshed").await?;
-        browser
-            .inner
-            .resume_auth_handoff(url::Url::parse("https://example.com")?)
-            .await?;
-        let result = browser
-            .execute(BrowserAction::Evaluate {
-                expression: "document.cookie.includes('nanocodex_cookie_bridge=refreshed')"
-                    .to_owned(),
-            })
-            .await?;
-        let BrowserActionResult::Evaluation { value, .. } = result else {
-            return Err(std::io::Error::other("expected refreshed evaluation result").into());
         };
         assert_eq!(value.as_bool(), Some(true));
 

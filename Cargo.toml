@@ -5,14 +5,17 @@ members = [
     "bin/nanousd-api",
     "crates/nanocodex",
     "crates/nanocodex-agent",
+    "crates/nanocodex-durability",
     "crates/experimental/nanocodex-browser",
     "crates/experimental/nanocodex-egress",
     "crates/experimental/nanocodex-voice",
+    "crates/experimental/nanocodex-voice-protocol",
     "crates/experimental/nanocodex-eval",
     "crates/experimental/nanocodex-eval-adapters",
     "crates/experimental/nanocodex-vm",
     "crates/nanocodex-oai-api",
     "crates/nanocodex-observability",
+    "crates/nanocodex-subagents",
     "crates/nanocodex-tools",
     "crates/nanocodex-tools/macros",
     "examples",
@@ -49,6 +52,7 @@ axum = { version = "0.8.9", default-features = false, features = ["form", "http1
 bm25 = { version = "2.3.2", default-features = false }
 chrono = { version = "0.4.43", default-features = false, features = ["clock", "std", "wasmbind"] }
 chromiumoxide = "0.9.1"
+landlock = "0.4.4"
 clap = { version = "4.5.54", features = ["derive", "env"] }
 cpal = "0.16.0"
 crossterm = { version = "0.28.1", features = ["bracketed-paste", "event-stream"] }
@@ -67,20 +71,24 @@ http-body-util = "0.1.3"
 hmac = "0.13.0"
 hudsucker = { version = "0.25.0", git = "https://github.com/gakonst/hudsucker", rev = "9a13609adc4b37b3e7fba28a320546bf672f0f4d", default-features = false, features = ["rcgen-ca", "ring", "rustls-client"] }
 ignore = "0.4.31"
+indicatif = "0.18"
 jiff = { version = "0.2.35", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 jsonschema = { version = "0.48.5", default-features = false }
 krun = { package = "libkrun", version = "=2.0.0-dev", git = "https://github.com/containers/libkrun", rev = "df85b8b75f55e8ef1b06b5bc18f08dc6d7b5aeb0", features = ["blk", "net"] }
-mpp = { version = "=0.11.0", git = "https://github.com/tempoxyz/mpp-rs", rev = "3e37469bb19434982b433ae44ea8c713f7ea923a", default-features = false }
+mpp = { version = "=0.11.0", git = "https://github.com/tempoxyz/mpp-rs", rev = "2e265801d216ef54a85b31acda5d0fac192e1b5e", default-features = false }
 nanocodex = { version = "0.5.0", path = "crates/nanocodex" }
 nanocodex-agent = { version = "0.5.0", path = "crates/nanocodex-agent" }
+nanocodex-durability = { version = "0.5.0", path = "crates/nanocodex-durability" }
 nanocodex-browser = { version = "0.5.0", path = "crates/experimental/nanocodex-browser" }
 nanocodex-egress = { version = "0.5.0", path = "crates/experimental/nanocodex-egress" }
 nanocodex-voice = { version = "0.5.0", path = "crates/experimental/nanocodex-voice" }
+nanocodex-voice-protocol = { version = "0.5.0", path = "crates/experimental/nanocodex-voice-protocol" }
 nanocodex-eval = { version = "0.5.0", path = "crates/experimental/nanocodex-eval" }
 nanocodex-eval-adapters = { version = "0.5.0", path = "crates/experimental/nanocodex-eval-adapters" }
 nanocodex-vm = { version = "0.5.0", path = "crates/experimental/nanocodex-vm" }
 nanocodex-oai-api = { version = "0.5.0", path = "crates/nanocodex-oai-api" }
 nanocodex-observability = { version = "0.5.0", path = "crates/nanocodex-observability" }
+nanocodex-subagents = { version = "0.5.0", path = "crates/nanocodex-subagents" }
 nanocodex-tools = { version = "0.5.0", path = "crates/nanocodex-tools" }
 nanocodex-tools-macros = { version = "0.5.0", path = "crates/nanocodex-tools/macros" }
 nanousd = { version = "0.5.0", path = "bin/nanousd" }
@@ -110,11 +118,15 @@ ratatui = { version = "0.29.0", features = ["unstable-rendered-line-info"] }
 ratatex = "0.1.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }
 reqwest-middleware = "0.5.2"
+rtnetlink = "0.21.0"
+rustix = { version = "1.1.4", features = ["thread"] }
 rustls = { version = "0.23.42", default-features = false, features = ["ring"] }
 regex = "1"
 rusqlite = { version = "0.38", features = ["bundled"] }
+seccompiler = "0.5.0"
+tokio-postgres = "0.7"
 rquickjs = "0.12.1"
-rmcp = { version = "1.8.0", default-features = false, features = ["auth", "client", "reqwest-tls-no-provider", "transport-async-rw", "transport-streamable-http-client-reqwest"] }
+rmcp = { version = "=3.0.0", default-features = false, features = ["auth", "client", "reqwest-tls-no-provider", "transport-async-rw", "transport-streamable-http-client-reqwest"] }
 oauth2 = { version = "5.0", default-features = false }
 safari-binarycookies = "1.0.0"
 schemars = "0.8.22"
@@ -250,5 +262,6 @@ inherits = "profiling"
 inherits = "release"
 codegen-units = 1
 lto = "fat"
-opt-level = "s"
-strip = "debuginfo"
+opt-level = "z"
+panic = "abort"
+strip = "symbols"

@@ -6,13 +6,14 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use chrono::DateTime;
 use nanocodex_oai_api::{
     Model,
     pricing::{ServiceTier, estimate_for_model},
     responses::{InputTokenDetails, Usage},
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
@@ -250,6 +251,7 @@ struct CoordinateRow {
     error: Option<String>,
     status: Option<String>,
     outcome: Option<String>,
+    agent_duration_ms: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -373,7 +375,7 @@ impl EvalApi {
         let mut statement = connection
             .prepare(
                 "SELECT e.harness, e.model, e.thinking, e.state, \
-                        e.started_at_ms, e.finished_at_ms, r.status, r.outcome, \
+                        r.agent_duration_ms, r.status, r.outcome, \
                         r.input_tokens, r.cached_input_tokens, r.output_tokens, r.cost_usd \
                  FROM eval_tasks e \
                  LEFT JOIN coordinate_results r ON r.coordinate_id = e.id \
@@ -389,13 +391,12 @@ impl EvalApi {
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, Option<i64>>(4)?,
-                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<String>>(5)?,
                     row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<i64>>(7)?,
                     row.get::<_, Option<i64>>(8)?,
                     row.get::<_, Option<i64>>(9)?,
-                    row.get::<_, Option<i64>>(10)?,
-                    row.get::<_, Option<f64>>(11)?,
+                    row.get::<_, Option<f64>>(10)?,
                 ))
             })
             .map_err(|error| error.to_string())?;
@@ -406,8 +407,7 @@ impl EvalApi {
                 model,
                 thinking,
                 state,
-                started_at_ms,
-                finished_at_ms,
+                agent_duration_ms,
                 status,
                 outcome,
                 input,
@@ -437,11 +437,7 @@ impl EvalApi {
             if let Some(output) = output.filter(|value| *value >= 0) {
                 group.output_tokens.push(output);
             }
-            if let Some(duration) = started_at_ms
-                .zip(finished_at_ms)
-                .map(|(started, finished)| finished.saturating_sub(started))
-                .filter(|value| *value >= 0)
-            {
+            if let Some(duration) = agent_duration_ms.filter(|value| *value >= 0) {
                 group.durations_ms.push(duration);
             }
             if let Some(cost) = cost.filter(|value| value.is_finite() && *value >= 0.0) {
@@ -484,42 +480,34 @@ impl EvalApi {
         digest: &str,
         task_id: &str,
     ) -> Result<Option<WorksetResults>, String> {
-        self.results(digest, Some(task_id))
+        self.results(digest, task_id)
     }
 
-    fn results(
-        &self,
-        digest: &str,
-        task_id: Option<&str>,
-    ) -> Result<Option<WorksetResults>, String> {
+    fn results(&self, digest: &str, task_id: &str) -> Result<Option<WorksetResults>, String> {
         let connection = self.connection()?;
         let Some(workset) = find_workset(&connection, digest)? else {
             return Ok(None);
         };
-        let task = match task_id {
-            Some(task_id) => match find_task(&connection, workset.id, digest, task_id)? {
-                Some(task) => Some(task),
-                None => return Ok(None),
-            },
-            None => None,
+        let Some(task) = find_task(&connection, workset.id, digest, task_id)? else {
+            return Ok(None);
         };
         let mut statement = connection
             .prepare(
                 "SELECT e.id, t.selector, e.state, e.harness, e.model, e.thinking, \
-                        e.repetition, e.started_at_ms, e.finished_at_ms, \
-                        r.status, r.outcome, r.input_tokens, r.cached_input_tokens, \
+                        e.repetition, r.agent_duration_ms, r.status, r.outcome, \
+                        r.input_tokens, r.cached_input_tokens, \
                         r.output_tokens, r.reasoning_output_tokens, r.total_tokens, r.cost_usd \
-                 FROM eval_tasks e \
+                 FROM eval_tasks e INDEXED BY eval_tasks_definition \
                  JOIN task_definitions t ON t.id = e.definition_id \
                  LEFT JOIN coordinate_results r ON r.coordinate_id = e.id \
-                 WHERE e.workset_id = ?1 AND (?2 IS NULL OR e.definition_id = ?2) \
+                 WHERE e.workset_id = ?1 AND e.definition_id = ?2 \
                    AND e.state IN ('success', 'failed') AND e.result_path IS NOT NULL \
                  ORDER BY t.selector, e.family_key, e.repetition",
             )
             .map_err(|error| error.to_string())?;
         let mut tasks = HashMap::<String, (String, String)>::new();
         let points = statement
-            .query_map((workset.id, task.as_ref().map(|task| task.id)), |row| {
+            .query_map((workset.id, task.id), |row| {
                 let coordinate_id = row.get::<_, i64>(0)?;
                 let task_name = row.get::<_, String>(1)?;
                 let (task_id, task_label) = if let Some(task) = tasks.get(&task_name) {
@@ -533,12 +521,10 @@ impl EvalApi {
                     task
                 };
                 let model = row.get::<_, String>(4)?;
-                let started_at_ms = row.get::<_, Option<i64>>(7)?;
-                let finished_at_ms = row.get::<_, Option<i64>>(8)?;
-                let input_tokens = row.get(11)?;
-                let cached_input_tokens = row.get(12)?;
-                let output_tokens = row.get(13)?;
-                let cost_usd = row.get::<_, Option<f64>>(16)?.or_else(|| {
+                let input_tokens = row.get(10)?;
+                let cached_input_tokens = row.get(11)?;
+                let output_tokens = row.get(12)?;
+                let cost_usd = row.get::<_, Option<f64>>(15)?.or_else(|| {
                     estimated_cost_usd(&model, input_tokens, cached_input_tokens, output_tokens)
                 });
                 Ok(ResultPoint {
@@ -551,16 +537,14 @@ impl EvalApi {
                     model,
                     thinking: row.get(5)?,
                     repetition: row.get(6)?,
-                    status: row.get(9)?,
-                    outcome: row.get(10)?,
-                    duration_ms: started_at_ms
-                        .zip(finished_at_ms)
-                        .map(|(started, finished)| finished.saturating_sub(started)),
+                    status: row.get(8)?,
+                    outcome: row.get(9)?,
+                    duration_ms: row.get(7)?,
                     input_tokens,
                     cached_input_tokens,
                     output_tokens,
-                    reasoning_output_tokens: row.get(14)?,
-                    total_tokens: row.get(15)?,
+                    reasoning_output_tokens: row.get(13)?,
+                    total_tokens: row.get(14)?,
                     cost_usd,
                 })
             })
@@ -602,6 +586,10 @@ impl EvalApi {
         Ok(())
     }
 
+    pub(crate) fn evidence(result_path: &Path) -> Result<Option<CaseEvidence>, String> {
+        read_result_evidence(result_path)
+    }
+
     pub(crate) fn task(
         &self,
         workset_digest: &str,
@@ -615,7 +603,7 @@ impl EvalApi {
             return Ok(None);
         };
         let now = now_ms()?;
-        let mut coordinates = read_coordinates(&connection, workset.id, Some(task.id))?;
+        let mut coordinates = read_coordinates(&connection, workset.id, task.id)?;
         let mut treatments = Vec::<TreatmentDetail>::new();
         for coordinate in coordinates.drain(..) {
             let state = coordinate_state(&coordinate);
@@ -628,10 +616,7 @@ impl EvalApi {
                 status: coordinate.status,
                 outcome: coordinate.outcome,
                 updated_at_ms: coordinate.finished_at_ms.or(coordinate.started_at_ms),
-                duration_ms: coordinate
-                    .finished_at_ms
-                    .zip(coordinate.started_at_ms)
-                    .map(|(finished, started)| finished.saturating_sub(started)),
+                duration_ms: coordinate.agent_duration_ms,
                 message: coordinate.error.clone(),
                 detail_id,
             };
@@ -685,7 +670,7 @@ impl EvalApi {
         let Some(task) = find_task(&connection, workset.id, workset_digest, task_id)? else {
             return Ok(None);
         };
-        let coordinates = read_coordinates(&connection, workset.id, Some(task.id))?
+        let coordinates = read_coordinates(&connection, workset.id, task.id)?
             .into_iter()
             .filter(|coordinate| {
                 matches!(coordinate.state.as_str(), "success" | "failed")
@@ -907,18 +892,18 @@ fn find_task(
 fn read_coordinates(
     connection: &Connection,
     workset_id: i64,
-    task_id: Option<i64>,
+    task_id: i64,
 ) -> Result<Vec<CoordinateRow>, String> {
     let mut statement = connection
         .prepare(
             "SELECT e.id, e.family_key, e.harness, e.model, e.thinking, \
                     e.repetition, e.state, e.result_path, e.started_at_ms, \
                     e.finished_at_ms, e.error, \
-                    r.status, r.outcome \
-             FROM eval_tasks e \
+                    r.status, r.outcome, r.agent_duration_ms \
+             FROM eval_tasks e INDEXED BY eval_tasks_definition \
              LEFT JOIN coordinate_results r ON r.coordinate_id = e.id \
-             WHERE e.workset_id = ?1 AND (?2 IS NULL OR e.definition_id = ?2) \
-             ORDER BY e.definition_id, e.family_key, e.repetition",
+             WHERE e.workset_id = ?1 AND e.definition_id = ?2 \
+             ORDER BY e.family_key, e.repetition",
         )
         .map_err(|error| error.to_string())?;
     let coordinates = statement
@@ -937,6 +922,7 @@ fn read_coordinates(
                 error: row.get(10)?,
                 status: row.get(11)?,
                 outcome: row.get(12)?,
+                agent_duration_ms: row.get(13)?,
             })
         })
         .map_err(|error| error.to_string())?
@@ -1008,12 +994,19 @@ fn read_evidence(result: &Path) -> Result<Option<CaseEvidence>, String> {
     let mut evidence = empty_evidence();
     for line in BufReader::new(file).lines() {
         let line = line.map_err(|error| error.to_string())?;
+        let kind = retained_event_kind(line.as_bytes())?;
+        if !matches!(
+            kind,
+            "attempt_started" | "verifier_output" | "completed" | "failed"
+        ) {
+            continue;
+        }
         if line.len() > MAX_EVENT_LINE_BYTES {
             return Err("retained evaluation event exceeded the API limit".to_owned());
         }
         let event: Value = serde_json::from_str(&line).map_err(|error| error.to_string())?;
-        match event.get("type").and_then(Value::as_str) {
-            Some("attempt_started") => {
+        match kind {
+            "attempt_started" => {
                 evidence.task_name = event
                     .pointer("/attempt/task_name")
                     .and_then(Value::as_str)
@@ -1023,7 +1016,7 @@ fn read_evidence(result: &Path) -> Result<Option<CaseEvidence>, String> {
                     .and_then(Value::as_str)
                     .map(str::to_owned);
             }
-            Some("verifier_output") => {
+            "verifier_output" => {
                 evidence.verifier_stdout = event
                     .pointer("/payload/stdout")
                     .and_then(Value::as_str)
@@ -1033,8 +1026,7 @@ fn read_evidence(result: &Path) -> Result<Option<CaseEvidence>, String> {
                     .and_then(Value::as_str)
                     .map(str::to_owned);
             }
-            Some("completed") => apply_terminal_payload(&mut evidence, &event["payload"]),
-            Some("failed") => apply_terminal_payload(&mut evidence, &event["payload"]),
+            "completed" | "failed" => apply_terminal_payload(&mut evidence, &event["payload"]),
             _ => {}
         }
     }
@@ -1071,20 +1063,31 @@ fn read_outcome(result: &Path) -> Result<Option<CaseEvidence>, String> {
         .rev()
         .filter(|line| !line.is_empty())
     {
+        let kind = retained_event_kind(line)?;
+        if !matches!(kind, "completed" | "failed") {
+            continue;
+        }
         if line.len() > MAX_EVENT_LINE_BYTES {
             return Err("retained evaluation event exceeded the API limit".to_owned());
         }
         let event: Value = serde_json::from_slice(line).map_err(|error| error.to_string())?;
-        if matches!(
-            event.get("type").and_then(Value::as_str),
-            Some("completed" | "failed")
-        ) {
-            let mut evidence = empty_evidence();
-            apply_terminal_payload(&mut evidence, &event["payload"]);
-            return Ok(Some(evidence));
-        }
+        let mut evidence = empty_evidence();
+        apply_terminal_payload(&mut evidence, &event["payload"]);
+        return Ok(Some(evidence));
     }
     read_evidence(result)
+}
+
+#[derive(Deserialize)]
+struct RetainedEventKind<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: &'a str,
+}
+
+fn retained_event_kind(line: &[u8]) -> Result<&str, String> {
+    serde_json::from_slice::<RetainedEventKind<'_>>(line)
+        .map(|event| event.kind)
+        .map_err(|error| error.to_string())
 }
 
 fn events_path(result: &Path) -> Option<PathBuf> {
@@ -1204,8 +1207,9 @@ fn insert_result(
         .execute(
             "INSERT INTO coordinate_results( \
                 coordinate_id, result_path, status, outcome, input_tokens, cached_input_tokens, \
-                output_tokens, reasoning_output_tokens, total_tokens, cost_usd \
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                output_tokens, reasoning_output_tokens, total_tokens, cost_usd, \
+                agent_duration_ms \
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
              ON CONFLICT(coordinate_id) DO UPDATE SET \
                 result_path = excluded.result_path, status = excluded.status, \
                 outcome = excluded.outcome, \
@@ -1213,7 +1217,8 @@ fn insert_result(
                 cached_input_tokens = excluded.cached_input_tokens, \
                 output_tokens = excluded.output_tokens, \
                 reasoning_output_tokens = excluded.reasoning_output_tokens, \
-                total_tokens = excluded.total_tokens, cost_usd = excluded.cost_usd",
+                total_tokens = excluded.total_tokens, cost_usd = excluded.cost_usd, \
+                agent_duration_ms = excluded.agent_duration_ms",
             params![
                 coordinate_id,
                 result_path,
@@ -1225,6 +1230,7 @@ fn insert_result(
                 usage.and_then(|value| integer_field(value, "reasoning_output_tokens")),
                 usage.and_then(|value| integer_field(value, "total_tokens")),
                 evidence.cost_usd,
+                agent_duration_ms(evidence.timing.as_ref()),
             ],
         )
         .map_err(|error| error.to_string())?;
@@ -1253,6 +1259,14 @@ fn decimal_value(value: &Value) -> Option<f64> {
     value
         .as_f64()
         .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+}
+
+fn agent_duration_ms(timing: Option<&Value>) -> Option<i64> {
+    let execution = timing?.get("agent_execution")?;
+    let started = DateTime::parse_from_rfc3339(execution.get("started_at")?.as_str()?).ok()?;
+    let finished = DateTime::parse_from_rfc3339(execution.get("finished_at")?.as_str()?).ok()?;
+    let duration = finished.signed_duration_since(started).num_milliseconds();
+    (duration >= 0).then_some(duration)
 }
 
 fn estimated_cost_usd(
@@ -1321,4 +1335,52 @@ fn now_ms() -> Result<i64, String> {
         .map_err(|error| error.to_string())?
         .as_millis();
     i64::try_from(millis).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs::File, io::Write as _};
+
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    use super::{MAX_EVENT_LINE_BYTES, agent_duration_ms, read_evidence, read_outcome};
+
+    #[test]
+    fn agent_duration_uses_retained_execution_phase() {
+        let timing = json!({
+            "started_at": "2026-08-17T22:29:47.063935980Z",
+            "finished_at": "2026-08-17T22:29:50.535579014Z",
+            "agent_execution": {
+                "started_at": "2026-08-17T22:29:47.160886122Z",
+                "finished_at": "2026-08-17T22:29:50.313306533Z"
+            }
+        });
+        assert_eq!(agent_duration_ms(Some(&timing)), Some(3_152));
+    }
+
+    #[test]
+    fn evidence_reader_skips_oversized_unmaterialized_events() {
+        let result = tempdir().unwrap();
+        let mut events = File::create(result.path().join("events.jsonl")).unwrap();
+        write!(events, "{{\"type\":\"agent\",\"payload\":\"").unwrap();
+        events
+            .write_all(&vec![b'x'; MAX_EVENT_LINE_BYTES + 1])
+            .unwrap();
+        writeln!(events, "\"}}").unwrap();
+        writeln!(
+            events,
+            "{{\"type\":\"completed\",\"payload\":{{\"status\":\"success\",\"outcome\":\"pass\"}}}}"
+        )
+        .unwrap();
+        drop(events);
+
+        let evidence = read_evidence(result.path()).unwrap().unwrap();
+        assert_eq!(evidence.status.as_deref(), Some("success"));
+        assert_eq!(evidence.outcome.as_deref(), Some("pass"));
+
+        let outcome = read_outcome(result.path()).unwrap().unwrap();
+        assert_eq!(outcome.status.as_deref(), Some("success"));
+        assert_eq!(outcome.outcome.as_deref(), Some("pass"));
+    }
 }

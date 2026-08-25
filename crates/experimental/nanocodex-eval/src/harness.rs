@@ -49,6 +49,7 @@ const DEFAULT_HARNESS_HOME: &str = "/run/nanocodex-harness-home";
 const DEFAULT_HARNESS_AUTH_FILE: &str = "/run/nanocodex-harness-home/auth.json";
 const DEFAULT_HARNESS_API_KEY_ENVIRONMENT: &str = "OPENAI_API_KEY";
 const HARNESS_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const CAPTURE_ONLY_GUEST_RUNTIME: &str = "/usr/local/bin/nanocodex-vm-capture";
 #[cfg(target_arch = "aarch64")]
 const VM_GUEST_TARGET: &str = "aarch64-unknown-linux-musl";
 #[cfg(target_arch = "x86_64")]
@@ -70,6 +71,7 @@ pub struct HarnessAuth {
 #[derive(Clone)]
 enum HarnessAuthKind {
     ApiKey(Arc<str>),
+    AccessToken(Arc<str>),
     AuthFile(PathBuf),
 }
 
@@ -88,6 +90,14 @@ impl HarnessAuth {
     pub fn api_key(api_key: impl Into<Arc<str>>) -> Self {
         Self {
             kind: HarnessAuthKind::ApiKey(api_key.into()),
+        }
+    }
+
+    /// Uses a persistent ChatGPT access token in the harness guest.
+    #[must_use]
+    pub fn access_token(access_token: impl Into<Arc<str>>) -> Self {
+        Self {
+            kind: HarnessAuthKind::AccessToken(access_token.into()),
         }
     }
 

@@ -20,7 +20,14 @@ use nanocodex::{
         responses::MessagePhase,
     },
 };
+use nanocodex_voice_protocol::{
+    TranscriptEntry as ProtocolTranscriptEntry,
+    realtime_delegation as protocol_realtime_delegation,
+    realtime_tail_delegation as protocol_realtime_tail_delegation,
+};
 use tokio::sync::{mpsc, oneshot};
+
+pub use nanocodex_voice_protocol::{REALTIME_END_INSTRUCTIONS, REALTIME_START_INSTRUCTIONS};
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod audio;
@@ -39,31 +46,15 @@ pub use nanocodex::oai::realtime::{
 
 use audio::VoiceAudio;
 
-const CODEX_BACKEND_PROMPT: &str = include_str!("backend_prompt.md");
+const CODEX_BACKEND_PROMPT: &str =
+    nanocodex_voice_protocol::CHATGPT_REALTIME_BACKEND_PROMPT_TEMPLATE;
 const USER_FIRST_NAME_PLACEHOLDER: &str = "{{ user_first_name }}";
 const DEFAULT_USER_FIRST_NAME: &str = "there";
 const HANDOFF_STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(200);
+const VOICE_COMMAND_CAPACITY: usize = 64;
 const REALTIME_ASSISTANT_OUTPUT_TOKEN_BUDGET: usize = 1_000;
 const APPROX_BYTES_PER_TOKEN: usize = 4;
 const HANDOFF_STREAM_TRUNCATION_MARKER: &str = "\n…output truncated…\n";
-const REALTIME_SESSION_ENDED_HANDOFF_INSTRUCTION: &str = "The user just ended their realtime session. Here is the remaining handoff/transcript tail. You probably do not have to do anything; acknowledge the handoff unless the transcript itself asks for something.";
-const REALTIME_START_INSTRUCTIONS: &str = concat!(
-    "<realtime_conversation>\n\n",
-    "Realtime conversation started.\n\n",
-    "You are operating as a backend executor behind an intermediary. The user does not talk to you directly. Any response you produce will be consumed by the intermediary and may be summarized before the user sees it.\n\n",
-    "When invoked, you receive the latest conversation transcript and any relevant mode or metadata. The intermediary may invoke you even when backend help is not actually needed. Use the transcript to decide whether you should do work. If backend help is unnecessary, avoid verbose responses that add user-visible latency.\n\n",
-    "When user text is routed from realtime, treat it as a transcript. It may be unpunctuated or contain recognition errors.\n\n",
-    "- Keep responses concise and action-oriented. Your updates should help the intermediary respond to the user.\n\n",
-    "</realtime_conversation>"
-);
-const REALTIME_END_INSTRUCTIONS: &str = concat!(
-    "<realtime_conversation>\n\n",
-    "Realtime conversation ended.\n\n",
-    "Subsequent user input will return to typed text rather than transcript-style text. Do not assume recognition errors or missing punctuation once realtime has ended. Resume normal chat behavior.\n\n",
-    "Reason: inactive\n\n",
-    "</realtime_conversation>"
-);
-
 /// Desktop capture and playback policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AudioConfig {
@@ -166,6 +157,7 @@ pub struct VoiceSession {
     stop: Option<oneshot::Sender<()>>,
     finished: Option<oneshot::Receiver<Result<(), String>>>,
     agent_events: mpsc::UnboundedSender<AgentEvent>,
+    commands: mpsc::Sender<VoiceCommand>,
     agent_control: VoiceAgentControl,
     task: Option<std::thread::JoinHandle<()>>,
 }
@@ -229,6 +221,48 @@ impl VoiceSession {
         self.agent_control.cancel().await
     }
 
+    /// Appends role-bearing text to the active realtime conversation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the voice lifecycle or bounded Realtime queue has
+    /// closed.
+    pub async fn append_text(
+        &self,
+        role: RealtimeInputTextRole,
+        text: impl Into<String>,
+    ) -> Result<(), RealtimeError> {
+        let (result, completed) = oneshot::channel();
+        self.commands
+            .send(VoiceCommand::AppendText {
+                role,
+                text: text.into(),
+                result,
+            })
+            .await
+            .map_err(|_| RealtimeError::Closed)?;
+        completed.await.map_err(|_| RealtimeError::Closed)?
+    }
+
+    /// Appends text that the realtime model should treat as directly speakable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the voice lifecycle or bounded Realtime queue has
+    /// closed.
+    pub async fn append_speech(&self, text: impl Into<String>) -> Result<(), RealtimeError> {
+        let text = text.into();
+        if text.trim().is_empty() {
+            return Ok(());
+        }
+        let (result, completed) = oneshot::channel();
+        self.commands
+            .send(VoiceCommand::AppendSpeech { text, result })
+            .await
+            .map_err(|_| RealtimeError::Closed)?;
+        completed.await.map_err(|_| RealtimeError::Closed)?
+    }
+
     /// Mirrors one session-wide event from work started outside this lifecycle.
     ///
     /// Embeddings with typed input should pass the agent's normal [`AgentEvent`]
@@ -248,7 +282,7 @@ impl VoiceSession {
 /// Realtime reconnect.
 #[derive(Clone, Default)]
 pub struct VoiceAgentControl {
-    active: Arc<Mutex<Option<ActiveVoiceAgentTurn>>>,
+    state: Arc<Mutex<VoiceAgentControlState>>,
 }
 
 impl VoiceAgentControl {
@@ -281,28 +315,33 @@ impl VoiceAgentControl {
     }
 
     fn active(&self) -> Option<ActiveVoiceAgentTurn> {
-        self.lock().clone()
+        self.lock().active.clone()
     }
 
-    fn set(&self, generation: u64, control: TurnControl) {
-        *self.lock() = Some(ActiveVoiceAgentTurn {
+    fn install(&self, control: TurnControl) -> u64 {
+        let mut state = self.lock();
+        state.next_generation = state.next_generation.saturating_add(1);
+        let generation = state.next_generation;
+        state.active = Some(ActiveVoiceAgentTurn {
             generation,
             control,
         });
+        generation
     }
 
     fn clear(&self, generation: u64) {
-        let mut active = self.lock();
-        if active
+        let mut state = self.lock();
+        if state
+            .active
             .as_ref()
             .is_some_and(|active| active.generation == generation)
         {
-            *active = None;
+            state.active = None;
         }
     }
 
-    fn lock(&self) -> MutexGuard<'_, Option<ActiveVoiceAgentTurn>> {
-        match self.active.lock() {
+    fn lock(&self) -> MutexGuard<'_, VoiceAgentControlState> {
+        match self.state.lock() {
             Ok(active) => active,
             Err(poisoned) => poisoned.into_inner(),
         }
@@ -313,6 +352,12 @@ impl VoiceAgentControl {
 struct ActiveVoiceAgentTurn {
     generation: u64,
     control: TurnControl,
+}
+
+#[derive(Default)]
+struct VoiceAgentControlState {
+    active: Option<ActiveVoiceAgentTurn>,
+    next_generation: u64,
 }
 
 impl Drop for VoiceSession {
@@ -335,6 +380,7 @@ pub struct VoiceSessionBuilder {
     session_mode: RealtimeSessionMode,
     output_modality: RealtimeOutputModality,
     client_managed_handoffs: bool,
+    delegation_ack_filler: Option<bool>,
     codex_responses_as_items: bool,
     codex_response_item_prefix: Option<String>,
     codex_response_handoff_mode: RealtimeResponseHandoffMode,
@@ -363,6 +409,7 @@ impl VoiceSessionBuilder {
             session_mode: RealtimeSessionMode::Conversational,
             output_modality: RealtimeOutputModality::Audio,
             client_managed_handoffs: false,
+            delegation_ack_filler: None,
             codex_responses_as_items: false,
             codex_response_item_prefix: None,
             codex_response_handoff_mode: RealtimeResponseHandoffMode::Thinking,
@@ -442,6 +489,16 @@ impl VoiceSessionBuilder {
     #[must_use]
     pub const fn client_managed_handoffs(mut self, managed: bool) -> Self {
         self.client_managed_handoffs = managed;
+        self
+    }
+
+    /// Controls the provider's Frameless delegation acknowledgement filler.
+    ///
+    /// Omitted policy preserves the Realtime API default. Realtime V1 and V2
+    /// ignore it.
+    #[must_use]
+    pub const fn delegation_ack_filler(mut self, enabled: bool) -> Self {
+        self.delegation_ack_filler = Some(enabled);
         self
     }
 
@@ -535,18 +592,29 @@ impl VoiceSessionBuilder {
     pub fn spawn(self) -> Result<(VoiceSession, VoiceEvents), VoiceError> {
         let (events, receiver) = mpsc::unbounded_channel();
         let (agent_events, observed_agent_events) = mpsc::unbounded_channel();
+        let (commands, voice_commands) = mpsc::channel(VOICE_COMMAND_CAPACITY);
         let (stop, stopped) = oneshot::channel();
         let (finished, completion) = oneshot::channel();
         let agent_control = self.agent_control.clone();
         let task = std::thread::Builder::new()
             .name("nanocodex-voice".to_owned())
-            .spawn(move || run_thread(self, events, observed_agent_events, stopped, finished))
+            .spawn(move || {
+                run_thread(
+                    self,
+                    events,
+                    observed_agent_events,
+                    voice_commands,
+                    stopped,
+                    finished,
+                );
+            })
             .map_err(VoiceError::Spawn)?;
         Ok((
             VoiceSession {
                 stop: Some(stop),
                 finished: Some(completion),
                 agent_events,
+                commands,
                 agent_control,
                 task: Some(task),
             },
@@ -647,6 +715,7 @@ fn run_thread(
     builder: VoiceSessionBuilder,
     events: mpsc::UnboundedSender<VoiceEvent>,
     observed_agent_events: mpsc::UnboundedReceiver<AgentEvent>,
+    voice_commands: mpsc::Receiver<VoiceCommand>,
     stopped: oneshot::Receiver<()>,
     finished: oneshot::Sender<Result<(), String>>,
 ) {
@@ -667,7 +736,13 @@ fn run_thread(
             return;
         }
     };
-    let result = runtime.block_on(run_voice(builder, &events, observed_agent_events, stopped));
+    let result = runtime.block_on(run_voice(
+        builder,
+        &events,
+        observed_agent_events,
+        voice_commands,
+        stopped,
+    ));
     let completion = result.as_ref().map_err(ToString::to_string).copied();
     let terminal = match result {
         Ok(()) => VoiceEvent::Stopped,
@@ -681,6 +756,7 @@ async fn run_voice(
     mut builder: VoiceSessionBuilder,
     events: &mpsc::UnboundedSender<VoiceEvent>,
     observed_agent_events: mpsc::UnboundedReceiver<AgentEvent>,
+    voice_commands: mpsc::Receiver<VoiceCommand>,
     stopped: oneshot::Receiver<()>,
 ) -> Result<(), VoiceFailure> {
     let lifecycle_agent = builder.agent.clone();
@@ -695,7 +771,14 @@ async fn run_voice(
             builder.instructions = Arc::from(format!("{}\n\n{startup}", builder.instructions));
         }
     }
-    let result = run_active_voice(builder, events, observed_agent_events, stopped).await;
+    let result = run_active_voice(
+        builder,
+        events,
+        observed_agent_events,
+        voice_commands,
+        stopped,
+    )
+    .await;
     let ended = lifecycle_agent
         .append_developer_message(REALTIME_END_INSTRUCTIONS)
         .await
@@ -711,6 +794,7 @@ async fn run_active_voice(
     builder: VoiceSessionBuilder,
     events: &mpsc::UnboundedSender<VoiceEvent>,
     mut observed_agent_events: mpsc::UnboundedReceiver<AgentEvent>,
+    mut voice_commands: mpsc::Receiver<VoiceCommand>,
     mut stopped: oneshot::Receiver<()>,
 ) -> Result<(), VoiceFailure> {
     send_event(events, VoiceEvent::Connecting);
@@ -735,6 +819,9 @@ async fn run_active_voice(
         .codex_responses_as_items(builder.codex_responses_as_items)
         .codex_response_handoff_mode(builder.codex_response_handoff_mode)
         .codex_response_handoff_channel_prefixes(builder.codex_response_handoff_channel_prefixes);
+    if let Some(enabled) = builder.delegation_ack_filler {
+        realtime = realtime.delegation_ack_filler(enabled);
+    }
     if let Some(model) = builder.model {
         realtime = realtime.model(model);
     }
@@ -857,6 +944,19 @@ async fn run_active_voice(
                 };
                 handle_observed_agent_event(event, &session, &mut agent_bridge).await?;
             }
+            command = voice_commands.recv() => {
+                let Some(command) = command else {
+                    continue;
+                };
+                match command {
+                    VoiceCommand::AppendText { role, text, result } => {
+                        drop(result.send(session.send_text(role, text).await));
+                    }
+                    VoiceCommand::AppendSpeech { text, result } => {
+                        drop(result.send(session.append_speech(text).await));
+                    }
+                }
+            }
             _ = external_flush.tick(), if agent_bridge.has_external_stream_output() => {
                 flush_observed_agent_output(&session, &mut agent_bridge).await?;
             }
@@ -869,6 +969,18 @@ async fn run_active_voice(
         }
     }
     result
+}
+
+enum VoiceCommand {
+    AppendText {
+        role: RealtimeInputTextRole,
+        text: String,
+        result: oneshot::Sender<Result<(), RealtimeError>>,
+    },
+    AppendSpeech {
+        text: String,
+        result: oneshot::Sender<Result<(), RealtimeError>>,
+    },
 }
 
 enum AgentBridgeUpdate {
@@ -952,9 +1064,8 @@ async fn handle_realtime_event(
                 .await
             {
                 Ok(PromptRoute::Started(turn)) => {
-                    agent_bridge.next_generation = agent_bridge.next_generation.saturating_add(1);
-                    let generation = agent_bridge.next_generation;
-                    agent_bridge.control.set(generation, turn.control());
+                    let generation = agent_bridge.control.install(turn.control());
+                    agent_bridge.next_generation = agent_bridge.next_generation.max(generation);
                     agent_bridge.active = Some(ActiveAgentRequest {
                         generation,
                         call_id: call_id.clone(),
@@ -1192,21 +1303,11 @@ async fn route_transcript_tail(
 /// Wraps an unconsumed session tail in Codex's tail-flush delegation markers.
 #[must_use]
 pub fn codex_realtime_tail_delegation(tail: &[RealtimeTranscriptEntry]) -> Option<String> {
-    if tail.is_empty() {
-        return None;
-    }
     let transcript = tail
         .iter()
-        .map(|entry| format!("{}: {}", entry.role, entry.text))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let source = "  <source>transcript_tail_flush</source>\n";
-    let input = escape_xml(REALTIME_SESSION_ENDED_HANDOFF_INSTRUCTION);
-    let transcript = escape_xml(&transcript);
-    let prompt = format!(
-        "<realtime_delegation>\n{source}  <input>{input}</input>\n  <transcript_delta>{transcript}</transcript_delta>\n</realtime_delegation>"
-    );
-    Some(prompt)
+        .map(|entry| ProtocolTranscriptEntry::new(&entry.role, &entry.text))
+        .collect::<Vec<_>>();
+    protocol_realtime_tail_delegation(&transcript)
 }
 
 async fn flush_observed_agent_output(
@@ -1343,13 +1444,13 @@ impl HandoffStream {
             if self.buffered_text.is_empty() {
                 return None;
             }
-            let text = self.buffered_text.drain(..).collect::<String>();
+            let text = std::mem::take(&mut self.buffered_text);
             self.sent_bytes = self.sent_bytes.saturating_add(text.len());
             return Some(text);
         }
 
-        let head = self.buffered_text.drain(..).collect::<String>();
-        let tail = self.tail_text.drain(..).collect::<String>();
+        let head = std::mem::take(&mut self.buffered_text);
+        let tail = std::mem::take(&mut self.tail_text);
         let text = format!("{head}{HANDOFF_STREAM_TRUNCATION_MARKER}{tail}");
         self.sent_bytes = self.sent_bytes.saturating_add(text.len());
         Some(text)
@@ -1404,26 +1505,11 @@ pub fn codex_realtime_delegation_with_transcript(
     input: &str,
     transcript: &[RealtimeTranscriptEntry],
 ) -> String {
-    let input = escape_xml(input);
     let transcript = transcript
         .iter()
-        .map(|entry| format!("{}: {}", entry.role, entry.text))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let transcript = escape_xml(&transcript);
-    if transcript.is_empty() {
-        format!("<realtime_delegation>\n  <input>{input}</input>\n</realtime_delegation>")
-    } else {
-        format!(
-            "<realtime_delegation>\n  <input>{input}</input>\n  <transcript_delta>{transcript}</transcript_delta>\n</realtime_delegation>"
-        )
-    }
-}
-
-fn escape_xml(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+        .map(|entry| ProtocolTranscriptEntry::new(&entry.role, &entry.text))
+        .collect::<Vec<_>>();
+    protocol_realtime_delegation(input, &transcript)
 }
 
 fn send_event(events: &mpsc::UnboundedSender<VoiceEvent>, event: VoiceEvent) {

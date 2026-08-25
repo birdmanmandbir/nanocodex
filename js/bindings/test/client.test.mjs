@@ -3,12 +3,222 @@ import { test } from "node:test";
 
 import { Actions } from "../index.mjs";
 import {
+  createMemoryDurabilityStore,
+  createSqliteDurabilityStore,
+  durabilityRevision,
+  sqliteDurabilitySchema,
+} from "nanocodex/durability";
+import {
   activateHost,
   bindHostSession,
   createAgentClient,
   defineRuntime,
   releaseHostSession,
+  toWasmConfig,
 } from "../internal.mjs";
+import {
+  own as ownDurabilityHost,
+  release as releaseDurabilityHost,
+  retain as retainDurabilityHost,
+} from "../runtime/durability.mjs";
+
+test("the memory durability store carries opaque Rust batches across host steps", () => {
+  const store = createMemoryDurabilityStore("journal-1");
+  assert.deepEqual(store.load("journal-1"), { revision: "0", batches: [] });
+  assert.deepEqual(store.acquire("journal-1", { ownerId: "owner-1" }), {
+    ownerId: "owner-1",
+    fence: "1",
+    revision: "0",
+    batches: [],
+  });
+  assert.deepEqual(store.append("journal-1", {
+    ownerId: "owner-1",
+    fence: "1",
+    expectedRevision: "0",
+    payload: "{\"entry\":1}",
+  }), { status: "appended", revision: "1" });
+  assert.deepEqual(store.acquire("journal-1", { ownerId: "owner-2" }), {
+    ownerId: "owner-2",
+    fence: "2",
+    revision: "1",
+    batches: [{ revision: "1", payload: "{\"entry\":1}" }],
+  });
+  assert.deepEqual(store.append("journal-1", {
+    ownerId: "owner-1",
+    fence: "1",
+    expectedRevision: "0",
+    payload: "stale",
+  }), { status: "fenced" });
+  assert.deepEqual(store.append("journal-1", {
+    ownerId: "owner-2",
+    fence: "2",
+    expectedRevision: "0",
+    payload: "conflicting",
+  }), { status: "conflict", actualRevision: "1" });
+  assert.deepEqual(store.compact("journal-1", {
+    ownerId: "owner-2",
+    fence: "2",
+    expectedRevision: "1",
+    payload: "{\"nanocodex_journal_state\":{}}",
+  }), { status: "compacted", revision: "1" });
+  assert.deepEqual(store.snapshot(), {
+    revision: "1",
+    batches: [{ revision: "1", payload: "{\"nanocodex_journal_state\":{}}" }],
+  });
+  assert.throws(() => store.load("other"), /unknown durability journal/);
+  assert.equal(durabilityRevision("18446744073709551615"), "18446744073709551615");
+  assert.throws(
+    () => durabilityRevision("18446744073709551616"),
+    /unsigned 64-bit decimal string/,
+  );
+  assert.equal(durabilityRevision(Number.MAX_SAFE_INTEGER), "9007199254740991");
+  assert.throws(
+    () => durabilityRevision(-1),
+    /revision numbers must be nonnegative safe integers/,
+  );
+  assert.throws(
+    () => durabilityRevision(1.5),
+    /revision numbers must be nonnegative safe integers/,
+  );
+  const exhausted = createMemoryDurabilityStore("exhausted", {
+    revision: "18446744073709551615",
+    batches: [],
+  });
+  const exhaustedOwner = exhausted.acquire("exhausted", { ownerId: "owner" });
+  assert.deepEqual(exhausted.append("exhausted", {
+    ownerId: exhaustedOwner.ownerId,
+    fence: exhaustedOwner.fence,
+    expectedRevision: "18446744073709551615",
+    payload: "never-written",
+  }), {
+    status: "not_committed",
+    message: "in-memory durability revision overflow",
+  });
+  assert.equal(exhausted.snapshot().revision, "18446744073709551615");
+});
+
+test("the SQLite durability store owns revision validation and compare-and-append", () => {
+  const owners = new Map();
+  const revisions = new Map();
+  const batches = [];
+  const query = (sql, args) => {
+    const [journalId, revision, payload] = args;
+    if (sql.startsWith("SELECT owner_id, fence FROM nanocodex_journal_owners")) {
+      const stored = owners.get(journalId);
+      return stored === undefined ? [] : [stored];
+    }
+    if (sql.startsWith("INSERT INTO nanocodex_journal_owners")) {
+      const [, ownerId, fence] = args;
+      owners.set(journalId, { owner_id: ownerId, fence });
+      return [];
+    }
+    if (sql.startsWith("SELECT revision FROM nanocodex_journals")) {
+      const stored = revisions.get(journalId);
+      return stored === undefined ? [] : [{ revision: stored }];
+    }
+    if (sql.startsWith("SELECT revision, payload FROM nanocodex_journal_batches")) {
+      return batches.filter((batch) => batch.journalId === journalId);
+    }
+    if (sql.startsWith("INSERT INTO nanocodex_journals")) {
+      revisions.set(journalId, revision);
+      return [];
+    }
+    if (sql.startsWith("INSERT INTO nanocodex_journal_batches")) {
+      batches.push({ journalId, revision, payload });
+      return [];
+    }
+    if (sql.startsWith("DELETE FROM nanocodex_journal_batches")) {
+      for (let index = batches.length - 1; index >= 0; index -= 1) {
+        if (batches[index].journalId === journalId) batches.splice(index, 1);
+      }
+      return [];
+    }
+    throw new Error(`unexpected SQL: ${sql}`);
+  };
+  const store = createSqliteDurabilityStore({
+    transaction: (callback) => callback(query),
+  });
+  assert.equal(sqliteDurabilitySchema.length, 3);
+
+  assert.deepEqual(store.load("journal-1"), { revision: "0", batches: [] });
+  const firstOwner = store.acquire("journal-1", { ownerId: "owner-1" });
+  assert.deepEqual(firstOwner, {
+    ownerId: "owner-1",
+    fence: "1",
+    revision: "0",
+    batches: [],
+  });
+  assert.deepEqual(store.append("journal-1", {
+    ownerId: firstOwner.ownerId,
+    fence: firstOwner.fence,
+    expectedRevision: "0",
+    payload: "opaque",
+  }), { status: "appended", revision: "1" });
+  assert.deepEqual(store.append("journal-1", {
+    ownerId: firstOwner.ownerId,
+    fence: firstOwner.fence,
+    expectedRevision: "0",
+    payload: "stale",
+  }), { status: "conflict", actualRevision: "1" });
+  assert.deepEqual(store.compact("journal-1", {
+    ownerId: firstOwner.ownerId,
+    fence: firstOwner.fence,
+    expectedRevision: "1",
+    payload: "checkpoint",
+  }), { status: "compacted", revision: "1" });
+  assert.deepEqual(store.load("journal-1"), {
+    revision: "1",
+    batches: [{ revision: "1", payload: "checkpoint" }],
+  });
+  revisions.set("exhausted", "18446744073709551615");
+  const exhaustedOwner = store.acquire("exhausted", { ownerId: "owner-exhausted" });
+  assert.deepEqual(store.append("exhausted", {
+    ownerId: exhaustedOwner.ownerId,
+    fence: exhaustedOwner.fence,
+    expectedRevision: "18446744073709551615",
+    payload: "never-written",
+  }), {
+    status: "not_committed",
+    message: "SQLite durability revision overflow",
+  });
+  assert.equal(batches.some((batch) => batch.journalId === "exhausted"), false);
+  assert.deepEqual(store.load("journal-1"), {
+    revision: "1",
+    batches: [{ revision: "1", payload: "checkpoint" }],
+  });
+  revisions.delete("journal-1");
+  batches.splice(0, batches.length);
+  const secondOwner = store.acquire("journal-1", { ownerId: "owner-2" });
+  assert.deepEqual(secondOwner, {
+    ownerId: "owner-2",
+    fence: "2",
+    revision: "0",
+    batches: [],
+  });
+  assert.deepEqual(store.append("journal-1", {
+    ownerId: firstOwner.ownerId,
+    fence: firstOwner.fence,
+    expectedRevision: "0",
+    payload: "stale-after-reset",
+  }), { status: "fenced" });
+
+  const roundedRevision = Number("9007199254740993");
+  assert.equal(roundedRevision, 9007199254740992);
+  revisions.set("unsafe-revision", roundedRevision);
+  assert.throws(
+    () => store.load("unsafe-revision"),
+    /revision numbers must be nonnegative safe integers; use exact unsigned decimal text/,
+  );
+
+  revisions.set("exact-revision", "9007199254740993");
+  assert.equal(store.load("exact-revision").revision, "9007199254740993");
+
+  owners.set("unsafe-fence", { owner_id: "old-owner", fence: roundedRevision });
+  assert.throws(
+    () => store.acquire("unsafe-fence", { ownerId: "new-owner" }),
+    /fence numbers must be nonnegative safe integers; use exact unsigned decimal text/,
+  );
+});
 
 test("the headless client exposes matching direct and standalone actions", async () => {
   const events = new Set();
@@ -29,13 +239,20 @@ test("the headless client exposes matching direct and standalone actions", async
   assert.deepEqual(Object.getOwnPropertySymbols(firstTurn), []);
   assert.deepEqual(Object.getOwnPropertySymbols(first), []);
   assert.equal(Object.isFrozen(first), true);
-  assert.equal(Object.isFrozen(first.usage), true);
-  assert.equal(Object.isFrozen(first.snapshot), true);
-  assert.strictEqual(Actions.turn.getUsage(first), first.usage);
-  assert.strictEqual(Actions.turn.getSnapshot(first), first.snapshot);
+  const [usage, sameUsage] = await Promise.all([first.usage(), Actions.turn.getUsage(first)]);
+  const [snapshot, sameSnapshot] = await Promise.all([
+    first.snapshot(),
+    Actions.turn.getSnapshot(first),
+  ]);
+  assert.equal(Object.isFrozen(usage), true);
+  assert.equal(Object.isFrozen(snapshot), true);
+  assert.strictEqual(sameUsage, usage);
+  assert.strictEqual(sameSnapshot, snapshot);
   const secondTurn = Actions.turn.prompt(agent, { input: "second" });
   const second = await Actions.turn.getResult(secondTurn);
   assert.equal(second.finalMessage, "session-1:second");
+  const durable = await agent.turn.prompt({ id: "request-7", input: "durable" }).result();
+  assert.equal(durable.finalMessage, "session-1:request-7:durable");
 
   const seen = [];
   const watch = agent.events.watch();
@@ -65,18 +282,330 @@ test("the headless client exposes matching direct and standalone actions", async
     (await branch.turn.prompt({ input: "branch" }).result()).finalMessage,
     "session-1-fork:branch",
   );
+  first.dispose();
 
   const fresh = await agent.session.spawn();
   assert.equal(fresh.sessionId, "session-1-spawn");
 
   await agent.session.compact();
   await Actions.session.compact(agent);
+  assert.deepEqual(
+    await agent.session.context(),
+    { workspace: "/workspace", history: [{ type: "message", role: "developer" }] },
+  );
+  assert.deepEqual(
+    await Actions.session.context(agent),
+    { workspace: "/workspace", history: [{ type: "message", role: "developer" }] },
+  );
+  assert.deepEqual(
+    await agent.session.appendDeveloperMessage("voice started"),
+    { workspace: "/workspace", history: [{ type: "message", role: "developer" }] },
+  );
+  assert.deepEqual(
+    await Actions.session.appendDeveloperMessage(agent, "voice stopped"),
+    { workspace: "/workspace", history: [{ type: "message", role: "developer" }] },
+  );
+  await assert.rejects(agent.session.appendDeveloperMessage("  "), /non-empty string/);
+  assert.deepEqual(
+    await agent.session.realtime.start(),
+    { workspace: "/workspace", history: [{ type: "message", role: "developer" }] },
+  );
+  assert.deepEqual(
+    await agent.session.realtime.end(),
+    { workspace: "/workspace", history: [{ type: "message", role: "developer" }] },
+  );
+  assert.equal(
+    await agent.session.realtime.delegation("ship", [{ role: "user", text: "now" }]),
+    "delegated:ship:user: now",
+  );
+  assert.equal(
+    await agent.session.realtime.tailDelegation([{ role: "assistant", text: "done" }]),
+    "tail:assistant: done",
+  );
 
   const extended = agent.extend((client) => ({ inspect: { session: () => client.sessionId } }));
   assert.equal(extended.inspect.session(), "session-1");
   branch.dispose();
   fresh.dispose();
   agent.dispose();
+});
+
+test("a duplicate stable session rejects before touching durability authority", async () => {
+  const sessionId = "session-duplicate-reservation";
+  let authorityAcquisitions = 0;
+  let releases = 0;
+  const runtime = defineRuntime({
+    create(options) {
+      authorityAcquisitions += 1;
+      return rawAgent(options.sessionId);
+    },
+    release() {
+      releases += 1;
+    },
+    decorate: (agent) => agent.extend(Actions.agentActions()),
+  });
+  const first = await createAgentClient(runtime, { sessionId, durabilityId: "journal-1" });
+
+  await assert.rejects(
+    createAgentClient(runtime, { sessionId, durabilityId: "journal-1" }),
+    /session ID is already active/,
+  );
+  assert.equal(authorityAcquisitions, 1);
+  assert.equal(
+    (await first.turn.prompt({ input: "first owner remains live" }).result()).finalMessage,
+    `${sessionId}:first owner remains live`,
+  );
+
+  first.dispose();
+  assert.equal(releases, 1);
+  const replacement = await createAgentClient(runtime, { sessionId, durabilityId: "journal-1" });
+  assert.equal(authorityAcquisitions, 2);
+  replacement.dispose();
+  assert.equal(releases, 2);
+});
+
+test("concurrent creation admits exactly one stable session owner", async () => {
+  const sessionId = "session-concurrent-reservation";
+  let creations = 0;
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  const runtime = defineRuntime({
+    async create(options) {
+      creations += 1;
+      await firstGate;
+      return rawAgent(options.sessionId);
+    },
+    decorate: (agent) => agent.extend(Actions.agentActions()),
+  });
+
+  const firstCreation = createAgentClient(runtime, { sessionId });
+  const secondCreation = createAgentClient(runtime, { sessionId });
+  await assert.rejects(secondCreation, /session ID is already active/);
+  assert.equal(creations, 1);
+  releaseFirst();
+  const first = await firstCreation;
+  first.dispose();
+});
+
+test("failed construction releases its stable session reservation", async () => {
+  const sessionId = "session-construction-failure";
+  let creations = 0;
+  const runtime = defineRuntime({
+    create(options) {
+      creations += 1;
+      if (creations === 1) throw new Error("WASM construction failed");
+      return rawAgent(options.sessionId);
+    },
+    decorate: (agent) => agent.extend(Actions.agentActions()),
+  });
+
+  await assert.rejects(
+    createAgentClient(runtime, { sessionId }),
+    /WASM construction failed/,
+  );
+  const recovered = await createAgentClient(runtime, { sessionId });
+  assert.equal(creations, 2);
+  recovered.dispose();
+});
+
+test("turn acceptance forwards durable IDs and remains optional for custom runtimes", async () => {
+  const legacyRuntime = defineRuntime({
+    create: () => rawAgent("legacy-session"),
+    decorate: (agent) => agent.extend(Actions.agentActions()),
+  });
+  const legacy = await createAgentClient(legacyRuntime);
+  const legacyTurn = legacy.turn.prompt({ input: "legacy" });
+  assert.equal(await legacyTurn.accepted(), undefined);
+  legacyTurn.dispose();
+  legacy.dispose();
+
+  let acceptanceCalls = 0;
+  const runtime = defineRuntime({
+    create() {
+      const raw = rawAgent("durable-session");
+      const prompt = raw.prompt;
+      raw.prompt = (input, id) => {
+        const turn = prompt(input, id);
+        turn.accepted = () => {
+          acceptanceCalls += 1;
+          return id;
+        };
+        return turn;
+      };
+      return raw;
+    },
+    decorate: (agent) => agent.extend(Actions.agentActions()),
+  });
+  const agent = await createAgentClient(runtime);
+  const turn = agent.turn.prompt({ input: "durable", id: "request-7" });
+  const accepted = turn.accepted();
+  assert.strictEqual(turn.accepted(), accepted);
+  assert.strictEqual(Actions.turn.accepted(turn), accepted);
+  assert.equal(await accepted, "request-7");
+  assert.equal(acceptanceCalls, 1);
+  turn.dispose();
+  agent.dispose();
+});
+
+test("the WASM config pairs a durability route with its journal", () => {
+  assert.deepEqual(toWasmConfig({
+    apiKey: "test-key",
+    hostDefinitionId: 1,
+    durabilityId: "journal-1",
+    durabilityHostId: "durability-route-1",
+    terminalReceiptRetention: 512,
+  }), {
+    api_key: "test-key",
+    durability_id: "journal-1",
+    durability_host_id: "durability-route-1",
+    terminal_receipt_retention: 512,
+    host_definition_id: 1,
+  });
+});
+
+test("the WASM host bridge routes owner-fenced durability per Agent binding", async () => {
+  const batches = [];
+  let owner;
+  const durability = {
+    acquire(_journalId, { ownerId }) {
+      const fence = String(BigInt(owner?.fence ?? "0") + 1n);
+      owner = { ownerId, fence };
+      return { ...owner, revision: String(batches.length), batches };
+    },
+    append(_journalId, { ownerId, fence, expectedRevision, payload }) {
+      if (ownerId !== owner?.ownerId || fence !== owner?.fence) {
+        return { status: "fenced" };
+      }
+      if (payload === "definite-failure") {
+        return { status: "not_committed", message: "transaction rolled back" };
+      }
+      if (expectedRevision !== String(batches.length)) {
+        return { status: "conflict", actualRevision: String(batches.length) };
+      }
+      const revision = String(batches.length + 1);
+      batches.push({ revision, payload });
+      return { status: "appended", revision };
+    },
+  };
+  const firstHost = { connect() {} };
+  const secondHost = { connect() {} };
+  activateHost(firstHost);
+  const firstRoute = ownDurabilityHost(firstHost, durability, "journal-1");
+  const secondRoute = ownDurabilityHost(secondHost, durability, "journal-1");
+  assert.notEqual(firstRoute.id, secondRoute.id);
+  retainDurabilityHost(firstHost, firstRoute.id);
+  retainDurabilityHost(firstHost, firstRoute.id);
+  retainDurabilityHost(secondHost, secondRoute.id);
+  try {
+    assert.deepEqual(
+      JSON.parse(await globalThis.nanocodexHost.durabilityAcquire(
+        firstRoute.id,
+        "journal-1",
+        "owner-1",
+      )),
+      { owner_id: "owner-1", fence: "1", revision: "0", batches: [] },
+    );
+    assert.deepEqual(
+      JSON.parse(await globalThis.nanocodexHost.durabilityAppend(
+        firstRoute.id,
+        "journal-1",
+        "owner-1",
+        "1",
+        "0",
+        "opaque-rust-batch",
+      )),
+      { status: "appended", revision: "1" },
+    );
+    assert.deepEqual(
+      JSON.parse(await globalThis.nanocodexHost.durabilityAppend(
+        firstRoute.id,
+        "journal-1",
+        "owner-1",
+        "1",
+        "0",
+        "stale",
+      )),
+      { status: "conflict", actual_revision: "1" },
+    );
+    assert.deepEqual(
+      JSON.parse(await globalThis.nanocodexHost.durabilityAppend(
+        firstRoute.id,
+        "journal-1",
+        "owner-1",
+        "1",
+        "1",
+        "definite-failure",
+      )),
+      { status: "not_committed", message: "transaction rolled back" },
+    );
+    assert.deepEqual(
+      JSON.parse(await globalThis.nanocodexHost.durabilityAcquire(
+        secondRoute.id,
+        "journal-1",
+        "owner-2",
+      )),
+      {
+        owner_id: "owner-2",
+        fence: "2",
+        revision: "1",
+        batches: [{ revision: "1", payload: "opaque-rust-batch" }],
+      },
+    );
+    assert.deepEqual(
+      JSON.parse(await globalThis.nanocodexHost.durabilityAppend(
+        firstRoute.id,
+        "journal-1",
+        "owner-1",
+        "1",
+        "1",
+        "stale-owner",
+      )),
+      { status: "fenced" },
+    );
+    await assert.rejects(
+      globalThis.nanocodexHost.durabilityAcquire(
+        firstRoute.id,
+        "another-journal",
+        "owner-3",
+      ),
+      /route does not own journal/,
+    );
+    releaseDurabilityHost(firstHost, firstRoute.id);
+    assert.equal(
+      JSON.parse(await globalThis.nanocodexHost.durabilityAcquire(
+        firstRoute.id,
+        "journal-1",
+        "owner-3",
+      )).fence,
+      "3",
+      "releasing a child host reference must preserve its parent's journal binding",
+    );
+    releaseDurabilityHost(firstHost, firstRoute.id);
+    await assert.rejects(
+      globalThis.nanocodexHost.durabilityAcquire(
+        firstRoute.id,
+        "journal-1",
+        "owner-4",
+      ),
+      /no Nanocodex host owns durability route/,
+    );
+    assert.equal(
+      JSON.parse(await globalThis.nanocodexHost.durabilityAcquire(
+        secondRoute.id,
+        "journal-1",
+        "owner-5",
+      )).fence,
+      "4",
+      "releasing one route must not release another route for the same journal",
+    );
+  } finally {
+    releaseDurabilityHost(firstHost, firstRoute.id);
+    releaseDurabilityHost(secondHost, secondRoute.id);
+  }
+  await assert.rejects(
+    globalThis.nanocodexHost.durabilityAcquire(firstRoute.id, "journal-1", "owner-4"),
+    /no Nanocodex host owns durability route/,
+  );
 });
 
 test("concurrent graceful shutdown defers exactly-once release until the join completes", async () => {
@@ -371,11 +900,14 @@ test("a failing event listener is reported without interrupting other observers"
 function rawAgent(sessionId) {
   return {
     sessionId,
-    prompt(input) {
-      return rawTurn(`${sessionId}:${input}`);
+    prompt(input, id) {
+      return rawTurn(id === undefined
+        ? `${sessionId}:${input}`
+        : `${sessionId}:${id}:${input}`);
     },
-    promptContent(input) {
-      return rawTurn(`${sessionId}:${JSON.parse(input)[0].text}`);
+    promptContent(input, id) {
+      const text = JSON.parse(input)[0].text;
+      return rawTurn(id === undefined ? `${sessionId}:${text}` : `${sessionId}:${id}:${text}`);
     },
     async fork() {
       return rawAgent(`${sessionId}-fork`);
@@ -387,6 +919,33 @@ function rawAgent(sessionId) {
       return rawAgent(`${sessionId}-spawn`);
     },
     async compact() {},
+    async context() {
+      return JSON.stringify({
+        workspace: "/workspace",
+        history: [{ type: "message", role: "developer" }],
+      });
+    },
+    async appendDeveloperMessage() {
+      return JSON.stringify({
+        workspace: "/workspace",
+        history: [{ type: "message", role: "developer" }],
+      });
+    },
+    async startRealtimeConversation() {
+      return this.appendDeveloperMessage();
+    },
+    async endRealtimeConversation() {
+      return this.appendDeveloperMessage();
+    },
+    realtimeDelegation(input, transcript) {
+      return `delegated:${input}:${JSON.parse(transcript).map(({ role, text }) => `${role}: ${text}`).join("\n")}`;
+    },
+    realtimeTailDelegation(transcript) {
+      const entries = JSON.parse(transcript);
+      return entries.length
+        ? `tail:${entries.map(({ role, text }) => `${role}: ${text}`).join("\n")}`
+        : undefined;
+    },
     free() {},
   };
 }

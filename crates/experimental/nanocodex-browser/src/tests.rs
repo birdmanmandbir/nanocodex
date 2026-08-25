@@ -15,14 +15,43 @@ use tokio::{
 use super::{
     BraveSession, Browser, BrowserAction, BrowserActionName, BrowserActionResult,
     BrowserAfterAction, BrowserBuildError, BrowserClickOptions, BrowserColorScheme, BrowserContext,
-    BrowserCookie, BrowserCruxClient, BrowserCruxScope, BrowserDocumentReadyState,
-    BrowserEgressPolicy, BrowserError, BrowserKeyModifier, BrowserLighthouseCategory,
+    BrowserCookie, BrowserCruxClient, BrowserCruxScope, BrowserDevicePreset,
+    BrowserDocumentReadyState, BrowserEgressPolicy, BrowserError, BrowserIosConfig,
+    BrowserIosDeviceSelector, BrowserKeyModifier, BrowserLighthouseCategory,
     BrowserLighthouseFormFactor, BrowserLoadState, BrowserNetworkBodyKind, BrowserNetworkContext,
-    BrowserOriginStorage, BrowserPerformanceInsight, BrowserPostActionSnapshot, BrowserPseudoClass,
-    BrowserReactEventKind, BrowserReducedMotion, BrowserRouteHeader, BrowserRouteResponse,
-    BrowserStorageState, BrowserTarget, BrowserTool, BrowserViewport, BrowserWaitForSelectorState,
-    ReactDiagnostics, VirtualAuthenticator,
+    BrowserOrientation, BrowserOriginStorage, BrowserPasskeyMode, BrowserPerformanceInsight,
+    BrowserPostActionSnapshot, BrowserPseudoClass, BrowserReactEventKind, BrowserReducedMotion,
+    BrowserRouteHeader, BrowserRouteResponse, BrowserStorageState, BrowserTarget, BrowserTool,
+    BrowserViewport, BrowserWaitForSelectorState, HostPasskeyAuthenticator, IosBrowser,
+    ReactDiagnostics, VirtualAuthenticator, browser_tool_builder,
 };
+
+#[test]
+fn browser_tool_enables_virtual_platform_passkeys() {
+    assert_eq!(
+        browser_tool_builder().virtual_authenticator,
+        Some(VirtualAuthenticator::platform_passkey())
+    );
+}
+
+#[test]
+fn host_and_virtual_passkey_policies_are_mutually_exclusive() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let executable = directory.path().join("desktop-browser");
+    std::fs::write(&executable, [])?;
+    let error = Browser::builder()
+        .virtual_authenticator(VirtualAuthenticator::platform_passkey())
+        .host_passkey_authenticator(HostPasskeyAuthenticator::new(executable))
+        .build()
+        .err()
+        .ok_or_else(|| eyre!("expected mutually exclusive passkey policies"))?;
+    assert!(matches!(
+        error,
+        BrowserBuildError::Configuration { ref message }
+            if message == "host and virtual passkey authenticators cannot be enabled together"
+    ));
+    Ok(())
+}
 
 #[test]
 fn remote_browser_accepts_cookie_only_brave_sessions() -> Result<()> {
@@ -38,6 +67,31 @@ fn remote_browser_accepts_cookie_only_brave_sessions() -> Result<()> {
         .cdp_endpoint(url::Url::parse("ws://127.0.0.1:9222")?)
         .brave_session(brave)
         .build()?;
+    Ok(())
+}
+
+#[test]
+fn caller_owned_browser_profile_is_created_and_not_deleted() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let profile = directory.path().join("durable-profile");
+    let browser = Browser::builder().persistent_profile(&profile).build()?;
+
+    assert!(profile.is_dir());
+    drop(browser);
+    assert!(profile.is_dir());
+    Ok(())
+}
+
+#[test]
+fn remote_browser_rejects_a_local_persistent_profile() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    assert!(matches!(
+        Browser::builder()
+            .cdp_endpoint(url::Url::parse("ws://127.0.0.1:9222")?)
+            .persistent_profile(directory.path())
+            .build(),
+        Err(BrowserBuildError::Configuration { .. })
+    ));
     Ok(())
 }
 
@@ -141,13 +195,264 @@ async fn virtual_credentials_require_the_first_navigation() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn authentication_handoff_requires_an_authenticated_brave_session() -> Result<()> {
-    let browser = Browser::new()?;
+#[tokio::test]
+#[ignore = "requires a local Chrome or Chromium installation"]
+async fn virtual_passkeys_persist_across_browser_sessions() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let credential_store = directory.path().join("browser/passkeys.json");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(serve_passkey_fixture(listener));
+    let url = format!("http://localhost:{}/", address.port());
+
+    let first = Browser::builder()
+        .virtual_authenticator(
+            VirtualAuthenticator::platform_passkey().credential_store(credential_store.clone()),
+        )
+        .build()?;
+    first
+        .execute(BrowserAction::Open { url: url.clone() })
+        .await?;
+    first
+        .execute(BrowserAction::Click {
+            target: BrowserTarget::role("button").named("Register passkey"),
+            options: None,
+        })
+        .await?;
+    let registration_wait = first
+        .execute(BrowserAction::WaitForText {
+            text: "registered".to_owned(),
+            target: Some(BrowserTarget::css("#status")),
+            hidden: false,
+        })
+        .await;
+    if let Err(error) = registration_wait {
+        let status = first
+            .execute(BrowserAction::Evaluate {
+                expression: "document.querySelector('#status').textContent".to_owned(),
+            })
+            .await?;
+        return Err(eyre!(
+            "passkey registration failed with {status:?}: {error}"
+        ));
+    }
+    let registered = first.virtual_credentials().await?;
+    assert_eq!(registered.len(), 1);
+    let credential_id = registered[0].credential_id.clone();
+    let registration_count = registered[0].sign_count;
+    first.close().await?;
+    assert!(credential_store.is_file());
+
+    let second = Browser::builder()
+        .virtual_authenticator(
+            VirtualAuthenticator::platform_passkey().credential_store(credential_store),
+        )
+        .build()?;
+    second.execute(BrowserAction::Open { url }).await?;
+    let restored = second.virtual_credentials().await?;
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].credential_id, credential_id);
+    let listed = second.execute(BrowserAction::Passkeys).await?;
     assert!(matches!(
-        browser.auth_handoff(url::Url::parse("https://example.com")?),
-        Err(BrowserError::BraveSessionNotConfigured)
+        listed,
+        BrowserActionResult::Passkeys {
+            mode: BrowserPasskeyMode::Auto,
+            ref credentials,
+            ..
+        } if credentials.len() == 1 && credentials[0].credential_id == credential_id
     ));
+    let selected = second
+        .execute(BrowserAction::PasskeyUse {
+            credential_id: credential_id.clone(),
+            relying_party_id: restored[0].relying_party_id.clone(),
+        })
+        .await?;
+    assert!(matches!(
+        selected,
+        BrowserActionResult::Passkeys {
+            mode: BrowserPasskeyMode::Use { ref credential_id, .. },
+            ..
+        } if credential_id == &registered[0].credential_id
+    ));
+    second
+        .execute(BrowserAction::Click {
+            target: BrowserTarget::role("button").named("Authenticate passkey"),
+            options: None,
+        })
+        .await?;
+    let authentication_wait = second
+        .execute(BrowserAction::WaitForText {
+            text: "authenticated".to_owned(),
+            target: Some(BrowserTarget::css("#status")),
+            hidden: false,
+        })
+        .await;
+    if let Err(error) = authentication_wait {
+        let status = second
+            .execute(BrowserAction::Evaluate {
+                expression: "document.querySelector('#status').textContent".to_owned(),
+            })
+            .await?;
+        return Err(eyre!(
+            "passkey authentication failed with {status:?}: {error}"
+        ));
+    }
+    let authenticated = second.virtual_credentials().await?;
+    assert_eq!(authenticated.len(), 1);
+    assert_eq!(authenticated[0].credential_id, credential_id);
+    assert!(authenticated[0].sign_count > registration_count);
+    let fresh = second.execute(BrowserAction::PasskeyNew).await?;
+    assert!(matches!(
+        fresh,
+        BrowserActionResult::Passkeys {
+            mode: BrowserPasskeyMode::New,
+            ref credentials,
+            ..
+        } if credentials.len() == 1 && credentials[0].credential_id == credential_id
+    ));
+    let automatic = second.execute(BrowserAction::PasskeyAuto).await?;
+    assert!(matches!(
+        automatic,
+        BrowserActionResult::Passkeys {
+            mode: BrowserPasskeyMode::Auto,
+            ref credentials,
+            ..
+        } if credentials.len() == 1 && credentials[0].credential_id == credential_id
+    ));
+    second.close().await?;
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local Chrome or Chromium installation"]
+async fn virtual_authenticator_is_reused_when_returning_to_a_tab() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let credential_store = directory.path().join("browser/passkeys.json");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(serve_passkey_fixture(listener));
+    let url = format!("http://localhost:{}/", address.port());
+    let browser = Browser::builder()
+        .virtual_authenticator(
+            VirtualAuthenticator::platform_passkey().credential_store(credential_store),
+        )
+        .build()?;
+
+    browser
+        .execute(BrowserAction::Open { url: url.clone() })
+        .await?;
+    let BrowserActionResult::Tabs { tabs, .. } = browser.execute(BrowserAction::ListTabs).await?
+    else {
+        return Err(eyre!("expected browser tabs"));
+    };
+    let original_tab = tabs
+        .into_iter()
+        .find(|tab| tab.active)
+        .ok_or_else(|| eyre!("missing active browser tab"))?
+        .tab_id;
+    browser
+        .execute(BrowserAction::NewTab { url: Some(url) })
+        .await?;
+    browser
+        .execute(BrowserAction::SelectTab {
+            tab_id: original_tab,
+        })
+        .await?;
+    browser.execute(BrowserAction::Passkeys).await?;
+    let BrowserActionResult::Tabs { tabs, .. } = browser.execute(BrowserAction::ListTabs).await?
+    else {
+        return Err(eyre!("expected browser tabs"));
+    };
+    let inactive_tab = tabs
+        .into_iter()
+        .find(|tab| !tab.active)
+        .ok_or_else(|| eyre!("missing inactive browser tab"))?
+        .tab_id;
+    browser
+        .execute(BrowserAction::CloseTab {
+            tab_id: inactive_tab,
+        })
+        .await?;
+    browser.execute(BrowserAction::Passkeys).await?;
+
+    browser.close().await?;
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local Chrome or Chromium installation"]
+async fn virtual_authenticator_reaches_a_window_open_popup() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(serve_passkey_fixture(listener));
+    let url = format!("http://localhost:{}/", address.port());
+    let browser = Browser::builder()
+        .virtual_authenticator(
+            VirtualAuthenticator::platform_passkey()
+                .credential_store(directory.path().join("passkeys.json")),
+        )
+        .build()?;
+
+    browser
+        .execute(BrowserAction::Open { url: url.clone() })
+        .await?;
+    let BrowserActionResult::Tabs { tabs, .. } = browser.execute(BrowserAction::ListTabs).await?
+    else {
+        return Err(eyre!("expected browser tabs"));
+    };
+    let opener = tabs
+        .into_iter()
+        .find(|tab| tab.active)
+        .ok_or_else(|| eyre!("missing active opener tab"))?
+        .tab_id;
+    browser
+        .execute(BrowserAction::Evaluate {
+            expression: "window.open(location.href, 'passkey-popup', 'popup=yes,width=440,height=720') !== null".to_owned(),
+        })
+        .await?;
+    let mut popup = None;
+    for _ in 0..100 {
+        let BrowserActionResult::Tabs { tabs, .. } =
+            browser.execute(BrowserAction::ListTabs).await?
+        else {
+            return Err(eyre!("expected browser tabs"));
+        };
+        if let Some(tab) = tabs
+            .into_iter()
+            .find(|tab| tab.tab_id != opener && tab.url == url)
+        {
+            popup = Some(tab.tab_id);
+            break;
+        }
+        browser
+            .execute(BrowserAction::WaitForTimeout { milliseconds: 50 })
+            .await?;
+    }
+    let popup = popup.ok_or_else(|| eyre!("window.open popup was not discovered"))?;
+    browser
+        .execute(BrowserAction::SelectTab { tab_id: popup })
+        .await?;
+    browser.execute(BrowserAction::PasskeyNew).await?;
+    browser
+        .execute(BrowserAction::Click {
+            target: BrowserTarget::role("button").named("Register passkey"),
+            options: None,
+        })
+        .await?;
+    browser
+        .execute(BrowserAction::WaitForText {
+            text: "registered".to_owned(),
+            target: Some(BrowserTarget::css("#status")),
+            hidden: false,
+        })
+        .await?;
+    assert_eq!(browser.virtual_credentials().await?.len(), 1);
+
+    browser.close().await?;
+    server.abort();
     Ok(())
 }
 
@@ -253,6 +558,182 @@ text({ opened, snapshot, clicked, html, elementContext });
     Ok(())
 }
 
+#[test]
+fn recording_browser_exposes_extension_lifecycle_actions() -> Result<()> {
+    let (_browser, recording) = BrowserTool::recording();
+
+    let loaded = recording.record(BrowserAction::LoadExtension {
+        path: "extensions/chrome/.output/chrome-mv3".into(),
+    })?;
+    let triggered = recording.record(BrowserAction::TriggerExtensionAction {
+        extension_id: "abcdefghijklmnop".to_owned(),
+        tab_id: Some("tab-1".to_owned()),
+    })?;
+
+    assert!(matches!(
+        loaded,
+        BrowserActionResult::Extension {
+            extension_id,
+            executed: false,
+            ..
+        } if extension_id.is_empty()
+    ));
+    assert!(matches!(
+        triggered,
+        BrowserActionResult::Action {
+            action: BrowserActionName::TriggerExtensionAction,
+            executed: false,
+            ..
+        }
+    ));
+    assert_eq!(recording.actions()?.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn recording_browser_exposes_model_controlled_passkey_modes() -> Result<()> {
+    let (_browser, recording) = BrowserTool::recording();
+
+    let listed = recording.record(BrowserAction::Passkeys)?;
+    let selected = recording.record(BrowserAction::PasskeyUse {
+        credential_id: "credential-id".to_owned(),
+        relying_party_id: Some("wallet.example".to_owned()),
+    })?;
+    let fresh = recording.record(BrowserAction::PasskeyNew)?;
+    let automatic = recording.record(BrowserAction::PasskeyAuto)?;
+    let host_started = recording.record(BrowserAction::HostPasskeyStart)?;
+    let host_resumed = recording.record(BrowserAction::HostPasskeyResume)?;
+
+    assert!(matches!(
+        listed,
+        BrowserActionResult::Passkeys {
+            action: BrowserActionName::Passkeys,
+            mode: BrowserPasskeyMode::Auto,
+            ..
+        }
+    ));
+    assert!(matches!(
+        selected,
+        BrowserActionResult::Passkeys {
+            action: BrowserActionName::PasskeyUse,
+            mode: BrowserPasskeyMode::Use {
+                credential_id,
+                relying_party_id: Some(relying_party_id),
+            },
+            ..
+        } if credential_id == "credential-id" && relying_party_id == "wallet.example"
+    ));
+    assert!(matches!(
+        fresh,
+        BrowserActionResult::Passkeys {
+            action: BrowserActionName::PasskeyNew,
+            mode: BrowserPasskeyMode::New,
+            ..
+        }
+    ));
+    assert!(matches!(
+        automatic,
+        BrowserActionResult::Passkeys {
+            action: BrowserActionName::PasskeyAuto,
+            mode: BrowserPasskeyMode::Auto,
+            ..
+        }
+    ));
+    assert!(matches!(
+        host_started,
+        BrowserActionResult::Action {
+            action: BrowserActionName::HostPasskeyStart,
+            ..
+        }
+    ));
+    assert!(matches!(
+        host_resumed,
+        BrowserActionResult::Action {
+            action: BrowserActionName::HostPasskeyResume,
+            ..
+        }
+    ));
+    Ok(())
+}
+
+#[test]
+fn mobile_device_profiles_are_pinned_and_orientation_aware() {
+    let portrait = BrowserDevicePreset::Iphone15Pro.descriptor(BrowserOrientation::Portrait);
+    let landscape = BrowserDevicePreset::Iphone15Pro.descriptor(BrowserOrientation::Landscape);
+
+    assert_eq!((portrait.width, portrait.height), (393, 852));
+    assert_eq!((landscape.width, landscape.height), (852, 393));
+    assert_eq!(portrait.device_scale_factor, 3.0);
+    assert!(portrait.mobile && portrait.touch);
+    assert_eq!(portrait.max_touch_points, 5);
+    assert_eq!(portrait.platform, "iPhone");
+}
+
+#[test]
+fn recording_browser_exposes_mobile_state_and_audit_contracts() -> Result<()> {
+    let (_browser, recording) = BrowserTool::recording();
+
+    let configured = recording.record(BrowserAction::SetDevice {
+        device: BrowserDevicePreset::Pixel8,
+        orientation: BrowserOrientation::Landscape,
+    })?;
+    let state = recording.record(BrowserAction::MobileState)?;
+    let audit = recording.record(BrowserAction::MobileAudit {
+        devices: vec![BrowserDevicePreset::IphoneSe],
+        orientations: vec![BrowserOrientation::Portrait],
+        ready: None,
+    })?;
+
+    assert!(matches!(
+        configured,
+        BrowserActionResult::Action {
+            action: BrowserActionName::SetDevice,
+            executed: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        state,
+        BrowserActionResult::MobileState {
+            executed: false,
+            state,
+            ..
+        } if state.provider == "chromium_emulation" && !state.verified
+    ));
+    assert!(matches!(
+        audit,
+        BrowserActionResult::MobileAudit {
+            executed: false,
+            audit,
+            ..
+        } if audit.samples.is_empty() && !audit.passed
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn ios_backend_uses_explicit_appium_session_and_reports_real_engine() -> Result<()> {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let endpoint = url::Url::parse(&format!("http://{}/", listener.local_addr()?))?;
+    let server = tokio::spawn(serve_appium_fixture(listener));
+    let browser = IosBrowser::new(BrowserIosConfig::new(
+        endpoint,
+        BrowserIosDeviceSelector::ExactName("iPhone 16 Pro".to_owned()),
+    )?)?;
+
+    let BrowserActionResult::MobileState { state, .. } =
+        browser.execute(BrowserAction::MobileState).await?
+    else {
+        return Err(eyre!("expected iOS mobile state"));
+    };
+    assert_eq!(state.provider, "ios_webdriver");
+    assert_eq!(state.engine, "webkit");
+    assert!(state.verified);
+    browser.close().await?;
+    server.await??;
+    Ok(())
+}
+
 #[tokio::test]
 async fn code_mode_description_exposes_browser_action_schema() -> Result<()> {
     let (browser, _recording) = BrowserTool::recording();
@@ -284,6 +765,11 @@ async fn code_mode_description_exposes_browser_action_schema() -> Result<()> {
     assert!(description.contains(r#"action: "get_styles""#));
     assert!(description.contains(r#"action: "screenshot""#));
     assert!(description.contains("device_scale_factor?: number"));
+    assert!(description.contains(r#"action: "set_device""#));
+    assert!(description.contains(r#"action: "mobile_state""#));
+    assert!(description.contains(r#"action: "mobile_audit""#));
+    assert!(description.contains(r#"device: "iphone_se" | "iphone15_pro""#));
+    assert!(description.contains("horizontalOverflow: number"));
     assert!(description.contains("target?:"));
     assert!(description.contains(r#"action: "pdf""#));
     assert!(description.contains(r#"action: "session_trace_start""#));
@@ -312,9 +798,17 @@ async fn code_mode_description_exposes_browser_action_schema() -> Result<()> {
     assert!(description.contains(r#"action: "axe_audit""#));
     assert!(description.contains(r#"action: "lighthouse_audit""#));
     assert!(description.contains(r#"action: "crux""#));
+    assert!(description.contains(r#"action: "passkeys""#));
+    assert!(description.contains(r#"action: "passkey_use""#));
+    assert!(description.contains(r#"action: "passkey_new""#));
+    assert!(description.contains(r#"action: "passkey_auto""#));
+    assert!(description.contains(r#"action: "host_passkey_start""#));
+    assert!(description.contains(r#"action: "host_passkey_resume""#));
     assert!(description.contains(r#"action: "export_har""#));
     assert!(description.contains(r#"action: "list_frames""#));
     assert!(description.contains(r#"action: "list_tabs""#));
+    assert!(description.contains(r#"action: "load_extension""#));
+    assert!(description.contains(r#"action: "trigger_extension_action""#));
     assert!(description.contains("after?: number"));
     assert!(description.contains("shadowTreeNodeCount: number"));
     assert!(description.contains("bodyAvailable: boolean"));
@@ -328,7 +822,6 @@ async fn code_mode_description_exposes_browser_action_schema() -> Result<()> {
     assert!(description.contains(r#"by: "role""#));
     assert!(description.contains("Promise.all"));
     assert!(description.contains("Promise<{"));
-    assert!(!description.contains("auth_handoff"));
     Ok(())
 }
 
@@ -484,6 +977,100 @@ async fn targeted_screenshots_honor_device_pixel_ratio() -> Result<()> {
             .await,
         Err(BrowserError::TargetWithFullPage)
     ));
+    browser.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local Chrome or Chromium installation"]
+async fn mobile_device_state_and_audit_are_page_observable() -> Result<()> {
+    let macos_chrome =
+        std::path::Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+    let test_chrome = std::env::var_os("NANOCODEX_TEST_CHROME").map(std::path::PathBuf::from);
+    let browser = if let Some(test_chrome) = test_chrome {
+        Browser::with_executable(test_chrome)?
+    } else if macos_chrome.is_file() {
+        Browser::with_executable(macos_chrome)?
+    } else {
+        Browser::new()?
+    };
+    browser
+        .execute(BrowserAction::SetDevice {
+            device: BrowserDevicePreset::IphoneSe,
+            orientation: BrowserOrientation::Portrait,
+        })
+        .await?;
+    browser
+        .execute(BrowserAction::Open {
+            url: "data:text/html,<meta name='viewport' content='width=device-width,initial-scale=1'><style>body{margin:0}button{width:20px;height:20px}input{font-size:12px}.wide{width:450px;height:1px}</style><button id='small'>x</button><input aria-label='message'><div class='wide'></div>".to_owned(),
+        })
+        .await?;
+
+    let BrowserActionResult::Box {
+        bounds: Some(bounds),
+        ..
+    } = browser
+        .execute(BrowserAction::GetBox {
+            target: BrowserTarget::css("input[aria-label='message']"),
+        })
+        .await?
+    else {
+        return Err(eyre!("expected input bounds"));
+    };
+    browser
+        .execute(BrowserAction::TouchTap {
+            x: (bounds.x + bounds.width / 2.0).round() as i32,
+            y: (bounds.y + bounds.height / 2.0).round() as i32,
+        })
+        .await?;
+    browser
+        .execute(BrowserAction::InsertText {
+            text: "touch input proof".to_owned(),
+        })
+        .await?;
+    let BrowserActionResult::Value { value, .. } = browser
+        .execute(BrowserAction::GetValue {
+            target: BrowserTarget::css("input[aria-label='message']"),
+        })
+        .await?
+    else {
+        return Err(eyre!("expected input value"));
+    };
+    assert_eq!(value.as_deref(), Some("touch input proof"));
+
+    let BrowserActionResult::MobileState { state, .. } =
+        browser.execute(BrowserAction::MobileState).await?
+    else {
+        return Err(eyre!("expected mobile state"));
+    };
+    assert!(state.verified, "{:?}", state.mismatches);
+    assert_eq!(state.screen_width, 375.0);
+    assert_eq!(state.screen_height, 667.0);
+    assert_eq!(state.device_pixel_ratio, 2.0);
+    assert_eq!(state.max_touch_points, 5);
+    assert!(state.coarse_pointer && state.no_hover);
+
+    let BrowserActionResult::MobileAudit { audit, .. } = browser
+        .execute(BrowserAction::MobileAudit {
+            devices: vec![BrowserDevicePreset::IphoneSe],
+            orientations: vec![BrowserOrientation::Portrait],
+            ready: None,
+        })
+        .await?
+    else {
+        return Err(eyre!("expected mobile audit"));
+    };
+    assert_eq!(audit.samples.len(), 1);
+    assert!(audit.error_count >= 1, "{audit:#?}");
+    assert!(audit.warning_count >= 2, "{audit:#?}");
+    let rules = audit.samples[0]
+        .findings
+        .iter()
+        .map(|finding| finding.rule.as_str())
+        .collect::<Vec<_>>();
+    assert!(rules.contains(&"horizontal-overflow"));
+    assert!(rules.contains(&"touch-target-size"));
+    assert!(rules.contains(&"input-font-size"));
     browser.close().await?;
     Ok(())
 }
@@ -2293,6 +2880,70 @@ async fn serve_action_fixture(listener: TcpListener) -> std::io::Result<()> {
     }
 }
 
+async fn serve_passkey_fixture(listener: TcpListener) -> std::io::Result<()> {
+    loop {
+        let (mut stream, _) = listener.accept().await?;
+        tokio::spawn(async move {
+            let mut request = [0_u8; 4_096];
+            if stream.read(&mut request).await? == 0 {
+                return Ok(());
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{PASSKEY_FIXTURE_HTML}",
+                PASSKEY_FIXTURE_HTML.len()
+            );
+            stream.write_all(response.as_bytes()).await?;
+            stream.shutdown().await
+        });
+    }
+}
+
+const PASSKEY_FIXTURE_HTML: &str = r##"<!doctype html>
+<button id="register">Register passkey</button>
+<button id="authenticate">Authenticate passkey</button>
+<output id="status" role="status">idle</output>
+<script>
+const challenge = () => crypto.getRandomValues(new Uint8Array(32));
+const status = document.querySelector("#status");
+document.querySelector("#register").addEventListener("click", async () => {
+  try {
+    const credential = await navigator.credentials.create({ publicKey: {
+      challenge: challenge(),
+      rp: { id: location.hostname, name: "Nanocodex passkey fixture" },
+      user: {
+        id: new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]),
+        name: "tester@nanocodex.invalid",
+        displayName: "Nanocodex Tester"
+      },
+      pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+      authenticatorSelection: {
+        authenticatorAttachment: "platform",
+        residentKey: "required",
+        userVerification: "required"
+      },
+      attestation: "none",
+      timeout: 5000
+    }});
+    status.textContent = credential ? "registered" : "registration failed";
+  } catch (error) {
+    status.textContent = `error:${error.name}:${error.message}`;
+  }
+});
+document.querySelector("#authenticate").addEventListener("click", async () => {
+  try {
+    const credential = await navigator.credentials.get({ publicKey: {
+      challenge: challenge(),
+      rpId: location.hostname,
+      userVerification: "required",
+      timeout: 5000
+    }});
+    status.textContent = credential ? "authenticated" : "authentication failed";
+  } catch (error) {
+    status.textContent = `error:${error.name}:${error.message}`;
+  }
+});
+</script>"##;
+
 const ACTION_FIXTURE_HTML: &str = r#"<!doctype html>
 <style>
 body { min-height: 600px; }
@@ -2367,6 +3018,73 @@ worker.onmessage = ({ data }) => {
         stream.write_all(response.as_bytes()).await?;
         stream.shutdown().await?;
     }
+}
+
+async fn serve_appium_fixture(listener: TcpListener) -> std::io::Result<()> {
+    let responses = [
+        serde_json::json!({"value":{"ready":true}}),
+        serde_json::json!({"value":{"sessionId":"ios-session","capabilities":{}}}),
+        serde_json::json!({"value":{
+            "provider":"ios_webdriver","engine":"webkit","url":"https://example.com/",
+            "viewportWidth":393.0,"viewportHeight":852.0,
+            "visualViewportWidth":393.0,"visualViewportHeight":852.0,"visualViewportScale":1.0,
+            "screenWidth":393.0,"screenHeight":852.0,"devicePixelRatio":3.0,
+            "userAgent":"Mozilla/5.0 (iPhone) AppleWebKit/605.1.15 Mobile Safari/604.1",
+            "platform":"iPhone","maxTouchPoints":5,"coarsePointer":true,"noHover":true,
+            "orientation":"portrait","metaViewport":"width=device-width,initial-scale=1",
+            "verified":true,"mismatches":[]
+        }}),
+        serde_json::json!({"value":null}),
+    ];
+    for (index, response) in responses.into_iter().enumerate() {
+        let (mut stream, _) = listener.accept().await?;
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let read = stream.read(&mut buffer).await?;
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                let body_start = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map_or(request.len(), |position| position + 4);
+                if request.len().saturating_sub(body_start) >= content_length {
+                    break;
+                }
+            }
+        }
+        let request = String::from_utf8_lossy(&request);
+        match index {
+            0 => assert!(request.starts_with("GET /status ")),
+            1 => {
+                assert!(request.starts_with("POST /session "));
+                assert!(request.contains(r#""appium:automationName":"XCUITest""#));
+                assert!(request.contains(r#""appium:deviceName":"iPhone 16 Pro""#));
+            }
+            2 => assert!(request.starts_with("POST /session/ios-session/execute/sync ")),
+            3 => assert!(request.starts_with("DELETE /session/ios-session ")),
+            _ => unreachable!(),
+        }
+        let body = response.to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await?;
+    }
+    Ok(())
 }
 
 const MANAGED_BROWSER_SOURCE: &str = r#"

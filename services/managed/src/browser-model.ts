@@ -1,0 +1,114 @@
+import { authenticate, type AccountAuthEnv } from "./account-auth";
+import { bindAgentCredential } from "./credentials";
+
+const MODEL_HOST = "nanocodex.internal";
+const STATUS_HOST = "broker.internal";
+const STATUS_PATH = "/.well-known/nanocodex/model-status";
+const MODEL_PATHS = new Set([
+  "/v1/responses",
+  "/v1/search",
+  "/v1/images/generations",
+  "/v1/images/edits",
+  "/v1/realtime/calls",
+  "/v1/realtime/sideband",
+]);
+
+type BrowserModelEnv = AccountAuthEnv & {
+  NANOCODEX: Fetcher;
+  NANOCODEX_SESSIONS: {
+    idFromName(name: string): DurableObjectId;
+    get(id: DurableObjectId): Fetcher;
+  };
+};
+
+/**
+ * Authenticates browser-owned model traffic inside the private managed Worker,
+ * binds one opaque broker subject to the account, and forwards no account
+ * cookie beyond this boundary.
+ */
+export async function routeBrowserModel(
+  request: Request,
+  env: BrowserModelEnv,
+  url: URL,
+): Promise<Response | undefined> {
+  const status = url.protocol === "https:" && url.hostname === STATUS_HOST
+    && !url.port && !url.search && !url.hash && url.pathname === STATUS_PATH
+    && request.method === "GET";
+  const model = url.protocol === "https:" && url.hostname === MODEL_HOST
+    && !url.port && !url.search && !url.hash && MODEL_PATHS.has(url.pathname);
+  if (!status && !model) return undefined;
+
+  const authenticationHeaders = new Headers(request.headers);
+  authenticationHeaders.delete("authorization");
+  authenticationHeaders.delete("x-nanocodex-subject");
+  const principal = await authenticate(
+    new Request(request.url, {
+      method: request.method,
+      headers: authenticationHeaders,
+      signal: request.signal,
+    }),
+    env,
+    url,
+  );
+  if (!principal || principal.kind !== "account_session") {
+    return Response.json({ error: "unauthorized" }, {
+      status: 401,
+      headers: { "cache-control": "no-store" },
+    });
+  }
+  const realtimeSubject = model && url.pathname.startsWith("/v1/realtime/")
+    ? await ownedRealtimeSubject(request, env, principal.userId)
+    : undefined;
+  if (realtimeSubject instanceof Response) return realtimeSubject;
+  const subject = realtimeSubject ?? await browserModelSubject(principal.userId);
+  try {
+    await bindAgentCredential(env.NANOCODEX, subject, principal.userId);
+  } catch {
+    return Response.json({ error: "credential_broker_unavailable" }, {
+      status: 503,
+      headers: { "cache-control": "no-store" },
+    });
+  }
+
+  const headers = new Headers(request.headers);
+  headers.delete("cookie");
+  headers.delete("x-nanocodex-agent-id");
+  headers.set("x-nanocodex-subject", subject);
+  return env.NANOCODEX.fetch(new Request(request, { headers }));
+}
+
+async function ownedRealtimeSubject(
+  request: Request,
+  env: BrowserModelEnv,
+  userId: string,
+): Promise<string | Response | undefined> {
+  const agentId = request.headers.get("x-nanocodex-agent-id");
+  if (agentId === null) return undefined;
+  const identities = [
+    request.headers.get("x-session-id"),
+    request.headers.get("session-id"),
+    request.headers.get("thread-id"),
+  ];
+  if (!UUID.test(agentId) || identities.some((identity) => identity !== agentId)) {
+    return Response.json({ error: "not_found" }, { status: 404 });
+  }
+  const durableId = env.NANOCODEX_SESSIONS.idFromName(agentId);
+  const owned = await env.NANOCODEX_SESSIONS.get(durableId).fetch("https://session.internal/state", {
+    headers: { "x-nanocodex-owner-id": userId },
+  });
+  await owned.body?.cancel();
+  if (!owned.ok) return Response.json({ error: "not_found" }, { status: 404 });
+  return durableId.toString();
+}
+
+async function browserModelSubject(userId: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(`browser-model-v1:${userId}`),
+  );
+  let binary = "";
+  for (const byte of new Uint8Array(digest)) binary += String.fromCharCode(byte);
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

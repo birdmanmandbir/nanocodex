@@ -1,306 +1,155 @@
 import {
-  lazy,
   memo,
-  Suspense,
   useCallback,
-  useEffect,
-  useState,
+  useMemo,
 } from "react";
 import {
-  NanocodexProvider,
+  createConfig,
   useNanocodex,
-  useNanocodexMessage,
 } from "nanocodex-react";
-import { NanocodexTui } from "nanocodex-tui-react";
-import type { Address } from "viem";
-import "nanocodex-tui-react/structure.css";
-
+import type { ArtifactDocument } from "nanocodex/tools/artifact";
 import {
-  nanocodexConfig,
-  type AgentTransport,
-  type PaymentStatus,
-  type WebTuiCommand,
-  type WebTuiMessage,
-} from "./nanocodex";
+  AgentTerminalView,
+  type AgentTerminalMode,
+  type AgentTerminalState,
+} from "nanocodex-terminal";
+import {
+  inactiveTerminalMessage,
+  type ModelSessionStatus,
+  type CredentialSource,
+} from "./modelSession";
+import { ArtifactDock } from "./ArtifactDock";
+import { browserMcpConfiguration } from "./browserMcp";
+import { clientFailureMessage } from "./clientFailure";
+import { managedTerminalAgent, openManagedAgent } from "./managedAgentRuntime";
 
-const MppControls = lazy(async () => ({
-  default: (await import("./MppControls")).MppControls,
-}));
+export type { AgentTerminalMode, AgentTerminalState } from "nanocodex-terminal";
+export { AgentTerminalView } from "nanocodex-terminal";
 
-/** Website policy around the reusable TUI: credential UX and the site theme. */
-export const AgentTerminal = memo(function AgentTerminal() {
+/** Authenticated website policy around the headless Agent SDK and shared transcript view. */
+export const AgentTerminal = memo(function AgentTerminal({
+  authStatus,
+  beforeLocalTurn,
+  mode,
+  onConversationActivity,
+  onStateChange,
+  source,
+  threadId,
+  welcome,
+}: {
+  authStatus: ModelSessionStatus | undefined;
+  beforeLocalTurn(): Promise<void>;
+  mode: AgentTerminalMode;
+  onConversationActivity(input: string): void;
+  onStateChange(state: AgentTerminalState): void;
+  source: Exclude<CredentialSource, null>;
+  threadId: string;
+  welcome?: string;
+}) {
+  const agentConfig = useMemo(() => createConfig({
+    agent: {
+      mcp: browserMcpConfiguration(location.origin, threadId),
+      durability: false,
+    },
+  }), [threadId]);
+  const {
+    data: agent,
+    error,
+    isError,
+    refetch,
+  } = useNanocodex({ config: agentConfig, threadId });
+  const retryAgent = useCallback(() => {
+    refetch();
+  }, [refetch]);
   return (
-    <NanocodexProvider config={nanocodexConfig}>
-      <AgentTerminalDemo />
-    </NanocodexProvider>
+    <AgentTerminalView
+      agent={agent}
+      agentError={isError ? errorMessage(error) : undefined}
+      inactiveMessage={({ agentError, agentStatus }) => inactiveTerminalMessage({
+        agentError,
+        agentStatus,
+        authStatus,
+        capabilityError: undefined,
+        source,
+      })}
+      mode={mode}
+      onConversationActivity={onConversationActivity}
+      onStateChange={onStateChange}
+      retryAgent={retryAgent}
+      voice
+      voiceOptions={{ beforeAgentTurn: beforeLocalTurn }}
+      welcome={welcome}
+      accessory={({ agentReady, submit }) => (
+        <ArtifactDock
+          agentReady={agentReady}
+          onPrompt={(artifact, prompt, path) => submit(artifactFollowOnPrompt(artifact, path, prompt))}
+        />
+      )}
+    />
   );
 });
 
-function AgentTerminalDemo() {
-  const agent = useNanocodex<WebTuiCommand>();
-  const [transport, setTransport] = useState<AgentTransport>("openai");
-  const [credentialSource, setCredentialSource] = useState<CredentialSource | undefined>();
-  const [payment, setPayment] = useState<PaymentStatus>();
-  const [jsonl, setJsonl] = useState<string[]>([]);
-  useNanocodexMessage<WebTuiMessage>((message) => {
-    if (message.type === "mppPayment") setPayment(message.payment);
-    if (message.type === "mppJsonl") {
-      setJsonl((current) => [...current.slice(-99), message.line]);
-    }
-  });
-  useEffect(() => {
-    setPayment(undefined);
-    setJsonl([]);
-    if (transport !== "openai") return;
-    if (credentialSource === "subscription") {
-      nanocodexConfig.restart(startCommand("chatgpt"));
-    } else if (credentialSource === "user" || credentialSource === "deployment") {
-      nanocodexConfig.restart(startCommand("openai"));
-    } else {
-      nanocodexConfig.disconnect();
-    }
-  }, [credentialSource, transport]);
-
-  const startMpp = useCallback((payerAddress: Address) => {
-    nanocodexConfig.restart(startCommand("mpp", payerAddress));
-  }, []);
-  const disconnectMpp = useCallback(() => nanocodexConfig.disconnect(), []);
-  const selectTransport = (next: AgentTransport) => {
-    if (next === transport) return;
-    nanocodexConfig.disconnect();
-    setTransport(next);
-  };
-
-  const enabled = transport === "openai"
-    ? credentialSource === "subscription"
-      || credentialSource === "user"
-      || credentialSource === "deployment"
-    : agent.status === "ready";
-  const unavailableMessage = transport === "openai"
-    ? credentialSource === undefined
-      ? "Checking ChatGPT login..."
-      : "Sign in with ChatGPT to start the agent"
-    : agent.status === "starting"
-      ? "Starting paid MPP session..."
-      : agent.status === "error"
-        ? agent.error ?? "MPP session failed"
-        : "Connect Tempo to authorize an MPP session";
-
-  return (
-    <div className="nanocodex-demo">
-      <div className="agent-transport" role="group" aria-label="Agent connection">
-        <button
-          type="button"
-          aria-pressed={transport === "openai"}
-          onClick={() => selectTransport("openai")}
-        >ChatGPT subscription</button>
-        <button
-          type="button"
-          aria-pressed={transport === "mpp"}
-          onClick={() => selectTransport("mpp")}
-        >Tempo MPP</button>
-      </div>
-      {transport === "openai" ? (
-        <SubscriptionBar source={credentialSource} onSourceChange={setCredentialSource} />
-      ) : (
-        <Suspense fallback={<aside className="agent-byok">Loading Tempo Accounts…</aside>}>
-          <MppControls
-            jsonl={jsonl}
-            payment={payment}
-            onDisconnect={disconnectMpp}
-            onReady={startMpp}
-          />
-        </Suspense>
-      )}
-      <NanocodexTui
-        key={transport}
-        enabled={enabled}
-        unavailableMessage={unavailableMessage}
-      />
-    </div>
-  );
-}
-
-function startCommand(transport: "openai" | "chatgpt"): WebTuiCommand;
-function startCommand(transport: "mpp", payerAddress: Address): WebTuiCommand;
-function startCommand(transport: "openai" | "chatgpt" | "mpp", payerAddress?: Address): WebTuiCommand {
-  if (transport === "mpp") {
-    if (!payerAddress) throw new Error("MPP requires a connected Tempo account");
-    return {
-      type: "start",
-      transport,
-      payerAddress,
-      thinking: "none",
-      reasoningMode: "standard",
-    };
-  }
-  return {
-    type: "start",
-    transport,
-    thinking: "high",
-    reasoningMode: "standard",
-  };
-}
-
-type CredentialSource = "subscription" | "user" | "deployment" | null;
-type ChatGptStatus =
-  | { state: "signed_out" }
-  | {
-      state: "pending";
-      verificationUrl: string;
-      userCode: string;
-      expiresAt: number;
-      pollAfterMs: number;
-    }
-  | { state: "authenticated"; accountId?: string; expiresAt?: number | null }
-  | { state: "expired" }
-  | { state: "error"; error: string };
-
-function SubscriptionBar({
+export const ManagedAgentTerminal = memo(function ManagedAgentTerminal({
+  agentId,
+  authStatus,
+  mode,
+  onConversationActivity,
+  onStateChange,
   source,
-  onSourceChange,
 }: {
-  source: CredentialSource | undefined;
-  onSourceChange(source: CredentialSource): void;
+  agentId: string;
+  authStatus: ModelSessionStatus | undefined;
+  mode: AgentTerminalMode;
+  onConversationActivity(input: string): void;
+  onStateChange(state: AgentTerminalState): void;
+  source: Exclude<CredentialSource, null>;
 }) {
-  const [status, setStatus] = useState<ChatGptStatus>();
-  const [busy, setBusy] = useState(false);
-  const refreshStatus = useCallback(async () => {
-    try {
-      const response = await fetch("/api/auth/chatgpt", {
-        credentials: "same-origin",
-      });
-      if (!response.ok) throw new Error(await credentialError(response));
-      const next = await response.json() as ChatGptStatus;
-      setStatus(next);
-      if (next.state === "authenticated") {
-        onSourceChange("subscription");
-      } else if (next.state === "pending") {
-        onSourceChange(null);
-      } else {
-        const health = await fetch("/api/health", { credentials: "same-origin" });
-        const payload = health.ok
-          ? await health.json() as { agent_configured?: boolean; credential_source?: unknown }
-          : undefined;
-        onSourceChange(payload?.agent_configured === true
-          && (payload.credential_source === "user" || payload.credential_source === "deployment")
-          ? payload.credential_source
-          : null);
-      }
-    } catch (cause) {
-      setStatus({
-        state: "error",
-        error: cause instanceof Error ? cause.message : "Could not check the ChatGPT login.",
-      });
-      onSourceChange(null);
-    }
-  }, [onSourceChange]);
-
-  useEffect(() => {
-    void refreshStatus();
-  }, [refreshStatus]);
-
-  useEffect(() => {
-    if (status?.state !== "pending") return;
-    const delay = Math.min(30_000, Math.max(500, status.pollAfterMs));
-    const timer = window.setTimeout(() => void refreshStatus(), delay);
-    return () => window.clearTimeout(timer);
-  }, [refreshStatus, status]);
-
-  const startLogin = async () => {
-    const authWindow = window.open("about:blank", "nanocodex-chatgpt-login");
-    setBusy(true);
-    try {
-      const response = await fetch("/api/auth/chatgpt", {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { "x-nanocodex-request": "1" },
-      });
-      if (!response.ok) throw new Error(await credentialError(response));
-      const next = await response.json() as ChatGptStatus;
-      if (next.state !== "pending") throw new Error("ChatGPT did not return a login code.");
-      setStatus(next);
-      onSourceChange(null);
-      if (authWindow) {
-        authWindow.opener = null;
-        authWindow.location.href = next.verificationUrl;
-      }
-    } catch (cause) {
-      authWindow?.close();
-      setStatus({
-        state: "error",
-        error: cause instanceof Error ? cause.message : "Could not start ChatGPT login.",
-      });
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const signOut = async () => {
-    setBusy(true);
-    try {
-      const response = await fetch("/api/auth/chatgpt", {
-        method: "DELETE",
-        credentials: "same-origin",
-        headers: { "x-nanocodex-request": "1" },
-      });
-      if (!response.ok) throw new Error(await credentialError(response));
-      setStatus({ state: "signed_out" });
-      await refreshStatus();
-    } catch (cause) {
-      setStatus({
-        state: "error",
-        error: cause instanceof Error ? cause.message : "Could not sign out of ChatGPT.",
-      });
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const label = status?.state === "authenticated"
-    ? "Connected to your ChatGPT subscription"
-    : status?.state === "pending"
-      ? "Finish signing in with ChatGPT"
-      : source === "user"
-        ? "Using your existing API-key session"
-        : source === "deployment"
-          ? "Using the site demo key"
-          : status === undefined || source === undefined
-            ? "Checking ChatGPT login"
-            : "Sign in to use your ChatGPT subscription";
-
+  const managed = useMemo(() => openManagedAgent(agentId), [agentId]);
+  const agent = useMemo(() => managedTerminalAgent(managed), [managed]);
+  const retryAgent = useCallback(() => {}, []);
   return (
-    <aside className="agent-byok" aria-label="ChatGPT subscription login">
-      <div className="agent-byok-summary">
-        <span><i className={source ? "is-ready" : ""} aria-hidden="true" />{label}</span>
-        <div>
-          {status?.state === "authenticated" ? (
-            <button type="button" onClick={signOut} disabled={busy}>Sign out</button>
-          ) : (
-            <button type="button" onClick={startLogin} disabled={busy || status?.state === "pending"}>
-              {busy ? "Starting…" : "Sign in with ChatGPT"}
-            </button>
-          )}
-        </div>
-      </div>
-      {status?.state === "pending" ? (
-        <div className="agent-oauth-code">
-          <span>Enter code <strong>{status.userCode}</strong> at ChatGPT.</span>
-          <button type="button" onClick={() => void navigator.clipboard.writeText(status.userCode)}>
-            Copy code
-          </button>
-          <a href={status.verificationUrl} target="_blank" rel="noreferrer">Open login page</a>
-        </div>
-      ) : null}
-      {status?.state === "error" ? <p className="agent-byok-error" role="alert">{status.error}</p> : null}
-      {status?.state === "expired" ? (
-        <p className="agent-byok-error" role="status">The login code expired. Start sign-in again.</p>
-      ) : null}
-    </aside>
+    <AgentTerminalView
+      agent={agent}
+      agentError={undefined}
+      inactiveMessage={({ agentError, agentStatus }) => inactiveTerminalMessage({
+        agentError,
+        agentStatus,
+        authStatus,
+        capabilityError: undefined,
+        runtime: "managed",
+        source,
+      })}
+      mode={mode}
+      onConversationActivity={onConversationActivity}
+      onStateChange={onStateChange}
+      retryAgent={retryAgent}
+      voice
+      accessory={({ agentReady, submit }) => (
+        <ArtifactDock
+          agentReady={agentReady}
+          onPrompt={(artifact, prompt, path) => submit(artifactFollowOnPrompt(artifact, path, prompt))}
+        />
+      )}
+    />
   );
+});
+
+function artifactFollowOnPrompt(
+  artifact: ArtifactDocument,
+  path: string,
+  prompt: string,
+): string {
+  return [
+    `Continue the current artifact with id ${JSON.stringify(artifact.id)}.`,
+    `Artifact path: ${JSON.stringify(path)}.`,
+    "",
+    prompt.trim(),
+  ].join("\n");
 }
 
-async function credentialError(response: Response): Promise<string> {
-  const payload = await response.json().catch(() => undefined) as { error?: unknown } | undefined;
-  return typeof payload?.error === "string" ? payload.error : `Request failed with HTTP ${response.status}`;
+function errorMessage(error: unknown): string {
+  return clientFailureMessage(
+    error,
+    "The agent connection was interrupted. Check your network and retry.",
+  );
 }

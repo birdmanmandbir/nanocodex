@@ -34,6 +34,10 @@ name = "minimal"
 path = "minimal.rs"
 
 [[bin]]
+name = "durable"
+path = "durable.rs"
+
+[[bin]]
 name = "follow-on"
 path = "follow_on.rs"
 
@@ -92,6 +96,10 @@ path = "browser_agent.rs"
 [[bin]]
 name = "realtime-pipe"
 path = "realtime_pipe.rs"
+
+[[bin]]
+name = "realtime-external"
+path = "realtime_external.rs"
 
 [[bin]]
 name = "voice"

@@ -88,6 +88,26 @@ where
         )
     }
 
+    /// Attaches an authenticated control sideband to an existing realtime call.
+    ///
+    /// The embedding retains ownership of call creation, WebRTC negotiation,
+    /// and media. Nanocodex does not reconfigure or close the remote call.
+    #[cfg(all(feature = "realtime", not(target_family = "wasm")))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(all(feature = "realtime", not(target_family = "wasm"))))
+    )]
+    #[must_use]
+    pub fn attach_realtime_call(
+        &self,
+        call_id: impl Into<String>,
+    ) -> crate::realtime::RealtimeCallAttachmentBuilder {
+        crate::realtime::RealtimeCallAttachmentBuilder::new(
+            self.config.auth.clone(),
+            call_id.into(),
+        )
+    }
+
     /// Starts a client-side managed session with stable developer
     /// instructions.
     ///
@@ -173,9 +193,9 @@ impl<F> OpenAiBuilder<F> {
     /// Controls the optional non-generating request used to prewarm a
     /// persistent Responses WebSocket before its first model call.
     ///
-    /// Disable this when an intermediary does not support `generate: false`
-    /// requests. The first model call still opens and then reuses the same
-    /// persistent WebSocket.
+    /// This is enabled by default to match Codex: session startup primes the
+    /// immutable tools and instructions, and the first model call reuses the
+    /// resulting response chain on the same connection.
     #[must_use]
     pub const fn websocket_warmup(mut self, enabled: bool) -> Self {
         self.config.websocket_warmup = enabled;

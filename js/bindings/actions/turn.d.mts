@@ -13,8 +13,14 @@ export function prompt<const agent extends Agent<object>>(
   options: prompt.Options,
 ): prompt.ReturnType<agent>;
 export declare namespace prompt {
-  type Options = { input: PromptInput };
+  type Options = { input: PromptInput; id?: string | undefined };
   type ReturnType<agent extends Agent<object> = Agent<object>> = Turn<agent>;
+}
+
+/** Waits for durable admission and returns its request ID when one was assigned. */
+export function accepted(turn: Turn): Promise<accepted.ReturnType>;
+export declare namespace accepted {
+  type ReturnType = string | undefined;
 }
 
 /** Waits for a Turn's typed completed result. */
@@ -23,14 +29,14 @@ export declare namespace getResult {
   type ReturnType = TurnResult;
 }
 
-/** Returns a completed result's serializable session snapshot. */
-export function getSnapshot(result: TurnResult): getSnapshot.ReturnType;
+/** Materializes a completed result's serializable session snapshot. */
+export function getSnapshot(result: TurnResult): Promise<getSnapshot.ReturnType>;
 export declare namespace getSnapshot {
   type ReturnType = SessionSnapshot;
 }
 
-/** Returns exact aggregate token usage from a completed result. */
-export function getUsage(result: TurnResult): getUsage.ReturnType;
+/** Materializes exact aggregate token usage from a completed result. */
+export function getUsage(result: TurnResult): Promise<getUsage.ReturnType>;
 export declare namespace getUsage {
   type ReturnType = TurnUsage;
 }

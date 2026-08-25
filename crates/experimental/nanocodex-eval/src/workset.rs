@@ -3,8 +3,9 @@
 //! Every desired task/treatment/repetition is one SQLite row. Coordinate state
 //! records scheduling and verifier outcome; an append-only attempt table keeps
 //! infrastructure failures and interruptions without consuming a coordinate.
-//! Claiming is a short `BEGIN IMMEDIATE` compare-and-set transaction; execution
-//! never holds a SQLite transaction open.
+//! Ledger mutations are serialized by a process-safe writer lock. Claiming is a
+//! short `BEGIN IMMEDIATE` compare-and-set transaction; execution never holds a
+//! SQLite transaction open.
 
 use std::{
     fs::{self, File, OpenOptions},
@@ -17,7 +18,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension as _, TransactionBehavio
 use serde::Serialize;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 9;
+const SCHEMA_VERSION: u32 = 1;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const OBSERVER_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 
@@ -118,8 +119,38 @@ pub struct WorksetStatus {
     pub tasks: TaskCounts,
     /// Stable names of workers that currently own running rows.
     pub workers: Vec<String>,
+    /// Terminal attempt outcomes recorded during the last five minutes.
+    pub recent_attempts: RecentAttemptCounts,
     /// Exact family-level status records.
     pub families: Vec<FamilyStatus>,
+}
+
+/// Recent terminal attempt outcomes used by the occupancy controller.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct RecentAttemptCounts {
+    /// Successful task executions.
+    pub passed: i64,
+    /// Completed verifier failures.
+    pub failed: i64,
+    /// Infrastructure failures which returned their task to the queue.
+    pub infrastructure_failed: i64,
+    /// Attempts released because their owner disappeared.
+    pub interrupted: i64,
+    /// Newest infrastructure failures and interruptions in this window.
+    pub failures: Vec<RecentAttemptFailure>,
+}
+
+/// One recent retryable attempt retained for controller diagnosis.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RecentAttemptFailure {
+    /// Worker which owned the attempt.
+    pub worker: String,
+    /// `infrastructure_failed` or `interrupted`.
+    pub state: String,
+    /// Worker or coordinator diagnostic when one was recorded.
+    pub error: Option<String>,
+    /// Completion time in Unix milliseconds.
+    pub finished_at_ms: i64,
 }
 
 /// Counts for the only durable task states.
@@ -210,6 +241,7 @@ impl Workset {
         let path = path.into();
         let claim_directory = claim_directory(&path);
         fs::create_dir_all(&claim_directory)?;
+        let _writer = lock_workset_writer(&claim_directory)?;
         let mut connection = open_connection(&path)?;
         initialize_schema(&mut connection)?;
         let retained: Option<(i64, String)> = connection
@@ -237,6 +269,7 @@ impl Workset {
         let path = path.into();
         let claim_directory = claim_directory(&path);
         fs::create_dir_all(&claim_directory)?;
+        let _writer = lock_workset_writer(&claim_directory)?;
         let mut connection = open_connection(&path)?;
         initialize_schema(&mut connection)?;
         let digest = Uuid::now_v7().simple().to_string();
@@ -259,6 +292,7 @@ impl Workset {
         tasks: &[WorksetTask],
         families: &[WorksetFamily],
     ) -> Result<(), WorksetError> {
+        let _writer = lock_workset_writer(&self.claim_directory)?;
         let mut connection = open_connection(&self.path)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         append_definition(&transaction, self.id, &self.digest, tasks, families)?;
@@ -373,8 +407,9 @@ impl Workset {
         family_key: &str,
         worker: &str,
     ) -> Result<BeginTask, WorksetError> {
-        self.reconcile_abandoned()?;
+        let _writer = lock_workset_writer(&self.claim_directory)?;
         let mut connection = open_connection(&self.path)?;
+        self.reconcile_abandoned_with_connection(&mut connection)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let row: Option<(i64, u16)> = transaction
             .query_row(
@@ -448,8 +483,9 @@ impl Workset {
 
     /// Atomically claims the next unclaimed row in the benchmark.
     pub fn begin_next_for_worker(&self, worker: &str) -> Result<BeginTask, WorksetError> {
-        self.reconcile_abandoned()?;
+        let _writer = lock_workset_writer(&self.claim_directory)?;
         let mut connection = open_connection(&self.path)?;
+        self.reconcile_abandoned_with_connection(&mut connection)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let row: Option<(i64, String, u16)> = transaction
             .query_row(
@@ -542,8 +578,8 @@ impl Workset {
     }
 
     /// Releases an interrupted execution if the claim still owns the row.
-    pub fn release(&self, claim: &TaskClaim) -> Result<(), WorksetError> {
-        self.release_attempt(claim, "interrupted", None, None)
+    pub fn release(&self, claim: &TaskClaim, error: &str) -> Result<(), WorksetError> {
+        self.release_attempt(claim, "interrupted", None, Some(error))
     }
 
     /// Reacquires ownership of rows retained as running after an owner restart.
@@ -586,7 +622,15 @@ impl Workset {
 
     /// Releases every running row whose OS ownership lock is no longer held.
     pub fn reconcile_abandoned(&self) -> Result<usize, WorksetError> {
+        let _writer = lock_workset_writer(&self.claim_directory)?;
         let mut connection = open_connection(&self.path)?;
+        self.reconcile_abandoned_with_connection(&mut connection)
+    }
+
+    fn reconcile_abandoned_with_connection(
+        &self,
+        connection: &mut Connection,
+    ) -> Result<usize, WorksetError> {
         let mut statement = connection.prepare(
             "SELECT id, claim_id FROM eval_tasks \
              WHERE workset_id = ?1 AND state = 'running' ORDER BY id",
@@ -643,6 +687,7 @@ impl Workset {
         result_path: Option<&Path>,
         error: Option<&str>,
     ) -> Result<(), WorksetError> {
+        let _writer = lock_workset_writer(&self.claim_directory)?;
         let mut connection = open_connection(&self.path)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let finished_at_ms = now_ms()?;
@@ -684,6 +729,7 @@ impl Workset {
         result_path: Option<&Path>,
         error: Option<&str>,
     ) -> Result<(), WorksetError> {
+        let _writer = lock_workset_writer(&self.claim_directory)?;
         let mut connection = open_connection(&self.path)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let finished_at_ms = now_ms()?;
@@ -878,6 +924,43 @@ fn read_status(
     let workers = worker_statement
         .query_map([workset_id], |row| row.get(0))?
         .collect::<Result<Vec<_>, _>>()?;
+    let recent_cutoff_ms = now_ms()?.saturating_sub(5 * 60 * 1_000);
+    let recent_attempts = connection.query_row(
+        "SELECT \
+            COALESCE(SUM(a.state = 'passed'), 0), \
+            COALESCE(SUM(a.state = 'failed'), 0), \
+            COALESCE(SUM(a.state = 'infrastructure_failed'), 0), \
+            COALESCE(SUM(a.state = 'interrupted'), 0) \
+         FROM eval_attempts a \
+         WHERE a.workset_id = ?1 AND a.finished_at_ms >= ?2",
+        params![workset_id, recent_cutoff_ms],
+        |row| {
+            Ok(RecentAttemptCounts {
+                passed: row.get(0)?,
+                failed: row.get(1)?,
+                infrastructure_failed: row.get(2)?,
+                interrupted: row.get(3)?,
+                failures: Vec::new(),
+            })
+        },
+    )?;
+    let mut recent_attempts = recent_attempts;
+    let mut failure_statement = connection.prepare(
+        "SELECT worker, state, error, finished_at_ms FROM eval_attempts \
+         WHERE workset_id = ?1 AND finished_at_ms >= ?2 \
+            AND state IN ('infrastructure_failed', 'interrupted') \
+         ORDER BY finished_at_ms DESC LIMIT 8",
+    )?;
+    recent_attempts.failures = failure_statement
+        .query_map(params![workset_id, recent_cutoff_ms], |row| {
+            Ok(RecentAttemptFailure {
+                worker: row.get(0)?,
+                state: row.get(1)?,
+                error: row.get(2)?,
+                finished_at_ms: row.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
     let mut statement = connection.prepare(
         "SELECT e.family_key, d.selector, e.harness, e.model, e.thinking, e.web_search, COUNT(*), \
             COALESCE(SUM(e.state = 'unclaimed'), 0), \
@@ -911,6 +994,7 @@ fn read_status(
         digest: digest.to_owned(),
         tasks,
         workers,
+        recent_attempts,
         families,
     })
 }
@@ -1059,6 +1143,18 @@ fn open_claim_lock(directory: &Path, id: i64) -> Result<File, WorksetError> {
         .open(directory.join(format!("{id}.lock")))?)
 }
 
+fn lock_workset_writer(directory: &Path) -> Result<File, WorksetError> {
+    fs::create_dir_all(directory)?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(directory.join("writer.lock"))?;
+    lock.lock_exclusive()?;
+    Ok(lock)
+}
+
 fn sqlite_data_version(connection: &Connection) -> Result<i64, WorksetError> {
     Ok(connection.pragma_query_value(None, "data_version", |row| row.get(0))?)
 }
@@ -1069,7 +1165,6 @@ fn open_connection(path: &Path) -> Result<Connection, WorksetError> {
     }
     let connection = Connection::open(path)?;
     connection.busy_timeout(BUSY_TIMEOUT)?;
-    connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
     Ok(connection)
 }
@@ -1080,6 +1175,9 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), WorksetError> {
         return Err(WorksetError::DefinitionConflict(format!(
             "schema {version}; expected {SCHEMA_VERSION}"
         )));
+    }
+    if version == 0 {
+        connection.pragma_update(None, "journal_mode", "WAL")?;
     }
     create_schema(connection)?;
     if version == 0 {
@@ -1150,7 +1248,8 @@ fn create_schema(connection: &Connection) -> Result<(), WorksetError> {
             output_tokens INTEGER,
             reasoning_output_tokens INTEGER,
             total_tokens INTEGER,
-            cost_usd REAL
+            cost_usd REAL,
+            agent_duration_ms INTEGER
          );
          CREATE TABLE IF NOT EXISTS eval_attempts(
             id INTEGER PRIMARY KEY,
@@ -1173,7 +1272,9 @@ fn create_schema(connection: &Connection) -> Result<(), WorksetError> {
          CREATE INDEX IF NOT EXISTS eval_attempts_task
             ON eval_attempts(task_id, started_at_ms);
          CREATE INDEX IF NOT EXISTS eval_attempts_worker
-            ON eval_attempts(worker, state);",
+            ON eval_attempts(worker, state);
+         CREATE INDEX IF NOT EXISTS eval_attempts_recent
+            ON eval_attempts(workset_id, finished_at_ms);",
     )?;
     Ok(())
 }

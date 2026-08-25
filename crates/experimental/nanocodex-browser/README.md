@@ -39,6 +39,14 @@ out of the model-facing tool prefix. A runnable version lives at
 `examples/browser_agent.rs`. Callers that deliberately want the eager schema
 can register the same value with `.tool(browser)`.
 
+`BrowserTool::new()`, `BrowserTool::with_executable(...)`, and the Nanocodex CLI
+install an isolated virtual platform authenticator by default, so passkey
+registration and sign-in work unattended inside the private browser session.
+Low-level `Browser::builder()` consumers retain explicit control through
+`.virtual_authenticator(...)`. On macOS, callers may instead configure
+`.host_passkey_authenticator(...)` for explicit user-approved access to the
+system passkey UI.
+
 For isolation, one non-cloneable VM owner keeps the disposable browser alive
 and gives the agent a tool handle:
 
@@ -94,6 +102,16 @@ browser.close().await?;
 # }
 ```
 
+On macOS, the private in-process browser selects chrome-headless-shell when it
+is available, avoiding macOS application/profile services entirely. It also
+recognizes Chrome for Testing installations created by `agent-browser install`
+or Playwright and always uses a fresh temporary profile with the noninteractive
+mock Keychain/basic password store. If no dedicated automation browser is
+installed, construction fails with an actionable configuration error instead
+of silently launching personal Chrome, an ambient `CHROME` executable, or the
+login Keychain. Explicit profile import, an explicit executable, and remote CDP
+remain caller-owned policies.
+
 The browser starts lazily on its first local action. Use `Browser::builder()`
 for deterministic browser context, egress policy, storage state, diagnostics,
 or an explicitly managed CDP endpoint.
@@ -130,6 +148,62 @@ browser.close().await?;
 # }
 ```
 
+Mobile audits use pinned Chromium profiles and verify page-visible state before
+reporting layout and input findings:
+
+```no_run
+use nanocodex_browser::{
+    Browser, BrowserAction, BrowserDevicePreset, BrowserOrientation, BrowserTarget,
+};
+
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+let browser = Browser::new()?;
+browser.execute(BrowserAction::SetDevice {
+    device: BrowserDevicePreset::Iphone15Pro,
+    orientation: BrowserOrientation::Portrait,
+}).await?;
+browser.execute(BrowserAction::Open {
+    url: "https://example.com/".to_owned(),
+}).await?;
+let report = browser.execute(BrowserAction::MobileAudit {
+    devices: vec![],
+    orientations: vec![],
+    ready: Some(BrowserTarget::css("#app > *")),
+}).await?;
+println!("{report:?}");
+browser.close().await?;
+# Ok(())
+# }
+```
+
+Real Mobile Safari is an explicit Appium/XCUITest backend. The harness chooses
+an exact device name or UDID and owns the external Appium server lifecycle:
+
+```no_run
+use nanocodex_browser::{
+    BrowserIosConfig, BrowserIosDeviceSelector, BrowserTool, IosBrowser,
+};
+
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+let config = BrowserIosConfig::new(
+    "http://127.0.0.1:4723/".parse()?,
+    BrowserIosDeviceSelector::ExactName("iPhone 16 Pro".to_owned()),
+)?;
+let ios = IosBrowser::new(config)?;
+let tool = BrowserTool::from_ios(ios.clone());
+// Pass `tool` to `Tools::builder().provider(tool)`.
+drop(tool);
+ios.close().await?;
+# Ok(())
+# }
+```
+
+`BrowserIosDeviceInventory::discover().await` reports Xcode simulators and USB
+devices while preserving discovery failures separately from a successful empty
+inventory. iOS supports mobile state/audit, raw tap/swipe, active-element text,
+evaluation, URL/title, navigation/reload, and plain screenshots. CDP-only
+actions return a typed unsupported error; there is no Chromium fallback.
+
 ## Capabilities
 
 - Chromium navigation and interaction through semantic references, CSS, roles,
@@ -139,14 +213,50 @@ browser.close().await?;
 - Viewport- and element-targeted screenshots, pixel-level visual diffs,
   PDF, visual/session/performance traces, video, CPU profiles, coverage, heap
   inspection, accessibility/axe, Lighthouse, and CrUX actions.
-- Harness-owned cookies/storage, virtual passkeys, allowlisted source-browser handoff,
+- Harness-owned cookies/storage, virtual passkeys, explicit host-passkey handoff,
   upload roots, browser egress policy, remote CDP, and libkrun VM composition.
+- Pinned Chromium mobile profiles, verified audit matrices, and an explicit
+  real-Safari Appium/XCUITest backend with Xcode device discovery.
 
-The Nanocodex CLI exposes a private Brave session and copies a standard desktop
-browser profile's complete cookie database into it by default. `all`
-auto-detects the source; `brave`, `chrome`, `chromium`, `edge`, `firefox`, and
-`safari` select it explicitly. Pass `none` to either option to disable that
-default:
+The Nanocodex CLI default and bare `--browser` use private automation-browser
+discovery with a fresh temporary profile. On macOS this selects a dedicated
+chrome-headless-shell or Chrome for Testing installation, not the user's Brave
+or Chrome application. `--browser=brave` remains an explicit request to launch
+the standard Brave application with a private profile. Cookie import defaults
+to `none` on macOS so unattended startup never opens the login Keychain, and
+to `all` on other platforms. `all` auto-detects the source; `brave`, `chrome`,
+`chromium`, `edge`, `firefox`, and `safari` select it explicitly. When
+requested on macOS, Chromium-family cookie decryption may briefly use the
+source browser's Keychain identity, but that bounded broker exits before the
+long-lived automation session starts.
+
+The CLI's virtual platform authenticator persists testing passkeys across
+browser and Nanocodex restarts in `$NANOCODEX_DIR/browser/passkeys.json`, or
+`~/.nanocodex/browser/passkeys.json` by default. That owner-only file contains
+private keys. Library consumers opt into persistence explicitly with
+`VirtualAuthenticator::platform_passkey().credential_store(path)`.
+With persistence configured, the model-facing browser tool can call `passkeys`
+to inspect non-secret metadata, `passkey_use` to expose one saved credential,
+`passkey_new` to create against an empty authenticator, and `passkey_auto` to
+restore normal automatic credential selection. Selection never deletes the
+other credentials in the persisted store.
+
+Pass `--passkeys=host` on macOS to use passkeys from the host authenticator
+without exporting them. The browser tool first navigates headlessly as usual.
+At a passkey gate it calls `host_passkey_start`, which opens the same page in a
+visible Brave, Chrome, Edge, or Chromium application backed by a new temporary
+profile. Complete the ceremony with Touch ID or an iPhone and leave that window
+open. A subsequent `host_passkey_resume` imports the resulting cookies, closes
+the temporary window, and continues in the private headless session. The
+ordinary desktop-browser profile is never opened, and passkey private keys and
+user handles never enter Nanocodex or browser-tool output. Host and virtual
+passkey modes are mutually exclusive.
+
+```console
+nanocodex --passkeys=host
+```
+
+Pass `none` to either option to disable the browser or cookie-copy default:
 
 ```console
 nanocodex
@@ -165,15 +275,27 @@ binary-cookie decoder may require granting the Nanocodex process macOS access
 to Safari's sandboxed profile. Source profiles are never mutated, and cookie
 values remain outside the model-callable browser schema. The `exec` contract
 advertises `tools.browser` with a compact summary; its complete action guidance
-remains runtime-only in `ALL_TOOLS`. The default cookie mode deliberately gives
-the agent authenticated access to every site represented in the selected
-profile.
+remains runtime-only in `ALL_TOOLS`. Selecting `all` deliberately gives the
+agent authenticated access to every site represented in the selected profile.
+
+On macOS, if a populated Chromium-family store cannot be decrypted in the
+background, rerun with `--cookie-auth=interactive`. Nanocodex first tries the
+invisible broker, then opens one visible window backed only by a fresh copied
+temporary profile. Approve the Keychain prompt within two minutes; the broker
+exports the cookies and closes before the dedicated automation browser starts.
+The ordinary source profile and its tabs are never opened or controlled.
+
+```console
+nanocodex --cookies=brave --cookie-auth=interactive
+```
 
 ## Current boundaries
 
-- This package is unpublished and its API is not stable. It currently targets
-  native Unix hosts and Chromium's DevTools protocol; it is not a Firefox,
-  Safari, WebDriver, WASM, Node, or Python browser adapter.
+- This package is unpublished and its API is not stable. Its complete backend
+  targets native Unix hosts and Chromium's DevTools protocol. The focused iOS
+  backend targets Mobile Safari through an operator-managed Appium/XCUITest
+  server; it does not claim CDP feature parity. Firefox, WASM, Node, and Python
+  are not browser backends.
 - Local mode is a private browser profile, not an OS sandbox. VM mode requires a
   prepared ext4 image, VMM entry point, gvproxy, and libkrun firmware. Its
   default network lease permits internet access; callers must supply their

@@ -1,0 +1,20 @@
+{
+  "name": "@nanocodex/connect-api",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit && wrangler deploy --dry-run --config ./wrangler.jsonc --outdir dist",
+    "deploy": "npm run build && wrangler deploy --config ./wrangler.jsonc",
+    "dev": "wrangler dev"
+  },
+  "dependencies": {
+    "accounts": "0.16.2",
+    "ox": "0.14.36",
+    "viem": "2.55.19"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "wrangler": "4.123.0"
+  }
+}

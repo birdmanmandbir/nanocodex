@@ -9,6 +9,8 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
 const CHECKSUM_FILE: &str = "nanocodex.sha256";
+const VM_GUEST_BINARY_NAME: &str = "nanocodex-vm-guest";
+const VM_GUEST_CHECKSUM_FILE: &str = "nanocodex-vm-guest.sha256";
 
 #[cfg(windows)]
 const BINARY_NAME: &str = "nanocodex.exe";
@@ -45,7 +47,8 @@ impl VersionStore {
             .wrap_err("failed to locate the running Nanocodex executable")?;
         let contents = fs::read(&executable)
             .wrap_err_with(|| format!("failed to read {}", executable.display()))?;
-        self.prepare_with_contents(manager_version, &contents)
+        self.prepare_with_contents(manager_version, &contents)?;
+        self.seed_running_updater_checksum(&executable, &contents)
     }
 
     fn prepare_with_contents(&self, manager_version: &str, contents: &[u8]) -> Result<()> {
@@ -64,6 +67,7 @@ impl VersionStore {
         }
         if !updater_exists {
             atomic_write(&self.updater_path(), contents, true)?;
+            self.write_updater_checksum(contents)?;
         }
         if active.is_none() {
             self.activate(manager_version)?;
@@ -77,20 +81,7 @@ impl VersionStore {
 
     pub(super) fn is_cached(&self, key: &str) -> Result<bool> {
         validate_key(key)?;
-        let binary = self.binary_path(key);
-        let checksum_path = self.checksum_path(key);
-        if !binary.is_file() || !checksum_path.is_file() {
-            return Ok(false);
-        }
-        let expected = fs::read_to_string(&checksum_path)
-            .wrap_err_with(|| format!("failed to read {}", checksum_path.display()))?;
-        let expected = expected.trim();
-        if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Ok(false);
-        }
-        let contents = fs::read(&binary)
-            .wrap_err_with(|| format!("failed to read cached {}", binary.display()))?;
-        Ok(hex::encode(Sha256::digest(contents)) == expected.to_ascii_lowercase())
+        file_matches_checksum(&self.binary_path(key), &self.checksum_path(key))
     }
 
     pub(super) fn install(&self, key: &str, contents: &[u8]) -> Result<()> {
@@ -105,6 +96,57 @@ impl VersionStore {
             format!("{checksum}\n").as_bytes(),
             false,
         )
+    }
+
+    pub(super) fn install_with_vm_guest(
+        &self,
+        key: &str,
+        binary: &[u8],
+        vm_guest: &[u8],
+    ) -> Result<()> {
+        validate_key(key)?;
+        fs::create_dir_all(self.versions_dir())
+            .wrap_err("failed to create the Nanocodex version store")?;
+        if self.is_cached_with_vm_guest(key)? {
+            return Ok(());
+        }
+
+        let directory = self.version_dir(key);
+        if directory.exists() {
+            bail!(
+                "cannot coherently replace incomplete Nanocodex version {}; remove {} and retry",
+                key,
+                directory.display()
+            );
+        }
+
+        let staging = tempfile::Builder::new()
+            .prefix(".install-")
+            .tempdir_in(self.versions_dir())
+            .wrap_err("failed to stage the Nanocodex version")?;
+        atomic_write(&staging.path().join(BINARY_NAME), binary, true)?;
+        atomic_write(
+            &staging.path().join(CHECKSUM_FILE),
+            format!("{}\n", hex::encode(Sha256::digest(binary))).as_bytes(),
+            false,
+        )?;
+        atomic_write(&staging.path().join(VM_GUEST_BINARY_NAME), vm_guest, true)?;
+        atomic_write(
+            &staging.path().join(VM_GUEST_CHECKSUM_FILE),
+            format!("{}\n", hex::encode(Sha256::digest(vm_guest))).as_bytes(),
+            false,
+        )?;
+        fs::rename(staging.path(), &directory)
+            .wrap_err_with(|| format!("failed to install {}", directory.display()))?;
+        Ok(())
+    }
+
+    pub(super) fn is_cached_with_vm_guest(&self, key: &str) -> Result<bool> {
+        Ok(self.is_cached(key)?
+            && file_matches_checksum(
+                &self.version_dir(key).join(VM_GUEST_BINARY_NAME),
+                &self.version_dir(key).join(VM_GUEST_CHECKSUM_FILE),
+            )?)
     }
 
     pub(super) fn activate(&self, key: &str) -> Result<()> {
@@ -174,8 +216,109 @@ impl VersionStore {
             let contents = fs::read(self.binary_path(key))
                 .wrap_err_with(|| format!("failed to read Nanocodex version {key}"))?;
             atomic_write(&self.updater_path(), &contents, true)?;
+            self.write_updater_checksum(&contents)?;
         }
 
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(super) fn prepare_legacy_nightly_bootstrap() -> Result<bool> {
+        let executable = std::env::current_exe()
+            .wrap_err("failed to locate the running Nanocodex executable")?;
+        let Some(store) = Self::legacy_nightly_store_for(&executable)? else {
+            return Ok(false);
+        };
+        store.install_launcher()?;
+        Ok(true)
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn prepare_legacy_nightly_bootstrap() -> Result<bool> {
+        Ok(false)
+    }
+
+    #[cfg(unix)]
+    pub(super) fn promote_running_legacy_nightly_manager() -> Result<bool> {
+        let executable = std::env::current_exe()
+            .wrap_err("failed to locate the running Nanocodex executable")?;
+        let Some(store) = Self::legacy_nightly_store_for(&executable)? else {
+            return Ok(false);
+        };
+        store.promote_manager("nightly")?;
+        Ok(true)
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn promote_running_legacy_nightly_manager() -> Result<bool> {
+        Ok(false)
+    }
+
+    #[cfg(unix)]
+    fn legacy_nightly_store_for(executable: &Path) -> Result<Option<Self>> {
+        let executable = executable
+            .canonicalize()
+            .wrap_err_with(|| format!("failed to resolve {}", executable.display()))?;
+        let Some(version_directory) = executable.parent() else {
+            return Ok(None);
+        };
+        let Some(versions_directory) = version_directory.parent() else {
+            return Ok(None);
+        };
+        if versions_directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            != Some("versions")
+        {
+            return Ok(None);
+        }
+        let Some(root) = versions_directory.parent() else {
+            return Ok(None);
+        };
+        let store = Self {
+            root: root.to_path_buf(),
+        };
+        if store.active()?.as_deref() != Some("nightly") || store.updater_checksum_path().is_file()
+        {
+            return Ok(None);
+        }
+        let active_binary = match store.binary_path("nightly").canonicalize() {
+            Ok(path) => path,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).wrap_err("failed to resolve the active nightly Nanocodex");
+            }
+        };
+        if executable != active_binary {
+            return Ok(None);
+        }
+
+        Ok(Some(store))
+    }
+
+    fn write_updater_checksum(&self, contents: &[u8]) -> Result<()> {
+        let checksum = hex::encode(Sha256::digest(contents));
+        atomic_write(
+            &self.updater_checksum_path(),
+            format!("{checksum}\n").as_bytes(),
+            false,
+        )
+    }
+
+    fn seed_running_updater_checksum(&self, executable: &Path, contents: &[u8]) -> Result<()> {
+        if self.updater_checksum_path().is_file() {
+            return Ok(());
+        }
+        let executable = executable
+            .canonicalize()
+            .wrap_err_with(|| format!("failed to resolve {}", executable.display()))?;
+        let updater = self
+            .updater_path()
+            .canonicalize()
+            .wrap_err("failed to resolve the Nanocodex updater")?;
+        if executable == updater {
+            self.write_updater_checksum(contents)?;
+        }
         Ok(())
     }
 
@@ -197,6 +340,10 @@ impl VersionStore {
 
     fn updater_path(&self) -> PathBuf {
         self.root.join("updater").join(BINARY_NAME)
+    }
+
+    fn updater_checksum_path(&self) -> PathBuf {
+        self.root.join("updater").join(CHECKSUM_FILE)
     }
 
     #[cfg(unix)]
@@ -233,9 +380,9 @@ case "$0" in
 esac
 bin_dir=$(CDPATH= cd -- "$(dirname -- "$launcher")" && pwd -P)
 install_root=$(dirname -- "$bin_dir")
+export NANOCODEX_DIR="$install_root"
 
-if [ "${1-}" = "update" ]; then
-    export NANOCODEX_DIR="$install_root"
+if [ "${1-}" = "update" ] && [ -f "$install_root/updater/nanocodex.sha256" ]; then
     exec "$install_root/updater/nanocodex" "$@"
 fi
 exec "$install_root/current/nanocodex" "$@"
@@ -259,6 +406,21 @@ fn validate_key(key: &str) -> Result<()> {
         bail!("invalid Nanocodex version key {key:?}");
     }
     Ok(())
+}
+
+fn file_matches_checksum(path: &Path, checksum_path: &Path) -> Result<bool> {
+    if !path.is_file() || !checksum_path.is_file() {
+        return Ok(false);
+    }
+    let expected = fs::read_to_string(checksum_path)
+        .wrap_err_with(|| format!("failed to read {}", checksum_path.display()))?;
+    let expected = expected.trim();
+    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Ok(false);
+    }
+    let contents =
+        fs::read(path).wrap_err_with(|| format!("failed to read cached {}", path.display()))?;
+    Ok(hex::encode(Sha256::digest(contents)) == expected.to_ascii_lowercase())
 }
 
 fn atomic_write(path: &Path, contents: &[u8], executable: bool) -> Result<()> {
@@ -310,6 +472,9 @@ mod tests {
         assert_eq!(store.active().unwrap().as_deref(), Some("0.3.0"));
         assert_eq!(fs::read(store.binary_path("0.3.0")).unwrap(), b"current");
         assert_eq!(fs::read(store.updater_path()).unwrap(), b"current");
+        assert!(
+            file_matches_checksum(&store.updater_path(), &store.updater_checksum_path()).unwrap()
+        );
         let launcher = fs::read_to_string(directory.path().join("bin/nanocodex")).unwrap();
         assert!(launcher.contains("updater/nanocodex"));
         assert!(launcher.contains("export NANOCODEX_DIR"));
@@ -323,6 +488,59 @@ mod tests {
     }
 
     #[test]
+    fn active_nightly_bootstraps_a_legacy_updater_without_copying_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = VersionStore::at(directory.path());
+        store.prepare_with_contents("0.3.0", b"legacy").unwrap();
+        store.install("nightly", b"nightly").unwrap();
+        store.activate("nightly").unwrap();
+        fs::remove_file(store.updater_checksum_path()).unwrap();
+
+        assert!(
+            VersionStore::legacy_nightly_store_for(&store.binary_path("nightly"))
+                .unwrap()
+                .is_some()
+        );
+        store.install_launcher().unwrap();
+        assert_eq!(fs::read(store.updater_path()).unwrap(), b"legacy");
+        let launcher = fs::read_to_string(directory.path().join("bin/nanocodex")).unwrap();
+        assert!(launcher.contains("updater/nanocodex.sha256"));
+        assert!(launcher.contains("updater/nanocodex"));
+        assert!(launcher.contains("current/nanocodex"));
+
+        VersionStore::legacy_nightly_store_for(&store.binary_path("nightly"))
+            .unwrap()
+            .unwrap()
+            .promote_manager("nightly")
+            .unwrap();
+        assert_eq!(fs::read(store.updater_path()).unwrap(), b"nightly");
+        assert!(store.updater_checksum_path().is_file());
+
+        store.install("local-build", b"local").unwrap();
+        store.activate("local-build").unwrap();
+        assert_eq!(fs::read(store.updater_path()).unwrap(), b"nightly");
+        assert!(
+            file_matches_checksum(&store.updater_path(), &store.updater_checksum_path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn running_legacy_updater_seeds_its_checksum_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = VersionStore::at(directory.path());
+        store.prepare_with_contents("0.3.0", b"legacy").unwrap();
+        fs::remove_file(store.updater_checksum_path()).unwrap();
+
+        store
+            .seed_running_updater_checksum(&store.updater_path(), b"legacy")
+            .unwrap();
+
+        assert!(
+            file_matches_checksum(&store.updater_path(), &store.updater_checksum_path()).unwrap()
+        );
+    }
+
+    #[test]
     fn refuses_corrupted_cached_versions() {
         let directory = tempfile::tempdir().unwrap();
         let store = VersionStore::at(directory.path());
@@ -333,5 +551,31 @@ mod tests {
 
         assert!(!store.is_cached("0.2.0").unwrap());
         assert!(store.activate("0.2.0").is_err());
+    }
+
+    #[test]
+    fn installs_cli_and_vm_guest_as_one_activatable_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = VersionStore::at(directory.path());
+
+        store
+            .install_with_vm_guest("nightly-build", b"cli", b"guest")
+            .unwrap();
+        store.activate("nightly-build").unwrap();
+
+        assert!(store.is_cached_with_vm_guest("nightly-build").unwrap());
+        assert_eq!(
+            fs::read(directory.path().join("current/nanocodex-vm-guest")).unwrap(),
+            b"guest"
+        );
+
+        fs::write(
+            store
+                .version_dir("nightly-build")
+                .join(VM_GUEST_BINARY_NAME),
+            b"corrupted",
+        )
+        .unwrap();
+        assert!(!store.is_cached_with_vm_guest("nightly-build").unwrap());
     }
 }

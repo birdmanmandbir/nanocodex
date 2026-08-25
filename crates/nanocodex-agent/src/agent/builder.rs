@@ -25,7 +25,7 @@ pub(super) struct PromptCacheConfig {
 #[derive(Clone, Default)]
 pub(super) struct CodexCompatibility {
     pub(super) context: ContextSourceConfig,
-    pub(super) durability: DurabilityConfig,
+    pub(super) execution: ExecutionConfig,
 }
 
 impl<F> NanocodexBuilder<F> {
@@ -102,8 +102,6 @@ impl<F> NanocodexBuilder<F> {
     /// runtime is being built. Use this for agent-relative tools such as Code
     /// Mode child-agent tools; stateless tools may continue using
     /// [`Self::tools`].
-    #[cfg(not(target_family = "wasm"))]
-    #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
     #[must_use]
     pub fn tools_factory<T>(mut self, factory: T) -> Self
     where
@@ -154,6 +152,19 @@ impl<F> NanocodexBuilder<F> {
         self
     }
 
+    /// Installs a cache identity only when the caller did not configure one.
+    ///
+    /// This is an internal composition seam for durable session owners that
+    /// need a stable pre-checkpoint lineage across process replacement.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn default_prompt_cache_key(mut self, prompt_cache_key: impl Into<String>) -> Self {
+        if self.prompt_cache.key.is_none() {
+            self.prompt_cache.key = Some(prompt_cache_key.into());
+        }
+        self
+    }
+
     /// Shares completed immutable-prefix warmups among builders cloned from
     /// this recipe.
     ///
@@ -188,7 +199,7 @@ impl<F> NanocodexBuilder<F> {
                 .context
                 .set_codex_home(rollout.codex_home().to_path_buf());
         }
-        self.codex.durability.set_rollout(rollout);
+        self.codex.execution.set_rollout(rollout);
         self
     }
 
@@ -196,12 +207,47 @@ impl<F> NanocodexBuilder<F> {
     /// and tool runtime while retaining its typed history and cache lineage.
     ///
     /// An explicitly configured session ID names the new runtime/event stream;
-    /// it does not replace the snapshot's prompt-cache lineage. Configure the
-    /// same instructions, tool definitions, and custom handlers used by the
-    /// original session; incompatible policy is rejected during [`Self::build`].
+    /// it does not replace the snapshot's prompt-cache lineage. The new runtime
+    /// supplies the instructions, tool definitions, and handlers used for
+    /// subsequent turns. Previously committed typed history remains
+    /// authoritative and is replayed on the first resumed request.
     #[must_use]
     pub fn resume(mut self, snapshot: SessionSnapshot) -> Self {
         self.resume = Some(snapshot);
+        self
+    }
+
+    /// Returns the explicitly configured resume boundary, if any.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn resume_snapshot(&self) -> Option<&SessionSnapshot> {
+        self.resume.as_ref()
+    }
+
+    /// Attaches a higher-layer execution policy at the agent's model, tool,
+    /// and committed-session boundaries.
+    ///
+    /// Persistence formats, storage, admission, and recovery remain owned by
+    /// the implementing crate. Most callers use a higher-level extension such
+    /// as `nanocodex-durability` instead of invoking this seam directly.
+    #[must_use]
+    pub fn execution_policy(mut self, policy: Arc<dyn execution::ExecutionPolicy>) -> Self {
+        self.codex.execution.set_policy(policy);
+        self
+    }
+
+    /// Builds a fresh higher-layer execution policy for every root agent.
+    ///
+    /// This internal composition seam is for stateful policy recipes whose
+    /// builder remains cloneable while each built driver requires independent
+    /// lifecycle ownership.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn execution_policy_factory<P>(mut self, factory: P) -> Self
+    where
+        P: Fn() -> Result<Arc<dyn execution::ExecutionPolicy>> + Send + Sync + 'static,
+    {
+        self.codex.execution.set_policy_factory(Arc::new(factory));
         self
     }
 }

@@ -17,6 +17,13 @@ the final seven are classified in
 latest 232 are classified in
 [`codex-parity/be2e4afc-7ada37a1.md`](codex-parity/be2e4afc-7ada37a1.md).
 
+The global checkpoint remains `7ada37a1`. A focused Realtime voice review also
+screened the 802 later commits through local Codex HEAD
+`50ea8fd411422b3f7bc906bcde6c1c4432019a2e`; its five behavior-adjacent changes
+are dispositioned below. This focused review does not advance the global
+checkpoint because the non-voice commits have not yet been classified
+individually in this ledger.
+
 The classifications mean:
 
 - `port`: the Nanocodex-relevant invariant is implemented and has concrete
@@ -34,8 +41,8 @@ claims.
 
 | Classification | Count |
 | --- | ---: |
-| `port` | 52 |
-| `evaluate` | 45 |
+| `port` | 53 |
+| `evaluate` | 44 |
 | `defer` | 10 |
 | `out-of-scope` | 448 |
 | Total | 555 |
@@ -353,25 +360,124 @@ serializes developer/user text as `input_text`, assistant text as
 cover the public contract; the experimental voice lifecycle forwards the same
 items without introducing app-server protocol types.
 
+### P40 — serialized, recoverable MCP OAuth refresh
+
+[`OAuthRuntime`](../crates/nanocodex-tools/src/mcp/oauth.rs) refreshes
+known-expiring credentials before startup and every MCP operation. The
+transaction in
+[`oauth/refresh.rs`](../crates/nanocodex-tools/src/mcp/oauth/refresh.rs)
+continues after caller cancellation, bounds lock and provider waits, locks
+across the authoritative reread, provider exchange, and durable save, adopts a
+refresh won by another runtime, preserves refresh tokens and scopes omitted by
+the provider, and restores the prior in-memory credential if persistence
+fails. Only a typed refresh-token rejection requires authorization; transient
+failures remain ordinary retryable errors. The CLI store implements
+Codex-compatible per-credential filesystem locks, allowing Codex and
+Nanocodex processes sharing `CODEX_HOME` to serialize rotating-token
+refreshes. The exact `rmcp 3.0.0` upgrade supplies one-shot server-401 refresh
+and retry behavior.
+
+Focused regressions cover omitted response fields, transient and rejected
+refreshes, concurrent runtimes, caller cancellation, persistence rollback, and
+a real HTTP 401 followed by token refresh and one authenticated retry. This
+ports the refresh invariants from Codex `6962a2ecae` and the OAuth-relevant
+portion of `a05bcda3db`; unrelated RMCP protocol and server surfaces remain
+outside this claim.
+
+### P41 — recoverable Frameless WebRTC sidebands
+
+[`run_socket`](../crates/nanocodex-oai-api/src/realtime.rs) keeps the owned
+WebRTC peer and media channels alive when a Frameless sideband ends
+unexpectedly. It reconnects after Codex's capped 200 ms, 400 ms, 800 ms, ...,
+5 s delays, resets the rapid-disconnect counter after 30 stable seconds, treats
+HTTP 404 and 410 as an ended call, keeps microphone and playback traffic live
+while reconnecting, and retries the one interrupted text or agent-output
+command. A normal close remains terminal; V1 and direct V2 behavior is
+unchanged.
+
+The same port bounds the active transcript to its newest 8 KiB and bounds each
+escaped Realtime delegation field to 4 KiB, retaining the start of the user
+input and the end of the transcript. The focused regressions
+`frameless_sideband_reconnects_without_ending_the_session`,
+`interrupted_text_command_resolves_after_replay`,
+`active_transcript_retains_a_bounded_suffix`,
+`sideband_reconnect_delay_backs_off_and_caps`, and
+`delegation_fields_keep_the_codex_bounded_edge` cover those invariants. This
+adopts Codex `ecb8013dfa82120d11b02e3b68b7d3a3afd79d39` without importing its
+app-server lifecycle.
+
+### P42 — caller-owned Realtime calls and complete live control surface
+
+[`RealtimeSessionBuilder::connect_with_sdp`](../crates/nanocodex-oai-api/src/realtime.rs)
+creates a caller-owned V1 or V3 WebRTC call and returns the answer SDP directly
+before its authenticated sideband finishes joining. The embedding owns the peer
+and all media. [`OpenAi::attach_realtime_call`](../crates/nanocodex-oai-api/src/openai/mod.rs)
+attaches to an already-negotiated V1 or V3 call through a configuration-free
+builder: it performs no call-create request and sends no `session.update`.
+Closing either external mode detaches the control socket without sending
+Frameless `session.close`; owned WebSocket/WebRTC sessions retain their existing
+close behavior.
+
+The same transport port uses Codex's direct V3 `/v1/live` HTTP and WebSocket
+routes, V1 Quicksilver/AVAS query contract, backend JSON versus direct multipart
+call bodies, direct-V3 `session.started` readiness gate, V3 delegation
+`ack_filler`, and versioned sideband call-ID routing.
+The low-level session exposes Codex's role-bearing text and speakable-context
+append operations, ignores empty speech, and applies the same 1,000-token bound
+after backend/item prefixing. The high-level voice session forwards those two
+bounded controls without introducing app-server request types.
+
+Focused regressions cover direct V1/V3 endpoint and multipart shapes,
+direct V3 readiness, SDP-before-sideband ordering, pending-join cancellation,
+configuration-free existing-call attachment, reconnect/transcript continuity,
+terminal 410 handling, external detach semantics, and output truncation.
+[`realtime_external.rs`](../examples/realtime_external.rs) is the concrete
+caller-owned SDP/existing-call consumer. This adopts Codex
+`536f86e5cc9ec1ff38457d099bf320b9d08eeeba`; its JSON-RPC and app-server
+notification plumbing remains out-of-scope.
+
 ## Reviewed baseline behavior
 
 ### Realtime voice delegation
 
-The experimental Realtime boundary matches Codex's V1, V2, and Frameless/V3
-behavior: lifecycle developer context, bounded 5,300-token startup context,
-typed-turn mirroring, transcript-tail flushing, current model/voice catalogs,
-byte-identical backend instructions, exact tools and acknowledgements, atomic
-steering, queued `response.create`, 200 ms bounded agent updates, 500-byte
-Frameless appends, BEM commentary/speakable routing, responses-as-items, and V2
-audio truncation on interruption. Protocol/transport, transcription/text
-output, client-managed handoffs, initial items, channel prefixes, startup
-context, and tail flushing are explicit builder policies. Shutdown awaits the
-transport/media lifecycle before the agent is stopped.
+The experimental owned-session Realtime boundary matches Codex's V1, V2, and
+Frameless/V3 behavior: lifecycle developer context, bounded 5,300-token startup
+context, typed-turn mirroring, transcript-tail flushing, current model/voice
+catalogs, byte-identical backend instructions, exact tools and
+acknowledgements, atomic steering, queued `response.create`, 200 ms bounded
+agent updates, 500-byte Frameless appends, BEM commentary/speakable routing,
+responses-as-items, V2 audio truncation on interruption, and recoverable
+Frameless sidebands. Protocol/transport, transcription/text output,
+client-managed handoffs, initial items, channel prefixes, startup context, and
+tail flushing are explicit builder policies. Shutdown awaits the
+transport/media lifecycle before the agent is stopped. Recent-work startup
+context discovers the canonical `<CODEX_HOME>/sessions/YYYY/MM/DD` layout
+through the rollout owner rather than scanning a nonexistent nested sessions
+directory.
 
 All Realtime orchestration remains in `nanocodex-voice`; the agent crate exposes
 only protocol-neutral live-input, developer-message, and read-only session
 context hooks. ChatGPT WebRTC uses native Rust WebRTC/Opus with a sideband
 WebSocket, while the host owns device-attestation generation.
+
+The focused later-commit dispositions are:
+
+- `13dfaab4469eff5c5b929bb7e1cbc6bba5e0c1be` is `out-of-scope`: it narrates
+  Codex approval, permission, patch-approval, elicitation, and app-owned input
+  requests. Nanocodex deliberately has no approval subsystem or app-server
+  request surface.
+- `ecb8013dfa82120d11b02e3b68b7d3a3afd79d39` is `port`: `P41` owns recoverable
+  V3 sidebands and the related transcript/delegation bounds.
+- `536f86e5cc9ec1ff38457d099bf320b9d08eeeba` is `port`: `P42` owns caller-SDP
+  call creation and configuration-free existing-call attachment without
+  importing Codex's app-server protocol.
+- `d44696065723a56b9de6538cd6348fcbe6c1542e` is `out-of-scope`: it adds a
+  Codex TUI keymap schema entry and Linux version-skew build plumbing, not a
+  Realtime transport behavior. The current local Codex Rust TUI contains no
+  corresponding native microphone implementation to copy.
+- `be6ebb1f6d4cf3bcd70c5c20be2677bb38dec860` is `out-of-scope`: it adds a
+  trace span around Codex's app-server Realtime running-state query without
+  changing session behavior.
 
 ### Responses Lite parallel-tool scheduling
 

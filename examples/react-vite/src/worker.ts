@@ -1,4 +1,4 @@
-import { Agent } from "nanocodex/browser";
+import { Agent, Transport } from "nanocodex/host";
 
 import {
   createExampleAgentController,
@@ -60,7 +60,7 @@ async function createAgent(data: StartMessage) {
       async (paymentSession) => {
         const agent = await Agent.create({
           ...common,
-          mpp: paymentSession.mpp,
+          transport: Transport.mpp({ session: paymentSession.provider }),
         });
         const payment: ExamplePayment = {
           rootAddress: paymentSession.rootAddress,
@@ -69,6 +69,7 @@ async function createAgent(data: StartMessage) {
             return paymentSession.mpp.channelId;
           },
           cumulative: () => paymentSession.mpp.cumulative.toString(),
+          mcpCumulative: () => paymentSession.mcpCumulative().toString(),
         };
         return { agent, payment };
       },
@@ -77,20 +78,8 @@ async function createAgent(data: StartMessage) {
   return {
     agent: await Agent.create({
       ...common,
-      apiKey: "worker-managed",
-      websocketUrl: workerEndpoint(),
-      createWebSocket: (endpoint: string, sessionId: string) => {
-        const url = new URL(endpoint);
-        url.searchParams.set("session_id", sessionId);
-        return new WebSocket(url);
-      },
     }),
   };
-}
-
-function workerEndpoint(): string {
-  const protocol = self.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${protocol}//${self.location.host}/api/responses`;
 }
 
 function errorMessage(error: unknown): string {

@@ -3,6 +3,19 @@ use std::{io, path::PathBuf, sync::Arc};
 use nanocodex_oai_api::ResponseError;
 pub use nanocodex_oai_api::transport::ResponsesError;
 
+/// Recovery action attached by a higher-layer execution policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionPolicyDisposition {
+    /// The same live policy owner may safely retry the operation.
+    Retry,
+    /// The operation remains pending but automatic execution is blocked.
+    Blocked,
+    /// This policy owner must stop and be rebuilt from authoritative state.
+    Reopen,
+    /// The operation cannot be retried automatically.
+    Fatal,
+}
+
 /// Error returned by the Nanocodex library boundary.
 #[derive(Debug, thiserror::Error)]
 pub enum NanocodexError {
@@ -65,6 +78,11 @@ pub enum NanocodexError {
     #[error("the agent stopped before accepting the command")]
     AgentStopped,
 
+    /// An agent with an attached execution policy stopped and must be rebuilt
+    /// from that policy's authoritative state before accepting more work.
+    #[error("the execution-policy-owned agent stopped and must be reopened")]
+    ExecutionPolicyOwnerStopped,
+
     /// The private driver stopped after accepting a turn but before delivering its result.
     #[error("the agent stopped before the turn completed")]
     TurnStopped,
@@ -102,6 +120,55 @@ pub enum NanocodexError {
     #[error("invalid session snapshot: {0}")]
     InvalidSessionSnapshot(String),
 
+    /// A higher-layer execution policy or its host store failed.
+    #[error("{layer} execution policy failed: {source}")]
+    ExecutionPolicy {
+        /// Human-readable layer identity.
+        layer: &'static str,
+        /// Action the lifecycle must preserve while handling the failure.
+        disposition: ExecutionPolicyDisposition,
+        /// Original extension error.
+        #[source]
+        source: Arc<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// An identified prompt was submitted without an execution policy.
+    #[error("identified prompt submission requires a configured execution policy")]
+    ExecutionPolicyNotConfigured,
+
+    /// An attached execution policy violated the agent integration contract.
+    #[error("invalid execution policy state: {0}")]
+    InvalidExecutionPolicy(String),
+
+    /// An execution policy relied on a fail-closed default for a capability
+    /// that must explicitly acknowledge durable authority.
+    #[error("execution policy does not implement required capability `{capability}`")]
+    ExecutionPolicyCapabilityUnsupported {
+        /// Missing policy capability.
+        capability: &'static str,
+    },
+
+    /// A child agent was requested from an execution-policy-owned session.
+    #[error(
+        "cannot {operation} from an agent with an attached execution policy; build the child with its own execution policy"
+    )]
+    ExecutionPolicyBranchUnsupported {
+        /// Requested child operation.
+        operation: &'static str,
+    },
+
+    /// A typed execution boundary could not be encoded or decoded.
+    #[error("execution policy payload is invalid: {0}")]
+    ExecutionPayload(#[source] serde_json::Error),
+
+    /// A policy-replayed result does not retain an in-process fork checkpoint.
+    #[error("a policy-replayed result cannot be used as an in-process fork checkpoint")]
+    ReplayedCheckpointUnavailable,
+
+    /// A previously failed identified operation was replayed from its durable terminal record.
+    #[error("durable operation previously failed: {0}")]
+    ReplayedExecutionFailed(String),
+
     /// Agent construction was attempted outside an active Tokio runtime.
     #[error("building an agent requires an active Tokio runtime")]
     TokioRuntimeUnavailable,
@@ -135,12 +202,52 @@ pub enum NanocodexError {
     Response(#[from] ResponseError),
 
     /// The configured tool registry or runtime could not be built.
-    #[cfg(not(target_family = "wasm"))]
     #[error("failed to build tools for an agent driver: {0}")]
     Tools(#[from] nanocodex_tools::ToolsBuildError),
 }
 
 impl NanocodexError {
+    /// Wraps an error returned by a higher-layer execution policy.
+    #[doc(hidden)]
+    pub fn execution_policy<E>(layer: &'static str, source: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self::ExecutionPolicy {
+            layer,
+            disposition: ExecutionPolicyDisposition::Fatal,
+            source: Arc::new(source),
+        }
+    }
+
+    /// Wraps an execution-policy error with its required recovery action.
+    #[doc(hidden)]
+    pub fn execution_policy_with_disposition<E>(
+        layer: &'static str,
+        disposition: ExecutionPolicyDisposition,
+        source: E,
+    ) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self::ExecutionPolicy {
+            layer,
+            disposition,
+            source: Arc::new(source),
+        }
+    }
+
+    /// Returns the recovery action supplied by an execution policy.
+    #[must_use]
+    pub fn execution_policy_disposition(&self) -> Option<ExecutionPolicyDisposition> {
+        match self {
+            Self::ExecutionPolicy { disposition, .. } => Some(*disposition),
+            Self::ExecutionPolicyOwnerStopped => Some(ExecutionPolicyDisposition::Reopen),
+            Self::Shutdown(source) => source.execution_policy_disposition(),
+            _ => None,
+        }
+    }
+
     /// Returns the underlying Responses transport/API error, including when a
     /// caller-provided Tower middleware boxed the standard service error.
     #[must_use]

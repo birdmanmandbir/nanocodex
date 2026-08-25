@@ -11,11 +11,15 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(target_family = "wasm", allow(clippy::module_name_repetitions))]
 
-#[cfg(all(not(target_family = "wasm"), feature = "workspace-runtime"))]
-mod apply_patch;
+#[cfg(feature = "workspace-runtime")]
+#[doc(hidden)]
+pub mod apply_patch;
 #[cfg(all(not(target_family = "wasm"), feature = "native"))]
 #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
 pub mod code_mode;
+#[cfg(feature = "native")]
+#[path = "code_mode/description.rs"]
+mod code_mode_description;
 #[cfg(feature = "native")]
 mod code_mode_order;
 #[cfg(feature = "native")]
@@ -37,7 +41,7 @@ pub mod runtime;
 mod runtime_config;
 #[cfg(all(not(target_family = "wasm"), feature = "workspace-runtime"))]
 mod shell;
-#[cfg(all(not(target_family = "wasm"), feature = "workspace-runtime"))]
+#[cfg(feature = "workspace-runtime")]
 #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
 pub mod standard;
 #[cfg(all(not(target_family = "wasm"), feature = "workspace-runtime"))]
@@ -81,7 +85,8 @@ pub mod runtime {
     pub use crate::{
         hosted::{
             HostedToolMode, HostedToolRuntime as ToolRuntime,
-            HostedToolRuntimeControl as ToolRuntimeControl, HostedTools as Tools, OwnedToolContext,
+            HostedToolRuntimeControl as ToolRuntimeControl, HostedTools as Tools,
+            HostedToolsBuildError as ToolsBuildError, OwnedToolContext,
         },
         runtime_config::{ImageGenerationConfig, WebSearchConfig},
     };
@@ -92,6 +97,8 @@ pub(crate) use contract::ToolOutputBody;
 #[cfg(all(not(target_family = "wasm"), feature = "workspace-runtime"))]
 pub(crate) use contract::ToolOutputContent;
 pub use contract::{Tool, ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolResult};
+#[cfg(all(target_family = "wasm", feature = "native"))]
+pub use hosted::HostedToolsBuildError as ToolsBuildError;
 #[cfg(all(not(target_family = "wasm"), feature = "workspace-runtime"))]
 pub(crate) use nanocodex_oai_api::ImageDetail;
 #[cfg(all(not(target_family = "wasm"), feature = "native"))]
@@ -110,7 +117,7 @@ pub use runtime::{ToolsBuildError, ToolsBuilder};
 #[cfg(all(not(target_family = "wasm"), feature = "native"))]
 #[cfg_attr(docsrs, doc(cfg(all(not(target_family = "wasm"), feature = "native"))))]
 pub use shell::ambient_sensitive_environment;
-#[cfg(all(not(target_family = "wasm"), feature = "workspace-runtime"))]
+#[cfg(feature = "workspace-runtime")]
 pub(crate) use standard::StandardTool;
 
 #[doc(hidden)]

@@ -12,6 +12,7 @@ use nanocodex_oai_api::PromptValidationError;
 #[must_use = "a turn continues running when dropped; await result(), control it, or explicitly drop it"]
 pub struct Turn {
     pub(super) control: TurnControl,
+    pub(super) request_id: Option<String>,
     pub(super) events: AgentEvents,
     pub(super) result: oneshot::Receiver<Result<TurnResult>>,
 }
@@ -30,6 +31,17 @@ pub enum PromptRoute {
 }
 
 impl Turn {
+    /// Returns the durable request identity selected during prompt admission.
+    ///
+    /// A caller-supplied [`PromptRequest::request_id`] is returned unchanged.
+    /// When an execution policy generated the identity, this returns the
+    /// generated or recovered journal operation ID. Agents without an attached
+    /// execution policy do not assign request identities.
+    #[must_use]
+    pub fn request_id(&self) -> Option<&str> {
+        self.request_id.as_deref()
+    }
+
     /// Returns a cheap cloneable capability targeting this exact turn.
     #[must_use]
     pub fn control(&self) -> TurnControl {
@@ -99,6 +111,7 @@ impl Future for Turn {
 pub struct TurnControl {
     pub(super) key: TurnKey,
     pub(super) commands: mpsc::Sender<Command>,
+    pub(super) shutdown: DriverShutdown,
 }
 
 impl TurnControl {
@@ -111,7 +124,7 @@ impl TurnControl {
     pub async fn steer(&self, prompt: impl Into<Prompt>) -> Result<()> {
         let prompt = prompt.into();
         prompt.validate().map_err(steer_validation_error)?;
-        request_command(&self.commands, |result| Command::Steer {
+        request_command(&self.commands, &self.shutdown, |result| Command::Steer {
             key: self.key,
             prompt,
             result,
@@ -126,7 +139,7 @@ impl TurnControl {
     /// Returns an error when the turn has already finished or if the driver
     /// stops.
     pub async fn cancel(&self) -> Result<()> {
-        request_command(&self.commands, |result| Command::Cancel {
+        request_command(&self.commands, &self.shutdown, |result| Command::Cancel {
             key: self.key,
             result,
         })
@@ -149,12 +162,25 @@ pub(super) struct TurnKey(pub(super) u64);
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct TurnResult {
+    pub(super) request_id: Option<String>,
     pub(super) final_message: String,
     pub(super) usage: TurnUsage,
-    pub(super) checkpoint: Arc<CommittedSession>,
+    pub(super) checkpoint: TurnCheckpoint,
+}
+
+#[derive(Clone)]
+pub(super) enum TurnCheckpoint {
+    Live(Arc<CommittedSession>),
+    Replayed(SessionSnapshot),
 }
 
 impl TurnResult {
+    /// Returns the durable request identity selected during prompt admission.
+    #[must_use]
+    pub fn request_id(&self) -> Option<&str> {
+        self.request_id.as_deref()
+    }
+
     /// Returns the final assistant message for this completed turn.
     #[must_use]
     pub fn final_message(&self) -> &str {
@@ -180,7 +206,10 @@ impl TurnResult {
     /// responsible for protecting and retaining serialized snapshots appropriately.
     #[must_use]
     pub fn snapshot(&self) -> SessionSnapshot {
-        self.checkpoint.snapshot()
+        match &self.checkpoint {
+            TurnCheckpoint::Live(checkpoint) => checkpoint.snapshot(),
+            TurnCheckpoint::Replayed(snapshot) => snapshot.clone(),
+        }
     }
 }
 
@@ -193,10 +222,102 @@ impl fmt::Debug for TurnResult {
     }
 }
 
+/// One prompt submission with an optional execution identity.
+///
+/// When an execution policy is attached, the agent automatically assigns an
+/// operation ID to requests that omit one. Attach a caller-owned ID when an
+/// external job, webhook, or host retry resubmits the same logical operation.
+#[derive(Clone, Debug)]
+pub struct PromptRequest {
+    pub(super) prompt: Prompt,
+    pub(super) request_id: Option<String>,
+}
+
+impl PromptRequest {
+    /// Creates a prompt submission without a caller-owned operation identity.
+    ///
+    /// A policy-enabled agent assigns a unique operation ID before accepting
+    /// this request.
+    #[must_use]
+    pub fn new(prompt: impl Into<Prompt>) -> Self {
+        Self {
+            prompt: prompt.into(),
+            request_id: None,
+        }
+    }
+
+    /// Supplies a stable caller-owned request identity.
+    ///
+    /// When omitted, an execution policy generates an identity before the
+    /// prompt is accepted. Resubmitting the same request ID with the same
+    /// prompt resumes or replays that durable operation; reusing it for a
+    /// different prompt is rejected as a conflict.
+    #[must_use]
+    pub fn request_id(mut self, request_id: impl Into<String>) -> Self {
+        self.request_id = Some(request_id.into());
+        self
+    }
+}
+
+impl From<Prompt> for PromptRequest {
+    fn from(prompt: Prompt) -> Self {
+        Self::new(prompt)
+    }
+}
+
+impl From<String> for PromptRequest {
+    fn from(prompt: String) -> Self {
+        Self::new(prompt)
+    }
+}
+
+impl From<&str> for PromptRequest {
+    fn from(prompt: &str) -> Self {
+        Self::new(prompt)
+    }
+}
+
+/// Optional model policy for a newly spawned clean agent.
+///
+/// Omitted values inherit the invoking agent's settings at the model boundary
+/// where the spawn command is handled.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SpawnOptions {
+    pub(super) model: Option<Model>,
+    pub(super) thinking: Option<Thinking>,
+}
+
+impl SpawnOptions {
+    /// Starts an inherited spawn configuration.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            model: None,
+            thinking: None,
+        }
+    }
+
+    /// Overrides the model for the new agent without changing its parent.
+    #[must_use]
+    pub const fn model(mut self, model: Model) -> Self {
+        self.model = Some(model);
+        self
+    }
+
+    /// Overrides the reasoning effort for the new agent without changing its parent.
+    #[must_use]
+    pub const fn thinking(mut self, thinking: Thinking) -> Self {
+        self.thinking = Some(thinking);
+        self
+    }
+}
+
 pub(super) enum Command {
     Prompt {
         key: TurnKey,
         prompt: Prompt,
+        execution_operation: Option<ExecutionOperation>,
+        accepted: Option<oneshot::Sender<Result<String>>>,
         thinking: Option<Thinking>,
         fast_mode: Option<bool>,
         parent: Option<tracing::Span>,
@@ -225,6 +346,7 @@ pub(super) enum Command {
         result: oneshot::Sender<Result<(Nanocodex, AgentEvents)>>,
     },
     Spawn {
+        options: SpawnOptions,
         result: oneshot::Sender<Result<(Nanocodex, AgentEvents)>>,
     },
     SetThinking {
@@ -243,7 +365,26 @@ pub(super) enum Command {
         text: String,
         result: oneshot::Sender<Result<AgentSessionContext>>,
     },
+    Context {
+        result: oneshot::Sender<Result<AgentSessionContext>>,
+    },
     Shutdown,
+}
+
+pub(super) enum ExecutionOperation {
+    Caller(String),
+    Automatic(String),
+    Admitted(String),
+}
+
+impl ExecutionOperation {
+    pub(super) fn into_id(self) -> String {
+        match self {
+            Self::Caller(operation_id)
+            | Self::Automatic(operation_id)
+            | Self::Admitted(operation_id) => operation_id,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -256,6 +397,7 @@ pub(super) enum QueuedTurn {
     Pending {
         key: TurnKey,
         prompt: Prompt,
+        execution_operation: Option<String>,
         thinking: Thinking,
         fast_mode: bool,
         parent: Option<tracing::Span>,
@@ -264,6 +406,8 @@ pub(super) enum QueuedTurn {
     },
     Cancelled {
         prompt: Prompt,
+        execution_operation: Option<String>,
+        cancellation_committed: bool,
         thinking: Thinking,
         fast_mode: bool,
         parent: Option<tracing::Span>,

@@ -1,4 +1,4 @@
-import type { AgentEvent, SessionSnapshot, TurnUsage } from "nanocodex";
+import type { AgentEvent, TurnUsage } from "nanocodex";
 
 export type PromptRequest = {
   id: string;
@@ -40,7 +40,6 @@ export type TurnOutcome =
   | {
       ok: true;
       completed: TurnCompleted;
-      snapshot: SessionSnapshot;
     }
   | {
       ok: false;

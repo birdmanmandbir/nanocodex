@@ -158,6 +158,10 @@ fn try_main() -> Result<()> {
     // requiring shell-specific syntax to load the repository's `.env` file.
     let _ = dotenvy::dotenv();
 
+    if let Err(error) = update::prepare_legacy_nightly_bootstrap() {
+        eprintln!("warning: failed to prepare the Nanocodex updater bootstrap: {error:#}");
+    }
+
     let cli = Cli::parse();
     if let Some(Command::VmRunConfig(command)) = &cli.command {
         return command.run();
@@ -320,15 +324,19 @@ mod tests {
     }
 
     #[test]
-    fn brave_browser_tool_and_all_cookies_are_enabled_by_default() {
+    fn browser_and_cookie_selection_follow_platform_defaults() {
         let tui = Cli::try_parse_from(["nanocodex"]).unwrap();
         assert!(tui.agent.browser_enabled());
+        #[cfg(target_os = "macos")]
+        assert!(!tui.agent.copies_all_browser_cookies());
+        #[cfg(target_os = "macos")]
+        assert!(!tui.agent.uses_brave_browser());
+        #[cfg(not(target_os = "macos"))]
         assert!(tui.agent.copies_all_browser_cookies());
-        assert!(tui.agent.uses_brave_browser());
 
         let tui = Cli::try_parse_from(["nanocodex", "--browser"]).unwrap();
         assert!(tui.agent.browser_enabled());
-        assert!(tui.agent.uses_brave_browser());
+        assert!(!tui.agent.uses_brave_browser());
 
         let brave =
             Cli::try_parse_from(["nanocodex", "--browser=brave", "--cookies=true"]).unwrap();
@@ -342,6 +350,16 @@ mod tests {
 
         let all_cookies = Cli::try_parse_from(["nanocodex", "--cookies=all"]).unwrap();
         assert!(all_cookies.agent.browser_enabled());
+
+        let interactive = Cli::try_parse_from(["nanocodex", "--cookie-auth=interactive"]).unwrap();
+        assert!(
+            interactive
+                .agent
+                .uses_interactive_browser_cookie_authorization()
+        );
+
+        let host_passkeys = Cli::try_parse_from(["nanocodex", "--passkeys=host"]).unwrap();
+        assert!(host_passkeys.agent.uses_host_browser_passkeys());
 
         let no_cookies = Cli::try_parse_from(["nanocodex", "--cookies=none"]).unwrap();
         assert!(no_cookies.agent.browser_enabled());

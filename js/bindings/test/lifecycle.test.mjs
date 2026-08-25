@@ -3,7 +3,8 @@ import { setImmediate as immediate } from "node:timers/promises";
 import { test } from "node:test";
 
 import { Actions } from "../index.mjs";
-import { Agent } from "../node/index.mjs";
+import { Agent, Transport } from "../node/index.mjs";
+import { createMemoryDurabilityStore } from "../runtime/durability-store.mjs";
 import {
   deferred,
   messageReader,
@@ -22,6 +23,14 @@ const SESSION_IDS = Object.freeze({
   fork: "018f1f9a-7b3c-7a15-8000-000000000015",
   reconnect: "018f1f9a-7b3c-7a16-8000-000000000016",
   shutdown: "018f1f9a-7b3c-7a17-8000-000000000017",
+  durability: "018f1f9a-7b3c-7a18-8000-000000000018",
+  durabilityFence: "018f1f9a-7b3c-7a19-8000-000000000019",
+  durabilityCollision: "018f1f9a-7b3c-7a20-8000-000000000020",
+});
+
+const createWarmAgent = ({ apiKey, websocketUrl, ...options }) => Agent.create({
+  ...options,
+  transport: Transport.openAi({ apiKey, websocketUrl, websocketWarmup: true }),
 });
 
 test("prompt acceptance is separate from results and healthy follow-ons reuse one socket", async () => {
@@ -30,7 +39,7 @@ test("prompt acceptance is separate from results and healthy follow-ons reuse on
   const releaseFirst = deferred();
   const events = [];
   let socketClosed;
-  const agent = await Agent.create({
+  const agent = await createWarmAgent({
     apiKey: "test-key",
     websocketUrl: server.url,
     thinking: "none",
@@ -64,6 +73,7 @@ test("prompt acceptance is separate from results and healthy follow-ons reuse on
 
   const first = agent.turn.prompt({ input: "first owned prompt" });
   assert.equal(typeof first.result, "function");
+  assert.equal(await first.accepted(), undefined);
   const firstResult = first.result();
   await firstSeen.promise;
   assert.equal(
@@ -93,11 +103,169 @@ test("prompt acceptance is separate from results and healthy follow-ons reuse on
   await server.close();
 });
 
+test("durable acceptance exposes its request ID and classifies conflicts", async () => {
+  const server = await startResponsesServer();
+  const durabilityId = "lifecycle-acceptance";
+  const agent = await createWarmAgent({
+    apiKey: "test-key",
+    websocketUrl: server.url,
+    thinking: "none",
+    sessionId: SESSION_IDS.durability,
+    durability: createMemoryDurabilityStore(durabilityId),
+    durabilityId,
+  });
+  const scenario = (async () => {
+    const socket = await server.nextConnection();
+    const reader = messageReader(socket);
+    await reader.next();
+    sendWarmup(socket, "resp-durable-warmup");
+    const request = await reader.next();
+    assert.match(JSON.stringify(request.input), /durable input/);
+    sendFinal(socket, "resp-durable", "DURABLE");
+  })();
+
+  const turn = agent.turn.prompt({ input: "durable input", id: "operation-7" });
+  assert.equal(await turn.accepted(), "operation-7");
+  const result = await turn.result();
+  assert.equal(result.finalMessage, "DURABLE");
+  await scenario;
+
+  const conflict = agent.turn.prompt({ input: "different input", id: "operation-7" });
+  await assert.rejects(
+    conflict.accepted(),
+    (error) => error instanceof Error && error.code === "conflict",
+  );
+  await assert.rejects(conflict.result(), /already has different input/);
+
+  conflict.dispose();
+  result.dispose();
+  turn.dispose();
+  agent.dispose();
+  await server.close();
+});
+
+test("a fenced durability owner requires reopening instead of retrying the stale Agent", async () => {
+  const durabilityId = "lifecycle-owner-fence";
+  const durability = createMemoryDurabilityStore(durabilityId);
+  const transport = Transport.openAi({
+    apiKey: "test-key",
+    websocketUrl: "ws://127.0.0.1:1",
+  });
+  const first = await Agent.create({
+    transport,
+    thinking: "none",
+    sessionId: SESSION_IDS.durability,
+    durability,
+    durabilityId,
+  });
+  const second = await Agent.create({
+    transport,
+    thinking: "none",
+    sessionId: SESSION_IDS.durabilityFence,
+    durability,
+    durabilityId,
+  });
+
+  const turn = first.turn.prompt({ input: "stale owner must stop", id: "operation-fenced" });
+  const requiresReopen = (error) => error instanceof Error && error.code === "reopen_required";
+  await assert.rejects(turn.accepted(), requiresReopen);
+  await assert.rejects(turn.result(), requiresReopen);
+  const stopped = first.turn.prompt({ input: "the poisoned driver cannot retry", id: "operation-stopped" });
+  await assert.rejects(stopped.accepted(), requiresReopen);
+  await assert.rejects(stopped.result(), requiresReopen);
+
+  turn.dispose();
+  stopped.dispose();
+  first.dispose();
+  second.dispose();
+});
+
+test("a duplicate durable session rejects without fencing the live Agent", async () => {
+  const server = await startResponsesServer();
+  const durabilityId = "lifecycle-session-collision";
+  const stored = createMemoryDurabilityStore(durabilityId);
+  let authorityAcquisitions = 0;
+  const durability = {
+    acquire(journalId, request) {
+      authorityAcquisitions += 1;
+      return stored.acquire(journalId, request);
+    },
+    append: (journalId, request) => stored.append(journalId, request),
+  };
+  const options = {
+    transport: Transport.openAi({ apiKey: "test-key", websocketUrl: server.url }),
+    thinking: "none",
+    sessionId: SESSION_IDS.durabilityCollision,
+    durability,
+    durabilityId,
+  };
+  const first = await Agent.create(options);
+  const firstAuthorityAcquisitions = authorityAcquisitions;
+  assert.ok(firstAuthorityAcquisitions > 0);
+  await assert.rejects(Agent.create(options), /session ID is already active/);
+  assert.equal(authorityAcquisitions, firstAuthorityAcquisitions);
+
+  const scenario = (async () => {
+    const socket = await server.nextConnection();
+    const request = await messageReader(socket).next();
+    assert.match(JSON.stringify(request.input), /live durable owner/);
+    sendFinal(socket, "resp-live-owner", "STILL LIVE");
+  })();
+  const turn = first.turn.prompt({ input: "live durable owner", id: "operation-live" });
+  assert.equal(await turn.accepted(), "operation-live");
+  assert.equal((await turn.result()).finalMessage, "STILL LIVE");
+  await scenario;
+
+  turn.dispose();
+  first.dispose();
+  await server.close();
+});
+
+test("durability store failures preserve reopen and retry-safe dispositions", async () => {
+  const transport = Transport.openAi({
+    apiKey: "test-key",
+    websocketUrl: "ws://127.0.0.1:1",
+  });
+  const cases = [
+    ["conflict", { status: "conflict", actualRevision: "1" }, "reopen_required"],
+    ["backend", new Error("durability backend unavailable"), "reopen_required"],
+    [
+      "not-committed",
+      { status: "not_committed", message: "transaction rolled back" },
+      "retryable",
+    ],
+  ];
+  for (const [name, appendOutcome, expectedCode] of cases) {
+    const durabilityId = `lifecycle-store-${name}`;
+    const durability = {
+      acquire(_journalId, { ownerId }) {
+        return { ownerId, fence: "1", revision: "0", batches: [] };
+      },
+      append() {
+        if (appendOutcome instanceof Error) throw appendOutcome;
+        return appendOutcome;
+      },
+    };
+    const agent = await Agent.create({
+      transport,
+      thinking: "none",
+      durability,
+      durabilityId,
+    });
+    const turn = agent.turn.prompt({ input: name, id: `operation-${name}` });
+    const hasExpectedCode = (error) => error instanceof Error && error.code === expectedCode;
+    await assert.rejects(turn.accepted(), hasExpectedCode);
+    await assert.rejects(turn.result(), hasExpectedCode);
+    turn.dispose();
+    agent.dispose();
+  }
+});
+
 test("steering joins the active turn at the next model boundary", async () => {
   const server = await startResponsesServer();
   const initialSeen = deferred();
   const releaseInitial = deferred();
-  const agent = await Agent.create({
+  const agent = await createWarmAgent({
     apiKey: "test-key",
     websocketUrl: server.url,
     thinking: "none",
@@ -135,7 +303,7 @@ test("steering joins the active turn at the next model boundary", async () => {
 test("cancellation stops the active socket and replays only committed and aborted input", async () => {
   const server = await startResponsesServer();
   const activeSeen = deferred();
-  const agent = await Agent.create({
+  const agent = await createWarmAgent({
     apiKey: "test-key",
     websocketUrl: server.url,
     thinking: "none",
@@ -184,7 +352,7 @@ test("graceful shutdown cancels active work and joins transport cleanup exactly 
   const server = await startResponsesServer();
   const activeSeen = deferred();
   const socketClosed = deferred();
-  const agent = await Agent.create({
+  const agent = await createWarmAgent({
     apiKey: "test-key",
     websocketUrl: server.url,
     thinking: "none",
@@ -218,7 +386,7 @@ test("graceful shutdown cancels active work and joins transport cleanup exactly 
   await agent.session.shutdown();
   turn.dispose();
 
-  const replacement = await Agent.create({
+  const replacement = await createWarmAgent({
     apiKey: "test-key",
     websocketUrl: server.url,
     thinking: "none",
@@ -231,7 +399,7 @@ test("graceful shutdown cancels active work and joins transport cleanup exactly 
 test("a replacement socket drops the remote response ID and replays committed history", async () => {
   const server = await startResponsesServer();
   const firstClosed = deferred();
-  const agent = await Agent.create({
+  const agent = await createWarmAgent({
     apiKey: "test-key",
     websocketUrl: server.url,
     thinking: "none",
@@ -276,7 +444,7 @@ test("a replacement socket drops the remote response ID and replays committed hi
 
 test("manual compaction and historical forks preserve exact committed boundaries", async () => {
   const server = await startResponsesServer();
-  const agent = await Agent.create({
+  const agent = await createWarmAgent({
     apiKey: "test-key",
     websocketUrl: server.url,
     thinking: "none",

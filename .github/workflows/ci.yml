@@ -144,16 +144,17 @@ jobs:
           cache-on-failure: true
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 22.13.0
+          node-version: 22.15.0
           cache: npm
           cache-dependency-path: |
             js/bindings/package-lock.json
+            js/artifacts/package-lock.json
             js/react/package-lock.json
-            js/tui/package-lock.json
-            js/tui-react/package-lock.json
+            js/terminal/package-lock.json
             examples/node/package-lock.json
             examples/rivet-actors/package-lock.json
-            examples/cloudflare-workers/package-lock.json
+            services/egress/package-lock.json
+            services/managed/package-lock.json
             examples/vercel-workflows/package-lock.json
             examples/react-vite/package-lock.json
       - uses: taiki-e/install-action@3522286d40783523f9c7880e33f785905b4c20d0 # v2
@@ -169,14 +170,15 @@ jobs:
             --package nanocodex-wasm \
             -- -D warnings
           npm ci --prefix js/bindings
+          npm ci --prefix js/artifacts
+          npm run build --prefix js/artifacts
           npm ci --prefix js/react
-          npm ci --prefix js/tui
-          npm run build --prefix js/tui
+          npm ci --prefix js/terminal
           ./scripts/build-js-package.sh
-          npm ci --prefix js/tui-react
           npm ci --prefix examples/node
           npm ci --prefix examples/rivet-actors
-          npm ci --prefix examples/cloudflare-workers
+          npm ci --prefix services/egress
+          npm ci --prefix services/managed
           npm ci --prefix examples/vercel-workflows
           npm ci --prefix examples/react-vite
       - name: Test JS runtime
@@ -188,13 +190,14 @@ jobs:
         run: |
           npm run test:typecheck --prefix js/bindings
           npm run check:package --prefix js/bindings
+          npm test --prefix js/artifacts
           npm test --prefix js/react
-          npm test --prefix js/tui
-          npm test --prefix js/tui-react
+          npm test --prefix js/terminal
           node --test examples/browser-cdn/*.test.mjs
           npm test --prefix examples/node
           npm run check --prefix examples/rivet-actors
-          npm run check --prefix examples/cloudflare-workers
+          npm run check --prefix services/egress
+          npm run check --prefix services/managed
           npm run check --prefix examples/vercel-workflows
           npm test --prefix examples/react-vite
           npm run build --prefix examples/react-vite
@@ -279,12 +282,14 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 22.13.0
+          node-version: 22.15.0
           cache: npm
           cache-dependency-path: |
+            js/bindings/package-lock.json
             js/react/package-lock.json
-            js/tui/package-lock.json
-            js/tui-react/package-lock.json
+            js/artifacts/package-lock.json
+            js/terminal/package-lock.json
+            web/connect-playground/package-lock.json
             web/package-lock.json
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -292,15 +297,229 @@ jobs:
           path: js/bindings/pkg-web
       - name: Build local website packages
         run: |
+          npm ci --prefix js/bindings
           npm ci --prefix js/react
-          npm ci --prefix js/tui
-          npm run build --prefix js/tui
-          npm ci --prefix js/tui-react
-          npm run build --prefix js/tui-react
+          npm ci --prefix js/artifacts
+          npm run build --prefix js/artifacts
+          npm ci --prefix js/terminal
+          npm run build --prefix js/terminal
+          npm ci --prefix web/connect-playground
           npm ci --prefix web
       - name: Type-check and build the website
         working-directory: web
-        run: npm test && npm run typecheck && npx --no-install vite build && npm run check:bundle
+        run: npm test && npm run build:from-wasm
+      - name: Type-check and build the Connect playground
+        run: npm run build --prefix web/connect-playground
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nanocodex-web-deployment
+          path: web/dist
+          include-hidden-files: true
+          retention-days: 1
+
+  production:
+    name: production website
+    if: github.repository == 'gakonst/nanocodex' && github.event_name == 'push' && github.ref == 'refs/heads/master' && vars.CLOUDFLARE_DEPLOY_ENABLED == 'true'
+    needs: [test, quality, vm-guest, policy, bindings, python, web, codeql]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: nanocodex-cloudflare
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.15.0
+          cache: npm
+          cache-dependency-path: |
+            services/egress/package-lock.json
+            services/managed/package-lock.json
+            web/package-lock.json
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: nanocodex-web-deployment
+          path: web/dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: nanocodex-web-wasm
+          path: js/bindings/pkg-web
+      - name: Install deployment tooling
+        run: |
+          npm ci --prefix services/egress --ignore-scripts
+          npm ci --prefix services/managed --ignore-scripts
+          npm ci --prefix web --ignore-scripts
+      - name: Select the current production revision
+        id: production
+        env:
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          current_sha="$(git ls-remote https://github.com/gakonst/nanocodex.git refs/heads/master | cut -f1)"
+          if [ "$current_sha" = "$TARGET_SHA" ]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "current=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping obsolete production revision $TARGET_SHA; master is $current_sha"
+          fi
+      - name: Validate the complete production rollout
+        if: steps.production.outputs.current == 'true'
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN_CONFIGURED: ${{ secrets.CLOUDFLARE_API_TOKEN != '' }}
+          NANOCODEX_ADMIN_TOKEN: ${{ secrets.NANOCODEX_ADMIN_TOKEN }}
+          NANOCODEX_BROKER_PROBE_TOKEN_CONFIGURED: ${{ secrets.NANOCODEX_BROKER_PROBE_TOKEN != '' }}
+          NANOCODEX_CREDENTIAL_ENCRYPTION_KEY_CONFIGURED: ${{ secrets.NANOCODEX_CREDENTIAL_ENCRYPTION_KEY != '' }}
+          NANOCODEX_GITHUB_OAUTH_CLIENT_ID_CONFIGURED: ${{ secrets.NANOCODEX_GITHUB_OAUTH_CLIENT_ID != '' }}
+          NANOCODEX_GITHUB_OAUTH_CLIENT_SECRET_CONFIGURED: ${{ secrets.NANOCODEX_GITHUB_OAUTH_CLIENT_SECRET != '' }}
+          NANOCODEX_GOOGLE_OAUTH_CLIENT_ID_CONFIGURED: ${{ secrets.NANOCODEX_GOOGLE_OAUTH_CLIENT_ID != '' }}
+          NANOCODEX_GOOGLE_OAUTH_CLIENT_SECRET_CONFIGURED: ${{ secrets.NANOCODEX_GOOGLE_OAUTH_CLIENT_SECRET != '' }}
+          NANOCODEX_X_OAUTH_CLIENT_ID_CONFIGURED: ${{ secrets.NANOCODEX_X_OAUTH_CLIENT_ID != '' }}
+          NANOCODEX_X_OAUTH_CLIENT_SECRET_CONFIGURED: ${{ secrets.NANOCODEX_X_OAUTH_CLIENT_SECRET != '' }}
+          NANOCODEX_GIT_TOKEN_CONFIGURED: ${{ secrets.NANOCODEX_GIT_TOKEN != '' }}
+          TARGET_SHA: ${{ github.sha }}
+        run: npm run deploy:production:preflight --prefix services/managed
+      - name: Deploy the private credential broker
+        if: steps.production.outputs.current == 'true'
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          NANOCODEX_BROKER_PROBE_TOKEN: ${{ secrets.NANOCODEX_BROKER_PROBE_TOKEN }}
+          NANOCODEX_CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.NANOCODEX_CREDENTIAL_ENCRYPTION_KEY }}
+          NANOCODEX_GITHUB_OAUTH_CLIENT_ID: ${{ secrets.NANOCODEX_GITHUB_OAUTH_CLIENT_ID }}
+          NANOCODEX_GITHUB_OAUTH_CLIENT_SECRET: ${{ secrets.NANOCODEX_GITHUB_OAUTH_CLIENT_SECRET }}
+          NANOCODEX_GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.NANOCODEX_GOOGLE_OAUTH_CLIENT_ID }}
+          NANOCODEX_GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.NANOCODEX_GOOGLE_OAUTH_CLIENT_SECRET }}
+          NANOCODEX_X_OAUTH_CLIENT_ID: ${{ secrets.NANOCODEX_X_OAUTH_CLIENT_ID }}
+          NANOCODEX_X_OAUTH_CLIENT_SECRET: ${{ secrets.NANOCODEX_X_OAUTH_CLIENT_SECRET }}
+          TARGET_SHA: ${{ github.sha }}
+        run: npm run deploy:production:broker --prefix services/egress
+      - name: Require master before managed rollout
+        if: steps.production.outputs.current == 'true'
+        env:
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          current_sha="$(git ls-remote https://github.com/gakonst/nanocodex.git refs/heads/master | cut -f1)"
+          test "$current_sha" = "$TARGET_SHA" || {
+            echo "Master advanced to $current_sha after broker deployment; refusing to deploy the managed Worker" >&2
+            exit 1
+          }
+      - name: Deploy the private managed Worker and migrations
+        if: steps.production.outputs.current == 'true'
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          NANOCODEX_ADMIN_TOKEN: ${{ secrets.NANOCODEX_ADMIN_TOKEN }}
+          TARGET_SHA: ${{ github.sha }}
+        run: npm run deploy:production:managed --prefix services/managed
+      - name: Verify private broker readiness
+        if: steps.production.outputs.current == 'true'
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          NANOCODEX_BROKER_PROBE_TOKEN: ${{ secrets.NANOCODEX_BROKER_PROBE_TOKEN }}
+          TARGET_SHA: ${{ github.sha }}
+        run: npm run verify:production:boundary --prefix services/managed
+      - name: Require master before website rollout
+        if: steps.production.outputs.current == 'true'
+        env:
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          current_sha="$(git ls-remote https://github.com/gakonst/nanocodex.git refs/heads/master | cut -f1)"
+          test "$current_sha" = "$TARGET_SHA" || {
+            echo "Master advanced to $current_sha after backend verification; refusing to deploy the website" >&2
+            exit 1
+          }
+      - name: Deploy the attested Cloudflare Worker
+        if: steps.production.outputs.current == 'true'
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          TARGET_SHA: ${{ github.sha }}
+        run: npm run deploy:production:web --prefix services/managed
+      - name: Resolve the production origin
+        if: steps.production.outputs.current == 'true'
+        id: production_origin
+        run: node -e 'process.stdout.write("origin=" + require("./web/production.json").origin + "\n")' >> "$GITHUB_OUTPUT"
+      - name: Verify the active Worker revision
+        if: steps.production.outputs.current == 'true'
+        env:
+          NANOCODEX_WEB_ORIGIN: ${{ steps.production_origin.outputs.origin }}
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          for attempt in $(seq 1 12); do
+            if body="$(curl -fsS "$NANOCODEX_WEB_ORIGIN/api/health?revision=$TARGET_SHA")" && \
+              DEPLOYMENT_HEALTH="$body" node -e '
+                const health = JSON.parse(process.env.DEPLOYMENT_HEALTH);
+                if (health.status !== "ok" || health.deployment_sha !== process.env.TARGET_SHA) process.exit(1);
+              '
+            then
+              exit 0
+            fi
+            if [ "$attempt" -lt 12 ]; then sleep 5; fi
+          done
+          echo "Cloudflare did not activate deployment $TARGET_SHA" >&2
+          exit 1
+      - name: Require master to remain on the deployed revision
+        if: steps.production.outputs.current == 'true'
+        env:
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          current_sha="$(git ls-remote https://github.com/gakonst/nanocodex.git refs/heads/master | cut -f1)"
+          test "$current_sha" = "$TARGET_SHA" || {
+            echo "Master advanced to $current_sha after deploying $TARGET_SHA; refusing to publish" >&2
+            exit 1
+          }
+      - name: Publish the matching repository generation
+        if: steps.production.outputs.current == 'true'
+        working-directory: web
+        env:
+          NANOCODEX_GIT_ORIGIN: ${{ steps.production_origin.outputs.origin }}
+          NANOCODEX_GIT_TOKEN: ${{ secrets.NANOCODEX_GIT_TOKEN }}
+        run: npm run publish:repository
+      - name: Verify the repository snapshot and Git endpoint
+        if: steps.production.outputs.current == 'true'
+        env:
+          NANOCODEX_GIT_ORIGIN: ${{ steps.production_origin.outputs.origin }}
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          snapshot_ready=false
+          for attempt in $(seq 1 12); do
+            if curl -fsS \
+              "$NANOCODEX_GIT_ORIGIN/api/repository/snapshot?revision=$TARGET_SHA" \
+              -o "$RUNNER_TEMP/nanocodex-repository.json" && \
+              node -e '
+                const fs = require("node:fs");
+                const snapshot = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+                if (snapshot.repository?.head !== process.env.TARGET_SHA) process.exit(1);
+              ' "$RUNNER_TEMP/nanocodex-repository.json"
+            then
+              snapshot_ready=true
+              break
+            fi
+            if [ "$attempt" -lt 12 ]; then sleep 5; fi
+          done
+          test "$snapshot_ready" = true || {
+            echo "Repository snapshot did not advance to $TARGET_SHA" >&2
+            exit 1
+          }
+
+          for attempt in $(seq 1 12); do
+            if remote_shas="$(git ls-remote \
+              "$NANOCODEX_GIT_ORIGIN/git" \
+              HEAD refs/heads/master | awk '{print $1}' | sort -u)" && \
+              [ "$remote_shas" = "$TARGET_SHA" ]
+            then
+              exit 0
+            fi
+            if [ "$attempt" -lt 12 ]; then sleep 5; fi
+          done
+          echo "Git endpoint did not advance to $TARGET_SHA (observed: $remote_shas)" >&2
+          exit 1
 
   codeql:
     name: CodeQL actions
@@ -325,7 +544,7 @@ jobs:
   ci-success:
     name: ci success
     if: always()
-    needs: [test, quality, policy, bindings, python, web, codeql]
+    needs: [test, quality, vm-guest, policy, bindings, python, web, production, codeql]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -333,16 +552,20 @@ jobs:
         env:
           TEST: ${{ needs.test.result }}
           QUALITY: ${{ needs.quality.result }}
+          VM_GUEST: ${{ needs.vm-guest.result }}
           POLICY: ${{ needs.policy.result }}
           BINDINGS: ${{ needs.bindings.result }}
           PYTHON: ${{ needs.python.result }}
           WEB: ${{ needs.web.result }}
+          PRODUCTION: ${{ needs.production.result }}
           CODEQL: ${{ needs.codeql.result }}
         run: |
           test "$TEST" = success
           test "$QUALITY" = success
+          test "$VM_GUEST" = success
           test "$POLICY" = success
           test "$BINDINGS" = success
           test "$PYTHON" = success
           test "$WEB" = success
+          test "$PRODUCTION" = success || test "$PRODUCTION" = skipped
           test "$CODEQL" = success

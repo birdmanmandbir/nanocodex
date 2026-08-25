@@ -37,19 +37,22 @@ clap.workspace = true
 crossterm.workspace = true
 dotenvy.workspace = true
 eyre.workspace = true
+flate2.workspace = true
 fs2.workspace = true
 futures-util.workspace = true
 hex.workspace = true
 image.workspace = true
+indicatif.workspace = true
 jsonschema.workspace = true
 nanocodex.workspace = true
 nanocodex-browser.workspace = true
 nanocodex-observability.workspace = true
+nanocodex-subagents.workspace = true
 nanocodex-voice.workspace = true
 nix.workspace = true
 nanousd = { workspace = true, optional = true }
 pulldown-cmark.workspace = true
-mpp = { workspace = true, optional = true, features = ["middleware", "tempo", "reqwest-rustls-tls-no-provider"] }
+mpp = { workspace = true, optional = true, features = ["middleware", "sqlite", "tempo", "reqwest-rustls-tls-no-provider"] }
 nanocodex-egress = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 ratatui.workspace = true
@@ -94,6 +97,10 @@ criterion.workspace = true
 [[bench]]
 name = "tui_render"
 harness = false
+
+[[test]]
+name = "tui_split"
+path = "tests/tui_split.rs"
 
 [[bin]]
 name = "nanocodex"

@@ -29,21 +29,12 @@ where
             lineage_id,
             prompt_cache_key: restored_cache_key,
             workspace,
-            base_instructions,
             canonical_context,
             history,
             context_baseline,
             checkpoint,
         } = snapshot.into_resume()?;
         Arc::make_mut(&mut config).model = model;
-        if base_instructions
-            .as_deref()
-            .is_some_and(|stored| stored != config.system_prompt())
-        {
-            return Err(NanocodexError::InvalidSessionSnapshot(
-                "instructions do not match the resumed rollout".to_owned(),
-            ));
-        }
         if key
             .as_deref()
             .is_some_and(|key| key != restored_cache_key.as_ref())
@@ -115,7 +106,7 @@ where
             context_config: codex.context,
             context_source,
             depth: 0,
-            durability: codex.durability,
+            execution: codex.execution,
             service_factory,
         },
         session_id,
@@ -145,13 +136,15 @@ where
 {
     let session_id_text = session_id.to_string();
     let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
+    let shutdown = DriverShutdown::default();
     let tools = spawner
         .tools
         .materialize(AgentHandle {
             commands: commands.downgrade(),
+            shutdown: shutdown.clone(),
         })?
         .for_session(&session_id_text);
-    let durability = spawner.durability.start(
+    let execution = spawner.execution.start(
         &session_id_text,
         workspace.as_deref(),
         spawner.config.system_prompt(),
@@ -159,6 +152,7 @@ where
         origin.parent_session_id.as_deref(),
         initial_resume.as_ref().map(InitialResume::history_len),
     )?;
+    shutdown.set_execution_policy_owned(execution.identifies_prompts());
     let (events, event_stream) = EventSink::channel(session_id_text.clone());
     let initial_model = initial_resume
         .map(|initial| match initial {
@@ -179,14 +173,13 @@ where
         })
         .transpose()?;
     let transport_stats = Arc::new(TransportStats::default());
-    let shutdown = DriverShutdown::default();
     let agent = Nanocodex {
         commands,
         events: events.clone(),
         next_turn: Arc::new(AtomicU64::new(1)),
         lineage_id: Arc::clone(&spawner.lineage_id),
         session_id,
-        durability: durability.clone(),
+        execution: execution.clone(),
         shutdown: shutdown.clone(),
     };
     // Start discovery before returning the handle so an idle CLI or TUI immediately
@@ -202,20 +195,19 @@ where
         spawner,
         initial_model,
         origin,
-        durability: durability.clone(),
+        execution: execution.clone(),
     };
     let driver_task = async move {
         let outcome = driver.run().await;
-        if shutdown.requested() {
-            let outcome = outcome.and(durability.shutdown().await);
-            shutdown.complete(outcome);
-        } else if let Err(error) = outcome {
+        let outcome = outcome.and(execution.shutdown().await);
+        if let Err(error) = &outcome {
             tracing::error!(
                 target: "nanocodex",
                 error = %error,
                 "agent driver stopped with an error"
             );
         }
+        shutdown.complete(outcome);
     };
     spawn_driver(driver_task)?;
     Ok((agent, event_stream))

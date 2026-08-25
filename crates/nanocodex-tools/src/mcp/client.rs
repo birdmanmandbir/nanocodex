@@ -7,15 +7,16 @@ use rmcp::{
         CallToolRequestParams, CallToolResult, ListResourceTemplatesResult, ListResourcesResult,
         PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult, Tool,
     },
-    service::{RoleClient, RunningService},
+    service::{RoleClient, RunningService, ServiceError},
     transport::{
         StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
     },
 };
+use serde_json::Value;
 use tokio::io::AsyncReadExt;
 use tracing::{Instrument, Span, info_span};
 
-use super::config::{McpServer, McpTransport, SecretSource};
+use super::config::{McpPaymentProvider, McpServer, McpTransport, SecretSource};
 use super::oauth::{McpOAuthStore, OAuthMetadataCache, OAuthRuntime, transport_from_credentials};
 use super::pagination::collect_paginated;
 use super::stdio::McpStdioTransport;
@@ -28,15 +29,20 @@ pub(crate) type Client = Arc<ClientInner>;
 pub(crate) struct ClientInner {
     service: Arc<RunningService<RoleClient, ()>>,
     oauth: Option<Arc<OAuthRuntime>>,
+    payment: Option<Arc<dyn McpPaymentProvider>>,
 }
+
+const MCP_CREDENTIAL_META_KEY: &str = "org.paymentauth/credential";
+const MCP_PAYMENT_REQUIRED_CODE: i32 = -32042;
+const MCP_PAYMENT_REQUIRED_META_KEY: &str = "org.paymentauth/payment-required";
 
 impl ClientInner {
     pub(crate) async fn call_tool(
         &self,
         params: CallToolRequestParams,
-    ) -> Result<CallToolResult, rmcp::service::ServiceError> {
+    ) -> Result<CallToolResult, String> {
         let parent = Span::current();
-        let result = self.service.call_tool(params).await;
+        let result = self.call_tool_with_payment(params).await;
         if let Some(oauth) = &self.oauth
             && let Err(error) = oauth.persist_if_changed(&parent).await
         {
@@ -45,12 +51,69 @@ impl ClientInner {
         result
     }
 
+    async fn call_tool_with_payment(
+        &self,
+        params: CallToolRequestParams,
+    ) -> Result<CallToolResult, String> {
+        let first = self.service.call_tool(params.clone()).await;
+        let (payment_required, payment) = match (&first, &self.payment) {
+            (Err(ServiceError::McpError(error)), Some(payment))
+                if error.code.0 == MCP_PAYMENT_REQUIRED_CODE =>
+            {
+                let Some(data) = error.data.as_ref() else {
+                    return first.map_err(|error| error.to_string());
+                };
+                (data, payment)
+            }
+            (Ok(result), Some(payment)) => {
+                let Some(data) = payment_required_result(result) else {
+                    return first.map_err(|error| error.to_string());
+                };
+                (data, payment)
+            }
+            _ => return first.map_err(|error| error.to_string()),
+        };
+        let Some(pending) = payment.prepare(payment_required).await? else {
+            return first.map_err(|error| error.to_string());
+        };
+
+        let mut paid = params;
+        paid.meta
+            .get_or_insert_with(rmcp::model::RequestMetaObject::new)
+            .0
+            .0
+            .insert(
+                MCP_CREDENTIAL_META_KEY.to_owned(),
+                pending.credential().clone(),
+            );
+        match self.service.call_tool(paid).await {
+            Ok(result) if payment_required_result(&result).is_some() => {
+                pending.rollback().await?;
+                Ok(result)
+            }
+            Ok(result) => {
+                pending.commit().await?;
+                Ok(result)
+            }
+            Err(error @ ServiceError::McpError(_)) => {
+                pending.rollback().await?;
+                Err(error.to_string())
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
     pub(crate) async fn list_resources(
         &self,
         params: Option<PaginatedRequestParams>,
-    ) -> Result<ListResourcesResult, rmcp::service::ServiceError> {
+    ) -> Result<ListResourcesResult, String> {
         let parent = Span::current();
-        let result = self.service.list_resources(params).await;
+        self.refresh_oauth().await?;
+        let result = self
+            .service
+            .list_resources(params)
+            .await
+            .map_err(|error| error.to_string());
         self.persist_oauth(&parent).await;
         result
     }
@@ -58,9 +121,14 @@ impl ClientInner {
     pub(crate) async fn list_resource_templates(
         &self,
         params: Option<PaginatedRequestParams>,
-    ) -> Result<ListResourceTemplatesResult, rmcp::service::ServiceError> {
+    ) -> Result<ListResourceTemplatesResult, String> {
         let parent = Span::current();
-        let result = self.service.list_resource_templates(params).await;
+        self.refresh_oauth().await?;
+        let result = self
+            .service
+            .list_resource_templates(params)
+            .await
+            .map_err(|error| error.to_string());
         self.persist_oauth(&parent).await;
         result
     }
@@ -68,9 +136,14 @@ impl ClientInner {
     pub(crate) async fn read_resource(
         &self,
         params: ReadResourceRequestParams,
-    ) -> Result<ReadResourceResult, rmcp::service::ServiceError> {
+    ) -> Result<ReadResourceResult, String> {
         let parent = Span::current();
-        let result = self.service.read_resource(params).await;
+        self.refresh_oauth().await?;
+        let result = self
+            .service
+            .read_resource(params)
+            .await
+            .map_err(|error| error.to_string());
         self.persist_oauth(&parent).await;
         result
     }
@@ -103,6 +176,17 @@ impl ClientInner {
             tracing::warn!(%error, "failed to persist refreshed MCP OAuth credentials");
         }
     }
+
+    pub(crate) async fn refresh_oauth(&self) -> Result<(), String> {
+        if let Some(oauth) = &self.oauth {
+            oauth.refresh_if_needed().await?;
+        }
+        Ok(())
+    }
+}
+
+fn payment_required_result(result: &CallToolResult) -> Option<&Value> {
+    result.meta.as_ref()?.0.get(MCP_PAYMENT_REQUIRED_META_KEY)
 }
 
 pub(crate) struct ConnectedServer {
@@ -365,6 +449,7 @@ async fn connect_stored_oauth(input: StoredOAuthConnect<'_>) -> Result<Connected
     }
     let oauth = oauth?;
     let runtime = oauth.runtime;
+    runtime.refresh_if_needed().await?;
     let transport = StreamableHttpClientTransport::with_client(oauth.client, config);
     let client = connect_transport(server, transport, parent).await;
     if let Err(error) = runtime.persist_if_changed(parent).await {
@@ -469,6 +554,7 @@ async fn finish_startup(
     let client = Arc::new(ClientInner {
         service: Arc::new(client),
         oauth,
+        payment: server.payment.clone(),
     });
     let span = info_span!(
         target: "nanocodex_tools",
@@ -479,6 +565,7 @@ async fn finish_startup(
         status = tracing::field::Empty,
         tool.count = tracing::field::Empty,
     );
+    client.refresh_oauth().await?;
     let tools =
         match tokio::time::timeout(server.startup_timeout, client.list_all_tools(&span)).await {
             Ok(Ok(tools)) => Ok(tools

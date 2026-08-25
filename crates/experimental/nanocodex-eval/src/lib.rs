@@ -50,6 +50,7 @@ mod api;
 /// Agent Trajectory Interchange Format projection and wire types.
 pub mod atif;
 mod capture_proxy;
+mod cluster;
 pub mod coordinator;
 mod digest;
 mod evaluation;
@@ -101,7 +102,7 @@ pub use event::{
     all(target_os = "linux", not(target_env = "musl")),
     all(target_os = "macos", target_arch = "aarch64")
 ))]
-pub use execution::CanonicalTaskRunner;
+pub use execution::{CanonicalTaskRunner, validate_prepared_eval_host};
 pub use execution::{ClaimedEvaluationTask, EvaluationExecution, EvaluationExecutionError};
 pub(crate) use harness_exec::{
     HarnessCommandOutput, HarnessCommandRunner, HarnessCommandRunnerError, HarnessCommandStatus,
@@ -124,3 +125,4 @@ pub use task::{
     all(target_os = "macos", target_arch = "aarch64")
 ))]
 pub use vm::{CachePolicy, VmResources, VmResourcesBuilder, VmResourcesError};
+pub use workset::{RecentAttemptCounts, RecentAttemptFailure};

@@ -1,3 +1,10 @@
+import Script from "next/script";
+
+import { AgentTerminal } from "./agent-terminal";
+import { WorkspaceTerminal } from "./workspace-terminal";
+
+export const dynamic = "force-dynamic";
+
 export default function Home() {
   return (
     <main>
@@ -30,20 +37,21 @@ export default function Home() {
         inside the Vercel Function step.
       </p>
 
-      <section id="transcript" className="transcript" aria-live="polite">
-        <article className="system">Create a workflow session, then send a prompt. You can detach, reload, or join it from another client.</article>
-      </section>
+      <AgentTerminal />
 
       <form id="prompt-form">
+        <label className="sr-only" htmlFor="prompt">Agent prompt</label>
         <textarea id="prompt" rows={3} maxLength={1_048_576} placeholder="Ask the durable workflow actor…" required />
         <button id="send" type="submit" disabled>Run durably</button>
       </form>
+
+      <WorkspaceTerminal />
 
       <footer>
         <span id="activity">idle</span>
         <span>Rust/WASM · Workflow actor · Vercel WebSockets</span>
       </footer>
-      <script src="/app.js" defer />
+      <Script src="/app.js" strategy="afterInteractive" />
     </main>
   );
 }

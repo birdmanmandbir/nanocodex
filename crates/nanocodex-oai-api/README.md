@@ -102,12 +102,29 @@ println!("{}", completed.output_text());
 
 Keep the credential file outside source control and reuse the same path on
 later runs. It uses Codex's `auth.json` format, so Codex and multiple Nanocodex
-processes can safely share the same path. [`auth::load_chatgpt_auth`] adopts a
-same-account rotation from disk before refreshing, refreshes expiring
-credentials, and recovers an unauthorized request once with the refreshed
-authorization.
-[`auth::chatgpt_auth_status`] inspects the selected account without exposing
-tokens, and [`auth::logout_chatgpt`] removes the stored credentials.
+processes can safely share the same path. The loader accepts both Codex OAuth
+sessions and its `personal_access_token` format. OAuth sessions adopt a
+same-account rotation from disk before refreshing; persistent Business and
+Enterprise access tokens resolve their account metadata once and never enter
+the OAuth refresh path.
+
+Applications that receive a persistent `at-...` token directly can skip the
+credential file:
+
+```rust,no_run
+use nanocodex_oai_api::{OpenAi, auth::chatgpt_access_token};
+
+# fn run() -> Result<(), Box<dyn std::error::Error>> {
+let auth = chatgpt_access_token(std::env::var("CODEX_ACCESS_TOKEN")?)?;
+let openai = OpenAi::new(auth)?;
+# let _ = openai;
+# Ok(())
+# }
+```
+
+[`auth::resolve_chatgpt_auth_status`] inspects either stored credential type
+without exposing tokens, and [`auth::logout_chatgpt`] removes the stored
+credentials.
 
 A [`Response`] is also a typed stream. It retains the completed aggregate
 after the stream reaches [`ResponseEvent::Completed`]:
@@ -155,6 +172,18 @@ can connect a microphone, files, or ordinary stdin and stdout pipes.
 The experimental `nanocodex-voice` crate packages default desktop devices and
 background-agent delegation without moving those policies into this transport
 boundary.
+
+Embeddings that already own WebRTC use
+[`realtime::RealtimeSessionBuilder::connect_with_sdp`]. It creates the remote
+call and returns a [`realtime::RealtimeSdpConnection`] immediately after the
+answer SDP is available, while the authenticated sideband joins in the
+background. The caller applies the answer and owns its peer and media for the
+entire call. [`OpenAi::attach_realtime_call`] instead joins a call created and
+negotiated elsewhere. Attachment defaults to Realtime V1, supports V3 when
+selected explicitly, performs no call-create request, and sends no
+`session.update`. Closing either external mode detaches Nanocodex's sideband; it
+does not send `session.close` or terminate the caller-owned media call. See the
+`realtime-external` example for both modes.
 
 Both transports expose background-agent delegation as
 [`realtime::RealtimeEvent::AgentRequest`]. An embedding handles that event with

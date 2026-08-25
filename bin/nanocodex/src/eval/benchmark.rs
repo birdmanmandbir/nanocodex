@@ -2,10 +2,12 @@ use std::path::PathBuf;
 
 use clap::Args;
 use eyre::{Result, WrapErr as _};
-use nanocodex_eval::{Evaluation, EvaluationStatus, coordinator::CoordinatorClient};
+use nanocodex_eval::{
+    Evaluation, EvaluationStatus, coordinator::CoordinatorClient, validate_prepared_eval_host,
+};
 use serde::Deserialize;
 
-use super::profile::default_state_dir;
+use super::{profile::default_state_dir, systemd};
 use crate::{
     RetryableProcessExit, benchmark, config::AgentArgs, observability::ObservabilityArgs, run, tui,
     vm::VmArgs,
@@ -39,6 +41,14 @@ pub(super) struct Benchmark {
     #[arg(long)]
     headless: bool,
 
+    /// Install and start this controller as a durable user systemd service.
+    #[arg(long)]
+    systemd: bool,
+
+    /// Host-local cache and temporary workspace for the systemd controller and workers.
+    #[arg(long, value_name = "DIRECTORY", requires = "systemd")]
+    runtime_dir: Option<PathBuf>,
+
     #[command(flatten)]
     agent: AgentArgs,
 
@@ -57,15 +67,29 @@ impl Benchmark {
             state_dir,
             coordinator,
             headless,
+            systemd,
+            runtime_dir,
             mut agent,
             observability,
             vm,
         } = self;
+        if systemd {
+            return systemd::install(
+                &profile,
+                &config,
+                state_dir.as_deref(),
+                coordinator.as_deref(),
+                runtime_dir.as_deref(),
+            );
+        }
+        let executable =
+            std::env::current_exe().wrap_err("failed to resolve nanocodex executable")?;
         let prompt = benchmark::prompt(
             Some(&profile),
             &config,
             state_dir.as_deref(),
             coordinator.as_deref(),
+            Some(&executable),
         );
         let initial = BoardStatus::load(
             Some(&profile),
@@ -77,6 +101,7 @@ impl Benchmark {
         if initial.is_complete() {
             return Ok(());
         }
+        validate_prepared_eval_host().wrap_err("evaluation host preflight failed")?;
         agent.restrict_to_host_control(CONTROLLER_INSTRUCTIONS);
         let workflow = if headless {
             let _observability = observability.install(false, agent.cwd())?;
@@ -134,7 +159,11 @@ impl BoardStatus {
         coordinator: Option<&str>,
     ) -> Result<Self> {
         if let Some(coordinator) = coordinator {
-            let status = CoordinatorClient::new(coordinator)?.status().await?;
+            let mut client = CoordinatorClient::new(coordinator)?;
+            if let Some(profile) = profile {
+                client = client.profile(profile);
+            }
+            let status = client.status().await?;
             return serde_json::from_value(status)
                 .wrap_err("coordinator returned an invalid benchmark board status");
         }

@@ -1,15 +1,24 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 
-import type {
-  AgentEvent,
-  DefaultAgent,
-  EventWatcher,
-  SessionSnapshot,
-  Turn,
-  TurnUsage,
+import {
+  type AgentEvent,
+  type DefaultAgent,
+  type EventWatcher,
+  type Turn,
+  type TurnUsage,
 } from "nanocodex";
-import { Agent } from "nanocodex/browser";
+import {
+  createSqliteDurabilityStore,
+  sqliteDurabilitySchema,
+  type DurabilitySqliteQuery,
+  type DurabilityStore,
+} from "nanocodex/durability";
+import {
+  Agent,
+  Transport,
+  type BrowserWebSocketRequest,
+} from "nanocodex/host";
 import { agentOS } from "@rivet-dev/agentos";
 import { event, UserError } from "rivetkit";
 import type { RawAccess } from "rivetkit/db";
@@ -17,11 +26,7 @@ import type { RawAccess } from "rivetkit/db";
 import type { SubscriptionSnapshot, SubscriptionStatus } from "./auth.js";
 import { type AuthCapabilityProof, createCapabilityProof } from "./auth-capability.js";
 import { createCodexAuthFileProvider } from "./codex-auth-file.js";
-import {
-  type BrowserAuthRequest,
-  openApiKeyWebSocket,
-  openSubscriptionWebSocket,
-} from "./model-websocket.js";
+import { openApiKeyWebSocket, openSubscriptionWebSocket } from "./model-websocket.js";
 import {
   type AgentOsActionContext,
   agentOsPreviewOptions,
@@ -33,7 +38,6 @@ import {
 
 const MAX_PROMPT_BYTES = 1024 * 1024;
 const MAX_ACTIVE_TURNS = 16;
-const MAX_TERMINAL_TURNS = 256;
 const TURN_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const CHATGPT_WEBSOCKET_URL = "wss://chatgpt.com/backend-api/codex/responses";
 const CHATGPT_API_BASE_URL = "https://chatgpt.com/backend-api/codex";
@@ -41,14 +45,8 @@ const wasmBytes = readFile(new URL(import.meta.resolve("nanocodex/wasm")));
 
 type ModelAuthMode = "api_key" | "chatgpt";
 
-type PromptAdmission =
-  | { kind: "fresh" }
-  | { kind: "terminal"; completed: TurnCompleted };
-
 type InFlightTurn = {
-  admission: Promise<PromptAdmission>;
   input: string;
-  inputHash: string;
   operation: Promise<TurnCompleted>;
 };
 
@@ -102,14 +100,8 @@ export type SessionStatus = {
 };
 
 type SessionRow = {
-  snapshot: string | null;
   completed_turns: number;
   last_active: number;
-};
-
-type TerminalRow = {
-  input_hash: string;
-  payload: string;
 };
 
 type AuthActorHandle = {
@@ -155,18 +147,17 @@ export const nanocodex = agentOS({
   },
   actions: {
     start: async (c: SessionContext, request: PromptRequest): Promise<TurnAccepted> => {
-      const started = startPrompt(c, request, true);
+      const started = await startPrompt(c, request, true);
       void started.operation.catch(() => {});
-      const admission = await started.admission;
       return {
         type: "turn_accepted",
         id: request.id,
         input: request.input,
-        replayed: started.replayed || admission.kind === "terminal",
+        replayed: started.replayed,
       };
     },
     turn: async (c: SessionContext, request: PromptRequest): Promise<TurnCompleted> => {
-      return startPrompt(c, request, false).operation;
+      return (await startPrompt(c, request, false)).operation;
     },
     steer: async (c: SessionContext, id: string, input: string): Promise<void> => {
       validateTurnId(id);
@@ -185,7 +176,7 @@ export const nanocodex = agentOS({
       const row = await sessionRow(c.db);
       return {
         session_id: sessionUuid(c.actorId),
-        has_snapshot: row.snapshot !== null,
+        has_snapshot: row.completed_turns > 0,
         completed_turns: row.completed_turns,
         last_active: row.last_active,
         active_turns: [...c.vars.inFlight.keys()],
@@ -205,10 +196,10 @@ export const nanocodex = agentOS({
       if (c.vars.inFlight.size > 0) throw userError("cannot reset while turns are active");
       await shutdown(c);
       await c.db.transaction(async (transaction: RawAccess) => {
-        await transaction.execute("DELETE FROM terminal_turns");
-        await transaction.execute(
-          "UPDATE session_state SET snapshot = NULL, completed_turns = 0, last_active = 0 WHERE singleton = 1",
-        );
+        await transaction.execute("DELETE FROM completed_operations");
+        await transaction.execute("DELETE FROM nanocodex_journal_batches");
+        await transaction.execute("DELETE FROM nanocodex_journals");
+        await transaction.execute("UPDATE session_state SET last_active = 0 WHERE singleton = 1");
       });
     },
   },
@@ -221,61 +212,49 @@ export const nanocodex = agentOS({
   },
 });
 
-function startPrompt(
+async function startPrompt(
   context: SessionContext,
   request: PromptRequest,
   detached: boolean,
-): InFlightTurn & { replayed: boolean } {
+): Promise<InFlightTurn & { replayed: boolean }> {
   validatePrompt(request);
-  const inputHash = hashInput(request.input);
-  const existing = context.vars.inFlight.get(request.id);
+  let existing = context.vars.inFlight.get(request.id);
   if (existing) {
-    if (existing.inputHash !== inputHash) throw userError(`turn ${request.id} already has different input`);
+    if (existing.input !== request.input) throw userError(`turn ${request.id} already has different input`);
+    return { ...existing, replayed: true };
+  }
+  const replayed = await completedOperation(context.db, request.id);
+  existing = context.vars.inFlight.get(request.id);
+  if (existing) {
+    if (existing.input !== request.input) throw userError(`turn ${request.id} already has different input`);
     return { ...existing, replayed: true };
   }
   if (context.vars.inFlight.size >= MAX_ACTIVE_TURNS) {
     throw userError(`at most ${MAX_ACTIVE_TURNS} turns may be active`);
   }
 
-  const admission = classifyPrompt(context, request, inputHash);
-  const running = admission.then((result) => result.kind === "terminal"
-    ? result.completed
-    : runPrompt(context, request, inputHash, !detached));
+  context.broadcast("turnAccepted", {
+    type: "turn_accepted",
+    id: request.id,
+    input: request.input,
+    replayed,
+  } satisfies TurnAccepted);
+  const running = runPrompt(context, request, !detached);
   let inFlight: InFlightTurn;
   const operation = running.finally(() => {
     if (context.vars.inFlight.get(request.id) === inFlight) {
       context.vars.inFlight.delete(request.id);
     }
   });
-  inFlight = { admission, input: request.input, inputHash, operation };
+  inFlight = { input: request.input, operation };
   context.vars.inFlight.set(request.id, inFlight);
   context.keepAwake(operation);
-  return { ...inFlight, replayed: false };
-}
-
-async function classifyPrompt(
-  context: SessionContext,
-  request: PromptRequest,
-  inputHash: string,
-): Promise<PromptAdmission> {
-  const stored = await terminal(context.db, request.id);
-  if (stored) {
-    if (stored.input_hash !== inputHash) throw userError(`turn ${request.id} already has different input`);
-    return { kind: "terminal", completed: parseTerminal(stored.payload) };
-  }
-  context.broadcast("turnAccepted", {
-    type: "turn_accepted",
-    id: request.id,
-    input: request.input,
-    replayed: false,
-  } satisfies TurnAccepted);
-  return { kind: "fresh" };
+  return { ...inFlight, replayed };
 }
 
 async function runPrompt(
   context: SessionContext,
   request: PromptRequest,
-  inputHash: string,
   cancelOnContextAbort: boolean,
 ): Promise<TurnCompleted> {
   let turn: Turn | undefined;
@@ -287,54 +266,29 @@ async function runPrompt(
   }
   try {
     const agent = await ensureAgent(context);
-    turn = agent.turn.prompt({ input: request.input });
+    turn = agent.turn.prompt({ id: request.id, input: request.input });
     context.vars.turns.set(request.id, turn);
     const result = await turn.result();
-    const completed: TurnCompleted = {
-      type: "turn_completed",
-      id: request.id,
-      final_message: result.finalMessage,
-      usage: result.usage,
-    };
-    const payload = JSON.stringify(completed);
-    const snapshot = JSON.stringify(result.snapshot);
-    const completedAt = Date.now();
     try {
-      await context.db.transaction(async (transaction) => {
-        await transaction.execute(
-          `UPDATE session_state
-           SET snapshot = ?, completed_turns = completed_turns + 1, last_active = ?
-           WHERE singleton = 1`,
-          snapshot,
-          completedAt,
-        );
-        await transaction.execute(
-          `INSERT INTO terminal_turns (id, input_hash, payload, completed_at)
-           VALUES (?, ?, ?, ?)
-           ON CONFLICT(id) DO UPDATE SET
-             input_hash = excluded.input_hash,
-             payload = excluded.payload,
-             completed_at = excluded.completed_at`,
-          request.id,
-          inputHash,
-          payload,
-          completedAt,
-        );
-        await transaction.execute(
-          `DELETE FROM terminal_turns
-           WHERE id NOT IN (
-             SELECT id FROM terminal_turns
-             ORDER BY completed_at DESC, rowid DESC LIMIT ?
-           )`,
-          MAX_TERMINAL_TURNS,
-        );
-      });
-    } catch (error) {
-      await shutdown(context);
-      throw new Error(`durable commit failed: ${errorMessage(error)}`);
+      const completed: TurnCompleted = {
+        type: "turn_completed",
+        id: request.id,
+        final_message: result.finalMessage,
+        usage: await result.usage(),
+      };
+      const completedAt = Date.now();
+      let firstCompletion: boolean;
+      try {
+        firstCompletion = await recordCompletion(context.db, request.id, completedAt);
+      } catch (error) {
+        await shutdown(context);
+        throw new Error(`completion telemetry failed: ${errorMessage(error)}`);
+      }
+      if (firstCompletion) context.broadcast("turnCompleted", completed);
+      return completed;
+    } finally {
+      result.dispose();
     }
-    context.broadcast("turnCompleted", completed);
-    return completed;
   } catch (error) {
     const failed: TurnFailed = {
       type: "turn_failed",
@@ -367,30 +321,29 @@ async function ensureAgent(context: SessionContext): Promise<DefaultAgent> {
 }
 
 async function createAgent(context: SessionContext): Promise<DefaultAgent> {
-  const row = await sessionRow(context.db);
-  const resume = row.snapshot === null ? undefined : JSON.parse(row.snapshot) as SessionSnapshot;
   const mode = modelAuthMode();
+  const sessionId = sessionUuid(context.actorId);
+  const websocketUrl = process.env.OPENAI_WEBSOCKET_URL
+    ?? (mode === "chatgpt" ? CHATGPT_WEBSOCKET_URL : undefined);
   const common = {
-    apiBaseUrl: mode === "chatgpt" ? CHATGPT_API_BASE_URL : undefined,
     instructions: "You are Nanocodex running as a durable Rivet Actor. Use the sandbox_* tools for code, files, and previews; their /workspace is an isolated persistent AgentOS VM filesystem for this actor.",
     module: await wasmBytes,
-    resume,
-    sessionId: sessionUuid(context.actorId),
+    durability: rivetDurabilityStore(context.db),
+    durabilityId: sessionId,
+    sessionId,
     tools: {
-      ...rivetSandboxTools(context, sessionUuid(context.actorId)),
+      ...rivetSandboxTools(context, sessionId),
       runtimeInfo: {
         description: "Return information about the current agent runtime.",
         parameters: { type: "object", additionalProperties: false },
         handler: () => ({
           runtime: "rivet-actor",
           sandbox: "rivet-agentos-persistent-vm",
-          session_id: sessionUuid(context.actorId),
+          session_id: sessionId,
           workspace: "/workspace",
         }),
       },
     },
-    websocketUrl: process.env.OPENAI_WEBSOCKET_URL
-      ?? (mode === "chatgpt" ? CHATGPT_WEBSOCKET_URL : undefined),
     workspace: "/workspace",
   };
 
@@ -399,8 +352,7 @@ async function createAgent(context: SessionContext): Promise<DefaultAgent> {
     const apiKey = requiredSecret("OPENAI_API_KEY");
     agent = await Agent.create({
       ...common,
-      apiKey,
-      createWebSocket: openApiKeyWebSocket,
+      transport: Transport.openAi({ apiKey, websocketUrl, createWebSocket: openApiKeyWebSocket }),
     });
   } else {
     const authFile = process.env.NANOCODEX_CODEX_AUTH_FILE;
@@ -409,9 +361,12 @@ async function createAgent(context: SessionContext): Promise<DefaultAgent> {
       : subscriptionActorProvider(context);
     agent = await Agent.create({
       ...common,
-      hostAuth: true,
-      createWebSocket: (endpoint: string, sessionId: string, request: BrowserAuthRequest) =>
-        openSubscriptionWebSocket(auth, endpoint, sessionId, request),
+      transport: Transport.hostManaged({
+        apiBaseUrl: CHATGPT_API_BASE_URL,
+        websocketUrl,
+        createWebSocket: (endpoint: string, sessionId: string, request: BrowserWebSocketRequest) =>
+          openSubscriptionWebSocket(auth, endpoint, sessionId, request),
+      }),
     });
   }
   const watcher = agent.events.watch();
@@ -425,22 +380,20 @@ async function migrateSessionDatabase(database: RawAccess): Promise<void> {
   await database.execute(`
     CREATE TABLE IF NOT EXISTS session_state (
       singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-      snapshot TEXT,
-      completed_turns INTEGER NOT NULL DEFAULT 0,
       last_active INTEGER NOT NULL DEFAULT 0
     )
   `);
   await database.execute(`
-    CREATE TABLE IF NOT EXISTS terminal_turns (
+    CREATE TABLE IF NOT EXISTS completed_operations (
       id TEXT PRIMARY KEY,
-      input_hash TEXT NOT NULL,
-      payload TEXT NOT NULL,
       completed_at INTEGER NOT NULL
     )
   `);
+  for (const statement of sqliteDurabilitySchema) await database.execute(statement);
   await database.execute(
     "INSERT OR IGNORE INTO session_state (singleton, last_active) VALUES (1, 0)",
   );
+  await database.execute("DROP TABLE IF EXISTS terminal_turns");
 }
 
 function subscriptionActorProvider(context: SessionContext) {
@@ -490,25 +443,53 @@ async function shutdown(context: SessionContext): Promise<void> {
 
 async function sessionRow(database: RawAccess): Promise<SessionRow> {
   const row = (await database.execute<SessionRow>(
-    "SELECT snapshot, completed_turns, last_active FROM session_state WHERE singleton = 1",
+    `SELECT
+       (SELECT COUNT(*) FROM completed_operations) AS completed_turns,
+       last_active
+     FROM session_state WHERE singleton = 1`,
   ))[0];
   if (!row) throw new Error("session state is not initialized");
   return row;
 }
 
-async function terminal(database: RawAccess, id: string): Promise<TerminalRow | undefined> {
-  return (await database.execute<TerminalRow>(
-    "SELECT input_hash, payload FROM terminal_turns WHERE id = ?",
+async function completedOperation(database: RawAccess, id: string): Promise<boolean> {
+  const row = (await database.execute<{ completed: number }>(
+    "SELECT EXISTS(SELECT 1 FROM completed_operations WHERE id = ?) AS completed",
     id,
   ))[0];
+  return row?.completed === 1;
 }
 
-function parseTerminal(payload: string): TurnCompleted {
-  const parsed = JSON.parse(payload) as TurnCompleted;
-  if (parsed.type !== "turn_completed" || typeof parsed.id !== "string") {
-    throw new Error("stored terminal result is invalid");
-  }
-  return parsed;
+async function recordCompletion(
+  database: RawAccess,
+  id: string,
+  completedAt: number,
+): Promise<boolean> {
+  return database.transaction(async (transaction) => {
+    if (await completedOperation(transaction, id)) return false;
+    await transaction.execute(
+      "INSERT INTO completed_operations (id, completed_at) VALUES (?, ?)",
+      id,
+      completedAt,
+    );
+    await transaction.execute(
+      "UPDATE session_state SET last_active = ? WHERE singleton = 1",
+      completedAt,
+    );
+    return true;
+  });
+}
+
+function rivetDurabilityStore(database: RawAccess): DurabilityStore {
+  return createSqliteDurabilityStore({
+    transaction: (callback) => database.transaction((transaction) => (
+      callback(rivetDurabilityQuery(transaction))
+    )),
+  });
+}
+
+function rivetDurabilityQuery(database: RawAccess): DurabilitySqliteQuery {
+  return (sql, args) => database.execute(sql, ...args);
 }
 
 function validatePrompt(request: PromptRequest): void {
@@ -528,10 +509,6 @@ function validateInput(input: string): void {
   if (Buffer.byteLength(input, "utf8") > MAX_PROMPT_BYTES) {
     throw userError("prompt input exceeds 1 MiB");
   }
-}
-
-function hashInput(input: string): string {
-  return createHash("sha256").update(input).digest("hex");
 }
 
 function sessionUuid(actorId: string): string {
